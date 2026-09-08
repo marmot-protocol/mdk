@@ -134,6 +134,9 @@ def install_fake_hermes_modules():
         async def remove_reaction(self, chat_id, message_id=None):
             raise NotImplementedError
 
+        def resume_typing_for_chat(self, chat_id):
+            pass
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
@@ -6052,6 +6055,411 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await queue.join()
+
+
+class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
+    ACCOUNT = "11" * 32
+    GROUP = "22" * 16
+    SENDER = "44" * 32
+    PROMPT = "cc" * 32
+
+    async def asyncSetUp(self):
+        self.module = load_adapter_module()
+        self.env = unittest.mock.patch.dict(
+            self.module.os.environ, {"MARMOT_ALLOWED_USERS": self.SENDER}, clear=True
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.adapter = self.make_adapter(True)
+
+    def make_adapter(self, enabled=None):
+        extra = {"account_id_hex": self.ACCOUNT}
+        if enabled is not None:
+            extra["approval_reactions"] = enabled
+        return self.module.MarmotPlatformAdapter(
+            sys.modules["gateway.config"].PlatformConfig(extra=extra),
+            client=_DeliveryRoutingFakeClient(),
+        )
+
+    async def send_prompt(self, adapter=None):
+        adapter = adapter or self.adapter
+        return await adapter.send(
+            self.GROUP, "Approval required", metadata={"is_approval_prompt": True,
+                                                       "is_turn_final": False,
+                                                       "delivery_class": "commentary",
+                                                       "_interim_send": True}
+        )
+
+    def reaction(self, **overrides):
+        return {
+            "type": "reaction_added", "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP, "target_message_id_hex": self.PROMPT,
+            "event_id_hex": "ee" * 32, "emoji": "👍",
+            "actor": {"account_id_hex": self.SENDER, "is_self": False},
+            **overrides,
+        }
+
+    async def test_mapping_through_send_and_mutation_hook(self):
+        for emoji, slash in [("👍", "/approve"), ("👎", "/deny"),
+                             ("❤️", "/approve always"), ("❤", "/approve always")]:
+            with self.subTest(emoji=emoji):
+                adapter = self.make_adapter(True)
+                result = await self.send_prompt(adapter)
+                self.assertTrue(result.success)
+                await adapter._handle_control_event(self.reaction(emoji=emoji))
+                self.assertEqual([event.text for event in adapter.events], [slash])
+                source = adapter.events[0].source
+                self.assertEqual(source.user_id, self.SENDER)
+                self.assertEqual(source.chat_id, self.GROUP)
+                self.assertEqual(source.message_id, "ee" * 32)
+                self.assertEqual(adapter._pending_ambient_context, {})
+
+    async def test_connector_wire_heart_on_own_prompt_delivers_confirmation(self):
+        # Exercise the real NDJSON client and subscription dispatcher. This is
+        # the connector's ReactionAdded DTO: actor is the reactor, while the
+        # referenced target's sender is the agent (not a self-reaction).
+        for emoji in ["\u2764\ufe0f", "\u2764"]:
+            with self.subTest(emoji=emoji), tempfile.TemporaryDirectory() as home:
+                socket = str(Path(home) / "agent.sock")
+                sends = []
+                server_errors = []
+                reaction_id = "ee" * 32
+
+                async def serve(reader, writer):
+                    try:
+                        request = json.loads(await reader.readline())
+                        if request["type"] == "send_final":
+                            sends.append(request)
+                            payload = {"type": "final_sent", "message_ids_hex": [self.PROMPT]}
+                        else:
+                            self.assertEqual(request["type"], "subscribe_inbound")
+                            self.assertEqual(request["account_id_hex"], self.ACCOUNT)
+                            writer.write((json.dumps({
+                                "marmot_agent_control": self.module.PROTOCOL,
+                                "id": request["id"], "type": "ack",
+                            }) + "\n").encode())
+                            payload = self.reaction(emoji=emoji, target={
+                                "message_id_hex": self.PROMPT,
+                                "availability": "available", "text_excerpt": "Approval required",
+                                "sender": {"account_id_hex": self.ACCOUNT, "is_self": True},
+                                "media": [],
+                            })
+                        writer.write((json.dumps({
+                            "marmot_agent_control": self.module.PROTOCOL,
+                            "id": request["id"], **payload,
+                        }) + "\n").encode())
+                        await writer.drain()
+                    except Exception as exc:
+                        server_errors.append(exc)
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+
+                server = await asyncio.start_unix_server(serve, path=socket)
+                async with server:
+                    adapter = self.module.MarmotPlatformAdapter(
+                        sys.modules["gateway.config"].PlatformConfig(extra={
+                            "account_id_hex": self.ACCOUNT, "approval_reactions": True,
+                        }), client=self.module.MarmotAgentControlClient(socket),
+                    )
+                    received = []
+
+                    async def gateway(event):
+                        received.append(event)
+                        # Mirrors Hermes _reply_anchor_for_event and its
+                        # slash-command confirmation send, not just synthesis.
+                        result = await adapter.send(
+                            event.source.chat_id, "Approved always",
+                            reply_to=event.message_id, metadata={"delivery_class": "notify"},
+                        )
+                        self.assertTrue(result.success)
+
+                    adapter.handle_message = gateway
+                    await self.send_prompt(adapter)
+                    await asyncio.wait_for(adapter._consume_inbound_once(drain=True), timeout=5)
+                self.assertEqual(server_errors, [])
+                self.assertEqual([event.text for event in received], ["/approve always"])
+                self.assertEqual(received[0].message_id, reaction_id)
+                self.assertEqual(received[0].source.message_id, reaction_id)
+                self.assertEqual(len(sends), 2)
+                self.assertEqual(sends[1]["reply_to_message_id_hex"], reaction_id)
+
+    async def test_typed_approval_keeps_own_message_id_not_reply_target(self):
+        self.adapter.group_activation = "always"
+        received = []
+
+        async def gateway(event):
+            received.append(event)
+            await self.adapter.send(self.GROUP, "Approved always", reply_to=event.message_id)
+
+        self.adapter.handle_message = gateway
+        event = wire_event({
+            "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP, "message_id_hex": "ab" * 32,
+            "sender_account_id_hex": self.SENDER, "text": "/approve always",
+            "reply_to_message_id_hex": self.PROMPT,
+        })
+        await self.adapter._handle_control_event(event)
+        await self.adapter._inbound_queue.join()
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].message_id, "ab" * 32)
+        self.assertEqual(received[0].reply_to_message_id, self.PROMPT)
+        self.assertEqual(self.adapter.client.final_sends[-1][3], "ab" * 32)
+
+    async def test_bad_approval_anchor_degrades_but_other_ids_stay_strict(self):
+        bad_anchor = "approval-reaction-private-test-token"
+        event = self.module.MessageEvent(
+            text="/approve always", message_id=bad_anchor,
+            source=self.adapter.build_source(chat_id=self.GROUP, user_id=self.SENDER),
+        )
+        outcomes = []
+
+        async def gateway(inbound):
+            outcomes.append(await self.adapter.send(
+                self.GROUP, "Approved always", reply_to=inbound.message_id,
+            ))
+            with self.assertRaises(self.module.AgentControlError):
+                await self.adapter.send("bad-group", "Approved always", reply_to=bad_anchor)
+            with self.assertRaises(self.module.AgentControlError):
+                await self.adapter.send("33" * 16, "Different group", reply_to=bad_anchor)
+
+        self.adapter.handle_message = gateway
+        with self.assertLogs(self.module.logger, level="DEBUG") as logs:
+            await self.adapter._handle_gateway_message(event)
+        self.assertTrue(outcomes[0].success)
+        self.assertIsNone(self.adapter.client.final_sends[-1][3])
+        diagnostic = "\n".join(logs.output)
+        self.assertIn(f"length={len(bad_anchor)}, prefix='ap'", diagnostic)
+        self.assertNotIn(bad_anchor, diagnostic)
+        # Recovery scope is reset after command dispatch, and the shared parser
+        # remains strict for normal sends and unrelated ids.
+        with self.assertRaises(self.module.AgentControlError):
+            await self.adapter.send(self.GROUP, "ordinary message", reply_to=bad_anchor)
+        with self.assertRaises(self.module.AgentControlError):
+            self.module._optional_hex(bad_anchor)
+
+    async def test_stale_prompt_cannot_resolve_new_approval_after_typed_resolution(self):
+        for command in ["/approve", "/approve always", "/deny"]:
+            with self.subTest(command=command):
+                adapter = self.make_adapter(True)
+                await self.send_prompt(adapter)
+                event = self.module.MessageEvent(text=command, source=adapter.build_source(
+                    chat_id=self.GROUP, user_id=self.SENDER,
+                ))
+                async def successful_gateway(command_event):
+                    # Match Hermes: only a successful decision resumes typing.
+                    adapter.resume_typing_for_chat(command_event.source.chat_id)
+                    adapter.events.append(command_event)
+
+                adapter.handle_message = successful_gateway
+                await adapter._handle_gateway_message(event)
+                adapter.client.send_final = unittest.mock.AsyncMock(return_value={
+                    "type": "final_sent", "message_ids_hex": ["dd" * 32],
+                })
+                await self.send_prompt(adapter)
+                adapter.events.clear()
+                await adapter._handle_control_event(self.reaction())
+                self.assertEqual(adapter.events, [], "A must never resolve B")
+                await adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
+                self.assertEqual([event.text for event in adapter.events], ["/approve"])
+
+    async def test_rejected_typed_command_preserves_authorized_reaction_consent(self):
+        for command in ["/approve", "/deny", "/approve invalid"]:
+            for raises in [False, True]:
+                with self.subTest(command=command, raises=raises):
+                    adapter = self.make_adapter(True)
+                    await self.send_prompt(adapter)
+                    rejected = self.module.MessageEvent(
+                        text=command, source=adapter.build_source(
+                            chat_id=self.GROUP, user_id="77" * 32,
+                        ),
+                    )
+
+                    async def gateway(event):
+                        if event is rejected:
+                            if raises:
+                                raise ValueError("command rejected")
+                            return  # Rejected by gateway validation; no decision.
+                        adapter.resume_typing_for_chat(event.source.chat_id)
+                        adapter.events.append(event)
+
+                    adapter.handle_message = gateway
+                    if raises:
+                        with self.assertRaises(ValueError):
+                            await adapter._handle_gateway_message(rejected)
+                    else:
+                        await adapter._handle_gateway_message(rejected)
+                    self.assertIsNone(self.module._APPROVAL_REPLY_CONTEXT.get())
+                    await adapter._handle_control_event(self.reaction())
+                    self.assertEqual([event.text for event in adapter.events], ["/approve"])
+                    self.assertEqual(adapter.events[0].source.user_id, self.SENDER)
+                    # Success still consumes the prompt exactly once.
+                    await adapter._handle_control_event(self.reaction())
+                    self.assertEqual(len(adapter.events), 1)
+
+    async def test_expiry_and_replacement_retire_stale_prompts(self):
+        with unittest.mock.patch.object(self.module, "approval_prompt_timeout", return_value=43200):
+            with unittest.mock.patch.object(self.module.time, "monotonic", return_value=100):
+                await self.send_prompt()
+            with unittest.mock.patch.object(self.module.time, "monotonic", return_value=43300):
+                await self.adapter._handle_control_event(self.reaction())
+                self.assertEqual(self.adapter.events, [])
+                self.adapter.client.send_final = unittest.mock.AsyncMock(return_value={
+                    "type": "final_sent", "message_ids_hex": ["dd" * 32],
+                })
+                await self.send_prompt()
+                await self.adapter._handle_control_event(self.reaction())
+                self.assertEqual(self.adapter.events, [])
+                await self.adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
+                self.assertEqual(len(self.adapter.events), 1)
+
+    async def test_unobserved_resolution_new_prompt_disables_ambiguous_consent(self):
+        await self.send_prompt()
+        # B arrives without an observable typed decision or an elapsed timeout.
+        # It may be replacement or parallel work: unscoped consent is unsafe.
+        self.adapter.client.send_final = unittest.mock.AsyncMock(return_value={
+            "type": "final_sent", "message_ids_hex": ["dd" * 32],
+        })
+        await self.send_prompt()
+        await self.adapter._handle_control_event(self.reaction())
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
+        self.assertEqual(self.adapter.events, [])
+        self.adapter.client.send_final.return_value = {
+            "type": "final_sent", "message_ids_hex": ["ab" * 32],
+        }
+        await self.send_prompt()
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex="ab" * 32))
+        self.assertEqual(self.adapter.events, [], "a third prompt must not bypass ambiguity")
+
+    async def test_gateway_resolution_callback_retires_prompt(self):
+        await self.send_prompt()
+        self.adapter.resume_typing_for_chat(self.GROUP)
+        await self.adapter._handle_control_event(self.reaction())
+        self.assertEqual(self.adapter.events, [])
+
+    def test_timeout_uses_gateway_configured_value(self):
+        approval = types.ModuleType("tools.approval")
+        approval._get_approval_timeout = lambda: 43200
+        with unittest.mock.patch.dict(sys.modules, {"tools.approval": approval}):
+            self.assertEqual(self.module.approval_prompt_timeout(), 43200)
+
+    async def test_flag_off_preserves_ambient_mutation_behavior(self):
+        for flag in [None, False, "false", "true"]:
+            adapter = self.make_adapter(flag)
+            ambient = unittest.mock.AsyncMock()
+            adapter._surface_ambient_context = ambient
+            await self.send_prompt(adapter)
+            await adapter._handle_control_event(self.reaction())
+            self.assertEqual(adapter._approval_prompt_messages, {})
+            self.assertEqual(adapter.events, [])
+            ambient.assert_awaited_once()
+
+    async def test_allowlist_is_fail_closed_even_with_allow_all(self):
+        await self.send_prompt()
+        for value in ["", "  ", "*", "npub1invalid", "33" * 32]:
+            with self.subTest(value=value), unittest.mock.patch.dict(
+                self.module.os.environ,
+                {"MARMOT_ALLOWED_USERS": value, "MARMOT_ALLOW_ALL_USERS": "true"},
+            ):
+                await self.adapter._handle_control_event(self.reaction())
+                self.assertEqual(self.adapter.events, [])
+        with unittest.mock.patch.dict(self.module.os.environ, {}, clear=True):
+            self.assertEqual(self.module.resolve_allowed_message_senders(), set())
+            await self.adapter._handle_control_event(self.reaction())
+            self.assertEqual(self.adapter.events, [])
+        # Unauthorized attempts never consume the pending prompt.
+        await self.adapter._handle_control_event(self.reaction())
+        self.assertEqual(len(self.adapter.events), 1)
+
+    def test_allowlist_normalizes_hex_and_npub_and_discards_invalid_entries(self):
+        npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
+        with unittest.mock.patch.dict(self.module.os.environ, {
+            "MARMOT_ALLOWED_USERS": f" 0x{'AB' * 32}, {npub}, *, invalid, npub1invalid",
+        }):
+            self.assertEqual(self.module.resolve_allowed_message_senders(), {
+                "ab" * 32,
+                "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4",
+            })
+
+    async def test_own_and_malformed_actors_never_consent(self):
+        await self.send_prompt()
+        with unittest.mock.patch.dict(self.module.os.environ, {
+            "MARMOT_ALLOWED_USERS": f"{self.SENDER},{self.ACCOUNT}",
+        }):
+            for actor in [self.SENDER, None, {}, {"account_id_hex": self.SENDER},
+                          {"account_id_hex": self.SENDER, "is_self": True},
+                          {"account_id_hex": self.ACCOUNT, "is_self": False}]:
+                await self.adapter._handle_control_event(self.reaction(actor=actor))
+                self.assertEqual(self.adapter.events, [])
+
+    async def test_untracked_wrong_scope_and_nondecision_mutations_stay_ambient(self):
+        await self.send_prompt()
+        ambient = unittest.mock.AsyncMock()
+        self.adapter._surface_ambient_context = ambient
+        for override in [
+            {"target_message_id_hex": "dd" * 32}, {"group_id_hex": "33" * 16},
+            {"account_id_hex": "55" * 32}, {"emoji": "👀"}, {"emoji": []},
+            {"type": "reaction_removed"}, {"type": "message_edited"},
+        ]:
+            await self.adapter._handle_control_event(self.reaction(**override))
+        self.assertEqual(self.adapter.events, [])
+        self.assertEqual(ambient.await_count, 7)
+
+    async def test_one_decision_even_for_concurrent_reactions_and_repeated_send(self):
+        await self.send_prompt()
+        handler = unittest.mock.AsyncMock()
+        self.adapter.handle_message = handler
+        await asyncio.gather(*[
+            self.adapter._handle_control_event(self.reaction(emoji=emoji))
+            for emoji in ["👍", "👎", "❤️"]
+        ])
+        handler.assert_awaited_once()
+        # An idempotent resend result cannot rearm a consumed prompt.
+        await self.send_prompt()
+        await self.adapter._handle_control_event(self.reaction())
+        handler.assert_awaited_once()
+
+    async def test_failed_dispatch_consumes_prompt_and_logs_no_private_data(self):
+        await self.send_prompt()
+        self.adapter.handle_message = unittest.mock.AsyncMock(
+            side_effect=RuntimeError(f"private payload {self.SENDER}")
+        )
+        with self.assertLogs(self.module.logger, level="WARNING") as logs:
+            await self.adapter._handle_control_event(self.reaction())
+        self.assertNotIn(self.SENDER, str(logs.output))
+        self.assertNotIn("private payload", str(logs.output))
+        await self.adapter._handle_control_event(self.reaction())
+        self.adapter.handle_message.assert_awaited_once()
+
+    async def test_only_durable_marked_successful_sends_are_tracked(self):
+        await self.adapter.send(self.GROUP, "ordinary message")
+        self.assertEqual(self.adapter._approval_prompt_messages, {})
+        for result in [
+            self.module.SendResult(success=False, message_id=self.PROMPT),
+            self.module.SendResult(success=True),
+            self.module.SendResult(success=True, message_id="marmot-stream:abcd"),
+            self.module.SendResult(success=True, message_id=self.PROMPT,
+                                   raw_response={"type": "app_event_sent"}),
+        ]:
+            self.adapter._record_approval_prompt(self.GROUP, {"is_approval_prompt": True}, result)
+        self.assertEqual(self.adapter._approval_prompt_messages, {})
+        await self.send_prompt()
+        self.assertEqual(len(self.adapter._approval_prompt_messages), 1)
+
+    async def test_fifo_bound_and_chunked_prompt_share_one_decision(self):
+        for index in range(33):
+            primary = f"{index:064x}"
+            continuation = f"{index + 100:064x}"
+            self.adapter._record_approval_prompt(self.GROUP, {"is_approval_prompt": True},
+                self.module.SendResult(success=True, message_id=primary, raw_response={
+                    "type": "stream_finalized", "message_ids_hex": [continuation, primary],
+                }))
+        self.assertEqual(len(self.adapter._approval_prompt_messages), 32)
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex="00" * 32))
+        self.assertEqual(self.adapter.events, [])
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex=f"{132:064x}"))
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex=f"{32:064x}"))
+        self.assertEqual(len(self.adapter.events), 1)
 
 
 if __name__ == "__main__":

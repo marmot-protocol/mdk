@@ -49,6 +49,11 @@ _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
     "marmot_turn_parent_message_id_hex",
     default=None,
 )
+# Scope reply-anchor recovery to sends made while dispatching an approval
+# command. ContextVar keeps concurrent groups and ordinary sends isolated.
+_APPROVAL_REPLY_CONTEXT: ContextVar[Optional[tuple[object, str]]] = ContextVar(
+    "marmot_approval_reply_context", default=None,
+)
 TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # Bounded backoff (seconds) for durable send_final retries. One idempotency key
 # is reused across these attempts so a retry after a post-write timeout dedups at
@@ -85,6 +90,41 @@ MAX_PENDING_AMBIENT_GROUPS = 256
 DEFAULT_SENT_TARGET_CACHE_SIZE = 2048
 DEFAULT_GROUP_ACTIVATION: Literal["mention", "always"] = "mention"
 MAX_PROFILE_NAME_CHARS = 80
+# Only explicit gateway approval prompts are eligible for reaction consent.
+APPROVAL_REACTION_CHOICES = {
+    "👍": "/approve",
+    "👎": "/deny",
+    "❤️": "/approve always",
+    "❤": "/approve always",
+}
+MAX_PENDING_APPROVAL_PROMPTS = 32
+
+
+def approval_prompt_timeout() -> float:
+    # Use the gateway's configured approvals.timeout (300 seconds by default).
+    # Older hosts without this API get the conservative gateway default.
+    try:
+        from tools.approval import _get_approval_timeout
+        return max(0, float(_get_approval_timeout()))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return 300.0
+
+
+def resolve_allowed_message_senders() -> set[str]:
+    """Explicit Marmot sender allowlist, normalized to hex; empty denies all.
+
+    MARMOT_ALLOW_ALL_USERS never authorizes reaction consent. Reuse the shared
+    npub/hex normalization but discard malformed entries instead of broadening
+    consent to every group member.
+    """
+    allowed = set()
+    for entry in (os.getenv("MARMOT_ALLOWED_USERS") or "").split(","):
+        sender = normalize_welcomer_id(entry)
+        if re.fullmatch(r"[0-9a-f]{64}", sender):
+            allowed.add(sender)
+    return allowed
+
+
 PROFILE_NAME_PROMPT = (
     "I do not have a public Nostr profile name yet. What should I publish as "
     'this agent\'s display name? Reply with a name, or reply "skip" to stay unnamed.'
@@ -1950,6 +1990,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
         self.debounce_ms = resolve_debounce_ms(extra)
         self.group_activation = resolve_group_activation(extra)
+        # This consent feature requires an explicit boolean opt-in.
+        self.approval_reactions = extra.get("approval_reactions") is True
+        # Keys bind account, group and primary durable message id. Values hold
+        # all chunks of one prompt; None is a consumed tombstone, preventing a
+        # repeated send result from rearming a decision. Total history is 32.
+        self._approval_prompt_messages: OrderedDict[
+            tuple[str, str, str], Optional[tuple[str, ...]]
+        ] = OrderedDict()
+        self._approval_prompt_deadlines: Dict[tuple[str, str, str], float] = {}
+        self._approval_prompt_sends: Dict[str, object] = {}
+        self._approval_ambiguous_until: Dict[str, float] = {}
         self.mention_patterns = resolve_mention_patterns(extra)
         self.agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
         self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
@@ -2075,6 +2126,43 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         self._capture_loop()
         chat_id = _normalize_hex(chat_id, "chat_id")
+        if _APPROVAL_REPLY_CONTEXT.get() == (self, chat_id):
+            try:
+                reply_to = _optional_hex(reply_to)
+            except AgentControlError:
+                # Only the reply anchor is optional. Retry its send preparation
+                # unthreaded; invalid destination/account ids remain errors.
+                logger.debug("Marmot approval confirmation dropping invalid reply anchor")
+                reply_to = None
+        if self.approval_reactions and (metadata or {}).get("is_approval_prompt") is True:
+            # Hermes marks approval prompts as interim commentary. Consent needs
+            # a durable chat message, never an activity event or live preview.
+            started = time.monotonic()
+            self._sweep_approval_prompts()
+            # The gateway slash command resolves FIFO, not a message id. If
+            # another prompt is still eligible, neither prompt is safe to use.
+            inflight = chat_id in self._approval_prompt_sends
+            ambiguous = (
+                self._invalidate_approval_prompts(chat_id) or inflight
+                or self._approval_ambiguous_until.get(chat_id, 0) > started
+            )
+            if ambiguous:
+                # A later prompt must not re-enable consent while an older
+                # parallel request might still occupy the gateway's FIFO head.
+                self._approval_ambiguous_until[chat_id] = started + approval_prompt_timeout()
+            ticket = object()
+            self._approval_prompt_sends[chat_id] = ticket
+            try:
+                result = await self._send_final_direct(
+                    chat_id, content, reply_to_message_id_hex=_optional_hex(reply_to)
+                )
+                eligible = not ambiguous and self._approval_prompt_sends.get(chat_id) is ticket
+                self._record_approval_prompt(chat_id, metadata, result,
+                                             eligible=eligible, started=started)
+                return result
+            finally:
+                if self._approval_prompt_sends.get(chat_id) is ticket:
+                    self._approval_prompt_sends.pop(chat_id, None)
         visible_content, is_preview = self._split_stream_preview(content)
 
         tool_events = _tool_events_from_progress_text(visible_content)
@@ -3479,7 +3567,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             ]
             if contexts:
                 hermes_event.channel_context = "\n".join(contexts)
-            await self.handle_message(hermes_event)
+            await self._handle_gateway_message(hermes_event)
         except asyncio.CancelledError:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             raise
@@ -3616,7 +3704,145 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             for message_id_hex in message_ids:
                 self._pending_inbound_ids.discard(message_id_hex)
 
+    def _record_approval_prompt(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]], result: SendResult,
+        *, eligible: bool = True, started: Optional[float] = None,
+    ) -> None:
+        if not self.approval_reactions or (metadata or {}).get("is_approval_prompt") is not True:
+            return
+        response = result.raw_response
+        if not result.success or not result.message_id or not isinstance(response, dict):
+            return
+        if response.get("type") not in {"final_sent", "stream_finalized"}:
+            return  # Activity and live-preview ids cannot be reaction targets.
+        ids = response.get("message_ids_hex")
+        if not isinstance(ids, (list, tuple)):
+            return
+        try:
+            account = _normalize_hex(self.account_id_hex)
+            group = _normalize_hex(chat_id)
+            primary = _normalize_hex(result.message_id)
+            message_ids = tuple(_normalize_hex(item) for item in ids)
+        except AgentControlError:
+            return  # An invalid receipt must not turn a successful send into a retry.
+        if primary not in message_ids:
+            return
+        key = (account, group, primary)
+        if key not in self._approval_prompt_messages:
+            self._approval_prompt_messages[key] = message_ids if eligible else None
+            self._approval_prompt_deadlines[key] = (
+                time.monotonic() if started is None else started
+            ) + approval_prompt_timeout()
+        while len(self._approval_prompt_messages) > MAX_PENDING_APPROVAL_PROMPTS:
+            evicted, _ = self._approval_prompt_messages.popitem(last=False)
+            self._approval_prompt_deadlines.pop(evicted, None)
+            if not any(key[1] == evicted[1] for key in self._approval_prompt_messages):
+                self._approval_ambiguous_until.pop(evicted[1], None)
+
+    def _sweep_approval_prompts(self) -> None:
+        now = time.monotonic()
+        self._approval_ambiguous_until = {
+            group: deadline for group, deadline in self._approval_ambiguous_until.items()
+            if deadline > now
+        }
+        for key, deadline in self._approval_prompt_deadlines.items():
+            if deadline <= now:
+                self._approval_prompt_messages[key] = None
+
+    def _invalidate_approval_prompts(self, chat_id: str) -> bool:
+        had_pending = False
+        for key, ids in self._approval_prompt_messages.items():
+            if key[:2] == (self.account_id_hex, chat_id) and ids is not None:
+                had_pending = True
+                self._approval_prompt_messages[key] = None
+        # Retire any send receipt still in flight during a resolution.
+        self._approval_prompt_sends.pop(chat_id, None)
+        return had_pending
+
+    def resume_typing_for_chat(self, chat_id: str) -> None:
+        # Hermes invokes this on successful typed /approve and /deny decisions.
+        self._invalidate_approval_prompts(chat_id)
+        super().resume_typing_for_chat(chat_id)
+
+    async def _handle_gateway_message(self, event: MessageEvent) -> None:
+        command = str(event.text or "").strip().split(maxsplit=1)
+        if not command or command[0].lower() not in {"/approve", "/deny"}:
+            await self.handle_message(event)
+            return
+        # Dispatch may reject authorization or syntax without resolving anything.
+        # Only resume_typing_for_chat's successful-resolution callback retires
+        # typed-command prompts; rejected commands must leave consent available.
+        token = _APPROVAL_REPLY_CONTEXT.set((self, event.source.chat_id))
+        try:
+            await self.handle_message(event)
+        finally:
+            _APPROVAL_REPLY_CONTEXT.reset(token)
+
+    async def _handle_approval_reaction(self, event: Dict[str, Any]) -> bool:
+        if not self.approval_reactions or event.get("type") != "reaction_added":
+            return False
+        self._sweep_approval_prompts()
+        emoji = event.get("emoji")
+        choice = APPROVAL_REACTION_CHOICES.get(emoji) if isinstance(emoji, str) else None
+        if choice is None:
+            return False
+        try:
+            account = _normalize_hex(event.get("account_id_hex"))
+            group = _normalize_hex(event.get("group_id_hex"))
+            target = _normalize_hex(event.get("target_message_id_hex"))
+            reaction_id = _normalize_hex(event.get("event_id_hex"))
+        except AgentControlError:
+            return False
+        if account != self.account_id_hex:
+            return False
+        key = next(
+            (key for key, ids in self._approval_prompt_messages.items()
+             if key[:2] == (account, group) and ids is not None and target in ids),
+            None,
+        )
+        if key is None:
+            return False
+        actor = event.get("actor")
+        if not isinstance(actor, dict) or actor.get("is_self") is not False:
+            return True
+        sender = str(actor.get("account_id_hex") or "").strip().lower()
+        allowed = resolve_allowed_message_senders()
+        if sender == account or not allowed or sender not in allowed:
+            logger.debug("Marmot approval reaction rejected by sender policy")
+            return True
+        # Consume before awaiting the gateway so concurrent reactions, failed
+        # dispatches and replayed events cannot decide this prompt twice.
+        self._approval_prompt_messages[key] = None
+        source = self.build_source(
+            chat_id=group,
+            chat_name=f"Marmot {group[:12]}",
+            chat_type="group",
+            user_id=sender,
+            user_name="Marmot sender",
+            message_id=reaction_id,
+        )
+        hermes_event = MessageEvent(
+            text=choice,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"via": "approval_reaction"},
+            # Hermes uses event.message_id (not source.message_id) as the
+            # confirmation reply anchor. Preserve the durable reaction id;
+            # a synthetic "approval-reaction-..." token cannot be a Marmot id.
+            message_id=reaction_id,
+            timestamp=datetime.now(timezone.utc),
+        )
+        try:
+            await self._handle_gateway_message(hermes_event)
+        except Exception:
+            # Exception messages and tracebacks may contain private event data.
+            logger.warning("Marmot approval reaction dispatch failed")
+        return True
+
     async def _handle_mutation(self, event: Dict[str, Any]) -> None:
+        if self.approval_reactions and event.get("type") == "reaction_added":
+            if await self._handle_approval_reaction(event):
+                return
         # Mutations are quiet next-turn context and never trigger an agent turn.
         # Privacy-safe log: no ids, actors, emoji, or plaintext.
         logger.debug("Marmot inbound mutation observed")
@@ -4424,6 +4650,8 @@ def _normalize_hex(value: Any, field: str = "hex") -> str:
     try:
         bytes.fromhex(text)
     except ValueError as exc:
+        # Bounded diagnostic only: never log the full id, payload or exception.
+        logger.debug("Marmot rejected hex value (length=%d, prefix=%r)", len(text), text[:2])
         raise AgentControlError(f"{field} must be hexadecimal", code="invalid_hex") from exc
     return text
 
