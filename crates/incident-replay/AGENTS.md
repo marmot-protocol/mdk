@@ -372,7 +372,7 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   enter VCS.
 - Real exports are the manual pre-PR verification set:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
-  The CLI rejects inputs larger than 64 MiB before JSON/NDJSON parsing.
+  The CLI rejects inputs larger than 256 MiB before JSON/NDJSON parsing.
 - Keep real inputs under ignored `incident-exports/` and generated local output under `target/` or ignored
   `incident-replay-output/`. Producer-attested artifacts may contain unredacted Scenario IR labels and payloads;
   treat them as confidential unless separately redacted and reviewed. Never add sensitive local replay capsules or
