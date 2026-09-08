@@ -385,8 +385,9 @@ fn query_indexes_upgrade() {
         rows
     };
     let before = contents(&conn);
-    super::run_all(&mut conn).unwrap();
-    super::run_all(&mut conn).unwrap();
+    // This assertion covers the index-only migration, not later column additions.
+    super::run(&mut conn, &super::MIGRATIONS[..63]).unwrap();
+    super::run(&mut conn, &super::MIGRATIONS[..63]).unwrap();
     let tx = conn.transaction().unwrap();
     super::migration_0063_query_indexes::apply(&tx).unwrap();
     tx.execute_batch("DROP INDEX idx_openmls_values_group;")

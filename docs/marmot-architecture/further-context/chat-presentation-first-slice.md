@@ -1,7 +1,7 @@
 ---
 title: "First chat presentation implementation slice"
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-08
 tags: [marmot, architecture, projections, implementation-plan]
 ---
 
@@ -9,7 +9,8 @@ tags: [marmot, architecture, projections, implementation-plan]
 
 Implementation plan for [#1517](https://github.com/marmot-protocol/mdk/issues/1517), under
 [#1742](https://github.com/marmot-protocol/mdk/issues/1742). This is the first C2/C3 slice; the C1 design needed for this
-slice is ready. No implementation or performance success is claimed. Later screen contracts retain their own design
+slice is ready. P1 now has an internal selection/storage implementation; runtime maintenance and native adoption
+remain P2–P4. No client performance success is claimed. Later screen contracts retain their own design
 and acceptance work. The [broader contract draft](chat-screen-contract-draft.md) maps those boundaries.
 
 ## Outcome and scope
@@ -193,7 +194,7 @@ change workspace versions as feature work. Schema migrations add representations
 existing directory rows with revision zero. First account preparation hydrates its dependencies directly, so it does
 not need an all-directory rewrite to manufacture historical revisions.
 
-Backfill selected rows in bounded batches of 50 with a durable cursor and version. Existing legacy APIs remain usable.
+Backfill selected rows in bounded batches of 50 with durable progress and a format version. Existing legacy APIs remain usable.
 The new open operation can await local preparation asynchronously; never block the host UI thread or wait on network.
 An upgrade that cannot complete reports typed preparation/storage failure, not a false cache miss. Do not advertise
 that the first upgrade has the same latency as a ready reopen. Measure it separately. For this first, existing-cardinality
@@ -218,6 +219,21 @@ P1/P2 may merge as internal foundations; they are not separate user-facing launc
 when P3's contract is complete. P4a/P4b can release independently. Keep commits/PRs focused on these boundaries; split
 an unusually large migration/test patch further without publishing an incomplete API. C1 does not require a new
 configuration/feature-flag framework. Later C4-C8 work can reuse the published presentation value and resolver.
+
+### P1 implementation boundary
+
+The account migration adds versioned selected values, dependency/roster indexes, and random account/row incarnation
+identifiers. Compare-and-store rejects preparation from a replaced store, recreated row or older source generation.
+The partial index of unprepared rows is the durable backfill worklist: committed rows leave it, invalidated rows rejoin
+it, and each read returns at most 50. This avoids skipping newly inserted or invalidated rows behind a global cursor.
+Ordinary reads distinguish missing, pending and ready without repair writes. Profile bookkeeping alone does not advance
+the selected-presentation notification revision; corrupt/unsupported envelopes return redacted errors.
+
+P1 seeds only roster evidence already available in the direct-member index. P2 must supply authoritative two-person
+rosters for named groups too, wire every source mutation, and run bounded hydration/catch-up after account readiness.
+The P1 methods and resolver are internal Rust building blocks; existing app, UniFFI and C chat-list behavior is unchanged.
+P2 must also authorize shared-store epoch transitions at its catch-up boundary; revisions in different shared-store
+incarnations are not ordered by the P1 account writer. P3 supplies atomic whole-row reads and subscription handoff.
 
 ### Consumer accounting
 
