@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-09-07
+updated: 2026-09-08
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -46,8 +46,22 @@ sweep, including retries of unrelated rows. Recovery resumes after the app
 consumes the journal; retaining the raw bytes and replay evidence takes priority
 over progress while the journal is full.
 
-The app consumes this evidence on account open and before receipt checkpoints,
-reconciliation, duplicate/echo shortcuts, and after engine ingest. Consumption
+`AppClient::transport_receipts` is the account-owned synchronization boundary.
+Its `SynchronizedTransportReceipts` view requires an exclusive client borrow and
+owns access to duplicate membership, reconciliation inventory, and pending seen
+checkpoint entries. The raw membership index exposes no production lookup API.
+The SDK drain passes the same view from its duplicate check into engine admission,
+so no intervening engine step or second pre-ingest journal query is needed.
+Direct ingestion creates its own view; post-ingest access synchronizes again
+because that engine step may have released more input. Account open restores
+pending backfill intents through this boundary, including when the journal is
+empty. Low-level storage reads and other read-only app APIs retain their existing
+behavior; this view is for the owning account client, not concurrent observers.
+
+The app consumes release evidence on account open, before receipt checkpoints,
+reconciliation and duplicate shortcuts, after engine ingest, and when observing
+engine effects. The empty-journal path remains a bounded existence query, without
+rebuilding the seen ring/index or loading all backfill intents. Consumption
 again removes both durable receipts (including an intervening stale checkpoint),
 arms the existing durable group backfill intent, and acknowledges the journal
 in one transaction. The caller then clears its in-memory seen ring/index

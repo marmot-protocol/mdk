@@ -6178,9 +6178,9 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 /// his own send — not a receive — applied it.
 ///
 /// This regression uses explicit test-policy overrides to create the precise
-/// post-cutoff/pre-scheduler state. `update_group_profile` completes its
-/// cross-account catch-up before returning, proving bob has ingested the
-/// rename. The test then lets the 100ms engine cutoff elapse while holding the
+/// post-cutoff/pre-scheduler state. Cross-account catch-up is best-effort, so
+/// the test witnesses the rename's commit edge in bob's durable active
+/// pass before allowing its engine cutoff to elapse while holding the
 /// scheduled worker for 60s. The send is therefore the only operation that can
 /// move bob's durable row from the old name to the new one, and the
 /// subscription must update within 5s, well before scheduled convergence can
@@ -6236,17 +6236,18 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         .await
         .unwrap();
 
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
     let renamed = "renamed during retained send".to_owned();
-    runtime
+    let rename_summary = runtime
         .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
         .await
         .unwrap();
-    assert_ne!(
-        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
-        Some(renamed.as_str()),
-        "bob's completed catch-up must retain the rename without applying it"
-    );
-    sleep(Duration::from_millis(250)).await;
+    assert!(rename_summary.published > 0, "the rename must be published");
+    wait_for_retained_commit_cutoff(&app, &bob.account.label, &group_id, source_epoch).await;
     assert_ne!(
         row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
         Some(renamed.as_str()),
@@ -6343,17 +6344,18 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         .await
         .unwrap();
 
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
     let renamed = "renamed during rejected send".to_owned();
-    runtime
+    let rename_summary = runtime
         .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
         .await
         .unwrap();
-    assert_ne!(
-        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
-        Some(renamed.as_str()),
-        "bob's completed catch-up must retain the rename without applying it"
-    );
-    sleep(Duration::from_millis(250)).await;
+    assert!(rename_summary.published > 0, "the rename must be published");
+    wait_for_retained_commit_cutoff(&app, &bob.account.label, &group_id, source_epoch).await;
     assert_ne!(
         row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
         Some(renamed.as_str()),
@@ -6587,6 +6589,48 @@ where
     })
     .await
     .expect("runtime chat update")
+}
+
+/// Witness a rename admitted at the receiver's current epoch before waiting
+/// out its cutoff. A completed best-effort catch-up and an unchanged title do
+/// not prove delivery. Passive reads leave the send as the only settling seam.
+#[cfg(feature = "test-policy-overrides")]
+async fn wait_for_retained_commit_cutoff(
+    app: &MarmotApp,
+    label: &str,
+    group_id: &GroupId,
+    source_epoch: u64,
+) {
+    use cgka_traits::convergence_pass::{ConvergencePassMemberRole, ConvergencePassPhase};
+
+    let pass = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pass) = app.convergence_pass_for_test(label, group_id).unwrap()
+                && matches!(
+                    pass.phase,
+                    ConvergencePassPhase::Collecting | ConvergencePassPhase::Frozen
+                )
+                && pass.base_epoch.0 == source_epoch
+                && pass.members.iter().any(|member| {
+                    member.role == ConvergencePassMemberRole::CommitEdge
+                        && member.source_epoch == source_epoch
+                })
+            {
+                break pass;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receiver must retain the rename in its active pass");
+    // Wait a full observed pass window using a monotonic timer, avoiding any
+    // assumption about how long publication/catch-up took or wall-clock phase.
+    sleep(Duration::from_millis(
+        pass.cutoff_monotonic_ms()
+            .saturating_sub(pass.opened_monotonic_ms)
+            .saturating_add(1),
+    ))
+    .await;
 }
 
 /// Current chat-list row title for one group, read fresh from the projection

@@ -21,8 +21,9 @@ App runtime bridge for the first real Marmot app surfaces.
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
   the cursor unit tests), `projection.rs` (timeline/group projection accessors, the `*_for_group` component reads, the
-  kind-1210 group-system row synthesis, and the local-send projection helpers), `push.rs` (push-token registration and
-  notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
+  kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
+  transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
+  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
   per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
   are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
