@@ -467,7 +467,27 @@ impl AppClient {
             .map(|group| group.group_id_hex.clone())
             .collect::<std::collections::HashSet<_>>();
         let live_group_ids = self.runtime.live_group_ids()?;
-        let mut changed = false;
+        let quarantined: std::collections::HashSet<_> = self
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(id, _)| hex::encode(id.as_slice()))
+            .collect();
+        let mut cleared = Vec::new();
+        for group in &mut self.state.groups {
+            if quarantined.contains(&group.group_id_hex)
+                && (group.member_count.is_some() || group.presentation_member_ids_hex.is_some())
+            {
+                group.member_count = None;
+                group.direct_member_ids_hex = None;
+                group.presentation_member_ids_hex = None;
+                cleared.push(group.group_id_hex.clone());
+            }
+        }
+        let mut changed = !cleared.is_empty();
+        for id in cleared {
+            self.mark_group_projection_dirty_hex(id);
+        }
         for group_id in live_group_ids {
             let group_id_hex = hex::encode(group_id.as_slice());
             if !projected.contains(group_id_hex.as_str()) {
@@ -500,8 +520,11 @@ impl AppClient {
                     dirty = true;
                 }
                 let previous_direct_members = projected_group.direct_member_ids_hex.clone();
+                let previous_presentation_members =
+                    projected_group.presentation_member_ids_hex.clone();
                 projected_group.set_direct_member_ids_from_roster(&group.members);
-                dirty |= projected_group.direct_member_ids_hex != previous_direct_members;
+                dirty |= projected_group.direct_member_ids_hex != previous_direct_members
+                    || projected_group.presentation_member_ids_hex != previous_presentation_members;
             }
             if dirty {
                 self.mark_group_projection_dirty_hex(group_id_hex);

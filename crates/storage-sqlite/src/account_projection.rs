@@ -186,6 +186,8 @@ pub struct StoredAccountGroup {
     /// peer without scanning every unnamed two-member chat. `None` when the
     /// group is not currently classified as Direct.
     pub direct_member_ids_hex: Option<Vec<String>>,
+    /// Current authoritative two-member roster, including explicitly named groups.
+    pub presentation_member_ids_hex: Option<Vec<String>>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
     pub nostr_routing_last_epoch: u64,
@@ -848,6 +850,7 @@ impl SqliteAccountStorage {
 
         let mut components_by_group = all_account_group_components(&conn)?;
         let mut members_by_group = load_direct_conversation_members(&conn)?;
+        let mut presentation_members = load_presentation_members(&conn)?;
         let mut groups = Vec::with_capacity(raw_groups.len());
         for raw in raw_groups {
             let prior_nostr_routes = serde_json::from_str(&raw.prior_nostr_routes_json)
@@ -856,6 +859,7 @@ impl SqliteAccountStorage {
                 .remove(&raw.group_id_hex)
                 .unwrap_or_default();
             let direct_member_ids_hex = members_by_group.remove(&raw.group_id_hex);
+            let presentation_member_ids_hex = presentation_members.remove(&raw.group_id_hex);
             groups.push(StoredAccountGroup {
                 group_id_hex: raw.group_id_hex,
                 endpoint: raw.endpoint,
@@ -871,6 +875,7 @@ impl SqliteAccountStorage {
                 pending_confirmation: raw.pending_confirmation,
                 member_count: raw.member_count.and_then(|value| value.try_into().ok()),
                 direct_member_ids_hex,
+                presentation_member_ids_hex,
                 welcomer_account_id_hex: raw.welcomer_account_id_hex,
                 via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
                 nostr_routing_last_epoch: raw
@@ -1263,6 +1268,8 @@ impl SqliteAccountStorage {
                     group.direct_member_ids_hex.as_deref(),
                     persist_direct_conversation_members(group),
                 )?;
+                crate::chat_presentation::replace_members_tx(&conn, &group.group_id_hex,
+                    group.presentation_member_ids_hex.as_deref().unwrap_or(&[]))?;
             }
             for message_id in application_event_ids_to_ack {
                 conn.execute_cached(
@@ -3779,6 +3786,29 @@ fn load_direct_conversation_members(
         .prepare_cached(
             "SELECT group_id_hex, member_id_hex
              FROM direct_conversation_members
+             ORDER BY group_id_hex, member_id_hex",
+        )
+        .storage()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .storage()?;
+    let mut members_by_group = HashMap::new();
+    for row in rows {
+        let (group_id_hex, member_id_hex) = row.storage()?;
+        members_by_group
+            .entry(group_id_hex)
+            .or_insert_with(Vec::new)
+            .push(member_id_hex);
+    }
+    Ok(members_by_group)
+}
+fn load_presentation_members(conn: &Connection) -> StorageResult<HashMap<String, Vec<String>>> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT group_id_hex, member_id_hex
+             FROM chat_presentation_members
              ORDER BY group_id_hex, member_id_hex",
         )
         .storage()?;

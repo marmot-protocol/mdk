@@ -128,6 +128,8 @@ mod migration_0063_query_indexes;
 mod migration_0064_own_commit_intents;
 #[path = "migrations/0065_chat_presentation.rs"]
 mod migration_0065_chat_presentation;
+#[path = "migrations/0066_chat_presentation_maintenance.rs"]
+mod migration_0066_chat_presentation_maintenance;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -470,6 +472,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 65,
         name: "0065_chat_presentation",
         apply: migration_0065_chat_presentation::apply,
+    },
+    Migration {
+        version: 66,
+        name: "0066_chat_presentation_maintenance",
+        apply: migration_0066_chat_presentation_maintenance::apply,
     },
 ];
 
@@ -1193,7 +1200,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 65,
+                found: 66,
                 latest_supported: 46,
             }
         ));
@@ -1249,7 +1256,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 65,
+                found: 66,
                 latest_supported: 46,
             }
         ));
@@ -1553,7 +1560,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 65,
+                found: 66,
                 latest_supported: 46,
             }
         ));

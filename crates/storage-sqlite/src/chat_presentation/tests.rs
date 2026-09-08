@@ -524,3 +524,53 @@ fn removing_group_name_or_required_image_material_never_returns_removed_display(
         assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
     }
 }
+
+#[test]
+fn catchup_checkpoint_and_batch_roll_back_together_and_fence_old_workers() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    seed(&store, "22");
+    let initial = store.chat_presentation_checkpoint().unwrap();
+    let mut next = initial.state.clone();
+    next.shared_epoch = vec![3; 16];
+    let first = store.chat_presentation_input("11").unwrap().unwrap();
+    let second = store.chat_presentation_input("22").unwrap().unwrap();
+    assert!(
+        store
+            .commit_chat_presentation_batch(
+                &initial,
+                &next,
+                &[
+                    (first.clone(), value("bb", "First", 1)),
+                    (second, value("cc", "Invalid peer", 1))
+                ]
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Pending
+    ));
+    assert_eq!(
+        store.chat_presentation_checkpoint().unwrap().generation,
+        initial.generation
+    );
+    assert!(
+        store
+            .commit_chat_presentation_batch(
+                &initial,
+                &next,
+                &[(first.clone(), value("bb", "Current", 2))]
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .commit_chat_presentation_batch(&initial, &next, &[(first, value("bb", "Old", 1))])
+            .unwrap()
+    );
+    assert_eq!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(Box::new(value("bb", "Current", 2)))
+    );
+}

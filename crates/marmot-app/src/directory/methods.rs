@@ -1501,6 +1501,7 @@ impl MarmotApp {
             return Ok(());
         }
         shared_storage.put_public_directory_user(&public_entry)?;
+        self.presentation_signals.wake();
         for cache in caches {
             cache.put_with_reason(&entry, reason)?;
         }
@@ -1638,6 +1639,7 @@ impl MarmotApp {
         let shared_storage = self.shared_storage()?;
         for entry in &entries {
             shared_storage.put_public_directory_user(&public_directory_user_record(entry)?)?;
+            self.presentation_signals.wake();
         }
         for cache in caches {
             for entry in &entries {

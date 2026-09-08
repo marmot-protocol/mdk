@@ -18852,6 +18852,7 @@ fn pending_group_invites_skips_malformed_rows() {
             pending_confirmation: true,
             member_count: None,
             direct_member_ids_hex: None,
+            presentation_member_ids_hex: None,
             welcomer_account_id_hex: welcomer.map(str::to_owned),
             via_welcome_message_id_hex: None,
             nostr_routing_last_epoch: 0,
@@ -18927,6 +18928,7 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
             pending_confirmation: pending,
             member_count: None,
             direct_member_ids_hex: None,
+            presentation_member_ids_hex: None,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
             nostr_routing_last_epoch: 0,
@@ -19757,4 +19759,126 @@ async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() 
             client.quarantined_groups().len()
         );
     }
+}
+
+#[test]
+fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notification_after_restart()
+ {
+    run_composed_app_runtime_test("presentation-worker-recovery", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        let created = runtime
+            .create_group_detailed("alice", "", std::slice::from_ref(&bob.account_id_hex), None)
+            .await
+            .unwrap();
+        let group = created.chat_list_row.group_id_hex;
+        let storage = app.account_storage("alice").unwrap();
+        // No UI or presentation subscriber is attached for initial hydration or this update.
+        let mut entry = app
+            .directory_entry_for_account_id(&bob.account_id_hex)
+            .unwrap()
+            .unwrap();
+        entry.profile = Some(UserProfileMetadata {
+            display_name: Some("Updated peer".into()),
+            created_at: unix_now_seconds() + 1,
+            ..Default::default()
+        });
+        app.save_directory_entry(&entry).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let storage_sqlite::ChatPresentationRead::Ready(value) =
+                    storage.chat_presentation(&group).unwrap()
+                    && value.presentation.title
+                        == storage_sqlite::PresentationText::Literal("Updated peer".into())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should hydrate and refresh without a subscriber");
+        runtime.shutdown().await;
+        // Commit a shared change with no wakeup (like interruption after shared commit).
+        let shared = app.shared_storage().unwrap();
+        let mut record = shared
+            .public_directory_user(&bob.account_id_hex)
+            .unwrap()
+            .unwrap();
+        record.profile_json = Some(
+            serde_json::to_string(&UserProfileMetadata {
+                display_name: Some("Restarted peer".into()),
+                created_at: unix_now_seconds() + 2,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        shared.put_public_directory_user(&record).unwrap();
+        let mut updates = app.presentation_signals.updates.subscribe();
+        let restarted = MarmotAppRuntime::new(app.clone());
+        restarted.reconcile_accounts().await.unwrap();
+        restarted.catch_up_accounts().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let update = updates.recv().await.unwrap();
+                if update.account_label() == "alice"
+                    && let storage_sqlite::ChatPresentationRead::Ready(value) =
+                        storage.chat_presentation(&group).unwrap()
+                    && value.presentation.title
+                        == storage_sqlite::PresentationText::Literal("Restarted peer".into())
+                    // Earlier valid invalidations can remain queued after a newer commit.
+                    && update.version() == &storage.chat_presentation_version().unwrap()
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("restart should recover the missed shared wakeup and notify after commit");
+        restarted.shutdown().await;
+
+        // Simulate account commit followed by process interruption before its notification.
+        record.profile_json = Some(
+            serde_json::to_string(&UserProfileMetadata {
+                display_name: Some("Already committed".into()),
+                created_at: unix_now_seconds() + 3,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        shared.put_public_directory_user(&record).unwrap();
+        while crate::chat_presentation::maintenance::maintain(
+            &storage,
+            &shared,
+            &home.account("alice").unwrap().account_id_hex,
+        )
+        .unwrap()
+        {}
+        let committed = storage.chat_presentation_version().unwrap();
+        let mut recovered = app.presentation_signals.updates.subscribe();
+        let third = MarmotAppRuntime::new(app.clone());
+        third.reconcile_accounts().await.unwrap();
+        third.catch_up_accounts().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let update = recovered.recv().await.unwrap();
+                if update.account_label() == "alice" && update.version() == &committed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("fresh worker must publish a commit whose original notification was lost");
+        third.shutdown().await;
+    });
 }

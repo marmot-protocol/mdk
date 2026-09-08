@@ -9,8 +9,8 @@ tags: [marmot, architecture, projections, implementation-plan]
 
 Implementation plan for [#1517](https://github.com/marmot-protocol/mdk/issues/1517), under
 [#1742](https://github.com/marmot-protocol/mdk/issues/1742). This is the first C2/C3 slice; the C1 design needed for this
-slice is ready. P1 now has an internal selection/storage implementation; runtime maintenance and native adoption
-remain P2–P4. No client performance success is claimed. Later screen contracts retain their own design
+slice is ready. P1 supplies selection/storage; P2 adds background maintenance and recovery. Native APIs and
+client adoption remain P3–P4. No client performance success is claimed. Later screen contracts retain their own design
 and acceptance work. The [broader contract draft](chat-screen-contract-draft.md) maps those boundaries.
 
 ## Outcome and scope
@@ -238,13 +238,35 @@ compatibility gate prevents an older binary from opening those newer-format rows
 `ChatPresentationWrite::Applied` reports committed row/dependency/progress work, including an identical refresh;
 notifications use the committed presentation revision rather than this write result.
 
-P1 seeds only roster evidence already available in the direct-member index. P2 must supply authoritative two-person
-rosters for named groups too before draining backfill, wire every source mutation, and run bounded hydration/catch-up
-after account readiness. Missing roster evidence yields a typed fallback; later hydration must call the roster setter
-to requeue it. It must not create a permanent busy retry loop for legitimately unavailable/quarantined groups.
+P1 seeds only roster evidence already available in the direct-member index. P2 carries authoritative two-person
+rosters for named groups through source projection transactions and live reconciliation before draining backfill.
+Missing roster evidence yields a typed fallback; later hydration uses the roster setter to requeue it, without
+creating a permanent busy retry loop for legitimately unavailable/quarantined groups.
 The P1 methods and resolver are internal Rust building blocks; existing app, UniFFI and C chat-list behavior is unchanged.
-P2 must also authorize shared-store epoch transitions at its catch-up boundary; revisions in different shared-store
-incarnations are not ordered by the P1 account writer. P3 supplies atomic whole-row reads and subscription handoff.
+P2 authorizes shared-store epoch transitions at its checkpoint boundary; delayed work from an older checkpoint
+or directory incarnation cannot overwrite a newer application. P3 supplies atomic whole-row reads and subscription handoff.
+
+### P2 maintenance boundary
+
+Shared schema 3 records one latest change per identity, comparing accepted `display_name`, `name`, and `picture`.
+Timestamps, relay observations and unrelated metadata do not advance this revision. Triggers cover normal saves,
+legacy import, and profile removal; tombstones remain until a future cleanup can prove no account needs them.
+
+Account schema 66 persists the directory incarnation, processed revision, active identity/group cursor and reset
+reconciliation cursor. Selected rows and checkpoint progress commit together. A newer coalesced change abandons the
+old identity cursor without skipping intervening identities. New dependencies always hydrate from the current shared
+cache, even behind the watermark. Store replacement captures the shared head and reconciles at most 50 rows per step,
+then processes changes since that head. Unrelated changes advance in batches of at most 50 identities. Idle steps use only indexed
+pending-work and revision reads; they do not scan groups, directory history, or messages.
+
+The existing account worker runs these bounded steps after readiness, yields between batches, and stops with its
+normal lifecycle. Coalesced process-local wakeups cover directory/source writes; the existing 15-second maintenance
+tick recovers missed wakeups. A fresh worker compares committed presentation revisions before notifying, recovering
+commit-before-broadcast interruption. These internal invalidations are the P3 subscription input.
+
+Groups missing a legacy chat row use a durable, bounded initialization queue and the existing row projector. This
+first-row construction retains the legacy projector's query cost; profile refresh and steady-state repair do not
+rebuild history. Quarantined rosters lose current peer evidence until live reconciliation supplies it again.
 
 ### Consumer accounting
 
@@ -277,8 +299,7 @@ incarnations are not ordered by the P1 account writer. P3 supplies atomic whole-
 
 Use meaningful existing regression foundations and add targeted storage, app-runtime and binding tests for new seams.
 Run `just fast-ci` before pushing, touched-crate tests, and C parity/header/smoke/alloc-audit gates when P3 changes them.
-Native adoption follows each client's own screenshot/device-test requirements. The plan itself changes documentation
-only; no new runtime tests have been executed for it.
+Native adoption follows each client's own screenshot/device-test requirements. P1/P2 tests cover storage and local maintenance; native binding and client validation remain P3/P4 work.
 
 For performance, preserve the recorded Pixel 9a / 20×40 fixture and artifact provenance. Measure native presented-list
 read, profile commit-to-update, first upgrade and ready offline reopen separately from whole-app startup. Report p50/p95

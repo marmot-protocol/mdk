@@ -1,5 +1,7 @@
 mod error;
 mod migrations;
+mod presentation;
+pub use presentation::{DirectoryPresentation, DirectoryPresentationChanges};
 
 use error::SharedSqliteResultExt;
 
