@@ -249,6 +249,24 @@ impl RetainedRelaySubject {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_engine_for_tests(
+        engine: EngineHarnessSubject,
+        clients: &[String],
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_deferred_peel_limits(
+            clients,
+            &ScenarioTopologyV2::default(),
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+            None,
+        )
+        .map(|mut subject| {
+            subject.engine = engine;
+            subject
+        })
+    }
+
     /// Bounded append-only transport evidence captured by the wrapped engine
     /// subject. Generated retained-history campaigns use this for the same
     /// failure-capsule diagnostics as packet-bus campaigns.

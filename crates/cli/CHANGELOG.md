@@ -29,6 +29,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   uncertain publications. Explicit recovery retains opaque historical bytes
   and starts a fresh approval epoch; Swift/Kotlin/C hosts use the epoch-aware
   approval APIs for recovered attempts.
+- Simulator engine-subject group-action refusals now stay on the existing
+  report, fixture, and portable capsule path instead of panicking. Failed
+  create, invite, profile, remove, and self-update steps use fixed
+  privacy-safe engine messages, release unused scenario-input reservations,
+  and leave successful current and legacy create forms unchanged.
 
 ## [0.9.19] - 2026-09-07
 

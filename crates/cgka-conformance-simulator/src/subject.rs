@@ -774,6 +774,7 @@ impl EngineHarnessSubject {
             storage_mode,
             false,
             None,
+            None,
         )
     }
 
@@ -792,6 +793,7 @@ impl EngineHarnessSubject {
             protocol_profile,
             storage_mode,
             true,
+            None,
             None,
         )
     }
@@ -815,6 +817,25 @@ impl EngineHarnessSubject {
             storage_mode,
             false,
             Some((rows_per_group, bytes_per_group, bytes_per_account)),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_welcome_wrap_refusal(
+        clients: &[String],
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+        refuse_welcome_wrap: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_topology_and_witness_mode(
+            clients,
+            &crate::ScenarioTopologyV2::default(),
+            protocol_profile,
+            storage_mode,
+            false,
+            None,
+            Some(refuse_welcome_wrap),
         )
     }
 
@@ -825,6 +846,7 @@ impl EngineHarnessSubject {
         storage_mode: HarnessStorageMode,
         disable_app_witnesses_for_tests: bool,
         deferred_peel_limits_override: Option<(usize, usize, usize)>,
+        welcome_wrap_refusal: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
         let convergence_clock = ManualConvergenceClock::new(0, 0);
@@ -866,6 +888,14 @@ impl EngineHarnessSubject {
                 .protocol_profile(protocol_profile)
                 .storage_mode(storage_mode)
                 .convergence_clock(Arc::new(convergence_clock.clone()));
+            #[cfg(test)]
+            let builder = if let Some(flag) = welcome_wrap_refusal.clone() {
+                builder.welcome_wrap_refusal(flag)
+            } else {
+                builder
+            };
+            #[cfg(not(test))]
+            let _ = &welcome_wrap_refusal;
             #[cfg(feature = "test-policy-overrides")]
             let builder = if disable_app_witnesses_for_tests {
                 builder.without_app_witnesses_for_tests()
@@ -1155,7 +1185,12 @@ impl EngineHarnessSubject {
     ) -> Result<Vec<KeyPackage>, SubjectError> {
         let mut key_packages = Vec::with_capacity(labels.len());
         for label in labels {
-            key_packages.push(self.client_mut(label)?.fresh_key_package().await);
+            key_packages.push(
+                self.client_mut(label)?
+                    .try_fresh_key_package()
+                    .await
+                    .map_err(subject_engine_error)?,
+            );
         }
         Ok(key_packages)
     }
@@ -1433,13 +1468,14 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let creator = self.client_mut(action.creator)?;
         creator.name_next_scenario_input(action.action_id);
         let (group_id, pending_ref) = creator
-            .create_group_with_admins_maybe_pending(
+            .try_create_group_with_admins_maybe_pending(
                 action.name,
                 key_packages,
                 required_features,
                 initial_admins,
             )
-            .await;
+            .await
+            .map_err(subject_engine_error)?;
         if let Some(group) = &self.active_scenario_group {
             self.scenario_groups.insert(group.clone(), group_id.clone());
         }
@@ -1465,7 +1501,10 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let key_packages = self.fresh_key_packages(action.invitees).await?;
         let inviter = self.client_mut(action.inviter)?;
         inviter.name_next_scenario_input(action.action_id);
-        let pending_ref = inviter.invite(key_packages).await;
+        let pending_ref = inviter
+            .try_invite(key_packages)
+            .await
+            .map_err(subject_engine_error)?;
         self.insert_pending(action.pending, action.inviter, pending_ref)
     }
 
@@ -1476,11 +1515,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let client = self.client_mut(action.client)?;
         client.name_next_scenario_input(action.action_id);
         let pending_ref = client
-            .update_group_profile(
+            .try_update_group_profile(
                 action.name.map(str::to_owned),
                 action.description.map(str::to_owned),
             )
-            .await;
+            .await
+            .map_err(subject_engine_error)?;
         self.insert_pending(action.pending, action.client, pending_ref)
     }
 
@@ -1491,14 +1531,20 @@ impl ConvergenceSubject for EngineHarnessSubject {
         let member_ids = self.member_ids(action.members)?;
         let remover = self.client_mut(action.remover)?;
         remover.name_next_scenario_input(action.action_id);
-        let pending_ref = remover.remove_members(member_ids).await;
+        let pending_ref = remover
+            .try_remove_members(member_ids)
+            .await
+            .map_err(subject_engine_error)?;
         self.insert_pending(action.pending, action.remover, pending_ref)
     }
 
     async fn self_update(&mut self, action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
         let client = self.client_mut(action.client)?;
         client.name_next_scenario_input(action.action_id);
-        let pending_ref = client.self_update().await;
+        let pending_ref = client
+            .try_self_update()
+            .await
+            .map_err(subject_engine_error)?;
         self.insert_pending(action.pending, action.client, pending_ref)
     }
 
@@ -2314,7 +2360,11 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
 
 fn subject_engine_error(error: EngineError) -> SubjectError {
     let (category, code) = classify_engine_error(&error);
-    SubjectError::classified(category, code, error.to_string())
+    SubjectError::classified(
+        category,
+        code.clone(),
+        format!("engine operation failed ({code})"),
+    )
 }
 
 fn ensure_tick_succeeded(
@@ -2574,7 +2624,8 @@ mod tests {
         .expect_err("tick must not discard the engine failure");
         assert_eq!(error.code, "backend");
         assert_eq!(error.category, SubjectFailureCategory::Resource);
-        assert!(error.message.contains("converge buffered group"));
+        assert_eq!(error.message, "engine operation failed (backend)");
+        assert!(!error.message.contains("converge buffered group"));
     }
 
     #[test]
@@ -3976,6 +4027,392 @@ mod tests {
                 .final_progress
                 .blocking_subsystems()
                 .contains(&"transport_delayed")
+        );
+    }
+
+    fn two_client_create_then_send(name: &str) -> crate::ScenarioSpec {
+        crate::ScenarioSpec {
+            name: name.to_owned(),
+            spec_version: "2".to_owned(),
+            topology: Default::default(),
+            clients: vec!["alice".into(), "bob".into()],
+            steps: vec![
+                crate::ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "room".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".into(),
+                },
+                crate::ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: "must-not-run".into(),
+                },
+            ],
+        }
+    }
+
+    fn assert_no_welcome_marker(value: &impl serde::Serialize) {
+        let encoded = serde_json::to_string(value).expect("value serializes");
+        assert!(
+            !encoded.contains(crate::client::WELCOME_WRAP_REFUSAL_MARKER),
+            "serialized evidence leaked the synthetic Welcome marker"
+        );
+    }
+
+    async fn refused_welcome_create_report(
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+    ) -> (
+        EngineHarnessSubject,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        crate::ScenarioReport,
+    ) {
+        let refuse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new_with_welcome_wrap_refusal(
+            &labels,
+            protocol_profile,
+            storage_mode,
+            refuse.clone(),
+        )
+        .expect("subject constructs");
+        let spec = two_client_create_then_send("refused-welcome-create/v1");
+        let report = crate::run_scenario_report_with_subject(&spec, None, Vec::new(), &mut subject)
+            .await
+            .expect("refused create remains a serializable report");
+        (subject, refuse, report)
+    }
+
+    fn assert_create_refused_without_marker(report: &crate::ScenarioReport) {
+        assert_eq!(report.step_log.len(), 1);
+        let crate::ScenarioStepStatus::Failed {
+            kind,
+            category,
+            message,
+        } = &report.step_log[0].status
+        else {
+            panic!("first step must fail");
+        };
+        assert_eq!(report.step_log[0].step_type, "create_group");
+        assert_eq!(kind, "peeler");
+        assert_eq!(*category, SubjectFailureCategory::Protocol);
+        assert_eq!(message, "engine operation failed (peeler)");
+        assert!(!message.contains(crate::client::WELCOME_WRAP_REFUSAL_MARKER));
+        assert_no_welcome_marker(report);
+    }
+
+    #[tokio::test]
+    async fn refused_welcome_create_is_reportable_for_both_protocol_profiles() {
+        for protocol_profile in [ProtocolProfile::Legacy, ProtocolProfile::Current] {
+            let (subject, _, report) =
+                refused_welcome_create_report(protocol_profile, HarnessStorageMode::InMemorySqlite)
+                    .await;
+            assert_create_refused_without_marker(&report);
+            assert!(subject.scenario_groups.is_empty());
+            assert!(subject.pending_refs.is_empty());
+            assert!(subject.outbound_records.is_empty());
+
+            let capsule = crate::FailureCapsuleV1::from_report(
+                report.clone(),
+                crate::FailureCapsuleSensitivity::SyntheticShareable,
+                Vec::new(),
+                None,
+            )
+            .expect("portable capsule builds");
+            assert_eq!(
+                capsule.sensitivity,
+                crate::FailureCapsuleSensitivity::SyntheticShareable
+            );
+            assert!(capsule.byte_replay.is_none());
+            assert_eq!(capsule.failure.failure_kind, "scenario_step_failed:peeler");
+            assert_eq!(
+                capsule.failure.first_failing_action_id.as_deref(),
+                Some("step-0:create_group")
+            );
+            assert_eq!(
+                capsule.failure.classification,
+                crate::TerminalOutcomeClassification::TerminalProtocolFailure
+            );
+            assert_no_welcome_marker(&capsule);
+            let capsule_dir = tempfile::tempdir().expect("capsule dir");
+            let capsule_path = capsule_dir.path().join("failure-capsule.v1.json");
+            crate::write_failure_capsule(&capsule_path, &capsule).expect("capsule writes");
+            let restored = crate::read_failure_capsule(&capsule_path).expect("capsule validates");
+            assert!(restored.byte_replay.is_none());
+            assert_no_welcome_marker(&restored);
+
+            let spec = two_client_create_then_send("refused-welcome-create-trace/v1");
+            let refuse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let mut refused = EngineHarnessSubject::new_with_welcome_wrap_refusal(
+                &["alice".into(), "bob".into()],
+                protocol_profile,
+                HarnessStorageMode::InMemorySqlite,
+                refuse,
+            )
+            .expect("refused subject constructs");
+            let error = crate::run_scenario_spec_with_subject(&spec, &mut refused)
+                .await
+                .expect_err("trace-only API maps the failed create");
+            assert_eq!(error.kind, "peeler");
+            assert_eq!(error.category, SubjectFailureCategory::Protocol);
+            assert_eq!(error.message, "engine operation failed (peeler)");
+            assert!(
+                !error
+                    .message
+                    .contains(crate::client::WELCOME_WRAP_REFUSAL_MARKER)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_welcome_create_reduction_preserves_original_failure_identity() {
+        let (_, _, original) = refused_welcome_create_report(
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .await;
+        assert_create_refused_without_marker(&original);
+        let original_fingerprint = crate::fingerprint_report_failure(&original)
+            .expect("failed create report fingerprints before reduction");
+        let original_identity = original_fingerprint.semantic_identity();
+        assert_eq!(original_identity.failing_action_type, "create_group");
+        assert_eq!(
+            original_identity.failure_kind,
+            "scenario_step_failed:peeler"
+        );
+        let original_capsule = crate::FailureCapsuleV1::from_report(
+            original.clone(),
+            crate::FailureCapsuleSensitivity::SyntheticShareable,
+            Vec::new(),
+            None,
+        )
+        .expect("original portable capsule builds before reduction");
+        assert_no_welcome_marker(&original);
+        assert_no_welcome_marker(&original_capsule);
+
+        let reduced_spec = crate::ScenarioSpec {
+            name: "refused-welcome-create-reduced/v1".to_owned(),
+            spec_version: "2".to_owned(),
+            topology: Default::default(),
+            clients: vec!["alice".into(), "bob".into()],
+            steps: vec![crate::ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "room".into(),
+                invitees: vec!["bob".into()],
+                required_features: Vec::new(),
+                initial_admins: None,
+                pending: "create".into(),
+            }],
+        };
+        let refuse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut reduced_subject = EngineHarnessSubject::new_with_welcome_wrap_refusal(
+            &["alice".into(), "bob".into()],
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+            refuse,
+        )
+        .expect("reduced subject constructs");
+        let reduced = crate::run_scenario_report_with_subject(
+            &reduced_spec,
+            None,
+            Vec::new(),
+            &mut reduced_subject,
+        )
+        .await
+        .expect("create-only reduction remains a serializable report");
+        assert_create_refused_without_marker(&reduced);
+        let reduced_identity = crate::fingerprint_report_failure(&reduced)
+            .expect("reduced create report fingerprints")
+            .semantic_identity();
+        assert_eq!(reduced_identity, original_identity);
+        assert_eq!(
+            crate::fingerprint_report_failure(&original)
+                .expect("original fingerprint remains computable")
+                .semantic_identity(),
+            original_identity
+        );
+        assert_no_welcome_marker(&original);
+        assert_no_welcome_marker(&original_capsule);
+    }
+
+    #[tokio::test]
+    async fn refused_create_releases_reservation_and_allows_a_later_named_create() {
+        for storage_mode in [
+            HarnessStorageMode::InMemorySqlite,
+            HarnessStorageMode::TempFileBackedSqlite,
+        ] {
+            let refuse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let labels = vec!["alice".to_owned(), "bob".to_owned()];
+            let mut subject = EngineHarnessSubject::new_with_welcome_wrap_refusal(
+                &labels,
+                ProtocolProfile::Current,
+                storage_mode,
+                refuse.clone(),
+            )
+            .expect("subject constructs");
+            let first = subject
+                .create_group(SubjectCreateGroup {
+                    action_id: "refused-create",
+                    creator: "alice",
+                    name: "first",
+                    invitees: &labels[1..],
+                    required_features: &[],
+                    initial_admins: &[],
+                    pending: "unused-first",
+                })
+                .await
+                .expect_err("injected Welcome wrap must refuse create");
+            assert_eq!(first.code, "peeler");
+            assert!(subject.scenario_groups.is_empty());
+            assert!(subject.pending_refs.is_empty());
+            assert!(subject.outbound_records.is_empty());
+
+            refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+            subject
+                .create_group(SubjectCreateGroup {
+                    action_id: "recovered-create",
+                    creator: "alice",
+                    name: "second",
+                    invitees: &labels[1..],
+                    required_features: &[],
+                    initial_admins: &[],
+                    pending: "unused-second",
+                })
+                .await
+                .expect("later named create succeeds after the refusal is cleared");
+            assert_eq!(subject.scenario_groups.len(), 0);
+            assert!(subject.pending_refs.is_empty());
+            let ledger = subject
+                .client_mut("alice")
+                .expect("creator")
+                .scenario_input_ledger();
+            assert!(
+                ledger
+                    .iter()
+                    .all(|entry| entry.scenario_id != "refused-create"),
+                "refused create must not leave a successful ledger row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_create_forms_preserve_legacy_pending_and_current_empty_publication() {
+        let current_bus = crate::TransportBus::ordered();
+        let mut current = crate::ClientBuilder::new(pad32(b"alice"))
+            .protocol_profile(ProtocolProfile::Current)
+            .attach(&current_bus);
+        let (_, current_pending) = current
+            .try_create_group_with_admins_maybe_pending("empty-current", vec![], vec![], vec![])
+            .await
+            .expect("zero-invitee current create succeeds");
+        assert!(
+            current_pending.is_none(),
+            "current founding create has no pending"
+        );
+
+        let legacy_bus = crate::TransportBus::ordered();
+        let mut legacy = crate::ClientBuilder::new(pad32(b"alice-legacy"))
+            .protocol_profile(ProtocolProfile::Legacy)
+            .attach(&legacy_bus);
+        let (_, legacy_pending) = legacy
+            .try_create_group_with_admins_maybe_pending("empty-legacy", vec![], vec![], vec![])
+            .await
+            .expect("zero-invitee legacy create succeeds");
+        let pending = legacy_pending.expect("legacy create still returns pending");
+        assert!(
+            legacy
+                .confirm_empty_publication(pending)
+                .await
+                .expect("empty publication is confirmable")
+        );
+    }
+
+    #[test]
+    fn subject_engine_error_uses_fixed_text_for_nested_and_identifier_errors() {
+        let cases = [
+            (
+                EngineError::Peeler(cgka_traits::error::PeelerError::WrapFailed(format!(
+                    "{} nested free-form",
+                    crate::client::WELCOME_WRAP_REFUSAL_MARKER
+                ))),
+                SubjectFailureCategory::Protocol,
+                "peeler",
+            ),
+            (
+                EngineError::Backend(format!(
+                    "backend {} with identifier aabbccddeeff",
+                    crate::client::WELCOME_WRAP_REFUSAL_MARKER
+                )),
+                SubjectFailureCategory::Resource,
+                "backend",
+            ),
+            (
+                EngineError::Storage(cgka_traits::storage::StorageError::Backend(format!(
+                    "storage {} path=/tmp/secret.sqlite",
+                    crate::client::WELCOME_WRAP_REFUSAL_MARKER
+                ))),
+                SubjectFailureCategory::Resource,
+                "storage",
+            ),
+            (
+                EngineError::Other(format!(
+                    "other {} bytes=0xdeadbeef",
+                    crate::client::WELCOME_WRAP_REFUSAL_MARKER
+                )),
+                SubjectFailureCategory::Protocol,
+                "other",
+            ),
+            (
+                EngineError::UnknownGroup(cgka_traits::GroupId::new(vec![0xAA; 16])),
+                SubjectFailureCategory::ExpectedRefusal,
+                "unknown_group",
+            ),
+        ];
+        for (error, category, code) in cases {
+            let mapped = subject_engine_error(error);
+            assert_eq!(mapped.category, category);
+            assert_eq!(mapped.code, code);
+            assert_eq!(mapped.message, format!("engine operation failed ({code})"));
+            assert!(
+                !mapped
+                    .message
+                    .contains(crate::client::WELCOME_WRAP_REFUSAL_MARKER)
+            );
+            assert!(!mapped.message.contains("aabbccddeeff"));
+            assert!(!mapped.message.contains("0xdeadbeef"));
+            assert!(!mapped.message.contains("/tmp/secret.sqlite"));
+            let encoded = format!("{mapped:?}");
+            assert!(!encoded.contains(crate::client::WELCOME_WRAP_REFUSAL_MARKER));
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_relay_subject_inherits_engine_create_refusal() {
+        let refuse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let engine = EngineHarnessSubject::new_with_welcome_wrap_refusal(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+            refuse,
+        )
+        .expect("engine subject constructs");
+        let mut retained = crate::RetainedRelaySubject::from_engine_for_tests(engine, &labels)
+            .expect("retained subject wraps the engine subject");
+        let error = crate::run_scenario_spec_with_subject(
+            &two_client_create_then_send("retained-refused-create/v1"),
+            &mut retained,
+        )
+        .await
+        .expect_err("retained relay must inherit the engine create refusal");
+        assert_eq!(error.kind, "peeler");
+        assert_eq!(error.message, "engine operation failed (peeler)");
+        assert!(
+            !error
+                .message
+                .contains(crate::client::WELCOME_WRAP_REFUSAL_MARKER)
         );
     }
 }

@@ -129,3 +129,62 @@ fn strict_worker_failure_writes_a_portable_capsule() {
             .is_file()
     );
 }
+
+#[test]
+#[ignore = "64-member Welcome-refusal boundary; prefer the campaign-bin fixture tests::large_group_pressure_8001_30_reports_create_refusal"]
+fn large_group_pressure_8001_30_report_and_campaign_worker_exit_failed_scenario() {
+    let temp = tempfile::tempdir().expect("temporary campaign root");
+    let case = cgka_conformance_simulator::generate_large_group_pressure_case(8001, 30);
+    let input = GeneratedScenarioInputV1::new(case);
+    let campaign_out = temp.path().join("campaign");
+    let report_out = temp.path().join("report");
+    fs_private::create_dir_all_private(&campaign_out).expect("campaign out");
+    fs_private::create_dir_all_private(&report_out).expect("report out");
+    let input_path =
+        campaign_out.join("large-group-pressure-v1-seed-8001-case-30-generated-input.json");
+    fs_private::write_private(
+        &input_path,
+        &serde_json::to_vec_pretty(&input).expect("generated input serializes"),
+    )
+    .expect("generated input writes");
+
+    let report_status = Command::new(env!("CARGO_BIN_EXE_cgka-conformance-simulator-report"))
+        .arg("--generated-input")
+        .arg(&input_path)
+        .arg("--out")
+        .arg(&report_out)
+        .args(["--storage", "file"])
+        .env("RUST_MIN_STACK", "4194304")
+        .status()
+        .expect("report binary starts");
+    assert_eq!(report_status.code(), Some(1));
+
+    let campaign_status = Command::new(campaign_binary())
+        .arg("--worker")
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--out")
+        .arg(&campaign_out)
+        .args(["--storage", "file"])
+        .env("RUST_MIN_STACK", "4194304")
+        .status()
+        .expect("campaign worker starts");
+    assert_eq!(campaign_status.code(), Some(1));
+
+    let stem = "large-group-pressure-v1-seed-8001-case-30";
+    let report_path = campaign_out.join(format!("{stem}.json"));
+    let fixture_path = campaign_out.join(format!("{stem}-fixture.v1.json"));
+    let capsule_path = campaign_out.join(format!("{stem}-failure-capsule.v1.json"));
+    let report: ScenarioReport =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("campaign report reads"))
+            .expect("campaign report parses");
+    assert!(fixture_path.is_file());
+    let capsule =
+        cgka_conformance_simulator::read_failure_capsule(&capsule_path).expect("capsule reads");
+    assert_eq!(
+        capsule.sensitivity,
+        cgka_conformance_simulator::FailureCapsuleSensitivity::SyntheticShareable
+    );
+    assert!(capsule.byte_replay.is_none());
+    assert_eq!(report.step_log[0].step_type, "create_group");
+}
