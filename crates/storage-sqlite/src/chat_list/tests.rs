@@ -158,6 +158,84 @@ fn setup_store() -> SqliteAccountStorage {
     setup_store_with_group(group())
 }
 
+// Compare the existing readiness API with migration 0066’s index on synthetic history.
+// Setup, index construction, and the connection/KDF are outside the timed region.
+// Run: cargo test -p storage-sqlite --release --lib chat_startup_benchmark -- --ignored --nocapture
+#[test]
+#[ignore = "file-backed chat startup performance investigation"]
+fn chat_startup_benchmark() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("synthetic chat benchmark").unwrap();
+    let store =
+        SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key).unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "benchmark".to_owned(),
+                groups: vec![group()],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP INDEX idx_message_timeline_group_received")
+        .unwrap();
+    let mut seeded = 0;
+    let body = "x".repeat(512);
+    for count in [10_000, 100_000] {
+        cgka_traits::StorageProvider::with_transaction(&store, |store| {
+            for index in seeded..count {
+                let mut event = chat(&format!("{index:064x}"), REMOTE, index, &body);
+                event.source_epoch = Some(1);
+                store.record_app_event(&event)?;
+            }
+            Ok::<_, cgka_traits::StorageError>(())
+        })
+        .unwrap();
+        seeded = count;
+        let id = format!("{:064x}", count - 1);
+        store
+            .mark_timeline_message_read(LOCAL, GROUP, &id, &no_mentions)
+            .unwrap();
+        store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        let expected = store.chat_list_rows(ChatListQuery::default()).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(
+            expected[0].last_message.as_ref().unwrap().message_id_hex,
+            id
+        );
+        assert_eq!(expected[0].unread_count, 0);
+        // Repeat A/B after dropping the index to expose cache/order effects.
+        for mode in ["baseline", "indexed", "baseline", "indexed"] {
+            if mode == "indexed" {
+                store.lock().unwrap().execute_batch("CREATE INDEX idx_message_timeline_group_received ON message_timeline(group_id_hex, received_at)").unwrap();
+            }
+            store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+                let rows = store.chat_list_rows(ChatListQuery::default()).unwrap();
+                samples.push(start.elapsed().as_micros());
+                assert_eq!(rows, expected);
+            }
+            samples.sort_unstable();
+            eprintln!("count={count} mode={mode} median_us={}", samples[3]);
+            if mode == "indexed" {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute_batch("DROP INDEX idx_message_timeline_group_received")
+                    .unwrap();
+            }
+        }
+    }
+}
+
 /// Preview work stays bounded for accepted history and displaced pending sends.
 #[test]
 fn preview_query_work() {
