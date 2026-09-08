@@ -7,8 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-09-08
+
 ### Added
 
+- Presented chat-list reads and subscriptions, chat presentation records, and
+  unified usage-diagnostics consent and settings APIs.
 - Explicit onboarding recovery/query and epoch-aware approval/acknowledgment
   commands. `MarmotOnboardingSnapshot` includes `recovery_epoch`; C consumers
   must rebuild against the matching generated header and library.
@@ -49,5 +53,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.16...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...HEAD
+[0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16
