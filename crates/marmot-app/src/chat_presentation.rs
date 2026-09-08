@@ -7,8 +7,10 @@ use storage_sqlite::{
 };
 
 /// Resolve already-cached evidence. Profile subjects must match the current peer.
-/// Remote descriptors do not authorize a download; the media layer still owns dial safety.
-pub fn select_chat_presentation(
+/// Remote descriptors do not authorize a download; the media layer still owns dial safety,
+/// including `reject_unsafe_group_avatar_contact_url` and validated-address pinning.
+#[allow(dead_code)] // Internal P1 policy; the P2 account worker supplies the production caller.
+pub(crate) fn select_chat_presentation(
     input: &ChatPresentationInput,
     local_id: &str,
     profile: Option<(&str, &UserProfileMetadata)>,
@@ -81,12 +83,9 @@ pub fn select_chat_presentation(
             PresentationSource::UnknownFallback,
         )
     };
-    let key = |kind: &str, parts: &[&str]| {
-        let subject = if kind.starts_with("peer-") || kind == "person" {
-            peer.as_deref().unwrap_or(&input.group_id_hex)
-        } else {
-            &input.group_id_hex
-        };
+    // Resetting an account store deliberately changes its cache namespace. Refetching is the
+    // accepted cost of preventing old-store avatar reuse after identity/storage replacement.
+    let key = |subject: &str, kind: &str, parts: &[&str]| {
         let mut digest = Sha256::new();
         for part in [
             b"mdk-chat-presentation-v1".as_slice(),
@@ -114,6 +113,7 @@ pub fn select_chat_presentation(
             SelectedAvatar::EncryptedGroupImage {
                 image: image.clone(),
                 cache_key: key(
+                    &input.group_id_hex,
                     "group-image",
                     &[
                         &image.image_hash_hex,
@@ -131,18 +131,19 @@ pub fn select_chat_presentation(
     }) {
         (
             SelectedAvatar::RemoteImage {
-                cache_key: key("group-url", &[&url]),
+                cache_key: key(&input.group_id_hex, "group-url", &[&url]),
                 url,
             },
             PresentationSource::Group,
         )
-    } else if let Some(url) = profile
-        .and_then(|p| p.picture.as_deref())
-        .and_then(safe_image_url)
-    {
+    } else if let Some((peer, url)) = peer.as_deref().zip(
+        profile
+            .and_then(|p| p.picture.as_deref())
+            .and_then(safe_image_url),
+    ) {
         (
             SelectedAvatar::RemoteImage {
-                cache_key: key("peer-url", &[&url]),
+                cache_key: key(peer, "peer-url", &[&url]),
                 url,
             },
             PresentationSource::PeerProfile,
@@ -151,6 +152,7 @@ pub fn select_chat_presentation(
         (
             SelectedAvatar::Placeholder {
                 stable_seed: key(
+                    peer.as_deref().unwrap_or(&input.group_id_hex),
                     match fallback_source {
                         PresentationSource::PeerFallback => "person",
                         PresentationSource::GroupFallback => "group",
@@ -205,22 +207,42 @@ fn safe_name(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 fn safe_image_url(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.len() > 4096 || raw.chars().any(char::is_control) {
-        return None;
-    }
-    let url = url::Url::parse(raw).ok()?;
-    (matches!(url.scheme(), "https" | "http")
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none())
-    .then(|| url.to_string())
+    let normalized =
+        cgka_traits::app_components::validate_and_normalize_group_avatar_url(raw).ok()?;
+    // Also match the existing profile-image loader's contact/port policy, without DNS or I/O.
+    crate::media::parse_profile_image_fetch_url(&normalized)
+        .ok()
+        .map(|url| url.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use storage_sqlite::{ChatListAvatar, ChatPresentationVersion};
+    #[test]
+    fn peer_images_use_the_shared_usable_https_policy() {
+        for picture in [
+            "http://example.com/avatar".to_owned(),
+            "https://example.com/avatar#fragment".to_owned(),
+            "https://example.com:8443/avatar".to_owned(),
+            "https://user:pass@example.com/avatar".to_owned(),
+            format!("https://example.com/{}", "a".repeat(2048)),
+        ] {
+            let profile = UserProfileMetadata {
+                picture: Some(picture),
+                ..Default::default()
+            };
+            assert!(matches!(
+                select_chat_presentation(
+                    &input(""),
+                    &"aa".repeat(32),
+                    Some((&"bb".repeat(32), &profile))
+                )
+                .avatar,
+                SelectedAvatar::Placeholder { .. }
+            ));
+        }
+    }
     fn input(name: &str) -> ChatPresentationInput {
         ChatPresentationInput {
             group_id_hex: "11".repeat(16),

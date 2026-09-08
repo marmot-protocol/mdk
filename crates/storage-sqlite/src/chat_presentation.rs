@@ -1,5 +1,12 @@
 //! Internal durable selected-presentation foundation. Runtime orchestration owns hydration.
+//!
+//! Before draining backfill, orchestration must persist authoritative two-person rosters for
+//! named and unnamed groups via `set_chat_presentation_members`. Missing evidence deliberately
+//! produces a typed fallback, not a retry loop; later roster hydration must call that same
+//! setter, which requeues the row. P2 wires both lifecycle paths before enabling its worker.
+use crate::connection::CachedSql;
 use crate::{ChatListAvatar, SqliteAccountStorage, SqliteResultExt, serialize, u64_to_i64};
+use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -149,22 +156,28 @@ impl SqliteAccountStorage {
         )
         .storage()
     }
-    /// Missing/pending are explicit; this read never writes or hydrates.
+    /// Missing/pending are explicit; this read never writes or hydrates. Same-subject dirty
+    /// values remain renderable as LastKnown. Membership changes erase old-subject evidence.
     pub fn chat_presentation(&self, group: &str) -> StorageResult<ChatPresentationRead> {
         let conn = self.lock()?;
-        let bytes: Option<Option<Vec<u8>>> = conn
+        let row: Option<(Option<Vec<u8>>, bool)> = conn
             .query_row(
-                "SELECT presentation_json FROM chat_list_rows WHERE group_id_hex = ?1",
+                "SELECT presentation_json,
+                        presentation_applied_source_revision != presentation_source_revision
+                 FROM chat_list_rows WHERE group_id_hex = ?1",
                 [group],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .storage()?;
-        match bytes {
+        match row {
             None => Ok(ChatPresentationRead::Missing),
-            Some(None) => Ok(ChatPresentationRead::Pending),
-            Some(Some(bytes)) => {
-                let envelope = decode_envelope(&bytes)?;
+            Some((None, _)) => Ok(ChatPresentationRead::Pending),
+            Some((Some(bytes), dirty)) => {
+                let mut envelope = decode_envelope(&bytes)?;
+                if dirty {
+                    envelope.value.presentation.resolution = PresentationResolution::LastKnown;
+                }
                 Ok(ChatPresentationRead::Ready(Box::new(envelope.value)))
             }
         }
@@ -177,7 +190,9 @@ impl SqliteAccountStorage {
             let mut query = conn
                 .prepare_cached(
                     "SELECT group_id_hex FROM chat_list_rows INDEXED BY chat_presentation_pending
-                 WHERE presentation_json IS NULL ORDER BY group_id_hex LIMIT ?1",
+                 WHERE presentation_json IS NULL
+                    OR presentation_applied_source_revision != presentation_source_revision
+                 ORDER BY group_id_hex LIMIT ?1",
                 )
                 .storage()?;
             let groups = query
@@ -209,28 +224,50 @@ impl SqliteAccountStorage {
                         a.image_hash_hex, a.image_key_hex, a.image_nonce_hex, a.image_upload_key_hex,
                         a.image_media_type,
                         (SELECT component_data_hex FROM account_group_app_components c
-                         WHERE c.group_id_hex = a.group_id_hex AND c.component_id = 32775), r.presentation_row_epoch
+                         WHERE c.group_id_hex = a.group_id_hex AND c.component_id = ?2),
+                        r.presentation_row_epoch
                  FROM chat_list_rows r JOIN account_groups a ON a.group_id_hex = r.group_id_hex
-                 CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1", [group], |r| {
-                    let hash: String = r.get(4)?;
+                 CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
+                params![group, GROUP_AVATAR_URL_COMPONENT_ID],
+                |row| {
+                    let hash: String = row.get(4)?;
+                    let avatar = if hash.is_empty() {
+                        None
+                    } else {
+                        Some(ChatListAvatar {
+                            image_hash_hex: hash,
+                            image_key_hex: row.get(5)?,
+                            image_nonce_hex: row.get(6)?,
+                            image_upload_key_hex: row.get(7)?,
+                            media_type: row.get(8)?,
+                        })
+                    };
+                    let component: Option<String> = row.get(9)?;
                     Ok(ChatPresentationInput {
                         group_id_hex: group.to_owned(),
-                        row_epoch: r.get(10)?,
-                        source_version: ChatPresentationVersion { store_epoch: r.get(0)?, revision: nonnegative(r, 1)? },
-                        group_name: r.get(2)?, member_count: r.get::<_, Option<i64>>(3)?.and_then(|n| u64::try_from(n).ok()), members: Vec::new(),
-                        avatar_url: crate::chat_list::decoded_avatar_url(r.get::<_, Option<String>>(9)?.as_deref()),
-                        avatar: if hash.is_empty() { None } else { Some(ChatListAvatar {
-                            image_hash_hex: hash, image_key_hex: r.get(5)?, image_nonce_hex: r.get(6)?,
-                            image_upload_key_hex: r.get(7)?, media_type: r.get(8)?,
-                        }) },
+                        row_epoch: row.get(10)?,
+                        source_version: ChatPresentationVersion {
+                            store_epoch: row.get(0)?,
+                            revision: nonnegative(row, 1)?,
+                        },
+                        group_name: row.get(2)?,
+                        member_count: row.get::<_, Option<i64>>(3)?
+                            .and_then(|count| u64::try_from(count).ok()),
+                        members: Vec::new(),
+                        avatar_url: crate::chat_list::decoded_avatar_url(component.as_deref()),
+                        avatar,
                     })
-                }
+                },
             ).optional().storage()?;
-            let Some(mut input) = input else { return Ok(None); };
-            let mut query = conn.prepare_cached("SELECT member_id_hex FROM chat_presentation_members WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3").storage()?;
-            let members = query.query_map([group], |r| r.get::<_, String>(0)).storage()?
-                .collect::<rusqlite::Result<Vec<_>>>().storage()?;
-            input.members = members;
+            let Some(mut input) = input else {
+                return Ok(None);
+            };
+            let mut query = conn.prepare_cached(
+                "SELECT member_id_hex FROM chat_presentation_members
+                 WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3",
+            ).storage()?;
+            input.members = query.query_map([group], |row| row.get::<_, String>(0))
+                .storage()?.collect::<rusqlite::Result<Vec<_>>>().storage()?;
             Ok(Some(input))
         })
     }
@@ -241,30 +278,48 @@ impl SqliteAccountStorage {
         group: &str,
         members: &[String],
     ) -> StorageResult<()> {
-        let mut normalized: Vec<_> = members
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .collect();
+        let mut normalized: Vec<_> = if members.len() == 2 {
+            members
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        } else {
+            Vec::new()
+        };
         normalized.sort();
         normalized.dedup();
-        if normalized.len() != 2
-            || normalized
-                .iter()
-                .any(|s| s.is_empty() || hex::decode(s).is_err())
-        {
+        if normalized.len() != 2 || normalized.iter().any(|s| !valid_member_identity(s)) {
             normalized.clear();
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let mut query = conn.prepare_cached("SELECT member_id_hex FROM chat_presentation_members WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3").storage()?;
-            let previous = query.query_map([group], |r| r.get::<_, String>(0)).storage()?
-                .collect::<rusqlite::Result<Vec<_>>>().storage()?;
+            let mut query = conn.prepare_cached(
+                "SELECT member_id_hex FROM chat_presentation_members
+                 WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3",
+            ).storage()?;
+            let previous = query.query_map([group], |row| row.get::<_, String>(0))
+                .storage()?.collect::<rusqlite::Result<Vec<_>>>().storage()?;
             drop(query);
-            if previous == normalized { return Ok(()); }
-            conn.execute("DELETE FROM chat_presentation_members WHERE group_id_hex = ?1", [group]).storage()?;
-            for member in normalized { conn.execute("INSERT INTO chat_presentation_members VALUES (?1, ?2)", params![group, member]).storage()?; }
-            conn.execute("UPDATE chat_list_rows SET presentation_json = NULL, presentation_source_revision = presentation_source_revision + 1 WHERE group_id_hex = ?1", [group]).storage()?;
-            conn.execute("DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1", [group]).storage()?;
+            if previous == normalized {
+                return Ok(());
+            }
+            conn.execute_cached(
+                "DELETE FROM chat_presentation_members WHERE group_id_hex = ?1", [group],
+            ).storage()?;
+            for member in normalized {
+                conn.execute_cached(
+                    "INSERT INTO chat_presentation_members(group_id_hex, member_id_hex) VALUES (?1, ?2)",
+                    params![group, member],
+                ).storage()?;
+            }
+            conn.execute_cached(
+                "UPDATE chat_list_rows SET presentation_json = NULL,
+                    presentation_source_revision = presentation_source_revision + 1
+                 WHERE group_id_hex = ?1", [group],
+            ).storage()?;
+            conn.execute_cached(
+                "DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1", [group],
+            ).storage()?;
             Ok(())
         })
     }
@@ -284,38 +339,100 @@ impl SqliteAccountStorage {
         if let Some(peer) = &value.presentation.peer_id
             && (input.member_count != Some(2)
                 || input.members.len() != 2
+                || !valid_member_identity(peer)
                 || !input.members.contains(peer))
         {
             return Err(invalid("presentation peer is not in captured roster"));
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let existing: Option<Option<Vec<u8>>> = conn.query_row(
-                "SELECT r.presentation_json FROM chat_list_rows r CROSS JOIN chat_presentation_meta m
-                 WHERE r.group_id_hex = ?1 AND r.presentation_source_revision = ?2 AND m.id = 1 AND m.store_epoch = ?3 AND r.presentation_row_epoch = ?4",
-                params![input.group_id_hex, u64_to_i64(input.source_version.revision)?, input.source_version.store_epoch, input.row_epoch], |r| r.get(0),
-            ).optional().storage()?;
-            let Some(existing) = existing else { return Ok(ChatPresentationWrite::Stale); };
-            if existing.as_ref() == Some(&bytes) { return Ok(ChatPresentationWrite::Unchanged); }
-            let old = existing.as_deref().map(decode_envelope).transpose()?;
-            // A deletion is versioned too. An absent cache read must not undo accepted profile evidence.
-            if let Some(old_version) = old.as_ref().and_then(|old| old.value.profile_version.as_ref()) {
-                let Some(new_version) = &value.profile_version else { return Ok(ChatPresentationWrite::Stale); };
-                if old_version.store_epoch == new_version.store_epoch && old_version.revision > new_version.revision {
+            let existing: Option<(Option<Vec<u8>>, i64)> = conn
+                .query_row(
+                    "SELECT r.presentation_json, r.presentation_applied_source_revision
+                 FROM chat_list_rows r CROSS JOIN chat_presentation_meta m
+                 WHERE r.group_id_hex = ?1 AND r.presentation_source_revision = ?2
+                   AND m.id = 1 AND m.store_epoch = ?3 AND r.presentation_row_epoch = ?4",
+                    params![
+                        input.group_id_hex,
+                        u64_to_i64(input.source_version.revision)?,
+                        input.source_version.store_epoch,
+                        input.row_epoch,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .storage()?;
+            let Some((existing, applied_revision)) = existing else {
+                return Ok(ChatPresentationWrite::Stale);
+            };
+            if existing.as_ref() == Some(&bytes)
+                && applied_revision == u64_to_i64(input.source_version.revision)?
+            {
+                return Ok(ChatPresentationWrite::Unchanged);
+            }
+            // Strict reads expose a redacted decode error, but a valid current-generation
+            // write can repair this derived cache. Schema migrations own format transitions.
+            let old = existing
+                .as_deref()
+                .and_then(|bytes| decode_envelope(bytes).ok());
+            // A deletion is versioned too. An absent cache read must not undo accepted evidence.
+            if let Some(old_version) = old
+                .as_ref()
+                .and_then(|old| old.value.profile_version.as_ref())
+            {
+                let Some(new_version) = &value.profile_version else {
+                    return Ok(ChatPresentationWrite::Stale);
+                };
+                if old_version.store_epoch == new_version.store_epoch
+                    && old_version.revision > new_version.revision
+                {
                     return Ok(ChatPresentationWrite::Stale);
                 }
             }
-            let changed = old.as_ref().is_none_or(|old| old.value.presentation != value.presentation);
-            conn.execute("UPDATE chat_list_rows SET presentation_json = ?2 WHERE group_id_hex = ?1", params![input.group_id_hex, bytes]).storage()?;
+            let changed = old
+                .as_ref()
+                .is_none_or(|old| old.value.presentation != value.presentation);
+            conn.execute_cached(
+                "UPDATE chat_list_rows SET presentation_json = ?2,
+                    presentation_applied_source_revision = presentation_source_revision
+                 WHERE group_id_hex = ?1",
+                params![input.group_id_hex, bytes],
+            )
+            .storage()?;
             if changed {
-                conn.execute("UPDATE chat_presentation_meta SET revision = revision + 1 WHERE id = 1", []).storage()?;
+                conn.execute_cached(
+                    "UPDATE chat_presentation_meta SET revision = revision + 1 WHERE id = 1",
+                    [],
+                )
+                .storage()?;
             }
-            conn.execute("DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1", [&input.group_id_hex]).storage()?;
-            let p = &value.presentation;
-            let title = matches!(p.title_source, PresentationSource::PeerProfile | PresentationSource::PeerFallback);
-            let avatar = matches!(p.avatar_source, PresentationSource::PeerProfile | PresentationSource::PeerFallback);
-            if let Some(peer) = &p.peer_id && (title || avatar) {
-                conn.execute("INSERT INTO chat_presentation_dependencies VALUES (?1, ?2, ?3)", params![input.group_id_hex, peer, i64::from(title) + 2 * i64::from(avatar)]).storage()?;
+            conn.execute_cached(
+                "DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1",
+                [&input.group_id_hex],
+            )
+            .storage()?;
+            let presentation = &value.presentation;
+            let title = matches!(
+                presentation.title_source,
+                PresentationSource::PeerProfile | PresentationSource::PeerFallback
+            );
+            let avatar = matches!(
+                presentation.avatar_source,
+                PresentationSource::PeerProfile | PresentationSource::PeerFallback
+            );
+            if let Some(peer) = &presentation.peer_id
+                && (title || avatar)
+            {
+                conn.execute_cached(
+                    "INSERT INTO chat_presentation_dependencies(group_id_hex, member_id_hex, roles)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        input.group_id_hex,
+                        peer,
+                        i64::from(title) + 2 * i64::from(avatar)
+                    ],
+                )
+                .storage()?;
             }
             Ok(ChatPresentationWrite::Applied)
         })
@@ -326,7 +443,12 @@ impl SqliteAccountStorage {
         after: Option<&str>,
     ) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
-        let mut query = conn.prepare_cached("SELECT group_id_hex FROM chat_presentation_dependencies WHERE member_id_hex = ?1 AND group_id_hex > ?2 ORDER BY group_id_hex LIMIT ?3").storage()?;
+        let mut query = conn
+            .prepare_cached(
+                "SELECT group_id_hex FROM chat_presentation_dependencies
+             WHERE member_id_hex = ?1 AND group_id_hex > ?2 ORDER BY group_id_hex LIMIT ?3",
+            )
+            .storage()?;
         query
             .query_map(
                 params![
@@ -340,6 +462,10 @@ impl SqliteAccountStorage {
             .collect::<rusqlite::Result<Vec<_>>>()
             .storage()
     }
+}
+
+fn valid_member_identity(raw: &str) -> bool {
+    raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

@@ -129,8 +129,8 @@ No new full-profile account table is needed for this slice. Read selected accept
 batches before the account write, then persist the selected row values. Readiness and dependency changes must be
 revalidated under the account transaction; never combine a newly selected peer ID with previously cached peer data.
 
-Account-local group/roster mutations commit either the new valid presentation or safe fallback plus durable dirty
-state with the changed source. Name/image changes and row creation use the same resolver. Existing source/timeline/
+Account-local group/roster mutations commit either the new valid presentation or durable dirty state with a
+same-subject last-known value or safe fallback. Name/image changes and row creation use the same resolver. Existing source/timeline/
 chat-row transactions introduced by #1737 must be retained. Coalesce work per affected group; repair must not scan
 message history, rebuild every account group, or introduce a second send/operation queue.
 
@@ -224,13 +224,19 @@ configuration/feature-flag framework. Later C4-C8 work can reuse the published p
 
 The account migration adds versioned selected values, dependency/roster indexes, and random account/row incarnation
 identifiers. Compare-and-store rejects preparation from a replaced store, recreated row or older source generation.
-The partial index of unprepared rows is the durable backfill worklist: committed rows leave it, invalidated rows rejoin
+The partial index of absent or unapplied source revisions is the durable backfill worklist: committed rows leave it, dirty rows rejoin
 it, and each read returns at most 50. This avoids skipping newly inserted or invalidated rows behind a global cursor.
 Ordinary reads distinguish missing, pending and ready without repair writes. Profile bookkeeping alone does not advance
-the selected-presentation notification revision; corrupt/unsupported envelopes return redacted errors.
+the selected-presentation notification revision. Same-subject name/image changes keep the committed value and
+dependencies renderable as `LastKnown` until refresh; membership changes clear invalid old-subject display immediately.
+The read-time freshness annotation does not itself advance the committed-value revision, and identical recomputation
+does not notify. Corrupt/unsupported envelopes return redacted read errors but a current-generation write can replace
+them. Future format changes must migrate or invalidate old envelopes, rather than relying on a decode failure to queue work.
 
 P1 seeds only roster evidence already available in the direct-member index. P2 must supply authoritative two-person
-rosters for named groups too, wire every source mutation, and run bounded hydration/catch-up after account readiness.
+rosters for named groups too before draining backfill, wire every source mutation, and run bounded hydration/catch-up
+after account readiness. Missing roster evidence yields a typed fallback; later hydration must call the roster setter
+to requeue it. It must not create a permanent busy retry loop for legitimately unavailable/quarantined groups.
 The P1 methods and resolver are internal Rust building blocks; existing app, UniFFI and C chat-list behavior is unchanged.
 P2 must also authorize shared-store epoch transitions at its catch-up boundary; revisions in different shared-store
 incarnations are not ordered by the P1 account writer. P3 supplies atomic whole-row reads and subscription handoff.

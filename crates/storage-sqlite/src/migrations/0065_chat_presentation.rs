@@ -15,8 +15,10 @@ CREATE TRIGGER chat_presentation_row_created AFTER INSERT ON chat_list_rows BEGI
 END;
 ALTER TABLE chat_list_rows ADD COLUMN presentation_source_revision INTEGER NOT NULL DEFAULT 0
     CHECK(typeof(presentation_source_revision) = 'integer' AND presentation_source_revision >= 0);
+ALTER TABLE chat_list_rows ADD COLUMN presentation_applied_source_revision INTEGER NOT NULL DEFAULT -1
+    CHECK(typeof(presentation_applied_source_revision) = 'integer' AND presentation_applied_source_revision >= -1);
 CREATE INDEX chat_presentation_pending ON chat_list_rows(group_id_hex)
-    WHERE presentation_json IS NULL;
+    WHERE presentation_json IS NULL OR presentation_applied_source_revision != presentation_source_revision;
 CREATE TABLE chat_presentation_meta (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     store_epoch BLOB NOT NULL CHECK(length(store_epoch) = 16),
@@ -28,7 +30,8 @@ CREATE TABLE chat_presentation_members (
     member_id_hex TEXT NOT NULL,
     PRIMARY KEY(group_id_hex, member_id_hex)
 );
-INSERT INTO chat_presentation_members SELECT group_id_hex, member_id_hex FROM direct_conversation_members;
+INSERT INTO chat_presentation_members(group_id_hex, member_id_hex)
+    SELECT group_id_hex, member_id_hex FROM direct_conversation_members;
 CREATE TABLE chat_presentation_dependencies (
     group_id_hex TEXT NOT NULL REFERENCES chat_list_rows(group_id_hex) ON DELETE CASCADE,
     member_id_hex TEXT NOT NULL,
@@ -55,10 +58,13 @@ WHEN OLD.profile_name IS NOT NEW.profile_name
   OR OLD.image_upload_key_hex IS NOT NEW.image_upload_key_hex
   OR OLD.image_media_type IS NOT NEW.image_media_type
 BEGIN
-    UPDATE chat_list_rows SET presentation_json = NULL,
+    UPDATE chat_list_rows SET presentation_json = CASE
+            WHEN OLD.member_count IS NOT NEW.member_count OR OLD.self_membership IS NOT NEW.self_membership
+            THEN NULL ELSE presentation_json END,
         presentation_source_revision = presentation_source_revision + 1
         WHERE group_id_hex = NEW.group_id_hex;
-    DELETE FROM chat_presentation_dependencies WHERE group_id_hex = NEW.group_id_hex;
+    DELETE FROM chat_presentation_dependencies WHERE group_id_hex = NEW.group_id_hex
+        AND (OLD.member_count IS NOT NEW.member_count OR OLD.self_membership IS NOT NEW.self_membership);
     DELETE FROM chat_presentation_members WHERE group_id_hex = NEW.group_id_hex
         AND (OLD.member_count IS NOT NEW.member_count OR OLD.self_membership IS NOT NEW.self_membership);
 END;
@@ -77,10 +83,8 @@ END;
         tx.execute_batch(&format!(
             "CREATE TRIGGER chat_presentation_avatar_{operation} AFTER {operation} ON account_group_app_components
              WHEN {condition} BEGIN
-                UPDATE chat_list_rows SET presentation_json = NULL,
-                    presentation_source_revision = presentation_source_revision + 1
+                UPDATE chat_list_rows SET presentation_source_revision = presentation_source_revision + 1
                     WHERE group_id_hex = {reference}.group_id_hex;
-                DELETE FROM chat_presentation_dependencies WHERE group_id_hex = {reference}.group_id_hex;
              END;"
         )).storage()?;
     }

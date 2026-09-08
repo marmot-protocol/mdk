@@ -356,19 +356,34 @@ fn query_indexes_upgrade() {
     seed_query_history(&conn, 256);
     conn.execute_batch("INSERT INTO openmls_values VALUES (1, x'01', x'02', x'03', x'04');")
         .unwrap();
+    // Keep comparing every pre-upgrade column, even when later migrations add new ones.
+    let tables: Vec<_> = [
+        "cgka_messages",
+        "app_events",
+        "encrypted_media_epoch_secrets",
+        "cgka_disband_tombstones",
+        "account_groups",
+        "chat_list_rows",
+        "openmls_values",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut query = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let columns = query
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (table, columns.join(", "))
+    })
+    .collect();
     let contents = |conn: &rusqlite::Connection| {
         let mut rows = Vec::new();
-        for table in [
-            "cgka_messages",
-            "app_events",
-            "encrypted_media_epoch_secrets",
-            "cgka_disband_tombstones",
-            "account_groups",
-            "chat_list_rows",
-            "openmls_values",
-        ] {
+        for (table, columns) in &tables {
             let mut stmt = conn
-                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .prepare(&format!("SELECT {columns} FROM {table} ORDER BY rowid"))
                 .unwrap();
             let columns = stmt.column_count();
             rows.extend(
@@ -385,9 +400,8 @@ fn query_indexes_upgrade() {
         rows
     };
     let before = contents(&conn);
-    // This assertion covers the index-only migration, not later column additions.
-    super::run(&mut conn, &super::MIGRATIONS[..63]).unwrap();
-    super::run(&mut conn, &super::MIGRATIONS[..63]).unwrap();
+    super::run_all(&mut conn).unwrap();
+    super::run_all(&mut conn).unwrap();
     let tx = conn.transaction().unwrap();
     super::migration_0063_query_indexes::apply(&tx).unwrap();
     tx.execute_batch("DROP INDEX idx_openmls_values_group;")

@@ -11,7 +11,7 @@ fn seed(store: &SqliteAccountStorage, id: &str) {
     .unwrap();
     drop(conn);
     store
-        .set_chat_presentation_members(id, &["aa".into(), "bb".into()])
+        .set_chat_presentation_members(id, &["aa".repeat(32), "bb".repeat(32)])
         .unwrap();
 }
 fn value(peer: &str, name: &str, rev: u64) -> StoredChatPresentation {
@@ -24,7 +24,7 @@ fn value(peer: &str, name: &str, rev: u64) -> StoredChatPresentation {
             },
             title_source: PresentationSource::PeerProfile,
             avatar_source: PresentationSource::PeerFallback,
-            peer_id: Some(peer.into()),
+            peer_id: Some(peer.repeat(32)),
             resolution: PresentationResolution::Cached,
         },
         profile_version: Some(ChatPresentationVersion {
@@ -60,7 +60,9 @@ fn selected_value_reopens_without_mutation_and_keeps_activity() {
     );
     assert_eq!(store.chat_presentation_version().unwrap(), version);
     assert_eq!(
-        store.chat_presentation_dependents("bb", None).unwrap(),
+        store
+            .chat_presentation_dependents(&"bb".repeat(32), None)
+            .unwrap(),
         ["11"]
     );
     assert_eq!(
@@ -88,7 +90,7 @@ fn source_generation_and_store_epoch_reject_stale_preparation() {
     );
     store.store_chat_presentation(&old, &v).unwrap();
     store
-        .set_chat_presentation_members("11", &["aa".into(), "cc".into()])
+        .set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
         .unwrap();
     assert_eq!(
         store.chat_presentation("11").unwrap(),
@@ -96,7 +98,7 @@ fn source_generation_and_store_epoch_reject_stale_preparation() {
     );
     assert!(
         store
-            .chat_presentation_dependents("bb", None)
+            .chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
@@ -211,11 +213,16 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
         )
         .unwrap();
     assert!(store.chat_presentation("11").is_err());
-    assert!(
+    assert_eq!(
         store
             .store_chat_presentation(&input, &value("bb", "Peer", 10))
-            .is_err()
+            .unwrap(),
+        ChatPresentationWrite::Applied
     );
+    assert!(matches!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(_)
+    ));
     store
         .lock()
         .unwrap()
@@ -226,6 +233,18 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
         .unwrap();
     let error = store.chat_presentation("11").unwrap_err();
     assert!(!format!("{error:?}").contains("private profile sentinel"));
+    let before_repair = store.chat_presentation_version().unwrap();
+    assert_eq!(
+        store
+            .store_chat_presentation(&input, &value("bb", "Peer", 11))
+            .unwrap(),
+        ChatPresentationWrite::Applied
+    );
+    assert!(store.chat_presentation_version().unwrap().revision > before_repair.revision);
+    assert!(matches!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(_)
+    ));
     // Reset/deletion cannot leave a dependency behind.
     store
         .lock()
@@ -234,7 +253,7 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
         .unwrap();
     assert!(
         store
-            .chat_presentation_dependents("bb", None)
+            .chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
@@ -289,7 +308,7 @@ fn unchanged_source_observations_keep_a_ready_selection_and_generation() {
     store.store_chat_presentation(&input, &selected).unwrap();
     let version = store.chat_presentation_version().unwrap();
     store
-        .set_chat_presentation_members("11", &["BB".into(), "aa".into()])
+        .set_chat_presentation_members("11", &["BB".repeat(32), "aa".repeat(32)])
         .unwrap();
     store
         .lock()
@@ -311,5 +330,63 @@ fn unchanged_source_observations_keep_a_ready_selection_and_generation() {
             .unwrap()
             .source_version,
         input.source_version
+    );
+}
+
+#[test]
+fn same_subject_source_changes_reopen_as_last_known_and_identical_repair_does_not_notify() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("last-known.db");
+    let key = SqlCipherKey::new("last known fixture key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "11");
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let selected = value("bb", "Peer", 1);
+    store.store_chat_presentation(&input, &selected).unwrap();
+    let version = store.chat_presentation_version().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET image_media_type='image/jpeg' WHERE group_id_hex='11'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut last_known = selected.clone();
+    last_known.presentation.resolution = PresentationResolution::LastKnown;
+    assert_eq!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(Box::new(last_known))
+    );
+    assert_eq!(store.chat_presentation_version().unwrap(), version);
+    let pending = store.pending_chat_presentation_inputs().unwrap();
+    assert_eq!(pending.len(), 1);
+    store
+        .store_chat_presentation(&pending[0], &selected)
+        .unwrap();
+    assert!(store.pending_chat_presentation_inputs().unwrap().is_empty());
+    assert_eq!(store.chat_presentation_version().unwrap(), version);
+    assert_eq!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(Box::new(selected))
+    );
+}
+
+#[test]
+fn malformed_member_identity_clears_peer_evidence() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    store
+        .set_chat_presentation_members("11", &["aa".repeat(32), "bb".repeat(16)])
+        .unwrap();
+    assert!(
+        store
+            .chat_presentation_input("11")
+            .unwrap()
+            .unwrap()
+            .members
+            .is_empty()
     );
 }

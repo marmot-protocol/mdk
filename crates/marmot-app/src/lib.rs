@@ -81,7 +81,6 @@ mod config;
 mod conversions;
 mod directory;
 mod drafts;
-pub use chat_presentation::select_chat_presentation;
 mod error;
 mod external_signer;
 mod groups;
