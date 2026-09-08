@@ -31,7 +31,12 @@ pub mod conversions;
 mod errors;
 mod external_signer;
 mod markdown;
+mod publisher;
 mod secret_store;
+pub use publisher::{
+    AgentTextPublisher, PublisherAckFfi, PublisherInfoFfi, PublisherOptionsFfi, PublisherRecordFfi,
+    PublisherTrustFfi,
+};
 pub mod subscriptions;
 
 use conversions::group_id_from_hex;
@@ -45,6 +50,14 @@ pub use markdown::{
 pub use secret_store::SecretStore;
 
 uniffi::setup_scaffolding!();
+
+/// Relay endpoint policy. Loopback is an explicit local-test opt-in;
+/// private, link-local, and public plaintext endpoints remain rejected.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum RelayPolicyFfi {
+    PublicOnly,
+    AllowLoopback,
+}
 
 pub use commands::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
@@ -167,6 +180,26 @@ pub struct Marmot {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Open with an explicit relay policy and optional host-owned key storage.
+    /// Existing constructors retain their public-only relay policy.
+    #[uniffi::constructor]
+    pub fn new_with_options(
+        root_path: String,
+        relay_urls: Vec<String>,
+        relay_policy: RelayPolicyFfi,
+        secret_store: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(matches!(
+            relay_policy,
+            RelayPolicyFfi::AllowLoopback
+        ));
+        let store = secret_store.map(|store| {
+            Arc::new(secret_store::ForeignSecretStore::new(store))
+                as Arc<dyn marmot_account::AccountSecretStore>
+        });
+        Self::open(root_path, relay_urls, config, store)
+    }
+
     /// Open the Marmot app at `root_path`, configured with the given default
     /// relay URLs. Account secrets (Nostr private keys) are stored in the
     /// platform keyring (Keychain on Apple platforms, Android's native

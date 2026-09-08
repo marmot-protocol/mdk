@@ -656,6 +656,64 @@ typedef enum MarmotChatListUpdateTrigger {
 } MarmotChatListUpdateTrigger;
 
 /**
+ * Relay endpoint policy used by `marmot_client_new_with_options`.
+ */
+enum MarmotRelayPolicy
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  MARMOT_RELAY_POLICY_PUBLIC_ONLY = 0,
+  MARMOT_RELAY_POLICY_ALLOW_LOOPBACK = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotRelayPolicy MarmotRelayPolicy;
+#else
+typedef uint32_t MarmotRelayPolicy;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Transcript record type. Pass the discriminant as uint32_t.
+ */
+enum MarmotPublisherRecord
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  MARMOT_PUBLISHER_RECORD_TEXT = 0,
+  MARMOT_PUBLISHER_RECORD_STATUS = 1,
+  MARMOT_PUBLISHER_RECORD_PROGRESS = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotPublisherRecord MarmotPublisherRecord;
+#else
+typedef uint32_t MarmotPublisherRecord;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Broker trust policy. AllowLoopback is an explicit local-test opt-in.
+ */
+enum MarmotPublisherTrust
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  MARMOT_PUBLISHER_TRUST_PUBLIC_ONLY = 0,
+  MARMOT_PUBLISHER_TRUST_ALLOW_LOOPBACK = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotPublisherTrust MarmotPublisherTrust;
+#else
+typedef uint32_t MarmotPublisherTrust;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * What woke the background collection.
  */
 typedef enum MarmotNotificationWakeSource {
@@ -729,6 +787,12 @@ typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_SUCCESS,
   MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE,
 } MarmotHostPerformanceOutcome;
+
+/**
+ * Single live stream. Free before its creating `MarmotClient`; never free
+ * concurrently with an in-flight call on this handle.
+ */
+typedef struct MarmotAgentPublisher MarmotAgentPublisher;
 
 /**
  * Opaque handle to a live agent-text-stream watch: incremental
@@ -3376,6 +3440,34 @@ typedef struct MarmotProductEvent {
 } MarmotProductEvent;
 
 /**
+ * Stable stream and start-message identifiers.
+ */
+typedef struct MarmotPublisherInfo {
+  char *stream_id_hex;
+  char *start_message_id_hex;
+} MarmotPublisherInfo;
+
+/**
+ * Accepted record receipt. A live preview error does not discard the
+ * transcript; finish still produces the durable final.
+ */
+typedef struct MarmotPublisherAck {
+  uint64_t chunk_count;
+  char *live_error;
+} MarmotPublisherAck;
+
+/**
+ * Borrowed broker options. NULL certificate with zero length selects
+ * platform trust. `trust` is a `MarmotPublisherTrust` discriminant.
+ */
+typedef struct MarmotPublisherOptions {
+  const char *candidate;
+  const uint8_t *server_cert_der;
+  uintptr_t server_cert_der_len;
+  uint32_t trust;
+} MarmotPublisherOptions;
+
+/**
  * One live-received message.
  */
 typedef struct MarmotReceivedMessage {
@@ -4013,6 +4105,25 @@ typedef struct MarmotPresentedChatListUpdate {
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Create a client with an explicit relay policy and optional host secret store.
+ * `store == NULL` selects the platform keychain. Loopback opt-in does not
+ * permit private/link-local relays or plaintext public endpoints.
+ * Ownership of the store transfers only on success, as with
+ * `marmot_client_new_with_secret_store`.
+ *
+ * # Safety
+ * Strings and arrays must be valid for the call; `store` must be NULL or a
+ * valid vtable; `out_client` must be writable. Pass a `MarmotRelayPolicy`
+ * discriminant as `relay_policy`; unknown values are rejected.
+ */
+MarmotStatus marmot_client_new_with_options(const char *root_path,
+                                            const char *const *relay_urls,
+                                            uintptr_t relay_urls_len,
+                                            uint32_t relay_policy,
+                                            const struct MarmotSecretStore *store,
+                                            struct MarmotClient **out_client);
 
 /**
  * Create a Marmot client rooted at `root_path`, connected to
@@ -7024,6 +7135,90 @@ MarmotStatus marmot_record_host_timing(const struct MarmotClient *client,
  */
 MarmotStatus marmot_set_product_analytics_activity(const struct MarmotClient *client,
                                                    uint32_t activity);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_publisher_info_free(struct MarmotPublisherInfo *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_publisher_ack_free(struct MarmotPublisherAck *ptr);
+
+/**
+ * Anchor a new stream and return its publisher. Broker connection happens
+ * in the background. Invalid inputs/out-pointers fail before anchoring.
+ *
+ * # Safety
+ * `client` is live; required strings and options are valid for this call;
+ * certificate is NULL with zero length or references that many bytes;
+ * `out` is writable. Input memory is neither retained nor freed.
+ */
+MarmotStatus marmot_agent_publisher_new(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const struct MarmotPublisherOptions *options,
+                                        struct MarmotAgentPublisher **out);
+
+/**
+ * Read stream identifiers. Free with `marmot_publisher_info_free`.
+ *
+ * # Safety
+ * `publisher` is live and `out` is writable.
+ */
+MarmotStatus marmot_agent_publisher_info(const struct MarmotAgentPublisher *publisher,
+                                         struct MarmotPublisherInfo **out);
+
+/**
+ * Append one text/status/progress record; free the receipt with
+ * `marmot_publisher_ack_free`. Unknown record types fail before appending.
+ *
+ * # Safety
+ * `publisher` is live, `text` is valid UTF-8/NUL-terminated, `out` writable.
+ */
+MarmotStatus marmot_agent_publisher_append(const struct MarmotAgentPublisher *publisher,
+                                           uint32_t kind,
+                                           const char *text,
+                                           struct MarmotPublisherAck **out);
+
+/**
+ * Seal and send the final transcript. Failed sends retain the sealed
+ * request for retry; a successful repeated call returns the original receipt.
+ * Free with `marmot_send_summary_free`. Inspect its delivery disposition.
+ *
+ * # Safety
+ * `publisher` is live and `out` is writable.
+ */
+MarmotStatus marmot_agent_publisher_finish(const struct MarmotAgentPublisher *publisher,
+                                           struct MarmotSendSummary **out);
+
+/**
+ * Cancel the preview. Does not retract a final already being published.
+ *
+ * # Safety
+ * `publisher` is a live handle.
+ */
+MarmotStatus marmot_agent_publisher_cancel(const struct MarmotAgentPublisher *publisher);
+
+/**
+ * Release a publisher, requesting preview cancellation. NULL is a no-op.
+ *
+ * # Safety
+ * `publisher` is NULL or a live root returned by this library, with no
+ * concurrent call using it. Free before the creating client.
+ */
+void marmot_agent_publisher_free(struct MarmotAgentPublisher *publisher);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).

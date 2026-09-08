@@ -35,6 +35,9 @@ prefix = ""
 # Enums a caller passes as a uint32_t discriminant are no longer referenced
 # by any signature, so cbindgen would drop the constants consumers need.
 include = [
+    "MarmotRelayPolicy",
+    "MarmotPublisherRecord",
+    "MarmotPublisherTrust",
     "MarmotNotificationWakeSource",
     "MarmotCursorPersistence",
     "MarmotSecretStoreStatus",
