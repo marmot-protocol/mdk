@@ -2462,6 +2462,33 @@ impl MarmotAppRuntime {
         }
         Ok(self.shared.product_analytics.record(event)?)
     }
+
+    /// Record an app-defined timing through the consent-gated product exporter.
+    /// Register `name` with `elapsed: DurationBucket` and an `outcome` enum
+    /// containing `success` and `failure`. Durations are bucketed before admission;
+    /// these events do not enter the OTLP app-performance snapshot.
+    pub fn record_host_timing(
+        &self,
+        name: String,
+        duration: Duration,
+        outcome: crate::HostPerformanceOutcome,
+    ) -> Result<crate::ProductRecordResult, AppError> {
+        let outcome = match outcome {
+            crate::HostPerformanceOutcome::Success => "success",
+            crate::HostPerformanceOutcome::Failure => "failure",
+        };
+        self.record_product_event(crate::ProductEvent {
+            name,
+            properties: std::collections::BTreeMap::from([
+                (
+                    "elapsed".into(),
+                    crate::product_duration_bucket(duration).into(),
+                ),
+                ("outcome".into(), outcome.into()),
+            ]),
+        })
+    }
+
     pub async fn set_product_analytics_activity(&self, activity: crate::ProductAnalyticsActivity) {
         if self.is_stopping() {
             return;

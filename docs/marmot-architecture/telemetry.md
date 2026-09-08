@@ -296,8 +296,10 @@ These are correctness gates, not device benchmarks. Compare histogram distributi
 sum phase percentiles or treat SDK projection and host render timings as a single end-to-end sample. Counters and
 histograms are process-local, with no per-message correlation identifiers or persisted timing journal.
 
-Host applications can only select the closed `HostPerformanceOperation` enum; callers cannot supply metric names,
-label names, or label values. Adding a new cross-platform operation requires an MDK API change and review.
+OTLP host milestones use the closed `HostPerformanceOperation` enum without caller-supplied metric names or labels.
+For app-specific measurements such as inbox layout, image decoding, or navigation, use `record_host_timing` with a
+registered product event name. This consent-gated path sends duration buckets and outcomes to Aptabase; it does not
+add OTLP series or local app-performance snapshot fields. See the [registration example](usage-diagnostics.md#custom-host-timings).
 
 The `app_account_sync_failures` and `app_account_catch_up_failures` counters are the only app-performance metrics with
 metric attributes. Every failed attempt emits exactly one point in a bounded classification bucket:

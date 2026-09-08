@@ -6710,6 +6710,19 @@ MarmotStatus marmot_record_product_event(const struct MarmotClient *client,
                                          enum MarmotProductRecordResult *out);
 
 /**
+ * Record an app-defined timing through the consent-gated product exporter.
+ * Register `name` with `elapsed: DurationBucket` and `outcome: Enum` choices
+ * `success`/`failure`. Milliseconds are bucketed before recording.
+ * # Safety
+ * Client and borrowed name must be valid; out must be writable.
+ */
+MarmotStatus marmot_record_host_timing(const struct MarmotClient *client,
+                                       const char *name,
+                                       uint64_t duration_ms,
+                                       uint32_t outcome,
+                                       enum MarmotProductRecordResult *out);
+
+/**
  * Signal host activity. Discriminants are validated before conversion.
  * # Safety
  * Client must be a live handle.
