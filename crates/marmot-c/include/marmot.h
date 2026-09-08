@@ -1056,6 +1056,7 @@ typedef struct MarmotOnboardingSingleDeviceNotice {
 
 typedef struct MarmotOnboardingSnapshot {
   char *account_id_hex;
+  char *recovery_epoch;
   uint64_t revision;
   bool ready;
   struct MarmotOnboardingStepState *steps;
@@ -4068,6 +4069,65 @@ MarmotStatus marmot_sign_out(const struct MarmotClient *client,
 
 /**
  * Retry onboarding against explicitly selected discovery relays.
+ * Query whether unreadable/exhausted checkpoints require explicit recovery.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_onboarding_recovery_required(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 bool *out);
+
+/**
+ * Retain opaque evidence, retire the old attempt, and return a new epoch.
+ * Requires explicit acknowledgment of latest-only evidence retention.
+ * Hosts invalidate old UI callbacks first, then explicitly begin again.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_recover_onboarding(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       uint8_t acknowledge_latest_only_evidence,
+                                       char **out);
+
+/**
+ * Approve using the epoch and revision from the same displayed snapshot.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_approve_onboarding_repair_in_epoch(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       uint64_t revision,
+                                                       const char *recovery_epoch,
+                                                       struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Acknowledge the displayed device notice in a recovered attempt.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_onboarding_single_device_in_epoch(const struct MarmotClient *client,
+                                                                  const char *account_ref,
+                                                                  uint64_t revision,
+                                                                  const char *recovery_epoch,
+                                                                  struct MarmotOnboardingSnapshot **out);
+
+/**
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4097,7 +4157,8 @@ MarmotStatus marmot_acknowledge_onboarding_single_device(const struct MarmotClie
 
 /**
  * Cancel unfinished onboarding, retaining the signed-out identity and private state.
- * An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+ * Cancellation is valid at every interactive step, including approved or ready
+ * attempts. It performs no relay deletion.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-07
+updated: 2026-09-08
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -30,7 +30,16 @@ validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
 It requires single-device acknowledgment before KeyPackage publication and offers
 advisory detection of packages that may belong to another installation.
 Account onboarding gates normal worker commands until required checks and
-KeyPackage publication complete. Host apps still need to adopt the identity-only
+KeyPackage publication complete. Hosts can cancel an interactive attempt at any
+step, including approved or ready checkpoints: the account stays signed out, the
+attempt is retired, and its exact evidence is retained in the latest cancellation
+checkpoint. A later cancellation replaces earlier evidence even if publication
+is uncertain. Explicit recovery preserves unreadable/exhausted checkpoints as
+opaque evidence and establishes a fresh approval epoch; hosts must adopt the
+epoch-aware approval APIs for recovered attempts. Ordinary checkpoints remain
+v3; recovered checkpoints use v4 to exclude unsafe older readers. Cancellation of a proposal is
+distinct from cancelling a signer future and from ending the attempt. Open Chats
+remains host-owned. Host apps still need to adopt the identity-only
 entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).
 
 Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the
