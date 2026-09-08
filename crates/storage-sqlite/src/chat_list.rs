@@ -2618,7 +2618,7 @@ fn chat_title(group: &AccountGroupRow) -> &str {
     }
 }
 
-fn decoded_avatar_url(component_data_hex: Option<&str>) -> Option<String> {
+pub(crate) fn decoded_avatar_url(component_data_hex: Option<&str>) -> Option<String> {
     let bytes = hex::decode(component_data_hex?).ok()?;
     let avatar = decode_group_avatar_url_v1(&bytes).ok()?;
     (!avatar.url.is_empty()).then_some(avatar.url)
