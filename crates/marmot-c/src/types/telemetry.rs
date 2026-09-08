@@ -15,12 +15,16 @@ c_enum! {
     MarmotHostPerformanceOperation from HostPerformanceOperationFfi {
         SplashReady,
         ForegroundLocalReady,
+        OutboundMessageVisible,
+        InboundMessageVisible,
     }
 }
 
 impl From<MarmotHostPerformanceOperation> for HostPerformanceOperationFfi {
     fn from(value: MarmotHostPerformanceOperation) -> Self {
         match value {
+            MarmotHostPerformanceOperation::OutboundMessageVisible => Self::OutboundMessageVisible,
+            MarmotHostPerformanceOperation::InboundMessageVisible => Self::InboundMessageVisible,
             MarmotHostPerformanceOperation::SplashReady => Self::SplashReady,
             MarmotHostPerformanceOperation::ForegroundLocalReady => Self::ForegroundLocalReady,
         }
@@ -109,7 +113,16 @@ c_mirror! {
         /// Existing-database opens that skipped the probe via a cached
         /// verdict since process start.
         copy sqlcipher_migration_probe_skips: u64,
+        rec inbound_delivery_projection: MarmotAppPerformanceOperationSnapshot,
         rec outbound_message_send: MarmotAppPerformanceOperationSnapshot,
+        rec outbound_message_queue_wait: MarmotAppPerformanceOperationSnapshot,
+        rec outbound_message_local_projection: MarmotAppPerformanceOperationSnapshot,
+        rec outbound_message_local_accept: MarmotAppPerformanceOperationSnapshot,
+        rec outbound_message_publish: MarmotAppPerformanceOperationSnapshot,
+        rec outbound_message_response: MarmotAppPerformanceOperationSnapshot,
+        rec host_outbound_message_visible: MarmotAppPerformanceOperationSnapshot,
+        rec host_inbound_message_visible: MarmotAppPerformanceOperationSnapshot,
+
         rec group_create_queue_wait: MarmotAppPerformanceOperationSnapshot,
         rec group_create_key_package_lookup: MarmotAppPerformanceOperationSnapshot,
         rec group_member_key_package_prewarm: MarmotAppPerformanceOperationSnapshot,

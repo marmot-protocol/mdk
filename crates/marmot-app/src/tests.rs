@@ -1,3 +1,5 @@
+mod message_journeys;
+
 use super::*;
 use async_trait::async_trait;
 use cgka_traits::Timestamp;
@@ -18167,6 +18169,14 @@ async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
     assert_eq!(
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let snapshot = runtime.app_performance_snapshot();
+    assert_eq!(snapshot.outbound_message_local_accept.successes, 1);
+    assert_eq!(snapshot.outbound_message_publish.successes, 0);
+    assert_eq!(snapshot.outbound_message_publish.failures, 1);
+    assert_eq!(
+        snapshot.outbound_message_response.successes, 1,
+        "accepted unknown is a truthful response, not a published message"
     );
     let failed_event_id = relay
         .attempted_event_ids()

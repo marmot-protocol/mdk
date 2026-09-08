@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
@@ -2064,8 +2064,14 @@ where
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
+        let accept_started = Instant::now();
         let effects = self.session.send(intent).await?;
+        let local_accept_duration = accept_started.elapsed();
+        let publish_started = Instant::now();
         let mut output = self.publish_session_effects(effects).await?;
+        output.local_accept_duration =
+            Some(local_accept_duration + output.local_accept_duration.unwrap_or_default());
+        output.publish_duration = Some(publish_started.elapsed());
         if let Some(group_id) = disposition_group
             && self.post_join_rotation_pending(&group_id)?
         {
@@ -2084,13 +2090,19 @@ where
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
+        let accept_started = Instant::now();
         let effects = self
             .session
             .send_with_audit_context(intent, context.clone())
             .await?;
+        let local_accept_duration = accept_started.elapsed();
+        let publish_started = Instant::now();
         let mut output = self
             .publish_session_effects_with_audit_context(effects, Some(context))
             .await?;
+        output.local_accept_duration =
+            Some(local_accept_duration + output.local_accept_duration.unwrap_or_default());
+        output.publish_duration = Some(publish_started.elapsed());
         if let Some(group_id) = disposition_group
             && self.post_join_rotation_pending(&group_id)?
         {
@@ -2275,13 +2287,19 @@ where
         payload: Vec<u8>,
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
+        let accept_started = Instant::now();
         let effects = self
             .session
             .queue_app_message_with_audit_context(group_id.clone(), payload, context.clone())
             .await?;
+        let local_accept_duration = accept_started.elapsed();
+        let publish_started = Instant::now();
         let mut output = self
             .publish_session_effects_with_audit_context(effects, Some(context))
             .await?;
+        output.local_accept_duration =
+            Some(local_accept_duration + output.local_accept_duration.unwrap_or_default());
+        output.publish_duration = Some(publish_started.elapsed());
         if self.post_join_rotation_pending(&group_id)? {
             output.maintenance_disposition =
                 SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
@@ -3595,6 +3613,7 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        let stage_started = application_message.as_ref().map(|_| Instant::now());
         let (pending, pending_kind, post_confirmation_welcomes) = match continuation {
             Some(continuation) => (
                 Some(continuation.pending),
@@ -3676,6 +3695,11 @@ where
                 self.rollback_unstaged_pending(pending, output, queue)
                     .await?;
                 return Err(error.into());
+            }
+            if let Some(started) = stage_started {
+                // Sum only local application-message preparation, before relay I/O.
+                output.local_accept_duration =
+                    Some(output.local_accept_duration.unwrap_or_default() + started.elapsed());
             }
             Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await
         } else {
@@ -4738,6 +4762,13 @@ fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountDeviceEffects {
+    /// Sum of local engine acceptance and application fanout journal preparation.
+    /// Excludes relay I/O; a batch can stage sibling application messages.
+    /// Present only when effects return; not propagated from absorbed batches.
+    pub local_accept_duration: Option<Duration>,
+    /// Publication and reconciliation duration for this send's effects batch.
+    /// This is not a raw relay acknowledgement or recipient-delivery timestamp.
+    pub publish_duration: Option<Duration>,
     pub events: Vec<GroupEvent>,
     pub queued: Vec<QueuedIntentRef>,
     pub pending_convergence: Vec<GroupId>,

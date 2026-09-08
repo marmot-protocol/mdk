@@ -2649,3 +2649,65 @@ fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_cate
     assert!(!failures[0].reason.contains("leak.example"));
     assert!(!failures[0].reason.contains("attacker-controlled"));
 }
+
+#[tokio::test]
+async fn message_journey_overflow() {
+    let root = tempfile::tempdir().unwrap();
+    let account = marmot_account::AccountHome::open(root.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(root.path(), "wss://journey.example").with_test_relay_client(relay);
+    let mut client = app.client("sender").await.unwrap();
+    let group = client.create_group("journey", &[]).await.unwrap();
+    let runtime = app.runtime();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group.as_slice())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(timeline.take_snapshot().messages.is_empty());
+    let sent = client
+        .send(&group, b"recover missed projection")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let mut observer = runtime.subscribe();
+        // No await: the single-thread executor cannot drain the 1024-event ring.
+        for _ in 0..2048 {
+            runtime
+                .events
+                .send(MarmotAppEvent::GroupStateUpdated {
+                    account_id_hex: account.account_id_hex.clone(),
+                    account_label: account.label.clone(),
+                    group_id: group.clone(),
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            observer.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let update = tokio::time::timeout(Duration::from_secs(5), timeline.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(update, RuntimeTimelineMessageUpdate::Page { .. }));
+        let page = timeline.take_snapshot();
+        assert_eq!(
+            page.messages.len(),
+            1,
+            "each gap refreshes authoritative state without duplicates"
+        );
+        assert_eq!(page.messages[0].message_id_hex, sent.message_ids[0]);
+        assert!(page.messages[0].source_message_id_hex.is_some());
+    }
+    drop(client);
+    runtime.shutdown_and_close().await.unwrap();
+}

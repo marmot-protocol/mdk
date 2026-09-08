@@ -703,6 +703,8 @@ typedef enum MarmotSecretStoreStatus {
 typedef enum MarmotHostPerformanceOperation {
   MARMOT_HOST_PERFORMANCE_OPERATION_SPLASH_READY,
   MARMOT_HOST_PERFORMANCE_OPERATION_FOREGROUND_LOCAL_READY,
+  MARMOT_HOST_PERFORMANCE_OPERATION_OUTBOUND_MESSAGE_VISIBLE,
+  MARMOT_HOST_PERFORMANCE_OPERATION_INBOUND_MESSAGE_VISIBLE,
 } MarmotHostPerformanceOperation;
 
 /**
@@ -3095,7 +3097,15 @@ typedef struct MarmotAppPerformanceSnapshot {
    * verdict since process start.
    */
   uint64_t sqlcipher_migration_probe_skips;
+  struct MarmotAppPerformanceOperationSnapshot inbound_delivery_projection;
   struct MarmotAppPerformanceOperationSnapshot outbound_message_send;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_queue_wait;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_local_projection;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_local_accept;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_publish;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_response;
+  struct MarmotAppPerformanceOperationSnapshot host_outbound_message_visible;
+  struct MarmotAppPerformanceOperationSnapshot host_inbound_message_visible;
   struct MarmotAppPerformanceOperationSnapshot group_create_queue_wait;
   struct MarmotAppPerformanceOperationSnapshot group_create_key_package_lookup;
   struct MarmotAppPerformanceOperationSnapshot group_member_key_package_prewarm;
