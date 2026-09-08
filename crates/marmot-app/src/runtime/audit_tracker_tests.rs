@@ -271,7 +271,9 @@ async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
 
 #[tokio::test]
 async fn bare_413_latches_the_file_while_any_retry_after_keeps_it_retryable() {
-    for (retry_after, latched) in [(None, true), (Some("soon"), false)] {
+    // "\u{e9}" is obs-text: hyper accepts it, but `HeaderValue::to_str` does
+    // not, so the header must count as present even without a readable value.
+    for (retry_after, latched) in [(None, true), (Some("soon"), false), (Some("\u{e9}"), false)] {
         let tmp = tempfile::tempdir().unwrap();
         let app = two_file_audit_app(tmp.path());
         let (server, endpoint, mut observed) = status_server(413, retry_after).await;

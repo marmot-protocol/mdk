@@ -614,7 +614,7 @@ impl MarmotApp {
                     response
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok()),
+                        .map(|value| value.to_str().unwrap_or_default()),
                     SystemTime::now(),
                 ),
             });
@@ -920,7 +920,7 @@ mod tests {
             Some(Duration::from_secs(300))
         );
         assert_eq!(audit_retry_after(None, now), None);
-        for malformed in ["nonsense", "-1"] {
+        for malformed in ["nonsense", "-1", ""] {
             assert_eq!(
                 audit_retry_after(Some(malformed), now),
                 Some(Duration::ZERO),
