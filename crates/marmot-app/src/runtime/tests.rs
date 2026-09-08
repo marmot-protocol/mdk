@@ -10,6 +10,49 @@ use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
 
 #[tokio::test]
+async fn message_journey_early_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = MarmotApp::with_relays(root.path(), vec![]).runtime();
+    let group = GroupId::new(vec![1; 16]);
+
+    for expected_failures in [2, 4] {
+        assert!(
+            runtime
+                .send_message("missing", &group, vec![])
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .accounts
+                .send_app_event(
+                    "missing",
+                    &group,
+                    AppMessageIntent::Chat {
+                        content: String::new()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        let snapshot = runtime.app_performance_snapshot();
+        assert_eq!(
+            snapshot.outbound_message_response.attempts,
+            expected_failures
+        );
+        assert_eq!(
+            snapshot.outbound_message_response.failures,
+            expected_failures
+        );
+        assert_eq!(snapshot.outbound_message_response.successes, 0);
+        assert_eq!(snapshot.outbound_message_queue_wait.attempts, 0);
+
+        // Repeat after shutdown to cover lifecycle rejection before account lookup.
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn missing_diagnostics_executor_keeps_exporters_stopped() {
     let root = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(root.path(), vec![]);
