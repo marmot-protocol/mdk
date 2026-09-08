@@ -7,6 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Explicit onboarding recovery/query and epoch-aware approval/acknowledgment
+  commands. `MarmotOnboardingSnapshot` includes `recovery_epoch`; C consumers
+  must rebuild against the matching generated header and library.
+
+### Changed
+
+- `marmot_cancel_onboarding` documentation now matches the runtime: approved or
+  ready attempts may be cancelled without first resuming a repair.
+
 ## [0.9.16] - 2026-09-01
 
 ### Added

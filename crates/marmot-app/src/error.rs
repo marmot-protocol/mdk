@@ -79,6 +79,8 @@ pub enum AppError {
     /// account hydration/reconciliation completes; do not treat this as a miss.
     #[error("direct conversation index is not ready; retry after account hydration")]
     DirectConversationIndexNotReady,
+    #[error("chat presentation preparation is incomplete; retry after local maintenance")]
+    ChatPresentationNotReady,
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
     #[error("invalid chat pin: {0}")]
@@ -275,6 +277,7 @@ impl AppError {
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
+            Self::ChatPresentationNotReady => "chat_presentation_not_ready",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
             Self::InvalidChatPin(_) => "invalid_chat_pin",

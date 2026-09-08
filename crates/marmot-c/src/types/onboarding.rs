@@ -22,7 +22,7 @@ c_enum! { MarmotOnboardingAction from OnboardingActionFfi {  Retry, ContinueWith
 c_mirror! { MarmotOnboardingFinding from OnboardingFindingFfi { copy issue: MarmotOnboardingIssue, opt_str endpoint, } }
 c_mirror! { MarmotOnboardingStepState from OnboardingStepStateFfi { copy step: MarmotOnboardingStep, copy status: MarmotOnboardingStatus, vec findings/findings_len: MarmotOnboardingFinding, vec actions/actions_len: MarmotOnboardingAction, opt_copy has_checked_at/checked_at: u64, } }
 c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, } }
-c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
+c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
 
 c_enum! { MarmotOnboardingDeviceDiscovery from OnboardingDeviceDiscoveryFfi { NoneFound, OtherInstallationPossible, Unknown } }
 c_mirror! { MarmotOnboardingDevicePackage from OnboardingDevicePackageFfi { str slot_id, opt_str key_package_ref_hex, str event_id_hex, copy published_at: u64, opt_copy has_expires_at/expires_at: u64, copy usable: bool, } }
@@ -38,6 +38,7 @@ mod tests {
         let before = audit::live_allocations();
         let ffi = OnboardingSnapshotFfi {
             account_id_hex: "account".into(),
+            recovery_epoch: Some("recovery epoch".into()),
             revision: 4,
             ready: false,
             cancellation_pending: false,

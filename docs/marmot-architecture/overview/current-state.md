@@ -27,6 +27,11 @@ replays recover nothing. Local self-updates cannot clear a latched warning. Rust
 Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
 See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
 
+The additive presented-chat-list contract exposes complete existing rows plus durable MDK-selected title/avatar
+through Rust, UniFFI and C. An attached initial snapshot and ordered replacement updates cover both presentation and
+ordinary row changes. Android/iOS adoption remains separate; see the
+[native integration contract](../../../crates/marmot-uniffi/README.md#selected-chat-list-presentation).
+
 Deferred transport resource release now preserves app replay eligibility across
 lost engine effects and restart. SQLCipher records release evidence atomically
 with raw-byte deletion; app recovery retires both inventory and duplicate
@@ -38,7 +43,16 @@ validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
 It requires single-device acknowledgment before KeyPackage publication and offers
 advisory detection of packages that may belong to another installation.
 Account onboarding gates normal worker commands until required checks and
-KeyPackage publication complete. Host apps still need to adopt the identity-only
+KeyPackage publication complete. Hosts can cancel an interactive attempt at any
+step, including approved or ready checkpoints: the account stays signed out, the
+attempt is retired, and its exact evidence is retained in the latest cancellation
+checkpoint. A later cancellation replaces earlier evidence even if publication
+is uncertain. Explicit recovery preserves unreadable/exhausted checkpoints as
+opaque evidence and establishes a fresh approval epoch; hosts must adopt the
+epoch-aware approval APIs for recovered attempts. Ordinary checkpoints remain
+v3; recovered checkpoints use v4 to exclude unsafe older readers. Cancellation of a proposal is
+distinct from cancelling a signer future and from ending the attempt. Open Chats
+remains host-owned. Host apps still need to adopt the identity-only
 entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).
 
 Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the

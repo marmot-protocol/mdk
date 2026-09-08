@@ -9,10 +9,26 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
 - Added `usage-diagnostics show|enable|disable` with JSON output and live daemon
   routing. One explicit local consent controls OTLP and stock Aptabase exports;
   prior telemetry users reconfirm. Standalone commands and TUI children are silent
   collectors. Aptabase configuration and app keys do not grant consent.
+
+### Changed
+
+- Interactive onboarding cancellation now ends approved, interrupted, or ready
+  sign-in attempts, keeps the account signed out, and retains uncertain
+  publication evidence for a later explicit restart. Late publication or signer
+  responses cannot revive a cancelled attempt, and a fresh explicit begin no
+  longer waits for the retired operation. Existing pre-generation checkpoints
+  keep working after upgrade, cancelled ready-state cleanup no longer deletes
+  retained setup journals, and a dropped cancellation waiter still observes a
+  finished worker reap. Cancellation evidence is now latest-only, including
+  uncertain publications. Explicit recovery retains opaque historical bytes
+  and starts a fresh approval epoch; Swift/Kotlin/C hosts use the epoch-aware
+  approval APIs for recovered attempts.
 
 ## [0.9.19] - 2026-09-07
 

@@ -11,20 +11,8 @@ impl PresentationMaintenance {
         let app = &client.app;
         let storage = app.account_storage(&client.state.label)?;
         let shared = app.shared_storage()?;
-        let result = (|| {
-            // Initialize queued legacy rows through their existing owner. Only
-            // durable completion counts as progress; a row may already exist.
-            let missing = storage.pending_chat_presentation_rows()?;
-            let classifier = crate::MarmotApp::chat_list_mention_classifier(account_id);
-            let mut initialized = false;
-            for group in &missing {
-                initialized |=
-                    storage.initialize_chat_presentation_row(account_id, group, &classifier)?;
-            }
-            let more =
-                crate::chat_presentation::maintenance::maintain(&storage, &shared, account_id)?;
-            Ok(more || initialized)
-        })();
+        let result =
+            crate::chat_presentation::maintenance::prepare_batch(&storage, &shared, account_id);
         // Inspect committed state even after a failed later step. A fresh worker always compares,
         // so interruption between a row commit and this send recovers without another message.
         let version = storage.chat_presentation_version()?;

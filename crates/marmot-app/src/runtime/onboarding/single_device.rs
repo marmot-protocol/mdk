@@ -116,13 +116,41 @@ impl AccountManager {
         account_ref: &str,
         revision: u64,
     ) -> Result<OnboardingSnapshot, AppError> {
-        let transaction = self.onboarding_transaction(&self.resolve(account_ref)?.account_id_hex);
+        self.acknowledge_onboarding_single_device_scoped(account_ref, revision, None)
+            .await
+    }
+
+    /// Acknowledge the displayed device notice after explicit recovery.
+    pub async fn acknowledge_onboarding_single_device_in_epoch(
+        &self,
+        account_ref: &str,
+        revision: u64,
+        recovery_epoch: &str,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.acknowledge_onboarding_single_device_scoped(
+            account_ref,
+            revision,
+            Some(recovery_epoch),
+        )
+        .await
+    }
+
+    async fn acknowledge_onboarding_single_device_scoped(
+        &self,
+        account_ref: &str,
+        revision: u64,
+        recovery_epoch: Option<&str>,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        let (account_id, attempt) = self.peek_onboarding_attempt(account_ref)?;
+        let transaction = self.onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut checkpoint = self
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
+        self.require_captured_attempt(&checkpoint, attempt)?;
         let step = &checkpoint.snapshot.steps[OnboardingStep::SingleDevice.index()];
-        if checkpoint.snapshot.revision != revision
+        if checkpoint.snapshot.recovery_epoch.as_deref() != recovery_epoch
+            || checkpoint.snapshot.revision != revision
             || checkpoint.approved
             || checkpoint.snapshot.proposal.is_some()
             || checkpoint.single_device_acknowledged

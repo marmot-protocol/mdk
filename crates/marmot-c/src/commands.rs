@@ -15,6 +15,7 @@
 //! Commands with struct/byte inputs are written by hand below the macro
 //! block.
 
+use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
 
 use marmot_uniffi::MarmotKitError;
@@ -531,11 +532,22 @@ c_cmd! {
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
     /// Retry onboarding against explicitly selected discovery relays.
+    /// Query whether unreadable/exhausted checkpoints require explicit recovery.
+    sync fn marmot_onboarding_recovery_required(account_ref: str) -> scalar(bool) = onboarding_recovery_required;
+    /// Retain opaque evidence, retire the old attempt, and return a new epoch.
+    /// Requires explicit acknowledgment of latest-only evidence retention.
+    /// Hosts invalidate old UI callbacks first, then explicitly begin again.
+    async fn marmot_recover_onboarding(account_ref: str, acknowledge_latest_only_evidence: flag) -> string = recover_onboarding;
+    /// Approve using the epoch and revision from the same displayed snapshot.
+    async fn marmot_approve_onboarding_repair_in_epoch(account_ref: str, revision: val u64, recovery_epoch: str) -> rec(MarmotOnboardingSnapshot) = approve_onboarding_repair_in_epoch;
+    /// Acknowledge the displayed device notice in a recovered attempt.
+    async fn marmot_acknowledge_onboarding_single_device_in_epoch(account_ref: str, revision: val u64, recovery_epoch: str) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device_in_epoch;
     async fn marmot_set_onboarding_discovery_relays(account_ref: str, discovery_relays/discovery_relays_len: str_arr) -> rec(MarmotOnboardingSnapshot) = set_onboarding_discovery_relays;
     /// Acknowledge the displayed one-device notice and resume setup.
     async fn marmot_acknowledge_onboarding_single_device(account_ref: str, revision: val u64) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device;
     /// Cancel unfinished onboarding, retaining the signed-out identity and private state.
-    /// An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+    /// Cancellation is valid at every interactive step, including approved or ready
+    /// attempts. It performs no relay deletion.
     async fn marmot_cancel_onboarding(account_ref: str) -> unit = cancel_onboarding;
 
     /// Create a brand-new Nostr identity, store its secret in the account
@@ -834,6 +846,10 @@ c_cmd! {
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
     sync fn marmot_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotChatListRowList) = chat_list;
+    /// Complete local rows with selected title/avatar. Free with marmot_presented_chat_list_snapshot_free.
+    async fn marmot_presented_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotPresentedChatListSnapshot) = presented_chat_list;
+    /// Keyed complete row; missing groups return NULL. Free with marmot_presented_chat_row_free.
+    async fn marmot_presented_chat_list_row(account_ref: str, group_id_hex: str) -> opt_rec(MarmotPresentedChatRow) = presented_chat_list_row;
 
     /// Initialize read state for a conversation being opened; writes the
     /// refreshed row, or NULL with `MARMOT_STATUS_OK` when the group has

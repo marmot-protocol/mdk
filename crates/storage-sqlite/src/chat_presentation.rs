@@ -146,6 +146,14 @@ fn decode_envelope(bytes: &[u8]) -> StorageResult<Envelope> {
     }
     Ok(envelope)
 }
+// Preserve the absence of usable evidence while a fallback is dirty.
+fn decode_retained(bytes: &[u8], dirty: bool) -> StorageResult<StoredChatPresentation> {
+    let mut value = decode_envelope(bytes)?.value;
+    if dirty && value.presentation.resolution == PresentationResolution::Cached {
+        value.presentation.resolution = PresentationResolution::LastKnown;
+    }
+    Ok(value)
+}
 fn invalid(detail: &str) -> StorageError {
     StorageError::Serialization(detail.to_owned())
 }
@@ -182,13 +190,9 @@ impl SqliteAccountStorage {
         match row {
             None => Ok(ChatPresentationRead::Missing),
             Some((None, _)) => Ok(ChatPresentationRead::Pending),
-            Some((Some(bytes), dirty)) => {
-                let mut envelope = decode_envelope(&bytes)?;
-                if dirty {
-                    envelope.value.presentation.resolution = PresentationResolution::LastKnown;
-                }
-                Ok(ChatPresentationRead::Ready(Box::new(envelope.value)))
-            }
+            Some((Some(bytes), dirty)) => Ok(ChatPresentationRead::Ready(Box::new(
+                decode_retained(&bytes, dirty)?,
+            ))),
         }
     }
     /// The pending partial index is the durable backfill worklist. Committed rows leave it;
@@ -511,3 +515,106 @@ fn valid_member_identity(raw: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// A complete existing row with MDK-selected display; callers need no peer lookup.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentedChatRow {
+    pub row: crate::ChatListRow,
+    pub presentation: ConversationPresentation,
+}
+impl std::fmt::Debug for PresentedChatRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedChatRow")
+            .field("presentation", &self.presentation)
+            .finish_non_exhaustive()
+    }
+}
+/// The version describes selected presentation only, not unread or other row fields.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentedChatListSnapshot {
+    pub rows: Vec<PresentedChatRow>,
+    pub presentation_version: ChatPresentationVersion,
+}
+impl std::fmt::Debug for PresentedChatListSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedChatListSnapshot")
+            .field("row_count", &self.rows.len())
+            .field("presentation_version", &self.presentation_version)
+            .finish()
+    }
+}
+impl SqliteAccountStorage {
+    /// Read existing row fields, selection and version in one local read transaction.
+    /// `None` means preparation is required, never an empty successful cache miss.
+    /// A keyed read with no group returns a ready snapshot with zero rows.
+    pub fn read_presented_chat_list(
+        &self,
+        query: crate::ChatListQuery,
+        group: Option<&str>,
+    ) -> StorageResult<Option<PresentedChatListSnapshot>> {
+        let conn = self.lock()?;
+        // Keep this guard until the read transaction ends and use only `tx` below:
+        // never release/reacquire the account lock or call another storage method here.
+        // A deferred read snapshot avoids with_transaction's BEGIN IMMEDIATE write
+        // reservation, while the guard excludes interleaving users of this connection.
+        let tx = conn.unchecked_transaction().storage()?;
+        let pending: bool = match group {
+            Some(group) => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex = ?1)",
+                [group], |r| r.get(0)).storage()?,
+            None => tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)", [], |r| r.get(0)).storage()?,
+        };
+        if pending {
+            return Ok(None);
+        }
+        let rows = match group {
+            Some(group) => crate::chat_list::chat_list_row_tx(&tx, group)?
+                .into_iter()
+                .collect(),
+            None => crate::chat_list::chat_list_rows_tx(&tx, query.clone())?,
+        };
+        // One cached query for all selected envelopes; keyed reads retain an indexed lookup.
+        let mut statement = tx.prepare_cached(match group {
+            Some(_) => "SELECT group_id_hex, presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex = ?1",
+            None if query.include_archived => "SELECT group_id_hex, presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows",
+            None => "SELECT group_id_hex, presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE archived = 0",
+        }).storage()?;
+        let parameters: Vec<&str> = group.into_iter().collect();
+        let mut selections = statement
+            .query_map(rusqlite::params_from_iter(parameters), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, Option<Vec<u8>>>(1)?, r.get::<_, bool>(2)?),
+                ))
+            })
+            .storage()?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+            .storage()?;
+        drop(statement);
+        let mut presented = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some((Some(bytes), dirty)) = selections.remove(&row.group_id_hex) else {
+                return Ok(None);
+            };
+            let presentation = decode_retained(&bytes, dirty)?.presentation;
+            presented.push(PresentedChatRow { row, presentation });
+        }
+        let presentation_version = tx
+            .query_row(
+                "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id = 1",
+                [],
+                |r| {
+                    Ok(ChatPresentationVersion {
+                        store_epoch: r.get(0)?,
+                        revision: nonnegative(r, 1)?,
+                    })
+                },
+            )
+            .storage()?;
+        tx.commit().storage()?;
+        Ok(Some(PresentedChatListSnapshot {
+            rows: presented,
+            presentation_version,
+        }))
+    }
+}
