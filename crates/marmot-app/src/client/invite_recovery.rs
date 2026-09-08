@@ -100,10 +100,11 @@ impl AppClient {
             pending_reinvites,
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
-            automatic_recovery_failed: self
-                .app
-                .account_storage(&self.state.label)?
-                .automatic_recovery_failed(group_id)?,
+            automatic_recovery_failed: !group.is_terminal()
+                && self
+                    .app
+                    .account_storage(&self.state.label)?
+                    .automatic_recovery_failed(group_id)?,
             rejoin_invitations,
         })
     }

@@ -146,7 +146,7 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
         client
             .runtime
             .session()
-            .pending_group_rejoins()
+            .pending_group_rejoins_for(&group_id)
             .unwrap()
             .is_empty()
     );
@@ -2705,6 +2705,66 @@ fn recovery_warning_requires_confirmed_replays_and_survives_local_commits_and_re
                 .automatic_recovery_failed
         );
     });
+}
+
+#[tokio::test]
+async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_groups() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("recovery status", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let original = storage.get_group(&group_id).unwrap();
+    storage
+        .record_recovery_evidence(
+            &[storage_sqlite::StoredEpochStallEvidence {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch: original.epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            }],
+            3,
+        )
+        .unwrap();
+    assert!(
+        client
+            .group_recovery_status(&group_id)
+            .unwrap()
+            .automatic_recovery_failed
+    );
+    for state in ["removed", "disbanded", "unrecoverable"] {
+        let mut group = original.clone();
+        match state {
+            "removed" => group.removed = true,
+            "disbanded" => {
+                group.disbanded = Some(cgka_traits::group::DisbandTombstone {
+                    epoch: original.epoch,
+                    actor: client.runtime.session().self_id(),
+                    origin_commit_id: None,
+                    commit_digest: [0; 32],
+                    local_was_committer_leaf: true,
+                    former_members: original.members.clone(),
+                    announced: true,
+                })
+            }
+            _ => group.unrecoverable = true,
+        }
+        storage.put_group(&group).unwrap();
+        assert_eq!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed,
+            state == "unrecoverable",
+            "terminal verdicts suppress the warning; repairable halts do not"
+        );
+    }
 }
 
 /// A tracked group stalled below the arm threshold, so `mark_replayed` is the

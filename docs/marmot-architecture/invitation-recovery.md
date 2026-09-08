@@ -58,7 +58,8 @@ alone do not clear a latched warning. A quiet group can therefore retain the war
 traffic arrives. Evidence collected before a local epoch change is no longer counted toward a future warning,
 so repeated local movement may delay detection; it cannot erase an already-reported failure. Recovery continues
 under the existing backoff policy after the warning is shown. The warning never changes `pending_confirmation`
-or the authoritative roster. Hosts subscribe to `GroupStateUpdated` and reread the recovery query after account open.
+or the authoritative roster. The query suppresses it once removal or disband is authoritative; an Unrecoverable
+copy still awaiting repair can continue to display it. Hosts subscribe to `GroupStateUpdated` and reread the recovery query after account open.
 
 Migration 67 gates the new serialized recovery fields against older writers and adds the recovery-failure latch. Replay evidence and newly earned warnings are written atomically. Authenticated recovery also
 clears persisted replay evidence so reopening cannot resurrect a resolved warning.

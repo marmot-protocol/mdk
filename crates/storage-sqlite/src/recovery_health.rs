@@ -1,4 +1,5 @@
 //! Durable reports of unsuccessful automatic synchronization recovery.
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, StoredEpochStallEvidence};
 use cgka_traits::GroupId;
 use cgka_traits::storage::{StorageProvider, StorageResult};
@@ -7,7 +8,7 @@ impl SqliteAccountStorage {
     /// Whether completed automatic recovery has failed to restore synchronization.
     pub fn automatic_recovery_failed(&self, group_id: &GroupId) -> StorageResult<bool> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM app_group_recovery_failures WHERE group_id = ?1)",
                 [group_id.as_slice()],
                 |row| row.get(0),
@@ -38,7 +39,7 @@ impl SqliteAccountStorage {
                     cgka_traits::storage::StorageError::Serialization(error.to_string())
                 })?;
                 if conn
-                    .execute(
+                    .execute_cached(
                         "INSERT OR IGNORE INTO app_group_recovery_failures(group_id) VALUES (?1)",
                         [group_id.as_slice()],
                     )
@@ -57,7 +58,7 @@ impl SqliteAccountStorage {
     pub fn clear_recovery_failure(&self, group_id: &GroupId) -> StorageResult<bool> {
         let has_evidence: bool = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM app_group_recovery_failures WHERE group_id = ?1)
              OR EXISTS(SELECT 1 FROM app_epoch_stall_evidence WHERE group_id = ?1)",
                 [group_id.as_slice()],
@@ -69,13 +70,13 @@ impl SqliteAccountStorage {
         }
         self.with_transaction(|storage| {
             let conn = storage.lock()?;
-            conn.execute(
+            conn.execute_cached(
                 "DELETE FROM app_epoch_stall_evidence WHERE group_id = ?1",
                 [group_id.as_slice()],
             )
             .storage()?;
             Ok(conn
-                .execute(
+                .execute_cached(
                     "DELETE FROM app_group_recovery_failures WHERE group_id = ?1",
                     [group_id.as_slice()],
                 )

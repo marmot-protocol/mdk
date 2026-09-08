@@ -10726,7 +10726,7 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
             .is_err()
     );
     let token = carol
-        .pending_group_rejoins()
+        .pending_group_rejoins_for(Some(&group_id))
         .unwrap()
         .into_iter()
         .find(|offer| offer.message_id == replacement.id)
@@ -10746,7 +10746,12 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         old_history.payload,
         "explicit rejoin preserves the existing local message history"
     );
-    assert!(carol.pending_group_rejoins().unwrap().is_empty());
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
     for id in filler_ids {
         assert!(
             carol_storage.has_ingress_dedup_marker(&id).unwrap(),

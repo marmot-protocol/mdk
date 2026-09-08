@@ -804,11 +804,6 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
-    /// Validated replacement offers, bound to the current local branch.
-    pub fn pending_group_rejoins(&self) -> Result<Vec<PendingWelcome>, EngineError> {
-        self.pending_group_rejoins_for(None)
-    }
-
     /// Filter stored metadata before reading MLS state for consent tokens.
     pub fn pending_group_rejoins_for(
         &self,

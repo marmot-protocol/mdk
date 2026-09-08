@@ -2494,20 +2494,39 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
         "failed replacement must restore the original Marmot group record"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), before.epoch);
-    let offer = carol.pending_group_rejoins().unwrap().remove(0);
+    let offer = carol
+        .pending_group_rejoins_for(Some(&group_id))
+        .unwrap()
+        .remove(0);
     assert_eq!(offer.rejoin.as_ref().unwrap().welcomer, bob.self_id());
     let mut rewrapped = unauthorized_newer_welcome.clone();
     rewrapped.id = cgka_traits::MessageId::new(vec![0x91; 32]);
     assert!(carol.join_welcome(rewrapped.clone()).await.is_err());
-    assert_eq!(carol.pending_group_rejoins().unwrap().len(), 1);
+    assert_eq!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .len(),
+        1
+    );
     carol.decline_group_rejoin(&offer.message_id).unwrap();
-    assert!(carol.pending_group_rejoins().unwrap().is_empty());
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
     rewrapped.id = cgka_traits::MessageId::new(vec![0x92; 32]);
     assert!(matches!(
         carol.join_welcome(rewrapped).await,
         Err(EngineError::WelcomeAlreadyProcessed)
     ));
-    assert!(carol.pending_group_rejoins().unwrap().is_empty());
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
     let payload = app_payload_for(&carol, b"original state remains usable");
     carol
         .send(SendIntent::AppMessage { group_id, payload })

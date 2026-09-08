@@ -1093,12 +1093,6 @@ impl AccountDeviceSession {
         Ok(self.engine.retry_rejoins_after_trusted_removal().await?)
     }
 
-    pub fn pending_group_rejoins(
-        &self,
-    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
-        Ok(self.engine.pending_group_rejoins()?)
-    }
-
     pub fn pending_group_rejoins_for(
         &self,
         group_id: &GroupId,
