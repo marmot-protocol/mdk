@@ -3,25 +3,20 @@ use crate::connection::{CachedSql, retry_on_busy};
 use crate::storage::messages::{RELEASED_TRANSPORT_RECEIPT_CAPACITY, retire_transport_receipts};
 use crate::transport_reconciliation::GROUP_ROUTE_KIND;
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, TRANSPORT_RECONCILIATION_RETENTION_SECS, deserialize,
+    SqliteAccountStorage, SqliteResultExt, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     unix_now_seconds_i64,
 };
-use cgka_traits::{
-    OutboundFanout,
-    storage::{StorageError, StorageResult},
-};
+use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, named_params, params};
 
 const BATCH_MAX: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TransportReceiptRepairProgress {
-    /// Inventory entries and legacy fanout records inspected, including exclusions.
+    /// Inventory entries inspected, including exclusions.
     pub examined: usize,
     /// IDs whose possession is uncertain, not proven releases.
     pub repaired: usize,
-    /// Undecodable pending fanouts skipped without modifying their records.
-    pub skipped_fanouts: usize,
     pub has_more: bool,
 }
 
@@ -41,8 +36,9 @@ impl SqliteAccountStorage {
     /// before LIMIT (which could scan all accepted history). Fixed high waters
     /// cap the traversal; persisted cursors survive deletion and restart. No MLS,
     /// projection, retention floor or reconciliation cursor is modified.
-    /// Malformed fanouts cannot supply a signed alias: count and skip them,
-    /// preserving the row and its exact-ID exclusion. Normal Nostr own echoes
+    /// Nostr fanouts have always frozen an already-signed envelope; their
+    /// message_id is the outer event ID. An indexed key probe excludes them
+    /// without decoding records, including malformed ones. Normal own echoes
     /// retain outer-ID Sent rows and stay excluded after fanout settlement.
     /// Historical accepted wrappers without outer-ID evidence may be refetched;
     /// retained canonical records still deduplicate their content.
@@ -57,109 +53,42 @@ impl SqliteAccountStorage {
             let (inbox_kind, inbox_route) = inbox.storage_key();
             let job = conn
                 .query_row_cached(
-                    "SELECT account_label, fanout_after, fanout_until, fanout_done,
-                    route_after, event_after, route_until, event_until
-                 FROM app_historical_receipt_repair LIMIT 1",
+                    "SELECT account_label, route_after, event_after, route_until, event_until
+                     FROM app_historical_receipt_repair LIMIT 1",
                     [],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
-                            r.get::<_, i64>(1)?,
-                            r.get::<_, Option<i64>>(2)?,
-                            r.get::<_, bool>(3)?,
-                            r.get::<_, Vec<u8>>(4)?,
-                            r.get::<_, Vec<u8>>(5)?,
-                            r.get::<_, Option<Vec<u8>>>(6)?,
-                            r.get::<_, Option<Vec<u8>>>(7)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, Vec<u8>>(2)?,
+                            r.get::<_, Option<Vec<u8>>>(3)?,
+                            r.get::<_, Option<Vec<u8>>>(4)?,
                         ))
                     },
                 )
                 .optional()
                 .storage()?;
-            let Some((
-                label,
-                mut fanout_after,
-                fanout_until,
-                mut fanout_done,
-                mut route_after,
-                mut event_after,
-                route_until,
-                event_until,
-            )) = job
+            let Some((label, mut route_after, mut event_after, route_until, event_until)) = job
             else {
                 return Ok(TransportReceiptRepairProgress::default());
             };
-            let (fanout_until, route_until, event_until) = if let Some(fanout_until) = fanout_until
-            {
-                (
-                    fanout_until,
-                    route_until.unwrap_or_default(),
-                    event_until.unwrap_or_default(),
-                )
+            let (route_until, event_until) = if let Some(route_until) = route_until {
+                (route_until, event_until.unwrap_or_default())
             } else {
-                let fanout_until = conn
-                    .query_row_cached(
-                        "SELECT COALESCE(MAX(insert_order), 0) FROM cgka_outbound_fanout",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .storage()?;
                 let (route_until, event_until) = conn.query_row_cached(
                     "SELECT route_id, event_id FROM transport_reconciliation_items WHERE route_kind = ?1
                      ORDER BY route_id DESC, event_id DESC LIMIT 1", [GROUP_ROUTE_KIND], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, Vec<u8>>(1)?)))
                     .optional().storage()?.unwrap_or_default();
-                conn.execute_cached("UPDATE app_historical_receipt_repair SET fanout_until=?1, route_until=?2, event_until=?3 WHERE account_label=?4",
-                    params![fanout_until, route_until, event_until, label]).storage()?;
-                (fanout_until, route_until, event_until)
+                conn.execute_cached(
+                    "UPDATE app_historical_receipt_repair SET route_until=?1, event_until=?2 WHERE account_label=?3",
+                    params![route_until, event_until, label],
+                ).storage()?;
+                (route_until, event_until)
             };
             let mut progress = TransportReceiptRepairProgress {
                 has_more: true,
                 ..Default::default()
             };
-            // Old retained fanouts may be keyed by an inner ID. Their lifetime
-            // ends at settlement, but their per-account count has no hard cap.
-            // Index signed outer IDs in bounded pages before candidate selection
-            // instead of repeatedly decoding the entire pending send set.
-            if !fanout_done {
-                let rows = conn
-                    .prepare_cached(
-                        "SELECT insert_order, record FROM cgka_outbound_fanout
-                    WHERE insert_order > ?1 AND insert_order <= ?2 ORDER BY insert_order LIMIT ?3",
-                    )
-                    .storage()?
-                    .query_map(params![fanout_after, fanout_until, limit as i64], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-                    })
-                    .storage()?
-                    .collect::<Result<Vec<_>, _>>()
-                    .storage()?;
-                progress.examined += rows.len();
-                for (order, record) in rows {
-                    fanout_after = order;
-                    let fanout: OutboundFanout = match deserialize(&record) {
-                        Ok(fanout) => fanout,
-                        Err(StorageError::Serialization(_)) => {
-                            // No trustworthy alias is recoverable. Preserve the
-                            // record, but do not strand all later repair work.
-                            progress.skipped_fanouts += 1;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    if let Some(published) = fanout.published_message_id() {
-                        conn.execute_cached("INSERT INTO cgka_outbound_transport_receipt_ids(message_id,published_message_id)
-                            VALUES (?1,?2) ON CONFLICT(message_id) DO UPDATE SET published_message_id=excluded.published_message_id",
-                            params![fanout.message_id().as_slice(), published.as_slice()]).storage()?;
-                    }
-                }
-                fanout_done = progress.examined < limit || fanout_after == fanout_until;
-                conn.execute_cached("UPDATE app_historical_receipt_repair SET fanout_after=?1, fanout_done=?2 WHERE account_label=?3",
-                    params![fanout_after, fanout_done, label]).storage()?;
-            }
-            if !fanout_done || progress.examined == limit {
-                return Ok(progress);
-            }
-            let remaining = limit - progress.examined;
             let rows = conn
                 .prepare_cached(
                     "SELECT route_id, event_id, created_at FROM transport_reconciliation_items
@@ -176,7 +105,7 @@ impl SqliteAccountStorage {
                         ":event_after": event_after,
                         ":route_until": route_until,
                         ":event_until": event_until,
-                        ":limit": remaining as i64,
+                        ":limit": limit as i64,
                     },
                     |r| {
                         Ok((
@@ -189,7 +118,7 @@ impl SqliteAccountStorage {
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
-            let finished = rows.len() < remaining;
+            let finished = rows.len() < limit;
             progress.examined += rows.len();
             let now = unix_now_seconds_i64();
             let retention_floor =
@@ -209,7 +138,6 @@ impl SqliteAccountStorage {
                        AND NOT EXISTS(SELECT 1 FROM cgka_processed_transport_ids WHERE id = :event_id)
                        AND NOT EXISTS(SELECT 1 FROM cgka_ingress_dedup WHERE id = :event_id)
                        AND NOT EXISTS(SELECT 1 FROM cgka_outbound_fanout WHERE message_id = :event_id)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_outbound_transport_receipt_ids WHERE published_message_id = :event_id)
                        AND NOT EXISTS(SELECT 1 FROM cgka_welcomes WHERE message_id = :event_id)
                        AND NOT EXISTS(SELECT 1 FROM transport_reconciliation_items
                            WHERE route_kind = :inbox_kind AND route_id = :inbox_route AND event_id = :event_id)",
@@ -516,7 +444,7 @@ mod tests {
             );
             assert!(
                 conn.query_row(
-                    "SELECT fanout_until IS NULL FROM app_historical_receipt_repair",
+                    "SELECT route_until IS NULL FROM app_historical_receipt_repair",
                     [],
                     |r| r.get::<_, bool>(0)
                 )
@@ -571,7 +499,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT fanout_until IS NULL FROM app_historical_receipt_repair",
+                    "SELECT route_until IS NULL FROM app_historical_receipt_repair",
                     [],
                     |r| r.get::<_, bool>(0)
                 )
@@ -666,7 +594,6 @@ mod tests {
         let first = store.repair_uncertain_transport_receipts(1).unwrap();
         assert_eq!(first.examined, 1);
         assert_eq!(first.repaired, 0);
-        assert_eq!(first.skipped_fanouts, 1);
         assert!(first.has_more);
         store.close().unwrap();
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
@@ -684,98 +611,6 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             1
-        );
-    }
-
-    #[test]
-    fn signed_fanout_aliases_backfill_before_selection_and_new_writes_are_atomic() {
-        use cgka_traits::storage::OutboundFanoutStorage;
-        use cgka_traits::*;
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        seed(&store, 3);
-        let mut fanout = OutboundFanout::stage(
-            TransportPublishRequest {
-                account_id: MemberId::new(vec![0xbb; 32]),
-                message: TransportMessage {
-                    id: MessageId::new(vec![1; 32]),
-                    payload: vec![42],
-                    timestamp: Timestamp(1),
-                    causal_deps: vec![],
-                    source: TransportSource("test".into()),
-                    envelope: TransportEnvelope::GroupMessage {
-                        transport_group_id: vec![1; 32],
-                    },
-                },
-                target: TransportPublishTarget::Group {
-                    group_id: GroupId::new(vec![0xaa]),
-                    transport_group_id: vec![1; 32],
-                    endpoints: vec![TransportEndpoint("wss://relay.example".into())],
-                },
-                required_acks: 1,
-            },
-            None,
-            Some(GroupId::new(vec![0xaa])),
-            1,
-        )
-        .unwrap();
-        fanout
-            .record_published_message_id(MessageId::new(vec![2; 32]))
-            .unwrap();
-        // Simulate serialized pre-upgrade fanout, without the new alias index.
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO cgka_outbound_fanout(message_id,group_id,record) VALUES (?1,x'aa',?2)",
-                params![
-                    fanout.message_id().as_slice(),
-                    crate::serialize(&fanout).unwrap()
-                ],
-            )
-            .unwrap();
-        let first = store.repair_uncertain_transport_receipts(1).unwrap();
-        assert_eq!(first.examined, 1);
-        assert_eq!(first.repaired, 0);
-        assert!(first.has_more);
-        assert_eq!(drain(&store, 1), 1);
-        store.delete_outbound_fanout(fanout.message_id()).unwrap();
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT count(*) FROM cgka_outbound_transport_receipt_ids",
-                    [],
-                    |r| r.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        store.lock().unwrap().execute_batch("CREATE TRIGGER abort_alias BEFORE INSERT ON cgka_outbound_transport_receipt_ids BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
-        assert!(store.put_outbound_fanout(&fanout).is_err());
-        assert!(
-            store
-                .outbound_fanout(fanout.message_id())
-                .unwrap()
-                .is_none()
-        );
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER abort_alias")
-            .unwrap();
-        store.put_outbound_fanout(&fanout).unwrap();
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT published_message_id FROM cgka_outbound_transport_receipt_ids",
-                    [],
-                    |r| r.get::<_, Vec<u8>>(0)
-                )
-                .unwrap(),
-            vec![2; 32]
         );
     }
 }

@@ -1999,9 +1999,9 @@ const HISTORICAL_RECEIPT_REPAIR_BATCH_SIZE: usize = 256;
 /// A bounded page after startup hydration, before maintenance can backfill.
 /// Contention, capacity and unclassified backend failures retry next tick;
 /// proven corruption/schema/decode failures halt until the next process start.
-/// Malformed legacy fanouts are counted and skipped by storage itself.
+/// Fanout exclusions use indexed IDs without decoding legacy records.
 fn run_historical_receipt_repair_batch(client: &mut AppClient, enabled: &mut bool) {
-    if !client.runtime.session().unhydrated_group_ids().is_empty() {
+    if !*enabled || !client.runtime.session().unhydrated_group_ids().is_empty() {
         return;
     }
     run_historical_receipt_repair_batch_with(enabled, |limit| {
@@ -2013,9 +2013,6 @@ fn run_historical_receipt_repair_batch_with(
     enabled: &mut bool,
     repair: impl FnOnce(usize) -> Result<storage_sqlite::TransportReceiptRepairProgress, AppError>,
 ) {
-    if !*enabled {
-        return;
-    }
     let started = Instant::now();
     match repair(HISTORICAL_RECEIPT_REPAIR_BATCH_SIZE) {
         Ok(progress) => {
@@ -2026,7 +2023,6 @@ fn run_historical_receipt_repair_batch_with(
                     method = "repair_uncertain_transport_receipts",
                     examined = progress.examined,
                     uncertain_possession_repairs = progress.repaired,
-                    skipped_fanouts = progress.skipped_fanouts,
                     duration_ms = started.elapsed().as_millis() as u64,
                     has_more = progress.has_more,
                     "processed one bounded historical receipt repair batch"
@@ -5416,9 +5412,6 @@ mod tests {
             let mut enabled = true;
             run_historical_receipt_repair_batch_with(&mut enabled, |_| Err(error.into()));
             assert!(!enabled);
-            run_historical_receipt_repair_batch_with(&mut enabled, |_| {
-                unreachable!("a stopped repair must not call storage again")
-            });
         }
     }
 

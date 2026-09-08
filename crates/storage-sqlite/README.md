@@ -39,17 +39,14 @@ Applied migrations are recorded in `cgka_schema_migrations`. Opening an encrypte
 migrations after SQLCipher keying and before storage handles are exposed.
 
 Migration 0066 schedules a one-time historical transport receipt repair for existing account databases.
-It creates repair metadata and an empty outbound signed-ID index without scanning retained history on open.
-After readiness and group hydration, the app worker inspects at most 256 fanout/inventory rows per maintenance
-pass (the storage API caps a batch at 256). Transactional keyset cursors and fixed high waters allow restart
-and bound each pass, including when every inventory entry is excluded by possession evidence. Old fanout
-signed IDs are indexed before inventory selection; new fanout writes maintain that index atomically.
-The index covers retained pending fanouts, including ones written by older versions; it cascades away when
-those fanouts settle. Pending fanouts have no hard per-account count limit, so decoding the entire set on
-every pass would violate the bounded-work requirement even though reconnect/resume paths currently perform
-full fanout scans. This maintenance pass does not inherit those paths' unbounded cost. Undecodable legacy
-fanouts are counted and skipped without changing their rows or exact-ID exclusions, so one malformed record
-cannot strand the inventory sweep. Proven corruption, schema and decode failures elsewhere halt the sweep;
+It creates only repair metadata without scanning retained history on open. After readiness and group
+hydration, the app worker inspects at most 256 inventory rows per maintenance pass (also the storage cap).
+Transactional keyset cursors and a fixed high water allow restart and bound each pass, including when every
+inventory entry is excluded by possession evidence. Retained Nostr fanouts are already keyed by the signed
+outer event ID: signing precedes engine persistence and fanout staging, including in the historical version
+that introduced fanout storage. An indexed message-ID probe therefore excludes them without an alias table,
+a fanout scan or any record decoding. Malformed fanout records retain their exact-ID exclusion without
+blocking unrelated inventory repair. Proven corruption, schema and decode failures elsewhere halt the sweep;
 lock contention, capacity and unclassified backend failures retry on the next tick. Closed handles stop quietly.
 
 Only retained group-route inventory entries without raw/message, processed-marker, ingress-dedup, Welcome,
@@ -65,7 +62,7 @@ relay history limit recovery; this repair cannot reconstruct missing relay histo
 The scan intentionally has no release-date cutoff on event `created_at`: that is the sender's signed authored
 time, not the local receipt/deletion time, and account upgrades may occur well after a release. The retained
 window and fixed keyset high water define its scope instead. A full 16,384-entry route needs 64 inventory
-passes (roughly 16 minutes of active worker time at a 15-second cadence, plus any fanout indexing passes).
+passes (roughly 16 minutes of active worker time at a 15-second cadence).
 The query-work regression checks 256-entry first/last pages against 512 and 16,384 retained entries; it bounds
 SQL work, not device latency. Large or multi-route histories can still require many maintenance ticks.
 

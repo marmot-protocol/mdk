@@ -6,17 +6,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     // Only metadata at upgrade: neither inventory nor serialized fanouts are
     // scanned on open. New accounts have no historical work to schedule.
     tx.execute_batch(
-        "CREATE TABLE cgka_outbound_transport_receipt_ids (
-             message_id BLOB PRIMARY KEY REFERENCES cgka_outbound_fanout(message_id) ON DELETE CASCADE,
-             published_message_id BLOB NOT NULL
-         );
-         CREATE INDEX idx_outbound_transport_receipt_id
-             ON cgka_outbound_transport_receipt_ids(published_message_id);
-         CREATE TABLE app_historical_receipt_repair (
+        "CREATE TABLE app_historical_receipt_repair (
              account_label TEXT PRIMARY KEY REFERENCES account_state(label) ON DELETE CASCADE,
-             fanout_after INTEGER NOT NULL DEFAULT 0,
-             fanout_until INTEGER,
-             fanout_done INTEGER NOT NULL DEFAULT 0,
              route_after BLOB NOT NULL DEFAULT x'',
              event_after BLOB NOT NULL DEFAULT x'',
              route_until BLOB,

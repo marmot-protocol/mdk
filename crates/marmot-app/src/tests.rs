@@ -19373,15 +19373,15 @@ fn historical_receipt_repair_replays_released_input_before_checkpoint_and_after_
 
 #[tokio::test]
 async fn historical_accepted_wrapper_repair_preserves_exact_once_public_projection() {
-    historical_wrapper_repair_preserves_projection("bob").await;
+    historical_wrapper_repair_preserves_projection("bob", false).await;
 }
 
 #[tokio::test]
 async fn historical_settled_own_echo_is_excluded_from_receipt_repair() {
-    historical_wrapper_repair_preserves_projection("alice").await;
+    historical_wrapper_repair_preserves_projection("alice", true).await;
 }
 
-async fn historical_wrapper_repair_preserves_projection(label: &str) {
+async fn historical_wrapper_repair_preserves_projection(label: &str, sender: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -19423,7 +19423,7 @@ async fn historical_wrapper_repair_preserves_projection(label: &str) {
     let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("unexpected overflow");
     };
-    let mut client = if label == "alice" { alice } else { bob_client };
+    let mut client = if sender { alice } else { bob_client };
     let mut delivery = *delivery;
     delivery.account_id = client.adapter.account_id().clone();
     let id = delivery.message.id.clone();
@@ -19442,10 +19442,10 @@ async fn historical_wrapper_repair_preserves_projection(label: &str) {
             |r| r.get::<_, i64>(0),
         )
         .unwrap(),
-        i64::from(label == "alice"),
+        i64::from(sender),
         "only the sender retains an exact outer-ID message row"
     );
-    if label == "alice" {
+    if sender {
         assert_eq!(
             conn.query_row("SELECT count(*) FROM cgka_outbound_fanout", [], |r| r
                 .get::<_, i64>(0))
@@ -19493,7 +19493,7 @@ async fn historical_wrapper_repair_preserves_projection(label: &str) {
             .contains(&hex::encode(id.as_slice()))
     );
     let progress = client.repair_uncertain_transport_receipts(256).unwrap();
-    if label == "alice" {
+    if sender {
         assert_eq!(progress.repaired, 0, "settled own echoes stay excluded");
     } else {
         assert!(progress.repaired >= 1);
@@ -19502,7 +19502,7 @@ async fn historical_wrapper_repair_preserves_projection(label: &str) {
         client
             .seen_events_index
             .contains(&hex::encode(id.as_slice())),
-        label == "alice",
+        sender,
     );
     client
         .ingest_received_delivery(delivery.clone())

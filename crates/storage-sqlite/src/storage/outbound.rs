@@ -220,20 +220,12 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
                 ],
             )
             .storage()?;
-            if let Some(published) = fanout.published_message_id() {
-                conn.execute_cached(
-                    "INSERT INTO cgka_outbound_transport_receipt_ids(message_id,published_message_id)
-                     VALUES (?1,?2) ON CONFLICT(message_id) DO UPDATE SET
-                        published_message_id=excluded.published_message_id",
-                    params![fanout.message_id().as_slice(), published.as_slice()],
-                ).storage()?;
-            }
             Ok(())
         };
         if self.connection.is_current_thread_transaction_owner() {
             write()
         } else {
-            retry_on_busy(|| self.connection.with_transaction(write))
+            retry_on_busy(write)
         }
     }
 
