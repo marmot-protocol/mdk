@@ -206,6 +206,54 @@ class InboundSpoolTests(unittest.TestCase):
             self.assertEqual("pending", store.get(event(1)["message_id_hex"]).state)
             store.close()
 
+    def test_expired_terminal_pages_are_reused_for_repeated_refill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(
+                Path(tmp) / "spool.sqlite3",
+                max_bytes=1024 * 1024,
+                terminal_retention_s=0,
+            )
+            store.open()
+            payload = "x" * (600 * 1024)
+
+            def seed_expired_terminal(item):
+                serialized = json.dumps(item, separators=(",", ":"), sort_keys=True)
+                now = time.time()
+                db = store._require_db()
+                with db:
+                    db.execute("DELETE FROM events")
+                    db.execute(
+                        "INSERT INTO events(account_id,group_id,message_id,state,event_json,"
+                        "source_ids_json,reply_anchor,attempts,next_attempt_at,disposition,"
+                        "created_at,changed_at) VALUES(?,?,?,'failed',?,'[]',NULL,0,0,'',?,?)",
+                        (
+                            item["account_id_hex"],
+                            item["group_id_hex"],
+                            item["message_id_hex"],
+                            serialized,
+                            now - 10,
+                            now - 10,
+                        ),
+                    )
+                store._checkpoint_and_verify_bound()
+
+            seed = event(1)
+            seed["text"] = payload
+            seed_expired_terminal(seed)
+            for index in range(2, 5):
+                item = event(index)
+                item["text"] = payload
+                inserted, state = store.record(item)
+                self.assertTrue(inserted)
+                self.assertEqual("pending", state)
+                self.assertIsNone(store.get(seed["message_id_hex"]))
+                self.assertLessEqual(store._allocated_bytes(), store.max_bytes)
+                seed_expired_terminal(item)
+                seed = item
+
+            self.assertEqual({"failed": 1}, store.snapshot())
+            store.close()
+
     def test_gc_never_evicts_live_handed_by_retention_or_count(self):
         for kwargs in (
             {"terminal_retention_s": 0},

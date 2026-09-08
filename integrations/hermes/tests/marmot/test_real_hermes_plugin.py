@@ -233,6 +233,87 @@ async def _exercise_media_routes(adapter_module, platform_config, temp_root: Pat
     return {"connector_calls": len(fake.calls), "routes": routes}
 
 
+async def _exercise_busy_session_crash_boundary(adapter_module, platform_config, temp_root: Path):
+    """Use the pinned real BasePlatformAdapter busy path, then lose host memory."""
+
+    config = platform_config(
+        enabled=True,
+        extra={
+            "account_id_hex": "11" * 32,
+            "home": str(temp_root / "busy-session-marmot-home"),
+            "group_activation": "always",
+            "profile_name_onboarding": False,
+        },
+    )
+    adapter = adapter_module.MarmotPlatformAdapter(config, client=object())
+    handler_started = asyncio.Event()
+
+    async def blocking_handler(_event):
+        handler_started.set()
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(blocking_handler)
+
+    def inbound(message_id: str, text: str):
+        return {
+            "marmot_agent_control": "marmot.agent-control.v2",
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message": {
+                "message_id_hex": message_id,
+                "sender": {
+                    "account_id_hex": "44" * 32,
+                    "display_name": "tester",
+                    "is_self": False,
+                },
+                "text": text,
+                "recorded_at": 0,
+                "media": [],
+            },
+            "mentions_self": True,
+        }
+
+    first_id = "33" * 32
+    followup_id = "55" * 32
+    await adapter._handle_control_event(inbound(first_id, "first"))
+    await asyncio.wait_for(handler_started.wait(), timeout=2)
+    await adapter._inbound_queue.join()
+    await adapter._handle_control_event(inbound(followup_id, "busy follow-up"))
+    await adapter._inbound_queue.join()
+
+    if not adapter._pending_messages:
+        raise AssertionError("real Hermes did not take the busy-session pending path")
+    before_crash = adapter._inbound_spool.get(followup_id)
+    if before_crash is None or before_crash.state != "unresolved":
+        raise AssertionError(
+            f"busy follow-up was not preserved as unknown before crash: {before_crash!r}"
+        )
+
+    # Model abrupt process loss: durable storage survives while every in-memory
+    # pending message and host task disappears without a graceful spool release.
+    adapter._inbound_spool.close(graceful=False)
+    adapter._pending_messages.clear()
+    for task in tuple(adapter._session_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*tuple(adapter._session_tasks.values()), return_exceptions=True)
+    adapter._session_tasks.clear()
+    adapter._active_sessions.clear()
+
+    recovery = adapter._inbound_spool.open()
+    try:
+        after_crash = adapter._inbound_spool.get(followup_id)
+        if after_crash is None or after_crash.state != "unresolved":
+            raise AssertionError(
+                f"busy follow-up disappeared or claimed completion after crash: {after_crash!r}"
+            )
+        if after_crash.disposition != "host_handoff_outcome_unknown":
+            raise AssertionError(f"unexpected busy follow-up disposition: {after_crash!r}")
+        return {"state": after_crash.state, "recovery": recovery}
+    finally:
+        adapter._inbound_spool.close()
+
+
 def _module_matches_path(module, expected: Path) -> bool:
     module_file = getattr(module, "__file__", None)
     return isinstance(module_file, str) and Path(module_file).resolve() == expected
@@ -450,11 +531,17 @@ def main() -> int:
         media_calls = asyncio.run(
             _exercise_media_routes(adapter_module, config_module.PlatformConfig, home)
         )
+        busy_session = asyncio.run(
+            _exercise_busy_session_crash_boundary(
+                adapter_module, config_module.PlatformConfig, home
+            )
+        )
 
         print(
             "real-hermes plugin install/discovery/media passed "
             f"(hermes_source={hermes_source}, mdk_ref={resolved_ref}, "
-            f"source_install_mode={source_install_mode}, media_calls={media_calls})"
+            f"source_install_mode={source_install_mode}, media_calls={media_calls}, "
+            f"busy_session={busy_session})"
         )
     return 0
 

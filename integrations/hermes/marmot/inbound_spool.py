@@ -184,7 +184,7 @@ class InboundSpool:
                 pending = int(db.execute(
                     "SELECT count(*) FROM events WHERE state IN ('pending','claimed','coalesced')"
                 ).fetchone()[0])
-                if pending >= self.max_pending or self._allocated_bytes() + len(payload.encode("utf-8")) > self.max_bytes:
+                if pending >= self.max_pending or self._live_allocated_bytes() + len(payload.encode("utf-8")) > self.max_bytes:
                     raise InboundSpoolFull("inbound spool capacity exhausted")
                 db.execute(
                     "INSERT INTO events(account_id,group_id,message_id,state,event_json,source_ids_json,"
@@ -326,7 +326,20 @@ class InboundSpool:
             if changed != 1:
                 raise StaleClaim("inbound claim lost a compare-and-set race")
             row = db.execute("SELECT * FROM events WHERE message_id=?", (message_id,)).fetchone()
-        self._checkpoint_and_verify_bound()
+        try:
+            self._checkpoint_and_verify_bound()
+        except Exception:
+            # The claim transaction has already committed. If post-commit
+            # checkpoint/permission verification fails, compensate the owned
+            # row immediately so the same process can retry it and preserve FIFO.
+            with db:
+                db.execute(
+                    "UPDATE events SET state='pending',owner_id=NULL,generation=NULL,next_attempt_at=0,"
+                    "disposition='claim_post_commit_verification_failed',changed_at=? "
+                    "WHERE message_id=? AND state='claimed' AND owner_id=? AND generation=?",
+                    (time.time(), message_id, self.owner_id, self.generation),
+                )
+            raise
         return self._record_from_row(row)
 
     def defer(self, message_id: str, *, delay_s: float, reason: str) -> None:
@@ -483,6 +496,13 @@ class InboundSpool:
             except FileNotFoundError:
                 pass
         return total
+
+    def _live_allocated_bytes(self) -> int:
+        """Return allocated bytes excluding reusable SQLite freelist pages."""
+        db = self._require_db()
+        page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+        reusable = int(db.execute("PRAGMA freelist_count").fetchone()[0]) * page_size
+        return max(0, self._allocated_bytes() - reusable)
 
     def _checkpoint_and_verify_bound(self) -> None:
         db = self._require_db()

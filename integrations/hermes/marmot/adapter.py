@@ -1414,6 +1414,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         )
         self._inbound_spool_retry_task: Optional[asyncio.Task] = None
         self._inbound_spool_wakeup = asyncio.Event()
+        # Disconnect fences durable admission before cancelling any producer or
+        # queue task. Direct unit/harness use starts enabled; connect() restores
+        # the fence only after the spool has opened successfully.
+        self._inbound_spool_admission_enabled = True
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
         self.profile_name_onboarding = (
             ProfileNameOnboardingStore(resolve_profile_onboarding_state_path(extra, self.socket_path))
@@ -1477,6 +1481,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         }
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._inbound_spool_admission_enabled = False
         try:
             await self._ensure_account_id()
             await self._sync_welcomer_allowlist()
@@ -1488,6 +1493,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     recovery["reclaimed"],
                     recovery["unresolved"],
                 )
+            self._inbound_spool_admission_enabled = True
             if self._inbound_spool_retry_task is None:
                 self._inbound_spool_retry_task = asyncio.create_task(
                     self._run_inbound_spool_retry_loop()
@@ -1497,6 +1503,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._mark_connected()
             return True
         except Exception as exc:
+            self._inbound_spool_admission_enabled = False
             logger.error("Failed to connect Marmot adapter: %s", exc)
             set_fatal = getattr(self, "_set_fatal_error", None)
             if callable(set_fatal):
@@ -1518,6 +1525,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.debug("Marmot welcomer allowlist sync failed", exc_info=True)
 
     async def disconnect(self) -> None:
+        # Fence every due-admission path before cancellation. A cancelled handed
+        # task may make its FIFO successor eligible; shutdown must not enqueue a
+        # task after KeyedAsyncQueue.cancel_all() has taken its snapshot.
+        self._inbound_spool_admission_enabled = False
         if self._listener_task is not None:
             self._listener_task.cancel()
             try:
@@ -1532,8 +1543,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._inbound_spool_retry_task = None
-        await self._inbound_queue.cancel_all()
-        await self._cancel_all_streams("adapter disconnect")
+        # Stop debounce producers and release their durable rows before draining
+        # the keyed queue. Its task finalizers can only wake the now-fenced spool.
         try:
             self._cancel_debounce_tasks()
         except Exception:
@@ -1548,6 +1559,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.error("Marmot inbound debounce disconnect release failed", exc_info=True)
         finally:
             self._debounce_release_pending.clear()
+        await self._inbound_queue.cancel_all()
+        await self._cancel_all_streams("adapter disconnect")
         self._pending_ambient_context.clear()
         self._last_inbound_message_ids.clear()
         self._activation_cache.clear()
@@ -2810,6 +2823,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             except asyncio.TimeoutError:
                 pass
             self._inbound_spool_wakeup.clear()
+            if not self._inbound_spool_admission_enabled:
+                continue
             try:
                 self._retry_pending_debounce_releases()
             except Exception:
@@ -2832,7 +2847,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     logger.error("Marmot inbound spool retry admission failed", exc_info=True)
 
     def _admit_due_spooled(self) -> None:
-        if not self._inbound_spool.is_open:
+        if not self._inbound_spool_admission_enabled or not self._inbound_spool.is_open:
             return
         try:
             records = self._inbound_spool.due()
@@ -2847,6 +2862,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 logger.error("Marmot inbound spool admission failed", exc_info=True)
 
     def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
+        if not self._inbound_spool_admission_enabled:
+            return False
         try:
             record = self._inbound_spool.claim(message_id_hex, ignore_backoff=ignore_backoff)
         except StaleClaim:
@@ -3097,12 +3114,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 spool_state = "handed"
             await self.handle_message(hermes_event)
             if spool_message_id:
+                # BasePlatformAdapter.handle_message() returns after an in-memory
+                # handoff: it may only have queued a busy-session follow-up or
+                # spawned background processing. Hermes exposes no durable-start
+                # or finality callback here, so never claim completion.
                 self._inbound_spool.transition(
                     spool_message_id,
-                    "completed",
-                    "host_returned",
+                    "unresolved",
+                    "host_handoff_outcome_unknown",
                 )
-                spool_state = "completed"
+                spool_state = "unresolved"
         except asyncio.CancelledError:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             if spool_message_id and spool_state == "claimed":

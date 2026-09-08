@@ -3904,11 +3904,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
         self.assertEqual(
-            "completed",
+            "unresolved",
             adapter._inbound_spool.get(first["message_id_hex"]).state,
         )
         self.assertEqual(
-            "completed",
+            "unresolved",
             adapter._inbound_spool.get(second["message_id_hex"]).state,
         )
 
@@ -6657,7 +6657,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await adapter._inbound_queue.join()
         self.assertEqual(["claimed"], observed)
         record = adapter._inbound_spool.get(message_id)
-        self.assertEqual("completed", record.state)
+        self.assertEqual("unresolved", record.state)
+        self.assertEqual("host_handoff_outcome_unknown", record.disposition)
         self.assertEqual("durable", record.event["text"])
         adapter._inbound_spool.close()
 
@@ -6684,7 +6685,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter._admit_due_spooled()
         await adapter._inbound_queue.join()
         delivered = adapter._inbound_spool.get("33" * 32)
-        self.assertEqual("completed", delivered.state)
+        self.assertEqual("unresolved", delivered.state)
         self.assertEqual(attempts, delivered.attempts)
         self.assertEqual([item.text for item in adapter.events], ["durable"])
         adapter._inbound_spool.close()
@@ -6759,10 +6760,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["first", "second"], [event.text for event in adapter.events])
         self.assertEqual(
-            "completed", adapter._inbound_spool.get(first["message_id_hex"]).state
+            "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
         )
         self.assertEqual(
-            "completed", adapter._inbound_spool.get(second["message_id_hex"]).state
+            "unresolved", adapter._inbound_spool.get(second["message_id_hex"]).state
         )
         adapter._inbound_spool.close()
 
@@ -6836,8 +6837,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
 
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
-        self.assertEqual("completed", adapter._inbound_spool.get("33" * 32).state)
-        self.assertEqual("completed", adapter._inbound_spool.get("55" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("55" * 32).state)
         adapter._inbound_spool.close()
 
     async def test_failed_debounce_release_retries_without_restart(self):
@@ -6878,7 +6879,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
-            self.assertEqual("completed", adapter._inbound_spool.get("33" * 32).state)
+            self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
             self.assertEqual({}, adapter._debounce_release_pending)
             self.assertFalse(retry.done())
         finally:
@@ -6943,8 +6944,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(2, release_attempts)
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
-        self.assertEqual("completed", adapter._inbound_spool.get("33" * 32).state)
-        self.assertEqual("completed", adapter._inbound_spool.get("55" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("55" * 32).state)
         adapter._inbound_spool.close()
 
     async def test_disconnect_survives_unexpected_release_exception_and_reopen_recovers_once(self):
@@ -6969,6 +6970,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         adapter._inbound_spool.release_debounce = original_release
         adapter._ensure_inbound_spool_open()
+        adapter._inbound_spool_admission_enabled = True
         recovered = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("pending", recovered.state)
         self.assertEqual("recovered_debounce_buffer", recovered.disposition)
@@ -6977,6 +6979,96 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter._admit_due_spooled()
         await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
         self.assertEqual([item.text for item in adapter.events], ["recover after reopen"])
+        adapter._inbound_spool.close()
+
+    async def test_disconnect_fences_successor_admission_before_queue_cancel(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first")
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        first_claim = adapter._inbound_spool.claim(first["message_id_hex"])
+        handed = asyncio.Event()
+        calls = []
+
+        async def blocking_handle(message):
+            calls.append(message.text)
+            handed.set()
+            await asyncio.Event().wait()
+
+        adapter.handle_message = blocking_handle
+        adapter._inbound_queue.enqueue(
+            first_claim.group_id,
+            lambda: adapter._dispatch_inbound_message(
+                first_claim.event, spool_message_id=first_claim.message_id
+            ),
+        )
+        await asyncio.wait_for(handed.wait(), timeout=1)
+
+        await adapter.disconnect()
+
+        self.assertEqual(["first"], calls)
+        self.assertFalse(adapter._inbound_spool_admission_enabled)
+        self.assertEqual(set(), adapter._inbound_queue._pending)
+        self.assertFalse(adapter._inbound_spool.is_open)
+        adapter._inbound_spool.open()
+        try:
+            self.assertEqual(
+                "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+            )
+            self.assertEqual(
+                "pending", adapter._inbound_spool.get(second["message_id_hex"]).state
+            )
+        finally:
+            adapter._inbound_spool.close()
+
+    async def test_post_commit_claim_verification_error_retries_once_and_preserves_fifo(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first")
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        original_verify = adapter._inbound_spool._checkpoint_and_verify_bound
+        failed_once = False
+
+        def fail_once():
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise self.adapter_module.InboundSpoolError(
+                    "synthetic post-commit claim verification failure"
+                )
+            return original_verify()
+
+        adapter._inbound_spool._checkpoint_and_verify_bound = fail_once
+        with self.assertRaisesRegex(
+            self.adapter_module.InboundSpoolError, "post-commit claim"
+        ):
+            adapter._try_admit_spooled(first["message_id_hex"])
+        recovered = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("pending", recovered.state)
+        self.assertEqual("claim_post_commit_verification_failed", recovered.disposition)
+
+        adapter._inbound_spool._checkpoint_and_verify_bound = original_verify
+        adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual(["first", "second"], [message.text for message in adapter.events])
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+        )
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(second["message_id_hex"]).state
+        )
         adapter._inbound_spool.close()
 
     async def test_retry_loop_survives_unexpected_debounce_release_exception(self):
