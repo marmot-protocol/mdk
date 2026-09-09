@@ -28,11 +28,12 @@
 //!
 //! ## HTML is not parsed
 //!
-//! Unlike CommonMark proper, this parser **does not** recognize HTML
+//! Unlike CommonMark proper, this parser **does not** recognize general HTML
 //! blocks or raw HTML inlines. Tag-like sequences (`<div>`, `<!-- ... -->`,
 //! etc.) are passed through as literal text and HTML-escaped at render
 //! time. Only autolinks — `<scheme:body>` and `<email@host>` — get
-//! structured treatment.
+//! structured treatment, plus a bounded [`Block::Details`] extension for
+//! structural `<details>` / `<summary>` lines (see the crate README).
 //!
 //! ## Untrusted destinations
 //!
@@ -60,6 +61,7 @@
 pub mod ast;
 mod block;
 mod destination;
+mod details;
 mod entity;
 mod inline;
 mod nostr;
@@ -95,6 +97,13 @@ pub use destination::classify_link_destination;
 ///   literal.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
+/// - Bounded `<details>` / `<summary>` disclosure blocks. The opener and
+///   closer each occupy their own logical line after quote/list prefixes and
+///   at most three columns of local indent. Compact one-line HTML stays
+///   literal. Recognition is limited to a 65536-byte original-source prefix
+///   and a 4096-byte structural tag cap. Missing or empty summaries yield an
+///   empty `summary` list; clients may localize a fallback label. Failed
+///   candidates remain ordinary Markdown with their tags literal.
 /// - Nostr bare mentions (`@npub1…`) and URIs (`nostr:<hrp>1…`) for the
 ///   whitelisted HRPs `npub`, `note`, `nevent`, `nprofile`, `naddr`,
 ///   `nrelay`. `nsec` is deliberately rejected from the ergonomic
@@ -109,4 +118,30 @@ pub use destination::classify_link_destination;
 pub fn parse(input: &str) -> Document {
     let (blocks, blank_lines_before, refs) = block::parse_blocks(input);
     inline::parse_inlines(blocks, blank_lines_before, &refs)
+}
+
+#[cfg(test)]
+mod details_work_tests {
+    use super::*;
+    use crate::details::Work;
+
+    #[test]
+    fn many_failed_openers_stay_linear() {
+        let mut md = String::new();
+        for _ in 0..200 {
+            md.push_str("<details>\n");
+        }
+        md.push_str("tail\n");
+        let doc = parse(&md);
+        assert!(
+            !doc.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Details { .. }))
+        );
+        let work = Work::get();
+        assert!(
+            work < 200 * 64,
+            "failed openers must not rescan quadratically, work={work}"
+        );
+    }
 }

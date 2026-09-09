@@ -8,45 +8,53 @@
 ///
 /// The iterator yields one item per line; if the input ends without a
 /// trailing newline, the final partial line is still yielded.
-pub(crate) fn lines(input: &str) -> Lines<'_> {
-    Lines { rest: input }
+#[allow(dead_code)]
+pub(crate) fn lines(input: &str) -> impl Iterator<Item = &str> {
+    lines_with_offsets(input).map(|(line, _)| line)
 }
 
-pub(crate) struct Lines<'a> {
-    rest: &'a str,
+/// Yield `(line, start_byte_offset)` over original source, matching [`lines`].
+pub(crate) fn lines_with_offsets(input: &str) -> LinesWithOffsets<'_> {
+    LinesWithOffsets { input, pos: 0 }
 }
 
-impl<'a> Iterator for Lines<'a> {
-    type Item = &'a str;
+pub(crate) struct LinesWithOffsets<'a> {
+    input: &'a str,
+    pos: usize,
+}
 
-    fn next(&mut self) -> Option<&'a str> {
-        if self.rest.is_empty() {
+impl<'a> Iterator for LinesWithOffsets<'a> {
+    type Item = (&'a str, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.input.len() {
             return None;
         }
-        let bytes = self.rest.as_bytes();
-        let mut i = 0;
+        let start = self.pos;
+        let bytes = self.input.as_bytes();
+        let mut i = start;
         while i < bytes.len() {
             match bytes[i] {
                 b'\n' => {
-                    let line = &self.rest[..i];
-                    self.rest = &self.rest[i + 1..];
-                    return Some(line);
+                    let line = &self.input[start..i];
+                    self.pos = i + 1;
+                    return Some((line, start));
                 }
                 b'\r' => {
-                    let line = &self.rest[..i];
+                    let line = &self.input[start..i];
                     let mut step = 1;
                     if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
                         step = 2;
                     }
-                    self.rest = &self.rest[i + step..];
-                    return Some(line);
+                    self.pos = i + step;
+                    return Some((line, start));
                 }
                 _ => i += 1,
             }
         }
-        let line = self.rest;
-        self.rest = "";
-        Some(line)
+        let line = &self.input[start..];
+        self.pos = self.input.len();
+        Some((line, start))
     }
 }
 

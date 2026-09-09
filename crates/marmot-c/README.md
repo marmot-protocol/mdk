@@ -54,6 +54,11 @@ int main(void) {
 }
 ```
 
+`MarmotMarkdownBlock` appends an additive `Details` tag whose fields live
+behind `MarmotMarkdownDetails`. Existing discriminants and union stride stay
+the same; regenerate `marmot.h` and consumer bindings to handle the new tag.
+Older clients cannot render it.
+
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it

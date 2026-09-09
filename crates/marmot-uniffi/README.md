@@ -15,6 +15,11 @@ package that shared surface:
 The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
 same UniFFI surface, and releases publish it once.
 
+`MarkdownBlockFfi` now includes an additive `Details` variant for bounded
+`<details>` / `<summary>` display blocks. Hosts must regenerate Swift/Kotlin
+bindings to handle the new tag; older generated sources cannot render it.
+No generated Swift or Kotlin files are committed here.
+
 See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
 checksums, provenance, and generated-source synchronization rules.
 

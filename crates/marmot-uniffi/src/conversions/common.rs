@@ -72,3 +72,21 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
     }
     Ok(GroupId::new(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown::MarkdownBlockFfi;
+
+    #[test]
+    fn chat_tokens_include_details_blocks() {
+        let tokens = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>More</summary>\nbody\n</details>",
+        );
+        assert!(matches!(tokens.blocks[0], MarkdownBlockFfi::Details { .. }));
+        let other =
+            markdown_content_tokens(1, "<details>\n<summary>More</summary>\nbody\n</details>");
+        assert!(other.blocks.is_empty());
+    }
+}

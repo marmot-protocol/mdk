@@ -113,3 +113,8 @@ fn nested_containers() {
 fn bare_urls() {
     assert_golden("bare_urls");
 }
+
+#[test]
+fn details() {
+    assert_golden("details");
+}

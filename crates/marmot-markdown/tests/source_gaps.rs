@@ -259,16 +259,37 @@ fn inline_parsing_is_unchanged_by_source_gap_metadata() {
 fn details_and_code_spans_keep_their_existing_ast_shape() {
     let document = parse("<details>\n<summary>More</summary>\n\n`code`\n\n</details>");
 
-    assert_eq!(document.blank_lines_before, vec![0, 1, 1]);
-    let marmot_markdown::Block::Paragraph { inlines } = &document.blocks[1] else {
+    assert_eq!(document.blank_lines_before, vec![0]);
+    let marmot_markdown::Block::Details {
+        summary,
+        open,
+        body,
+        blank_lines_before,
+    } = &document.blocks[0]
+    else {
+        panic!("recognized disclosure");
+    };
+    assert!(!open);
+    assert_eq!(summary, &[marmot_markdown::Inline::Text("More".to_owned())]);
+    assert_eq!(blank_lines_before, &vec![1]);
+    assert_eq!(body.len(), 1);
+    let marmot_markdown::Block::Paragraph { inlines } = &body[0] else {
         panic!("code span should remain in a paragraph");
     };
     assert_eq!(inlines, &[marmot_markdown::Inline::Code("code".to_owned())]);
-    let marmot_markdown::Block::Paragraph { inlines } = &document.blocks[2] else {
-        panic!("closing details tag should remain paragraph text");
-    };
-    assert_eq!(
-        inlines,
-        &[marmot_markdown::Inline::Text("</details>".to_owned())]
+}
+
+#[test]
+fn literal_details_tags_remain_when_unclosed() {
+    let document = parse("<details>\n<summary>More</summary>\n\n`code`");
+    assert!(
+        !document
+            .blocks
+            .iter()
+            .any(|block| matches!(block, marmot_markdown::Block::Details { .. }))
     );
+    let marmot_markdown::Block::Paragraph { inlines } = document.blocks.last().unwrap() else {
+        panic!("code span should remain in a paragraph");
+    };
+    assert_eq!(inlines, &[marmot_markdown::Inline::Code("code".to_owned())]);
 }

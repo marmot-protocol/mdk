@@ -665,7 +665,9 @@ fn max_container_depth(blocks: &[Block]) -> usize {
 
 fn max_single_block_container_depth(block: &Block) -> usize {
     match block {
-        Block::BlockQuote { blocks, .. } => 1 + max_container_depth(blocks),
+        Block::BlockQuote { blocks, .. } | Block::Details { body: blocks, .. } => {
+            1 + max_container_depth(blocks)
+        }
         Block::List { items, .. } => {
             1 + items
                 .iter()

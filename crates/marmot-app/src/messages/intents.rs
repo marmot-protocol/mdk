@@ -109,6 +109,12 @@ fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<Str
         }
         // Code blocks, math blocks, and thematic breaks carry no inline
         // mentions.
+        Block::Details { summary, body, .. } => {
+            collect_inline_mention_hexes(summary, out);
+            for block in body {
+                collect_block_mention_hexes(block, out);
+            }
+        }
         Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => {}
     }
 }
@@ -817,6 +823,36 @@ mod mention_tests {
         let capped = markdown_mention_scan_input(&input);
         assert_eq!(capped, "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
         assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    #[test]
+    fn mention_p_tags_walk_details_summary_and_body() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let closed = format!("<details>\n<summary>hi @{npub}</summary>\nalso @{npub}\n</details>");
+        let opened =
+            format!("<details open>\n<summary>hi @{npub}</summary>\nalso @{npub}\n</details>");
+        assert_eq!(
+            mention_p_tags(&closed),
+            vec![vec!["p".to_owned(), hex.clone()]]
+        );
+        assert_eq!(
+            mention_p_tags(&opened),
+            vec![vec!["p".to_owned(), hex.clone()]]
+        );
+        let nested = format!(
+            "<details>\n<summary>outer</summary>\n<details>\n<summary>@{npub}</summary>\n</details>\n</details>"
+        );
+        assert_eq!(
+            mention_p_tags(&nested),
+            vec![vec!["p".to_owned(), hex.clone()]]
+        );
+        let in_code =
+            format!("<details>\n<summary>`@{npub}`</summary>\n```\n@{npub}\n```\n</details>");
+        assert!(mention_p_tags(&in_code).is_empty());
+        let ignored_attr =
+            format!("<details title=\"@{npub}\">\n<summary>plain</summary>\nbody\n</details>");
+        assert!(mention_p_tags(&ignored_attr).is_empty());
     }
 
     #[test]

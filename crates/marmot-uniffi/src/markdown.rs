@@ -65,6 +65,13 @@ pub enum MarkdownBlockFfi {
     MathBlock {
         content: String,
     },
+    Details {
+        summary: Vec<MarkdownInlineFfi>,
+        open: bool,
+        body: Vec<MarkdownBlockFfi>,
+        /// Blank source lines before each corresponding body block.
+        blank_lines_before: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -294,6 +301,20 @@ fn markdown_block_from_md(value: MdBlock, depth: usize) -> MarkdownBlockFfi {
                 .collect(),
         },
         MdBlock::MathBlock { content } => MarkdownBlockFfi::MathBlock { content },
+        MdBlock::Details {
+            summary,
+            open,
+            body,
+            blank_lines_before,
+        } => MarkdownBlockFfi::Details {
+            summary: markdown_inlines_from_md(summary, 0),
+            open,
+            body: body
+                .into_iter()
+                .map(|block| markdown_block_from_md(block, depth + 1))
+                .collect(),
+            blank_lines_before,
+        },
     }
 }
 
@@ -681,6 +702,32 @@ mod tests {
     }
 
     #[test]
+    fn bridges_details_block() {
+        let document = parse_markdown_document(
+            "<details>\n<summary>Tap to expand</summary>\nHidden body **bold**\n</details>",
+        );
+        let MarkdownBlockFfi::Details {
+            summary,
+            open,
+            body,
+            blank_lines_before,
+        } = &document.blocks[0]
+        else {
+            panic!("expected details");
+        };
+        assert!(!open);
+        assert!(matches!(
+            &summary[0],
+            MarkdownInlineFfi::Text { content } if content == "Tap to expand"
+        ));
+        assert_eq!(blank_lines_before, &[0]);
+        let MarkdownBlockFfi::Paragraph { inlines } = &body[0] else {
+            panic!("expected body paragraph");
+        };
+        assert!(matches!(inlines[1], MarkdownInlineFfi::Strong { .. }));
+    }
+
+    #[test]
     fn bridges_pathological_nesting_without_unbounded_recursion() {
         let document = parse_markdown_document(&">".repeat(2_000));
         assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);
@@ -692,7 +739,8 @@ mod tests {
 
     fn max_single_block_depth(block: &MarkdownBlockFfi) -> usize {
         match block {
-            MarkdownBlockFfi::BlockQuote { blocks, .. } => 1 + max_block_depth(blocks),
+            MarkdownBlockFfi::BlockQuote { blocks, .. }
+            | MarkdownBlockFfi::Details { body: blocks, .. } => 1 + max_block_depth(blocks),
             MarkdownBlockFfi::ListBlock { items, .. } => {
                 1 + items
                     .iter()

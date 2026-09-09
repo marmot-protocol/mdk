@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- App-message Markdown now emits a structured `Details` block for structural
+  `<details>` / `<summary>` lines, including UniFFI and C display trees. Hosts
+  must regenerate bindings to render the new variant.
+
 ### Changed
 
 - User search includes cached public identities from every connected account and delivers Vertex matches without

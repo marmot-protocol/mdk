@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, TableCell};
+use crate::details::{self, SummaryLine};
 use crate::scanner;
 
 pub(crate) const MAX_CONTAINER_DEPTH: usize = 96;
@@ -29,9 +30,10 @@ pub(crate) struct LinkRef {
 }
 
 pub(crate) fn parse_blocks(input: &str) -> (Vec<Block>, Vec<u8>, HashMap<String, LinkRef>) {
-    let mut p = BlockParser::new();
-    for line in scanner::lines(input) {
-        p.feed(line);
+    details::Work::reset();
+    let mut p = BlockParser::new(details::recognition_window(input));
+    for (line, start) in scanner::lines_with_offsets(input) {
+        p.feed(line, start);
     }
     p.finish();
     (p.root, p.root_blank_lines_before, p.refs)
@@ -60,6 +62,37 @@ enum Container {
         blank_lines_before: Vec<u8>,
         indent: usize,
     },
+    Details {
+        open: bool,
+        opener_raw: String,
+        children: Vec<Block>,
+        blank_lines_before: Vec<u8>,
+        leading_blank_lines: u8,
+        summary_inner: Option<String>,
+        summary_state: SummaryState,
+        failed: bool,
+    },
+}
+
+#[derive(Debug)]
+enum SummaryState {
+    AwaitingFirstNonblank,
+    AwaitingClose {
+        after_open: String,
+        held_line: String,
+    },
+    Done,
+}
+
+enum SummaryAction {
+    MarkDone,
+    Complete(String),
+    Hold {
+        after_open: String,
+        held_line: String,
+    },
+    FailAndContinue,
+    FailReplay(String),
 }
 
 #[derive(Debug)]
@@ -110,6 +143,9 @@ struct BlockParser {
     /// (slot `index + 1`). Each slot saturates independently so blank markers
     /// belonging to a nested quote cannot consume an ancestor's count budget.
     pending_source_gaps: [u8; MAX_CONTAINER_DEPTH + 1],
+    /// UTF-8-safe source prefix in which complete details candidates may match.
+    details_window: usize,
+    line_start: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +161,7 @@ struct ContainerMatch {
 }
 
 impl BlockParser {
-    fn new() -> Self {
+    fn new(details_window: usize) -> Self {
         Self {
             refs: HashMap::new(),
             root: Vec::new(),
@@ -134,12 +170,15 @@ impl BlockParser {
             leaf: None,
             leaf_blank_lines_before: 0,
             pending_source_gaps: [0; MAX_CONTAINER_DEPTH + 1],
+            details_window,
+            line_start: 0,
         }
     }
 
     // -------- top-level line dispatch --------
 
-    fn feed(&mut self, line: &str) {
+    fn feed(&mut self, line: &str, line_start: usize) {
+        self.line_start = line_start;
         let bytes = line.as_bytes();
         let ContainerMatch {
             cursor,
@@ -190,6 +229,7 @@ impl BlockParser {
                 _ => self.close_leaf(),
             }
             if mark_blank {
+                self.flush_held_summary_on_blank();
                 self.record_source_blank(scanner::is_blank(bytes), &blank_owners);
                 self.mark_list_blank_at_depth(matched_depth);
             }
@@ -247,6 +287,16 @@ impl BlockParser {
 
                 // Leaf-block starters that beat container openers.
                 if !rest.is_empty() {
+                    let rest_str = std::str::from_utf8(rest).unwrap_or("");
+                    if self.try_close_details(rest_str, probe_off) {
+                        return;
+                    }
+                    if self.try_accept_summary_line(rest_str) {
+                        return;
+                    }
+                    if self.try_open_details(rest_str, probe_off) {
+                        return;
+                    }
                     if let Some((level, text)) = parse_atx_heading(rest) {
                         self.close_leaf();
                         self.push_new_block(Block::Heading {
@@ -500,9 +550,9 @@ impl BlockParser {
                     }
                     blank_owners[i + 1] = scanner::is_blank(&bytes[off..]);
                 }
-                Container::List { .. } => {
-                    // Lists themselves consume nothing; their open ListItem
-                    // (if any) handles indent matching.
+                Container::List { .. } | Container::Details { .. } => {
+                    // Lists and details consume nothing; list items handle
+                    // indent matching, and details close on an explicit tag.
                 }
                 Container::ListItem { indent, .. } => {
                     let needed = *indent;
@@ -723,11 +773,28 @@ impl BlockParser {
         blank_owners: &[bool; MAX_CONTAINER_DEPTH + 1],
     ) {
         if physically_blank {
-            Self::increment_gap(&mut pending_source_gaps[0]);
+            // Blanks inside an open details stay in that disclosure; they must
+            // not become a sibling gap on an ancestor after the closer.
+            let inner_from = containers
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, container)| {
+                    matches!(container, Container::Details { .. }).then_some(index + 1)
+                })
+                .unwrap_or(0);
+            if inner_from == 0 {
+                Self::increment_gap(&mut pending_source_gaps[0]);
+            }
             for (index, container) in containers.iter().enumerate() {
+                if index + 1 < inner_from {
+                    continue;
+                }
                 if matches!(
                     container,
-                    Container::BlockQuote { .. } | Container::ListItem { .. }
+                    Container::BlockQuote { .. }
+                        | Container::ListItem { .. }
+                        | Container::Details { .. }
                 ) {
                     Self::increment_gap(&mut pending_source_gaps[index + 1]);
                 }
@@ -768,9 +835,11 @@ impl BlockParser {
         self.close_dangling_lists();
         let slot = match self.containers.last() {
             None => 0,
-            Some(Container::BlockQuote { .. } | Container::ListItem { .. }) => {
-                self.containers.len()
-            }
+            Some(
+                Container::BlockQuote { .. }
+                | Container::ListItem { .. }
+                | Container::Details { .. },
+            ) => self.containers.len(),
             Some(Container::List { .. }) => unreachable!("dangling lists were just closed"),
         };
         let count = self.pending_source_gaps[slot];
@@ -805,6 +874,11 @@ impl BlockParser {
                 ..
             })
             | Some(Container::ListItem {
+                children,
+                blank_lines_before: child_gaps,
+                ..
+            })
+            | Some(Container::Details {
                 children,
                 blank_lines_before: child_gaps,
                 ..
@@ -863,6 +937,7 @@ impl BlockParser {
                 let block = Block::List { kind, tight, items };
                 self.push_block(block, leading_blank_lines);
             }
+            Container::Details { .. } => self.finish_details(c, None),
         }
     }
 
@@ -917,6 +992,281 @@ impl BlockParser {
                 *tight = false;
                 *last_blank = false;
             }
+        }
+    }
+
+    fn details_is_current_parent(&self) -> bool {
+        match self.containers.last() {
+            Some(Container::Details { .. }) => true,
+            Some(Container::List { .. }) => self
+                .containers
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| matches!(c, Container::Details { .. })),
+            _ => false,
+        }
+    }
+
+    fn try_close_details(&mut self, rest: &str, probe_off: usize) -> bool {
+        let Some(close) = details::parse_details_closer_line(rest) else {
+            return false;
+        };
+        if !self.details_is_current_parent() {
+            return false;
+        }
+        self.close_leaf();
+        self.close_dangling_lists();
+        let closer_end = self.line_start + probe_off + close.tag_end;
+        let closer_raw = rest.trim_matches([' ', '\t']).to_string();
+        if let Some(Container::Details { .. }) = self.containers.last() {
+            let c = self.containers.pop().unwrap();
+            self.finish_details(c, Some((closer_raw, closer_end)));
+            return true;
+        }
+        false
+    }
+
+    fn try_open_details(&mut self, rest: &str, probe_off: usize) -> bool {
+        let Some(open) = details::parse_details_opener_line(rest) else {
+            return false;
+        };
+        let tag_end_abs = self.line_start + probe_off + open.tag_end;
+        if tag_end_abs > self.details_window {
+            return false;
+        }
+        if self.containers.len() >= MAX_CONTAINER_DEPTH {
+            return false;
+        }
+        self.close_leaf();
+        let opener_raw = rest.trim_matches([' ', '\t']).to_string();
+        let leading_blank_lines = self.take_pending_source_gap();
+        self.containers.push(Container::Details {
+            open: open.open,
+            opener_raw,
+            children: Vec::new(),
+            blank_lines_before: Vec::new(),
+            leading_blank_lines,
+            summary_inner: None,
+            summary_state: SummaryState::AwaitingFirstNonblank,
+            failed: false,
+        });
+        true
+    }
+
+    fn try_accept_summary_line(&mut self, rest: &str) -> bool {
+        let action = match self.containers.last() {
+            Some(Container::Details { summary_state, .. }) => match summary_state {
+                SummaryState::Done => return false,
+                SummaryState::AwaitingFirstNonblank => match details::parse_summary_line(rest) {
+                    SummaryLine::NotSummary => SummaryAction::MarkDone,
+                    SummaryLine::Complete { inner } => SummaryAction::Complete(inner),
+                    SummaryLine::OpenOnly { after_open } => SummaryAction::Hold {
+                        after_open,
+                        held_line: rest.trim_matches([' ', '\t']).to_string(),
+                    },
+                    SummaryLine::CloseOnly { .. } | SummaryLine::Malformed => {
+                        SummaryAction::FailAndContinue
+                    }
+                },
+                SummaryState::AwaitingClose {
+                    after_open,
+                    held_line,
+                } => match details::parse_summary_close_only(rest) {
+                    Some(before_close) => {
+                        let mut inner = after_open.clone();
+                        if !before_close.is_empty() {
+                            if !inner.is_empty() {
+                                inner.push('\n');
+                            }
+                            inner.push_str(&before_close);
+                        }
+                        SummaryAction::Complete(inner)
+                    }
+                    None => SummaryAction::FailReplay(held_line.clone()),
+                },
+            },
+            _ => return false,
+        };
+        match action {
+            SummaryAction::MarkDone => {
+                if let Some(Container::Details { summary_state, .. }) = self.containers.last_mut() {
+                    *summary_state = SummaryState::Done;
+                }
+                false
+            }
+            SummaryAction::Complete(inner) => {
+                if let Some(Container::Details {
+                    summary_state,
+                    summary_inner,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *summary_inner = if details::summary_inner_is_empty(&inner) {
+                        None
+                    } else {
+                        Some(inner)
+                    };
+                    *summary_state = SummaryState::Done;
+                }
+                self.clear_current_details_gap();
+                true
+            }
+            SummaryAction::Hold {
+                after_open,
+                held_line,
+            } => {
+                if let Some(Container::Details { summary_state, .. }) = self.containers.last_mut() {
+                    *summary_state = SummaryState::AwaitingClose {
+                        after_open,
+                        held_line,
+                    };
+                }
+                true
+            }
+            SummaryAction::FailAndContinue => {
+                if let Some(Container::Details {
+                    summary_state,
+                    failed,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *failed = true;
+                    *summary_state = SummaryState::Done;
+                }
+                false
+            }
+            SummaryAction::FailReplay(held) => {
+                if let Some(Container::Details {
+                    summary_state,
+                    failed,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *failed = true;
+                    *summary_state = SummaryState::Done;
+                }
+                self.push_new_block(Block::Paragraph {
+                    inlines: vec![Inline::Text(held)],
+                });
+                false
+            }
+        }
+    }
+
+    fn flush_held_summary_on_blank(&mut self) {
+        let held = match self.containers.last() {
+            Some(Container::Details {
+                summary_state: SummaryState::AwaitingClose { held_line, .. },
+                ..
+            }) => held_line.clone(),
+            _ => return,
+        };
+        if let Some(Container::Details {
+            summary_state,
+            failed,
+            ..
+        }) = self.containers.last_mut()
+        {
+            *failed = true;
+            *summary_state = SummaryState::Done;
+        }
+        self.push_new_block(Block::Paragraph {
+            inlines: vec![Inline::Text(held)],
+        });
+    }
+
+    fn clear_current_details_gap(&mut self) {
+        if let Some(Container::Details { .. }) = self.containers.last() {
+            self.pending_source_gaps[self.containers.len()] = 0;
+        }
+    }
+
+    fn finish_details(&mut self, c: Container, closer: Option<(String, usize)>) {
+        let Container::Details {
+            open,
+            opener_raw,
+            mut children,
+            mut blank_lines_before,
+            leading_blank_lines,
+            summary_inner,
+            summary_state,
+            failed,
+        } = c
+        else {
+            unreachable!("finish_details requires Details");
+        };
+
+        if let SummaryState::AwaitingClose { held_line, .. } = summary_state {
+            children.insert(
+                0,
+                Block::Paragraph {
+                    inlines: vec![Inline::Text(held_line)],
+                },
+            );
+            blank_lines_before.insert(0, 0);
+            return self.fallback_details(
+                opener_raw,
+                children,
+                blank_lines_before,
+                leading_blank_lines,
+                closer.map(|(raw, _)| raw),
+            );
+        }
+
+        let matched = !failed
+            && closer
+                .as_ref()
+                .is_some_and(|(_, end)| *end <= self.details_window);
+        if !matched {
+            return self.fallback_details(
+                opener_raw,
+                children,
+                blank_lines_before,
+                leading_blank_lines,
+                closer.map(|(raw, _)| raw),
+            );
+        }
+
+        let summary = match summary_inner {
+            Some(raw) => vec![Inline::Text(raw)],
+            None => Vec::new(),
+        };
+        self.push_block(
+            Block::Details {
+                summary,
+                open,
+                body: children,
+                blank_lines_before,
+            },
+            leading_blank_lines,
+        );
+    }
+
+    fn fallback_details(
+        &mut self,
+        opener_raw: String,
+        children: Vec<Block>,
+        child_gaps: Vec<u8>,
+        leading_blank_lines: u8,
+        closer_raw: Option<String>,
+    ) {
+        self.push_block(
+            Block::Paragraph {
+                inlines: vec![Inline::Text(opener_raw)],
+            },
+            leading_blank_lines,
+        );
+        for (block, gap) in children.into_iter().zip(child_gaps) {
+            self.push_block(block, gap);
+        }
+        if let Some(closer_raw) = closer_raw {
+            self.push_block(
+                Block::Paragraph {
+                    inlines: vec![Inline::Text(closer_raw)],
+                },
+                0,
+            );
         }
     }
 }
@@ -1343,6 +1693,12 @@ impl BlockParser {
             return false;
         }
         if try_open_list_marker(bytes, cursor.col, cursor.off, true).is_some() {
+            return false;
+        }
+        let rest_str = std::str::from_utf8(rest).unwrap_or("");
+        if details::parse_details_opener_line(rest_str).is_some()
+            || details::parse_details_closer_line(rest_str).is_some()
+        {
             return false;
         }
         if let Some(open) = try_open_list_marker(bytes, probe_col, probe_off, false)
