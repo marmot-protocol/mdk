@@ -50,7 +50,7 @@ pub struct AgentPublisher {
     commands: mpsc::Sender<StreamComposeCommand>,
     cancel: mpsc::Sender<()>,
     abort: AbortHandle,
-    state: Mutex<PublisherState>,
+    state: Arc<Mutex<PublisherState>>,
 }
 
 impl MarmotAppRuntime {
@@ -153,7 +153,7 @@ impl MarmotAppRuntime {
             commands,
             cancel,
             abort: task.abort_handle(),
-            state: Mutex::new(PublisherState::Active),
+            state: Arc::new(Mutex::new(PublisherState::Active)),
         }))
     }
 }
@@ -200,11 +200,14 @@ impl AgentPublisher {
     /// send leaves the sealed request intact; successful retries return the
     /// original receipt without publishing another final.
     pub async fn finish(self: &Arc<Self>) -> Result<SendSummary, AppError> {
+        self.runtime.shared.lifecycle().ensure_running()?;
+        // Reserve finalization before spawning; the task keeps the reservation
+        // even if its caller is cancelled.
+        let mut state = Arc::clone(&self.state).lock_owned().await;
         let publisher = Arc::clone(self);
         tokio::spawn(async move {
             let this = publisher;
             this.runtime.shared.lifecycle().ensure_running()?;
-            let mut state = this.state.lock().await;
             match &*state {
                 PublisherState::Finished(summary) => return Ok(summary.clone()),
                 PublisherState::Cancelled => return Err(closed()),
@@ -279,4 +282,54 @@ fn now() -> u64 {
 
 fn closed() -> AppError {
     AppError::AgentStreamPublisher("publisher closed".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn finish_reserves_before_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::MarmotApp::with_relays(root.path(), vec![]).runtime();
+        let (commands, mut received) = mpsc::channel(1);
+        let (cancel, _cancelled) = mpsc::channel(1);
+        let task = tokio::spawn(async {});
+        let publisher = Arc::new(AgentPublisher {
+            runtime,
+            account: String::new(),
+            group: GroupId::new(vec![]),
+            stream_id: vec![],
+            start_id: String::new(),
+            commands,
+            cancel,
+            abort: task.abort_handle(),
+            state: Arc::new(Mutex::new(PublisherState::Active)),
+        });
+        let finish = publisher.finish();
+        tokio::pin!(finish);
+        // Poll finish once without letting its spawned task run.
+        tokio::select! {
+            biased;
+            _ = &mut finish => panic!("finish must await the composer"),
+            _ = std::future::ready(()) => {}
+        }
+        let cancel = publisher.cancel();
+        tokio::pin!(cancel);
+        tokio::select! {
+            biased;
+            _ = &mut cancel => panic!("cancel must wait for finalization"),
+            _ = std::future::ready(()) => {}
+        }
+        let StreamComposeCommand::Finish { respond, .. } = received.recv().await.unwrap() else {
+            panic!("expected finalization");
+        };
+        // Stop at the composer boundary: no network or account is needed.
+        respond.send(Err("fixture failure".into())).unwrap();
+        assert!(
+            matches!(finish.await, Err(AppError::AgentStreamPublisher(error))
+            if error == "fixture failure")
+        );
+        cancel.await;
+    }
 }

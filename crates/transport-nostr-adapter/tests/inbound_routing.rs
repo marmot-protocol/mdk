@@ -3743,7 +3743,41 @@ async fn maintenance_failure_cleans_up() {
         .await
         .unwrap();
     assert_eq!(adapter.handle_relay_event(event.clone()).await.unwrap(), 1);
-    adapter.deactivate_account(&account_id).await.unwrap();
+    let subscription_id = NostrSubscription::GroupMaintenance {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: group.endpoints.clone(),
+    }
+    .subscription_id();
+    for group_subscriptions in [Some(vec![]), None] {
+        adapter
+            .install_group_maintenance_subscription(&account_id, &group)
+            .await
+            .unwrap();
+        adapter
+            .handle_relay_eose(group.endpoints[0].clone(), subscription_id.clone())
+            .await;
+        assert_eq!(
+            adapter.subscription_synced(&subscription_id).await,
+            Some(true)
+        );
+        if let Some(group_subscriptions) = group_subscriptions {
+            adapter
+                .activate_account(TransportAccountActivation {
+                    account_id: account_id.clone(),
+                    inbox_endpoints: vec![],
+                    group_subscriptions,
+                    since: None,
+                })
+                .await
+                .unwrap();
+        } else {
+            adapter.deactivate_account(&account_id).await.unwrap();
+        }
+        assert_eq!(adapter.subscription_synced(&subscription_id).await, None);
+        assert_eq!(adapter.subscription_any_eose(&subscription_id).await, None);
+    }
     assert_eq!(adapter.handle_relay_event(event).await.unwrap(), 0);
 }
 

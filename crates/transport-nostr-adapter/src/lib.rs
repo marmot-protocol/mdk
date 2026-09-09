@@ -1541,8 +1541,7 @@ impl AdapterState {
         // the high-water map is what survives their removal.
         self.activation_attempt_high_water
             .insert(activation.account_id.clone(), attempt);
-        self.maintenance_routes
-            .retain(|_, subscription| subscription.account_id() != &activation.account_id);
+        self.forget_maintenance_routes(&activation.account_id);
         self.accounts.insert(
             activation.account_id,
             AccountRoutes {
@@ -1650,10 +1649,19 @@ impl AdapterState {
         self.accounts.get(account_id).map(|routes| routes.attempt)
     }
 
+    fn forget_maintenance_routes(&mut self, account_id: &MemberId) {
+        self.maintenance_routes.retain(|id, subscription| {
+            if subscription.account_id() != account_id {
+                return true;
+            }
+            self.sync.forget_subscription(id);
+            false
+        });
+    }
+
     fn deactivate(&mut self, account_id: &MemberId, removed_count: usize) {
         self.accounts.remove(account_id);
-        self.maintenance_routes
-            .retain(|_, subscription| subscription.account_id() != account_id);
+        self.forget_maintenance_routes(account_id);
         self.account_replay_coverage.remove(account_id);
         self.metrics.subscriptions_removed += removed_count;
         self.rebuild_transport_group_index();
