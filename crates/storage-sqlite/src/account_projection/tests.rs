@@ -565,6 +565,58 @@ fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
 }
 
 #[test]
+fn epoch_backfill_intents_clear_by_group_at_whatever_epoch_is_stored() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    insert_protocol_group_marker(&store, &[0xbb]);
+
+    let aa_epoch_8 = StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 8,
+    };
+    let bb_epoch_3 = StoredEpochBackfillIntent {
+        group_id_hex: "bb".to_owned(),
+        stalled_epoch: 3,
+    };
+    store
+        .arm_epoch_backfill_intents(&[aa_epoch_8, bb_epoch_3.clone()])
+        .unwrap();
+
+    store
+        .clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
+        .unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![bb_epoch_3.clone()],
+        "clearing by group retires that group and leaves every other group armed"
+    );
+
+    // The stored epoch is not part of the key: re-arm at a different epoch and
+    // the same by-group clear still retires it.
+    store
+        .arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
+            group_id_hex: "aa".to_owned(),
+            stalled_epoch: 41,
+        }])
+        .unwrap();
+    store
+        .clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
+        .unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![bb_epoch_3.clone()],
+        "a by-group clear is not epoch-sensitive"
+    );
+
+    store.clear_epoch_backfill_intents_for_groups(&[]).unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![bb_epoch_3],
+        "an empty slice clears nothing"
+    );
+}
+
+#[test]
 fn pending_confirmation_group_invites_reads_only_pending_outlines() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     // One applied member group, one pending invite with a welcomer, one

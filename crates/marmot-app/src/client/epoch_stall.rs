@@ -1043,8 +1043,9 @@ impl EpochStallDetector {
             .collect()
     }
 
-    /// Authenticated current-epoch peer traffic or a join ends the failed
-    /// recovery run; a local epoch advance alone never calls this method.
+    /// Authenticated current-epoch peer traffic, a join, or a terminal marker
+    /// for this device's copy ends the failed recovery run; a local epoch
+    /// advance alone never calls this method.
     pub(crate) fn clear_recovered_group(&mut self, group: &GroupId) {
         self.groups.remove(group);
     }

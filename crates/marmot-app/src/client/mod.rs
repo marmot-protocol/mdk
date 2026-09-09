@@ -423,6 +423,10 @@ pub struct AppClient {
     /// One-shot storage-read failure after durable release consumption.
     #[cfg(test)]
     pub(crate) fail_next_released_backfill_reload: bool,
+    /// One-shot durable-clear failure inside the terminal-group recovery
+    /// retirement, for the retry path its callers depend on.
+    #[cfg(test)]
+    pub(crate) fail_next_terminal_recovery_retire: bool,
     /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
     /// when a replay failure must not overwrite a newer arm minted in flight.
     pub(crate) queued_epoch_backfills:

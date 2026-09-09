@@ -1789,6 +1789,8 @@ impl MarmotApp {
             released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
+            #[cfg(test)]
+            fail_next_terminal_recovery_retire: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
@@ -1797,6 +1799,9 @@ impl MarmotApp {
         // Initial access also restores durable backfill work, with or without
         // new releases, so open does not read the intent table twice.
         client.transport_receipts()?;
+        // After that call, never before: it restores the durable intents, drops
+        // the terminal ones and retires their runs, so a group retired there
+        // cannot have its evidence re-seeded into the detector here.
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
         client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         // Reads only the durable terminal guards, never live group state, so it
@@ -3329,6 +3334,17 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         self.account_storage(label)?
             .clear_epoch_backfill_intents(intents)?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_epoch_backfill_intents_for_groups(
+        &self,
+        label: &str,
+        group_ids_hex: &[String],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .clear_epoch_backfill_intents_for_groups(group_ids_hex)?;
         Ok(())
     }
 
