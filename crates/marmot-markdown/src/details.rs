@@ -5,6 +5,7 @@
 //! linear scan bound.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
 /// Inclusive byte length from `<` through `>` for a structural tag.
 pub(crate) const MAX_DETAILS_TAG_BYTES: usize = 4096;
@@ -30,6 +31,10 @@ impl Work {
 
     fn charge(n: usize) {
         WORK.with(|c| c.set(c.get().saturating_add(n)));
+    }
+
+    fn charge_bytes(n: usize) {
+        Self::charge(n);
     }
 }
 
@@ -70,10 +75,14 @@ pub(crate) enum SummaryLine {
     OpenOnly {
         after_open: String,
     },
-    /// Closing tag present; opener is not on this line.
-    CloseOnly {
-        before_close: String,
-    },
+    Malformed,
+}
+
+/// Result of scanning one additional nonblank line of an already-open summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SummaryContinue {
+    Complete { inner: String },
+    StillOpen { accumulated: String },
     Malformed,
 }
 
@@ -118,18 +127,18 @@ pub(crate) fn parse_details_closer_line(line: &str) -> Option<DetailsClose> {
 /// Classify a candidate first-child summary line (container prefixes already
 /// stripped). Leading/trailing horizontal whitespace around the whole line is
 /// allowed; anything else before the opener or after the closer is malformed.
+///
+/// First-nonblank classification does not search for a closer-only line: a
+/// body line of backticks must not pay summary-close work.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_summary_line(line: &str) -> SummaryLine {
+    parse_summary_line_bounded(line, usize::MAX)
+}
+
+pub(crate) fn parse_summary_line_bounded(line: &str, max_bytes: usize) -> SummaryLine {
     Work::charge(1);
     let (body, _) = trim_line_ws(line);
     if !starts_with_open_angle(body) {
-        if let Some(inner) = parse_summary_close_only(line) {
-            return SummaryLine::CloseOnly {
-                before_close: inner,
-            };
-        }
-        if looks_like_summary_close(body) {
-            return SummaryLine::Malformed;
-        }
         return SummaryLine::NotSummary;
     }
 
@@ -145,7 +154,7 @@ pub(crate) fn parse_summary_line(line: &str) -> SummaryLine {
     }
 
     let after = &body[open.tag_end..];
-    match find_summary_close(after) {
+    match find_summary_close_bounded(after, max_bytes.saturating_sub(open.tag_end)) {
         CloseSeek::Found { rel_start, tag_end } => {
             if !is_only_ws(&after.as_bytes()[tag_end..]) {
                 return SummaryLine::Malformed;
@@ -161,17 +170,62 @@ pub(crate) fn parse_summary_line(line: &str) -> SummaryLine {
     }
 }
 
+/// Continue an open `<summary>` across the next consecutive nonblank line,
+/// keeping code-span matching in the accumulated inner source.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn continue_summary(accumulated: &str, next_line: &str) -> SummaryContinue {
+    continue_summary_bounded(accumulated, next_line, usize::MAX)
+}
+
+pub(crate) fn continue_summary_bounded(
+    accumulated: &str,
+    next_line: &str,
+    max_bytes: usize,
+) -> SummaryContinue {
+    Work::charge(1);
+    let (next, _) = trim_line_ws(next_line);
+    if starts_with_open_angle(next) && look_like_summary_open(next) {
+        return SummaryContinue::Malformed;
+    }
+    let search = join_summary_inner(accumulated, next);
+    match find_summary_close_bounded(&search, max_bytes) {
+        CloseSeek::Found { rel_start, tag_end } => {
+            if !is_only_ws(&search.as_bytes()[tag_end..]) {
+                return SummaryContinue::Malformed;
+            }
+            let prefix_len = if accumulated.is_empty() {
+                0
+            } else {
+                accumulated.len() + 1
+            };
+            let before_close = if rel_start >= prefix_len {
+                &search[prefix_len..rel_start]
+            } else {
+                &search[..rel_start]
+            };
+            SummaryContinue::Complete {
+                inner: join_summary_inner(accumulated, before_close),
+            }
+        }
+        CloseSeek::ProtectedOrAbsent => SummaryContinue::StillOpen {
+            accumulated: search,
+        },
+        CloseSeek::Malformed => SummaryContinue::Malformed,
+    }
+}
+
+pub(crate) fn join_summary_inner(left: &str, right: &str) -> String {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => right.to_string(),
+        (false, true) => left.to_string(),
+        (false, false) => format!("{left}\n{right}"),
+    }
+}
+
 fn look_like_summary_open(body: &str) -> bool {
     let bytes = body.as_bytes();
     bytes.first() == Some(&b'<') && match_name(&bytes[1..], b"summary").is_some()
-}
-
-fn looks_like_summary_close(body: &str) -> bool {
-    let bytes = body.as_bytes();
-    bytes.len() >= 2
-        && bytes[0] == b'<'
-        && bytes[1] == b'/'
-        && match_name(&bytes[2..], b"summary").is_some()
 }
 
 #[derive(Debug)]
@@ -334,16 +388,23 @@ enum CloseSeek {
 }
 
 /// Find `</summary>` in `after`, skipping markdown code spans. A closer
-/// inside a code span is content, not a terminator.
-fn find_summary_close(after: &str) -> CloseSeek {
+/// inside a code span is content, not a terminator. Backtick runs are
+/// indexed once so unmatched openers never rescan the same suffix.
+fn find_summary_close_bounded(after: &str, max_bytes: usize) -> CloseSeek {
+    let limit = after.len().min(max_bytes);
+    let limit = floor_char_boundary(after, limit);
     let bytes = after.as_bytes();
+    let index = CodeSpanIndex::new(&bytes[..limit]);
     let mut i = 0;
-    while i < bytes.len() {
+    while i < limit {
         Work::charge(1);
         if bytes[i] == b'`' {
-            match skip_code_span(bytes, i) {
-                Some(end) => i = end,
-                None => i += 1,
+            let run_end = skip_backtick_run(bytes, i, limit);
+            let run_len = run_end - i;
+            if let Some((_, close_end)) = index.next_run(run_len, i) {
+                i = close_end.min(limit);
+            } else {
+                i = run_end;
             }
             continue;
         }
@@ -372,30 +433,53 @@ fn find_summary_close(after: &str) -> CloseSeek {
     CloseSeek::ProtectedOrAbsent
 }
 
-fn skip_code_span(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut ticks = 0;
-    while start + ticks < bytes.len() && bytes[start + ticks] == b'`' {
-        ticks += 1;
-    }
-    if ticks == 0 {
-        return None;
-    }
-    let mut i = start + ticks;
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            let mut run = 0;
-            while i + run < bytes.len() && bytes[i + run] == b'`' {
-                run += 1;
+/// Backtick runs indexed once by length. A failed match skips the whole
+/// opener run instead of retrying at every remaining tick.
+struct CodeSpanIndex {
+    by_len: HashMap<usize, Vec<(usize, usize)>>,
+}
+
+impl CodeSpanIndex {
+    fn new(bytes: &[u8]) -> Self {
+        let mut by_len: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            Work::charge_bytes(1);
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
             }
-            if run == ticks {
-                return Some(i + run);
-            }
-            i += run;
-        } else {
-            i += 1;
+            let end = skip_backtick_run(bytes, i, bytes.len());
+            by_len.entry(end - i).or_default().push((i, end));
+            i = end;
         }
+        Self { by_len }
     }
-    None
+
+    fn next_run(&self, run_len: usize, after_start: usize) -> Option<(usize, usize)> {
+        let runs = self.by_len.get(&run_len)?;
+        let next = runs.partition_point(|(start, _)| *start <= after_start);
+        runs.get(next).copied()
+    }
+}
+
+fn skip_backtick_run(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut end = start;
+    while end < limit && bytes[end] == b'`' {
+        Work::charge_bytes(1);
+        end += 1;
+    }
+    end
+}
+
+fn floor_char_boundary(s: &str, mut end: usize) -> usize {
+    if end >= s.len() {
+        return s.len();
+    }
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn match_name(bytes: &[u8], name: &[u8]) -> Option<usize> {
@@ -425,6 +509,7 @@ fn is_attr_name_continue(b: u8) -> bool {
 
 fn skip_ascii_ws(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        Work::charge_bytes(1);
         i += 1;
     }
     i
@@ -451,25 +536,11 @@ fn trim_line_ws(line: &str) -> (&str, usize) {
     (&line[start..end], start)
 }
 
-/// True when `inner` is empty or only horizontal whitespace.
+/// True when `inner` is empty or only whitespace (including newlines).
 pub(crate) fn summary_inner_is_empty(inner: &str) -> bool {
-    inner.bytes().all(|b| b == b' ' || b == b'\t')
-}
-
-/// Second line of a two-line summary: optional content then `</summary>`.
-pub(crate) fn parse_summary_close_only(line: &str) -> Option<String> {
-    Work::charge(1);
-    let (body, _) = trim_line_ws(line);
-    if starts_with_open_angle(body) && look_like_summary_open(body) {
-        return None;
-    }
-    match find_summary_close(body) {
-        CloseSeek::Found { rel_start, tag_end } if is_only_ws(&body.as_bytes()[tag_end..]) => {
-            Some(body[..rel_start].to_string())
-        }
-        CloseSeek::Malformed => None,
-        _ => None,
-    }
+    inner
+        .bytes()
+        .all(|b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
 }
 
 #[cfg(test)]
@@ -539,6 +610,51 @@ mod tests {
             SummaryLine::Malformed
         ));
         assert_eq!(parse_summary_line("hello"), SummaryLine::NotSummary);
+        assert_eq!(parse_summary_line(&"`".repeat(64)), SummaryLine::NotSummary);
+    }
+
+    #[test]
+    fn continue_summary_spans_lines_and_code() {
+        assert_eq!(
+            continue_summary("", "More **information**"),
+            SummaryContinue::StillOpen {
+                accumulated: "More **information**".into()
+            }
+        );
+        assert_eq!(
+            continue_summary("More **information**", "</summary>"),
+            SummaryContinue::Complete {
+                inner: "More **information**".into()
+            }
+        );
+        assert_eq!(
+            continue_summary("use `literal", "</summary>` here</summary>"),
+            SummaryContinue::Complete {
+                inner: "use `literal\n</summary>` here".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unmatched_backtick_close_search_is_linear() {
+        let mut prev = 0usize;
+        for n in [2_000usize, 4_000, 8_000, 16_000] {
+            Work::reset();
+            let line = "`".repeat(n);
+            let _ = continue_summary("after", &line);
+            let work = Work::get();
+            assert!(
+                work <= n * 8 + 256,
+                "close search must stay linear, n={n} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
     }
 
     #[test]

@@ -15,6 +15,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   `<details>` / `<summary>` lines, including UniFFI and C display trees. Hosts
   must regenerate bindings to render the new variant.
 
+### Fixed
+
+- Failed `<details>` candidates now keep a completed `<summary>` in the display
+  tree, multiline summaries can span more than two lines, and summary recognition
+  stays linear inside the documented scan window.
+
 ### Changed
 
 - User search includes cached public identities from every connected account and delivers Vertex matches without

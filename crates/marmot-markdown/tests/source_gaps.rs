@@ -288,6 +288,16 @@ fn literal_details_tags_remain_when_unclosed() {
             .iter()
             .any(|block| matches!(block, marmot_markdown::Block::Details { .. }))
     );
+    assert!(
+        document.blocks.iter().any(|block| match block {
+            marmot_markdown::Block::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                marmot_markdown::Inline::Text(text) if text.contains("<summary>More</summary>")
+            )),
+            _ => false,
+        }),
+        "completed summary must be restored on unclosed fallback: {document:?}"
+    );
     let marmot_markdown::Block::Paragraph { inlines } = document.blocks.last().unwrap() else {
         panic!("code span should remain in a paragraph");
     };

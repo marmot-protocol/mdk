@@ -76,7 +76,7 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::MarkdownBlockFfi;
+    use crate::markdown::{MarkdownBlockFfi, MarkdownInlineFfi};
 
     #[test]
     fn chat_tokens_include_details_blocks() {
@@ -88,5 +88,38 @@ mod tests {
         let other =
             markdown_content_tokens(1, "<details>\n<summary>More</summary>\nbody\n</details>");
         assert!(other.blocks.is_empty());
+        let fallback = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>KEEP_THIS_SUMMARY</summary>\nbody",
+        );
+        assert!(
+            !fallback
+                .blocks
+                .iter()
+                .any(|block| matches!(block, MarkdownBlockFfi::Details { .. }))
+        );
+        assert!(fallback.blocks.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content } if content.contains("KEEP_THIS_SUMMARY")
+            )),
+            _ => false,
+        }));
+        let later = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n    code\n<summary>ordinary later text</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &later.blocks[0] else {
+            panic!("expected details");
+        };
+        assert!(summary.is_empty());
+        assert!(body.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content }
+                    if content.contains("<summary>ordinary later text</summary>")
+            )),
+            _ => false,
+        }));
     }
 }

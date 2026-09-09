@@ -58,7 +58,9 @@ This is a block-oriented extension, not a general HTML parser:
   Markdown and do not swallow following siblings.
 - Recognition is limited to a 65536-byte original-source prefix and a 4096-byte
   structural tag cap (inclusive of `<` through `>`). Each details block consumes
-  one existing container-depth slot.
+  one existing container-depth slot. Recognition work is linear in that capped
+  prefix: backtick runs are indexed once per candidate so unmatched openers do
+  not rescan the same suffix.
 - Body blank-line counts align with `body` and saturate at
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.

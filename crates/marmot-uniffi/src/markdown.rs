@@ -728,6 +728,64 @@ mod tests {
     }
 
     #[test]
+    fn bridges_multiline_summary_and_fallback_preserves_text() {
+        let document = parse_markdown_document(
+            "<details>\n<summary>\nMore **information**\n</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &document.blocks[0] else {
+            panic!("expected details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Strong { .. }))
+        );
+        assert!(matches!(body[0], MarkdownBlockFfi::Paragraph { .. }));
+
+        let fallback =
+            parse_markdown_document("<details>\n<summary>KEEP_THIS_SUMMARY</summary>\nbody");
+        assert!(
+            !fallback
+                .blocks
+                .iter()
+                .any(|block| matches!(block, MarkdownBlockFfi::Details { .. }))
+        );
+        assert!(fallback.blocks.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content } if content.contains("KEEP_THIS_SUMMARY")
+            )),
+            _ => false,
+        }));
+
+        let later = parse_markdown_document(
+            "<details>\n    code\n<summary>ordinary later text</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &later.blocks[0] else {
+            panic!("expected details after indented code");
+        };
+        assert!(summary.is_empty());
+        assert!(body.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content } if content.contains("<summary>ordinary later text</summary>")
+            )),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn hostile_backtick_details_input_stays_bounded() {
+        let ticks = "`".repeat(65_519 - "<details>\n\n</details>".len());
+        let document = parse_markdown_document(&format!("<details>\n{ticks}\n</details>"));
+        assert!(!document.truncated);
+        let summary_ticks = "`".repeat(8_192);
+        let document =
+            parse_markdown_document(&format!("<details>\n<summary>{summary_ticks}\n</details>"));
+        assert!(!document.blocks.is_empty());
+    }
+
+    #[test]
     fn bridges_pathological_nesting_without_unbounded_recursion() {
         let document = parse_markdown_document(&">".repeat(2_000));
         assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);

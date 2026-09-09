@@ -110,6 +110,15 @@ fn multiline_summary() {
         details_only("<details>\n<summary>More\ninfo</summary>\nbody\n</details>");
     assert_eq!(summary, vec![t("More"), Inline::SoftBreak, t("info")]);
     assert_eq!(body, vec![paragraph("body")]);
+    let (_, summary, body, _) = details_only(
+        "<details>\r\n<summary>\r\nMore **information**\r\n</summary>\r\nbody\r\n</details>\r\n",
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|inline| matches!(inline, Inline::Strong(_)))
+    );
+    assert_eq!(body, vec![paragraph("body")]);
 }
 
 #[test]

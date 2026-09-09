@@ -827,32 +827,50 @@ mod mention_tests {
 
     #[test]
     fn mention_p_tags_walk_details_summary_and_body() {
-        let hex = valid_pubkey_hex();
-        let npub = npub_for_account_id(&hex).unwrap();
-        let closed = format!("<details>\n<summary>hi @{npub}</summary>\nalso @{npub}\n</details>");
-        let opened =
-            format!("<details open>\n<summary>hi @{npub}</summary>\nalso @{npub}\n</details>");
-        assert_eq!(
-            mention_p_tags(&closed),
-            vec![vec!["p".to_owned(), hex.clone()]]
+        let summary_hex = valid_pubkey_hex();
+        let body_hex = valid_pubkey_hex();
+        let summary_npub = npub_for_account_id(&summary_hex).unwrap();
+        let body_npub = npub_for_account_id(&body_hex).unwrap();
+        let closed = format!(
+            "<details>\n<summary>hi @{summary_npub}</summary>\nalso @{body_npub}\n</details>"
         );
-        assert_eq!(
-            mention_p_tags(&opened),
-            vec![vec!["p".to_owned(), hex.clone()]]
+        let opened = format!(
+            "<details open>\n<summary>hi @{summary_npub}</summary>\nalso @{body_npub}\n</details>"
         );
+        let expected = vec![
+            vec!["p".to_owned(), summary_hex.clone()],
+            vec!["p".to_owned(), body_hex.clone()],
+        ];
+        assert_eq!(mention_p_tags(&closed), expected);
+        assert_eq!(mention_p_tags(&opened), expected);
         let nested = format!(
-            "<details>\n<summary>outer</summary>\n<details>\n<summary>@{npub}</summary>\n</details>\n</details>"
+            "<details>\n<summary>outer</summary>\n<details>\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>\n</details>"
+        );
+        assert_eq!(mention_p_tags(&nested), expected);
+        let in_code = format!(
+            "<details>\n<summary>`@{summary_npub}`</summary>\n```\n@{body_npub}\n```\n</details>"
+        );
+        assert!(mention_p_tags(&in_code).is_empty());
+        let ignored_attr = format!(
+            "<details title=\"@{summary_npub}\">\n<summary>plain</summary>\nbody\n</details>"
+        );
+        assert!(mention_p_tags(&ignored_attr).is_empty());
+        let duplicate = format!(
+            "<details>\n<summary>@{summary_npub}</summary>\nagain @{summary_npub}\n</details>"
         );
         assert_eq!(
-            mention_p_tags(&nested),
-            vec![vec!["p".to_owned(), hex.clone()]]
+            mention_p_tags(&duplicate),
+            vec![vec!["p".to_owned(), summary_hex.clone()]]
         );
-        let in_code =
-            format!("<details>\n<summary>`@{npub}`</summary>\n```\n@{npub}\n```\n</details>");
-        assert!(mention_p_tags(&in_code).is_empty());
-        let ignored_attr =
-            format!("<details title=\"@{npub}\">\n<summary>plain</summary>\nbody\n</details>");
-        assert!(mention_p_tags(&ignored_attr).is_empty());
+        let fallback = format!("<details>\n<summary>hi @{summary_npub}</summary>\nbody");
+        assert_eq!(
+            mention_p_tags(&fallback),
+            vec![vec!["p".to_owned(), summary_hex.clone()]]
+        );
+        let later = format!(
+            "<details>\n    code\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>"
+        );
+        assert_eq!(mention_p_tags(&later), expected);
     }
 
     #[test]

@@ -144,4 +144,75 @@ mod details_work_tests {
             "failed openers must not rescan quadratically, work={work}"
         );
     }
+
+    #[test]
+    fn unmatched_backtick_first_line_stays_linear() {
+        use crate::details::MAX_DETAILS_SCAN_BYTES;
+        let mut prev = 0usize;
+        for n in [4_000usize, 8_000, 16_000, 32_000] {
+            Work::reset();
+            let md = format!("<details>\n{}\n</details>", "`".repeat(n));
+            let _ = parse(&md);
+            let work = Work::get();
+            assert!(
+                work <= n * 16 + 4_096,
+                "backtick close-search must stay linear, n={n} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, n={n} prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
+        Work::reset();
+        let near_cap = 65_519.min(MAX_DETAILS_SCAN_BYTES.saturating_sub(16));
+        let md = format!("<details>\n{}\n</details>", "`".repeat(near_cap));
+        let _ = parse(&md);
+        let work = Work::get();
+        assert!(
+            work <= near_cap * 16 + 4_096,
+            "FFI-cap backtick line must stay linear, work={work}"
+        );
+    }
+
+    #[test]
+    fn summary_opener_plus_backticks_stays_linear() {
+        let mut prev = 0usize;
+        for n in [4_000usize, 8_000, 16_000, 32_000] {
+            Work::reset();
+            let md = format!("<details>\n<summary>{}\n</details>", "`".repeat(n));
+            let _ = parse(&md);
+            let work = Work::get();
+            assert!(
+                work <= n * 16 + 4_096,
+                "summary+backtick search must stay linear, n={n} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, n={n} prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
+    }
+
+    #[test]
+    fn unequal_backtick_runs_stay_linear() {
+        Work::reset();
+        let mut md = String::from("<details>\n<summary>");
+        for len in 1..=64 {
+            md.push_str(&"`".repeat(len));
+            md.push('x');
+        }
+        md.push_str("\n</details>");
+        let _ = parse(&md);
+        let work = Work::get();
+        assert!(
+            work < 64 * 64 * 8,
+            "unequal run lengths must not rescan suffixes, work={work}"
+        );
+    }
 }
