@@ -846,6 +846,7 @@ impl MarmotApp {
                 continue;
             };
             results.push(UserDirectorySearchResult {
+                is_followed_by_searcher: radius == 1,
                 account_id_hex: record.account_id_hex.clone(),
                 npub: record.npub.clone(),
                 radius,

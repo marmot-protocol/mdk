@@ -134,6 +134,43 @@ impl DirectoryCache {
         Ok(entries)
     }
 
+    /// Public profile rows only: no per-user follow, key-package, or local-label reads.
+    /// Search includes un-promoted profiles without making them sync candidates.
+    pub(crate) fn public_search_records(
+        &self,
+        now: i64,
+    ) -> Result<Vec<UserDirectoryRecord>, AppError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT account_id_hex, npub, profile_json FROM directory_users
+             UNION ALL
+             SELECT account_id_hex, npub, profile_json FROM directory_search_graph_users
+             WHERE profile_json IS NOT NULL
+               AND (metadata_expires_at IS NULL OR metadata_expires_at > ?1)",
+        )?;
+        let rows = statement.query_map([now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (account_id_hex, npub, profile_json) = row?;
+            Ok(UserDirectoryRecord {
+                account_id_hex,
+                npub,
+                profile: optional_value(profile_json)?,
+                local_account: None,
+                follows: Vec::new(),
+                follow_source_relays: Vec::new(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+        })
+        .collect()
+    }
+
     /// Look an account up for search: the promoted directory tier first, then
     /// the un-promoted search graph.
     ///

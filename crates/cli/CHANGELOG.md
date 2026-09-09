@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- User search includes cached public identities from every connected account and delivers Vertex matches without
+  waiting for graph traversal. Swift/Kotlin and C expose a cache-only search and explicit selected-account follow
+  labels. Streaming consumers must apply `updated_results` as keyed replacements; CLI search merges them into one
+  result per person. Search-discovered profiles remain outside live directory subscriptions.
+
 ## [0.9.20] - 2026-09-08
 
 ### Added

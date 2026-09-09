@@ -39,6 +39,7 @@ use crate::types::chat_list::{
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
 use crate::types::directory::MarmotCachedIdentityProjectionList;
+use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
 use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
@@ -1010,6 +1011,11 @@ c_cmd! {
     /// before opening it. Free with
     /// `marmot_existing_direct_conversation_free`.
     async fn marmot_existing_direct_conversation(account_ref: str, peer_account_id: str) -> opt_rec(MarmotExistingDirectConversation) = existing_direct_conversation;
+
+    /// Search public identities cached through any connected account. Follow
+    /// flags refer to the selected account. Call off the UI thread and free with
+    /// `marmot_user_directory_search_result_list_free`.
+    sync fn marmot_search_cached_users(account_id_hex: str, query: str, limit: val u32) -> rec(MarmotUserDirectorySearchResultList) = search_cached_users;
 
     /// What the local directory cache holds for each requested id, one
     /// row per request in order. Free with
