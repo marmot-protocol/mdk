@@ -121,6 +121,19 @@ mod tests {
             )),
             _ => false,
         }));
+        let protected = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>`one\n</summary>\n</details>\ntwo`\n</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &protected.blocks[0] else {
+            panic!("expected protected delimiter tokens");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { content } if content.contains("</details>")))
+        );
+        assert_eq!(protected.blocks.len(), 1);
         let tokens = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
             "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",

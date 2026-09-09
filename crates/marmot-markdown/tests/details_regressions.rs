@@ -365,6 +365,40 @@ fn summary_retains_hard_break() {
 }
 
 #[test]
+fn summary_code_span_protects_delimiter_only_interior_lines() {
+    let doc = parse(
+        "<details>\n<summary>`one\n</summary>\n</details>\ntwo`\n</summary>\nbody\n</details>",
+    );
+    let Block::Details { summary, body, .. } = &doc.blocks[0] else {
+        panic!("expected Details, got {doc:?}");
+    };
+    assert!(
+        summary.iter().any(|inline| matches!(
+            inline,
+            Inline::Code(s) if s.contains("</summary>") && s.contains("</details>")
+        )),
+        "delimiter-only interior lines must stay inside the code span: {summary:?}"
+    );
+    assert_eq!(body, &vec![paragraph("body")]);
+    assert_eq!(doc.blocks.len(), 1);
+
+    let crlf = parse(
+        "<details>\r\n<summary>`one\r\n</summary>\r\n</details>\r\ntwo`\r\n</summary>\r\nbody\r\n</details>\r\n",
+    );
+    let Block::Details { summary, body, .. } = &crlf.blocks[0] else {
+        panic!("expected CRLF Details, got {crlf:?}");
+    };
+    assert!(
+        summary.iter().any(|inline| matches!(
+            inline,
+            Inline::Code(s) if s.contains("</summary>") && s.contains("</details>")
+        )),
+        "CRLF delimiter-only lines must stay inside the code span: {summary:?}"
+    );
+    assert_eq!(body, &vec![paragraph("body")]);
+}
+
+#[test]
 fn summary_code_span_can_span_three_lines_and_crlf() {
     let doc = parse("<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>");
     let Block::Details { summary, .. } = &doc.blocks[0] else {

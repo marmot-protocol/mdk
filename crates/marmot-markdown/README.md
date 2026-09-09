@@ -60,9 +60,10 @@ This is a block-oriented extension, not a general HTML parser:
   structural tag cap (inclusive of `<` through `>`). Each details block consumes
   one existing container-depth slot. Recognition work is linear in that capped
   prefix: each continuation line is scanned once with carried code-span state,
-  and unmatched backtick runs are never rescanned. Failed candidates restore
-  ordinary block structure and source gaps instead of collapsing to one
-  paragraph.
+  and unmatched backtick runs are never rescanned. An open summary code span
+  keeps interior `</summary>` and `</details>` lines as content until a
+  matching run closes it. Failed candidates restore ordinary block structure
+  and source gaps instead of collapsing to one paragraph.
 - Body blank-line counts align with `body` and saturate at
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.

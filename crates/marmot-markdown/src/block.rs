@@ -1061,7 +1061,7 @@ impl BlockParser {
             Some(Container::Details {
                 summary_state: SummaryState::Collecting { collector, .. },
                 ..
-            }) if collector.has_unmatched_openers() && !collector.has_deferred_closer()
+            }) if collector.has_unmatched_openers()
         )
     }
 

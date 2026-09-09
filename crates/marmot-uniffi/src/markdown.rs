@@ -773,6 +773,20 @@ mod tests {
             _ => false,
         }));
 
+        let protected = parse_markdown_document(
+            "<details>\n<summary>`one\n</summary>\n</details>\ntwo`\n</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &protected.blocks[0] else {
+            panic!("expected protected delimiter details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { content } if content.contains("</details>")))
+        );
+        assert!(matches!(body[0], MarkdownBlockFfi::Paragraph { .. }));
+        assert_eq!(protected.blocks.len(), 1);
+
         let code_span = parse_markdown_document(
             "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",
         );

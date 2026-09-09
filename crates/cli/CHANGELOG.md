@@ -20,7 +20,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Failed `<details>` candidates now keep a completed `<summary>` in the display
   tree, restore ordinary block structure and source gaps on fallback, preserve
   hard breaks and cross-line code spans in multiline summaries, and keep
-  summary recognition linear for many short continuation lines.
+  summary recognition linear for many short continuation lines. An open
+  summary code span now also keeps interior `</summary>` / `</details>` lines
+  literal until the matching backticks close.
 
 ### Changed
 

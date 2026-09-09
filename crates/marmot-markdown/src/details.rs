@@ -121,12 +121,6 @@ impl SummaryCollector {
         !self.unmatched.is_empty()
     }
 
-    pub(crate) fn has_deferred_closer(&self) -> bool {
-        self.deferred_closers
-            .iter()
-            .any(|closer| closer.trailing_ws_only)
-    }
-
     pub(crate) fn push_line(&mut self, next_line: &str, max_bytes: usize) -> SummaryContinue {
         Work::charge(1);
         let (next, _) = trim_leading_ws(next_line);
@@ -711,6 +705,27 @@ mod tests {
             continue_summary("use `literal", "</summary>` here</summary>"),
             SummaryContinue::Complete {
                 inner: "use `literal\n</summary>` here".into()
+            }
+        );
+        let mut collector = SummaryCollector::from_after_open("`one");
+        assert!(matches!(
+            collector.push_line("</summary>", usize::MAX),
+            SummaryContinue::StillOpen
+        ));
+        assert!(collector.has_unmatched_openers());
+        assert!(matches!(
+            collector.push_line("</details>", usize::MAX),
+            SummaryContinue::StillOpen
+        ));
+        assert!(matches!(
+            collector.push_line("two`", usize::MAX),
+            SummaryContinue::StillOpen
+        ));
+        assert!(!collector.has_unmatched_openers());
+        assert_eq!(
+            collector.push_line("</summary>", usize::MAX),
+            SummaryContinue::Complete {
+                inner: "`one\n</summary>\n</details>\ntwo`".into()
             }
         );
     }
