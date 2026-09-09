@@ -16175,6 +16175,96 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     );
 }
 
+/// Mark this device terminal in `group_id` the way a removal Commit or a
+/// selected disband Commit leaves the engine record.
+pub(crate) fn make_group_terminal(
+    client: &crate::AppClient,
+    group_id: &cgka_traits::GroupId,
+    disbanded: bool,
+) {
+    use cgka_traits::storage::GroupStorage;
+    let storage = client.app.account_storage(&client.state.label).unwrap();
+    let mut record = storage.get_group(group_id).unwrap();
+    if disbanded {
+        let tombstone = cgka_traits::group::DisbandTombstone {
+            epoch: record.epoch,
+            actor: client.runtime.session().self_id(),
+            origin_commit_id: None,
+            commit_digest: [0; 32],
+            local_was_committer_leaf: true,
+            former_members: record.members.clone(),
+            announced: true,
+        };
+        record.disbanded = Some(tombstone);
+    } else {
+        record.removed = true;
+    }
+    storage.put_group(&record).unwrap();
+}
+
+pub(crate) fn armed_group_ids(client: &crate::AppClient) -> Vec<cgka_traits::GroupId> {
+    client
+        .pending_epoch_backfill
+        .iter()
+        .chain(client.queued_epoch_backfills.iter())
+        .flat_map(|owner| owner.groups.keys().cloned())
+        .collect()
+}
+
+/// A resource refusal can still reach the arm site after this device is
+/// terminal: the outbound sweep's terminal gate
+/// (`message_processor/mod.rs`) checks `removed` but not `disbanded`, and
+/// `release_deferred_peel_row` buffers one refusal per released deferred row.
+/// A terminal copy has no servable history, so arming there could only mint a
+/// durable intent and a forensic row for work that is never coming.
+#[tokio::test]
+async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://terminal-refusal.example")
+        .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("terminal refusal", &[]).await.unwrap();
+    // Disbanded rather than removed: the sweep gate already stops the removed
+    // copy, so this is the shape that actually reaches the arm site.
+    make_group_terminal(&client, &group_id, true);
+
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects.events.push(
+        cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+        },
+    );
+    client
+        .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+        .expect("a clean refusal pass must not fail");
+
+    assert!(
+        armed_group_ids(&client).is_empty(),
+        "a terminal group must not arm an epoch-gap replay"
+    );
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .is_empty(),
+        "a terminal group must not leave a durable recovery marker"
+    );
+    assert_eq!(
+        audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
+        0,
+        "a terminal group must not record an arm in the forensic log"
+    );
+}
+
 /// Count forensic audit rows of one kind across the account's JSONL files.
 fn audit_rows_of_kind(app: &MarmotApp, kind: &str) -> usize {
     app.audit_log_files()

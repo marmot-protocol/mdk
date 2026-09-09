@@ -1797,6 +1797,9 @@ impl MarmotApp {
         // Initial access also restores durable backfill work, with or without
         // new releases, so open does not read the intent table twice.
         client.transport_receipts()?;
+        // After that call, never before: it restores the durable intents, drops
+        // the terminal ones and retires their runs, so a group retired there
+        // cannot have its evidence re-seeded into the detector here.
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
         client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         // Reads only the durable terminal guards, never live group state, so it
