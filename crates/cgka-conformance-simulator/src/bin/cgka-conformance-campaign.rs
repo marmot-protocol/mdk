@@ -1150,6 +1150,138 @@ mod tests {
         assert!(usage.signal.is_some());
     }
 
+    #[test]
+    fn large_group_pressure_8001_30_identity_is_the_reported_bulk_fanout() {
+        let case = cgka_conformance_simulator::generate_large_group_pressure_case(8001, 30);
+        assert_eq!(case.family_name, "large-group-pressure/v1");
+        assert_eq!(case.generator_version, "1");
+        let profile = case
+            .workload_profile
+            .as_ref()
+            .expect("large-group cases carry a workload profile");
+        assert_eq!(profile.version, "1");
+        assert_eq!(profile.member_count, 64);
+        assert_eq!(profile.traffic_profile, "application-heavy");
+        assert_eq!(
+            case.scenario.name,
+            "large-group-pressure/v1/case-30/bulk-application-fanout"
+        );
+        assert!(profile.name.contains("large-anchor-64"));
+        assert!(profile.name.contains("bulk-application-fanout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "64-member Welcome-refusal boundary; run: cargo test -p cgka-conformance-simulator --locked --bin cgka-conformance-campaign -- --ignored --exact tests::large_group_pressure_8001_30_reports_create_refusal"]
+    fn large_group_pressure_8001_30_reports_create_refusal() {
+        let root = tempfile::tempdir().expect("temporary campaign root");
+        let out = root.path().join("boundary");
+        fs_private::create_dir_all_private(&out).expect("private output directory");
+        let case = cgka_conformance_simulator::generate_large_group_pressure_case(8001, 30);
+        let paths = case_artifact_paths(&out, &case);
+        let input = GeneratedScenarioInputV1::new(case.clone());
+        fs_private::write_private(
+            &paths.generated_input,
+            &serde_json::to_vec_pretty(&input).expect("generated input serializes"),
+        )
+        .expect("generated input writes");
+
+        let started = Instant::now();
+        let child = Command::new(std::env::current_exe().expect("test executable path"))
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::large_group_pressure_8001_30_worker_fixture",
+            ])
+            .env("CGKA_LARGE_GROUP_WORKER_INPUT", &paths.generated_input)
+            .env("CGKA_LARGE_GROUP_WORKER_OUT", &out)
+            .spawn()
+            .expect("worker fixture starts");
+        let worker_pid = child.id();
+        let usage = wait_with_usage(child, Duration::from_secs(180)).expect("worker is reaped");
+        assert!(!usage.timed_out, "boundary worker must not time out");
+        assert!(
+            usage.signal.is_none(),
+            "boundary worker must not be signaled"
+        );
+        assert_eq!(
+            usage.exit_code,
+            Some(1),
+            "failed scenario is exit 1, not panic 101"
+        );
+
+        let mut inspection = inspect_case_artifacts(&case, &paths, &usage);
+        inspection
+            .integrity_errors
+            .extend(cleanup_worker_temporary_artifacts(&paths, worker_pid));
+        assert_eq!(inspection.integrity_errors, Vec::<String>::new());
+        let measurement = build_case_measurement(30, paths, usage, inspection, started.elapsed());
+        assert!(measurement.fixture_candidate.is_some());
+        assert!(measurement.failure_capsule.is_some());
+        assert_eq!(measurement.artifact_integrity_errors, Vec::<String>::new());
+
+        let report: ScenarioReport = serde_json::from_slice(
+            &std::fs::read(&measurement.report).expect("scenario report reads"),
+        )
+        .expect("scenario report parses");
+        let first = report
+            .step_log
+            .first()
+            .expect("failed create leaves a step log");
+        assert_eq!(first.step_type, "create_group");
+        match &first.status {
+            cgka_conformance_simulator::ScenarioStepStatus::Failed { kind, .. } => {
+                assert_eq!(kind, "peeler");
+            }
+            other => panic!("first step must fail, got {other:?}"),
+        }
+
+        let capsule = cgka_conformance_simulator::read_failure_capsule(
+            measurement
+                .failure_capsule
+                .as_ref()
+                .expect("failure capsule path"),
+        )
+        .expect("portable capsule reads");
+        assert_eq!(
+            capsule.sensitivity,
+            cgka_conformance_simulator::FailureCapsuleSensitivity::SyntheticShareable
+        );
+        assert!(capsule.byte_replay.is_none());
+        assert_eq!(capsule.failure.failure_kind, "scenario_step_failed:peeler");
+        assert_eq!(
+            capsule.failure.first_failing_action_id.as_deref(),
+            Some("step-0:create_group")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "process fixture launched by large_group_pressure_8001_30_reports_create_refusal"]
+    async fn large_group_pressure_8001_30_worker_fixture() {
+        let input = PathBuf::from(
+            std::env::var_os("CGKA_LARGE_GROUP_WORKER_INPUT").expect("worker fixture input path"),
+        );
+        let out = PathBuf::from(
+            std::env::var_os("CGKA_LARGE_GROUP_WORKER_OUT").expect("worker fixture output path"),
+        );
+        let code = run_worker(&Args {
+            family: "large-group-pressure/v1".into(),
+            seed: 8001,
+            cases: 1,
+            out,
+            storage: HarnessStorageMode::TempFileBackedSqlite,
+            case_timeout: Duration::from_secs(180),
+            minimization_budget: GeneratedScenarioMinimizationBudget::default(),
+            input: Some(input),
+            capture_sensitive_replay: false,
+            worker: true,
+        })
+        .await
+        .expect("worker returns an exit code");
+        std::process::exit(if code == ExitCode::FAILURE { 1 } else { 0 });
+    }
+
     #[cfg(unix)]
     #[test]
     fn preserves_a_workers_nonzero_exit_code() {

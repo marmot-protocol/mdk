@@ -22,22 +22,34 @@ use cgka_traits::app_components::{
     default_group_components, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+#[cfg(test)]
+use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
+#[cfg(test)]
+use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
+#[cfg(test)]
+use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent};
+#[cfg(test)]
+use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{ConvergencePassStorage, MessageStorage, StorageProvider};
+#[cfg(test)]
+use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{ConvergenceCutoffCause, ConvergencePassPhase, DurableConvergencePass};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
@@ -47,6 +59,10 @@ const STORAGE_MODE_ENV: &str = "MDK_CONFORMANCE_SQLITE_STORAGE";
 const TEMP_FILE_KEY: &str = "marmot-conformance-sqlite-temp-key";
 const HARNESS_CONVERGENCE_SETTLED_AT_MS: u64 = 1_000_000;
 const HARNESS_CONVERGENCE_DRAIN_PASSES: usize = 8;
+const MISSING_DEFAULT_GROUP: &str = "must create or join a group first";
+#[cfg(test)]
+pub(crate) const WELCOME_WRAP_REFUSAL_MARKER: &str =
+    "cgka-conformance-synthetic-welcome-wrap-refusal";
 
 pub struct HarnessClient {
     engine: Option<Engine<SqliteAccountStorage>>,
@@ -83,6 +99,8 @@ pub struct HarnessClient {
     convergence_checkpoints: HashMap<String, (GroupId, DurableConvergencePass)>,
     #[cfg(test)]
     scripted_convergence_drain: Option<ScriptedConvergenceDrain>,
+    #[cfg(test)]
+    welcome_wrap_refusal: Option<Arc<AtomicBool>>,
 }
 
 #[cfg(test)]
@@ -680,6 +698,135 @@ mod tests {
         }
     }
 
+    fn pad32(name: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 32];
+        out[..name.len()].copy_from_slice(name);
+        out
+    }
+
+    #[tokio::test]
+    async fn missing_group_preconditions_release_named_reservations() {
+        let bus = TransportBus::ordered();
+        let mut alice = ClientBuilder::new(pad32(b"alice")).attach(&bus);
+        alice.name_next_scenario_input("missing-group-invite");
+        alice
+            .try_invite(Vec::new())
+            .await
+            .expect_err("invite without a group is refused");
+        alice.name_next_scenario_input("missing-group-profile");
+        alice
+            .try_update_group_profile(Some("name".into()), None)
+            .await
+            .expect_err("profile update without a group is refused");
+        alice.name_next_scenario_input("missing-group-remove");
+        alice
+            .try_remove_members(Vec::new())
+            .await
+            .expect_err("remove without a group is refused");
+        alice.name_next_scenario_input("missing-group-self-update");
+        alice
+            .try_self_update()
+            .await
+            .expect_err("self-update without a group is refused");
+        alice.name_next_scenario_input("missing-group-admin");
+        alice
+            .update_admin_policy(Vec::new())
+            .await
+            .expect_err("admin policy without a group is refused");
+        alice.name_next_scenario_input("missing-group-send");
+        alice
+            .try_send_app(b"no-group".to_vec())
+            .await
+            .expect_err("application send without a group is refused");
+        alice.name_next_scenario_input("post-missing-group");
+    }
+
+    #[tokio::test]
+    async fn successful_create_forms_and_invite_refusal_preserve_action_ids() {
+        let refuse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let bus = TransportBus::ordered();
+        let mut alice = ClientBuilder::new(pad32(b"alice"))
+            .protocol_profile(ProtocolProfile::Current)
+            .welcome_wrap_refusal(refuse.clone())
+            .attach(&bus);
+        let mut bob = ClientBuilder::new(pad32(b"bob"))
+            .protocol_profile(ProtocolProfile::Current)
+            .attach(&bus);
+        let bob_kp = bob.fresh_key_package().await;
+        alice.name_next_scenario_input("refused-create");
+        alice
+            .try_create_group_with_admins_maybe_pending("room", vec![bob_kp], vec![], vec![])
+            .await
+            .expect_err("Welcome wrap refusal must surface");
+        assert!(alice.default_group.is_none());
+        assert!(alice.pending_publication_artifacts.is_empty());
+        refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut carol = ClientBuilder::new(pad32(b"carol"))
+            .protocol_profile(ProtocolProfile::Current)
+            .attach(&bus);
+        let carol_kp = carol.fresh_key_package().await;
+        alice.name_next_scenario_input("recovered-create");
+        let (group_id, pending) = alice
+            .try_create_group_with_admins_maybe_pending("room-2", vec![carol_kp], vec![], vec![])
+            .await
+            .expect("later create succeeds");
+        assert!(pending.is_none(), "current founding create has no pending");
+        assert_eq!(alice.default_group.as_ref(), Some(&group_id));
+
+        let mut dave = ClientBuilder::new(pad32(b"dave"))
+            .protocol_profile(ProtocolProfile::Current)
+            .attach(&bus);
+        let dave_kp = dave.fresh_key_package().await;
+        refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        alice.name_next_scenario_input("refused-invite");
+        alice
+            .try_invite(vec![dave_kp])
+            .await
+            .expect_err("invite Welcome wrap refusal is typed");
+
+        let unknown = MemberId::new(vec![0x11; 32]);
+        alice.name_next_scenario_input("refused-remove");
+        alice
+            .try_remove_members(vec![unknown.clone()])
+            .await
+            .expect_err("unknown-member remove is a typed refusal");
+        alice.name_next_scenario_input("profile-after-remove");
+        let profile = alice
+            .try_update_group_profile(Some("renamed".into()), None)
+            .await
+            .expect("named profile update succeeds after refused remove");
+        alice.confirm(profile).await;
+
+        alice.name_next_scenario_input("refused-admin");
+        alice
+            .update_admin_policy(vec![unknown])
+            .await
+            .expect_err("admin policy naming a non-member is a typed refusal");
+        alice.name_next_scenario_input("self-update-after-admin");
+        let self_update = alice
+            .try_self_update()
+            .await
+            .expect("named self-update succeeds after refused admin policy");
+        alice.confirm(self_update).await;
+
+        let ids = alice
+            .scenario_input_ledger()
+            .into_iter()
+            .map(|entry| entry.scenario_id)
+            .collect::<Vec<_>>();
+        assert!(
+            !ids.iter()
+                .any(|id| id == "refused-remove" || id == "refused-admin"),
+            "refused mutations must not overwrite later action ids"
+        );
+        for expected in ["profile-after-remove", "self-update-after-admin"] {
+            assert!(
+                ids.iter().any(|id| id == expected),
+                "later named success must keep action id {expected}: {ids:?}"
+            );
+        }
+    }
+
     /// Wraps a scripted drain in a real `HarnessClient` tick surface.
     fn scripted_client(script: ScriptedConvergenceDrain) -> HarnessClient {
         let bus = TransportBus::ordered();
@@ -717,6 +864,8 @@ pub struct ClientBuilder {
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
     deferred_peel_limits_override: Option<(usize, usize, usize)>,
+    #[cfg(test)]
+    welcome_wrap_refusal: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) enum HarnessPublicationError {
@@ -858,6 +1007,8 @@ impl ClientBuilder {
             disable_app_witnesses_for_tests: false,
             replay_probe_budget_override: None,
             deferred_peel_limits_override: None,
+            #[cfg(test)]
+            welcome_wrap_refusal: None,
         }
     }
 
@@ -926,6 +1077,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Test-only Welcome wrap refusal. The flag is per-instance and can be
+    /// cleared after a refused create so the same client can create again.
+    #[cfg(test)]
+    pub(crate) fn welcome_wrap_refusal(mut self, refuse: Arc<AtomicBool>) -> Self {
+        self.welcome_wrap_refusal = Some(refuse);
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -946,6 +1105,8 @@ impl ClientBuilder {
                 disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
                 replay_probe_budget_override: self.replay_probe_budget_override,
                 deferred_peel_limits_override: self.deferred_peel_limits_override,
+                #[cfg(test)]
+                welcome_wrap_refusal: self.welcome_wrap_refusal.as_ref(),
             },
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
@@ -981,6 +1142,8 @@ impl ClientBuilder {
             convergence_checkpoints: HashMap::new(),
             #[cfg(test)]
             scripted_convergence_drain: None,
+            #[cfg(test)]
+            welcome_wrap_refusal: self.welcome_wrap_refusal,
         }
     }
 }
@@ -994,6 +1157,8 @@ struct HarnessEngineOptions<'a> {
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
     deferred_peel_limits_override: Option<(usize, usize, usize)>,
+    #[cfg(test)]
+    welcome_wrap_refusal: Option<&'a Arc<AtomicBool>>,
 }
 
 fn build_harness_engine(
@@ -1014,7 +1179,17 @@ fn build_harness_engine(
         ProtocolProfile::Legacy,
         "the legacy harness protocol profile is unavailable in release builds"
     );
-    let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
+    let inner_peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
+    #[cfg(test)]
+    let peeler: Box<dyn TransportPeeler> = match options.welcome_wrap_refusal {
+        Some(flag) => Box::new(WelcomeWrapRefusalPeeler {
+            inner: inner_peeler,
+            refuse: flag.clone(),
+        }),
+        None => Box::new(inner_peeler),
+    };
+    #[cfg(not(test))]
+    let peeler: Box<dyn TransportPeeler> = Box::new(inner_peeler);
     let mut builder = EngineBuilder::new(storage.clone())
         .identity(identity.to_vec())
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
@@ -1023,7 +1198,7 @@ fn build_harness_engine(
         .protocol_profile(protocol_profile)
         .feature_registry(registry.clone())
         .supported_app_components(harness_supported_app_components())
-        .peeler(Box::new(peeler))
+        .peeler(peeler)
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
     #[cfg(debug_assertions)]
     if protocol_profile == ProtocolProfile::Legacy {
@@ -1112,6 +1287,78 @@ fn key_package_with_harness_source(key_package: KeyPackage) -> KeyPackage {
         MessageId::new(hasher.finalize().to_vec()),
     )
     .with_protocol_profile(protocol_profile)
+}
+
+/// Test-only peeler that delegates to the real signed Nostr peeler except for
+/// Welcome wrap. The refusal is per-instance and can be switched off.
+#[cfg(test)]
+struct WelcomeWrapRefusalPeeler {
+    inner: NostrMlsPeeler,
+    refuse: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl TransportPeeler for WelcomeWrapRefusalPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_group_message_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        metadata: &GroupMessageMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner
+            .wrap_group_message_with_metadata(payload, ctx, metadata)
+            .await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(PeelerError::WrapFailed(
+                WELCOME_WRAP_REFUSAL_MARKER.to_owned(),
+            ));
+        }
+        self.inner.wrap_welcome(payload, recipient).await
+    }
+
+    async fn wrap_welcome_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        metadata: &WelcomeMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(PeelerError::WrapFailed(
+                WELCOME_WRAP_REFUSAL_MARKER.to_owned(),
+            ));
+        }
+        self.inner
+            .wrap_welcome_with_metadata(payload, recipient, metadata)
+            .await
+    }
 }
 
 /// Stable variant name for unexpected-result errors. Debug-formatting a
@@ -1340,6 +1587,8 @@ impl HarnessClient {
                 disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
                 replay_probe_budget_override: self.replay_probe_budget_override,
                 deferred_peel_limits_override: self.deferred_peel_limits_override,
+                #[cfg(test)]
+                welcome_wrap_refusal: self.welcome_wrap_refusal.as_ref(),
             },
         );
         engine
@@ -1487,9 +1736,32 @@ impl HarnessClient {
         self.next_scenario_input_id = Some(scenario_id.into());
     }
 
+    fn release_unconsumed_scenario_input_on_err<T>(
+        &mut self,
+        result: Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        if result.is_err() {
+            self.next_scenario_input_id = None;
+        }
+        result
+    }
+
+    fn missing_default_group() -> EngineError {
+        EngineError::Other(MISSING_DEFAULT_GROUP.into())
+    }
+
     pub async fn fresh_key_package(&mut self) -> KeyPackage {
-        let key_package = self.engine_mut().fresh_key_package().await.expect("kp");
-        key_package_with_harness_source(key_package)
+        self.try_fresh_key_package().await.expect("kp")
+    }
+
+    pub(crate) async fn try_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
+        let result = self.try_fresh_key_package_inner().await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_fresh_key_package_inner(&mut self) -> Result<KeyPackage, EngineError> {
+        let key_package = self.engine_mut().fresh_key_package().await?;
+        Ok(key_package_with_harness_source(key_package))
     }
 
     /// Create a new group with the given members + features.
@@ -1555,7 +1827,25 @@ impl HarnessClient {
         .expect("create_group")
     }
 
-    async fn try_create_group_with_admins_maybe_pending(
+    pub(crate) async fn try_create_group_with_admins_maybe_pending(
+        &mut self,
+        name: &str,
+        invitees: Vec<KeyPackage>,
+        required_features: Vec<cgka_traits::capabilities::Feature>,
+        initial_admins: Vec<MemberId>,
+    ) -> Result<(GroupId, Option<PendingStateRef>), EngineError> {
+        let result = self
+            .try_create_group_with_admins_maybe_pending_inner(
+                name,
+                invitees,
+                required_features,
+                initial_admins,
+            )
+            .await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_create_group_with_admins_maybe_pending_inner(
         &mut self,
         name: &str,
         invitees: Vec<KeyPackage>,
@@ -1579,7 +1869,8 @@ impl HarnessClient {
             (gid, SendResult::FoundingGroupCreated { welcomes }) => (gid, None, welcomes),
             (_, other) => {
                 return Err(EngineError::Other(format!(
-                    "expected group creation result, got {other:?}"
+                    "expected group creation result, got {}",
+                    send_result_kind(&other)
                 )));
             }
         };
@@ -1733,7 +2024,29 @@ impl HarnessClient {
         name: Option<String>,
         description: Option<String>,
     ) -> PendingStateRef {
-        let gid = self.default_group.clone().expect("group");
+        self.try_update_group_profile(name, description)
+            .await
+            .expect("update group profile")
+    }
+
+    pub(crate) async fn try_update_group_profile(
+        &mut self,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let result = self.try_update_group_profile_inner(name, description).await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_update_group_profile_inner(
+        &mut self,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
         let res = self
             .engine_mut()
             .send(SendIntent::UpdateGroupData {
@@ -1741,35 +2054,64 @@ impl HarnessClient {
                 name,
                 description,
             })
-            .await
-            .expect("update group profile");
+            .await?;
         self.publish_group_evolution(res, &gid, "update_group_profile")
             .await
     }
 
     pub async fn remove_members(&mut self, members: Vec<MemberId>) -> PendingStateRef {
-        let gid = self.default_group.clone().expect("group");
+        self.try_remove_members(members)
+            .await
+            .expect("remove members")
+    }
+
+    pub(crate) async fn try_remove_members(
+        &mut self,
+        members: Vec<MemberId>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let result = self.try_remove_members_inner(members).await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_remove_members_inner(
+        &mut self,
+        members: Vec<MemberId>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
         let result = self
             .engine_mut()
             .send(SendIntent::RemoveMembers {
                 group_id: gid.clone(),
                 members,
             })
-            .await
-            .expect("remove members");
+            .await?;
         self.publish_group_evolution(result, &gid, "remove_members")
             .await
     }
 
     pub async fn self_update(&mut self) -> PendingStateRef {
-        let gid = self.default_group.clone().expect("group");
+        self.try_self_update().await.expect("self update")
+    }
+
+    pub(crate) async fn try_self_update(&mut self) -> Result<PendingStateRef, EngineError> {
+        let result = self.try_self_update_inner().await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_self_update_inner(&mut self) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
         let result = self
             .engine_mut()
             .send(SendIntent::SelfUpdate {
                 group_id: gid.clone(),
             })
-            .await
-            .expect("self update");
+            .await?;
         self.publish_group_evolution(result, &gid, "self_update")
             .await
     }
@@ -1779,25 +2121,29 @@ impl HarnessClient {
         result: SendResult,
         group_id: &GroupId,
         operation: &str,
-    ) -> PendingStateRef {
+    ) -> Result<PendingStateRef, EngineError> {
         match result {
             SendResult::GroupEvolution {
                 msg,
                 welcomes,
                 pending,
             } => {
-                assert!(
-                    welcomes.is_empty(),
-                    "{operation} should not create welcomes"
-                );
+                if !welcomes.is_empty() {
+                    return Err(EngineError::Other(format!(
+                        "{operation} should not create welcomes"
+                    )));
+                }
                 let routed = route(msg, group_id);
                 self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
                 self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
                 self.publish_commit_scenario_input(&routed, pending).await;
                 self.bus.send(self.bus_id, routed);
-                pending
+                Ok(pending)
             }
-            other => panic!("expected GroupEvolution from {operation}, got {other:?}"),
+            other => Err(EngineError::Other(format!(
+                "expected GroupEvolution from {operation}, got {}",
+                send_result_kind(&other)
+            ))),
         }
     }
 
@@ -1805,7 +2151,18 @@ impl HarnessClient {
         &mut self,
         admins: Vec<MemberId>,
     ) -> Result<PendingStateRef, EngineError> {
-        let gid = self.default_group.clone().expect("group");
+        let result = self.update_admin_policy_inner(admins).await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn update_admin_policy_inner(
+        &mut self,
+        admins: Vec<MemberId>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
         let data = encode_admin_policy(admins)?;
         let res = self
             .engine_mut()
@@ -1823,10 +2180,11 @@ impl HarnessClient {
                 welcomes,
                 pending,
             } => {
-                assert!(
-                    welcomes.is_empty(),
-                    "admin policy update should not create welcomes"
-                );
+                if !welcomes.is_empty() {
+                    return Err(EngineError::Backend(
+                        "admin policy update should not create welcomes".into(),
+                    ));
+                }
                 let routed = route(msg, &gid);
                 self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
                 self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
@@ -1835,7 +2193,8 @@ impl HarnessClient {
                 Ok(pending)
             }
             other => Err(EngineError::Backend(format!(
-                "expected GroupEvolution from update_admin_policy, got {other:?}"
+                "expected GroupEvolution from update_admin_policy, got {}",
+                send_result_kind(&other)
             ))),
         }
     }
@@ -1915,10 +2274,18 @@ impl HarnessClient {
         &mut self,
         payload: impl Into<Vec<u8>>,
     ) -> Result<(DecryptabilityProbeSendStatus, String), EngineError> {
+        let result = self.try_send_app_inner(payload).await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_send_app_inner(
+        &mut self,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<(DecryptabilityProbeSendStatus, String), EngineError> {
         let gid = self
             .default_group
             .clone()
-            .ok_or_else(|| EngineError::Other("must create or join a group first".into()))?;
+            .ok_or_else(Self::missing_default_group)?;
         let payload = self.next_app_payload(payload.into());
         let (logical_id, logical_payload) = logical_message_fields(&payload);
         let scenario_input = self.next_scenario_input_metadata(
@@ -1951,7 +2318,8 @@ impl HarnessClient {
                 Ok((DecryptabilityProbeSendStatus::Queued, logical_id))
             }
             other => Err(EngineError::Backend(format!(
-                "expected ApplicationMessage or Queued, got {other:?}"
+                "expected ApplicationMessage or Queued, got {}",
+                send_result_kind(&other)
             ))),
         }
     }
@@ -1969,7 +2337,18 @@ impl HarnessClient {
         &mut self,
         kps: Vec<KeyPackage>,
     ) -> Result<PendingStateRef, EngineError> {
-        let gid = self.default_group.clone().expect("group");
+        let result = self.try_invite_inner(kps).await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_invite_inner(
+        &mut self,
+        kps: Vec<KeyPackage>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
         let res = self
             .engine_mut()
             .send(SendIntent::Invite {
@@ -2004,7 +2383,8 @@ impl HarnessClient {
                 Ok(pending)
             }
             other => Err(EngineError::Other(format!(
-                "expected GroupEvolution, got {other:?}"
+                "expected GroupEvolution, got {}",
+                send_result_kind(&other)
             ))),
         }
     }
@@ -2032,7 +2412,7 @@ impl HarnessClient {
         let gid = self
             .default_group
             .clone()
-            .ok_or_else(|| EngineError::Other("must create or join a group first".into()))?;
+            .ok_or_else(Self::missing_default_group)?;
         let res = self
             .engine_mut()
             .send(SendIntent::Leave {
