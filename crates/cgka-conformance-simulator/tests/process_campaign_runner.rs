@@ -1,7 +1,8 @@
 use cgka_conformance_simulator::{
-    GeneratedScenarioInputV1, ScenarioReport, generate_convergence_e2e_delivery_case,
-    resolve_scenario_input_bytes,
+    GeneratedScenarioInputV1, ScenarioReport, ScenarioStepStatus,
+    generate_convergence_e2e_delivery_case, resolve_scenario_input_bytes,
 };
+use std::path::Path;
 use std::process::Command;
 
 fn campaign_binary() -> &'static str {
@@ -172,19 +173,38 @@ fn large_group_pressure_8001_30_report_and_campaign_worker_exit_failed_scenario(
     assert_eq!(campaign_status.code(), Some(1));
 
     let stem = "large-group-pressure-v1-seed-8001-case-30";
-    let report_path = campaign_out.join(format!("{stem}.json"));
-    let fixture_path = campaign_out.join(format!("{stem}-fixture.v1.json"));
-    let capsule_path = campaign_out.join(format!("{stem}-failure-capsule.v1.json"));
+    assert_create_refusal_artifacts(&report_out, stem);
+    assert_create_refusal_artifacts(&campaign_out, stem);
+}
+
+fn assert_create_refusal_artifacts(out: &Path, stem: &str) {
+    let report_path = out.join(format!("{stem}.json"));
+    let fixture_path = out.join(format!("{stem}-fixture.v1.json"));
+    let capsule_path = out.join(format!("{stem}-failure-capsule.v1.json"));
     let report: ScenarioReport =
-        serde_json::from_slice(&std::fs::read(&report_path).expect("campaign report reads"))
-            .expect("campaign report parses");
-    assert!(fixture_path.is_file());
-    let capsule =
-        cgka_conformance_simulator::read_failure_capsule(&capsule_path).expect("capsule reads");
+        serde_json::from_slice(&std::fs::read(&report_path).expect("create-refusal report reads"))
+            .expect("create-refusal report parses");
+    assert!(
+        fixture_path.is_file(),
+        "missing fixture {}",
+        fixture_path.display()
+    );
+    let capsule = cgka_conformance_simulator::read_failure_capsule(&capsule_path)
+        .expect("create-refusal capsule reads");
     assert_eq!(
         capsule.sensitivity,
         cgka_conformance_simulator::FailureCapsuleSensitivity::SyntheticShareable
     );
     assert!(capsule.byte_replay.is_none());
-    assert_eq!(report.step_log[0].step_type, "create_group");
+    let first = report
+        .step_log
+        .first()
+        .expect("failed create leaves a step log");
+    assert_eq!(first.step_type, "create_group");
+    match &first.status {
+        ScenarioStepStatus::Failed { kind, .. } => {
+            assert_eq!(kind, "peeler");
+        }
+        other => panic!("first step must fail with peeler, got {other:?}"),
+    }
 }

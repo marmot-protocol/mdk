@@ -819,11 +819,12 @@ mod tests {
                 .any(|id| id == "refused-remove" || id == "refused-admin"),
             "refused mutations must not overwrite later action ids"
         );
-        assert!(
-            ids.iter()
-                .any(|id| id == "profile-after-remove" || id == "self-update-after-admin"),
-            "later named successes must keep their own action ids: {ids:?}"
-        );
+        for expected in ["profile-after-remove", "self-update-after-admin"] {
+            assert!(
+                ids.iter().any(|id| id == expected),
+                "later named success must keep action id {expected}: {ids:?}"
+            );
+        }
     }
 
     /// Wraps a scripted drain in a real `HarnessClient` tick surface.

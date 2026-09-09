@@ -4298,6 +4298,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_and_self_update_engine_refusals_recover_on_memory_and_file() {
+        for storage_mode in [
+            HarnessStorageMode::InMemorySqlite,
+            HarnessStorageMode::TempFileBackedSqlite,
+        ] {
+            let labels = vec!["alice".to_owned(), "bob".to_owned()];
+            let mut subject =
+                EngineHarnessSubject::new(&labels, ProtocolProfile::Current, storage_mode)
+                    .expect("subject constructs");
+
+            let prejoin_profile = subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id: "prejoin-profile",
+                    client: "alice",
+                    name: Some("too-early"),
+                    description: None,
+                    pending: "unused-prejoin-profile",
+                })
+                .await
+                .expect_err("profile update before create is a typed engine refusal");
+            assert_eq!(prejoin_profile.code, "other");
+            assert_eq!(prejoin_profile.category, SubjectFailureCategory::Protocol);
+            assert_eq!(prejoin_profile.message, "engine operation failed (other)");
+            assert!(!prejoin_profile.message.contains("must create or join"));
+            assert!(subject.pending_refs.is_empty());
+            assert!(subject.outbound_records.is_empty());
+
+            let prejoin_self_update = subject
+                .self_update(SubjectSelfUpdate {
+                    action_id: "prejoin-self-update",
+                    client: "alice",
+                    pending: "unused-prejoin-self-update",
+                })
+                .await
+                .expect_err("self-update before create is a typed engine refusal");
+            assert_eq!(prejoin_self_update.code, "other");
+            assert_eq!(
+                prejoin_self_update.category,
+                SubjectFailureCategory::Protocol
+            );
+            assert_eq!(
+                prejoin_self_update.message,
+                "engine operation failed (other)"
+            );
+            assert!(!prejoin_self_update.message.contains("must create or join"));
+            assert!(subject.pending_refs.is_empty());
+            assert!(subject.outbound_records.is_empty());
+
+            create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+            let outbound_after_join = subject.outbound_records.len();
+            let pending_after_join = subject.pending_refs.len();
+
+            let denied_profile = subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id: "nonadmin-profile",
+                    client: "bob",
+                    name: Some("denied"),
+                    description: None,
+                    pending: "unused-nonadmin-profile",
+                })
+                .await
+                .expect_err("non-admin profile update is a typed engine refusal");
+            assert_eq!(denied_profile.code, "not_group_admin");
+            assert_eq!(
+                denied_profile.category,
+                SubjectFailureCategory::ExpectedRefusal
+            );
+            assert_eq!(
+                denied_profile.message,
+                "engine operation failed (not_group_admin)"
+            );
+            assert!(!subject.pending_refs.contains_key("unused-nonadmin-profile"));
+            assert_eq!(subject.outbound_records.len(), outbound_after_join);
+            assert_eq!(subject.pending_refs.len(), pending_after_join);
+
+            subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id: "recovered-profile",
+                    client: "alice",
+                    name: Some("renamed"),
+                    description: None,
+                    pending: "recovered-profile",
+                })
+                .await
+                .expect("admin profile update succeeds after sibling refusals");
+            subject
+                .self_update(SubjectSelfUpdate {
+                    action_id: "recovered-self-update",
+                    client: "bob",
+                    pending: "recovered-self-update",
+                })
+                .await
+                .expect("member self-update succeeds after sibling refusals");
+
+            let alice_ids = subject
+                .client_mut("alice")
+                .expect("alice")
+                .scenario_input_ledger()
+                .into_iter()
+                .map(|entry| entry.scenario_id)
+                .collect::<Vec<_>>();
+            let bob_ids = subject
+                .client_mut("bob")
+                .expect("bob")
+                .scenario_input_ledger()
+                .into_iter()
+                .map(|entry| entry.scenario_id)
+                .collect::<Vec<_>>();
+            for refused in ["prejoin-profile", "prejoin-self-update"] {
+                assert!(
+                    !alice_ids.iter().any(|id| id == refused),
+                    "refused {refused} must not leave a successful alice ledger row: {alice_ids:?}"
+                );
+            }
+            assert!(
+                alice_ids.iter().any(|id| id == "recovered-profile"),
+                "later named profile must keep its action id: {alice_ids:?}"
+            );
+            assert!(
+                !bob_ids.iter().any(|id| id == "nonadmin-profile"),
+                "refused non-admin profile must not leave a successful bob ledger row: {bob_ids:?}"
+            );
+            assert!(
+                bob_ids.iter().any(|id| id == "recovered-self-update"),
+                "later named self-update must keep its action id: {bob_ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn successful_create_forms_preserve_legacy_pending_and_current_empty_publication() {
         let current_bus = crate::TransportBus::ordered();
         let mut current = crate::ClientBuilder::new(pad32(b"alice"))
