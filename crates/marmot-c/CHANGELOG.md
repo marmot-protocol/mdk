@@ -7,6 +7,18 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot_search_cached_users`, `MarmotUserDirectorySearchResultList`, and
+  `marmot_user_directory_search_result_list_free` for network-free public cache search across connected accounts.
+
+### Changed
+
+- Search results include `is_followed_by_searcher`; streaming updates include keyed `updated_results` replacements
+  and a `CachedResultsFound` trigger. Consumers must merge by account ID, including across radius pages, and use
+  the explicit follow flag instead of radius 1 for badges. C consumers must rebuild against the matching generated
+  header and library because both search-result and search-update struct layouts changed.
+
 ## [0.9.20] - 2026-09-08
 
 ### Added

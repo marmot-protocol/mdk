@@ -8,6 +8,9 @@ use crate::{
     parse_account_id_hex, sort_user_search_results,
 };
 
+/// Defensive materialization cap, matching the shared public directory's bound.
+pub(crate) const CACHED_SEARCH_MAX_RECORDS: usize = 10_000;
+
 impl MarmotApp {
     /// Search all cached public identities, independent of social-graph reachability.
     /// This does no relay work or group-membership reads. Follow attribution is
@@ -83,7 +86,7 @@ impl MarmotApp {
             })
             .collect::<Vec<_>>();
         sort_user_search_results(&mut results);
-        results.truncate(limit);
+        results.truncate(limit.min(CACHED_SEARCH_MAX_RECORDS));
         Ok((follows, results))
     }
 
@@ -91,17 +94,44 @@ impl MarmotApp {
         &self,
         searcher: &str,
     ) -> Result<HashSet<String>, AppError> {
-        // A previous search may have learned the selected account's kind-3
-        // without promoting its profile into the directory.
-        for cache in self.directory_caches()? {
+        Ok(self
+            .cached_search_follow_list(searcher)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect())
+    }
+
+    /// Prefer a connected searcher's own contact-list cache. Other accounts may
+    /// hold older copies of its public kind-3 and cannot override its follow badge.
+    /// `None` retains the distinction between unknown and explicitly empty lists.
+    pub(crate) fn cached_search_follow_list(
+        &self,
+        searcher: &str,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let account = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == searcher && account.is_active_signing());
+        let caches = if let Some(account) = account {
+            vec![self.directory_cache_for_account(&account)?]
+        } else {
+            // The Rust API also supports a public, non-connected graph root.
+            self.directory_caches()?
+        };
+        for cache in &caches {
             if let Some(follows) = cache.search_graph_follows(searcher)? {
-                return Ok(follows.into_iter().collect());
+                return Ok(Some(follows));
             }
         }
-        Ok(self
-            .directory_entry_for_account_id(searcher)?
-            .map(|record| record.follows.into_iter().collect())
-            .unwrap_or_default())
+        for cache in &caches {
+            if let Some(record) = cache.entry(searcher)?
+                && !record.follows.is_empty()
+            {
+                return Ok(Some(record.follows));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -111,6 +141,114 @@ mod tests {
     use crate::directory::cache::DirectorySearchGraphRecord;
     use crate::directory::records::public_directory_user_record;
     use crate::{UserDirectoryLocalAccount, UserProfileMetadata};
+
+    #[tokio::test]
+    async fn connected_searcher_ignores_another_accounts_stale_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.invalid",
+            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+        );
+        let other = app.account_home().create_account("a-other").unwrap();
+        let searcher = app.account_home().create_account("z-searcher").unwrap();
+        let own_cache = app.directory_cache_for_account(&searcher).unwrap();
+        let other_cache = app.directory_cache_for_account(&other).unwrap();
+        let followed = "11".repeat(32);
+        let stale = "22".repeat(32);
+        for id in [&searcher.account_id_hex, &followed, &stale] {
+            let mut record = app.empty_directory_record(id);
+            record.profile = Some(UserProfileMetadata {
+                name: Some("needle".into()),
+                created_at: 1,
+                ..Default::default()
+            });
+            own_cache.put(&record).unwrap();
+        }
+        own_cache
+            .remember_search_graph_follows(
+                &searcher.account_id_hex,
+                &crate::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+                std::slice::from_ref(&followed),
+            )
+            .unwrap();
+        other_cache
+            .remember_search_graph_follows(
+                &searcher.account_id_hex,
+                &crate::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+                std::slice::from_ref(&stale),
+            )
+            .unwrap();
+        let cached = app
+            .search_cached_users(&searcher.account_id_hex, "needle", 100)
+            .unwrap();
+        assert_eq!(
+            cached[0].account_id_hex, searcher.account_id_hex,
+            "self ranks first"
+        );
+        assert_eq!(
+            cached
+                .iter()
+                .filter(|r| r.is_followed_by_searcher)
+                .map(|r| r.account_id_hex.clone())
+                .collect::<Vec<_>>(),
+            vec![followed.clone()]
+        );
+        let offline = app
+            .search_user_directory(crate::UserDirectorySearch {
+                searcher_account_id_hex: searcher.account_id_hex.clone(),
+                query: "needle".into(),
+                radius_start: 1,
+                radius_end: 1,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].account_id_hex, followed);
+        assert!(offline[0].is_followed_by_searcher);
+        let mut stream = app
+            .search_users(crate::UserSearchParams {
+                searcher_account_id_hex: searcher.account_id_hex.clone(),
+                query: "needle".into(),
+                radius_start: 0,
+                radius_end: 1,
+                radius_one_seeds: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut latest = BTreeMap::new();
+        while let Some(update) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next_update())
+                .await
+                .unwrap()
+        {
+            assert!(!matches!(
+                update.trigger,
+                crate::SearchUpdateTrigger::Error { .. }
+            ));
+            for row in update.new_results.into_iter().chain(update.updated_results) {
+                latest.insert(row.account_id_hex.clone(), row);
+            }
+        }
+        assert!(latest[&followed].is_followed_by_searcher);
+        assert!(!latest[&stale].is_followed_by_searcher);
+        assert_eq!(latest[&stale].radius, OFF_GRAPH_SEARCH_RADIUS);
+
+        // A known-empty list remains authoritative even with another cache's stale edges.
+        own_cache
+            .remember_search_graph_follows(
+                &searcher.account_id_hex,
+                &crate::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+                &[],
+            )
+            .unwrap();
+        assert!(
+            app.search_cached_users(&searcher.account_id_hex, "needle", 100)
+                .unwrap()
+                .iter()
+                .all(|row| !row.is_followed_by_searcher)
+        );
+    }
 
     #[test]
     fn public_cache_spans_accounts_but_follow_labels_do_not() {

@@ -319,7 +319,11 @@ async fn run_search<F>(
         let cached_query = query.clone();
         let cached_started = Instant::now();
         let cached = blocking_app_task(move || {
-            cached_app.cached_search_snapshot(&cached_searcher, &cached_query, usize::MAX)
+            cached_app.cached_search_snapshot(
+                &cached_searcher,
+                &cached_query,
+                super::cached_search::CACHED_SEARCH_MAX_RECORDS,
+            )
         });
         let cached = tokio::select! {
             _ = emitter.updates_tx.closed() => return,
@@ -340,12 +344,7 @@ async fn run_search<F>(
                     .await;
             }
             Err(error) => {
-                failed = true;
-                emitter
-                    .emit(SearchUpdateTrigger::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
+                tracing::debug!(target: "marmot_app::directory", method = "search_cache", error_kind = error.privacy_safe_kind(), "cached search unavailable; continuing network search");
             }
         }
         trace_search_stage("cache", cached_started);
@@ -361,16 +360,10 @@ async fn run_search<F>(
             match resolved_seeds {
                 Ok(Ok(seeds)) => graph_params.radius_one_seeds.extend(seeds),
                 Ok(Err(error)) => {
-                    graph_emitter
-                        .emit(SearchUpdateTrigger::Error {
-                            message: error.to_string(),
-                        })
-                        .await
+                    tracing::debug!(target: "marmot_app::directory", method = "search_group_seeds", error_kind = error.privacy_safe_kind(), "group search seeds unavailable; continuing without them");
                 }
                 Err(_) => {
-                    graph_emitter
-                        .emit(SearchUpdateTrigger::RadiusTimeout { radius: 1 })
-                        .await
+                    tracing::debug!(target: "marmot_app::directory", method = "search_group_seeds", outcome = "timeout", "group search seeds timed out; continuing without them");
                 }
             }
             let started = Instant::now();
@@ -987,7 +980,19 @@ async fn extend_with_follows(
     searcher_layer: bool,
     emitter: &mut SearchEmitter,
 ) -> Result<(), AppError> {
-    let (cached, unknown) = partition_cached_follows(app, frontier).await?;
+    let (cached, unknown) = if searcher_layer {
+        let app = app.clone();
+        let searcher = frontier[0].clone();
+        blocking_app_task(move || {
+            Ok(match app.cached_search_follow_list(&searcher)? {
+                Some(follows) => (vec![follows], Vec::new()),
+                None => (Vec::new(), vec![searcher]),
+            })
+        })
+        .await?
+    } else {
+        partition_cached_follows(app, frontier).await?
+    };
 
     // Pass 1: contact lists already on the device. No relay round trip, so the
     // next layer starts forming immediately.
@@ -1024,7 +1029,7 @@ async fn extend_with_follows(
 /// how that claim gets checked in the field instead of assumed. Counts only --
 /// never an account id, a relay, or the query, per the privacy invariant in
 /// `AGENTS.md`.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct SearchTally {
     /// Answered from the device: the promoted directory or the search graph.
     from_cache: usize,
@@ -1188,16 +1193,15 @@ async fn cache_resolved_follows(
 }
 
 /// Sends updates to the subscription and keeps the running result total.
-#[derive(Clone)]
 struct SearchEmitter {
     updates_tx: mpsc::Sender<UserSearchUpdate>,
+    started: Instant,
     state: Arc<Mutex<SearchState>>,
     tally: SearchTally,
 }
 
 #[derive(Default)]
 struct SearchState {
-    started: Option<Instant>,
     first_result_reported: bool,
     first_network_result_reported: bool,
     results: HashMap<String, UserDirectorySearchResult>,
@@ -1210,10 +1214,8 @@ impl SearchEmitter {
     fn new(updates_tx: mpsc::Sender<UserSearchUpdate>) -> Self {
         Self {
             updates_tx,
-            state: Arc::new(Mutex::new(SearchState {
-                started: Some(Instant::now()),
-                ..Default::default()
-            })),
+            started: Instant::now(),
+            state: Arc::new(Mutex::new(SearchState::default())),
             tally: SearchTally::default(),
         }
     }
@@ -1221,23 +1223,34 @@ impl SearchEmitter {
     fn fork(&self) -> Self {
         Self {
             updates_tx: self.updates_tx.clone(),
+            started: self.started,
             state: self.state.clone(),
             tally: SearchTally::default(),
         }
     }
 
     fn total_result_count(&self) -> usize {
-        self.state.lock().expect("search state").results.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .results
+            .len()
     }
 
     fn set_searcher(&mut self, searcher: &str, follows: HashSet<String>) {
         self.remember_graph_accounts(0, &[searcher.to_owned()]);
         self.remember_graph_accounts(1, &follows.iter().cloned().collect::<Vec<_>>());
-        self.state.lock().expect("search state").follows = follows;
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .follows = follows;
     }
 
     fn remember_follows(&mut self, follows: &[String]) {
-        let mut state = self.state.lock().expect("search state");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for id in follows {
             state.follows.insert(id.clone());
             if let Some(result) = state.results.get_mut(id)
@@ -1255,7 +1268,10 @@ impl SearchEmitter {
     }
 
     fn remember_graph_accounts(&mut self, radius: u8, account_ids: &[String]) {
-        let mut state = self.state.lock().expect("search state");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for account_id in account_ids {
             let known = state
                 .graph_radii
@@ -1279,7 +1295,10 @@ impl SearchEmitter {
         ranked_pubkeys: Vec<RankedPubkey>,
         radius_start: u8,
     ) -> Vec<RankedPubkey> {
-        let state = self.state.lock().expect("search state");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         ranked_pubkeys
             .into_iter()
             .filter(|ranked| {
@@ -1329,7 +1348,7 @@ impl SearchEmitter {
             let radius = self
                 .state
                 .lock()
-                .expect("search state")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .graph_radii
                 .get(&ranked.record.account_id_hex)
                 .copied()
@@ -1393,7 +1412,10 @@ impl SearchEmitter {
         let Ok(permit) = self.updates_tx.reserve().await else {
             return;
         };
-        let mut state = self.state.lock().expect("search state");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut added = Vec::new();
         for mut result in new_results {
             result.is_followed_by_searcher = state.follows.contains(&result.account_id_hex);
@@ -1443,17 +1465,13 @@ impl SearchEmitter {
         }
         if !added.is_empty() || !updated_results.is_empty() {
             if !state.first_result_reported {
-                if let Some(started) = state.started {
-                    trace_search_stage("first_result", started);
-                }
+                trace_search_stage("first_result", self.started);
                 state.first_result_reported = true;
             }
             if !state.first_network_result_reported
                 && !matches!(trigger, SearchUpdateTrigger::CachedResultsFound)
             {
-                if let Some(started) = state.started {
-                    trace_search_stage("first_enrichment", started);
-                }
+                trace_search_stage("first_enrichment", self.started);
                 state.first_network_result_reported = true;
             }
         }
@@ -1466,7 +1484,7 @@ impl SearchEmitter {
     }
 }
 
-/// Rank results best-first: direct follows, nearest radius, then provider rank for discovery
+/// Rank results best-first: self, direct follows, nearest radius, then provider rank for discovery
 /// results, then local match strength, matched field, and pubkey for stability.
 ///
 /// Public because a streaming consumer has to re-rank for itself. Updates
@@ -1475,8 +1493,9 @@ impl SearchEmitter {
 /// stream must sort the aggregate to recover this order.
 pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
     results.sort_by(|a, b| {
-        b.is_followed_by_searcher
-            .cmp(&a.is_followed_by_searcher)
+        (b.radius == 0)
+            .cmp(&(a.radius == 0))
+            .then_with(|| b.is_followed_by_searcher.cmp(&a.is_followed_by_searcher))
             .then_with(|| a.radius.cmp(&b.radius))
             .then_with(|| match (a.provider_rank, b.provider_rank) {
                 (Some(left), Some(right)) => right.total_cmp(&left),
@@ -1590,6 +1609,46 @@ mod tests {
         );
         assert!(graph_dropped.await.is_err());
         assert!(provider_dropped.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_membership_keeps_cached_results_and_completes_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.invalid",
+            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+        );
+        let account = app.account_home().create_account("alice").unwrap();
+        app.directory_cache_for_account(&account)
+            .unwrap()
+            .put(&record_named(&account.account_id_hex, "needle"))
+            .unwrap();
+        let subscription = app
+            .search_users_with_seeds(
+                params(&account.account_id_hex, "needle", (0, 0)),
+                std::future::ready(Err(AppError::RelayDirectory(
+                    "membership unavailable".into(),
+                ))),
+            )
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+        assert_eq!(updates[0].trigger, SearchUpdateTrigger::CachedResultsFound);
+        assert_eq!(updates[0].new_results.len(), 1);
+        assert!(
+            updates
+                .iter()
+                .any(|u| u.trigger == SearchUpdateTrigger::RadiusCompleted { radius: 0 })
+        );
+        assert!(updates.iter().all(|u| !matches!(
+            u.trigger,
+            SearchUpdateTrigger::Error { .. } | SearchUpdateTrigger::RadiusTimeout { .. }
+        )));
+        assert_eq!(
+            updates.last().unwrap().trigger,
+            SearchUpdateTrigger::SearchCompleted
+        );
     }
 
     #[tokio::test]

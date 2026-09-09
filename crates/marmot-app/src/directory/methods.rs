@@ -837,6 +837,8 @@ impl MarmotApp {
             return Ok(Vec::new());
         }
 
+        let follows =
+            self.cached_search_follows(&parse_account_id_hex(&search.searcher_account_id_hex)?)?;
         let mut results = Vec::new();
         for (record, radius) in records {
             if radius < search.radius_start || radius > search.radius_end {
@@ -846,7 +848,7 @@ impl MarmotApp {
                 continue;
             };
             results.push(UserDirectorySearchResult {
-                is_followed_by_searcher: radius == 1,
+                is_followed_by_searcher: follows.contains(&record.account_id_hex),
                 account_id_hex: record.account_id_hex.clone(),
                 npub: record.npub.clone(),
                 radius,
@@ -1174,11 +1176,16 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) =
+                let Some(mut record) =
                     Self::directory_search_record_from_caches(&caches, &account_id, now)?
                 else {
                     continue;
                 };
+                if radius == 0 {
+                    record.follows = self
+                        .cached_search_follow_list(&account_id)?
+                        .unwrap_or_default();
+                }
                 if radius < radius_end {
                     for follow in &record.follows {
                         if next.len() >= USER_DIRECTORY_SEARCH_MAX_FRONTIER {

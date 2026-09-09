@@ -140,15 +140,26 @@ impl DirectoryCache {
         &self,
         now: i64,
     ) -> Result<Vec<UserDirectoryRecord>, AppError> {
+        self.public_search_records_capped(now, super::cached_search::CACHED_SEARCH_MAX_RECORDS)
+    }
+
+    fn public_search_records_capped(
+        &self,
+        now: i64,
+        max: usize,
+    ) -> Result<Vec<UserDirectoryRecord>, AppError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, profile_json FROM directory_users
              UNION ALL
              SELECT account_id_hex, npub, profile_json FROM directory_search_graph_users
              WHERE profile_json IS NOT NULL
-               AND (metadata_expires_at IS NULL OR metadata_expires_at > ?1)",
+               AND (metadata_expires_at IS NULL OR metadata_expires_at > ?1)
+             ORDER BY account_id_hex
+             LIMIT ?2",
         )?;
-        let rows = statement.query_map([now], |row| {
+        let cap = i64::try_from(max).unwrap_or(i64::MAX);
+        let rows = statement.query_map([now, cap], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -807,6 +818,25 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn public_search_materialization_stops_at_its_cap() {
+        let (_dir, cache) = test_cache();
+        for id in 1..=4 {
+            cache
+                .put(&directory_record(account_id(id), vec![]))
+                .unwrap();
+        }
+        // Each put populates both tiers. The fourth identity must not be decoded beyond the row cap.
+        cache.lock().unwrap().execute(
+            "UPDATE directory_users SET profile_json = 'invalid json' WHERE account_id_hex = ?1",
+            [account_id(4)]).unwrap();
+        let rows = cache.public_search_records_capped(i64::MAX, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].account_id_hex, account_id(1));
+        assert_eq!(rows[2].account_id_hex, account_id(2));
+        assert!(cache.public_search_records_capped(i64::MAX, 7).is_err());
     }
 
     #[test]

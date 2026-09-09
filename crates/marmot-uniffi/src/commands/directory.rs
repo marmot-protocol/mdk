@@ -164,6 +164,8 @@ impl Marmot {
     /// Stream cached public identities across accounts, then independent provider
     /// and graph results. The radius window bounds known social distances;
     /// cached/provider identities without a known distance remain discoverable.
+    /// Those identities can recur when paging radii: deduplicate by account id
+    /// across pages as well as within each subscription.
     ///
     /// Returns without waiting for group membership. Consume until completion,
     /// inserting `new_results` and replacing `updated_results` by account id.

@@ -53,7 +53,8 @@ event, pre-cache direct follows, and cache profile metadata for those likely con
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
 keep warming the cache. `search_cached_users(searcher, query, limit)` searches public profiles learned through
 **any connected account**, including un-promoted profiles from previous searches, without relay access or group
-membership reads. Private labels/nicknames do not participate. `is_followed_by_searcher` is relative only to the
+membership reads. A profile learned during a search under one account is intentionally searchable under another account.
+Private labels/nicknames do not participate. `is_followed_by_searcher` is relative only to the
 selected account; another account's follows never confer that label. The older `search_user_directory` remains the
 explicit offline graph-radius query.
 
@@ -62,11 +63,16 @@ follow-graph traversal. The runtime resolves group co-members on the graph path,
 Consumers insert `new_results` and replace `updated_results` by `account_id_hex`, then re-sort; `total_result_count`
 counts unique people. Results with radius 255 have no established graph distance yet and may receive one later.
 Radius 1 also includes group co-members, so only the explicit follow flag means "You follow". Requested radius windows
-filter known distances; other cached/provider identities remain discoverable.
+filter known distances; other cached/provider identities remain discoverable and can recur on later pages.
+Deduplicate by account ID across searches/pages as well as within a stream. Cache materialization is capped at
+10,000 rows per account cache (in account-ID order), matching the shared directory's existing cap; the cache-only
+API and the stream's initial cache batch return at most 10,000 results. At that scale, local results can be partial;
+network enrichment remains available.
 
 Hosts should use the cache-only call off the UI thread on each query change, debounce network searches separately,
 and discard results when the query or selected account changes. Dropping the streaming subscription cancels both
-network sources, including blocked membership reads. Vertex's signed profiles are cached only in the un-promoted
+network sources, including blocked membership reads. A failed cache read or unavailable group membership is an optional-source
+failure: search continues without that input rather than emitting a terminal error. Vertex's signed profiles are cached only in the un-promoted
 search tier; discovering a stranger never creates a live per-author subscription. Traversal retains its radius,
 candidate, batch, and timeout bounds. Aggregate `search_stage` timings separate cache reads, membership, provider
 response, profile hydration, and network completion, without logging queries or identities.
