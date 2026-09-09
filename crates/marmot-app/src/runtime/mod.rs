@@ -1784,6 +1784,27 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Stream cached public matches and provider discovery immediately, resolving
+    /// group co-members only on the independent graph-enrichment path.
+    pub async fn search_users(
+        &self,
+        params: crate::UserSearchParams,
+    ) -> Result<crate::UserSearchSubscription, AppError> {
+        let runtime = self.clone();
+        let searcher = params.searcher_account_id_hex.clone();
+        let include_groups = params.radius_end >= 1;
+        self.accounts
+            .app
+            .search_users_with_seeds(params, async move {
+                if include_groups {
+                    runtime.group_co_members(&searcher).await
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+            .await
+    }
+
     /// Accounts the searcher currently shares a group with.
     ///
     /// Feeds [`UserSearchParams::radius_one_seeds`]: sharing a group is social

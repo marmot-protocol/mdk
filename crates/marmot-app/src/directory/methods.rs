@@ -837,6 +837,8 @@ impl MarmotApp {
             return Ok(Vec::new());
         }
 
+        let follows =
+            self.cached_search_follows(&parse_account_id_hex(&search.searcher_account_id_hex)?)?;
         let mut results = Vec::new();
         for (record, radius) in records {
             if radius < search.radius_start || radius > search.radius_end {
@@ -846,6 +848,7 @@ impl MarmotApp {
                 continue;
             };
             results.push(UserDirectorySearchResult {
+                is_followed_by_searcher: follows.contains(&record.account_id_hex),
                 account_id_hex: record.account_id_hex.clone(),
                 npub: record.npub.clone(),
                 radius,
@@ -1173,11 +1176,16 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) =
+                let Some(mut record) =
                     Self::directory_search_record_from_caches(&caches, &account_id, now)?
                 else {
                     continue;
                 };
+                if radius == 0 {
+                    record.follows = self
+                        .cached_search_follow_list(&account_id)?
+                        .unwrap_or_default();
+                }
                 if radius < radius_end {
                     for follow in &record.follows {
                         if next.len() >= USER_DIRECTORY_SEARCH_MAX_FRONTIER {
@@ -1305,6 +1313,9 @@ impl MarmotApp {
         entry.follows = follow_list.follows.clone();
         entry.follow_source_relays = follow_list.source_relays.clone();
         self.save_directory_entry(&entry)?;
+        // A fetched empty kind-3 is authoritative, unlike a profile-only
+        // promotion whose empty follow vec means "not loaded".
+        self.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
         for follow in &follow_list.follows {
             self.remember_directory_user(follow)?;
         }

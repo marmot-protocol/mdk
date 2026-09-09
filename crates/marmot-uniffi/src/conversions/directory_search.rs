@@ -55,18 +55,18 @@ impl From<MatchedField> for MatchedFieldFfi {
 
 /// One person the search found.
 ///
-/// `radius` is social distance from the searcher: 0 is the searcher, 1 a
-/// direct follow. Render it as provenance ("via someone you follow").
-///
-/// `255` is the exception and means *off-graph*: this person came from a
-/// configured fallback or a discovery provider rather than through anyone the user
-/// knows. Present those as discovery, never as a connection -- they are not a
-/// distance from the user at all.
+/// `is_followed_by_searcher` is the direct-follow label for the selected account.
+/// Radius 1 can also mean a shared group; it must not be used as a follow flag.
+/// Radius 255 means no relationship has been established for this result yet;
+/// a later update may supply a graph radius. Cached public profiles can come
+/// from any connected account without inheriting that account's relationships.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct UserDirectorySearchResultFfi {
     pub account_id_hex: String,
     pub npub: String,
     pub radius: u8,
+    /// Direct follow of the selected searcher; radius 1 alone is insufficient.
+    pub is_followed_by_searcher: bool,
     pub matched_field: MatchedFieldFfi,
     pub match_quality: MatchQualityFfi,
     /// Rank supplied by an off-graph discovery provider.
@@ -80,6 +80,7 @@ impl From<UserDirectorySearchResult> for UserDirectorySearchResultFfi {
             account_id_hex: value.account_id_hex,
             npub: value.npub,
             radius: value.radius,
+            is_followed_by_searcher: value.is_followed_by_searcher,
             matched_field: value.matched_field.into(),
             match_quality: value.match_quality.into(),
             provider_rank: value.provider_rank,
@@ -101,6 +102,7 @@ pub enum SearchUpdateTriggerFfi {
     /// Results from the optional off-graph discovery tier. Each result still
     /// carries its own graph or discovery provenance.
     DiscoveryResultsFound,
+    CachedResultsFound,
     RadiusCompleted {
         radius: u8,
     },
@@ -129,6 +131,7 @@ impl From<SearchUpdateTrigger> for SearchUpdateTriggerFfi {
             SearchUpdateTrigger::RadiusStarted { radius } => Self::RadiusStarted { radius },
             SearchUpdateTrigger::ResultsFound { radius } => Self::ResultsFound { radius },
             SearchUpdateTrigger::DiscoveryResultsFound => Self::DiscoveryResultsFound,
+            SearchUpdateTrigger::CachedResultsFound => Self::CachedResultsFound,
             SearchUpdateTrigger::RadiusCompleted { radius } => Self::RadiusCompleted { radius },
             SearchUpdateTrigger::RadiusTimeout { radius } => Self::RadiusTimeout { radius },
             SearchUpdateTrigger::RadiusTruncated { radius } => Self::RadiusTruncated { radius },
@@ -142,12 +145,13 @@ impl From<SearchUpdateTrigger> for SearchUpdateTriggerFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct UserSearchUpdateFfi {
     pub trigger: SearchUpdateTriggerFfi,
-    /// Matches found by this step, pre-sorted within the batch. Ordering
-    /// *across* graph updates is radius order; an optional discovery batch
-    /// follows graph traversal and may contain results retaining graph
-    /// provenance. A host rendering one flat list should re-sort the aggregate.
+    /// New identities, sorted within this batch. Cache, provider, and graph
+    /// sources arrive independently. Merge by account id and re-sort after
+    /// applying `updated_results` as replacements.
     pub new_results: Vec<UserDirectorySearchResultFfi>,
-    /// Running total this search has emitted so far, including `new_results`.
+    /// Replace existing rows with these values, matching by account id.
+    pub updated_results: Vec<UserDirectorySearchResultFfi>,
+    /// Unique person count; replacements do not increment it.
     pub total_result_count: u32,
 }
 
@@ -156,6 +160,7 @@ impl From<UserSearchUpdate> for UserSearchUpdateFfi {
         Self {
             trigger: value.trigger.into(),
             new_results: value.new_results.into_iter().map(Into::into).collect(),
+            updated_results: value.updated_results.into_iter().map(Into::into).collect(),
             total_result_count: saturating_u32(value.total_result_count),
         }
     }
@@ -174,6 +179,7 @@ mod tests {
         let update = UserSearchUpdate {
             trigger: SearchUpdateTrigger::ResultsFound { radius: 1 },
             new_results: vec![UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: "aa".repeat(32),
                 npub: "npub1example".to_owned(),
                 radius: 1,
@@ -182,9 +188,15 @@ mod tests {
                 provider_rank: Some(0.75),
                 profile: None,
             }],
+            updated_results: Vec::new(),
             total_result_count: 1,
         };
 
+        let mut replacement = update.new_results[0].clone();
+        replacement.is_followed_by_searcher = true;
+        replacement.provider_rank = None;
+        let mut update = update;
+        update.updated_results.push(replacement);
         let ffi = UserSearchUpdateFfi::from(update);
 
         assert!(matches!(
@@ -193,6 +205,10 @@ mod tests {
         ));
         assert_eq!(ffi.total_result_count, 1);
         assert_eq!(ffi.new_results.len(), 1);
+        assert_eq!(ffi.updated_results.len(), 1);
+        assert!(ffi.updated_results[0].is_followed_by_searcher);
+        assert_eq!(ffi.updated_results[0].provider_rank, None);
+
         assert_eq!(ffi.new_results[0].provider_rank, Some(0.75));
         assert!(matches!(
             ffi.new_results[0].matched_field,
@@ -209,6 +225,7 @@ mod tests {
         let ffi = UserSearchUpdateFfi::from(UserSearchUpdate {
             trigger: SearchUpdateTrigger::SearchCompleted,
             new_results: Vec::new(),
+            updated_results: Vec::new(),
             total_result_count: 3,
         });
 

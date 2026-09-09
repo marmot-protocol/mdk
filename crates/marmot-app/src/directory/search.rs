@@ -3,8 +3,8 @@
 //! [`MarmotApp::search_users`] answers "who do I know called *foo*" by walking
 //! the searcher's own social graph outward and streaming matches as each layer
 //! resolves, while a bounded Open Ranking request supplies off-graph discovery.
-//! Graph results retain priority and social provenance; only remaining ranked
-//! pubkeys are hydrated from signed Nostr profile events.
+//! Cached public identities arrive first. Provider and graph results then arrive
+//! independently, with keyed replacements when relationship or profile data improves.
 //!
 //! Traversal is bounded by construction, as `AGENTS.md` requires: the radius is
 //! capped, relay work per radius is batched author-scoped fetches under a
@@ -18,7 +18,9 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Duration;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cgka_traits::TransportEndpoint;
 
@@ -76,14 +78,13 @@ const SEARCH_PUBKEY_BATCH_SIZE: usize = 200;
 /// Ceiling on the relay work a single radius may spend.
 const SEARCH_RADIUS_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Reported distance for matches that are not on the searcher's graph at all.
+/// No social distance from the searcher has been established for this result.
 ///
-/// Every consumer renders `radius` as provenance -- "via someone you follow".
-/// When a search falls back to a configured seed, or a discovery provider finds
-/// someone outside the graph, that person is not a measurable distance from
-/// the searcher. Labelling them radius 1 would make that provenance a lie, so
-/// they are reported as off-graph. `u8::MAX` also sorts last, which is where an
-/// off-graph match belongs.
+/// Public cache and provider hits can arrive before graph traversal knows their
+/// relationship. Later updates may supply a distance. Fallback-seed matches
+/// remain unmeasured because those hops are from the seed, not the searcher.
+/// Never infer a follow from this sentinel or from radius 1 (which also includes
+/// group co-members); use `is_followed_by_searcher` for that label.
 pub const OFF_GRAPH_SEARCH_RADIUS: u8 = u8::MAX;
 
 /// How far a layer has walked, and how that distance is reported.
@@ -172,8 +173,9 @@ pub enum SearchUpdateTrigger {
     RadiusStarted { radius: u8 },
     /// A batch of matches resolved at this radius.
     ResultsFound { radius: u8 },
-    /// A batch produced by the optional off-graph discovery tier after graph
-    /// traversal. Individual results retain any graph radius already observed,
+    /// Cached public matches from every connected account.
+    CachedResultsFound,
+    /// A batch produced independently by the optional discovery tier. Individual results retain any graph radius already observed,
     /// but this trigger never reopens a completed radius bucket.
     DiscoveryResultsFound,
     /// This radius finished resolving.
@@ -194,13 +196,14 @@ pub enum SearchUpdateTrigger {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UserSearchUpdate {
     pub trigger: SearchUpdateTrigger,
-    /// Matches discovered by this step, pre-sorted within the batch. Ordering
-    /// *across* graph updates is radius order; an optional discovery batch
-    /// follows graph traversal and may contain results retaining graph
-    /// provenance. Flat-list consumers should re-sort the aggregate.
+    /// New identities, sorted within this batch. Sources arrive independently.
+    /// Merge by account id and re-sort after applying both new and updated rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_results: Vec<UserDirectorySearchResult>,
-    /// Running total emitted by this search so far, including `new_results`.
+    /// Replacements for previously emitted identities, keyed by account id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updated_results: Vec<UserDirectorySearchResult>,
+    /// Number of unique identities, including this update; replacements do not increment it.
     pub total_result_count: usize,
 }
 
@@ -230,6 +233,18 @@ impl MarmotApp {
         &self,
         params: UserSearchParams,
     ) -> Result<UserSearchSubscription, AppError> {
+        self.search_users_with_seeds(params, std::future::ready(Ok(Vec::new())))
+            .await
+    }
+
+    pub(crate) async fn search_users_with_seeds<F>(
+        &self,
+        params: UserSearchParams,
+        seeds: F,
+    ) -> Result<UserSearchSubscription, AppError>
+    where
+        F: Future<Output = Result<Vec<String>, AppError>> + Send + 'static,
+    {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
             "search",
@@ -253,6 +268,7 @@ impl MarmotApp {
                 params,
                 updates_tx,
                 observation,
+                seeds,
             )
             .await;
         });
@@ -262,13 +278,16 @@ impl MarmotApp {
 
 /// Drive one search to completion, reporting a failure as an update rather
 /// than losing it: the caller holds a subscription, not a `Result`.
-async fn run_search(
+async fn run_search<F>(
     app: MarmotApp,
     searcher_account_id_hex: String,
     params: UserSearchParams,
     updates_tx: mpsc::Sender<UserSearchUpdate>,
     observation: Option<crate::ProductObservation>,
-) {
+    seeds: F,
+) where
+    F: Future<Output = Result<Vec<String>, AppError>> + Send,
+{
     let source_observation = app
         .product_analytics
         .begin(
@@ -279,6 +298,8 @@ async fn run_search(
         .map(crate::ProductObservation::counts_only);
     let mut failed = false;
     let mut emitter = SearchEmitter::new(updates_tx);
+    emitter.remember_graph_accounts(0, std::slice::from_ref(&searcher_account_id_hex));
+    emitter.remember_graph_accounts(1, &params.radius_one_seeds);
     // An empty query would match every candidate through `contains`, so it
     // finds nobody by definition rather than everybody.
     let query = params.query.trim().to_lowercase();
@@ -294,26 +315,141 @@ async fn run_search(
             .collect::<Vec<_>>();
         let open_ranking_search_endpoint =
             open_ranking_search_endpoint.filter(|_| !open_ranking_profile_relays.is_empty());
-        // Start the independent discovery request with the graph walk, but
-        // merge its results afterwards. That gives a graph result precedence
-        // when both sources return the same identity, without holding a
-        // mutable emitter across concurrent tasks.
-        let discovery_updates_tx = emitter.updates_tx.clone();
-        let (graph_result, ranked_pubkeys) = tokio::join!(
-            traverse_graph(
+        let cached_app = app.clone();
+        let cached_searcher = searcher_account_id_hex.clone();
+        let cached_query = query.clone();
+        let cached_started = Instant::now();
+        let cached = blocking_app_task(move || {
+            cached_app.cached_search_snapshot(
+                &cached_searcher,
+                &cached_query,
+                super::cached_search::CACHED_SEARCH_MAX_RECORDS,
+            )
+        });
+        let cached = tokio::select! {
+            _ = emitter.updates_tx.closed() => return,
+            result = cached => result,
+        };
+        match cached {
+            Ok((follows, mut results)) => {
+                emitter.set_searcher(&searcher_account_id_hex, follows);
+                // Radius windows constrain known social distances, not discovery.
+                results.retain(|result| {
+                    result.radius == OFF_GRAPH_SEARCH_RADIUS
+                        || (params.radius_start..=params.radius_end).contains(&result.radius)
+                });
+                emitter.tally.resolved_from_cache(results.len());
+                emitter
+                    .emit_results(SearchUpdateTrigger::CachedResultsFound, results)
+                    .await;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    target: "marmot_app::directory",
+                    method = "search_cache",
+                    error_kind = error.privacy_safe_kind(),
+                    "cached search unavailable; continuing network search"
+                );
+            }
+        }
+        trace_search_stage("cache", cached_started);
+        let mut graph_emitter = emitter.fork();
+        let mut discovery_emitter = emitter.fork();
+        let graph = async {
+            let mut graph_params = params.clone();
+            // Membership reads belong only to graph enrichment. A stalled worker
+            // cannot hold cache or provider results hostage.
+            let seed_started = Instant::now();
+            let resolved_seeds = timeout(SEARCH_RADIUS_TIMEOUT, seeds).await;
+            trace_search_stage("group_seeds", seed_started);
+            match resolved_seeds {
+                Ok(Ok(seeds)) => graph_params.radius_one_seeds.extend(seeds),
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        target: "marmot_app::directory",
+                        method = "search_group_seeds",
+                        error_kind = error.privacy_safe_kind(),
+                        "group search seeds unavailable; continuing without them"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "marmot_app::directory",
+                        method = "search_group_seeds",
+                        outcome = "timeout",
+                        "group search seeds timed out; continuing without them"
+                    );
+                }
+            }
+            let started = Instant::now();
+            let result = traverse_graph(
                 &app,
                 &searcher_account_id_hex,
                 &query,
-                &params,
-                &mut emitter,
-            ),
-            fetch_open_ranking_pubkeys(
+                &graph_params,
+                &mut graph_emitter,
+            )
+            .await;
+            trace_search_stage("graph", started);
+            result
+        };
+        let discovery = async {
+            let started = Instant::now();
+            let ranked = fetch_open_ranking_pubkeys(
                 &query,
                 open_ranking_search_endpoint.as_deref(),
-                discovery_updates_tx,
-            ),
-        );
-        if let Err(error) = graph_result {
+                discovery_emitter.updates_tx.clone(),
+            )
+            .await;
+            trace_search_stage("provider_response", started);
+            let remaining = discovery_emitter.remaining_ranked_pubkeys(ranked, params.radius_start);
+            if !remaining.is_empty() && !discovery_emitter.is_cancelled() {
+                let started = Instant::now();
+                match hydrate_open_ranking_profiles(&app, remaining, &open_ranking_profile_relays)
+                    .await
+                {
+                    Ok(records) => {
+                        discovery_emitter
+                            .tally
+                            .resolved_from_open_ranking(records.len());
+                        // Cache signed profiles in the un-promoted tier for repeat queries.
+                        let profiles = records
+                            .iter()
+                            .map(|ranked| ranked.record.clone())
+                            .collect::<Vec<_>>();
+                        discovery_emitter.emit_ranked_matches(records, &query).await;
+                        if cache_resolved_profiles(
+                            &app,
+                            &profiles,
+                            crate::unix_now_seconds() as i64,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::debug!(
+                                target: "marmot_app::directory",
+                                method = "search_cache_provider",
+                                outcome = "failed",
+                                "search profile cache write failed"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "marmot_app::directory",
+                            method = "search_users_open_ranking_hydrate",
+                            outcome = "fetch_failed",
+                            "Open Ranking profile hydration unavailable"
+                        )
+                    }
+                }
+                trace_search_stage("provider_profiles", started);
+            }
+        };
+        let started = Instant::now();
+        let graph_result = drive_search_sources(emitter.updates_tx.clone(), graph, discovery).await;
+        trace_search_stage("network", started);
+        if let Some(Err(error)) = graph_result {
             failed = true;
             emitter
                 .emit(SearchUpdateTrigger::Error {
@@ -321,33 +457,8 @@ async fn run_search(
                 })
                 .await;
         }
-        let remaining = emitter.remaining_ranked_pubkeys(ranked_pubkeys, params.radius_start);
-        if !remaining.is_empty() && !emitter.is_cancelled() {
-            let hydration_updates_tx = emitter.updates_tx.clone();
-            let hydration = tokio::select! {
-                _ = hydration_updates_tx.closed() => None,
-                result = hydrate_open_ranking_profiles(
-                    &app,
-                    remaining,
-                    &open_ranking_profile_relays,
-                ) => Some(result),
-            };
-            match hydration {
-                None => {}
-                Some(Ok(records)) => {
-                    emitter.tally.resolved_from_open_ranking(records.len());
-                    emitter.emit_ranked_matches(records, &query).await;
-                }
-                Some(Err(_)) => {
-                    tracing::debug!(
-                        target: "marmot_app::directory",
-                        method = "search_users_open_ranking_hydrate",
-                        outcome = "fetch_failed",
-                        "Open Ranking profile hydration unavailable"
-                    );
-                }
-            }
-        }
+        emitter.tally.add(&graph_emitter.tally);
+        emitter.tally.add(&discovery_emitter.tally);
     }
     let cancelled = emitter.is_cancelled();
     emitter.emit(SearchUpdateTrigger::SearchCompleted).await;
@@ -368,12 +479,33 @@ async fn run_search(
             "cancelled"
         } else if failed {
             "failure"
-        } else if emitter.total_result_count == 0 {
+        } else if emitter.total_result_count() == 0 {
             "empty"
         } else {
             "success"
         });
     }
+}
+
+/// Both sources are polled independently and dropped immediately with their consumer.
+async fn drive_search_sources<G, D>(
+    updates: mpsc::Sender<UserSearchUpdate>,
+    graph: G,
+    discovery: D,
+) -> Option<Result<(), AppError>>
+where
+    G: Future<Output = Result<(), AppError>>,
+    D: Future<Output = ()>,
+{
+    tokio::select! {
+        _ = updates.closed() => None,
+        (result, ()) = async { tokio::join!(graph, discovery) } => Some(result),
+    }
+}
+
+fn trace_search_stage(stage: &'static str, started: Instant) {
+    tracing::debug!(target: "marmot_app::directory", method = "search_stage",
+        stage, duration_ms = started.elapsed().as_millis() as u64, "user search stage finished");
 }
 
 /// Fetch ranked identities from Vertex without exposing failures to the graph
@@ -409,7 +541,7 @@ async fn fetch_open_ranking_pubkeys(
 ///
 /// The ranked response itself is derived data. Profiles still come from signed
 /// Nostr events and pass through the relay-plane safety, signature, kind, and
-/// freshness checks. Nothing in this path is persisted.
+/// freshness checks. Resolved profiles are cached in the un-promoted search tier.
 async fn hydrate_open_ranking_profiles(
     app: &MarmotApp,
     ranked_pubkeys: Vec<RankedPubkey>,
@@ -470,12 +602,12 @@ async fn traverse_graph(
                 radius
             },
         };
+        emitter.remember_graph_accounts(depth.reported, &frontier);
         emitter
             .emit(SearchUpdateTrigger::RadiusStarted {
                 radius: depth.reported,
             })
             .await;
-        emitter.remember_graph_accounts(depth.reported, &frontier);
 
         // One timeout per radius, covering every relay round trip the radius
         // makes: resolving its profiles and reading the follow lists that
@@ -551,7 +683,12 @@ async fn advance_radius(
     if depth.hop == 0 {
         layer.admit(params.radius_one_seeds.clone(), seen);
     }
-    extend_with_follows(app, frontier, seen, &mut layer).await?;
+    let searcher = if depth.hop == 0 {
+        frontier.first().map(String::as_str)
+    } else {
+        None
+    };
+    extend_with_follows(app, frontier, seen, &mut layer, searcher, emitter).await?;
     if layer.truncated {
         emitter
             .emit(SearchUpdateTrigger::RadiusTruncated {
@@ -870,12 +1007,29 @@ async fn extend_with_follows(
     frontier: &[String],
     seen: &mut HashSet<String>,
     layer: &mut NextLayer,
+    searcher: Option<&str>,
+    emitter: &mut SearchEmitter,
 ) -> Result<(), AppError> {
-    let (cached, unknown) = partition_cached_follows(app, frontier).await?;
+    let (cached, unknown) = if let Some(searcher) = searcher {
+        let app = app.clone();
+        let searcher = searcher.to_owned();
+        blocking_app_task(move || {
+            Ok(match app.cached_search_follow_list(&searcher)? {
+                Some(follows) => (vec![follows], Vec::new()),
+                None => (Vec::new(), vec![searcher]),
+            })
+        })
+        .await?
+    } else {
+        partition_cached_follows(app, frontier).await?
+    };
 
     // Pass 1: contact lists already on the device. No relay round trip, so the
     // next layer starts forming immediately.
     for follows in cached {
+        if searcher.is_some() {
+            emitter.remember_follows(&follows);
+        }
         if !layer.admit(follows, seen) {
             return Ok(());
         }
@@ -888,6 +1042,9 @@ async fn extend_with_follows(
         let fetched = fetch_follow_lists(app, batch).await?;
         cache_resolved_follows(app, &fetched).await?;
         for (_, follows) in fetched {
+            if searcher.is_some() {
+                emitter.remember_follows(&follows);
+            }
             if !layer.admit(follows, seen) {
                 return Ok(());
             }
@@ -917,6 +1074,14 @@ struct SearchTally {
 }
 
 impl SearchTally {
+    fn add(&mut self, other: &Self) {
+        self.from_cache += other.from_cache;
+        self.from_relays += other.from_relays;
+        self.from_write_relays += other.from_write_relays;
+        self.from_open_ranking += other.from_open_ranking;
+        self.unresolved += other.unresolved;
+    }
+
     fn resolved_from_cache(&mut self, count: usize) {
         self.from_cache += count;
     }
@@ -1060,32 +1225,98 @@ async fn cache_resolved_follows(
 /// Sends updates to the subscription and keeps the running result total.
 struct SearchEmitter {
     updates_tx: mpsc::Sender<UserSearchUpdate>,
-    total_result_count: usize,
-    emitted_account_ids: HashSet<String>,
-    graph_radii: HashMap<String, u8>,
+    started: Instant,
+    state: Arc<Mutex<SearchState>>,
     tally: SearchTally,
+}
+
+#[derive(Default)]
+struct SearchState {
+    first_result_reported: bool,
+    first_network_result_reported: bool,
+    results: HashMap<String, UserDirectorySearchResult>,
+    graph_radii: HashMap<String, u8>,
+    follows: HashSet<String>,
+    pending_updates: BTreeMap<String, UserDirectorySearchResult>,
 }
 
 impl SearchEmitter {
     fn new(updates_tx: mpsc::Sender<UserSearchUpdate>) -> Self {
         Self {
             updates_tx,
-            total_result_count: 0,
-            emitted_account_ids: HashSet::new(),
-            graph_radii: HashMap::new(),
+            started: Instant::now(),
+            state: Arc::new(Mutex::new(SearchState::default())),
             tally: SearchTally::default(),
         }
     }
 
-    /// Whether the consumer has dropped the subscription, which is how a
-    /// search is cancelled.
+    fn fork(&self) -> Self {
+        Self {
+            updates_tx: self.updates_tx.clone(),
+            started: self.started,
+            state: self.state.clone(),
+            tally: SearchTally::default(),
+        }
+    }
+
+    fn total_result_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .results
+            .len()
+    }
+
+    fn set_searcher(&mut self, searcher: &str, follows: HashSet<String>) {
+        self.remember_graph_accounts(0, &[searcher.to_owned()]);
+        self.remember_graph_accounts(1, &follows.iter().cloned().collect::<Vec<_>>());
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .follows = follows;
+    }
+
+    fn remember_follows(&mut self, follows: &[String]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in follows {
+            state.follows.insert(id.clone());
+            if let Some(result) = state.results.get_mut(id)
+                && !result.is_followed_by_searcher
+            {
+                result.is_followed_by_searcher = true;
+                let result = result.clone();
+                state.pending_updates.insert(id.clone(), result);
+            }
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.updates_tx.is_closed()
     }
 
     fn remember_graph_accounts(&mut self, radius: u8, account_ids: &[String]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for account_id in account_ids {
-            self.graph_radii.entry(account_id.clone()).or_insert(radius);
+            let known = state
+                .graph_radii
+                .entry(account_id.clone())
+                .or_insert(radius);
+            *known = (*known).min(radius);
+            let radius = *known;
+            if let Some(result) = state.results.get_mut(account_id)
+                && radius < result.radius
+            {
+                result.radius = radius;
+                result.provider_rank = None;
+                let result = result.clone();
+                state.pending_updates.insert(account_id.clone(), result);
+            }
         }
     }
 
@@ -1094,11 +1325,18 @@ impl SearchEmitter {
         ranked_pubkeys: Vec<RankedPubkey>,
         radius_start: u8,
     ) -> Vec<RankedPubkey> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         ranked_pubkeys
             .into_iter()
             .filter(|ranked| {
-                !self.emitted_account_ids.contains(&ranked.account_id_hex)
-                    && self
+                state
+                    .results
+                    .get(&ranked.account_id_hex)
+                    .is_none_or(|result| result.radius == OFF_GRAPH_SEARCH_RADIUS)
+                    && state
                         .graph_radii
                         .get(&ranked.account_id_hex)
                         .is_none_or(|radius| *radius >= radius_start)
@@ -1113,6 +1351,7 @@ impl SearchEmitter {
             .filter_map(|record| {
                 let search_match = user_record_match(&record, query)?;
                 Some(UserDirectorySearchResult {
+                    is_followed_by_searcher: false,
                     account_id_hex: record.account_id_hex,
                     npub: record.npub,
                     radius,
@@ -1123,10 +1362,6 @@ impl SearchEmitter {
                 })
             })
             .collect::<Vec<_>>();
-        results.retain(|result| {
-            self.emitted_account_ids
-                .insert(result.account_id_hex.clone())
-        });
         if results.is_empty() {
             return;
         }
@@ -1144,12 +1379,16 @@ impl SearchEmitter {
                 continue;
             };
             let radius = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .graph_radii
                 .get(&ranked.record.account_id_hex)
                 .copied()
                 .unwrap_or(OFF_GRAPH_SEARCH_RADIUS);
             let provider_rank = (radius == OFF_GRAPH_SEARCH_RADIUS).then_some(ranked.rank);
             let result = UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: ranked.record.account_id_hex,
                 npub: ranked.record.npub,
                 radius,
@@ -1158,12 +1397,7 @@ impl SearchEmitter {
                 provider_rank,
                 profile: ranked.record.profile,
             };
-            if self
-                .emitted_account_ids
-                .insert(result.account_id_hex.clone())
-            {
-                results.push(result);
-            }
+            results.push(result);
         }
         if !results.is_empty() {
             sort_user_search_results(&mut results);
@@ -1189,7 +1423,7 @@ impl SearchEmitter {
             from_write_relays = self.tally.from_write_relays,
             from_open_ranking = self.tally.from_open_ranking,
             unresolved = self.tally.unresolved,
-            matches = self.total_result_count,
+            matches = self.total_result_count(),
             "user search finished"
         );
     }
@@ -1207,19 +1441,83 @@ impl SearchEmitter {
         trigger: SearchUpdateTrigger,
         new_results: Vec<UserDirectorySearchResult>,
     ) {
-        self.total_result_count += new_results.len();
-        let _ = self
-            .updates_tx
-            .send(UserSearchUpdate {
+        // Reserve before locking: backpressure must not block provenance updates.
+        let Ok(permit) = self.updates_tx.reserve().await else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut added = Vec::new();
+        for mut result in new_results {
+            result.is_followed_by_searcher = state.follows.contains(&result.account_id_hex);
+            if let Some(radius) = state.graph_radii.get(&result.account_id_hex) {
+                result.radius = result.radius.min(*radius);
+            }
+            if result.radius != OFF_GRAPH_SEARCH_RADIUS {
+                result.provider_rank = None;
+            }
+            if let Some(old) = state.results.get(&result.account_id_hex) {
+                result.radius = result.radius.min(old.radius);
+                if old.profile.as_ref().map(|p| p.created_at)
+                    > result.profile.as_ref().map(|p| p.created_at)
+                {
+                    result.profile = old.profile.clone();
+                    result.matched_field = old.matched_field;
+                    result.match_quality = old.match_quality;
+                }
+                if result.radius == OFF_GRAPH_SEARCH_RADIUS && result.provider_rank.is_none() {
+                    result.provider_rank = old.provider_rank;
+                }
+                if result == *old {
+                    continue;
+                }
+                state
+                    .pending_updates
+                    .insert(result.account_id_hex.clone(), result.clone());
+            } else {
+                added.push(result.clone());
+            }
+            state.results.insert(result.account_id_hex.clone(), result);
+        }
+        let mut updated_results = std::mem::take(&mut state.pending_updates)
+            .into_values()
+            .collect::<Vec<_>>();
+        sort_user_search_results(&mut added);
+        sort_user_search_results(&mut updated_results);
+        if added.is_empty()
+            && updated_results.is_empty()
+            && matches!(
                 trigger,
-                new_results,
-                total_result_count: self.total_result_count,
-            })
-            .await;
+                SearchUpdateTrigger::ResultsFound { .. }
+                    | SearchUpdateTrigger::DiscoveryResultsFound
+            )
+        {
+            return;
+        }
+        if !added.is_empty() || !updated_results.is_empty() {
+            if !state.first_result_reported {
+                trace_search_stage("first_result", self.started);
+                state.first_result_reported = true;
+            }
+            if !state.first_network_result_reported
+                && !matches!(trigger, SearchUpdateTrigger::CachedResultsFound)
+            {
+                trace_search_stage("first_enrichment", self.started);
+                state.first_network_result_reported = true;
+            }
+        }
+        permit.send(UserSearchUpdate {
+            trigger,
+            new_results: added,
+            updated_results,
+            total_result_count: state.results.len(),
+        });
     }
 }
 
-/// Rank results best-first: nearest radius, then provider rank for discovery
+/// Rank results best-first: self, direct follows, nearest radius, then provider rank for discovery
 /// results, then local match strength, matched field, and pubkey for stability.
 ///
 /// Public because a streaming consumer has to re-rank for itself. Updates
@@ -1228,8 +1526,10 @@ impl SearchEmitter {
 /// stream must sort the aggregate to recover this order.
 pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
     results.sort_by(|a, b| {
-        a.radius
-            .cmp(&b.radius)
+        (b.radius == 0)
+            .cmp(&(a.radius == 0))
+            .then_with(|| b.is_followed_by_searcher.cmp(&a.is_followed_by_searcher))
+            .then_with(|| a.radius.cmp(&b.radius))
             .then_with(|| match (a.provider_rank, b.provider_rank) {
                 (Some(left), Some(right)) => right.total_cmp(&left),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -1302,6 +1602,206 @@ mod tests {
         })
         .await
         .expect("generated identity bootstrap must become network-ready");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_search_stops_both_pending_sources() {
+        let (tx, rx) = mpsc::channel(1);
+        let (graph_started, graph_ready) = tokio::sync::oneshot::channel();
+        let (provider_started, provider_ready) = tokio::sync::oneshot::channel();
+        let (graph_lifetime, graph_dropped) = tokio::sync::oneshot::channel::<()>();
+        let (provider_lifetime, provider_dropped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(drive_search_sources(
+            tx,
+            async move {
+                let _lifetime = graph_lifetime;
+                let _ = graph_started.send(());
+                std::future::pending::<Result<(), AppError>>().await
+            },
+            async move {
+                let _lifetime = provider_lifetime;
+                let _ = provider_started.send(());
+                std::future::pending::<()>().await
+            },
+        ));
+        timeout(Duration::from_secs(5), graph_ready)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), provider_ready)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(rx);
+        assert!(
+            timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(graph_dropped.await.is_err());
+        assert!(provider_dropped.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_membership_keeps_cached_results_and_completes_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.invalid",
+            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+        );
+        let account = app.account_home().create_account("alice").unwrap();
+        app.directory_cache_for_account(&account)
+            .unwrap()
+            .put(&record_named(&account.account_id_hex, "needle"))
+            .unwrap();
+        let subscription = app
+            .search_users_with_seeds(
+                params(&account.account_id_hex, "needle", (0, 0)),
+                std::future::ready(Err(AppError::RelayDirectory(
+                    "membership unavailable".into(),
+                ))),
+            )
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+        assert_eq!(updates[0].trigger, SearchUpdateTrigger::CachedResultsFound);
+        assert_eq!(updates[0].new_results.len(), 1);
+        assert!(
+            updates
+                .iter()
+                .any(|u| u.trigger == SearchUpdateTrigger::RadiusCompleted { radius: 0 })
+        );
+        assert!(updates.iter().all(|u| !matches!(
+            u.trigger,
+            SearchUpdateTrigger::Error { .. } | SearchUpdateTrigger::RadiusTimeout { .. }
+        )));
+        assert_eq!(
+            updates.last().unwrap().trigger,
+            SearchUpdateTrigger::SearchCompleted
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_matches_arrive_before_blocked_membership_and_cancel_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.invalid",
+            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+        );
+        let account = app.account_home().create_account("alice").unwrap();
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let peer = "11".repeat(32);
+        cache.put(&record_named(&peer, "needle")).unwrap();
+        let (seed_started_tx, seed_started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let mut subscription = app
+            .search_users_with_seeds(
+                params(&account.account_id_hex, "needle", (1, 2)),
+                async move {
+                    let _guard = DropSignal(Some(dropped_tx));
+                    let _ = seed_started_tx.send(());
+                    std::future::pending::<Result<Vec<String>, AppError>>().await
+                },
+            )
+            .await
+            .unwrap();
+        let update = timeout(Duration::from_secs(5), subscription.next_update())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.trigger, SearchUpdateTrigger::CachedResultsFound);
+        assert_eq!(update.new_results[0].account_id_hex, peer);
+        assert!(!update.new_results[0].is_followed_by_searcher);
+        timeout(Duration::from_secs(5), seed_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(subscription);
+        timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_results_stream_before_graph_and_later_provenance_replaces_them() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut emitter = SearchEmitter::new(tx.clone());
+        let mut graph_emitter = emitter.fork();
+        let mut provider_emitter = emitter.fork();
+        let id = "11".repeat(32);
+        let graph_id = id.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            drive_search_sources(
+                tx,
+                async move {
+                    release_rx.await.unwrap();
+                    graph_emitter.remember_graph_accounts(1, std::slice::from_ref(&graph_id));
+                    graph_emitter
+                        .emit_matches(1, vec![record_named(&graph_id, "needle")], "needle")
+                        .await;
+                    Ok(())
+                },
+                async move {
+                    provider_emitter
+                        .emit_ranked_matches(
+                            vec![RankedDirectoryRecord {
+                                record: record_named(&id, "needle"),
+                                rank: 0.75,
+                            }],
+                            "needle",
+                        )
+                        .await;
+                },
+            )
+            .await
+        });
+        let first = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.trigger, SearchUpdateTrigger::DiscoveryResultsFound);
+        assert_eq!(first.new_results.len(), 1);
+        assert_eq!(first.new_results[0].radius, OFF_GRAPH_SEARCH_RADIUS);
+        assert_eq!(first.new_results[0].provider_rank, Some(0.75));
+        assert!(
+            !task.is_finished(),
+            "graph is still blocked while provider results are visible"
+        );
+        release_tx.send(()).unwrap();
+        let next = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(next.new_results.is_empty());
+        assert_eq!(next.updated_results.len(), 1);
+        assert_eq!(next.updated_results[0].radius, 1);
+        assert_eq!(next.updated_results[0].provider_rank, None);
+        assert!(
+            !next.updated_results[0].is_followed_by_searcher,
+            "group proximity is not a follow"
+        );
+        assert_eq!(next.total_result_count, 1);
+        task.await.unwrap().unwrap().unwrap();
+        emitter.remember_follows(&[first.new_results[0].account_id_hex.clone()]);
+        emitter
+            .emit(SearchUpdateTrigger::RadiusCompleted { radius: 1 })
+            .await;
+        let followed = rx.recv().await.unwrap();
+        assert!(followed.new_results.is_empty());
+        assert!(followed.updated_results[0].is_followed_by_searcher);
+        assert_eq!(followed.total_result_count, 1);
     }
 
     #[tokio::test]
@@ -1396,8 +1896,8 @@ mod tests {
                 .map(|update| update.trigger.clone())
                 .collect::<Vec<_>>(),
             vec![
+                SearchUpdateTrigger::CachedResultsFound,
                 SearchUpdateTrigger::RadiusStarted { radius: 0 },
-                SearchUpdateTrigger::ResultsFound { radius: 0 },
                 SearchUpdateTrigger::RadiusCompleted { radius: 0 },
                 SearchUpdateTrigger::SearchCompleted,
             ]
@@ -1623,7 +2123,8 @@ mod tests {
 
         let matched = updates
             .iter()
-            .flat_map(|update| &update.new_results)
+            .rev()
+            .flat_map(|update| update.updated_results.iter().chain(&update.new_results))
             .find(|result| result.account_id_hex == stranger)
             .expect("a follow-of-a-follow must be reachable at radius 2");
         assert_eq!(matched.radius, 2);
@@ -1684,6 +2185,64 @@ mod tests {
         assert_eq!(tally.from_write_relays, 1);
         assert_eq!(tally.from_open_ranking, 5);
         assert_eq!(tally.unresolved, 4);
+    }
+
+    #[tokio::test]
+    async fn cached_discovery_receives_provider_rank_and_a_fresher_profile() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut emitter = SearchEmitter::new(tx);
+        let id = "11".repeat(32);
+        let cached = record_named(&id, "needle");
+        let cached_time = cached.profile.as_ref().unwrap().created_at;
+        emitter
+            .emit_matches(OFF_GRAPH_SEARCH_RADIUS, vec![cached], "needle")
+            .await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.new_results[0].provider_rank, None);
+        let ranked = emitter.remaining_ranked_pubkeys(
+            vec![RankedPubkey {
+                account_id_hex: id.clone(),
+                rank: 0.9,
+            }],
+            1,
+        );
+        assert_eq!(
+            ranked.len(),
+            1,
+            "cached off-graph hits still receive provider enrichment"
+        );
+        let mut fresh = record_named(&id, "needle updated");
+        fresh.profile.as_mut().unwrap().created_at = cached_time + 1;
+        emitter
+            .emit_ranked_matches(
+                vec![RankedDirectoryRecord {
+                    record: fresh,
+                    rank: ranked[0].rank,
+                }],
+                "needle",
+            )
+            .await;
+        let enriched = rx.recv().await.unwrap();
+        assert!(enriched.new_results.is_empty());
+        assert_eq!(enriched.total_result_count, 1);
+        assert_eq!(enriched.updated_results.len(), 1);
+        assert_eq!(enriched.updated_results[0].provider_rank, Some(0.9));
+        assert_eq!(
+            enriched.updated_results[0]
+                .profile
+                .as_ref()
+                .unwrap()
+                .created_at,
+            cached_time + 1
+        );
+        let other = UserDirectorySearchResult {
+            provider_rank: Some(0.5),
+            account_id_hex: "22".repeat(32),
+            ..enriched.updated_results[0].clone()
+        };
+        let mut rows = vec![other, enriched.updated_results[0].clone()];
+        sort_user_search_results(&mut rows);
+        assert_eq!(rows[0].account_id_hex, id);
     }
 
     #[tokio::test]
@@ -2033,8 +2592,8 @@ mod tests {
         );
     }
 
-    /// The seed is a last resort, not a supplement. Someone with a real graph
-    /// must never have a stranger's network folded into their results.
+    /// Cached profiles remain searchable, but the fallback graph is traversed
+    /// only when the searcher's own graph is empty.
     #[tokio::test]
     async fn a_searcher_with_follows_never_reaches_the_fallback_seed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2089,12 +2648,28 @@ mod tests {
             .unwrap();
         let updates = drain(subscription).await;
 
+        let cached = updates
+            .iter()
+            .find(|update| update.trigger == SearchUpdateTrigger::CachedResultsFound)
+            .unwrap();
+        let result = cached
+            .new_results
+            .iter()
+            .find(|result| result.account_id_hex == seeded_stranger)
+            .unwrap();
+        assert_eq!(
+            result.radius, OFF_GRAPH_SEARCH_RADIUS,
+            "public cache is searchable without adopting the seed's graph"
+        );
+        assert!(!result.is_followed_by_searcher);
         assert!(
-            !updates
-                .iter()
-                .flat_map(|update| &update.new_results)
-                .any(|result| result.account_id_hex == seeded_stranger),
-            "a searcher with their own graph must not be given a stranger's"
+            updates.iter().all(|update| !matches!(
+                update.trigger,
+                SearchUpdateTrigger::RadiusStarted {
+                    radius: OFF_GRAPH_SEARCH_RADIUS
+                }
+            )),
+            "a searcher with follows must not traverse the fallback seed"
         );
     }
 
@@ -2301,6 +2876,7 @@ mod tests {
     fn a_batch_ranks_match_quality_before_matched_field() {
         let mut results = vec![
             UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: format!("{:064x}", 1),
                 npub: "npub-contains-name".into(),
                 radius: 1,
@@ -2310,6 +2886,7 @@ mod tests {
                 profile: None,
             },
             UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: format!("{:064x}", 2),
                 npub: "npub-exact-about".into(),
                 radius: 1,
@@ -2319,6 +2896,7 @@ mod tests {
                 profile: None,
             },
             UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: format!("{:064x}", 3),
                 npub: "npub-exact-name".into(),
                 radius: 1,
@@ -2344,6 +2922,7 @@ mod tests {
     fn discovery_results_preserve_provider_rank() {
         let mut results = vec![
             UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: format!("{:064x}", 4),
                 npub: "npub-lower-provider-rank".into(),
                 radius: OFF_GRAPH_SEARCH_RADIUS,
@@ -2353,6 +2932,7 @@ mod tests {
                 profile: None,
             },
             UserDirectorySearchResult {
+                is_followed_by_searcher: false,
                 account_id_hex: format!("{:064x}", 5),
                 npub: "npub-higher-provider-rank".into(),
                 radius: OFF_GRAPH_SEARCH_RADIUS,

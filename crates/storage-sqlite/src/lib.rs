@@ -62,9 +62,9 @@ pub use prepared_group_image_upload::{
     PreparedGroupImageUploadState,
 };
 pub use shared::{
-    DirectoryPresentation, DirectoryPresentationChanges, PublicDirectoryUserRecord,
-    SqliteSharedStorage, StoredAuditLogSettings, StoredRelayTelemetrySettings,
-    StoredUsageDiagnosticsSettings,
+    DirectoryPresentation, DirectoryPresentationChanges, PublicDirectoryProfileRecord,
+    PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
+    StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
 };
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]

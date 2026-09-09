@@ -184,15 +184,18 @@ async fn collect_user_search(
     params: UserSearchParams,
 ) -> Result<(Vec<UserDirectorySearchResult>, SearchCompleteness), WnError> {
     let mut subscription = app.search_users(params).await?;
-    let mut results = Vec::new();
+    let mut results = std::collections::BTreeMap::new();
     let mut completeness = SearchCompleteness::Complete;
     while let Some(update) = subscription.next_update().await {
         if let SearchUpdateTrigger::Error { message } = update.trigger {
             return Err(WnError::UserSearch(message));
         }
         completeness.observe(&update.trigger);
-        results.extend(update.new_results);
+        for result in update.new_results.into_iter().chain(update.updated_results) {
+            results.insert(result.account_id_hex.clone(), result);
+        }
     }
+    let mut results = results.into_values().collect::<Vec<_>>();
     sort_user_search_results(&mut results);
     Ok((results, completeness))
 }

@@ -448,6 +448,27 @@ typedef enum MarmotAccountSetupReadiness {
 } MarmotAccountSetupReadiness;
 
 /**
+ * Which profile field the query matched.
+ */
+typedef enum MarmotMatchedField {
+  MARMOT_MATCHED_FIELD_NAME,
+  MARMOT_MATCHED_FIELD_NIP05,
+  MARMOT_MATCHED_FIELD_DISPLAY_NAME,
+  MARMOT_MATCHED_FIELD_ABOUT,
+  MARMOT_MATCHED_FIELD_NPUB,
+  MARMOT_MATCHED_FIELD_PUBKEY,
+} MarmotMatchedField;
+
+/**
+ * How closely a result matched the query.
+ */
+typedef enum MarmotMatchQuality {
+  MARMOT_MATCH_QUALITY_EXACT,
+  MARMOT_MATCH_QUALITY_PREFIX,
+  MARMOT_MATCH_QUALITY_CONTAINS,
+} MarmotMatchQuality;
+
+/**
  * Where a prepared group image sits in the upload lifecycle.
  */
 typedef enum MarmotPreparedGroupImageUploadState {
@@ -633,27 +654,6 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_SNAPSHOT_REFRESH,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_REMOVED,
 } MarmotChatListUpdateTrigger;
-
-/**
- * Which profile field the query matched.
- */
-typedef enum MarmotMatchedField {
-  MARMOT_MATCHED_FIELD_NAME,
-  MARMOT_MATCHED_FIELD_NIP05,
-  MARMOT_MATCHED_FIELD_DISPLAY_NAME,
-  MARMOT_MATCHED_FIELD_ABOUT,
-  MARMOT_MATCHED_FIELD_NPUB,
-  MARMOT_MATCHED_FIELD_PUBKEY,
-} MarmotMatchedField;
-
-/**
- * How closely a result matched the query.
- */
-typedef enum MarmotMatchQuality {
-  MARMOT_MATCH_QUALITY_EXACT,
-  MARMOT_MATCH_QUALITY_PREFIX,
-  MARMOT_MATCH_QUALITY_CONTAINS,
-} MarmotMatchQuality;
 
 /**
  * What woke the background collection.
@@ -2273,6 +2273,35 @@ typedef struct MarmotExistingDirectConversation {
   bool archived;
   uint64_t activity_sort_at;
 } MarmotExistingDirectConversation;
+
+/**
+ * One search hit, with typed attribution for why it matched.
+ */
+typedef struct MarmotUserDirectorySearchResult {
+  char *account_id_hex;
+  char *npub;
+  /**
+   * Social distance from the searching account.
+   */
+  uint8_t radius;
+  bool is_followed_by_searcher;
+  enum MarmotMatchedField matched_field;
+  enum MarmotMatchQuality match_quality;
+  bool has_provider_rank;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  double provider_rank;
+  struct MarmotUserProfileMetadata *profile;
+} MarmotUserDirectorySearchResult;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotUserDirectorySearchResultList {
+  struct MarmotUserDirectorySearchResult *items;
+  uintptr_t len;
+} MarmotUserDirectorySearchResultList;
 
 /**
  * What the local directory cache knows about one requested id.
@@ -3906,6 +3935,7 @@ typedef enum MarmotSearchUpdateTrigger_Tag {
    */
   MARMOT_SEARCH_UPDATE_TRIGGER_SEARCH_COMPLETED,
   MARMOT_SEARCH_UPDATE_TRIGGER_ERROR,
+  MARMOT_SEARCH_UPDATE_TRIGGER_CACHED_RESULTS_FOUND,
 } MarmotSearchUpdateTrigger_Tag;
 
 typedef struct MarmotSearchUpdateTrigger_RadiusStarted_Body {
@@ -3945,26 +3975,6 @@ typedef struct MarmotSearchUpdateTrigger {
 } MarmotSearchUpdateTrigger;
 
 /**
- * One search hit, with typed attribution for why it matched.
- */
-typedef struct MarmotUserDirectorySearchResult {
-  char *account_id_hex;
-  char *npub;
-  /**
-   * Social distance from the searching account.
-   */
-  uint8_t radius;
-  enum MarmotMatchedField matched_field;
-  enum MarmotMatchQuality match_quality;
-  bool has_provider_rank;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  double provider_rank;
-  struct MarmotUserProfileMetadata *profile;
-} MarmotUserDirectorySearchResult;
-
-/**
  * One step of a running user search. Free with
  * `marmot_user_search_update_free`.
  */
@@ -3975,6 +3985,8 @@ typedef struct MarmotUserSearchUpdate {
    */
   struct MarmotUserDirectorySearchResult *new_results;
   uintptr_t new_results_len;
+  struct MarmotUserDirectorySearchResult *updated_results;
+  uintptr_t updated_results_len;
   uint32_t total_result_count;
 } MarmotUserSearchUpdate;
 
@@ -5992,6 +6004,23 @@ MarmotStatus marmot_existing_direct_conversation(const struct MarmotClient *clie
                                                  const char *account_ref,
                                                  const char *peer_account_id,
                                                  struct MarmotExistingDirectConversation **out);
+
+/**
+ * Search public identities cached through any connected account. Follow
+ * flags refer to the selected account. Call off the UI thread and free with
+ * `marmot_user_directory_search_result_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_search_cached_users(const struct MarmotClient *client,
+                                        const char *account_id_hex,
+                                        const char *query,
+                                        uint32_t limit,
+                                        struct MarmotUserDirectorySearchResultList **out);
 
 /**
  * What the local directory cache holds for each requested id, one
@@ -8061,6 +8090,15 @@ void marmot_cached_identity_projection_free(struct MarmotCachedIdentityProjectio
  * library.
  */
 void marmot_cached_identity_projection_list_free(struct MarmotCachedIdentityProjectionList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_user_directory_search_result_list_free(struct MarmotUserDirectorySearchResultList *list);
 
 /**
  * Free a value of this type returned by this library. NULL
