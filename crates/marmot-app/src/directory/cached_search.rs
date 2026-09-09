@@ -1,8 +1,8 @@
 //! Network-free public-profile search across every connected account's caches.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 
-use super::records::{user_directory_record_from_public, user_record_match};
+use super::records::user_record_match;
 use crate::{
     AppError, MarmotApp, OFF_GRAPH_SEARCH_RADIUS, UserDirectoryRecord, UserDirectorySearchResult,
     parse_account_id_hex, sort_user_search_results,
@@ -43,13 +43,17 @@ impl MarmotApp {
             if let Some(profile) = &mut record.profile {
                 profile.source_relays.clear();
             }
-            let current = records
-                .entry(record.account_id_hex.clone())
-                .or_insert_with(|| record.clone());
-            if record.profile.as_ref().map(|p| p.created_at)
-                > current.profile.as_ref().map(|p| p.created_at)
-            {
-                *current = record;
+            match records.entry(record.account_id_hex.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(record);
+                }
+                Entry::Occupied(mut entry) => {
+                    if record.profile.as_ref().map(|p| p.created_at)
+                        > entry.get().profile.as_ref().map(|p| p.created_at)
+                    {
+                        entry.insert(record);
+                    }
+                }
             }
         };
         let now = crate::unix_now_seconds() as i64;
@@ -58,8 +62,20 @@ impl MarmotApp {
                 insert(record);
             }
         }
-        for record in self.shared_storage()?.public_directory_users()? {
-            insert(user_directory_record_from_public(record)?);
+        for record in self.shared_storage()?.public_directory_profiles()? {
+            insert(UserDirectoryRecord {
+                account_id_hex: record.account_id_hex,
+                npub: record.npub,
+                profile: record
+                    .profile_json
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?,
+                local_account: None,
+                follows: Vec::new(),
+                follow_source_relays: Vec::new(),
+                relay_lists: crate::AccountRelayListStatus::empty(),
+                key_package: None,
+            });
         }
         let mut results = records
             .into_values()
@@ -234,14 +250,15 @@ mod tests {
         assert!(!latest[&stale].is_followed_by_searcher);
         assert_eq!(latest[&stale].radius, OFF_GRAPH_SEARCH_RADIUS);
 
-        // A known-empty list remains authoritative even with another cache's stale edges.
-        own_cache
-            .remember_search_graph_follows(
-                &searcher.account_id_hex,
-                &crate::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
-                &[],
-            )
-            .unwrap();
+        // The refresh path's explicit empty kind-3 clears stale graph edges too.
+        app.remember_directory_follow_list_for_test(
+            &searcher.account_id_hex,
+            &crate::directory::FetchedFollowList {
+                follows: Vec::new(),
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
         assert!(
             app.search_cached_users(&searcher.account_id_hex, "needle", 100)
                 .unwrap()

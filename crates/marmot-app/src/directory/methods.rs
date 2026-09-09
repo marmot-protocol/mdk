@@ -1313,6 +1313,9 @@ impl MarmotApp {
         entry.follows = follow_list.follows.clone();
         entry.follow_source_relays = follow_list.source_relays.clone();
         self.save_directory_entry(&entry)?;
+        // A fetched empty kind-3 is authoritative, unlike a profile-only
+        // promotion whose empty follow vec means "not loaded".
+        self.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
         for follow in &follow_list.follows {
             self.remember_directory_user(follow)?;
         }

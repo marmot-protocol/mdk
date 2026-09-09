@@ -16,7 +16,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   labels. Streaming consumers must apply `updated_results` as keyed replacements; CLI search merges them into one
   result per person. Radius windows filter known distances only; consumers must deduplicate off-graph identities
   across pages. Search-discovered public profiles are searchable across accounts but remain outside live directory
-  subscriptions. Local cache materialization and result batches are defensively capped at 10,000 rows.
+  subscriptions. Local cache materialization is capped at 10,000 distinct identities per account cache, and cache result
+  batches at 10,000 people.
 
 ## [0.9.20] - 2026-09-08
 

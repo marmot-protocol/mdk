@@ -53,6 +53,15 @@ pub struct PublicDirectoryUserRecord {
     pub follows: Vec<String>,
 }
 
+/// Public identity/profile projection for search; excludes follows, relay lists,
+/// key packages, and event provenance that search does not consume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicDirectoryProfileRecord {
+    pub account_id_hex: String,
+    pub npub: String,
+    pub profile_json: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredRelayTelemetrySettings {
     pub export_enabled: bool,
@@ -298,6 +307,29 @@ impl SqliteSharedStorage {
 
     pub fn public_directory_users(&self) -> StorageResult<Vec<PublicDirectoryUserRecord>> {
         self.public_directory_users_capped(PUBLIC_DIRECTORY_USERS_MAX)
+    }
+
+    /// Read only searchable public identity/profile fields, with the same
+    /// defensive identity cap as `public_directory_users`. No follow-edge join.
+    pub fn public_directory_profiles(&self) -> StorageResult<Vec<PublicDirectoryProfileRecord>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT account_id_hex, npub, profile_json FROM directory_users
+                 ORDER BY account_id_hex LIMIT ?1",
+            )
+            .storage()?;
+        statement
+            .query_map([PUBLIC_DIRECTORY_USERS_MAX as i64], |row| {
+                Ok(PublicDirectoryProfileRecord {
+                    account_id_hex: row.get(0)?,
+                    npub: row.get(1)?,
+                    profile_json: row.get(2)?,
+                })
+            })
+            .storage()?
+            .map(|row| row.storage())
+            .collect()
     }
 
     fn public_directory_users_capped(
@@ -680,6 +712,36 @@ mod tests {
             .unwrap();
         assert_eq!(stored.npub, record.npub);
         assert_eq!(stored.follows, vec![follow]);
+    }
+
+    #[test]
+    fn public_directory_profiles_do_not_read_follow_edges_or_unrelated_json() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let record = PublicDirectoryUserRecord {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1test".into(),
+            profile_json: Some(r#"{"name":"Alice"}"#.into()),
+            relay_lists_json: "not parsed by profile projection".into(),
+            key_package_json: Some("also not parsed".into()),
+            event_id_hex: None,
+            event_kind: None,
+            event_created_at: None,
+            follows: vec!["bb".repeat(32)],
+        };
+        storage.put_public_directory_user(&record).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE directory_user_follows")
+            .unwrap();
+        assert_eq!(
+            storage.public_directory_profiles().unwrap(),
+            vec![PublicDirectoryProfileRecord {
+                account_id_hex: record.account_id_hex,
+                npub: record.npub,
+                profile_json: record.profile_json,
+            }]
+        );
     }
 
     // #761: the batched listing is defensively bounded. The uncapped path still

@@ -299,6 +299,7 @@ async fn run_search<F>(
     let mut failed = false;
     let mut emitter = SearchEmitter::new(updates_tx);
     emitter.remember_graph_accounts(0, std::slice::from_ref(&searcher_account_id_hex));
+    emitter.remember_graph_accounts(1, &params.radius_one_seeds);
     // An empty query would match every candidate through `contains`, so it
     // finds nobody by definition rather than everybody.
     let query = params.query.trim().to_lowercase();
@@ -332,7 +333,6 @@ async fn run_search<F>(
         match cached {
             Ok((follows, mut results)) => {
                 emitter.set_searcher(&searcher_account_id_hex, follows);
-                emitter.remember_graph_accounts(1, &params.radius_one_seeds);
                 // Radius windows constrain known social distances, not discovery.
                 results.retain(|result| {
                     result.radius == OFF_GRAPH_SEARCH_RADIUS
@@ -344,7 +344,12 @@ async fn run_search<F>(
                     .await;
             }
             Err(error) => {
-                tracing::debug!(target: "marmot_app::directory", method = "search_cache", error_kind = error.privacy_safe_kind(), "cached search unavailable; continuing network search");
+                tracing::debug!(
+                    target: "marmot_app::directory",
+                    method = "search_cache",
+                    error_kind = error.privacy_safe_kind(),
+                    "cached search unavailable; continuing network search"
+                );
             }
         }
         trace_search_stage("cache", cached_started);
@@ -360,10 +365,20 @@ async fn run_search<F>(
             match resolved_seeds {
                 Ok(Ok(seeds)) => graph_params.radius_one_seeds.extend(seeds),
                 Ok(Err(error)) => {
-                    tracing::debug!(target: "marmot_app::directory", method = "search_group_seeds", error_kind = error.privacy_safe_kind(), "group search seeds unavailable; continuing without them");
+                    tracing::debug!(
+                        target: "marmot_app::directory",
+                        method = "search_group_seeds",
+                        error_kind = error.privacy_safe_kind(),
+                        "group search seeds unavailable; continuing without them"
+                    );
                 }
                 Err(_) => {
-                    tracing::debug!(target: "marmot_app::directory", method = "search_group_seeds", outcome = "timeout", "group search seeds timed out; continuing without them");
+                    tracing::debug!(
+                        target: "marmot_app::directory",
+                        method = "search_group_seeds",
+                        outcome = "timeout",
+                        "group search seeds timed out; continuing without them"
+                    );
                 }
             }
             let started = Instant::now();
@@ -411,11 +426,21 @@ async fn run_search<F>(
                         .await
                         .is_err()
                         {
-                            tracing::debug!(target: "marmot_app::directory", method = "search_cache_provider", outcome = "failed", "search profile cache write failed");
+                            tracing::debug!(
+                                target: "marmot_app::directory",
+                                method = "search_cache_provider",
+                                outcome = "failed",
+                                "search profile cache write failed"
+                            );
                         }
                     }
                     Err(_) => {
-                        tracing::debug!(target: "marmot_app::directory", method = "search_users_open_ranking_hydrate", outcome = "fetch_failed", "Open Ranking profile hydration unavailable")
+                        tracing::debug!(
+                            target: "marmot_app::directory",
+                            method = "search_users_open_ranking_hydrate",
+                            outcome = "fetch_failed",
+                            "Open Ranking profile hydration unavailable"
+                        )
                     }
                 }
                 trace_search_stage("provider_profiles", started);
@@ -658,7 +683,12 @@ async fn advance_radius(
     if depth.hop == 0 {
         layer.admit(params.radius_one_seeds.clone(), seen);
     }
-    extend_with_follows(app, frontier, seen, &mut layer, depth.hop == 0, emitter).await?;
+    let searcher = if depth.hop == 0 {
+        frontier.first().map(String::as_str)
+    } else {
+        None
+    };
+    extend_with_follows(app, frontier, seen, &mut layer, searcher, emitter).await?;
     if layer.truncated {
         emitter
             .emit(SearchUpdateTrigger::RadiusTruncated {
@@ -977,12 +1007,12 @@ async fn extend_with_follows(
     frontier: &[String],
     seen: &mut HashSet<String>,
     layer: &mut NextLayer,
-    searcher_layer: bool,
+    searcher: Option<&str>,
     emitter: &mut SearchEmitter,
 ) -> Result<(), AppError> {
-    let (cached, unknown) = if searcher_layer {
+    let (cached, unknown) = if let Some(searcher) = searcher {
         let app = app.clone();
-        let searcher = frontier[0].clone();
+        let searcher = searcher.to_owned();
         blocking_app_task(move || {
             Ok(match app.cached_search_follow_list(&searcher)? {
                 Some(follows) => (vec![follows], Vec::new()),
@@ -997,7 +1027,7 @@ async fn extend_with_follows(
     // Pass 1: contact lists already on the device. No relay round trip, so the
     // next layer starts forming immediately.
     for follows in cached {
-        if searcher_layer {
+        if searcher.is_some() {
             emitter.remember_follows(&follows);
         }
         if !layer.admit(follows, seen) {
@@ -1012,7 +1042,7 @@ async fn extend_with_follows(
         let fetched = fetch_follow_lists(app, batch).await?;
         cache_resolved_follows(app, &fetched).await?;
         for (_, follows) in fetched {
-            if searcher_layer {
+            if searcher.is_some() {
                 emitter.remember_follows(&follows);
             }
             if !layer.admit(follows, seen) {
@@ -1302,7 +1332,10 @@ impl SearchEmitter {
         ranked_pubkeys
             .into_iter()
             .filter(|ranked| {
-                !state.results.contains_key(&ranked.account_id_hex)
+                state
+                    .results
+                    .get(&ranked.account_id_hex)
+                    .is_none_or(|result| result.radius == OFF_GRAPH_SEARCH_RADIUS)
                     && state
                         .graph_radii
                         .get(&ranked.account_id_hex)
@@ -2152,6 +2185,64 @@ mod tests {
         assert_eq!(tally.from_write_relays, 1);
         assert_eq!(tally.from_open_ranking, 5);
         assert_eq!(tally.unresolved, 4);
+    }
+
+    #[tokio::test]
+    async fn cached_discovery_receives_provider_rank_and_a_fresher_profile() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut emitter = SearchEmitter::new(tx);
+        let id = "11".repeat(32);
+        let cached = record_named(&id, "needle");
+        let cached_time = cached.profile.as_ref().unwrap().created_at;
+        emitter
+            .emit_matches(OFF_GRAPH_SEARCH_RADIUS, vec![cached], "needle")
+            .await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.new_results[0].provider_rank, None);
+        let ranked = emitter.remaining_ranked_pubkeys(
+            vec![RankedPubkey {
+                account_id_hex: id.clone(),
+                rank: 0.9,
+            }],
+            1,
+        );
+        assert_eq!(
+            ranked.len(),
+            1,
+            "cached off-graph hits still receive provider enrichment"
+        );
+        let mut fresh = record_named(&id, "needle updated");
+        fresh.profile.as_mut().unwrap().created_at = cached_time + 1;
+        emitter
+            .emit_ranked_matches(
+                vec![RankedDirectoryRecord {
+                    record: fresh,
+                    rank: ranked[0].rank,
+                }],
+                "needle",
+            )
+            .await;
+        let enriched = rx.recv().await.unwrap();
+        assert!(enriched.new_results.is_empty());
+        assert_eq!(enriched.total_result_count, 1);
+        assert_eq!(enriched.updated_results.len(), 1);
+        assert_eq!(enriched.updated_results[0].provider_rank, Some(0.9));
+        assert_eq!(
+            enriched.updated_results[0]
+                .profile
+                .as_ref()
+                .unwrap()
+                .created_at,
+            cached_time + 1
+        );
+        let other = UserDirectorySearchResult {
+            provider_rank: Some(0.5),
+            account_id_hex: "22".repeat(32),
+            ..enriched.updated_results[0].clone()
+        };
+        let mut rows = vec![other, enriched.updated_results[0].clone()];
+        sort_user_search_results(&mut rows);
+        assert_eq!(rows[0].account_id_hex, id);
     }
 
     #[tokio::test]
