@@ -778,13 +778,20 @@ impl NostrTransportAdapter {
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
         let _subscription_guard = self.subscription_lock.lock().await;
-        self.relay_client.unsubscribe(subscription.clone()).await?;
-        let mut state = self.state.write().await;
-        state
-            .maintenance_routes
-            .remove(&subscription.subscription_id());
-        state.forget_subscription_starts(std::slice::from_ref(&subscription));
-        state.rebuild_transport_group_index();
+        let subscription_id = subscription.subscription_id();
+        {
+            let mut state = self.state.write().await;
+            state.maintenance_routes.remove(&subscription_id);
+            state.forget_subscription_starts(std::slice::from_ref(&subscription));
+            state.rebuild_transport_group_index();
+            // Keep teardown intent through relay errors and caller cancellation.
+            state.queue_pending_unsubscribes(vec![subscription.clone()]);
+        }
+        self.relay_client.unsubscribe(subscription).await?;
+        self.state
+            .write()
+            .await
+            .remove_pending_unsubscribe_by_id(&subscription_id);
         Ok(())
     }
 
@@ -1586,8 +1593,12 @@ impl AdapterState {
     /// teardown cannot tear down a just-re-established subscription.
     fn prune_live_pending_unsubscribes(&mut self) {
         let live_route_keys = self.live_group_route_keys();
-        self.pending_unsubscribes
-            .retain(|subscription| !live_route_keys.contains(&subscription.route_key()));
+        self.pending_unsubscribes.retain(|subscription| {
+            !live_route_keys.contains(&subscription.route_key())
+                && !self
+                    .maintenance_routes
+                    .contains_key(&subscription.subscription_id())
+        });
     }
 
     fn remove_pending_unsubscribe_by_id(&mut self, subscription_id: &str) -> bool {

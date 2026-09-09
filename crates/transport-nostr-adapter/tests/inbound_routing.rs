@@ -3838,3 +3838,76 @@ async fn maintenance_cancel_cleans_up() {
         0
     );
 }
+
+#[tokio::test]
+async fn maintenance_teardown_retries() {
+    let relay = Arc::new(FlakyUnsubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![1; 32]);
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![2; 16]),
+        transport_group_id: vec![3; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    let subscription = NostrSubscription::GroupMaintenance {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: group.endpoints.clone(),
+    };
+    // A plain retry drains the teardown; reinstalling first must preserve it.
+    for reinstall in [None, Some(&group)] {
+        let id = adapter
+            .install_group_maintenance_subscription(&account_id, &group)
+            .await
+            .unwrap();
+        relay.fail_next_unsubscribes.store(1, Ordering::SeqCst);
+        assert!(
+            adapter
+                .remove_group_maintenance_subscription(subscription.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter.subscription_synced(&id).await, None);
+        assert_eq!(adapter.subscription_any_eose(&id).await, None);
+        assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 1);
+        let event = NostrRelayEvent {
+            endpoint: group.endpoints[0].clone(),
+            subscription_id: None,
+            event: group_event("31", &group.transport_group_id),
+        };
+        assert_eq!(adapter.handle_relay_event(event.clone()).await.unwrap(), 0);
+        if let Some(group) = reinstall {
+            adapter
+                .install_group_maintenance_subscription(&account_id, group)
+                .await
+                .unwrap();
+        }
+        adapter
+            .sync_account_groups(TransportGroupSync {
+                account_id: account_id.clone(),
+                group_subscriptions: vec![],
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 0);
+        assert_eq!(
+            relay.unsubscribed.lock().unwrap().as_slice(),
+            std::slice::from_ref(&subscription)
+        );
+        assert_eq!(
+            adapter.handle_relay_event(event).await.unwrap(),
+            usize::from(reinstall.is_some())
+        );
+    }
+}
