@@ -245,7 +245,8 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
         && let Some(source_epoch) = source_epoch
     {
         let source_epoch = u64_to_i64(source_epoch)?;
-        for component_id in encrypted_media_component_ids(tags) {
+        let component_ids = encrypted_media_component_ids(tags);
+        for component_id in &component_ids {
             tx.execute_cached(
                 "INSERT INTO encrypted_media_epoch_secret_references (
                      group_id_hex, message_id_hex, component_id, source_epoch
@@ -253,16 +254,20 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
                 params![
                     group_id_hex,
                     message_id_hex,
-                    i64::from(component_id),
+                    i64::from(*component_id),
                     source_epoch,
                 ],
             )
             .storage()?;
+        }
+        // All media formats share the exporter; mark its cached rows once.
+        if !component_ids.is_empty() {
             tx.execute_cached(
                 "UPDATE encrypted_media_epoch_secrets
                  SET retention_managed = 1
                  WHERE group_id_hex = ?1
-                   AND source_epoch = ?2",
+                   AND source_epoch = ?2
+                   AND retention_managed = 0",
                 params![group_id_hex, source_epoch],
             )
             .storage()?;
