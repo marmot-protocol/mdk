@@ -69,6 +69,8 @@ c_mirror! {
     MarmotPublisherAck from PublisherAckFfi,
     free marmot_publisher_ack_free {
         copy chunk_count: u64,
+        /// NULL when no preview error occurred; otherwise an error string.
+        /// Either is possible after a successful append; check before dereferencing.
         opt_str live_error,
     }
 }

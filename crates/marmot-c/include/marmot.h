@@ -3457,6 +3457,10 @@ typedef struct MarmotPublisherInfo {
  */
 typedef struct MarmotPublisherAck {
   uint64_t chunk_count;
+  /**
+   * NULL when no preview error occurred; otherwise an error string.
+   * Either is possible after a successful append; check before dereferencing.
+   */
   char *live_error;
 } MarmotPublisherAck;
 
