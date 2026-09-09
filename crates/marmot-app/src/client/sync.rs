@@ -3106,7 +3106,23 @@ impl AppClient {
     /// Dropping the intent alone leaves the run behind to accumulate
     /// fruitless-completion evidence, and nothing else retires that evidence
     /// row while the group row is kept.
-    fn retire_terminal_group_recovery(&mut self, group_id: &cgka_traits::GroupId) {
+    ///
+    /// Returns whether the durable rows are gone. Best-effort either way — the
+    /// warn is in here so both callers share it — but a caller holding
+    /// something that would strand the evidence row on failure has to be able
+    /// to see it, which is what
+    /// [`Self::drop_terminal_epoch_backfill_intents`] does with the intent row.
+    fn retire_terminal_group_recovery(&mut self, group_id: &cgka_traits::GroupId) -> bool {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_terminal_recovery_retire) {
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "retire_terminal_group_recovery",
+                error_kind = "injected_terminal_retire_failure",
+                "terminal recovery run kept its durable rows and will be retired on a later pass"
+            );
+            return false;
+        }
         match self
             .app
             .account_storage(&self.state.label)
@@ -3117,13 +3133,17 @@ impl AppClient {
                 if changed {
                     self.mark_recovery_status_changed(group_id);
                 }
+                true
             }
-            Err(error) => tracing::warn!(
-                target: "marmot_app::epoch_stall",
-                method = "retire_terminal_group_recovery",
-                error_kind = error.privacy_safe_kind(),
-                "terminal recovery run kept its durable rows and will be retired on a later pass"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::epoch_stall",
+                    method = "retire_terminal_group_recovery",
+                    error_kind = error.privacy_safe_kind(),
+                    "terminal recovery run kept its durable rows and will be retired on a later pass"
+                );
+                false
+            }
         }
     }
 
@@ -3184,20 +3204,21 @@ impl AppClient {
             dropped_groups = terminal.len(),
             "dropped epoch-gap recovery arms for groups this device is terminal in"
         );
-        // Retire the runs before clearing the intent rows, never after. The
-        // intent row is the only thing that brings a group back through
-        // restore into this drop, so clearing it first and then failing to
-        // retire would orphan the evidence row with nothing left to retry it.
+        // Retire each run first, and clear only the intent rows whose retire
+        // succeeded. The intent row is the only thing that brings a group back
+        // through restore into this drop, so a group whose evidence row is
+        // still there has to keep its intent row: clearing it anyway would
+        // strand that evidence with nothing left to retire it. The dropped
+        // in-memory arm is not the retry — the surviving row is.
+        let mut retired = Vec::new();
         for group_id in &terminal {
-            self.retire_terminal_group_recovery(group_id);
+            if self.retire_terminal_group_recovery(group_id) {
+                retired.push(hex::encode(group_id.as_slice()));
+            }
         }
-        let group_ids_hex = terminal
-            .iter()
-            .map(|group_id| hex::encode(group_id.as_slice()))
-            .collect::<Vec<_>>();
         if let Err(error) = self
             .app
-            .clear_epoch_backfill_intents_for_groups(&self.state.label, &group_ids_hex)
+            .clear_epoch_backfill_intents_for_groups(&self.state.label, &retired)
         {
             tracing::warn!(
                 target: "marmot_app::epoch_stall",
@@ -3523,7 +3544,9 @@ impl AppClient {
             .cloned()
             .partition(|group_id| super::group_is_terminal(&self.runtime, group_id));
         for group_id in &terminal {
-            self.retire_terminal_group_recovery(group_id);
+            // No intent row is in play here — `begin_...` consumed it — so a
+            // failed retire has nothing to strand and nothing to gate.
+            let _ = self.retire_terminal_group_recovery(group_id);
         }
         if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, &counts) {
             self.epoch_stall.mark_replayed();
@@ -6132,6 +6155,77 @@ mod tests {
                 "deliveries={deliveries}: a terminal group must keep no durable frozen-epoch evidence"
             );
         }
+    }
+
+    /// The retry the drop's ordering exists for. A failed durable retire must
+    /// leave the intent row behind, because that row is the only thing that
+    /// brings the group back through restore into the drop — clearing it anyway
+    /// would strand the evidence row with nothing left to retire it.
+    #[tokio::test]
+    async fn a_failed_retire_keeps_the_intent_row_so_the_next_restore_retries() {
+        use marmot_forensics::EpochStallBackfillTrigger;
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let departed = client.create_group("departed", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let epoch = client.group_mls_state(&departed).unwrap().epoch;
+
+        let decision = client.epoch_stall.observe_resource_refusal(
+            departed.clone(),
+            cgka_traits::EpochId(epoch),
+            crate::client::sync::epoch_stall_now_ms(),
+        );
+        client.apply_backfill_decision(
+            &departed,
+            epoch,
+            decision,
+            EpochStallBackfillTrigger::ResourceRefusal,
+        );
+        assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
+        assert_eq!(storage.epoch_stall_evidence().unwrap().len(), 1);
+        make_group_terminal(&client, &departed, false);
+
+        client.fail_next_terminal_recovery_retire = true;
+        client.restore_persisted_epoch_backfill_intents(
+            storage.pending_epoch_backfill_intents().unwrap(),
+        );
+        assert!(
+            armed_group_ids(&client).is_empty(),
+            "the in-memory intent is dropped either way"
+        );
+        assert_eq!(
+            storage.pending_epoch_backfill_intents().unwrap().len(),
+            1,
+            "a failed retire must keep the intent row that drives the retry"
+        );
+        assert_eq!(
+            storage.epoch_stall_evidence().unwrap().len(),
+            1,
+            "the evidence row the retire failed on is still there to retire"
+        );
+
+        // The next restore re-admits the surviving row and completes both.
+        client.restore_persisted_epoch_backfill_intents(
+            storage.pending_epoch_backfill_intents().unwrap(),
+        );
+        assert!(
+            storage.pending_epoch_backfill_intents().unwrap().is_empty(),
+            "the retried pass clears the intent row"
+        );
+        assert!(
+            storage.epoch_stall_evidence().unwrap().is_empty(),
+            "the retried pass retires the durable evidence row"
+        );
+        assert!(
+            client.epoch_stall.wedge_evidence(&departed).is_none(),
+            "the retried pass retires the in-memory run"
+        );
     }
 
     fn failed_replay_outcome() -> EpochBackfillReplayOutcome {

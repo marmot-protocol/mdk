@@ -1789,6 +1789,8 @@ impl MarmotApp {
             released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
+            #[cfg(test)]
+            fail_next_terminal_recovery_retire: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
