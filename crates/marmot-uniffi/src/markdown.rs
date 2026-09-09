@@ -772,6 +772,29 @@ mod tests {
             )),
             _ => false,
         }));
+
+        let code_span = parse_markdown_document(
+            "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &code_span.blocks[0] else {
+            panic!("expected multiline code-span details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { .. }))
+        );
+
+        let hard =
+            parse_markdown_document("<details>\n<summary>one  \ntwo</summary>\nbody\n</details>");
+        let MarkdownBlockFfi::Details { summary, .. } = &hard.blocks[0] else {
+            panic!("expected hard-break details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::HardBreak))
+        );
     }
 
     #[test]
@@ -782,6 +805,12 @@ mod tests {
         let summary_ticks = "`".repeat(8_192);
         let document =
             parse_markdown_document(&format!("<details>\n<summary>{summary_ticks}\n</details>"));
+        assert!(!document.blocks.is_empty());
+        let mut many_lines = String::from("<details>\n<summary>\n");
+        for _ in 0..4_096 {
+            many_lines.push_str("x\n");
+        }
+        let document = parse_markdown_document(&many_lines);
         assert!(!document.blocks.is_empty());
     }
 

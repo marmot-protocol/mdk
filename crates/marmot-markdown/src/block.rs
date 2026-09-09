@@ -70,8 +70,10 @@ enum Container {
         leading_blank_lines: u8,
         summary_inner: Option<String>,
         /// Original summary source lines with tags, retained until commit so
-        /// fallback can restore them in source order.
-        summary_raw: Option<String>,
+        /// fallback can restore ordinary block semantics.
+        summary_raw_lines: Vec<String>,
+        summary_replayed: bool,
+        pre_summary_gap: u8,
         summary_state: SummaryState,
         failed: bool,
     },
@@ -81,7 +83,7 @@ enum Container {
 enum SummaryState {
     AwaitingFirstNonblank,
     Collecting {
-        after_open: String,
+        collector: details::SummaryCollector,
         raw_lines: Vec<String>,
     },
     Done,
@@ -91,10 +93,11 @@ enum SummaryAction {
     MarkDone,
     Complete {
         inner: String,
-        raw: String,
+        raw_lines: Vec<String>,
+        leftover: Vec<String>,
     },
     Hold {
-        after_open: String,
+        collector: details::SummaryCollector,
         raw_lines: Vec<String>,
     },
     FailAndContinue,
@@ -1029,6 +1032,17 @@ impl BlockParser {
         if !self.details_is_current_parent() {
             return false;
         }
+        if self.summary_blocks_details_close() {
+            return false;
+        }
+        if let Some((inner, leftover)) = self.finalize_collecting_summary() {
+            let raw_lines = self.take_collecting_raw_lines();
+            self.apply_summary_action(SummaryAction::Complete {
+                inner,
+                raw_lines,
+                leftover,
+            });
+        }
         self.close_leaf();
         self.close_dangling_lists();
         let closer_end = self.line_start + probe_off + close.tag_end;
@@ -1039,6 +1053,36 @@ impl BlockParser {
             return true;
         }
         false
+    }
+
+    fn summary_blocks_details_close(&self) -> bool {
+        matches!(
+            self.containers.last(),
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { collector, .. },
+                ..
+            }) if collector.has_unmatched_openers() && !collector.has_deferred_closer()
+        )
+    }
+
+    fn finalize_collecting_summary(&self) -> Option<(String, Vec<String>)> {
+        match self.containers.last() {
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { collector, .. },
+                ..
+            }) => collector.finalize(),
+            _ => None,
+        }
+    }
+
+    fn take_collecting_raw_lines(&mut self) -> Vec<String> {
+        match self.containers.last_mut() {
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { raw_lines, .. },
+                ..
+            }) => std::mem::take(raw_lines),
+            _ => Vec::new(),
+        }
     }
 
     fn try_open_details(&mut self, rest: &str, probe_off: usize) -> bool {
@@ -1066,7 +1110,9 @@ impl BlockParser {
             blank_lines_before: Vec::new(),
             leading_blank_lines,
             summary_inner: None,
-            summary_raw: None,
+            summary_raw_lines: Vec::new(),
+            summary_replayed: false,
+            pre_summary_gap: 0,
             summary_state: SummaryState::AwaitingFirstNonblank,
             failed: false,
         });
@@ -1118,10 +1164,10 @@ impl BlockParser {
                     false
                 }
                 Some(Container::Details {
-                    summary_state: SummaryState::Collecting { raw_lines, .. },
+                    summary_state: SummaryState::Collecting { .. },
                     ..
                 }) => {
-                    let raw = raw_lines.clone();
+                    let raw = self.take_collecting_raw_lines();
                     self.apply_summary_action(SummaryAction::FailReplay {
                         raw_lines: raw,
                         consume: false,
@@ -1131,78 +1177,89 @@ impl BlockParser {
             };
         }
         let action = match self.containers.last() {
-            Some(Container::Details { summary_state, .. }) => match summary_state {
-                SummaryState::Done => return false,
-                SummaryState::AwaitingFirstNonblank => {
-                    match details::parse_summary_line_bounded(rest, budget) {
-                        SummaryLine::NotSummary => SummaryAction::MarkDone,
-                        SummaryLine::Complete { inner } => {
-                            let raw = rest.trim_matches([' ', '\t']).to_string();
-                            SummaryAction::Complete { inner, raw }
-                        }
-                        SummaryLine::OpenOnly { after_open } => {
-                            if extends_past {
-                                SummaryAction::FailAndContinue
-                            } else {
-                                SummaryAction::Hold {
-                                    after_open,
-                                    raw_lines: vec![rest.trim_matches([' ', '\t']).to_string()],
-                                }
-                            }
-                        }
-                        SummaryLine::Malformed => SummaryAction::FailAndContinue,
-                    }
-                }
-                SummaryState::Collecting {
-                    after_open,
-                    raw_lines,
-                } => {
-                    let prefix = if after_open.is_empty() {
-                        0
+            Some(Container::Details {
+                summary_state: SummaryState::Done,
+                ..
+            }) => return false,
+            Some(Container::Details {
+                summary_state: SummaryState::AwaitingFirstNonblank,
+                ..
+            }) => match details::parse_summary_line_bounded(rest, budget) {
+                SummaryLine::NotSummary => SummaryAction::MarkDone,
+                SummaryLine::Complete { inner } => SummaryAction::Complete {
+                    inner,
+                    raw_lines: vec![rest.to_string()],
+                    leftover: Vec::new(),
+                },
+                SummaryLine::OpenOnly { after_open } => {
+                    if extends_past {
+                        SummaryAction::FailAndContinue
                     } else {
-                        after_open.len() + 1
-                    };
-                    let max_search = prefix.saturating_add(budget);
-                    match details::continue_summary_bounded(after_open, rest, max_search) {
-                        SummaryContinue::Complete { inner } => {
-                            let mut raw = raw_lines.clone();
-                            raw.push(rest.trim_matches([' ', '\t']).to_string());
-                            SummaryAction::Complete {
-                                inner,
-                                raw: raw.join("\n"),
-                            }
-                        }
-                        SummaryContinue::StillOpen { accumulated } => {
-                            if extends_past {
-                                let mut raw = raw_lines.clone();
-                                raw.push(rest.trim_matches([' ', '\t']).to_string());
-                                SummaryAction::FailReplay {
-                                    raw_lines: raw,
-                                    consume: true,
-                                }
-                            } else {
-                                let mut raw = raw_lines.clone();
-                                raw.push(rest.trim_matches([' ', '\t']).to_string());
-                                SummaryAction::Hold {
-                                    after_open: accumulated,
-                                    raw_lines: raw,
-                                }
-                            }
-                        }
-                        SummaryContinue::Malformed => {
-                            let mut raw = raw_lines.clone();
-                            raw.push(rest.trim_matches([' ', '\t']).to_string());
-                            SummaryAction::FailReplay {
-                                raw_lines: raw,
-                                consume: true,
-                            }
+                        SummaryAction::Hold {
+                            collector: details::SummaryCollector::from_after_open(&after_open),
+                            raw_lines: vec![rest.to_string()],
                         }
                     }
                 }
+                SummaryLine::Malformed => SummaryAction::FailAndContinue,
             },
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { .. },
+                ..
+            }) => {
+                if extends_past {
+                    let raw = self.take_collecting_raw_lines();
+                    return self.apply_summary_action(SummaryAction::FailReplay {
+                        raw_lines: raw,
+                        consume: false,
+                    });
+                }
+                return self.continue_collecting_summary(rest, budget);
+            }
             _ => return false,
         };
         self.apply_summary_action(action)
+    }
+
+    fn continue_collecting_summary(&mut self, rest: &str, budget: usize) -> bool {
+        let outcome = match self.containers.last_mut() {
+            Some(Container::Details {
+                summary_state:
+                    SummaryState::Collecting {
+                        collector,
+                        raw_lines,
+                    },
+                ..
+            }) => {
+                let continue_result = collector.push_line(rest, budget);
+                match continue_result {
+                    SummaryContinue::Complete { inner } => {
+                        raw_lines.push(rest.to_string());
+                        Some(SummaryAction::Complete {
+                            inner,
+                            raw_lines: std::mem::take(raw_lines),
+                            leftover: Vec::new(),
+                        })
+                    }
+                    SummaryContinue::StillOpen => {
+                        raw_lines.push(rest.to_string());
+                        None
+                    }
+                    SummaryContinue::Malformed => {
+                        raw_lines.push(rest.to_string());
+                        Some(SummaryAction::FailReplay {
+                            raw_lines: std::mem::take(raw_lines),
+                            consume: true,
+                        })
+                    }
+                }
+            }
+            _ => return false,
+        };
+        match outcome {
+            Some(action) => self.apply_summary_action(action),
+            None => true,
+        }
     }
 
     fn apply_summary_action(&mut self, action: SummaryAction) -> bool {
@@ -1213,11 +1270,26 @@ impl BlockParser {
                 }
                 false
             }
-            SummaryAction::Complete { inner, raw } => {
+            SummaryAction::Complete {
+                inner,
+                raw_lines,
+                leftover,
+            } => {
+                let leftover_n = leftover.len();
+                let (summary_lines, leftover_raw) =
+                    if leftover_n > 0 && leftover_n <= raw_lines.len() {
+                        let split_at = raw_lines.len() - leftover_n;
+                        let leftover_raw = raw_lines[split_at..].to_vec();
+                        (raw_lines[..split_at].to_vec(), leftover_raw)
+                    } else {
+                        (raw_lines, leftover)
+                    };
+                let gap = self.current_details_gap();
                 if let Some(Container::Details {
                     summary_state,
                     summary_inner,
-                    summary_raw,
+                    summary_raw_lines,
+                    pre_summary_gap,
                     ..
                 }) = self.containers.last_mut()
                 {
@@ -1226,22 +1298,34 @@ impl BlockParser {
                     } else {
                         Some(inner)
                     };
-                    *summary_raw = Some(raw);
+                    *summary_raw_lines = summary_lines;
+                    *pre_summary_gap = gap;
                     *summary_state = SummaryState::Done;
                 }
                 self.clear_current_details_gap();
+                if !leftover_raw.is_empty() {
+                    self.replay_ordinary_lines(leftover_raw, 0);
+                }
                 true
             }
             SummaryAction::Hold {
-                after_open,
+                collector,
                 raw_lines,
             } => {
-                if let Some(Container::Details { summary_state, .. }) = self.containers.last_mut() {
+                let gap = self.current_details_gap();
+                if let Some(Container::Details {
+                    summary_state,
+                    pre_summary_gap,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *pre_summary_gap = gap;
                     *summary_state = SummaryState::Collecting {
-                        after_open,
+                        collector,
                         raw_lines,
                     };
                 }
+                self.clear_current_details_gap();
                 true
             }
             SummaryAction::FailAndContinue => {
@@ -1257,26 +1341,52 @@ impl BlockParser {
                 false
             }
             SummaryAction::FailReplay { raw_lines, consume } => {
+                let gap = self.current_details_pre_gap();
                 if let Some(Container::Details {
                     summary_state,
                     failed,
+                    summary_replayed,
                     ..
                 }) = self.containers.last_mut()
                 {
                     *failed = true;
                     *summary_state = SummaryState::Done;
+                    *summary_replayed = true;
                 }
-                if !raw_lines.is_empty() {
-                    self.push_new_block(Block::Paragraph {
-                        inlines: vec![Inline::Text(raw_lines.join("\n"))],
-                    });
-                }
+                self.replay_ordinary_lines(raw_lines, gap);
                 consume
             }
         }
     }
 
+    fn current_details_gap(&self) -> u8 {
+        if matches!(self.containers.last(), Some(Container::Details { .. })) {
+            self.pending_source_gaps[self.containers.len()]
+        } else {
+            0
+        }
+    }
+
+    fn current_details_pre_gap(&self) -> u8 {
+        match self.containers.last() {
+            Some(Container::Details {
+                pre_summary_gap, ..
+            }) if *pre_summary_gap > 0 => *pre_summary_gap,
+            Some(Container::Details { .. }) => self.current_details_gap(),
+            _ => 0,
+        }
+    }
+
     fn flush_held_summary_on_blank(&mut self) {
+        if let Some((inner, leftover)) = self.finalize_collecting_summary() {
+            let raw_lines = self.take_collecting_raw_lines();
+            self.apply_summary_action(SummaryAction::Complete {
+                inner,
+                raw_lines,
+                leftover,
+            });
+            return;
+        }
         let held = match self.containers.last() {
             Some(Container::Details {
                 summary_state: SummaryState::Collecting { raw_lines, .. },
@@ -1284,20 +1394,10 @@ impl BlockParser {
             }) => raw_lines.clone(),
             _ => return,
         };
-        if let Some(Container::Details {
-            summary_state,
-            failed,
-            ..
-        }) = self.containers.last_mut()
-        {
-            *failed = true;
-            *summary_state = SummaryState::Done;
-        }
-        if !held.is_empty() {
-            self.push_new_block(Block::Paragraph {
-                inlines: vec![Inline::Text(held.join("\n"))],
-            });
-        }
+        self.apply_summary_action(SummaryAction::FailReplay {
+            raw_lines: held,
+            consume: true,
+        });
     }
 
     fn clear_current_details_gap(&mut self) {
@@ -1314,7 +1414,9 @@ impl BlockParser {
             mut blank_lines_before,
             leading_blank_lines,
             summary_inner,
-            mut summary_raw,
+            summary_raw_lines,
+            summary_replayed,
+            pre_summary_gap,
             summary_state,
             failed,
         } = c
@@ -1322,25 +1424,28 @@ impl BlockParser {
             unreachable!("finish_details requires Details");
         };
 
-        let still_collecting = matches!(summary_state, SummaryState::Collecting { .. });
-        if let SummaryState::Collecting { raw_lines, .. } = summary_state {
-            summary_raw = Some(raw_lines.join("\n"));
-        }
+        let (still_collecting, collecting_raw, finalized) = match summary_state {
+            SummaryState::Collecting {
+                collector,
+                raw_lines,
+            } => (true, raw_lines, collector.finalize()),
+            _ => (false, summary_raw_lines, None),
+        };
 
         let matched = !failed
             && !still_collecting
             && closer
                 .as_ref()
                 .is_some_and(|(_, end)| *end <= self.details_window);
+        let _ = finalized;
         if !matched {
-            if let Some(raw) = summary_raw.filter(|raw| !raw.is_empty()) {
-                children.insert(
-                    0,
-                    Block::Paragraph {
-                        inlines: vec![Inline::Text(raw)],
-                    },
-                );
-                blank_lines_before.insert(0, 0);
+            if !summary_replayed && !collecting_raw.is_empty() {
+                let (mut restored, mut restored_gaps) =
+                    self.parse_ordinary_line_blocks(collecting_raw, pre_summary_gap);
+                restored.append(&mut children);
+                restored_gaps.append(&mut blank_lines_before);
+                children = restored;
+                blank_lines_before = restored_gaps;
             }
             return self.fallback_details(
                 opener_raw,
@@ -1364,6 +1469,165 @@ impl BlockParser {
             },
             leading_blank_lines,
         );
+    }
+
+    fn parse_ordinary_line_blocks(
+        &mut self,
+        lines: Vec<String>,
+        first_gap: u8,
+    ) -> (Vec<Block>, Vec<u8>) {
+        let saved_leaf = self.leaf.take();
+        let saved_leaf_gap = self.leaf_blank_lines_before;
+        self.containers.push(Container::Details {
+            open: false,
+            opener_raw: String::new(),
+            children: Vec::new(),
+            blank_lines_before: Vec::new(),
+            leading_blank_lines: 0,
+            summary_inner: None,
+            summary_raw_lines: Vec::new(),
+            summary_replayed: true,
+            pre_summary_gap: 0,
+            summary_state: SummaryState::Done,
+            failed: true,
+        });
+        self.replay_ordinary_lines(lines, first_gap);
+        let popped = self.containers.pop();
+        self.leaf = saved_leaf;
+        self.leaf_blank_lines_before = saved_leaf_gap;
+        match popped {
+            Some(Container::Details {
+                children,
+                blank_lines_before,
+                ..
+            }) => (children, blank_lines_before),
+            _ => (Vec::new(), Vec::new()),
+        }
+    }
+
+    fn replay_ordinary_lines(&mut self, lines: Vec<String>, first_gap: u8) {
+        if lines.is_empty() {
+            return;
+        }
+        if matches!(self.containers.last(), Some(Container::Details { .. })) {
+            self.pending_source_gaps[self.containers.len()] = first_gap;
+        }
+        for line in lines {
+            self.classify_ordinary_rest(&line);
+        }
+        self.close_leaf();
+    }
+
+    fn classify_ordinary_rest(&mut self, rest: &str) {
+        let bytes = rest.as_bytes();
+        let (sub_col, sub_off) = scanner::measure_indent(bytes);
+        if sub_col < 4 {
+            let rest_bytes = &bytes[sub_off..];
+            if !rest_bytes.is_empty() {
+                if let Some((level, text)) = parse_atx_heading(rest_bytes) {
+                    self.close_leaf();
+                    self.push_new_block(Block::Heading {
+                        level,
+                        inlines: vec![Inline::Text(text)],
+                    });
+                    return;
+                }
+                if let Some((fence, fence_len, info)) = parse_fence_open(rest_bytes) {
+                    self.close_leaf();
+                    self.begin_leaf();
+                    self.leaf = Some(Leaf::FencedCode {
+                        fence,
+                        fence_len,
+                        indent: sub_col,
+                        info,
+                        content: String::new(),
+                    });
+                    return;
+                }
+                if is_math_fence(rest_bytes) {
+                    self.close_leaf();
+                    self.begin_leaf();
+                    self.leaf = Some(Leaf::MathBlock {
+                        indent: sub_col,
+                        content: String::new(),
+                    });
+                    return;
+                }
+                if is_thematic_break(rest_bytes) {
+                    self.close_leaf();
+                    self.push_new_block(Block::ThematicBreak);
+                    return;
+                }
+                if rest_bytes[0] == b'>'
+                    && let Some((_, no)) = try_open_blockquote(bytes, 0, 0)
+                    && self.containers.len() < MAX_CONTAINER_DEPTH
+                {
+                    self.close_leaf();
+                    let leading_blank_lines = self.take_pending_source_gap();
+                    self.containers.push(Container::BlockQuote {
+                        children: Vec::new(),
+                        blank_lines_before: Vec::new(),
+                        leading_blank_lines,
+                    });
+                    if no < rest.len() {
+                        self.classify_ordinary_rest(&rest[no..]);
+                    }
+                    if let Some(Container::BlockQuote { .. }) = self.containers.last() {
+                        let quote = self.containers.pop().unwrap();
+                        self.close_container(quote);
+                    }
+                    return;
+                }
+                if let Some(open) =
+                    try_open_list_marker(bytes, 0, 0, matches!(self.leaf, Some(Leaf::Paragraph(_))))
+                    && self.containers.len() + 2 <= MAX_CONTAINER_DEPTH
+                {
+                    self.close_leaf();
+                    self.ensure_list_open(open.kind);
+                    self.containers.push(Container::ListItem {
+                        children: Vec::new(),
+                        blank_lines_before: Vec::new(),
+                        indent: open.indent,
+                    });
+                    if open.off_after < rest.len() {
+                        self.classify_ordinary_rest(&rest[open.off_after..]);
+                    } else {
+                        self.append_paragraph("");
+                    }
+                    self.close_leaf();
+                    if let Some(Container::ListItem { .. }) = self.containers.last() {
+                        let item = self.containers.pop().unwrap();
+                        self.close_container(item);
+                    }
+                    if let Some(Container::List { .. }) = self.containers.last() {
+                        let list = self.containers.pop().unwrap();
+                        self.close_container(list);
+                    }
+                    return;
+                }
+            }
+        }
+        if sub_col >= 4 && !matches!(self.leaf, Some(Leaf::Paragraph(_))) {
+            let stripped = indented_strip(rest, 0);
+            if let Some(Leaf::IndentedCode { content, .. }) = &mut self.leaf {
+                content.push_str(stripped);
+                content.push('\n');
+            } else {
+                self.close_leaf();
+                self.begin_leaf();
+                let mut content = String::new();
+                content.push_str(stripped);
+                content.push('\n');
+                self.leaf = Some(Leaf::IndentedCode {
+                    content,
+                    pending_blanks: 0,
+                    pending_source_gaps: Box::new([0; MAX_CONTAINER_DEPTH + 1]),
+                    pending_list_blanks: Box::new([false; MAX_CONTAINER_DEPTH]),
+                });
+            }
+            return;
+        }
+        self.append_paragraph_from(rest, 0);
     }
 
     fn fallback_details(

@@ -121,5 +121,29 @@ mod tests {
             )),
             _ => false,
         }));
+        let tokens = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &tokens.blocks[0] else {
+            panic!("expected details tokens");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { .. }))
+        );
+        let hard = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>one  \ntwo</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &hard.blocks[0] else {
+            panic!("expected hard-break tokens");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::HardBreak))
+        );
     }
 }

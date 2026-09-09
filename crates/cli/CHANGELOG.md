@@ -18,8 +18,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Fixed
 
 - Failed `<details>` candidates now keep a completed `<summary>` in the display
-  tree, multiline summaries can span more than two lines, and summary recognition
-  stays linear inside the documented scan window.
+  tree, restore ordinary block structure and source gaps on fallback, preserve
+  hard breaks and cross-line code spans in multiline summaries, and keep
+  summary recognition linear for many short continuation lines.
 
 ### Changed
 

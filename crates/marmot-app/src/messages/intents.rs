@@ -871,6 +871,9 @@ mod mention_tests {
             "<details>\n    code\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>"
         );
         assert_eq!(mention_p_tags(&later), expected);
+        let heading_fallback =
+            format!("<details>\n<summary>@{summary_npub}\n# heading\n\n@{body_npub}\n</details>");
+        assert_eq!(mention_p_tags(&heading_fallback), expected);
     }
 
     #[test]

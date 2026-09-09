@@ -240,6 +240,156 @@ fn blank_interrupted_summary_falls_back() {
 }
 
 #[test]
+fn fallback_restores_markdown_heading() {
+    let doc = parse("<details>\n<summary>one\n# heading\n\nbody\n</details>");
+    assert!(!has_details(&doc));
+    assert_eq!(doc.blocks[0], paragraph("<details>"));
+    assert!(
+        doc.blocks
+            .iter()
+            .any(|block| matches!(block, Block::Heading { level: 1, .. })),
+        "fallback must restore heading structure: {doc:?}"
+    );
+    assert_eq!(doc.blocks.last(), Some(&paragraph("</details>")));
+    assert!(texts(&doc).contains("one"));
+    assert!(texts(&doc).contains("heading"));
+    assert!(texts(&doc).contains("body"));
+}
+
+#[test]
+fn fallback_retains_blank_before_summary() {
+    let doc = parse("<details>\n\n<summary>sum</summary>\n\nbody");
+    assert!(!has_details(&doc));
+    assert_eq!(
+        doc.blank_lines_before,
+        vec![0, 1, 1],
+        "gap before a completed summary must survive fallback: {doc:?}"
+    );
+    assert_eq!(doc.blocks[0], paragraph("<details>"));
+    assert!(texts(&doc).contains("sum"));
+    assert_eq!(doc.blocks.last(), Some(&paragraph("body")));
+}
+
+#[test]
+fn fallback_multiline_keeps_lists_code_refs_and_siblings() {
+    let doc = parse(
+        "<details>\n<summary>one\n- item\n    code\n[lab]: /url\n\nsee [lab]\n# After\n</details>\n\nsibling",
+    );
+    assert!(!has_details(&doc));
+    assert!(
+        doc.blocks
+            .iter()
+            .any(|block| matches!(block, Block::List { .. })),
+        "list structure must survive fallback: {doc:?}"
+    );
+    assert!(
+        doc.blocks
+            .iter()
+            .any(|block| matches!(block, Block::CodeBlock { .. })),
+        "indented code must survive fallback: {doc:?}"
+    );
+    assert!(
+        doc.blocks
+            .iter()
+            .any(|block| matches!(block, Block::Heading { .. })),
+        "following heading must survive: {doc:?}"
+    );
+    assert_eq!(doc.blocks.last(), Some(&paragraph("sibling")));
+}
+
+#[test]
+fn fallback_blank_before_summary_on_container_loss_and_scan_refusal() {
+    let listed = parse("- <details>\n\n  <summary>sum</summary>\n  body\n# After");
+    assert!(!has_details(&listed));
+    let Block::List { items, .. } = &listed.blocks[0] else {
+        panic!("list: {listed:?}");
+    };
+    assert!(
+        items[0].blank_lines_before.get(1) == Some(&1),
+        "container-loss fallback must keep the blank before summary: {listed:?}"
+    );
+    assert_eq!(listed.blocks.last(), Some(&common::heading(1, "After")));
+
+    let header = "<details>\n\n<summary>sum</summary>\n";
+    let pad = 65_536_usize.saturating_sub(header.len());
+    let md = format!("{header}{}</details>", "y".repeat(pad));
+    let doc = parse(&md);
+    assert!(!has_details(&doc));
+    assert_eq!(doc.blank_lines_before[0], 0);
+    assert!(
+        doc.blank_lines_before.get(1) == Some(&1),
+        "scan-refused fallback must keep the blank before summary: {doc:?}"
+    );
+}
+
+#[test]
+fn summary_code_protects_details_delimiter() {
+    let doc = parse("<details>\n<summary>`one\n</details>\ntwo`\n</summary>\nbody\n</details>");
+    let Block::Details { summary, body, .. } = &doc.blocks[0] else {
+        panic!("expected Details, got {doc:?}");
+    };
+    assert!(
+        summary
+            .iter()
+            .any(|inline| matches!(inline, Inline::Code(s) if s.contains("</details>"))),
+        "code span must protect the details delimiter: {summary:?}"
+    );
+    assert_eq!(body, &vec![paragraph("body")]);
+}
+
+#[test]
+fn code_span_can_protect_earlier_line_summary_closer() {
+    let doc = parse("<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>");
+    let Block::Details { summary, .. } = &doc.blocks[0] else {
+        panic!("expected Details, got {doc:?}");
+    };
+    assert_eq!(
+        summary,
+        &[code("one </summary> two")],
+        "later matching ticks must protect the earlier closer: {summary:?}"
+    );
+}
+
+#[test]
+fn summary_retains_hard_break() {
+    let doc = parse("<details>\n<summary>one  \ntwo</summary>\nbody\n</details>");
+    let Block::Details { summary, .. } = &doc.blocks[0] else {
+        panic!("expected Details, got {doc:?}");
+    };
+    assert!(
+        summary
+            .iter()
+            .any(|inline| matches!(inline, Inline::HardBreak)),
+        "two trailing spaces must remain a hard break: {summary:?}"
+    );
+}
+
+#[test]
+fn summary_code_span_can_span_three_lines_and_crlf() {
+    let doc = parse("<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>");
+    let Block::Details { summary, .. } = &doc.blocks[0] else {
+        panic!("expected Details, got {doc:?}");
+    };
+    assert!(
+        summary
+            .iter()
+            .any(|inline| matches!(inline, Inline::Code(_)))
+    );
+
+    let crlf = parse(
+        "<details>\r\n<summary>`one\r\n</summary>\r\ntwo`</summary>\r\nbody\r\n</details>\r\n",
+    );
+    let Block::Details { summary, .. } = &crlf.blocks[0] else {
+        panic!("expected CRLF Details, got {crlf:?}");
+    };
+    assert!(
+        summary
+            .iter()
+            .any(|inline| matches!(inline, Inline::Code(_)))
+    );
+}
+
+#[test]
 fn indented_code_then_summary_in_quote() {
     let doc = parse("> <details>\n>     code\n>\n> <summary>later</summary>\n> body\n> </details>");
     let Block::BlockQuote { blocks, .. } = &doc.blocks[0] else {

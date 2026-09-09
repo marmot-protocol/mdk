@@ -59,8 +59,10 @@ This is a block-oriented extension, not a general HTML parser:
 - Recognition is limited to a 65536-byte original-source prefix and a 4096-byte
   structural tag cap (inclusive of `<` through `>`). Each details block consumes
   one existing container-depth slot. Recognition work is linear in that capped
-  prefix: backtick runs are indexed once per candidate so unmatched openers do
-  not rescan the same suffix.
+  prefix: each continuation line is scanned once with carried code-span state,
+  and unmatched backtick runs are never rescanned. Failed candidates restore
+  ordinary block structure and source gaps instead of collapsing to one
+  paragraph.
 - Body blank-line counts align with `body` and saturate at
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.

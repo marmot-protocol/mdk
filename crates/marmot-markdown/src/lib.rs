@@ -215,4 +215,93 @@ mod details_work_tests {
             "unequal run lengths must not rescan suffixes, work={work}"
         );
     }
+
+    #[test]
+    fn multiline_scanner_actual_work_is_linear() {
+        let mut prev = 0usize;
+        for n in [1_000usize, 2_000, 4_000, 8_000] {
+            Work::reset();
+            let mut md = String::from("<details>\n<summary>\n");
+            for _ in 0..n {
+                md.push_str("x\n");
+            }
+            md.push_str("</details>");
+            let _ = parse(&md);
+            let work = Work::get();
+            let bytes = md.len();
+            assert!(
+                work <= bytes * 16 + 4_096,
+                "multiline continuation must stay linear, n={n} bytes={bytes} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, n={n} prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
+        Work::reset();
+        let near_cap = 32_000usize;
+        let mut md = String::from("<details>\n<summary>\n");
+        for _ in 0..near_cap {
+            md.push_str("x\n");
+        }
+        let bytes = md.len();
+        let _ = parse(&md);
+        let work = Work::get();
+        assert!(
+            work <= bytes * 16 + 4_096,
+            "many-line open summary near the FFI cap must stay linear, bytes={bytes} work={work}"
+        );
+    }
+
+    #[test]
+    fn many_line_open_summary_release_probe_compares_to_control() {
+        use std::time::Instant;
+        let n = 32_749usize;
+        let mut hostile = String::from("<details>\n<summary>\n");
+        for _ in 0..n {
+            hostile.push_str("x\n");
+        }
+        let mut control = String::from("<details>\n");
+        for _ in 0..n {
+            control.push_str("x\n");
+        }
+        let _ = parse(&hostile);
+        let _ = parse(&control);
+        let started = Instant::now();
+        let _ = parse(&hostile);
+        let hostile_us = started.elapsed().as_micros();
+        let started = Instant::now();
+        let _ = parse(&control);
+        let control_us = started.elapsed().as_micros();
+        eprintln!(
+            "many-line open-summary probe bytes={} hostile_us={} control_us={} ratio={:.2}",
+            hostile.len(),
+            hostile_us,
+            control_us,
+            hostile_us as f64 / control_us.max(1) as f64
+        );
+        assert!(
+            hostile_us < 5_000_000,
+            "hostile many-line summary must stay well under the previous multi-second stall, us={hostile_us}"
+        );
+    }
+
+    #[test]
+    fn bounded_summary_never_copies_unbounded_suffix() {
+        Work::reset();
+        let huge = format!("<summary>{}", "z".repeat(1_000_000));
+        let classified = crate::details::parse_summary_line_bounded(&huge, 16);
+        assert!(matches!(
+            classified,
+            crate::details::SummaryLine::OpenOnly { .. }
+        ));
+        let work = Work::get();
+        assert!(
+            work < 8_192,
+            "a 16-byte budget must not copy a 1MB suffix, work={work}"
+        );
+    }
 }
