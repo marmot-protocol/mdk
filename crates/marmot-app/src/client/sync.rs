@@ -3072,51 +3072,25 @@ impl AppClient {
         )
     }
 
-    /// Every durable epoch-gap row whose group this device is terminal in, at
-    /// the epoch storage actually holds for it.
-    ///
-    /// Read rather than reconstructed from the in-memory arms: durable arm
-    /// takes `MAX(stalled_epoch)` while the in-memory arm overwrites, and
-    /// deletion is epoch-keyed, so a row can sit at a later epoch than the
-    /// intent holding it. Reading also reaches a terminal group's row when no
-    /// in-memory owner holds it at all.
-    fn durable_terminal_epoch_backfill_rows(
-        &self,
-    ) -> Result<Vec<storage_sqlite::StoredEpochBackfillIntent>, AppError> {
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .pending_epoch_backfill_intents()?
-            .into_iter()
-            .filter(|intent| {
-                hex::decode(&intent.group_id_hex).is_ok_and(|group_id| {
-                    super::group_is_terminal(&self.runtime, &cgka_traits::GroupId::new(group_id))
-                })
-            })
-            .collect())
-    }
-
     /// Drop every armed epoch-gap intent for a group this device is terminal in
     /// (removed, or the group disbanded) and clear its durable marker.
     ///
-    /// Dropping an intent prevents no subscription. The replay is not scoped to
-    /// the intent's groups: it re-subscribes the whole account routing table
-    /// with `since = None`, and terminal groups are kept out of *that* by
-    /// `refresh_group_routes` / `refresh_routing`. Which is exactly why the
-    /// intent is unservable — its routes are already pruned, so no replay can
-    /// ever fetch that group's history. All keeping it does is spend the one
-    /// account-wide replay budget and manufacture `started` rows and
-    /// fruitless-completion evidence for a group we left, which reads
-    /// downstream as a live stall.
+    /// Such an intent is unservable. `refresh_group_routes` / `refresh_routing`
+    /// have already pruned the group's routes, and the replay is account-wide
+    /// rather than intent-scoped, so no replay can ever fetch that group's
+    /// history. Keeping the intent only spends the one account-wide replay
+    /// budget and manufactures `started` rows and fruitless-completion evidence
+    /// for a group we left, which reads downstream as a live stall.
     ///
     /// [`super::group_is_terminal`] reads the engine record, so a deferred open
     /// answers `false` for everything before hydration. That makes the
     /// restore-time call an early-out only; the guarantee is the call at the top
     /// of [`Self::run_pending_epoch_backfill`], which runs after hydration.
     ///
-    /// A terminal group has no next owner, so the rows go straight to
-    /// `clear_epoch_backfill_intents` rather than through
-    /// [`Self::clear_epoch_backfill_intent`]'s rearm-preserving retain guard.
+    /// Rows go through the by-group clear, not the epoch-exact
+    /// [`Self::clear_epoch_backfill_intent`]. That guard exists so a completed
+    /// replay cannot erase a concurrently re-armed newer intent; terminal is
+    /// final, so here there is no such re-arm to protect.
     fn drop_terminal_epoch_backfill_intents(&mut self) {
         let terminal = self
             .pending_epoch_backfill
@@ -3157,12 +3131,13 @@ impl AppClient {
             dropped_groups = terminal.len(),
             "dropped epoch-gap recovery arms for groups this device is terminal in"
         );
+        let group_ids_hex = terminal
+            .iter()
+            .map(|group_id| hex::encode(group_id.as_slice()))
+            .collect::<Vec<_>>();
         if let Err(error) = self
-            .durable_terminal_epoch_backfill_rows()
-            .and_then(|rows| {
-                self.app
-                    .clear_epoch_backfill_intents(&self.state.label, &rows)
-            })
+            .app
+            .clear_epoch_backfill_intents_for_groups(&self.state.label, &group_ids_hex)
         {
             tracing::warn!(
                 target: "marmot_app::epoch_stall",
@@ -5923,12 +5898,11 @@ mod tests {
         );
     }
 
-    /// Durable arm takes `MAX(stalled_epoch)` while the in-memory arm
-    /// overwrites, so the row can sit at a later epoch than the intent holding
-    /// it. Clearing has to key off the epoch storage actually holds, and has to
-    /// reach a terminal group's row even when no in-memory owner holds it.
+    /// The durable arm can sit at a later epoch than the in-memory intent
+    /// holding it, so the clear must not key off the intent's epoch. Retiring
+    /// the group's row retires it whatever epoch storage holds.
     #[tokio::test]
-    async fn terminal_group_rows_clear_at_their_durable_epoch_in_one_pass() {
+    async fn terminal_group_row_clears_whatever_epoch_storage_holds() {
         use marmot_forensics::EpochBackfillExecutionSeam;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5939,7 +5913,6 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let departed = client.create_group("departed", &[]).await.unwrap();
-        let orphaned = client.create_group("orphaned row", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
 
         client
@@ -5949,20 +5922,12 @@ mod tests {
         // A later arm reached storage but not this client's owner, so the row
         // now sits at 9 while the intent still says 5.
         storage
-            .arm_epoch_backfill_intents(&[
-                storage_sqlite::StoredEpochBackfillIntent {
-                    group_id_hex: hex::encode(departed.as_slice()),
-                    stalled_epoch: 9,
-                },
-                // No in-memory owner ever held this one.
-                storage_sqlite::StoredEpochBackfillIntent {
-                    group_id_hex: hex::encode(orphaned.as_slice()),
-                    stalled_epoch: 3,
-                },
-            ])
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(departed.as_slice()),
+                stalled_epoch: 9,
+            }])
             .unwrap();
         make_group_terminal(&app, &client, &departed, false);
-        make_group_terminal(&app, &client, &orphaned, true);
 
         assert!(matches!(
             client
@@ -5973,7 +5938,7 @@ mod tests {
         ));
         assert!(
             storage.pending_epoch_backfill_intents().unwrap().is_empty(),
-            "one pass must retire every terminal group's row, at whatever epoch storage holds"
+            "the terminal group keeps no intent at any epoch"
         );
     }
 

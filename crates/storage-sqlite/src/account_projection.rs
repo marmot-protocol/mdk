@@ -559,6 +559,35 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Retire these groups' recovery intents whatever epoch they were armed at.
+    ///
+    /// A group this device is terminal in keeps no intent at any epoch, so the
+    /// stored epoch is not part of the key here. Use
+    /// [`Self::clear_epoch_backfill_intents`] instead when a replay completed
+    /// and a concurrent newer arm must survive.
+    pub fn clear_epoch_backfill_intents_for_groups(
+        &self,
+        group_ids_hex: &[String],
+    ) -> StorageResult<()> {
+        if group_ids_hex.is_empty() {
+            return Ok(());
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for group_id_hex in group_ids_hex {
+                let group_id = hex::decode(group_id_hex).map_err(|error| {
+                    StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
+                })?;
+                conn.execute_cached(
+                    "DELETE FROM app_epoch_backfill_intents WHERE group_id = ?1",
+                    params![group_id],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn account_delivery_recovery(
         &self,
         label: &str,
