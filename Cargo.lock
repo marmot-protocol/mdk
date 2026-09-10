@@ -3339,6 +3339,7 @@ dependencies = [
 name = "marmot-app"
 version = "0.9.20"
 dependencies = [
+ "agent-stream-compose",
  "async-trait",
  "bytes",
  "cgka-engine",
@@ -3387,10 +3388,13 @@ dependencies = [
 name = "marmot-c"
 version = "0.9.20"
 dependencies = [
+ "keyring-core",
  "libc",
  "marmot-uniffi",
+ "nostr-relay-builder",
  "tempfile",
  "tokio",
+ "transport-quic-broker",
  "zeroize",
 ]
 

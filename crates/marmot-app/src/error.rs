@@ -101,6 +101,8 @@ pub enum AppError {
     InvalidMessageDraft(String),
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
+    #[error("agent publisher: {0}")]
+    AgentStreamPublisher(String),
     #[error("agent text stream start has no confirmed message id yet")]
     AgentStreamStartNotConfirmed,
     #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
@@ -285,6 +287,7 @@ impl AppError {
             Self::GroupRemoved(_) => "group_removed",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
+            Self::AgentStreamPublisher(_) => "agent_stream_publisher",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
             Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",
             Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",
