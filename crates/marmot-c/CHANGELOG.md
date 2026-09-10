@@ -7,6 +7,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.9.21] - 2026-09-10
+
+This cohort also exposes host-driven agent stream publishing and the v4 audit
+tracker configuration. Rebuild with the matching header and library. Account
+storage advances through migrations 68–69; back up before upgrading because
+downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#0921---2026-09-10).
+
 ### Added
 
 - Additive `MarmotMarkdownBlock::Details` with an indirect `MarmotMarkdownDetails`
