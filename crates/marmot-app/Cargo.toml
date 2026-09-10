@@ -34,6 +34,7 @@ hex.workspace = true
 httpdate.workspace = true
 hkdf.workspace = true
 image.workspace = true
+jsonschema.workspace = true
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 marmot-markdown.workspace = true

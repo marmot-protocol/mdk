@@ -48,6 +48,10 @@ App runtime bridge for the first real Marmot app surfaces.
   the upload client, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for
   audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and HTTP upload. Audit-log
   unit tests live in its own `#[cfg(test)] mod tests`.
+- Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
+  or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
+  by size and mtime without retry cooldowns. Keep legacy files available locally for inspection/deletion.
+  Account/device names are forbidden in rows and headers; hardware model is system-sourced, never a label.
 - Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
   never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
   Checkpoint only complete immutable upload snapshots after successful upload.

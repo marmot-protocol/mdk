@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-08
+updated: 2026-09-10
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -186,7 +186,9 @@ This repository now has the main engine candidate:
   `stream_id + start_event_id` without account state, relay integration, or payload persistence.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
-- `crates/marmot-forensics` — opt-in JSONL forensic audit schema and recorder traits.
+- `crates/marmot-forensics` — opt-in v4 JSONL forensic audit schema and recorder traits. Account/device display names
+  are excluded; platform, app version and optional system hardware model are retained. App uploads validate v4-only
+  snapshots and leave legacy files local. See [audit logging](../audit-logging.md).
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
 - `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.
 - `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.

@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-03
+updated: 2026-09-10
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -12,9 +12,10 @@ This is a source-grounded inventory of the append-only JSONL audit logging used 
 It is intentionally separate from the privacy-safe telemetry/tracing surface described in
 [`telemetry.md`](./telemetry.md).
 
-Audit logs are opt-in forensic artifacts and should not be treated like telemetry. The current v3 model has one
-privacy-safe shape: it cannot represent decrypted application content, cleartext group-state values, full account or
-member identities, or arbitrary convergence-rule input/result JSON. There is no sensitive/full-data mode.
+Audit logs are opt-in forensic artifacts and should not be treated like telemetry. The current v4 model has one
+content-restricted shape: it cannot represent decrypted application content, cleartext group-state values, full account or
+member public keys, account/device display names, or arbitrary convergence-rule input/result JSON. There is no sensitive/full-data mode.
+The retained deterministic hashes, raw group/message/transport identifiers, timestamps and relationships remain sensitive and linkable. The fixed hash prefixes are public domain separators, not secret salts.
 
 ## Current status
 
@@ -22,16 +23,16 @@ member identities, or arbitrary convergence-rule input/result JSON. There is no 
 | --- | --- |
 | Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed into each `AccountDeviceSession` only when app-level `AuditLogSettings.enabled` is true before that account session opens. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
-| File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v3`; the line-level JSON Schema is [`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json). |
-| Local file location | `<account_dir>/audit-<engine_id>-v3.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Existing v1/v2 files are not rewritten or appended to. |
-| Upload/listing | App and UniFFI expose listing and explicit upload of all local `audit-*.jsonl` files. Runtime tracker uploads continue to include existing v1/v2 files. |
+| File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v4`; the line-level JSON Schema is [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json). |
+| Local file location | `<account_dir>/audit-<engine_id>-v4.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Existing v1/v2/v3 files are not rewritten or appended to. |
+| Upload/listing | App and bindings list all local `audit-*.jsonl` files for inspection/deletion. Both explicit and tracker uploads accept only valid v4 snapshots; legacy and key-reveal files stay local. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
 
 ## Source map
 
 | Area | Files |
 | --- | --- |
-| Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json) |
+| Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json) |
 | Engine recorder installation point | [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs), [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
@@ -84,19 +85,19 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 
 | Value | How it is produced | Where it appears |
 | --- | --- | --- |
-| `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id`; not included in JSONL events directly. |
+| `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id` and included as `source.device_id` in the recorder source row. |
 | `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
 | `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
-| File path | `<account_dir>/audit-<engine_id>-v3.jsonl`. | Listed and uploaded by app APIs. |
+| File path | `<account_dir>/audit-<engine_id>-v4.jsonl`. | Listed and uploaded by app APIs. |
 
-The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<dir>/audit-<engine_id>.jsonl`.
+The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<dir>/audit-<engine_id>-v4.jsonl`.
 
 Identity properties:
 
 - `account_ref` is stable for the same account id.
 - `engine_id` is stable for the same account id plus the account directory's stored `audit-device-id`.
 - Both are 16-byte hex strings derived from hashes/randomness, not raw account ids.
-- `group_ref` and `msg_id` fields are raw hex forms of group/message identifiers. The log is local-only and sensitive.
+- `group_ref` and `msg_id` fields are raw hex forms of group/message identifiers. Uploaded logs retain these identifiers and remain sensitive.
 
 ## JSONL envelope
 
@@ -104,7 +105,7 @@ Each line serializes an `AuditEvent`:
 
 | Top-level field | Type | Present when | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | string | Always | Current value: `marmot-forensics-audit/v3`. |
+| `schema_version` | string | Always | Current value: `marmot-forensics-audit/v4`. |
 | `seq` | u64 | Always | Recorder-local sequence number. Starts at `0` for each `JsonlRecorder` opening and uses wrapping increment. |
 | `wall_time_ms` | u64 | Always | `SystemTime::now()` milliseconds since Unix epoch at record time. Falls back to `0` if system time is before epoch. |
 | `recorder_session_id` | string | Optional | Locally generated id for this recorder opening. Present for `JsonlRecorder` rows. |
@@ -118,7 +119,7 @@ Each line serializes an `AuditEvent`:
 
 ```json
 {
-  "schema_version": "marmot-forensics-audit/v3",
+  "schema_version": "marmot-forensics-audit/v4",
   "seq": 0,
   "wall_time_ms": 1700000000000,
   "recorder_session_id": "00000000000000000000018f2d0c1e2f000012340000000000000000",
@@ -158,7 +159,7 @@ Do not treat `seq` as globally unique. It is recorder-local and can reset after 
 prefer file hash plus line number, or raw line hash plus line number, for dedupe and indexing.
 
 The JSON Schema validates one `AuditEvent` object, not a whole JSONL file. JSONL/NDJSON consumers should parse each line
-independently against [`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json)
+independently against [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json)
 and retain the raw line for forward-compatible reprocessing.
 
 ### `context`
@@ -200,7 +201,7 @@ This catalogue is not yet complete. These event kinds have no section here yet �
 `sync_drain`, and `transport_received`.
 
 The authoritative catalogue is the `AuditEventKind` enum together with
-[`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json); the
+[`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
 `audit_log_event_schema_tracks_kind_catalog` test keeps those two in lockstep.
 
 ### `recorder_started`
@@ -1037,7 +1038,7 @@ Files are sorted by app account label, then file name.
 ### Segment rotation
 
 The recorder seals the active file into an immutable segment once it reaches `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
-continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v3-seg<NNNNNN>.jsonl`, so they are
+continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
 still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 - Rotation is a rename, so nothing is deleted or truncated, and the concatenation of a session's segments plus its
@@ -1080,13 +1081,12 @@ HTTP request:
 
 Optional source headers:
 
-- `X-Goggles-Device-Label`
+- `X-Goggles-Hardware-Model`
 - `X-Goggles-Platform`
 - `X-Goggles-App-Version`
 
-Account identity belongs in the uploaded JSONL file (`account_ref` on every row and a
-`source_context` row at recorder open with the human-readable account label). Do not send
-`X-Goggles-Account-Label`.
+The deterministic `account_ref` remains in JSONL. Neither JSONL nor upload headers carry account or free-form device names.
+`X-Goggles-Account-Label` and `X-Goggles-Device-Label` are not sent.
 
 `AuditLogUploadResult` fields:
 
@@ -1099,6 +1099,19 @@ Account identity belongs in the uploaded JSONL file (`account_ref` on every row 
 Upload errors are normalized to safe messages such as `HTTP <status>`, `request timed out`, `connection failed`,
 `invalid response body`, or `request failed`.
 
+### V4 upload boundary
+
+Before HTTP, MDK validates each complete row in the immutable upload snapshot against the bundled v4 JSON Schema.
+Strict typed deserialization rejects unknown and duplicate fields (including nested source metadata); schema
+validation also enforces value constraints. One invalid row rejects the entire snapshot without modifying local bytes.
+A file's name never substitutes for validation. An unfinished trailing row stays deferred until a later snapshot.
+The validator has HTTP/file reference resolution disabled and compiles only the bundled schema.
+
+No v1-v3 migration or sanitization is performed. Historical schemas remain committed for offline interpretation;
+new app and default recorder paths use v4. Deploy Goggles v4-only acceptance before the historical server purge.
+Rejected bodies must not be stored as quarantined artifacts by Goggles. Client adoption and server deployment are
+separate from this SDK change.
+
 ### Tracker config
 
 `AuditLogTrackerConfig` is runtime-only:
@@ -1107,10 +1120,17 @@ Upload errors are normalized to safe messages such as `HTTP <status>`, `request 
 | --- | --- |
 | `endpoint` | Optional tracker endpoint override. If absent, the app can use the compiled/default endpoint. |
 | `authorization_bearer_token` | Bearer token supplied by the host app. |
-| `source` | Optional upload client labels (`device_label`, `platform`, `app_version`). |
+| `source` | Optional system metadata (`hardware_model`, `platform`, `app_version`). |
 
-At recorder open the app writes a `source_context` JSONL row with the account display label,
-stable `device_id`, and the same host-supplied client labels when tracker config is set.
+At recorder open the app writes a `source_context` JSONL row with stable `device_id` and the host-supplied
+platform, app version and optional hardware model. Hardware model must be an OS-provided model identifier, not
+a hostname, serial number, or user-assigned name; omit it when unavailable. Hosts must update their Swift/Kotlin
+config construction to `AuditLogTrackerConfigV4Ffi` / `AuditLogUploadSourceV4Ffi` and replace `deviceLabel` with
+`hardwareModel` explicitly. The versioned config changes the UniFFI setter checksum so old generated bindings fail
+the compatibility check instead of reinterpreting a device label. The legacy C config ignores and returns NULL
+for `device_label`; C hosts use `marmot_set_audit_log_tracker_config_v4` for hardware-model support.
+Source rows are emitted on recorder opening, not on each segment roll. A valid uploaded segment may therefore
+lack source metadata; analyzers may associate it with validated source rows for the same engine or leave it unknown.
 
 Compiled/default endpoint source:
 
@@ -1119,7 +1139,7 @@ Compiled/default endpoint source:
 
 ### Tracker update
 
-`post_audit_log_tracker_update_for_app()` uploads every listed audit file only when:
+`post_audit_log_tracker_update_for_app()` considers listed audit files only when:
 
 - audit logging is enabled;
 - a resolved tracker endpoint exists;
@@ -1147,7 +1167,7 @@ Structured skip reasons:
 
 Each account directory holds `audit-upload-checkpoint.json` (owner-only, staged-and-renamed, deliberately not an
 `audit-*.jsonl` name). It records, per audit file, the size and mtime the file had when the tracker last finished with
-it, plus whether that was an accepted upload or a file above the request ceiling.
+it, plus whether that was an accepted upload, a file above the request ceiling, or an ineligible schema snapshot.
 
 - A file whose current size and mtime match its entry is never re-read or re-posted. Sealed segments never change, so
   one `2xx` is a durable acknowledgment of their whole content.
@@ -1156,12 +1176,14 @@ it, plus whether that was an accepted upload or a file above the request ceiling
 - Identity is metadata, not a content hash, because the point of the checkpoint is to avoid reading the file. Audit
   files only grow, so every mismatch — including the racy ones where the file grew between enumeration and upload —
   falls back to re-uploading, which the endpoint short-circuits on `file_sha256` without parsing a line.
-- Losing or corrupting the sidecar costs one repeat transfer per still-present file and nothing else.
+- Losing or corrupting the sidecar costs repeat validation and, for eligible files, one repeat transfer.
+- Legacy, malformed and schema-ineligible snapshots are recorded as `ineligible_schema`; they do not trigger retry
+  cooldowns or block later files. A size/mtime change makes them eligible for validation again, never for bypassing it.
 - A file above the 64 MiB ceiling is recorded as such, logged once with aggregate counts, and skipped on later runs
   instead of failing on every trigger. It never blocks the files behind it.
 - There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
   it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
-  for manual handling (copy it off the device and hand it to the endpoint out of band, or split it). Deleting it is
+  for local handling. Goggles must reject legacy schemas even through other upload paths. Deleting it is
   mdk#1014's contract. Segment rotation is what keeps any newly produced file well under the ceiling, so this is an
   upgrade-path condition only.
 - The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
@@ -1287,9 +1309,9 @@ Recommended indexes for downstream ingestion:
 
 Recommended parser behavior:
 
-- Dispatch parsers by `schema_version`; new rows use `marmot-forensics-audit/v3`, while retained v1/v2 files may still
-  be listed and uploaded.
-- Preserve the raw JSON line even when normalizing fields into columns.
+- Uploaded rows must use `marmot-forensics-audit/v4`; retained v1-v3 files remain local only.
+- Validate before any raw persistence. Preserve only accepted v4 lines when normalizing into columns;
+  schema rejection must not quarantine legacy or prohibited raw content.
 - Do not assume the following:
   - `seq` is globally unique.
   - every line has `account_ref` or `group_ref`.

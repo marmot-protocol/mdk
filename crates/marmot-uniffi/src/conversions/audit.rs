@@ -98,46 +98,49 @@ impl From<AuditLogSettingsFfi> for AuditLogSettings {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct AuditLogUploadSourceFfi {
-    pub device_label: Option<String>,
+pub struct AuditLogUploadSourceV4Ffi {
+    /// System model identifier; never a user-assigned device name, hostname, or serial number.
+    pub hardware_model: Option<String>,
     pub platform: Option<String>,
     pub app_version: Option<String>,
 }
 
-impl From<AuditLogUploadSourceFfi> for AuditLogUploadSource {
-    fn from(value: AuditLogUploadSourceFfi) -> Self {
+impl From<AuditLogUploadSourceV4Ffi> for AuditLogUploadSource {
+    fn from(value: AuditLogUploadSourceV4Ffi) -> Self {
         Self {
-            device_label: value.device_label,
+            hardware_model: value.hardware_model,
             platform: value.platform,
             app_version: value.app_version,
         }
     }
 }
 
-impl From<AuditLogUploadSource> for AuditLogUploadSourceFfi {
+impl From<AuditLogUploadSource> for AuditLogUploadSourceV4Ffi {
     fn from(value: AuditLogUploadSource) -> Self {
         Self {
-            device_label: value.device_label,
+            hardware_model: value.hardware_model,
             platform: value.platform,
             app_version: value.app_version,
         }
     }
 }
 
-/// Tracker upload config supplied by the host app. Write-only across FFI:
+/// V4 tracker config. The versioned type name changes the UniFFI method checksum
+/// so old generated bindings cannot reinterpret device labels as hardware models.
+/// Write-only across FFI:
 /// `authorization_bearer_token` is accepted here but never returned back to
 /// the host — [`redacted`](Self::redacted) strips it — and the hand-written
 /// `Debug` impl below never prints it.
 #[derive(Clone, uniffi::Record)]
-pub struct AuditLogTrackerConfigFfi {
+pub struct AuditLogTrackerConfigV4Ffi {
     pub endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
-    pub source: AuditLogUploadSourceFfi,
+    pub source: AuditLogUploadSourceV4Ffi,
 }
 
-impl std::fmt::Debug for AuditLogTrackerConfigFfi {
+impl std::fmt::Debug for AuditLogTrackerConfigV4Ffi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuditLogTrackerConfigFfi")
+        f.debug_struct("AuditLogTrackerConfigV4Ffi")
             .field("endpoint", &self.endpoint)
             .field(
                 "authorization_bearer_token",
@@ -151,8 +154,8 @@ impl std::fmt::Debug for AuditLogTrackerConfigFfi {
     }
 }
 
-impl From<AuditLogTrackerConfigFfi> for AuditLogTrackerConfig {
-    fn from(value: AuditLogTrackerConfigFfi) -> Self {
+impl From<AuditLogTrackerConfigV4Ffi> for AuditLogTrackerConfig {
+    fn from(value: AuditLogTrackerConfigV4Ffi) -> Self {
         Self {
             endpoint: value.endpoint,
             authorization_bearer_token: value.authorization_bearer_token,
@@ -161,7 +164,7 @@ impl From<AuditLogTrackerConfigFfi> for AuditLogTrackerConfig {
     }
 }
 
-impl AuditLogTrackerConfigFfi {
+impl AuditLogTrackerConfigV4Ffi {
     /// The stored config with the bearer token stripped, for returning across
     /// FFI: secrets flow in through setters but are never handed back out.
     pub(crate) fn redacted(value: AuditLogTrackerConfig) -> Self {
@@ -179,12 +182,12 @@ mod tests {
 
     const TOKEN: &str = "super-secret-bearer-token";
 
-    fn config_with_token() -> AuditLogTrackerConfigFfi {
-        AuditLogTrackerConfigFfi {
+    fn config_with_token() -> AuditLogTrackerConfigV4Ffi {
+        AuditLogTrackerConfigV4Ffi {
             endpoint: Some("https://goggles.example/upload".to_owned()),
             authorization_bearer_token: Some(TOKEN.to_owned()),
-            source: AuditLogUploadSourceFfi {
-                device_label: Some("test-device".to_owned()),
+            source: AuditLogUploadSourceV4Ffi {
+                hardware_model: Some("TestModel".to_owned()),
                 platform: None,
                 app_version: None,
             },
@@ -203,7 +206,7 @@ mod tests {
     #[test]
     fn audit_tracker_config_redacted_strips_bearer_token() {
         let stored: AuditLogTrackerConfig = config_with_token().into();
-        let returned = AuditLogTrackerConfigFfi::redacted(stored);
+        let returned = AuditLogTrackerConfigV4Ffi::redacted(stored);
         assert_eq!(returned.authorization_bearer_token, None);
         assert_eq!(
             returned.endpoint.as_deref(),

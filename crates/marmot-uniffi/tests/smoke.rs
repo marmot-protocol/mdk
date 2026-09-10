@@ -12,8 +12,8 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi, CursorPersistenceFfi,
-    Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
+    AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi, AuditLogUploadSourceV4Ffi,
+    CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
     MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayEndpointPolicyFfi,
     RelayTelemetrySettingsFfi, TimelineMessageQueryFfi, parse_media_imeta_tag,
@@ -43,7 +43,7 @@ struct CapturedAuditUpload {
     path: String,
     authorization: Option<String>,
     content_type: Option<String>,
-    device_label: Option<String>,
+    hardware_model: Option<String>,
     platform: Option<String>,
     app_version: Option<String>,
     body: Vec<u8>,
@@ -102,7 +102,7 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
         let path = parts.next().unwrap_or_default().to_owned();
         let authorization = header_value(&headers, "authorization");
         let content_type = header_value(&headers, "content-type");
-        let device_label = header_value(&headers, "x-goggles-device-label");
+        let hardware_model = header_value(&headers, "x-goggles-hardware-model");
         let platform = header_value(&headers, "x-goggles-platform");
         let app_version = header_value(&headers, "x-goggles-app-version");
         let body = buf[header_end..header_end + content_length].to_vec();
@@ -116,7 +116,7 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
             path,
             authorization,
             content_type,
-            device_label,
+            hardware_model,
             platform,
             app_version,
             body,
@@ -847,7 +847,7 @@ fn audit_log_binding_lists_local_jsonl_logs() {
         .expect("reopen account home")
         .account_dir(&account.label)
         .join("audit-binding.jsonl");
-    std::fs::write(&audit_path, b"{\"seq\":1}\n").expect("write audit log");
+    std::fs::write(&audit_path, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n").expect("write audit log");
 
     let files = kit.audit_log_files().expect("list audit logs");
 
@@ -870,7 +870,7 @@ async fn audit_log_binding_posts_jsonl_file() {
         .expect("open account home")
         .create_nostr_account()
         .expect("create local account");
-    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     let audit_path = AccountHome::open_with_default_keychain(tmp.path())
         .expect("reopen account home")
         .account_dir(&account.label)
@@ -921,7 +921,7 @@ async fn audit_log_binding_posts_tracker_update() {
         .expect("open account home")
         .create_nostr_account()
         .expect("create local account");
-    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     let audit_path = AccountHome::open_with_default_keychain(tmp.path())
         .expect("reopen account home")
         .account_dir(&account.label)
@@ -936,11 +936,11 @@ async fn audit_log_binding_posts_tracker_update() {
     kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
         .await
         .expect("enable audit logs");
-    kit.set_audit_log_tracker_config(AuditLogTrackerConfigFfi {
+    kit.set_audit_log_tracker_config(AuditLogTrackerConfigV4Ffi {
         endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
         authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
-        source: AuditLogUploadSourceFfi {
-            device_label: Some("Alice iPhone".to_owned()),
+        source: AuditLogUploadSourceV4Ffi {
+            hardware_model: Some("iPhone17,3".to_owned()),
             platform: Some("ios".to_owned()),
             app_version: Some("2026.6.8".to_owned()),
         },
@@ -968,7 +968,7 @@ async fn audit_log_binding_posts_tracker_update() {
         captured.content_type.as_deref(),
         Some("application/x-ndjson")
     );
-    assert_eq!(captured.device_label.as_deref(), Some("Alice iPhone"));
+    assert_eq!(captured.hardware_model.as_deref(), Some("iPhone17,3"));
     assert_eq!(captured.platform.as_deref(), Some("ios"));
     assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
     assert_eq!(captured.body, audit_body);

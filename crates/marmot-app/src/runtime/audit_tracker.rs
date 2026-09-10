@@ -319,6 +319,7 @@ async fn post_audit_log_tracker_update(
     let mut acknowledged = 0_usize;
     let mut too_large_recorded = 0_usize;
     let mut too_large_known = 0_usize;
+    let mut ineligible = 0_usize;
     // `audit_log_files` sorts by account first, so each account's files arrive
     // as one contiguous run and its checkpoint is loaded and stored once.
     for account_files in group_by_account(files) {
@@ -350,6 +351,10 @@ async fn post_audit_log_tracker_update(
                 }
                 Some(AuditUploadOutcome::TooLargeToUpload) => {
                     too_large_known += 1;
+                    continue;
+                }
+                Some(AuditUploadOutcome::IneligibleSchema) => {
+                    ineligible += 1;
                     continue;
                 }
                 None => {}
@@ -401,6 +406,22 @@ async fn post_audit_log_tracker_update(
                 }
                 // No complete row yet: no request, checkpoint, or failure warning.
                 Ok(AuditUploadAttempt::Deferred) => {}
+                Ok(AuditUploadAttempt::Ineligible {
+                    observed_bytes,
+                    modified_at_ms,
+                }) => {
+                    ineligible += 1;
+                    // Cache only the enumerated snapshot's verdict. A changed
+                    // file must be reconsidered; ineligible files never arm retry.
+                    if observed_bytes == file.size_bytes && modified_at_ms == file.modified_at_ms {
+                        checkpoint.acknowledge(
+                            file,
+                            observed_bytes,
+                            AuditUploadOutcome::IneligibleSchema,
+                        );
+                        checkpoint_changed = true;
+                    }
+                }
                 // The endpoint refused this content outright. RFC 9110 15.5.14
                 // has a server send Retry-After when a 413 is temporary, so its
                 // absence is read as a verdict on this file, not a cooldown:
@@ -492,6 +513,7 @@ async fn post_audit_log_tracker_update(
             acknowledged,
             too_large_recorded,
             too_large_known,
+            ineligible,
             failed,
             "completed forensic audit log tracker update with file upload failures"
         );
@@ -503,6 +525,7 @@ async fn post_audit_log_tracker_update(
             uploaded_bytes = uploaded.iter().map(|upload| upload.bytes_sent).sum::<u64>(),
             acknowledged,
             too_large_known,
+            ineligible,
             "completed forensic audit log tracker update"
         );
     }
