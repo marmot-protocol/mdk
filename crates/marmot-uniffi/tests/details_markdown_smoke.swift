@@ -7,7 +7,7 @@ struct DetailsMarkdownSmoke {
             summary: [MarkdownInlineFfi.text(content: "More")],
             open: false,
             body: [MarkdownBlockFfi.paragraph(inlines: [MarkdownInlineFfi.text(content: "body")])],
-            blankLinesBefore: [1]
+            blankLinesBefore: Data([1])
         )
         let copy = try FfiConverterTypeMarkdownBlockFfi.lift(FfiConverterTypeMarkdownBlockFfi.lower(block))
         precondition(copy == block)
