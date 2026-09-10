@@ -26,6 +26,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Group creation, invites, and composition prewarming fetch current KeyPackages from relays, including for local
+  sibling accounts; unavailable relay material no longer falls back to cached packages. MarmotKit's prewarm
+  `reusedMembers` remains present but always returns zero. Prewarm caches only discovery routes.
+- Create and Invite reject packages advertising RFC 9420 default capabilities. Recipients with older affected
+  packages must use a client with the corrected generator and generate a fresh package; updating or republishing
+  alone may reuse the old artifact. Private-bundle retention and historical Welcome processing are unchanged.
+  The engine reports `InvalidKeyPackageCapabilities` with the affected member for typed callers, while diagnostic
+  text omits identities and classifies the error as a deliberate protocol refusal.
+
 - User search includes cached public identities from every connected account and delivers Vertex matches without
   waiting for graph traversal. Swift/Kotlin and C expose a cache-only search and explicit selected-account follow
   labels. Streaming consumers must apply `updated_results` as keyed replacements; CLI search merges them into one

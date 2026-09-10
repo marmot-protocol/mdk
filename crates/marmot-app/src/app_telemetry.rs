@@ -316,8 +316,8 @@ pub struct AppPerformanceSnapshot {
     pub group_create_key_package_lookup: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_member_key_package_prewarm: AppPerformanceOperationSnapshot,
-    #[serde(default)]
     /// Retired counter retained for export/API compatibility; no new samples.
+    #[serde(default)]
     pub group_create_key_package_cache_reuse: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_key_package_network_resolution: AppPerformanceOperationSnapshot,

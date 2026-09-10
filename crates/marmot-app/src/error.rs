@@ -429,6 +429,7 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
         | EngineError::InvalidAppMessagePayload(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::InvalidKeyPackageCapabilities { .. }
         | EngineError::InvalidWelcome
         | EngineError::Serialize(_)
         | EngineError::ForkedEpoch { .. }
@@ -537,6 +538,24 @@ mod tests {
     use crate::SyncFailureClassification;
     use cgka_traits::error::EngineError;
     use cgka_traits::types::{EpochId, GroupId};
+
+    #[test]
+    fn invalid_key_package_capabilities_preserve_member_and_protocol_classification() {
+        let member = cgka_traits::MemberId::new(vec![0xBB; 32]);
+        let error = AppError::Session(cgka_session::SessionError::Engine(
+            EngineError::InvalidKeyPackageCapabilities {
+                member: member.clone(),
+            },
+        ));
+        assert_eq!(
+            error.privacy_safe_kind(),
+            "invalid_key_package_capabilities"
+        );
+        assert_eq!(error.sync_error_class(), crate::SyncErrorClass::Protocol);
+        assert!(matches!(error.as_engine_error(),
+            Some(EngineError::InvalidKeyPackageCapabilities { member: rejected }) if rejected == &member));
+        assert!(!error.to_string().contains(&hex::encode(member.as_slice())));
+    }
 
     // Kind strings leave the runtime: `account_error_message` interpolates
     // them into messages the CLI daemon persists and host apps log. Pin the

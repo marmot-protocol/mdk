@@ -2495,6 +2495,13 @@ async fn create_and_invite_reject_explicit_default_key_package_capabilities() {
     for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
+        let mut bob = build_profile_client_on_storage(
+            b"valid-first-invitee",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let valid_first = bob.fresh_key_package().await.unwrap();
+        let rejected_member = MemberId::new(pad32(b"capability-invitee"));
         // Test every forbidden id separately, including the historical 0x0003
         // RequiredCapabilities advertisement. Directory metadata stays usable
         // for discovery and private-bundle maintenance.
@@ -2508,7 +2515,7 @@ async fn create_and_invite_reject_explicit_default_key_package_capabilities() {
                 .create_group(CreateGroupRequest {
                     name: "invalid-capabilities".into(),
                     description: String::new(),
-                    members: vec![kp],
+                    members: vec![valid_first.clone(), kp],
                     required_features: vec![],
                     app_components: vec![],
                     initial_admins: vec![],
@@ -2516,8 +2523,8 @@ async fn create_and_invite_reject_explicit_default_key_package_capabilities() {
                 .await
                 .expect_err("forbidden advertisement must fail before group creation");
             assert!(
-                matches!(error, EngineError::Backend(ref message)
-                if message.contains("default capabilities must not be advertised")),
+                matches!(error, EngineError::InvalidKeyPackageCapabilities { ref member }
+                    if member == &rejected_member),
                 "{error:?}"
             );
             assert!(storage.list_groups().unwrap().is_empty());
@@ -2546,14 +2553,14 @@ async fn create_and_invite_reject_explicit_default_key_package_capabilities() {
             let error = alice
                 .send(SendIntent::Invite {
                     group_id: group_id.clone(),
-                    key_packages: vec![kp],
+                    key_packages: vec![valid_first.clone(), kp],
                     initial_admins: vec![],
                 })
                 .await
                 .expect_err("forbidden advertisement must fail before an Add commit");
             assert!(
-                matches!(error, EngineError::Backend(ref message)
-                if message.contains("default capabilities must not be advertised")),
+                matches!(error, EngineError::InvalidKeyPackageCapabilities { ref member }
+                    if member == &rejected_member),
                 "{error:?}"
             );
             assert_eq!(alice.epoch(&group_id).unwrap(), epoch);

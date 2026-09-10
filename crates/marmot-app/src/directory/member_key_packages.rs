@@ -239,6 +239,8 @@ impl MarmotApp {
     }
 
     /// Prewarm group composition without reserving or consuming any package.
+    /// Success reports relay/metadata readiness only; final Create/Invite
+    /// re-fetches packages and enforces the engine's membership policy.
     ///
     /// The roster must also resolve a safe Marmot inbox route for every member;
     /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
