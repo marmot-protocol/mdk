@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Additive `MarmotMarkdownBlock::Details` with an indirect `MarmotMarkdownDetails`
+  payload for bounded `<details>` / `<summary>` display blocks. Existing block
+  discriminants and union stride are unchanged; C consumers must regenerate
+  compatible bindings to render the new tag.
 - `marmot_search_cached_users`, `MarmotUserDirectorySearchResultList`, and
   `marmot_user_directory_search_result_list_free` for network-free public cache search across connected accounts.
 

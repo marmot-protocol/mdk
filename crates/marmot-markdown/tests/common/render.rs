@@ -122,6 +122,23 @@ fn render_block(b: &Block, out: &mut String) {
             out.push_str(&escape(content));
             out.push_str("</div>\n");
         }
+        Block::Details {
+            summary,
+            open,
+            body,
+            ..
+        } => {
+            if *open {
+                out.push_str("<details open>\n");
+            } else {
+                out.push_str("<details>\n");
+            }
+            out.push_str("<summary>");
+            render_inlines(summary, out);
+            out.push_str("</summary>\n");
+            render_blocks(body, out);
+            out.push_str("</details>\n");
+        }
     }
 }
 

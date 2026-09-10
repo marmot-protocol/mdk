@@ -9,6 +9,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- App-message Markdown now emits a structured `Details` block for structural
+  `<details>` / `<summary>` lines, including UniFFI and C display trees. Hosts
+  must regenerate bindings to render the new variant.
+
+### Fixed
+
+- Failed `<details>` candidates now keep a completed `<summary>` in the display
+  tree, restore ordinary block structure and source gaps on fallback, preserve
+  hard breaks and cross-line code spans in multiline summaries, and keep
+  summary recognition linear for many short continuation lines. An open
+  summary code span now also keeps interior `</summary>` / `</details>` lines
+  literal until the matching backticks close.
+
 ### Changed
 
 - User search includes cached public identities from every connected account and delivers Vertex matches without

@@ -72,3 +72,91 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
     }
     Ok(GroupId::new(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown::{MarkdownBlockFfi, MarkdownInlineFfi};
+
+    #[test]
+    fn chat_tokens_include_details_blocks() {
+        let tokens = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>More</summary>\nbody\n</details>",
+        );
+        assert!(matches!(tokens.blocks[0], MarkdownBlockFfi::Details { .. }));
+        let other =
+            markdown_content_tokens(1, "<details>\n<summary>More</summary>\nbody\n</details>");
+        assert!(other.blocks.is_empty());
+        let fallback = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>KEEP_THIS_SUMMARY</summary>\nbody",
+        );
+        assert!(
+            !fallback
+                .blocks
+                .iter()
+                .any(|block| matches!(block, MarkdownBlockFfi::Details { .. }))
+        );
+        assert!(fallback.blocks.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content } if content.contains("KEEP_THIS_SUMMARY")
+            )),
+            _ => false,
+        }));
+        let later = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n    code\n<summary>ordinary later text</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &later.blocks[0] else {
+            panic!("expected details");
+        };
+        assert!(summary.is_empty());
+        assert!(body.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content }
+                    if content.contains("<summary>ordinary later text</summary>")
+            )),
+            _ => false,
+        }));
+        let protected = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>`one\n</summary>\n</details>\ntwo`\n</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &protected.blocks[0] else {
+            panic!("expected protected delimiter tokens");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { content } if content.contains("</details>")))
+        );
+        assert_eq!(protected.blocks.len(), 1);
+        let tokens = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &tokens.blocks[0] else {
+            panic!("expected details tokens");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { .. }))
+        );
+        let hard = markdown_content_tokens(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            "<details>\n<summary>one  \ntwo</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &hard.blocks[0] else {
+            panic!("expected hard-break tokens");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::HardBreak))
+        );
+    }
+}

@@ -48,6 +48,14 @@ pub enum Block {
     MathBlock {
         content: String,
     },
+    Details {
+        summary: Vec<Inline>,
+        open: bool,
+        body: Vec<Block>,
+        /// Blank source lines before each corresponding body block.
+        #[serde(default)]
+        blank_lines_before: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

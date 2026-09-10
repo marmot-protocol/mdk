@@ -1821,6 +1821,20 @@ typedef struct MarmotMarkdownTableRow {
 } MarmotMarkdownTableRow;
 
 /**
+ * Owned payload for [`MarmotMarkdownBlock::Details`]. Indirection keeps the
+ * existing tagged-union size and discriminants unchanged.
+ */
+typedef struct MarmotMarkdownDetails {
+  struct MarmotMarkdownInline *summary;
+  uintptr_t summary_len;
+  bool open;
+  struct MarmotMarkdownBlock *body;
+  uintptr_t body_len;
+  uint8_t *blank_lines_before;
+  uintptr_t blank_lines_before_len;
+} MarmotMarkdownDetails;
+
+/**
  * One block-level Markdown node.
  */
 typedef enum MarmotMarkdownBlock_Tag {
@@ -1832,6 +1846,7 @@ typedef enum MarmotMarkdownBlock_Tag {
   MARMOT_MARKDOWN_BLOCK_LIST_BLOCK,
   MARMOT_MARKDOWN_BLOCK_TABLE,
   MARMOT_MARKDOWN_BLOCK_MATH_BLOCK,
+  MARMOT_MARKDOWN_BLOCK_DETAILS,
 } MarmotMarkdownBlock_Tag;
 
 typedef struct MarmotMarkdownBlock_Paragraph_Body {
@@ -1881,6 +1896,10 @@ typedef struct MarmotMarkdownBlock_MathBlock_Body {
   char *content;
 } MarmotMarkdownBlock_MathBlock_Body;
 
+typedef struct MarmotMarkdownBlock_Details_Body {
+  struct MarmotMarkdownDetails *details;
+} MarmotMarkdownBlock_Details_Body;
+
 typedef struct MarmotMarkdownBlock {
   MarmotMarkdownBlock_Tag tag;
   union {
@@ -1891,6 +1910,7 @@ typedef struct MarmotMarkdownBlock {
     MarmotMarkdownBlock_ListBlock_Body LIST_BLOCK;
     MarmotMarkdownBlock_Table_Body TABLE;
     MarmotMarkdownBlock_MathBlock_Body MATH_BLOCK;
+    MarmotMarkdownBlock_Details_Body DETAILS;
   };
 } MarmotMarkdownBlock;
 

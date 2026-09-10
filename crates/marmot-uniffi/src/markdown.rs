@@ -65,6 +65,13 @@ pub enum MarkdownBlockFfi {
     MathBlock {
         content: String,
     },
+    Details {
+        summary: Vec<MarkdownInlineFfi>,
+        open: bool,
+        body: Vec<MarkdownBlockFfi>,
+        /// Blank source lines before each corresponding body block.
+        blank_lines_before: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -294,6 +301,20 @@ fn markdown_block_from_md(value: MdBlock, depth: usize) -> MarkdownBlockFfi {
                 .collect(),
         },
         MdBlock::MathBlock { content } => MarkdownBlockFfi::MathBlock { content },
+        MdBlock::Details {
+            summary,
+            open,
+            body,
+            blank_lines_before,
+        } => MarkdownBlockFfi::Details {
+            summary: markdown_inlines_from_md(summary, 0),
+            open,
+            body: body
+                .into_iter()
+                .map(|block| markdown_block_from_md(block, depth + 1))
+                .collect(),
+            blank_lines_before,
+        },
     }
 }
 
@@ -681,6 +702,133 @@ mod tests {
     }
 
     #[test]
+    fn bridges_details_block() {
+        let document = parse_markdown_document(
+            "<details>\n<summary>Tap to expand</summary>\nHidden body **bold**\n</details>",
+        );
+        let MarkdownBlockFfi::Details {
+            summary,
+            open,
+            body,
+            blank_lines_before,
+        } = &document.blocks[0]
+        else {
+            panic!("expected details");
+        };
+        assert!(!open);
+        assert!(matches!(
+            &summary[0],
+            MarkdownInlineFfi::Text { content } if content == "Tap to expand"
+        ));
+        assert_eq!(blank_lines_before, &[0]);
+        let MarkdownBlockFfi::Paragraph { inlines } = &body[0] else {
+            panic!("expected body paragraph");
+        };
+        assert!(matches!(inlines[1], MarkdownInlineFfi::Strong { .. }));
+    }
+
+    #[test]
+    fn bridges_multiline_summary_and_fallback_preserves_text() {
+        let document = parse_markdown_document(
+            "<details>\n<summary>\nMore **information**\n</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &document.blocks[0] else {
+            panic!("expected details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Strong { .. }))
+        );
+        assert!(matches!(body[0], MarkdownBlockFfi::Paragraph { .. }));
+
+        let fallback =
+            parse_markdown_document("<details>\n<summary>KEEP_THIS_SUMMARY</summary>\nbody");
+        assert!(
+            !fallback
+                .blocks
+                .iter()
+                .any(|block| matches!(block, MarkdownBlockFfi::Details { .. }))
+        );
+        assert!(fallback.blocks.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content } if content.contains("KEEP_THIS_SUMMARY")
+            )),
+            _ => false,
+        }));
+
+        let later = parse_markdown_document(
+            "<details>\n    code\n<summary>ordinary later text</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &later.blocks[0] else {
+            panic!("expected details after indented code");
+        };
+        assert!(summary.is_empty());
+        assert!(body.iter().any(|block| match block {
+            MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline| matches!(
+                inline,
+                MarkdownInlineFfi::Text { content } if content.contains("<summary>ordinary later text</summary>")
+            )),
+            _ => false,
+        }));
+
+        let protected = parse_markdown_document(
+            "<details>\n<summary>`one\n</summary>\n</details>\ntwo`\n</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, body, .. } = &protected.blocks[0] else {
+            panic!("expected protected delimiter details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { content } if content.contains("</details>")))
+        );
+        assert!(matches!(body[0], MarkdownBlockFfi::Paragraph { .. }));
+        assert_eq!(protected.blocks.len(), 1);
+
+        let code_span = parse_markdown_document(
+            "<details>\n<summary>`one\n</summary>\ntwo`</summary>\nbody\n</details>",
+        );
+        let MarkdownBlockFfi::Details { summary, .. } = &code_span.blocks[0] else {
+            panic!("expected multiline code-span details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::Code { .. }))
+        );
+
+        let hard =
+            parse_markdown_document("<details>\n<summary>one  \ntwo</summary>\nbody\n</details>");
+        let MarkdownBlockFfi::Details { summary, .. } = &hard.blocks[0] else {
+            panic!("expected hard-break details");
+        };
+        assert!(
+            summary
+                .iter()
+                .any(|inline| matches!(inline, MarkdownInlineFfi::HardBreak))
+        );
+    }
+
+    #[test]
+    fn hostile_backtick_details_input_stays_bounded() {
+        let ticks = "`".repeat(65_519 - "<details>\n\n</details>".len());
+        let document = parse_markdown_document(&format!("<details>\n{ticks}\n</details>"));
+        assert!(!document.truncated);
+        let summary_ticks = "`".repeat(8_192);
+        let document =
+            parse_markdown_document(&format!("<details>\n<summary>{summary_ticks}\n</details>"));
+        assert!(!document.blocks.is_empty());
+        let mut many_lines = String::from("<details>\n<summary>\n");
+        for _ in 0..4_096 {
+            many_lines.push_str("x\n");
+        }
+        let document = parse_markdown_document(&many_lines);
+        assert!(!document.blocks.is_empty());
+    }
+
+    #[test]
     fn bridges_pathological_nesting_without_unbounded_recursion() {
         let document = parse_markdown_document(&">".repeat(2_000));
         assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);
@@ -692,7 +840,8 @@ mod tests {
 
     fn max_single_block_depth(block: &MarkdownBlockFfi) -> usize {
         match block {
-            MarkdownBlockFfi::BlockQuote { blocks, .. } => 1 + max_block_depth(blocks),
+            MarkdownBlockFfi::BlockQuote { blocks, .. }
+            | MarkdownBlockFfi::Details { body: blocks, .. } => 1 + max_block_depth(blocks),
             MarkdownBlockFfi::ListBlock { items, .. } => {
                 1 + items
                     .iter()

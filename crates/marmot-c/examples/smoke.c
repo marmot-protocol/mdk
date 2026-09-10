@@ -84,6 +84,11 @@ static int walk_markdown(const struct MarmotMarkdownDocument *doc) {
             printf("smoke:   block %zu: list with %zu items\n", i,
                    b->LIST_BLOCK.items_len);
             break;
+        case MARMOT_MARKDOWN_BLOCK_DETAILS:
+            printf("smoke:   block %zu: details (open=%d body=%zu)\n", i,
+                   b->DETAILS.details ? (int)b->DETAILS.details->open : -1,
+                   b->DETAILS.details ? b->DETAILS.details->body_len : 0);
+            break;
         default:
             printf("smoke:   block %zu: other (tag %d)\n", i, (int)b->tag);
             break;
@@ -169,6 +174,22 @@ int main(int argc, char **argv) {
     check(doc->blocks_len >= 4, "markdown has heading + paragraph + list + code");
     int headings = walk_markdown(doc);
     check(headings == 1, "walked tree found the heading");
+    marmot_markdown_document_free(doc);
+
+    doc = NULL;
+    st = marmot_parse_markdown(client,
+                               "<details>\n<summary>More</summary>\nHidden **bold**\n</details>",
+                               &doc);
+    check(st == MARMOT_STATUS_OK && doc != NULL, "details markdown parsed");
+    if (doc == NULL) {
+        return 1;
+    }
+    check(doc->blocks_len == 1, "details is a single top-level block");
+    check(doc->blocks[0].tag == MARMOT_MARKDOWN_BLOCK_DETAILS, "details tag");
+    check(doc->blocks[0].DETAILS.details != NULL, "details payload");
+    check(!doc->blocks[0].DETAILS.details->open, "details default closed");
+    check(doc->blocks[0].DETAILS.details->summary_len == 1, "details summary");
+    check(doc->blocks[0].DETAILS.details->body_len == 1, "details body");
     marmot_markdown_document_free(doc);
 
     /* ---- offline reads ------------------------------------------------ */
