@@ -10,7 +10,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
     MaintenanceObligation, MaintenancePhase, PendingKeyPackageReplacement,
-    PeriodicMaintenancePolicy, TransportFanoutTarget,
+    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, TransportFanoutTarget,
 };
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::Timestamp;
@@ -55,7 +55,21 @@ impl<S: StorageProvider> Engine<S> {
             let key_package = self.build_fresh_key_package(storage)?;
             let metadata = crate::key_package::key_package_metadata(&key_package)?;
             let mut staged = state.clone();
+            // An older pending artifact may have reached a relay even without
+            // a recorded ACK. Retain its private material when superseding it;
+            // the replacement and this ownership transfer commit together.
+            if let Some(previous) = staged.pending_replacement.take() {
+                staged
+                    .retained_private_material
+                    .push(RetainedKeyPackagePrivateMaterial {
+                        key_package: previous.key_package,
+                        key_package_ref: previous.key_package_ref,
+                        not_after: previous.not_after,
+                        replaced_at: authored_created_at,
+                    });
+            }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {
+                generation_revision: cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION,
                 key_package: key_package.clone(),
                 key_package_ref: hex::decode(&metadata.key_package_ref_hex)
                     .map_err(|error| EngineError::Serialize(error.to_string()))?,

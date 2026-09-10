@@ -62,9 +62,11 @@ adding members. They also reject LeafNode capabilities that explicitly advertise
 extension or proposal types. Unknown capability values remain accepted for protocol extensibility.
 
 Recipients whose published packages contain the former default-capability advertisement must generate a fresh
-package using the corrected client. Updating the app or republishing can reuse the existing artifact, so neither
-alone guarantees repair. The refusal is `InvalidKeyPackageCapabilities`, with an authenticated member id for typed
-callers and identity-free diagnostic text; it is classified as an expected refusal rather than a resource failure.
+package using the corrected client. The account runtime records a per-account-device generator revision and
+MarmotApp attempts a one-time fresh publication on activation after upgrading. Offline or signing failures remain
+retryable; the revision advances only with an acknowledged replacement. The refusal is `InvalidKeyPackageCapabilities`,
+with an authenticated member id for typed callers and identity-free diagnostic text; it is classified as an expected
+refusal rather than a resource failure.
 
 This membership check does not change local private-bundle retention or historical Welcome processing. Directory
 metadata can still describe an older package; that does not make it eligible for a new membership operation.

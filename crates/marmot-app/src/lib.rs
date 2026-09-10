@@ -1883,6 +1883,26 @@ impl MarmotApp {
                 }
             }
         }
+        // A generator revision is account-device state, independent of the
+        // strict protocol-profile cutover markers. Local-only/frozen opens
+        // must not start network maintenance.
+        if self.cursor_persistence() == CursorPersistence::Advance {
+            let result = async {
+                if client.runtime.key_package_generation_upgrade_due()? {
+                    client.runtime.publish_fresh_key_package().await?;
+                }
+                Ok::<_, marmot_account::AccountError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "key package generator upgrade remains retryable"
+                );
+            }
+        }
     }
 
     pub fn status(&self, label: &str) -> Result<AppStatus, AppError> {

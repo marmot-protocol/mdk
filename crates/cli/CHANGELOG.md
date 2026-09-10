@@ -30,8 +30,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   sibling accounts; unavailable relay material no longer falls back to cached packages. MarmotKit's prewarm
   `reusedMembers` remains present but always returns zero. Prewarm caches only discovery routes.
 - Create and Invite reject packages advertising RFC 9420 default capabilities. Recipients with older affected
-  packages must use a client with the corrected generator and generate a fresh package; updating or republishing
-  alone may reuse the old artifact. Private-bundle retention and historical Welcome processing are unchanged.
+  packages automatically regenerate on account activation after upgrading. A durable per-account-device generator
+  revision advances only after a relay acknowledges the replacement, with retries across restarts. Older pending
+  publications are superseded in the same slot with a newer timestamp while preserving their private bundles.
+  Previous unused private bundles remain available until expiry; historical Welcome processing is unchanged.
   The engine reports `InvalidKeyPackageCapabilities` with the affected member for typed callers, while diagnostic
   text omits identities and classifies the error as a deliberate protocol refusal.
 

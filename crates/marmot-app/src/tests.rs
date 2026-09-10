@@ -7044,6 +7044,7 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
             lifecycle.publication_targets = replacement.targets;
             lifecycle.refresh_at = Some(replacement.refresh_at);
             lifecycle.upgrade_rotation_recorded = true;
+            lifecycle.generation_revision = replacement.generation_revision;
             storage.put_key_package_lifecycle(&lifecycle).unwrap();
         }
         runtime.shutdown().await;
@@ -7192,6 +7193,106 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
         "projection recovery should issue one idempotent bootstrap batch"
     );
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
+    use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    for label in ["alice", "bob"] {
+        let mut client = app.client(label).await.unwrap();
+        client.runtime.publish_fresh_key_package().await.unwrap();
+        let storage = app.account_storage(label).unwrap();
+        let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+        assert_eq!(
+            lifecycle.generation_revision,
+            KEY_PACKAGE_GENERATION_REVISION
+        );
+        lifecycle.generation_revision = 0;
+        storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    }
+    let before = app
+        .account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    // A frozen notification/read pass leaves this network migration pending.
+    let frozen = MarmotApp::with_relay_and_config(
+        directory.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            cursor_persistence: CursorPersistence::Frozen,
+            ..Default::default()
+        },
+    )
+    .with_test_relay_client(relay);
+    drop(frozen.client("alice").await.unwrap());
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap(),
+        Some(before.clone())
+    );
+    drop(frozen);
+
+    drop(app.client("alice").await.unwrap());
+    let upgraded = app
+        .account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        upgraded.generation_revision,
+        KEY_PACKAGE_GENERATION_REVISION
+    );
+    assert_ne!(
+        upgraded.current_key_package_ref,
+        before.current_key_package_ref
+    );
+    assert_eq!(upgraded.stable_slot_id, before.stable_slot_id);
+    assert!(
+        upgraded
+            .retained_private_material
+            .iter()
+            .any(|old| Some(&old.key_package) == before.current_key_package.as_ref())
+    );
+    assert_eq!(
+        app.account_storage("bob")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap()
+            .generation_revision,
+        0,
+        "opening one account cannot complete another account's migration"
+    );
+    drop(app.client("alice").await.unwrap());
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap(),
+        Some(upgraded)
+    );
+    drop(app.client("bob").await.unwrap());
+    assert_eq!(
+        app.account_storage("bob")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap()
+            .generation_revision,
+        KEY_PACKAGE_GENERATION_REVISION
+    );
 }
 
 #[tokio::test]
