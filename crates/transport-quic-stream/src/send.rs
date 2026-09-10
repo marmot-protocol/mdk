@@ -20,6 +20,11 @@ use crate::publisher_sequence::reserve_publisher_records;
 use crate::receive::ServerTrust;
 use crate::tls::client_endpoint;
 
+/// Direct-path sender request. Callers supply an already validated and pinned
+/// `server_addr` plus configuration-derived `trust` and `server_name`. This
+/// API has no resolver or dev-flag context and does not infer permission from
+/// the destination IP. A family-matched unspecified client bind is not
+/// authorization of the remote destination.
 #[derive(Clone, Debug)]
 pub struct SendTextStream {
     pub server_addr: SocketAddr,
