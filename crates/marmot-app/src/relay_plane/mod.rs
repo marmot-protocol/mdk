@@ -596,16 +596,18 @@ impl MarmotRelayPlane {
 
     #[cfg(test)]
     pub(crate) fn new_with_directory_fetcher_for_test(
+        subscription_rebuild_lookback: Option<Duration>,
         relay_client: Arc<dyn NostrRelayClient>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
+        allow_loopback: bool,
     ) -> Self {
         Self::from_adapter(
-            Some(Duration::from_secs(120)),
+            subscription_rebuild_lookback,
             NostrTransportAdapter::new(relay_client),
             None,
             None,
             directory_fetcher,
-            false,
+            allow_loopback,
         )
     }
 

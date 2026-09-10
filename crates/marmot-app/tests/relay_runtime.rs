@@ -11568,6 +11568,10 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
         .await
         .expect("reactivation must resolve kind 10050 from the advertised outbox");
 
+    // Moving the advertised outbox requires publishing the public package
+    // there as well. Invitation resolution must not rely on the local cache.
+    runtime.publish_key_package(&carol_id).await.unwrap();
+
     let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(

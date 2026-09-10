@@ -5899,9 +5899,13 @@ impl MarmotApp {
     }
 
     #[cfg(test)]
-    fn with_test_relay_client(mut self, client: Arc<dyn NostrRelayClient>) -> Self {
-        self.relay_plane = MarmotRelayPlane::new_with_loopback(
+    fn with_test_relay_client<C>(mut self, client: Arc<C>) -> Self
+    where
+        C: NostrRelayClient + crate::relay_plane::DirectoryRelayFetcher + 'static,
+    {
+        self.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
             None,
+            client.clone(),
             client.clone(),
             self.config.allow_loopback_relay_endpoints,
         );

@@ -1183,9 +1183,9 @@ impl AppClient {
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
-    /// Resolve and cache the current composition roster without reserving or
-    /// consuming any KeyPackage. Group creation revalidates the cached bytes
-    /// and the MLS mutation boundary retains its ordinary validation.
+    /// Fetch current relay KeyPackages for the composition roster without
+    /// reserving or consuming them. Group creation fetches again before the
+    /// MLS mutation; cached packages only inform discovery.
     pub async fn prewarm_group_member_key_packages(
         &self,
         member_refs: &[&str],

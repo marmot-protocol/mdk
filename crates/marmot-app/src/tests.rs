@@ -844,6 +844,34 @@ impl ScriptedPushRelayClient {
     }
 }
 
+// Directory reads must use the same simulated relay publications as writes;
+// invitation tests can no longer rely on a local KeyPackage cache shortcut.
+#[async_trait]
+impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
+    async fn fetch_directory_events(
+        &self,
+        request: crate::relay_plane::DirectoryFetchRequest,
+    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        Ok(self
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
+            })
+            .cloned()
+            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: request.endpoints.clone(),
+                event,
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
     async fn subscribe(
@@ -7854,41 +7882,9 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
 
 #[tokio::test]
 async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() {
-    let directory = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(directory.path());
-    let bob = home.create_account("bob").unwrap();
-    let carol = home.create_account("carol").unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
-
-    for account in [&bob, &carol] {
-        let current = fresh_key_package_for_account(&app, account, false).await;
-        let metadata = cgka_engine::key_package::key_package_metadata(&current).unwrap();
-        let mut relay_lists = AccountRelayListStatus::empty();
-        relay_lists.inbox.created_at = 1;
-        relay_lists.inbox.relays = vec!["wss://inbox.example".into()];
-        relay_lists.refresh();
-        app.save_directory_entry(&UserDirectoryRecord {
-            account_id_hex: account.account_id_hex.clone(),
-            npub: npub_for_account_id_lossy(&account.account_id_hex),
-            local_account: Some(UserDirectoryLocalAccount {
-                label: account.label.clone(),
-                local_signing: true,
-            }),
-            profile: None,
-            follows: Vec::new(),
-            follow_source_relays: Vec::new(),
-            relay_lists,
-            key_package: Some(DirectoryKeyPackage {
-                key_package_id: format!("{}-slot", account.label),
-                key_package_ref_hex: metadata.key_package_ref_hex,
-                key_package_event_id: String::new(),
-                key_package_hex: hex::encode(current.bytes()),
-                created_at: 1,
-                source_relays: Vec::new(),
-            }),
-        })
-        .unwrap();
-    }
+    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(2, false).await;
+    let bob = accounts[0].clone();
+    let carol = accounts[1].clone();
 
     let bob_npub = npub_for_account_id_lossy(&bob.account_id_hex);
     let resolved = app
@@ -7998,7 +7994,12 @@ pub(crate) async fn member_resolution_fixture(
                 String::new(),
             ));
     }
-    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(relay, fetcher.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay,
+        fetcher.clone(),
+        false,
+    );
     (directory, app, accounts, fetcher)
 }
 
@@ -8357,11 +8358,11 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
         "a cached NIP-65 list must not suppress independent inbox discovery"
     );
     assert!(
-        requests.iter().all(|request| request
+        requests.iter().any(|request| request
             .queries
             .iter()
-            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)),
-        "the KeyPackage fetched during failed prewarm must remain reusable"
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)),
+        "the KeyPackage fetched during failed prewarm must still be refreshed"
     );
 }
 
@@ -8464,13 +8465,13 @@ async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
     client
         .invite_members(&group_id, &[account_id.as_str()])
         .await
-        .expect("the explicit retry should reuse the unconsumed KeyPackage");
+        .expect("the explicit retry should refetch the unconsumed KeyPackage");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
-    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
         request
             .queries
             .iter()
-            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
 }
 
@@ -8518,13 +8519,13 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
     let group_id = client
         .create_group("create route readiness", &[account_id.as_str()])
         .await
-        .expect("the explicit retry should reuse the unconsumed KeyPackage");
+        .expect("the explicit retry should refetch the unconsumed KeyPackage");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
-    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
         request
             .queries
             .iter()
-            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
 }
 
@@ -8580,7 +8581,7 @@ async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_me
     client
         .invite_members(&group_id, &member_refs)
         .await
-        .expect("the explicit retry should reuse both fetched KeyPackages");
+        .expect("the explicit retry should refetch both unconsumed KeyPackages");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 3);
     assert!(
         fetcher
@@ -8588,11 +8589,11 @@ async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_me
             .lock()
             .unwrap()
             .iter()
-            .all(|request| request
+            .any(|request| request
                 .queries
                 .iter()
-                .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)),
-        "the failed preflight must not consume or discard valid fetched KeyPackages"
+                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)),
+        "the retry must refetch packages even though failed preflight did not consume them"
     );
 }
 
@@ -8634,18 +8635,147 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     }
 }
 
-/// Fresh reinvites must not resurrect a cached package when relays only return
+/// The public directory is shared by accounts on a device. Its old package may
+/// still validate cryptographically even after the recipient has rotated it.
+#[tokio::test]
+async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let recipient = &accounts[0];
+    let members = [recipient.account_id_hex.as_str()];
+    let old = app
+        .resolve_member_key_packages(&members)
+        .await
+        .unwrap()
+        .remove(0);
+    let old_directory = app
+        .directory_entry_for_account_id(&recipient.account_id_hex)
+        .unwrap()
+        .unwrap()
+        .key_package
+        .unwrap();
+
+    write_json(
+        app.key_package_record_path(&recipient.label),
+        &KeyPackageRecord {
+            account_label: recipient.label.clone(),
+            account_id_hex: recipient.account_id_hex.clone(),
+            key_package_id: old_directory.key_package_id.clone(),
+            key_package_ref_hex: old_directory.key_package_ref_hex.clone(),
+            key_package_event_id: old_directory.key_package_event_id.clone(),
+            published_at: old_directory.created_at,
+            key_package_hex: old_directory.key_package_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        app.validated_current_local_key_package(&recipient.label),
+        Some(old.clone())
+    );
+
+    // A new sender on the same installation sees the existing shared directory.
+    app.account_home().create_account("new-sender").unwrap();
+    let refreshed = fresh_key_package_for_account(&app, recipient, false).await;
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        events.push(member_resolution_key_package_event(
+            recipient,
+            refreshed.clone(),
+        ));
+    }
+    let prewarm = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .unwrap();
+    assert_eq!(prewarm.reused_members, 0);
+    assert_eq!(prewarm.network_resolved_members, 1);
+    assert_eq!(
+        app.directory_entry_for_account_id(&recipient.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .key_package
+            .unwrap()
+            .key_package_hex,
+        old_directory.key_package_hex,
+        "prewarm must preserve the durable discovery projection"
+    );
+
+    // Rotation after prewarming must also be observed at the invitation boundary.
+    let latest = fresh_key_package_for_account(&app, recipient, false).await;
+    assert_ne!(old, latest);
+    assert_ne!(refreshed, latest);
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        events.push(member_resolution_key_package_event(
+            recipient,
+            latest.clone(),
+        ));
+    }
+    fetcher.requests.lock().unwrap().clear();
+    assert_eq!(
+        app.resolve_member_key_packages(&members).await.unwrap(),
+        vec![latest]
+    );
+    let requests = fetcher.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "prewarmed routes should avoid repeating discovery"
+    );
+    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+}
+
+#[tokio::test]
+async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
+    for relay_failure in [false, true] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+        let members = [accounts[0].account_id_hex.as_str()];
+        app.resolve_member_key_packages(&members).await.unwrap();
+        app.prewarm_group_member_key_packages(&members)
+            .await
+            .unwrap();
+        if relay_failure {
+            *fetcher.failing_single_author.lock().unwrap() = Some(members[0].to_owned());
+        } else {
+            fetcher
+                .events
+                .lock()
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        assert!(
+            app.resolve_member_key_packages(&members).await.is_err(),
+            "neither a relay error nor a relay miss may authorize using the cached package"
+        );
+        assert!(
+            app.prewarm_group_member_key_packages(&members)
+                .await
+                .is_err(),
+            "prewarm must also refresh instead of returning cached readiness"
+        );
+        assert!(
+            app.directory_entry_for_account_id(members[0])
+                .unwrap()
+                .unwrap()
+                .key_package
+                .is_some(),
+            "failed refresh must preserve cached discovery information"
+        );
+    }
+}
+
+/// Invitations and prewarming must not resurrect a cached package when relays only return
 /// future-dated records, including when the batch falls back to single authors.
 #[tokio::test]
-async fn fresh_reinvite_resolution_never_falls_back_to_cached_key_packages() {
+async fn member_key_package_resolution_never_falls_back_to_cached_key_packages() {
     for reject_batch in [false, true] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         let members = accounts
             .iter()
             .map(|account| account.account_id_hex.clone())
             .collect::<Vec<_>>();
-        let cached = app
-            .resolve_fresh_reinvite_key_packages(&members)
+        app.resolve_fresh_reinvite_key_packages(&members)
             .await
             .unwrap();
         for member in &members {
@@ -8680,19 +8810,19 @@ async fn fresh_reinvite_resolution_never_falls_back_to_cached_key_packages() {
             }),
             "single-author fallback must also reject cached material"
         );
-        let ordinary = app
-            .resolve_member_key_packages(&members.iter().map(String::as_str).collect::<Vec<_>>())
+        let refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+        let ordinary = app.resolve_member_key_packages(&refs).await.unwrap_err();
+        assert!(matches!(ordinary, AppError::MissingKeyPackage(id) if id == members[0]));
+        let prewarm = app
+            .prewarm_group_member_key_packages(&refs)
             .await
-            .unwrap();
-        assert_eq!(
-            ordinary, cached,
-            "ordinary resolution still permits cached packages"
-        );
+            .unwrap_err();
+        assert!(matches!(prewarm, AppError::MissingKeyPackage(id) if id == members[0]));
     }
 }
 
 #[tokio::test]
-async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
+async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
     let members = accounts
         .iter()
@@ -8752,8 +8882,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        3,
-        "fresh prewarm entries must eliminate create-time relay requests"
+        4,
+        "create must reuse discovery routes but fetch KeyPackages again"
     );
 }
 
@@ -8793,8 +8923,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        2,
-        "fresh prewarm must not repeat either query"
+        3,
+        "create must repeat only the KeyPackage query"
     );
 }
 
@@ -8894,12 +9024,12 @@ async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() 
         .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
         .await
         .expect("the valid sibling should remain reusable after the partial failure");
-    assert_eq!(summary.reused_members, 1);
-    assert_eq!(summary.network_resolved_members, 0);
+    assert_eq!(summary.reused_members, 0);
+    assert_eq!(summary.network_resolved_members, 1);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        requests_after_partial,
-        "reusing the valid sibling must not issue another relay request"
+        requests_after_partial + 1,
+        "reuse the valid sibling routes but refresh its KeyPackage"
     );
 }
 
@@ -8954,12 +9084,12 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
         .prewarm_group_member_key_packages(&[valid_account.as_str()])
         .await
         .expect("the valid member from the partial batch remains safely reusable");
-    assert_eq!(summary.reused_members, 1);
-    assert_eq!(summary.network_resolved_members, 0);
+    assert_eq!(summary.reused_members, 0);
+    assert_eq!(summary.network_resolved_members, 1);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        requests_after_partial,
-        "reusing the valid partial result must not issue another relay request"
+        requests_after_partial + 1,
+        "reuse the valid partial routes but refresh its KeyPackage"
     );
 }
 

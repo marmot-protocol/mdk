@@ -79,9 +79,11 @@ separate cache reads, membership, provider response, profile hydration, and netw
 queries or identities.
 
 Group creation and invites still take pubkeys at the action boundary. The app canonicalizes and deduplicates the
-requested roster, reuses current cached KeyPackages, and resolves cold members in bounded multi-author relay batches
-before building the MLS add. Hosts may prewarm that same bounded composition lookup without reserving packages or
-durably admitting strangers; the final mutation revalidates every package. New Nostr-routed groups generate
+requested roster and fetches current KeyPackages in bounded multi-author relay batches before building the MLS add.
+Cached packages remain useful for discovery, but cannot authorize an invitation or substitute for a failed relay
+lookup. Hosts may prewarm that same bounded composition lookup without reserving packages or durably admitting
+strangers; the final action reuses discovery routes but fetches packages again before the mutation validates them.
+New Nostr-routed groups generate
 `marmot.transport.nostr.routing.v1` at creation, store the component bytes in
 signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
