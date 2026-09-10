@@ -79,9 +79,21 @@ separate cache reads, membership, provider response, profile hydration, and netw
 queries or identities.
 
 Group creation and invites still take pubkeys at the action boundary. The app canonicalizes and deduplicates the
-requested roster, reuses current cached KeyPackages, and resolves cold members in bounded multi-author relay batches
-before building the MLS add. Hosts may prewarm that same bounded composition lookup without reserving packages or
-durably admitting strangers; the final mutation revalidates every package. New Nostr-routed groups generate
+requested roster and fetches current KeyPackages in bounded multi-author relay batches before building the MLS add.
+Cached packages remain useful for discovery, but cannot authorize an invitation or substitute for a failed relay
+lookup. Hosts may prewarm that same bounded composition lookup without reserving packages or durably admitting
+strangers; the final action reuses discovery routes but fetches packages again before the mutation validates them. This
+also applies to another account on the same installation: its local package record is not an invitation shortcut,
+and its published package must be reachable on relays. Relay freshness is not proof that the recipient still owns
+private material; it avoids authorizing from a stale local copy. Each prewarm call requests a fresh readiness signal,
+so hosts should debounce roster changes. The process-local prewarm cache retains only bounded relay metadata;
+only completed discovery and advertised-outbox metadata hops can renew its freshness deadline. A usable package
+returned after an incomplete metadata hop does not make previously cached routes fresh.
+
+Directory diagnostics (`key-package check` / `fetch`) may still describe cached public packages. Their availability
+result is advisory and does not guarantee a fresh relay lookup or acceptance by the Create/Invite admission policy.
+
+New Nostr-routed groups generate
 `marmot.transport.nostr.routing.v1` at creation, store the component bytes in
 signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.

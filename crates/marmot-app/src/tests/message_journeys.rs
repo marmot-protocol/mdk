@@ -14,6 +14,16 @@ struct CrashRelay {
 }
 
 #[async_trait]
+impl crate::relay_plane::DirectoryRelayFetcher for CrashRelay {
+    async fn fetch_directory_events(
+        &self,
+        request: crate::relay_plane::DirectoryFetchRequest,
+    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        self.inner.fetch_directory_events(request).await
+    }
+}
+
+#[async_trait]
 impl NostrRelayClient for CrashRelay {
     async fn subscribe(
         &self,

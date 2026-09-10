@@ -25,6 +25,10 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
             member: member_id.clone(),
         }
         .to_string(),
+        EngineError::InvalidKeyPackageCapabilities {
+            member: member_id.clone(),
+        }
+        .to_string(),
         EngineError::AdminCannotSelfRemove {
             group_id: group_id.clone(),
         }

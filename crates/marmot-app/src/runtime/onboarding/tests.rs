@@ -483,8 +483,12 @@ fn options() -> OnboardingOptions {
 fn runtime(path: &std::path::Path, network: Arc<Network>) -> MarmotAppRuntime {
     let mut app = MarmotApp::with_relay(path, "wss://default.example")
         .with_test_relay_client(network.clone());
-    app.relay_plane =
-        MarmotRelayPlane::new_with_directory_fetcher_for_test(network.clone(), network);
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        network.clone(),
+        network,
+        false,
+    );
     MarmotAppRuntime::new(app)
 }
 async fn fixture() -> (

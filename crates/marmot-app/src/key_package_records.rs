@@ -197,6 +197,7 @@ fn cached_key_package_from_entry(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn validated_cached_key_package(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,

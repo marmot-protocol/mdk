@@ -17,6 +17,7 @@ use cgka_traits::engine::{
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
     GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
@@ -796,6 +797,7 @@ where
                     publication_targets: Vec::new(),
                     refresh_at: None,
                     upgrade_rotation_recorded: false,
+                    generation_revision: 0,
                     last_consumed_key_package_ref: None,
                     last_consumed_at: None,
                     retained_private_material: Vec::new(),
@@ -810,10 +812,22 @@ where
             .into());
         }
 
-        if lifecycle.pending_replacement.is_none() {
+        if lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_none_or(|pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
+        {
             let created_at = Timestamp(
                 lifecycle
                     .authored_event_created_at
+                    .into_iter()
+                    .chain(
+                        lifecycle
+                            .pending_replacement
+                            .as_ref()
+                            .map(|pending| pending.authored_created_at),
+                    )
+                    .max()
                     .map(|previous| previous.0.saturating_add(1))
                     .unwrap_or(now.0)
                     .max(now.0),
@@ -1017,6 +1031,7 @@ where
             cgka_traits::MaintenancePhase::Fanout
         };
         lifecycle.upgrade_rotation_recorded = true;
+        lifecycle.generation_revision = replacement.generation_revision;
         lifecycle.last_consumed_key_package_ref = None;
         lifecycle.last_consumed_at = None;
         let retired = if previous_was_consumed {
@@ -1039,13 +1054,32 @@ where
         Ok(self.session.durably_owned_key_packages()?)
     }
 
+    /// Whether account activation owes a generator-policy upgrade. A pending
+    /// replacement owns the work until ACK; its revision prevents regenerating
+    /// on every retry while the acknowledged current revision is still old.
+    pub fn key_package_generation_upgrade_due(&self) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .key_package_lifecycle()?
+            .is_some_and(|lifecycle| {
+                lifecycle.pending_replacement.as_ref().map_or_else(
+                    || {
+                        lifecycle.current_key_package.is_some()
+                            && lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                    },
+                    |pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION,
+                )
+            }))
+    }
+
     pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
         let now = self.wall_clock.now();
         Ok(match self.session.key_package_lifecycle()? {
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
-                    pending.signed_event.is_none()
+                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                        || pending.signed_event.is_none()
                         || pending
                             .targets
                             .iter()
@@ -1057,6 +1091,7 @@ where
                             == lifecycle.current_key_package_ref
                         || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
                         || !lifecycle.upgrade_rotation_recorded
+                        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
                 }
             },
         })
@@ -1067,7 +1102,8 @@ where
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
-                lifecycle.authored_signed_event.is_some()
+                lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                    && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
                         matches!(
                             target.state,
@@ -1160,7 +1196,8 @@ where
                     && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
                     && (lifecycle.current_key_package.is_none()
                         || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
-                        || !lifecycle.upgrade_rotation_recorded)
+                        || !lifecycle.upgrade_rotation_recorded
+                        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
             }
         })
     }
@@ -1440,10 +1477,17 @@ where
             }
         }
         let key_package_due = self.key_package_network_maintenance_due()?;
+        // Paused maintenance may finish existing publication intent, but an
+        // obsolete pending generator revision requires fresh private material
+        // and therefore waits for resume like every other new preparation.
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
-            .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some());
+            .is_some_and(|lifecycle| {
+                lifecycle.pending_replacement.is_some_and(|pending| {
+                    pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                })
+            });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
             let result = self.publish_fresh_key_package().await;
@@ -4578,7 +4622,9 @@ fn current_key_package_republish_blocker(
         Some("missing_authored_signed_event")
     } else if lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref {
         Some("current_key_package_ref_consumed")
-    } else if !lifecycle.upgrade_rotation_recorded {
+    } else if !lifecycle.upgrade_rotation_recorded
+        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+    {
         Some("upgrade_rotation_required")
     } else {
         None
