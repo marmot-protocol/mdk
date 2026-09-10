@@ -2445,9 +2445,15 @@ pub(crate) fn chat_list_row_tx(
     .transpose()
 }
 
-// All chat reads share these columns; only pin-rank computation differs.
-const CHAT_LIST_ROW_SELECT_LIST: &str =
-    "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
+// Keep positional decoding shared, with explicit source-field selection for bounded pages.
+macro_rules! chat_list_columns {
+    ($archived:literal, $pending:literal, $membership:literal) => {
+        concat!(
+            "SELECT row.group_id_hex, ",
+            $archived,
+            ", ",
+            $pending,
+            ",
             row.title, row.group_name, row.avatar_url,
             row.avatar_image_hash_hex, row.avatar_image_key_hex,
             row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
@@ -2459,7 +2465,9 @@ const CHAT_LIST_ROW_SELECT_LIST: &str =
             row.manually_marked_unread, row.unread_mention_count,
             row.first_unread_message_id_hex, row.last_read_message_id_hex,
             row.last_read_timeline_at, row.conversation_created_at,
-            row.activity_sort_at, row.updated_at, row.self_membership,
+            row.activity_sort_at, row.updated_at, ",
+            $membership,
+            ",
             ag.member_count,
             mute.group_id_hex IS NOT NULL,
             mute.muted_until_ms,
@@ -2467,7 +2475,20 @@ const CHAT_LIST_ROW_SELECT_LIST: &str =
                 SELECT 1 FROM cgka_disband_tombstones AS tomb
                 WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
             ),
-            pin.group_id_hex IS NOT NULL,";
+            pin.group_id_hex IS NOT NULL,"
+        )
+    };
+}
+const CHAT_LIST_ROW_SELECT_LIST: &str = chat_list_columns!(
+    "row.archived",
+    "row.pending_confirmation",
+    "row.self_membership"
+);
+const CHAT_LIST_PAGE_SELECT_LIST: &str = chat_list_columns!(
+    "COALESCE(ag.archived, row.archived)",
+    "COALESCE(ag.pending_confirmation, row.pending_confirmation)",
+    "COALESCE(ag.self_membership, row.self_membership)"
+);
 
 const CHAT_PIN_POSITION_SQL: &str = "CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
                 SELECT COUNT(*)

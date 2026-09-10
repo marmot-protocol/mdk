@@ -1,51 +1,7 @@
 use crate::SqliteAccountStorage;
 use crate::encrypted_media_secrets::retire_unreferenced_encrypted_media_secret_epochs_tx;
-use rusqlite::StatementStatus;
-use rusqlite::trace::{TraceEvent, TraceEventCodes};
+use crate::query_work_test_support::{QUERY_MEASUREMENT, measured};
 use std::collections::BTreeSet;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Instant;
-
-static QUERY_STEPS: AtomicI64 = AtomicI64::new(0);
-static QUERY_MEASUREMENT: Mutex<()> = Mutex::new(());
-
-fn measured<T>(
-    store: &SqliteAccountStorage,
-    label: &str,
-    max_steps: i64,
-    action: impl FnOnce() -> T,
-) -> T {
-    {
-        let conn = store.lock().unwrap();
-        conn.flush_prepared_statement_cache();
-        QUERY_STEPS.store(0, Ordering::Relaxed);
-        conn.trace_v2(
-            TraceEventCodes::SQLITE_TRACE_PROFILE,
-            Some(|event| {
-                if let TraceEvent::Profile(statement, _) = event {
-                    QUERY_STEPS.fetch_add(
-                        i64::from(statement.get_status(StatementStatus::VmStep)),
-                        Ordering::Relaxed,
-                    );
-                }
-            }),
-        );
-    }
-    let start = Instant::now();
-    let result = action();
-    let elapsed = start.elapsed();
-    store
-        .lock()
-        .unwrap()
-        .trace_v2(TraceEventCodes::empty(), None);
-    let steps = QUERY_STEPS.load(Ordering::Relaxed);
-    assert!(
-        steps < max_steps,
-        "{label}: {steps} >= {max_steps}, elapsed={elapsed:?}"
-    );
-    result
-}
 
 fn seed_query_history(conn: &rusqlite::Connection, count: i64) {
     conn.execute_batch(

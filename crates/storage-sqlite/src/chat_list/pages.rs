@@ -9,6 +9,8 @@
 //! This is M1 of #1777. It intentionally does not change legacy APIs or implement runtime
 //! subscriptions, selected-presentation preparation, rejoin/archive command orchestration,
 //! effective screen badge values, account summaries or native bindings. Those follow in M2-M4.
+//! Legacy summary eligibility is deliberately unchanged in M1; M3 must reuse list_scope = 0
+//! and list_unread instead of adding another archive/terminal/invitation predicate.
 use crate::connection::CachedSql;
 use crate::{ChatListRow, SqliteAccountStorage, SqliteResultExt, deserialize};
 use cgka_traits::storage::StorageError;
@@ -144,10 +146,35 @@ pub enum ChatListPageError {
     CursorMismatch,
     #[error("chat list ordering or membership changed; refresh the window")]
     StaleCursor,
+    #[error("chat anchor is absent or no longer matches the selected view")]
+    AnchorUnavailable,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
 impl SqliteAccountStorage {
+    /// Recover around a stable row after cursor invalidation, without replaying earlier pages.
+    /// Includes the anchor at the beginning (Forward) or end (Backward) of the returned page.
+    /// Anchor lookup, fresh boundaries and page read are one transaction, so unrelated traffic
+    /// cannot invalidate the operation between resolving the anchor and reading its neighbors.
+    /// An absent/nonmatching anchor returns AnchorUnavailable; the runtime can try a retained
+    /// neighboring identity without inferring disappearance from an empty successful page.
+    pub fn chat_list_page_from_anchor(
+        &self,
+        view: ChatListView,
+        group: &str,
+        limit: usize,
+        direction: ChatListPageDirection,
+    ) -> Result<ChatListPage, ChatListPageError> {
+        self.read_chat_list_page(
+            ChatListPageQuery {
+                view,
+                limit,
+                direction,
+                cursor: None,
+            },
+            Some(group),
+        )
+    }
     /// Read a raw storage page in one deferred transaction, without writes, preparation,
     /// network work, full-list hydration or unrelated lifecycle record decoding.
     /// Limits are 1..=100. With no cursor, Forward starts at the top and Backward at the end.
@@ -159,6 +186,13 @@ impl SqliteAccountStorage {
         &self,
         query: ChatListPageQuery,
     ) -> Result<ChatListPage, ChatListPageError> {
+        self.read_chat_list_page(query, None)
+    }
+    fn read_chat_list_page(
+        &self,
+        mut query: ChatListPageQuery,
+        anchor: Option<&str>,
+    ) -> Result<ChatListPage, ChatListPageError> {
         if !(1..=100).contains(&query.limit) {
             return Err(ChatListPageError::InvalidLimit);
         }
@@ -167,6 +201,33 @@ impl SqliteAccountStorage {
         let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row(
             "SELECT p.store_epoch, n.revision FROM chat_presentation_meta p, chat_list_navigation_meta n WHERE p.id = 1 AND n.id = 1",
             [], |r|Ok((r.get(0)?, r.get(1)?))).storage()?;
+        if let Some(group) = anchor {
+            let key = tx
+                .query_row_cached(
+                    &format!(
+                        "SELECT {ORDER} FROM chat_list_rows WHERE group_id_hex = ?1 AND {}",
+                        query.view.predicate()
+                    ),
+                    [group],
+                    |r| {
+                        Ok(SortKey {
+                            section: r.get(0)?,
+                            pin: r.get(1)?,
+                            activity: r.get(2)?,
+                            group: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .storage()?
+                .ok_or(ChatListPageError::AnchorUnavailable)?;
+            query.cursor = Some(ChatListCursor {
+                store_epoch: store_epoch.clone(),
+                revision,
+                view: query.view,
+                key,
+            });
+        }
         if let Some(cursor) = &query.cursor {
             if cursor.store_epoch != store_epoch || cursor.view != query.view {
                 return Err(ChatListPageError::CursorMismatch);
@@ -175,13 +236,15 @@ impl SqliteAccountStorage {
                 return Err(ChatListPageError::StaleCursor);
             }
         }
-        let relation = query.cursor.as_ref().map(|_| {
-            if query.direction == ChatListPageDirection::Forward {
-                ">"
-            } else {
-                "<"
-            }
-        });
+        let relation = query
+            .cursor
+            .as_ref()
+            .map(|_| match (query.direction, anchor.is_some()) {
+                (ChatListPageDirection::Forward, true) => ">=",
+                (ChatListPageDirection::Forward, false) => ">",
+                (ChatListPageDirection::Backward, true) => "<=",
+                (ChatListPageDirection::Backward, false) => "<",
+            });
         let mut parameters = query
             .cursor
             .as_ref()
@@ -253,16 +316,7 @@ fn page_row_sql() -> String {
     // Keep the legacy normalized pin position without ranking all pins on each read.
     // Group classification uses authoritative account fields even between source writes
     // and legacy row refresh; all fields and operation overlays share this read snapshot.
-    let select = super::CHAT_LIST_ROW_SELECT_LIST
-        .replace("row.archived", "COALESCE(ag.archived, row.archived)")
-        .replace(
-            "row.pending_confirmation",
-            "COALESCE(ag.pending_confirmation, row.pending_confirmation)",
-        )
-        .replace(
-            "row.self_membership",
-            "COALESCE(ag.self_membership, row.self_membership)",
-        );
+    let select = super::CHAT_LIST_PAGE_SELECT_LIST;
     format!(
         "{select} row.list_pin_position {} {} WHERE row.group_id_hex = ?1",
         super::CHAT_LIST_ROW_JOINS,
@@ -293,7 +347,7 @@ fn page_row(tx: &Connection, group: &str, sql: &str) -> Result<ChatListRow, Chat
         .map(|b| deserialize::<DisbandRequest>(&b))
         .transpose()?;
     let candidate: bool = tx
-        .query_row(
+        .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM cgka_disband_candidates WHERE lower(hex(group_id)) = ?1)",
             params![group],
             |r| r.get(0),
