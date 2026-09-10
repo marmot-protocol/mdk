@@ -136,6 +136,8 @@ mod migration_0067_invitation_recovery;
 mod migration_0068_media_epoch_index;
 #[path = "migrations/0069_chat_readiness_index.rs"]
 mod migration_0069_chat_readiness_index;
+#[path = "migrations/0070_chat_list_pages.rs"]
+mod migration_0070_chat_list_pages;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -498,6 +500,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 69,
         name: "0069_chat_readiness_index",
         apply: migration_0069_chat_readiness_index::apply,
+    },
+    Migration {
+        version: 70,
+        name: "0070_chat_list_pages",
+        apply: migration_0070_chat_list_pages::apply,
     },
 ];
 
@@ -1269,7 +1276,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 69,
+                found: 70,
                 latest_supported: 46,
             }
         ));
@@ -1325,7 +1332,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 69,
+                found: 70,
                 latest_supported: 46,
             }
         ));
@@ -1629,7 +1636,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 69,
+                found: 70,
                 latest_supported: 46,
             }
         ));

@@ -33,8 +33,10 @@ pub use account_projection::{
 };
 pub use chat_list::{
     AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
-    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,
-    ChatPinState, ExistingDirectConversation, select_reusable_direct_conversation,
+    ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview, ChatListPage,
+    ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery, ChatListRow,
+    ChatListView, ChatPinError, ChatPinState, ExistingDirectConversation,
+    select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
     CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,

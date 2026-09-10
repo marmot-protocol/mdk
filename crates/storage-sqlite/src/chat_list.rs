@@ -1,3 +1,4 @@
+mod pages;
 use crate::account_projection::chat_mute_is_effective;
 use crate::connection::CachedSql;
 use crate::storage::disband_requests::{
@@ -16,6 +17,10 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
 use cgka_traits::storage::StorageResult;
+pub use pages::{
+    ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
+    ChatListView,
+};
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
