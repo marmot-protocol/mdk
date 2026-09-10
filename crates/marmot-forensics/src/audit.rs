@@ -149,8 +149,8 @@ pub struct AuditEventContext {
 pub struct AuditSourceContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     /// System hardware model, never a user-assigned name, hostname, or serial number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,

@@ -42,7 +42,7 @@ pub(crate) const AUDIT_ID_BYTES: usize = 16;
 pub(crate) const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     let schema = serde_json::from_str(include_str!(
         "../../marmot-forensics/schema/audit-log-event.v4.schema.json"
     ))
@@ -718,7 +718,7 @@ impl MarmotApp {
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
         // Start a distinct v4 file. Legacy files remain enumerable for local
         // inspection/deletion, but the upload gate rejects their contents.
-        let audit_path = account_dir.join(format!("audit-{engine_id_hex}-v4.jsonl"));
+        let audit_path = marmot_forensics::default_jsonl_path(&account_dir, &engine_id_hex);
         match marmot_forensics::JsonlRecorder::open_with_account_ref(
             &audit_path,
             engine_id_hex,

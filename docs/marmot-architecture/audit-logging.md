@@ -1179,6 +1179,7 @@ it, plus whether that was an accepted upload, a file above the request ceiling, 
 - Losing or corrupting the sidecar costs repeat validation and, for eligible files, one repeat transfer.
 - Legacy, malformed and schema-ineligible snapshots are recorded as `ineligible_schema`; they do not trigger retry
   cooldowns or block later files. A size/mtime change makes them eligible for validation again, never for bypassing it.
+  A new rejection emits a warning with only the file index and byte count; a cached verdict does not repeat it.
 - A file above the 64 MiB ceiling is recorded as such, logged once with aggregate counts, and skipped on later runs
   instead of failing on every trigger. It never blocks the files behind it.
 - There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
@@ -1222,8 +1223,10 @@ these triggers:
 Tracker scheduling itself logs only the trigger, skip reason, file sizes, the file index for failed and skipped
 uploads, and aggregate counts: `uploaded`, `acknowledged` (already accepted by the endpoint), `too_large_recorded`
 (newly found above the ceiling this run, which is what warrants the warning), `too_large_known` (already recorded as
-above the ceiling, so skipped without a repeat warning), and `failed`. Acknowledged-and-uploaded is kept distinct from
-skipped-as-too-large so the counts never report a permanently untransferable file as delivered. It does not log audit
+above the ceiling, so skipped without a repeat warning), `ineligible_recorded` (new schema rejection),
+`ineligible_known` (cached schema rejection), and `failed`. Newly rejected files warrant a warning; cached rejections
+stay silent. Acknowledged-and-uploaded is kept distinct from skipped files so the counts never report a permanently
+untransferable file as delivered. It does not log audit
 file names, paths, or contents.
 
 ## Coverage audit

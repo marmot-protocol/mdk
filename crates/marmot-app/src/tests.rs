@@ -1552,7 +1552,13 @@ fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
             std::fs::read_to_string(file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    crate::audit_log::AUDIT_UPLOAD_SCHEMA
+                        .validate(&row)
+                        .expect("real recorder output must satisfy the upload schema");
+                    row
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
