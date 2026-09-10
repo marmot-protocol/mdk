@@ -1114,24 +1114,37 @@ separate from this SDK change.
 
 ### Legacy local cleanup
 
+Legacy forensic logs are permanently retired on upgrade. This replaces the interim v4-cutover policy of retaining
+v1-v3 files for manual inspection. Those files no longer have a supported upload path, and older FullData-mode
+logs can contain decrypted content in plaintext outside SQLCipher. Orphaned/unreadable account directories are
+not exposed by `audit_log_files()`, so leaving cleanup to the host's list/delete UI would miss them.
+The policy is automatic with no host opt-out or per-file callback. It removes these diagnostic artifacts, not
+account identities: account directory names and ordinary account data remain. Hosts should refresh any cached
+file listing after opening a new runtime; historical file paths are not durable handles.
+
 `MarmotApp::try_with_relays_and_account_home_and_config` removes the app's legacy forensic files after acquiring
 the exclusive root lease and before exposing the app or opening recorders. Swift/Kotlin constructors already use
 this path; no new host call is required. Cleanup runs regardless of the recording toggle or upload configuration.
 Constructors for tests/embeddings with externally coordinated ownership do not run this cleanup.
 
-The scan is limited to regular files directly inside `<root>/accounts/<account-directory>/`, including directories
-whose account records are missing, unreadable, or signed out. It recognizes the reserved app filenames
-`audit-<32-hex-engine-id>.jsonl` and `audit-<32-hex-engine-id>-v1.jsonl` / `-v2.jsonl` / `-v3.jsonl`, plus their
-`-seg<index>.jsonl` siblings (u32 decimal index, padded to at least six digits). Classification is by that historical
+The scan is limited to regular files directly inside `<root>/accounts/<account-directory>/` and
+`<root>/.wipe-tombstones/<account-remnant>/`, including failed wipes and directories whose account records are
+missing, unreadable, or signed out. These are fixed historical namespaces inside the leased root. It recognizes
+the reserved app filenames `audit-<32-lowercase-hex-engine-id>.jsonl` and the `-v1.jsonl` / `-v2.jsonl` / `-v3.jsonl`
+variants, plus their `-seg<index>.jsonl` siblings (u32 decimal index, padded to at least six digits). Classification is by that historical
 filename convention, so empty, corrupt, or partially written files are removed too; payloads are not read or copied.
 This is distinct from the upload gate, which always validates content.
 
-V4/future filenames, custom names, temporary files, databases, the device ID, and `audit-key-reveal.jsonl` are
-preserved. Symlinks are skipped at every scan level, nested directories are not traversed, and files outside the
-leased root are not scanned. Cleanup is idempotent; a scan/deletion failure does not prevent startup or processing
+V4/future filenames, names outside those reserved forms, temporary files, databases, the device ID, and
+`audit-key-reveal.jsonl` are preserved. A custom file that uses a reserved legacy name is also deleted. Symlinks
+are skipped at every scan level; a symlinked or non-directory container is reported as a cleanup failure.
+Nested directories are not traversed, and files outside the leased root are not scanned. Cleanup is idempotent;
+a scan/deletion failure does not prevent startup or processing
 other accounts/files, and a later exclusive-root open retries. Logs contain only deleted/failed counts. Remaining
 legacy files still fail the v4 upload gate. Cleanup does not rewrite the upload-checkpoint sidecar; the tracker
 retains its existing pruning behavior. This retirement does not introduce ongoing v4 retention limits.
+There is no date-based sunset: direct upgrades from old builds, restored backups, and previous deletion failures
+can reintroduce legacy files later. Removing the scan requires an explicit change to those upgrade/restore guarantees.
 
 ### Tracker config
 

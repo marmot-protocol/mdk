@@ -719,8 +719,8 @@ impl MarmotApp {
         // live-recorder match fail, so a delete would remove the visible file
         // while the recorder kept appending to the orphaned inode.
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
-        // Start a distinct v4 file. Legacy files remain enumerable for local
-        // inspection/deletion, but the upload gate rejects their contents.
+        // Start a distinct v4 file. Exclusive-root startup retires legacy files;
+        // any that survive cleanup still fail the upload gate.
         let audit_path = marmot_forensics::default_jsonl_path(&account_dir, &engine_id_hex);
         match marmot_forensics::JsonlRecorder::open_with_account_ref(
             &audit_path,
