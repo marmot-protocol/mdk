@@ -419,7 +419,6 @@ mod tests {
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
         if fs::remove_file(&probe).is_ok() {
             fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-            eprintln!("permission failure scenario requires an unprivileged test process");
             return;
         }
         let result = open_app(root.path());
