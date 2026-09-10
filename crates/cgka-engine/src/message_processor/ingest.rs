@@ -1599,6 +1599,13 @@ impl<S: StorageProvider> Engine<S> {
                     // intents so later drains do not re-fail them forever
                     // against the removed-copy send gate.
                     self.discard_queued_outbound_intents_for_removed_group(&group_id)?;
+                    // And retire the deferred-peel backlog (see
+                    // `retire_deferred_peel_rows_for_terminal_group`). This
+                    // seam owns that here rather than deferring to
+                    // `realize_self_eviction`: the transaction above already
+                    // wrote `removed`, so a later realization early-returns
+                    // without ever reaching it.
+                    self.retire_deferred_peel_rows_for_terminal_group(&group_id)?;
                 } else if after_ids.contains(self.identity.self_id()) {
                     if self.load_leave_request_state(&group_id)?.is_some() {
                         // A SelfRemove proposal is valid only in its
@@ -2246,6 +2253,10 @@ impl<S: StorageProvider> Engine<S> {
         // leaving them to re-fail through the removed-copy send gate on every
         // later drain.
         self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+        // Same for retained inbound work: see
+        // `retire_deferred_peel_rows_for_terminal_group` for why no later
+        // sweep can reach these rows.
+        self.retire_deferred_peel_rows_for_terminal_group(group_id)?;
         // Deliberately LAST, after the marker write — not before it like the
         // convergence path (which has no attribution read). The notification
         // is already enqueued above, so a failure here cannot lose it; it only
