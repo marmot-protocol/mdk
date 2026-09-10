@@ -22,7 +22,9 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
          CREATE TABLE chat_list_navigation_meta (
              id INTEGER PRIMARY KEY CHECK(id = 1),
              revision INTEGER NOT NULL DEFAULT 0
-                 CHECK(typeof(revision) = 'integer' AND revision >= 0)
+                 CHECK(typeof(revision) = 'integer' AND revision >= 0),
+             pin_rewrite_in_progress INTEGER NOT NULL DEFAULT 0
+                 CHECK(pin_rewrite_in_progress IN (0, 1))
          );
          INSERT INTO chat_list_navigation_meta(id) VALUES(1);",
     )
@@ -130,7 +132,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
                 "DELETE" => format!("{row_key} = {}", key("OLD")),
                 _ => format!("{row_key} IN ({}, {})", key("OLD"), key("NEW")),
             };
-            let changed = if operation == "UPDATE" {
+            let mut changed = if operation == "UPDATE" {
                 format!(
                     "WHEN {}",
                     updates
@@ -141,6 +143,22 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
                 )
             } else {
                 String::new()
+            };
+            if table == "chat_pin_positions" {
+                let enabled = "(SELECT pin_rewrite_in_progress = 0 FROM chat_list_navigation_meta WHERE id = 1)";
+                changed = if changed.is_empty() {
+                    format!("WHEN {enabled}")
+                } else {
+                    format!(
+                        "WHEN {enabled} AND ({})",
+                        changed.trim_start_matches("WHEN ")
+                    )
+                };
+            }
+            let scope = if table == "chat_pin_positions" {
+                String::new()
+            } else {
+                format!("{refresh} WHERE {filter};")
             };
             let pins = match (table, operation) {
                 ("chat_pin_positions", _) | ("chat_list_rows", "INSERT") => {
@@ -153,22 +171,25 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             };
             tx.execute_batch(&format!(
                 "CREATE TRIGGER chat_list_keys_{table}_{operation}
-                AFTER {event} ON {table} {changed} BEGIN {refresh} WHERE {filter}; {pins} END;"
+                AFTER {event} ON {table} {changed} BEGIN {scope} {pins} END;"
             ))
             .storage()?;
         }
     }
     tx.execute_batch(
         "CREATE INDEX idx_chat_list_pin_ordinal ON chat_list_rows(list_pin_ordinal);
-        CREATE TRIGGER chat_list_pin_rank_insert AFTER INSERT ON chat_pin_positions BEGIN
+        CREATE TRIGGER chat_list_pin_rank_insert AFTER INSERT ON chat_pin_positions
+        WHEN (SELECT pin_rewrite_in_progress = 0 FROM chat_list_navigation_meta WHERE id = 1) BEGIN
             UPDATE chat_list_rows SET list_pin_position = list_pin_position + 1
                 WHERE list_pin_ordinal > NEW.ordinal AND group_id_hex != NEW.group_id_hex;
         END;
-        CREATE TRIGGER chat_list_pin_rank_delete AFTER DELETE ON chat_pin_positions BEGIN
+        CREATE TRIGGER chat_list_pin_rank_delete AFTER DELETE ON chat_pin_positions
+        WHEN (SELECT pin_rewrite_in_progress = 0 FROM chat_list_navigation_meta WHERE id = 1) BEGIN
             UPDATE chat_list_rows SET list_pin_position = list_pin_position - 1
                 WHERE list_pin_ordinal > OLD.ordinal AND group_id_hex != OLD.group_id_hex;
         END;
-        CREATE TRIGGER chat_list_pin_rank_update AFTER UPDATE OF ordinal ON chat_pin_positions BEGIN
+        CREATE TRIGGER chat_list_pin_rank_update AFTER UPDATE OF ordinal ON chat_pin_positions
+        WHEN (SELECT pin_rewrite_in_progress = 0 FROM chat_list_navigation_meta WHERE id = 1) BEGIN
             UPDATE chat_list_rows SET list_pin_position = list_pin_position - 1
                 WHERE list_pin_ordinal > OLD.ordinal AND group_id_hex != NEW.group_id_hex;
             UPDATE chat_list_rows SET list_pin_position = list_pin_position + 1
