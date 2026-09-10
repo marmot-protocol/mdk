@@ -1,5 +1,7 @@
 use super::*;
 use crate::SqliteAccountStorage;
+use cgka_traits::storage::{DisbandFailureReason, DisbandRequestStorage, LeaveRequestStorage};
+use cgka_traits::types::GroupId;
 use rusqlite::params;
 
 fn seed(
@@ -43,9 +45,6 @@ fn four_lists_partition_terminal_and_archive_state_and_suppress_invites_from_unr
     assert_eq!(ids(&page(&store, ChatListView::Left)), ["04", "05"]);
 }
 
-use cgka_traits::storage::{DisbandFailureReason, DisbandRequestStorage, LeaveRequestStorage};
-use cgka_traits::types::GroupId;
-
 fn engine_group(store: &SqliteAccountStorage, id: &str) -> GroupId {
     let bytes = hex::decode(id).unwrap();
     store
@@ -69,6 +68,83 @@ fn query(
         limit,
         direction,
         cursor,
+    }
+}
+
+#[test]
+fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
+    for id in ["ABCD", "aBcD"] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, id, false, "member", 4, false);
+        let group = engine_group(&store, id);
+        store
+            .put_leave_request(&LeaveRequest {
+                group_id: group.clone(),
+                requested_at_ms: 123,
+                last_proposed_epoch: None,
+            })
+            .unwrap();
+        assert!(page(&store, ChatListView::Chats).rows.is_empty(), "{id}");
+        assert_eq!(
+            page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
+            Some(123)
+        );
+        store.clear_leave_request(&group).unwrap();
+        assert_eq!(ids(&page(&store, ChatListView::Chats)), [id]);
+        let mut request = DisbandRequest {
+            group_id: group.clone(),
+            requested_at_ms: 124,
+            status: DisbandRequestStatus::Pending,
+            last_prepared_epoch: None,
+        };
+        store.put_disband_request(&request).unwrap();
+        assert!(page(&store, ChatListView::Left).rows[0].disbanding);
+        request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
+        store.put_disband_request(&request).unwrap();
+        assert_eq!(
+            page(&store, ChatListView::Chats).rows[0].disband_request,
+            Some(request)
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_disband_candidates VALUES (?1, x'01', x'00')",
+                [group.as_slice()],
+            )
+            .unwrap();
+        assert!(page(&store, ChatListView::Left).rows[0].disbanding);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM cgka_disband_candidates WHERE group_id = ?1",
+                [group.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(ids(&page(&store, ChatListView::Chats)), [id]);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_disband_tombstones VALUES (?1, x'00')",
+                [group.as_slice()],
+            )
+            .unwrap();
+        assert!(page(&store, ChatListView::Chats).rows.is_empty());
+        assert_eq!(
+            page(&store, ChatListView::Left).rows[0].lifecycle_state,
+            cgka_traits::GroupLifecycleState::Disbanded
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM cgka_disband_tombstones WHERE group_id = ?1",
+                [group.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(ids(&page(&store, ChatListView::Chats)), [id]);
     }
 }
 
@@ -447,7 +523,7 @@ fn reopening_preserves_queued_leave_and_bounded_navigation() {
 #[test]
 fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
     use crate::query_work_test_support::measure;
-    for count in [256, 4096] {
+    for (count, pin_cap) in [(256, 8), (4096, 8), (256, 256), (4096, 4096)] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         {
             let conn = store.lock().unwrap();
@@ -457,9 +533,13 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                     SELECT printf('%032x',x), '', 0, x % 4 = 0, CASE WHEN x % 4 = 1 THEN 'left' ELSE 'member' END FROM numbers;
                 INSERT INTO chat_list_rows(group_id_hex, updated_at, activity_sort_at, unread_count)
                     SELECT printf('%032x',x), 0, x, x % 7 = 0 FROM numbers;
-                INSERT INTO chat_pin_positions(group_id_hex, ordinal) SELECT printf('%032x',x), x FROM numbers WHERE x % 4 = 2;
+                INSERT INTO chat_pin_positions(group_id_hex, ordinal) SELECT printf('%032x',x), x FROM numbers WHERE x % 4 = 2 AND x <= {pin_cap};
                 INSERT INTO app_events(group_id_hex, message_id_hex, direction, sender, plaintext, kind, tags_json, recorded_at, received_at)
                     SELECT 'unrelated', printf('%064x',x), 'received', 'sender', 'text', 9, '[]', x, x FROM numbers;
+                INSERT INTO cgka_groups(id, epoch, record) SELECT CAST(printf('unrelated-%06d',x) AS BLOB), 0, x'00' FROM numbers;
+                INSERT INTO cgka_leave_requests SELECT id, x'00' FROM cgka_groups;
+                INSERT INTO cgka_disband_requests SELECT id, x'00' FROM cgka_groups;
+                INSERT INTO cgka_disband_candidates SELECT id, x'01', x'00' FROM cgka_groups;
                 DROP TABLE numbers;")).unwrap();
         }
         for view in [
@@ -471,41 +551,45 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
             let tail = store
                 .chat_list_page(query(view, 10, ChatListPageDirection::Backward, None))
                 .unwrap();
-            for (direction, cursor) in [
-                (ChatListPageDirection::Forward, None),
-                (ChatListPageDirection::Backward, tail.first),
-            ] {
-                let (result, steps) = measure(&store, || {
-                    store
-                        .chat_list_page(query(view, 10, direction, cursor.clone()))
+            for limit in [10, 100] {
+                for (direction, cursor) in [
+                    (ChatListPageDirection::Forward, None),
+                    (ChatListPageDirection::Backward, tail.first.clone()),
+                ] {
+                    let (result, steps) = measure(&store, || {
+                        store
+                            .chat_list_page(query(view, limit, direction, cursor.clone()))
+                            .unwrap()
+                    });
+                    assert!(
+                        steps < if limit == 10 { 2200 } else { 19000 },
+                        "{count} pins={pin_cap} limit={limit} {view:?} {direction:?}: {steps} VM steps"
+                    );
+                    assert!(!result.rows.is_empty() && result.rows.len() <= limit);
+                    eprintln!(
+                        "rows={count} pins={pin_cap} limit={limit} view={view:?} direction={direction:?} vm_steps={steps}"
+                    );
+                    let relation = cursor.as_ref().map(|_| "<");
+                    let sql = format!(
+                        "EXPLAIN QUERY PLAN {}",
+                        navigation_sql(view, relation, direction, false)
+                    );
+                    let mut values = cursor
+                        .as_ref()
+                        .map(|c| key_params(&c.key))
+                        .unwrap_or_default();
+                    values.push((limit as i64).into());
+                    let conn = store.lock().unwrap();
+                    let mut stmt = conn.prepare(&sql).unwrap();
+                    let plan = stmt
+                        .query_map(params_from_iter(values), |r| r.get::<_, String>(3))
                         .unwrap()
-                });
-                assert!(
-                    steps < 2200,
-                    "{count} {view:?} {direction:?}: {steps} VM steps"
-                );
-                assert!(!result.rows.is_empty() && result.rows.len() <= 10);
-                eprintln!("rows={count} view={view:?} direction={direction:?} vm_steps={steps}");
-                let relation = cursor.as_ref().map(|_| "<");
-                let sql = format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    navigation_sql(view, relation, direction, false)
-                );
-                let mut values = cursor
-                    .as_ref()
-                    .map(|c| key_params(&c.key))
-                    .unwrap_or_default();
-                values.push(10i64.into());
-                let conn = store.lock().unwrap();
-                let mut stmt = conn.prepare(&sql).unwrap();
-                let plan = stmt
-                    .query_map(params_from_iter(values), |r| r.get::<_, String>(3))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap()
-                    .join("\n");
-                assert!(!plan.contains("TEMP B-TREE"), "{plan}");
-                assert!(plan.contains(view.index()), "{plan}");
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap()
+                        .join("\n");
+                    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+                    assert!(plan.contains(view.index()), "{plan}");
+                }
             }
         }
         // Test late pinned and unpinned rows: ordinary message/read writes must not
@@ -518,19 +602,19 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
             });
             eprintln!("rows={count} source_update_vm_steps={steps}");
             assert!(steps < 1000, "{count} source write: {steps} VM steps");
+            let group = engine_group(&store, &group);
+            let (_, steps) = measure(&store, || {
+                store
+                    .put_leave_request(&LeaveRequest {
+                        group_id: group.clone(),
+                        requested_at_ms: 123,
+                        last_proposed_epoch: None,
+                    })
+                    .unwrap();
+            });
+            eprintln!("rows={count} engine_write_vm_steps={steps}");
+            assert!(steps < 1000, "{count} engine write: {steps} VM steps");
         }
-        let (_, rank_steps) = measure(&store, || {
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT count(*) FROM chat_pin_positions WHERE ordinal < ?1",
-                    [count - 2],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap()
-        });
-        eprintln!("rows={count} single_legacy_pin_rank_vm_steps={rank_steps}");
     }
 }
 

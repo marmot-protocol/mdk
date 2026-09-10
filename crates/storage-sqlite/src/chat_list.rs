@@ -2484,6 +2484,11 @@ const CHAT_LIST_ROW_SELECT_LIST: &str = chat_list_columns!(
     "row.pending_confirmation",
     "row.self_membership"
 );
+// M1's new page contract observes committed account-source lifecycle fields immediately.
+// Legacy rows retain their existing projector publication timing. Copying source fields into
+// those rows from these new triggers would also change existing readers/subscriptions without
+// their refresh notifications. M2 owns runtime command/invalidation integration; migrating
+// legacy publication is a separate compatibility change, not a side effect of storage paging.
 const CHAT_LIST_PAGE_SELECT_LIST: &str = chat_list_columns!(
     "COALESCE(ag.archived, row.archived)",
     "COALESCE(ag.pending_confirmation, row.pending_confirmation)",
