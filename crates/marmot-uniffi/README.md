@@ -26,6 +26,20 @@ checksums, provenance, and generated-source synchronization rules.
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
 
+## Audit v4 adoption
+
+Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
+Regenerate Swift/Kotlin bindings and use `AuditLogTrackerConfigV4Ffi` with
+`AuditLogUploadSourceV4Ffi.hardwareModel` in place of the old source record and its `deviceLabel`.
+The versioned config type changes the setter ABI checksum so old generated bindings cannot silently
+reinterpret a device label as a hardware model.
+Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
+hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
+Deploy a v4-compatible Goggles endpoint before expecting successful uploads from these bindings.
+Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
+`MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
+These regenerate host bindings and execute DTO round trips; platform package builds remain separate.
+
 ## Exclusive Root Ownership
 
 Every `Marmot` constructor acquires a nonblocking exclusive lease on

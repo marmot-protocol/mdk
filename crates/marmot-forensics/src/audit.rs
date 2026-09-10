@@ -30,7 +30,7 @@ use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v3";
+pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 
 /// Size at which [`JsonlRecorder`] seals the active file into an immutable
 /// segment and continues into a fresh one (mdk#1181).
@@ -63,7 +63,7 @@ pub type AccountRefHex = String;
 /// single account-device engine instance.
 pub type EngineIdHex = String;
 
-/// Hex-encoded `GroupId` bytes. Raw form; the audit log is local-only.
+/// Hex-encoded `GroupId` bytes. Raw identifiers remain sensitive in uploaded logs.
 pub type GroupRefHex = String;
 
 /// Hex-encoded `MessageId` bytes.
@@ -82,6 +82,7 @@ static RECORDER_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `seq`, `wall_time_ms`, `account_ref`, and `engine_id` are
 /// recorder-assigned; the engine supplies the rest via [`AuditRecord`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEvent {
     pub schema_version: String,
     pub seq: u64,
@@ -122,6 +123,7 @@ impl AuditRecord {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEventContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
@@ -140,18 +142,16 @@ pub struct AuditEventContext {
 }
 
 /// Identifies the account/device/app that produced an audit log, for upload
-/// correlation. Labels are opaque, user-supplied display strings; full account
-/// identities are never included.
+/// correlation. Account and device display names are never included. Hardware
+/// model metadata must come from the host platform, not a user-editable label.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditSourceContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    /// System hardware model, never a user-assigned name, hostname, or serial number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_name: Option<String>,
+    pub hardware_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +164,7 @@ pub struct AuditSourceContext {
 /// stable `run_id`, so an analyzer can group a run's `convergence_run_state`
 /// lifecycle and `convergence_decision` together.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConvergenceContext {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +256,7 @@ pub enum EpochBackfillDeferredReason {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditHumanActionContext {
     pub action: String,
     pub origin: String,
@@ -267,6 +269,7 @@ pub struct AuditHumanActionContext {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditTransportContext {
     pub transport_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +295,7 @@ pub struct AuditTransportContext {
 /// are safe for audit recording. Never carries auth tokens, signatures,
 /// ciphertext, or key material.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditTransportWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
@@ -333,6 +337,7 @@ pub struct AuditTransportWire {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEngineContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ciphersuite: Option<u16>,
@@ -347,6 +352,7 @@ pub struct AuditEngineContext {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditGroupContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
@@ -401,6 +407,7 @@ pub enum RecipientScope {
 /// authenticated group membership at send time. Recipients are represented by
 /// salted member refs and an aggregate count, never full member identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipientExpectation {
     pub artifact_kind: MessageArtifactKind,
     pub recipient_scope: RecipientScope,
@@ -417,6 +424,7 @@ pub struct RecipientExpectation {
 /// One message produced by a send/create operation, for the `outbound_messages`
 /// inventory on `send_outcome` / `create_group_outcome`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutboundMessage {
     pub msg_id: MessageRefHex,
     pub artifact_kind: MessageArtifactKind,
@@ -429,6 +437,7 @@ pub struct OutboundMessage {
 /// One witness application message observed at a future epoch, used by the
 /// witness-quorum convergence rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConvergenceAppWitness {
     pub epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,6 +447,7 @@ pub struct ConvergenceAppWitness {
 /// The score the selector computed for a convergence candidate. Mirrors the
 /// engine's `BranchScore` using only obfuscated identities and digests.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConvergenceScore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_commit_depth: Option<u64>,
@@ -457,6 +467,7 @@ pub struct ConvergenceScore {
 
 /// One branch the convergence selector evaluated.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConvergenceCandidate {
     pub branch_id: String,
     pub fork_epoch: u64,
@@ -489,6 +500,7 @@ pub struct ConvergenceCandidate {
 
 /// The value of a group-state change, represented only by a digest and length.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroupStateValue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<DigestHex>,
@@ -497,6 +509,7 @@ pub struct GroupStateValue {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditRecorderHealthSnapshot {
     pub serialization_failures: u64,
     pub write_failures: u64,
@@ -504,7 +517,7 @@ pub struct AuditRecorderHealthSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuditEventKind {
     /// The JSONL recorder opened a new local recorder session. The session id
     /// is carried on the enclosing [`AuditEvent::recorder_session_id`] rather
@@ -1187,6 +1200,7 @@ pub enum ForkWinner {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishRelayFailure {
     pub relay_url: String,
     pub reason: String,
@@ -1198,6 +1212,7 @@ pub struct PublishRelayFailure {
 /// subscription registration. See the kind doc for why the relay URL is carried
 /// here (publish-kind precedent).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayRegistration {
     pub relay_url: String,
     pub accepted: bool,
@@ -1764,10 +1779,10 @@ fn staged_swap_path(path: &Path) -> PathBuf {
 
 /// Filename convention for the engine-scoped audit log.
 ///
-/// Returned path is `<dir>/audit-<engine_id>.jsonl`. The caller is
+/// Returned path is `<dir>/audit-<engine_id>-v4.jsonl`. The caller is
 /// responsible for ensuring the directory exists.
 pub fn default_jsonl_path(dir: impl AsRef<Path>, engine_id: &str) -> std::path::PathBuf {
-    dir.as_ref().join(format!("audit-{engine_id}.jsonl"))
+    dir.as_ref().join(format!("audit-{engine_id}-v4.jsonl"))
 }
 
 #[cfg(test)]

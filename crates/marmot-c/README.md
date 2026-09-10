@@ -66,6 +66,14 @@ against both linkage models (valgrind when available). Pass `--debug` first
 to reuse debug/test-profile dependencies for a faster local or PR smoke run;
 release and scheduled validation use the default release build.
 
+## Audit v4 adoption
+
+Use `MarmotAuditLogTrackerConfigV4` and `marmot_set_audit_log_tracker_config_v4` to supply optional
+system `hardware_model`, platform and app version. Free its returned config with
+`marmot_audit_log_tracker_config_v4_free`. Never pass a device name, hostname or serial number as the model.
+The legacy config/setter retains its binary layout, ignores `device_label`, and returns that field as NULL;
+it never reinterprets an old device name as a hardware model. Both setters use the same v4-only upload gate.
+
 ## Rules of the road
 
 - Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is

@@ -3646,7 +3646,7 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v3.jsonl`. The v3 schema contains
+        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::new(

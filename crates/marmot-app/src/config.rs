@@ -533,7 +533,8 @@ impl std::fmt::Debug for RelayTelemetryRuntimeConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditLogUploadSource {
-    pub device_label: Option<String>,
+    /// System model identifier; never a user-assigned device name, hostname, or serial number.
+    pub hardware_model: Option<String>,
     pub platform: Option<String>,
     pub app_version: Option<String>,
 }
@@ -616,7 +617,7 @@ impl RelayTelemetryRuntimeConfig {
 
 impl AuditLogUploadSource {
     fn normalize(mut self) -> Self {
-        self.device_label = trim_optional(self.device_label);
+        self.hardware_model = trim_optional(self.hardware_model);
         self.platform = trim_optional(self.platform);
         self.app_version = trim_optional(self.app_version);
         self

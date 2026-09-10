@@ -2799,8 +2799,8 @@ typedef struct MarmotRelayTelemetryRuntimeConfig {
 } MarmotRelayTelemetryRuntimeConfig;
 
 /**
- * Optional device/app provenance attached to tracker uploads.
- * Borrowed input inside `MarmotAuditLogTrackerConfig`.
+ * Legacy ABI input. `device_label` is ignored and always returned NULL.
+ * Use the v4 config entry point to supply a system hardware model.
  */
 typedef struct MarmotAuditLogUploadSource {
   char *device_label;
@@ -2817,6 +2817,24 @@ typedef struct MarmotAuditLogTrackerConfig {
   char *authorization_bearer_token;
   struct MarmotAuditLogUploadSource source;
 } MarmotAuditLogTrackerConfig;
+
+/**
+ * V4 provenance. Hardware model must be system-sourced, never a device name.
+ */
+typedef struct MarmotAuditLogUploadSourceV4 {
+  char *hardware_model;
+  char *platform;
+  char *app_version;
+} MarmotAuditLogUploadSourceV4;
+
+/**
+ * V4 tracker input/output. Credentials are redacted from returned values.
+ */
+typedef struct MarmotAuditLogTrackerConfigV4 {
+  char *endpoint;
+  char *authorization_bearer_token;
+  struct MarmotAuditLogUploadSourceV4 source;
+} MarmotAuditLogTrackerConfigV4;
 
 /**
  * One attachment to encrypt and upload. Borrowed input only: the
@@ -6530,6 +6548,18 @@ MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient *clie
                                                  struct MarmotAuditLogTrackerConfig **out);
 
 /**
+ * Replace the audit-log tracker endpoint config. Free the result with
+ * `marmot_audit_log_tracker_config_v4_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `config` a valid borrowed struct;
+ * `out` valid.
+ */
+MarmotStatus marmot_set_audit_log_tracker_config_v4(const struct MarmotClient *client,
+                                                    const struct MarmotAuditLogTrackerConfigV4 *config,
+                                                    struct MarmotAuditLogTrackerConfigV4 **out);
+
+/**
  * Publish the account's kind:0 profile metadata. The returned profile is
  * what was actually published. Free with
  * `marmot_user_profile_metadata_free`.
@@ -8160,6 +8190,16 @@ void marmot_agent_stream_update_free(struct MarmotAgentStreamUpdate *update);
  * this library.
  */
 void marmot_audit_log_settings_free(struct MarmotAuditLogSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_audit_log_tracker_config_v4_free(struct MarmotAuditLogTrackerConfigV4 *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

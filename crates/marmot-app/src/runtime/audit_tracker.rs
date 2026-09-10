@@ -319,6 +319,8 @@ async fn post_audit_log_tracker_update(
     let mut acknowledged = 0_usize;
     let mut too_large_recorded = 0_usize;
     let mut too_large_known = 0_usize;
+    let mut ineligible_recorded = 0_usize;
+    let mut ineligible_known = 0_usize;
     // `audit_log_files` sorts by account first, so each account's files arrive
     // as one contiguous run and its checkpoint is loaded and stored once.
     for account_files in group_by_account(files) {
@@ -350,6 +352,10 @@ async fn post_audit_log_tracker_update(
                 }
                 Some(AuditUploadOutcome::TooLargeToUpload) => {
                     too_large_known += 1;
+                    continue;
+                }
+                Some(AuditUploadOutcome::IneligibleSchema) => {
+                    ineligible_known += 1;
                     continue;
                 }
                 None => {}
@@ -401,6 +407,29 @@ async fn post_audit_log_tracker_update(
                 }
                 // No complete row yet: no request, checkpoint, or failure warning.
                 Ok(AuditUploadAttempt::Deferred) => {}
+                Ok(AuditUploadAttempt::Ineligible {
+                    observed_bytes,
+                    modified_at_ms,
+                }) => {
+                    ineligible_recorded += 1;
+                    // Cache only the enumerated snapshot's verdict. A changed
+                    // file must be reconsidered; ineligible files never arm retry.
+                    if observed_bytes == file.size_bytes && modified_at_ms == file.modified_at_ms {
+                        checkpoint.acknowledge(
+                            file,
+                            observed_bytes,
+                            AuditUploadOutcome::IneligibleSchema,
+                        );
+                        checkpoint_changed = true;
+                    }
+                    tracing::warn!(
+                        target: "marmot_app::audit_log",
+                        method = "post_audit_log_tracker_update",
+                        file_index,
+                        size_bytes = observed_bytes,
+                        "skipped forensic audit log file that does not conform to the v4 schema"
+                    );
+                }
                 // The endpoint refused this content outright. RFC 9110 15.5.14
                 // has a server send Retry-After when a 413 is temporary, so its
                 // absence is read as a verdict on this file, not a cooldown:
@@ -480,10 +509,10 @@ async fn post_audit_log_tracker_update(
             break;
         }
     }
-    // Only a newly recorded over-ceiling file warrants a warning: one already
+    // Only a newly recorded oversized or ineligible file warrants a warning: one already
     // in the checkpoint has been reported, and re-warning every trigger is the
     // noise this contract removes. Counts only — no file names or paths.
-    if failed > 0 || too_large_recorded > 0 {
+    if failed > 0 || too_large_recorded > 0 || ineligible_recorded > 0 {
         tracing::warn!(
             target: "marmot_app::audit_log",
             method = "post_audit_log_tracker_update",
@@ -492,6 +521,8 @@ async fn post_audit_log_tracker_update(
             acknowledged,
             too_large_recorded,
             too_large_known,
+            ineligible_recorded,
+            ineligible_known,
             failed,
             "completed forensic audit log tracker update with file upload failures"
         );
@@ -503,6 +534,7 @@ async fn post_audit_log_tracker_update(
             uploaded_bytes = uploaded.iter().map(|upload| upload.bytes_sent).sum::<u64>(),
             acknowledged,
             too_large_known,
+            ineligible_known,
             "completed forensic audit log tracker update"
         );
     }

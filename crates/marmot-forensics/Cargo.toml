@@ -12,4 +12,5 @@ serde_json.workspace = true
 web-time.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 tempfile.workspace = true

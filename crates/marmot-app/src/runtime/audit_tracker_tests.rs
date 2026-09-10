@@ -215,7 +215,9 @@ fn two_file_audit_app(root: &std::path::Path) -> MarmotApp {
     let home = marmot_account::AccountHome::open(root);
     home.create_account("alice").unwrap();
     for name in ["audit-a.jsonl", "audit-b.jsonl"] {
-        std::fs::write(home.account_dir("alice").join(name), b"{}\n").unwrap();
+        std::fs::write(home.account_dir("alice").join(name),
+            b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"seq\":0,\"wall_time_ms\":0,\"engine_id\":\"test\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"}}\n"
+        ).unwrap();
     }
     let app = MarmotApp::with_relay(root, "wss://relay.example");
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })

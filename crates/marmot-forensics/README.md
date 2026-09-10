@@ -7,7 +7,7 @@ implementations used by the engine and app runtime when operators enable forensi
 
 ## What this crate does
 
-- Owns the versioned JSONL schema (`schema/audit-log-event.v3.schema.json`) and the Rust event kind catalog.
+- Owns the versioned JSONL schema (`schema/audit-log-event.v4.schema.json`) and the Rust event kind catalog.
 - Provides privacy-safe `JsonlRecorder` and `NoopRecorder` implementations. There is no full-data mode.
 - Stays independent of engine, storage, transport, and simulator crates.
 
