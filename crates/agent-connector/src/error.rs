@@ -54,6 +54,7 @@ impl ConnectorError {
             Self::AccountHome(_) => "account_home_error",
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
+            Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
             Self::App(_) => "app_error",
             Self::Control(_) => "control_error",
             Self::Hex(_) => "invalid_hex",
@@ -83,7 +84,9 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",
-            Self::Stream(_) => "agent stream request failed",
+            Self::Stream(_) | Self::App(AppError::AgentStreamPublisher(_)) => {
+                "agent stream request failed"
+            }
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {

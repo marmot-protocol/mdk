@@ -150,6 +150,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::StreamAppend { .. } => "stream_append",
         AgentControlRequest::StreamStatus { .. } => "stream_status",
         AgentControlRequest::StreamProgress { .. } => "stream_progress",
+        AgentControlRequest::StreamFinish { .. } => "stream_finish",
         AgentControlRequest::StreamFinalize { .. } => "stream_finalize",
         AgentControlRequest::StreamCancel { .. } => "stream_cancel",
         AgentControlRequest::AccountList => "account_list",

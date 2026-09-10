@@ -546,6 +546,12 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
         await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
 
+        await client.stream_finish("55" * 32, "33" * 32, "final", idempotency_key="finish-1")
+        self.assertEqual(requests[3]["type"], "stream_finish")
+        self.assertEqual(requests[3]["final_text"], "final")
+        self.assertEqual(requests[3]["idempotency_key"], "finish-1")
+        self.assertNotIn("transcript_hash_hex", requests[3])
+        self.assertNotIn("chunk_count", requests[3])
         self.assertEqual(requests[0]["idempotency_key"], "key-1")
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
@@ -1099,80 +1105,6 @@ class MediaCapabilityContractTests(unittest.TestCase):
 class TranscriptTests(unittest.TestCase):
     def setUp(self):
         self.adapter = load_adapter_module()
-
-    def test_quic_varint_encoder_matches_rfc9000_boundaries(self):
-        cases = {
-            0: "00",
-            32: "20",
-            63: "3f",
-            64: "4040",
-            16383: "7fff",
-            16384: "80004000",
-            1073741823: "bfffffff",
-            1073741824: "c000000040000000",
-            4611686018427387903: "ffffffffffffffff",
-        }
-
-        for value, expected_hex in cases.items():
-            with self.subTest(value=value):
-                self.assertEqual(self.adapter._encode_quic_varint(value).hex(), expected_hex)
-
-        with self.assertRaises(ValueError):
-            self.adapter._encode_quic_varint(-1)
-        with self.assertRaises(ValueError):
-            self.adapter._encode_quic_varint(4611686018427387904)
-
-    def test_transcript_matches_rust_status_hash_fixture(self):
-        # Mirrors crates/cgka-conformance-simulator/tests/agent_text_stream_vectors.rs:
-        # fixed stream_id 0x40..0x5f, fixed start_event_id 0xc0..0xdf,
-        # record type 1 text_delta "hello", then record type 3 status "thinking".
-        transcript = self.adapter.AgentTextStreamTranscript(
-            stream_id_hex=bytes(range(0x40, 0x60)).hex(),
-            start_message_id_hex=bytes(range(0xC0, 0xE0)).hex(),
-            chunk_bytes=1024,
-        )
-
-        self.assertEqual(
-            transcript.hash_hex,
-            "e4ef961892a7425c1c279f747920ac18d55810732f2aa6b20b330f2666714c78",
-        )
-        transcript.append_text("hello")
-        transcript.append_status("thinking")
-
-        self.assertEqual(transcript.chunk_count, 2)
-        self.assertEqual(
-            transcript.hash_hex,
-            "c0bc23a83a5607f29babfd40464c454306674b82b4653c88fd6f8dbb77e1415c",
-        )
-
-    def test_default_stream_chunking_matches_connector_compose_default(self):
-        self.assertEqual(self.adapter.DEFAULT_STREAM_CHUNK_BYTES, 1024)
-
-        transcript = self.adapter.AgentTextStreamTranscript(
-            stream_id_hex="11" * 32,
-            start_message_id_hex="22" * 32,
-            chunk_bytes=self.adapter.DEFAULT_STREAM_CHUNK_BYTES,
-        )
-        transcript.append_text("a" * (self.adapter.DEFAULT_STREAM_CHUNK_BYTES + 1))
-
-        self.assertEqual(transcript.chunk_count, 2)
-        self.assertEqual(
-            [len(chunk) for chunk in self.adapter.split_text_deltas("a" * 1025, 1024)],
-            [1024, 1],
-        )
-
-    def test_effective_stream_chunking_clamps_to_policy_frame_len(self):
-        self.assertEqual(
-            self.adapter.effective_stream_chunk_bytes(
-                self.adapter.DEFAULT_STREAM_CHUNK_BYTES,
-                4,
-            ),
-            4,
-        )
-        self.assertEqual(
-            [len(chunk) for chunk in self.adapter.split_text_deltas("abcdefghi", 4)],
-            [4, 4, 1],
-        )
 
     def test_append_only_delta_rejects_replacements(self):
         state = self.adapter.AppendOnlyTextState()
@@ -2341,8 +2273,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -2388,10 +2320,9 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(fake_client.stream_finalizes), 1)
         self.assertEqual(fake_client.stream_finalizes[0][1], "hello")
-        self.assertEqual(fake_client.stream_finalizes[0][3], 2)
         self.assertEqual(fake_client.final_sends, [])
 
-    async def test_stream_transcript_chunks_at_policy_frame_len_from_begin_response(self):
+    async def test_stream_finish_leaves_policy_chunking_to_server(self):
         class FakeClient:
             def __init__(self):
                 self.stream_appends = []
@@ -2412,8 +2343,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -2443,7 +2374,6 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.stream_appends, [("55" * 32, "abcdefghi")])
         self.assertEqual(len(fake_client.stream_finalizes), 1)
         self.assertEqual(fake_client.stream_finalizes[0][1], "abcdefghi")
-        self.assertEqual(fake_client.stream_finalizes[0][3], 3)
         self.assertEqual(fake_client.final_sends, [])
 
     async def test_draft_stream_skips_empty_visible_frames(self):
@@ -2642,8 +2572,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -2707,13 +2637,11 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(
+            async def stream_finish(
                 self,
                 stream_id_hex,
                 stream_capability,
                 final_text,
-                transcript_hash_hex,
-                chunk_count,
                 idempotency_key=None,
             ):
                 self.stream_finalizes.append((stream_id_hex, final_text))
@@ -2811,7 +2739,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
@@ -2876,8 +2804,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {"type": "stream_finalized", "stream_id_hex": stream_id_hex}
 
             async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
@@ -2978,13 +2906,11 @@ class _DeliveryRoutingFakeClient:
         self.stream_appends.append((stream_id_hex, append_text))
         return {"type": "ack"}
 
-    async def stream_finalize(
+    async def stream_finish(
         self,
         stream_id_hex,
         stream_capability,
         final_text,
-        transcript_hash_hex,
-        chunk_count,
         idempotency_key=None,
     ):
         self.stream_finalizes.append((stream_id_hex, final_text))
@@ -3688,12 +3614,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await stream.append_replacement("hello")
         self.assertEqual(stream.text.text, "")
-        self.assertEqual(stream.transcript.chunk_count, 0)
 
         # The same text is re-appendable and now commits exactly once.
         await stream.append_replacement("hello")
         self.assertEqual(stream.text.text, "hello")
-        self.assertEqual(stream.transcript.chunk_count, 1)
         self.assertEqual(fake_client.appends, [("55" * 32, "hello"), ("55" * 32, "hello")])
 
     async def test_pending_suffix_for_does_not_mutate_and_commit_advances(self):
@@ -4614,7 +4538,6 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             account_id_hex="11" * 32,
             group_id_hex="22" * 32,
             quic_candidates=(),
-            chunk_bytes=1024,
         )
 
         self.assertTrue(client.request_ids[0])
@@ -4653,33 +4576,23 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                 return {"type": "ack"}
 
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return await self._preview("append", adapter_module.TEXT_DELTA_RECORD, append_text, idempotency_key)
+                return await self._preview("append", "append", append_text, idempotency_key)
 
             async def stream_status(self, stream_id_hex, stream_capability, status_text, idempotency_key=None):
-                return await self._preview("status", adapter_module.STATUS_RECORD, status_text, idempotency_key)
+                return await self._preview("status", "status", status_text, idempotency_key)
 
             async def stream_progress(self, stream_id_hex, stream_capability, progress_text, idempotency_key=None):
-                return await self._preview("progress", adapter_module.PROGRESS_DELTA_RECORD, progress_text, idempotency_key)
+                return await self._preview("progress", "progress", progress_text, idempotency_key)
 
-            async def stream_finalize(
+            async def stream_finish(
                 self,
                 stream_id_hex,
                 stream_capability,
                 final_text,
-                transcript_hash_hex,
-                chunk_count,
                 idempotency_key=None,
             ):
-                self.finalize_calls.append((transcript_hash_hex, chunk_count, idempotency_key))
-                transcript = adapter_module.AgentTextStreamTranscript(
-                    stream_id_hex,
-                    "66" * 32,
-                    chunk_bytes=1024,
-                )
-                for record_type, text in self.records:
-                    transcript._append_record(record_type, text)
-                assert transcript.hash_hex == transcript_hash_hex
-                assert transcript.chunk_count == chunk_count
+                self.finalize_calls.append((final_text, idempotency_key))
+                assert final_text == "".join(text for kind, text in self.records if kind == "append")
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -4692,7 +4605,6 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             account_id_hex="11" * 32,
             group_id_hex="22" * 32,
             quic_candidates=["quic://127.0.0.1:4433"],
-            chunk_bytes=1024,
         )
         await stream.append_replacement("hello")
         await stream.status("thinking")
@@ -4709,7 +4621,7 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(fake_client.records), 3)
         self.assertEqual(len(fake_client.finalize_calls), 1)
-        self.assertTrue(fake_client.finalize_calls[0][2])
+        self.assertTrue(fake_client.finalize_calls[0][1])
 
     async def test_exhausted_preview_retry_blocks_a_different_pending_mutation(self):
         adapter_module = self.adapter_module
@@ -4755,7 +4667,6 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             account_id_hex="11" * 32,
             group_id_hex="22" * 32,
             quic_candidates=(),
-            chunk_bytes=1024,
         )
 
         with unittest.mock.patch.object(adapter_module, "STREAM_PREVIEW_RETRY_BACKOFF_S", ()):
@@ -4788,17 +4699,15 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
-            async def stream_finalize(
+            async def stream_finish(
                 self,
                 stream_id_hex,
                 stream_capability,
                 final_text,
-                transcript_hash_hex,
-                chunk_count,
                 idempotency_key=None,
             ):
                 self.stream_finalizes.append(
-                    (stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key)
+                    (stream_id_hex, final_text, idempotency_key)
                 )
                 if len(self.stream_finalizes) == 1:
                     raise adapter_module.AgentControlError(
@@ -4834,8 +4743,8 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(final.success)
         self.assertEqual(fake_client.final_sends, [])
         self.assertEqual(len(fake_client.stream_finalizes), 2)
-        self.assertTrue(fake_client.stream_finalizes[0][4])
-        self.assertEqual(fake_client.stream_finalizes[1][4], fake_client.stream_finalizes[0][4])
+        self.assertTrue(fake_client.stream_finalizes[0][2])
+        self.assertEqual(fake_client.stream_finalizes[1][2], fake_client.stream_finalizes[0][2])
 
     async def test_finalize_rejection_falls_back_to_plain_send_final(self):
         adapter_module = self.adapter_module
@@ -4857,7 +4766,7 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
                 raise adapter_module.AgentControlError(
                     "transcript hash mismatch",
                     code="stream_finalize_rejected",

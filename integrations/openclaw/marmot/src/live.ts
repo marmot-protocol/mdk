@@ -2,15 +2,12 @@
 // Marmot's QUIC preview stream + durable finalize.
 //
 // OpenClaw hands us growing full-text snapshots (draft-stream `update(text)`);
-// we reduce each to an append-only suffix, mirror it into a local transcript
-// (byte-for-byte with wn-agent's), and send `stream_append`. On finalize we send
-// the transcript hash + chunk count wn-agent validates against its own. A
-// non-append-only update throws so the caller can cancel + send a plain final.
+// we send append-only suffixes. wn-agent owns chunking and transcript hashing;
+// finish checks the final text against the acknowledged appends.
 
 import { randomUUID } from "node:crypto";
 import { AppendOnlyText, NonAppendOnlyUpdateError } from "./append-only.js";
 import { AgentControlError, isRetryable, type MarmotAgentControlClient } from "./client.js";
-import { AgentTextStreamTranscript, DEFAULT_STREAM_CHUNK_BYTES } from "./transcript.js";
 
 const STREAM_FINALIZE_RETRY_BACKOFF_MS = [100, 300] as const;
 const STREAM_PREVIEW_RETRY_BACKOFF_MS = [100, 300] as const;
@@ -18,7 +15,7 @@ const STREAM_PREVIEW_RETRY_BACKOFF_MS = [100, 300] as const;
 /** Narrow control-client surface used by the live preview (eases testing). */
 export type StreamControlClient = Pick<
   MarmotAgentControlClient,
-  "streamBegin" | "streamAppend" | "streamStatus" | "streamProgress" | "streamFinalize" | "streamCancel"
+  "streamBegin" | "streamAppend" | "streamStatus" | "streamProgress" | "streamFinish" | "streamCancel"
 >;
 
 export interface MarmotLivePreviewOptions {
@@ -26,7 +23,6 @@ export interface MarmotLivePreviewOptions {
   groupIdHex: string;
   parentMessageIdHex?: string | null;
   quicCandidates: string[];
-  chunkBytes?: number;
 }
 
 export interface MarmotLiveFinalizeResult {
@@ -43,10 +39,8 @@ export class MarmotLivePreview {
   private streamCapability: string | null = null;
   private startMessageIdHex: string | null = null;
   private readonly beginRequestId = randomUUID();
-  private transcript: AgentTextStreamTranscript | null = null;
   private readonly finalizeIdempotencyKey = randomUUID();
   private readonly appendOnly = new AppendOnlyText();
-  private readonly chunkBytes: number;
   private mutationTail: Promise<void> | null = null;
   private pendingPreviewMutation: { operation: string; payload: string; key: string } | null = null;
 
@@ -54,7 +48,6 @@ export class MarmotLivePreview {
     private readonly client: StreamControlClient,
     private readonly options: MarmotLivePreviewOptions,
   ) {
-    this.chunkBytes = options.chunkBytes ?? DEFAULT_STREAM_CHUNK_BYTES;
   }
 
   get streamId(): string | null {
@@ -158,10 +151,6 @@ export class MarmotLivePreview {
     this.streamIdHex = response.stream_id_hex;
     this.streamCapability = response.stream_capability;
     this.startMessageIdHex = response.start_message_id_hex;
-    this.transcript = new AgentTextStreamTranscript(
-      Buffer.from(response.stream_id_hex, "hex"),
-      Buffer.from(response.start_message_id_hex, "hex"),
-    );
     this.begun = true;
   }
 
@@ -196,12 +185,11 @@ export class MarmotLivePreview {
     if (suffix.length === 0) {
       return;
     }
-    // Commit local transcript/append state only after the remote append
+    // Commit local append state only after the remote append
     // succeeds, so a failed append can be retried with the same text without
     // diverging from wn-agent's transcript.
     await this.retryPreviewMutation("append", suffix, (key) =>
       this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix, key));
-    this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(fullText);
   }
 
@@ -220,7 +208,6 @@ export class MarmotLivePreview {
     const next = `${this.appendOnly.current}${suffix}`;
     await this.retryPreviewMutation("append", suffix, (key) =>
       this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix, key));
-    this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(next);
   }
 
@@ -238,7 +225,6 @@ export class MarmotLivePreview {
     this.ensureOpen();
     await this.retryPreviewMutation("status", text, (key) =>
       this.client.streamStatus(this.streamIdHex!, this.streamCapability!, text, key));
-    this.transcript!.appendStatus(text, this.chunkBytes);
   }
 
   async progress(text: string): Promise<void> {
@@ -255,7 +241,6 @@ export class MarmotLivePreview {
     this.ensureOpen();
     await this.retryPreviewMutation("progress", progressText, (key) =>
       this.client.streamProgress(this.streamIdHex!, this.streamCapability!, progressText, key));
-    this.transcript!.appendProgress(progressText, this.chunkBytes);
   }
 
   /**
@@ -279,19 +264,16 @@ export class MarmotLivePreview {
     if (suffix.length > 0) {
       await this.retryPreviewMutation("append", suffix, (key) =>
         this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix, key));
-      this.transcript!.appendText(suffix, this.chunkBytes);
       this.appendOnly.suffixFor(finalText);
     }
-    let response: Awaited<ReturnType<StreamControlClient["streamFinalize"]>> | null = null;
+    let response: Awaited<ReturnType<StreamControlClient["streamFinish"]>> | null = null;
     for (let attempt = 0; attempt <= STREAM_FINALIZE_RETRY_BACKOFF_MS.length; attempt += 1) {
       this.ensureOpen();
       try {
-        response = await this.client.streamFinalize(
+        response = await this.client.streamFinish(
           this.streamIdHex!,
           this.streamCapability!,
           finalText,
-          this.transcript!.hashHex,
-          this.transcript!.chunkCount,
           this.finalizeIdempotencyKey,
         );
       } catch (error) {

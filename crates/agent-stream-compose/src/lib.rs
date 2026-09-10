@@ -88,9 +88,9 @@ impl StreamComposeAck {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamFinishExpectation {
     pub final_text: String,
-    /// Lowercase hex of the expected transcript hash.
-    pub transcript_hash_hex: String,
-    pub chunk_count: u64,
+    /// Legacy client expectation; omitted when the server owns hashing.
+    pub transcript_hash_hex: Option<String>,
+    pub chunk_count: Option<u64>,
 }
 
 pub enum StreamComposeCommand {
@@ -689,10 +689,17 @@ fn validate_finish_expectation(
     if report.text != expected.final_text {
         return Err("stream final text does not match appended transcript".to_owned());
     }
-    if transcript.transcript_hash() != expected.transcript_hash_hex {
+    if expected
+        .transcript_hash_hex
+        .as_ref()
+        .is_some_and(|hash| transcript.transcript_hash() != *hash)
+    {
         return Err("stream final transcript hash does not match appended transcript".to_owned());
     }
-    if transcript.chunk_count() != expected.chunk_count {
+    if expected
+        .chunk_count
+        .is_some_and(|count| transcript.chunk_count() != count)
+    {
         return Err("stream final chunk count does not match appended transcript".to_owned());
     }
     Ok(())

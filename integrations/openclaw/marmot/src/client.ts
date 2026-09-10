@@ -755,6 +755,21 @@ export class MarmotAgentControlClient {
     );
   }
 
+  async streamFinish(
+    streamIdHex: string,
+    streamCapability: string,
+    finalText: string,
+    idempotencyKey?: string,
+  ): Promise<StreamFinalizedResponse> {
+    return (await this.request({
+      type: "stream_finish",
+      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+      stream_capability: normalizeStreamCapability(streamCapability),
+      final_text: String(finalText ?? ""),
+      ...(idempotencyKey?.trim() ? { idempotency_key: idempotencyKey.trim() } : {}),
+    })) as unknown as StreamFinalizedResponse;
+  }
+
   async streamFinalize(
     streamIdHex: string,
     streamCapability: string,

@@ -120,7 +120,7 @@ pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLea
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult, AgentPublisher,
-    AgentPublisherOptions, AgentPublisherRecord, AgentStreamWatchOptions,
+    AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting, AgentStreamWatchOptions,
     AgentTextStreamCryptoContext, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
     LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
     OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,

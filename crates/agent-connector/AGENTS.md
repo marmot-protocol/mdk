@@ -11,10 +11,8 @@ Local Marmot agent connector daemon; ships the `wn-agent` binary.
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
 - Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
   process glue, not the protocol or composition owner.
-- Keep the QUIC broker dial safe (`src/quic.rs`): agent-supplied `quic://` candidates are validated + pinned through
-  the shared host-safety classifier, and `InsecureLocal` trust is chosen only from `allow_insecure_local_broker` (the
-  `--insecure-local-broker` dev flag, off by default) plus a literal loopback candidate host — never a resolved
-  loopback IP. See `docs/marmot-architecture/overview/dial-safety.md`.
+- Publisher routing and TLS trust use `marmot-app` host-safety validation.
+  `allow_insecure_local_broker` remains an explicit dev-only opt-in.
 
 ## Key files
 
@@ -47,15 +45,14 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`retryable`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.
-- `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the persisted
+- `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the shared runtime publisher handles, and persisted
   `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
-  versioned SHA-256 request fingerprints, `stream_finalize_v2:` keys for durable finalized sends,
+  versioned SHA-256 request fingerprints, `stream_finalize_v2:` / `stream_finish_v1:` keys for durable finalized sends,
   crash-safe atomic writes, plus bounded same-key/same-fingerprint in-flight gates whose followers
   reuse a leader's successful result or receive `send_in_progress` when the gate wait expires), and
   the `DebugFinalSendStore` recorder.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.
-- `src/quic.rs` — QUIC broker candidate parsing, address resolution, and trust selection.
 - `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
   `InboundCatchUpDriver`. The driver's scheduled passes are an adaptive safety net (base
   `INBOUND_CATCH_UP_BASE_INTERVAL`, doubling to `INBOUND_CATCH_UP_MAX_INTERVAL` while the runtime is quiet):

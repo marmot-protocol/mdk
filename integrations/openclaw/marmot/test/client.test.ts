@@ -132,6 +132,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         echoed_parent_message_id_hex: req.parent_message_id_hex ?? null,
       });
       break;
+    case "stream_finish":
     case "stream_finalize":
       send(socket, id, {
         type: "stream_finalized",
@@ -325,6 +326,11 @@ describe("MarmotAgentControlClient", () => {
       1,
     )) as unknown as { echoed_idempotency_key?: string | null };
     expect(withoutKey.echoed_idempotency_key).toBeNull();
+  });
+
+  it("finishes server-owned transcripts without hash fields", async () => {
+    const result = await client.streamFinish(HEX32("ee"), HEX32("55"), "done", "finish-key");
+    expect(result).toMatchObject({ type: "stream_finalized", echoed_idempotency_key: "finish-key", echoed_stream_capability: HEX32("55") });
   });
 
   it("forwards the optional parent message id on stream_begin", async () => {

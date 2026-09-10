@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_stream_compose::{
-    StreamComposeAck, StreamComposeCommand, StreamComposeReport, run_stream_compose_session,
+    StreamComposeAck, StreamComposeCommand, StreamComposeReport, StreamFinishExpectation,
+    run_stream_compose_session_candidates,
 };
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use cgka_traits::{GroupId, MessageId};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use transport_quic_broker::OpenBrokerTextPublisher;
+use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
 
 use super::agent_stream_watch::{
     broker_trust_for_candidate, parse_quic_candidate, resolve_broker_addr,
@@ -18,9 +19,18 @@ use super::agent_stream_watch::{
 use super::{MarmotAppRuntime, wait_for_runtime_shutdown};
 use crate::{AgentTextStreamFinishRequest, AppError, SendSummary};
 
-/// Broker routing and trust for a single live preview.
+/// Whether an unavailable broker route prevents opening the publisher.
+pub enum AgentPublisherRouting {
+    Required,
+    BestEffort,
+}
+
+/// Broker routing, parent linkage, and transcript chunking for a live preview.
 pub struct AgentPublisherOptions {
-    pub candidate: String,
+    pub candidates: Vec<String>,
+    pub routing: AgentPublisherRouting,
+    pub parent_message_id: Option<String>,
+    pub chunk_bytes: usize,
     pub server_cert_der: Option<Vec<u8>>,
     pub insecure_local: bool,
 }
@@ -35,7 +45,7 @@ pub enum AgentPublisherRecord {
 enum PublisherState {
     Active,
     Sealed(AgentTextStreamFinishRequest),
-    Finished(SendSummary),
+    Finished(AgentTextStreamFinishRequest, SendSummary),
     Cancelled,
 }
 
@@ -47,6 +57,7 @@ pub struct AgentPublisher {
     group: GroupId,
     stream_id: Vec<u8>,
     start_id: String,
+    policy_max_plaintext_frame_len: Option<u32>,
     commands: mpsc::Sender<StreamComposeCommand>,
     cancel: mpsc::Sender<()>,
     abort: AbortHandle,
@@ -64,25 +75,54 @@ impl MarmotAppRuntime {
         options: AgentPublisherOptions,
     ) -> Result<Arc<AgentPublisher>, AppError> {
         self.shared.lifecycle().ensure_running()?;
-        let candidate = parse_quic_candidate(&options.candidate)?;
-        let address = tokio::time::timeout(
-            Duration::from_secs(5),
-            resolve_broker_addr(&candidate.authority, options.insecure_local),
-        )
-        .await
-        .map_err(|_| AppError::AgentStreamPublisher("broker resolution timed out".into()))??;
-        let trust = broker_trust_for_candidate(
-            &candidate.server_name,
-            options.server_cert_der,
-            options.insecure_local,
-        );
+        if options.chunk_bytes == 0
+            || options.chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
+        {
+            return Err(AppError::AgentStreamPublisher(
+                "invalid stream chunk size".into(),
+            ));
+        }
+        let mut routes = Vec::new();
+        for candidate in &options.candidates {
+            let resolved = async {
+                let parsed = parse_quic_candidate(candidate)?;
+                let address = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    resolve_broker_addr(&parsed.authority, options.insecure_local),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::AgentStreamPublisher("broker resolution timed out".into())
+                })??;
+                let trust = broker_trust_for_candidate(
+                    &parsed.server_name,
+                    options.server_cert_der.clone(),
+                    options.insecure_local,
+                );
+                Ok::<_, AppError>((candidate.clone(), address, parsed.server_name, trust))
+            }
+            .await;
+            match resolved {
+                Ok(route) => routes.push(route),
+                Err(error) if matches!(options.routing, AgentPublisherRouting::Required) => {
+                    return Err(error);
+                }
+                Err(_) => continue,
+            }
+        }
+        if matches!(options.routing, AgentPublisherRouting::Required) && routes.is_empty() {
+            return Err(AppError::AgentStreamPublisher(
+                "no broker candidates".into(),
+            ));
+        }
         let (_, summary) = self
-            .start_agent_text_stream(
+            .start_agent_text_stream_with_parent(
                 &account,
                 &group,
                 &stream_id,
                 now(),
-                vec![options.candidate.clone()],
+                options.parent_message_id,
+                options.candidates,
             )
             .await?;
         let start_id = summary
@@ -101,9 +141,18 @@ impl MarmotAppRuntime {
             )
             .await?;
         let open = OpenBrokerTextPublisher {
-            broker_addr: address,
-            server_name: candidate.server_name,
-            trust,
+            broker_addr: routes
+                .first()
+                .map(|(_, addr, ..)| *addr)
+                .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
+            server_name: routes
+                .first()
+                .map(|(_, _, name, _)| name.clone())
+                .unwrap_or_else(|| "localhost".into()),
+            trust: routes
+                .first()
+                .map(|(_, _, _, trust)| trust.clone())
+                .unwrap_or(BrokerServerTrust::Platform),
             stream_id: stream_id.clone(),
             start_event_id: MessageId::new(hex::decode(&start_id)?),
             crypto: Some(crypto.crypto),
@@ -114,21 +163,37 @@ impl MarmotAppRuntime {
             group_id: group_hex,
             stream_id: stream_hex,
             start_message_id: start_id.clone(),
-            candidate: options.candidate,
+            candidate: routes
+                .first()
+                .map(|(candidate, ..)| candidate.clone())
+                .unwrap_or_default(),
             status: "streaming".into(),
             text: String::new(),
             transcript_hash: None,
             chunk_count: 0,
             error: None,
         };
+        // An empty candidate set keeps the transcript alive without dialing.
+        let candidates = routes
+            .into_iter()
+            .map(
+                |(_, broker_addr, server_name, trust)| OpenBrokerTextPublisher {
+                    broker_addr,
+                    server_name,
+                    trust,
+                    ..open.clone()
+                },
+            )
+            .collect();
         let (commands, rx) = mpsc::channel(16);
         let (cancel, cancel_rx) = mpsc::channel(1);
         let shutdown_cancel = cancel.clone();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let task = tokio::spawn(async move {
-            let compose = run_stream_compose_session(
+            let compose = run_stream_compose_session_candidates(
                 open,
-                AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize,
+                candidates,
+                options.chunk_bytes,
                 rx,
                 cancel_rx,
                 report,
@@ -150,6 +215,7 @@ impl MarmotAppRuntime {
             group,
             stream_id,
             start_id,
+            policy_max_plaintext_frame_len: crypto.policy_max_plaintext_frame_len,
             commands,
             cancel,
             abort: task.abort_handle(),
@@ -165,6 +231,18 @@ impl AgentPublisher {
 
     pub fn start_id(&self) -> &str {
         &self.start_id
+    }
+
+    /// Group policy cap advertised to control clients.
+    pub fn policy_frame_limit(&self) -> Option<u32> {
+        self.policy_max_plaintext_frame_len
+    }
+
+    /// Only idle active publishers may be evicted; preserve a sealed retry.
+    pub fn is_active(&self) -> bool {
+        self.state
+            .try_lock()
+            .is_ok_and(|state| matches!(*state, PublisherState::Active))
     }
 
     /// Append a transcript record. The ack never copies the accumulated text.
@@ -199,7 +277,10 @@ impl AgentPublisher {
     /// Seal the composed transcript and publish its durable final. A failed
     /// send leaves the sealed request intact; successful retries return the
     /// original receipt without publishing another final.
-    pub async fn finish(self: &Arc<Self>) -> Result<SendSummary, AppError> {
+    pub async fn finish(
+        self: &Arc<Self>,
+        expected: Option<StreamFinishExpectation>,
+    ) -> Result<SendSummary, AppError> {
         self.runtime.shared.lifecycle().ensure_running()?;
         // Reserve finalization before spawning; the task keeps the reservation
         // even if its caller is cancelled.
@@ -209,13 +290,16 @@ impl AgentPublisher {
             let this = publisher;
             this.runtime.shared.lifecycle().ensure_running()?;
             match &*state {
-                PublisherState::Finished(summary) => return Ok(summary.clone()),
+                PublisherState::Finished(request, summary) => {
+                    check_expected(request, expected.as_ref())?;
+                    return Ok(summary.clone());
+                }
                 PublisherState::Cancelled => return Err(closed()),
                 PublisherState::Active => {
                     let (respond, response) = oneshot::channel();
                     this.commands
                         .send(StreamComposeCommand::Finish {
-                            expected: None,
+                            expected: expected.clone(),
                             respond,
                         })
                         .await
@@ -240,11 +324,13 @@ impl AgentPublisher {
             let PublisherState::Sealed(request) = &*state else {
                 unreachable!()
             };
+            check_expected(request, expected.as_ref())?;
+            let request = request.clone();
             let (_, summary) = this
                 .runtime
                 .finish_agent_text_stream(&this.account, &this.group, request.clone())
                 .await?;
-            *state = PublisherState::Finished(summary.clone());
+            *state = PublisherState::Finished(request, summary.clone());
             Ok(summary)
         })
         .await
@@ -271,6 +357,29 @@ impl Drop for AgentPublisher {
             self.abort.abort();
         }
     }
+}
+
+fn check_expected(
+    request: &AgentTextStreamFinishRequest,
+    expected: Option<&StreamFinishExpectation>,
+) -> Result<(), AppError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if request.final_text_or_reference != expected.final_text
+        || expected
+            .transcript_hash_hex
+            .as_ref()
+            .is_some_and(|hash| *hash != hex::encode(request.transcript_hash))
+        || expected
+            .chunk_count
+            .is_some_and(|count| count != request.chunk_count)
+    {
+        return Err(AppError::AgentStreamPublisher(
+            "stream finalize does not match the sealed transcript".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn now() -> u64 {
@@ -301,12 +410,13 @@ mod tests {
             group: GroupId::new(vec![]),
             stream_id: vec![],
             start_id: String::new(),
+            policy_max_plaintext_frame_len: None,
             commands,
             cancel,
             abort: task.abort_handle(),
             state: Arc::new(Mutex::new(PublisherState::Active)),
         });
-        let finish = publisher.finish();
+        let finish = publisher.finish(None);
         tokio::pin!(finish);
         // Poll finish once without letting its spawned task run.
         tokio::select! {
@@ -331,5 +441,64 @@ mod tests {
             if error == "fixture failure")
         );
         cancel.await;
+    }
+    #[tokio::test]
+    async fn sealed_finish_retains_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::MarmotApp::with_relays(root.path(), vec![]).runtime();
+        let (commands, mut received) = mpsc::channel(1);
+        let (cancel, mut cancelled) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let request = AgentTextStreamFinishRequest {
+            stream_id: vec![1; 32],
+            start_event_id: hex::encode([2; 32]),
+            final_text_or_reference: "done".into(),
+            transcript_hash: [3; 32],
+            chunk_count: 1,
+            finished_at: 1,
+        };
+        let publisher = Arc::new(AgentPublisher {
+            runtime,
+            account: "missing".into(),
+            group: GroupId::new(vec![1; 16]),
+            stream_id: request.stream_id.clone(),
+            start_id: request.start_event_id.clone(),
+            policy_max_plaintext_frame_len: None,
+            commands,
+            cancel,
+            abort: task.abort_handle(),
+            state: Arc::new(Mutex::new(PublisherState::Sealed(request))),
+        });
+        assert!(!publisher.is_active());
+        let mismatch = StreamFinishExpectation {
+            final_text: "different".into(),
+            transcript_hash_hex: None,
+            chunk_count: None,
+        };
+        assert!(matches!(
+            publisher.finish(Some(mismatch)).await,
+            Err(AppError::AgentStreamPublisher(_))
+        ));
+        let expected = StreamFinishExpectation {
+            final_text: "done".into(),
+            transcript_hash_hex: Some(hex::encode([3; 32])),
+            chunk_count: Some(1),
+        };
+        // The absent account fails the durable send. Retrying still uses the
+        // sealed request, without consulting the finished composer.
+        for _ in 0..2 {
+            assert!(publisher.finish(Some(expected.clone())).await.is_err());
+            assert!(matches!(
+                *publisher.state.lock().await,
+                PublisherState::Sealed(_)
+            ));
+            assert!(received.try_recv().is_err());
+        }
+        // A queued cancel must not force-abort the task before it emits Abort.
+        publisher.cancel.try_send(()).unwrap();
+        drop(publisher);
+        assert!(!task.is_finished());
+        assert_eq!(cancelled.recv().await, Some(()));
+        task.abort();
     }
 }

@@ -227,6 +227,15 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
+    /// Finalize the server-owned transcript, checking only the acknowledged text.
+    StreamFinish {
+        stream_id_hex: String,
+        stream_capability: String,
+        final_text: String,
+        /// Stable retry key, bound to this stream, capability, and final text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+    },
     /// Finalize an active preview stream into the durable final message.
     ///
     /// If `final_text`, `transcript_hash_hex`, or `chunk_count` do not match
@@ -1500,6 +1509,15 @@ mod tests {
                     idempotency_key: None,
                 },
                 "stream_progress",
+            ),
+            (
+                AgentControlRequest::StreamFinish {
+                    stream_id_hex: stream(),
+                    stream_capability: capability(),
+                    final_text: "hello".to_owned(),
+                    idempotency_key: Some("stream-finish-1".to_owned()),
+                },
+                "stream_finish",
             ),
             (
                 AgentControlRequest::StreamFinalize {

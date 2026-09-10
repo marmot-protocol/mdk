@@ -20,6 +20,19 @@ returns the original stream id, start event, candidates, policy limit, and capab
 begin inputs is an error, and trying to begin another active stream with an occupied explicit stream id returns
 `stream_id_in_use`; neither case replaces the existing session.
 
+## Stream finalization
+
+`stream_finish` accepts `stream_id_hex`, `stream_capability`, `final_text`, and an
+optional `idempotency_key`. The shared publisher derives the hash and chunk count
+from acknowledged text, status, and progress records. A text mismatch leaves the
+stream active; a failed durable send retains the sealed transcript for retry.
+Successful retries with the same inputs and key return the original message ids,
+including after the connector restarts. Both paths return `stream_finalized`.
+
+The existing `stream_finalize` remains supported and additionally validates the
+client's `transcript_hash_hex` and `chunk_count`. New clients use `stream_finish`;
+it is an additive v2 operation shipped with the companion connector.
+
 ## What this crate does
 
 - Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, invite policy, stream compose,

@@ -596,7 +596,8 @@ not a disk-streaming or low-memory-mobile transfer mode.
   the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
-- Status records are included in the stream transcript hash and chunk count.
+- `stream_finish` sends the acknowledged final text. The shared Rust publisher
+  owns chunking and transcript hashing, including status and progress records.
 
 Run the shim tests with:
 

@@ -60,7 +60,9 @@ use crate::{
 pub(crate) mod account_worker;
 mod agent_publisher;
 mod agent_stream_watch;
-pub use agent_publisher::{AgentPublisher, AgentPublisherOptions, AgentPublisherRecord};
+pub use agent_publisher::{
+    AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
+};
 mod audit_tracker;
 mod commands;
 mod event_routing;

@@ -8,11 +8,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_control::{AgentControlDebugFinalSend, AgentControlSendMaintenanceDisposition};
-use agent_stream_compose::StreamComposeCommand;
-use cgka_traits::GroupId;
+use marmot_app::AgentPublisher;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::error::ConnectorError;
@@ -624,32 +621,9 @@ impl Drop for StreamBeginReservationGuard {
 
 #[derive(Clone)]
 pub(crate) struct ActiveStreamSession {
-    pub(crate) account_label: String,
-    pub(crate) group_id: GroupId,
-    pub(crate) stream_id: Vec<u8>,
+    pub(crate) publisher: Arc<AgentPublisher>,
     pub(crate) stream_capability: [u8; 32],
-    pub(crate) start_message_id_hex: String,
-    pub(crate) tx: mpsc::Sender<StreamComposeCommand>,
-    pub(crate) cancel_tx: mpsc::Sender<()>,
-    pub(crate) abort: tokio::task::AbortHandle,
     pub(crate) last_activity: Instant,
-    /// Set once the compose task has validated the finalize expectation and
-    /// exited. The compose task is then gone, but the durable
-    /// `finish_agent_text_stream` publish that follows can still fail; the
-    /// retained transcript lets a re-issued `StreamFinalize` retry that publish
-    /// without the (dead) compose task, so a transient error never strands the
-    /// stream with a live preview and no durable final (#366).
-    pub(crate) finalized: Option<FinalizedStream>,
-}
-
-/// Frozen finalize inputs retained after the compose task exits, so the durable
-/// finish step is retryable and a retry that disagrees with the frozen
-/// transcript is rejected.
-#[derive(Clone)]
-pub(crate) struct FinalizedStream {
-    pub(crate) final_text: String,
-    pub(crate) transcript_hash: [u8; 32],
-    pub(crate) chunk_count: u64,
 }
 
 impl StreamSessionStore {
@@ -829,35 +803,10 @@ impl StreamSessionStore {
     ) -> Option<ActiveStreamSession> {
         let mut sessions = crate::lock_recover(&self.sessions);
         match sessions.get(stream_id_hex) {
-            Some(entry) if entry.tx.same_channel(&session.tx) => sessions.remove(stream_id_hex),
-            _ => None,
-        }
-    }
-
-    /// Freeze the finalize inputs on the stored entry so a durable-finish failure
-    /// can be retried without the compose task, which has exited by this point.
-    ///
-    /// Returns `true` only when the freeze landed on the still-current session
-    /// (matched by command-channel identity). It returns `false` when the entry
-    /// was removed or replaced by a same-stream-id session between the caller's
-    /// `get` and this call: in that case the caller's session is stale and must
-    /// NOT proceed to the durable publish, or a failure there would leave no
-    /// retry handle (`finalized` unset) and strand the stream (#366).
-    #[must_use]
-    pub(crate) fn mark_finalized(
-        &self,
-        stream_id_hex: &str,
-        session: &ActiveStreamSession,
-        finalized: FinalizedStream,
-    ) -> bool {
-        let mut sessions = crate::lock_recover(&self.sessions);
-        match sessions.get_mut(stream_id_hex) {
-            Some(entry) if entry.tx.same_channel(&session.tx) => {
-                entry.finalized = Some(finalized);
-                entry.last_activity = Instant::now();
-                true
+            Some(entry) if Arc::ptr_eq(&entry.publisher, &session.publisher) => {
+                sessions.remove(stream_id_hex)
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -913,48 +862,29 @@ impl StreamSessionStore {
             .ok_or(ConnectorError::StreamCapabilityDenied)
     }
 
-    /// Abort and drop every session whose last activity is older than `max_idle`.
-    ///
-    /// Returns the number of sessions swept. This is what bounds the lifetime of
-    /// sessions abandoned when the gateway crashes or restarts mid-stream: each such
-    /// session otherwise keeps the compose task, its `mpsc::Sender`, the accumulated
-    /// transcript, and (when broker connect succeeded) a dedicated quinn `Endpoint`
-    /// UDP socket plus a live keep-alive'd QUIC connection alive forever.
-    ///
-    /// A session whose transcript has been finalized is NEVER swept: its compose
-    /// task has already exited and the frozen transcript is the only handle for
-    /// retrying a durable finish that failed. Sweeping it would recreate the
-    /// exact #366 failure mode (a published live preview with no durable final
-    /// and no way to retry), so a finalized session lives until its durable
-    /// finish succeeds or the connector restarts.
-    pub(crate) fn sweep_idle(&self, max_idle: Duration) -> usize {
+    /// Evict idle active publishers, retaining sealed durable-send retries.
+    pub(crate) async fn sweep_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
-        let mut sessions = crate::lock_recover(&self.sessions);
-        let stale: Vec<String> = sessions
-            .iter()
-            .filter(|(_, session)| {
-                session.finalized.is_none() && now.duration_since(session.last_activity) >= max_idle
-            })
-            .map(|(stream_id_hex, _)| stream_id_hex.clone())
-            .collect();
-        for stream_id_hex in &stale {
-            if let Some(session) = sessions.remove(stream_id_hex) {
-                // Graceful cancel over the dedicated signal so an abandoned
-                // session still emits a live `Abort`; only force-abort if the
-                // cancel channel is gone. The forced abort is intentionally NOT
-                // unconditional here: a successful cancel lets the session flush
-                // its Abort and shut itself down.
-                match session.cancel_tx.try_send(()) {
-                    // Delivered, or a cancel is already queued (`Full`): the
-                    // session will still drain a cancel and emit its `Abort`.
-                    Ok(()) | Err(TrySendError::Full(())) => {}
-                    // The receiver is gone, so no `Abort` can be published:
-                    // force-abort to release the held resources.
-                    Err(TrySendError::Closed(())) => session.abort.abort(),
-                }
-            }
+        let stale = {
+            let mut sessions = crate::lock_recover(&self.sessions);
+            let keys: Vec<_> = sessions
+                .iter()
+                .filter(|(_, session)| {
+                    Arc::strong_count(&session.publisher) == 1
+                        && session.publisher.is_active()
+                        && now.duration_since(session.last_activity) >= max_idle
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|id| sessions.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let count = stale.len();
+        for session in stale {
+            session.publisher.cancel().await;
         }
-        stale.len()
+        count
     }
 }
 

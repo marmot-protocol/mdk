@@ -70,12 +70,6 @@ def _live_adapter() -> Optional["MarmotPlatformAdapter"]:
     return _LIVE_ADAPTER_REF() if _LIVE_ADAPTER_REF is not None else None
 
 DEFAULT_SOCKET_HOME = "~/.marmot"
-DEFAULT_STREAM_CHUNK_BYTES = 1024
-AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN = 65519
-TEXT_DELTA_RECORD = 0x01
-PROGRESS_DELTA_RECORD = 0x02
-STATUS_RECORD = 0x03
-TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
 _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
@@ -1044,47 +1038,6 @@ class ProfileNameOnboardingStore:
         os.replace(tmp_path, self.path)
 
 
-class AgentTextStreamTranscript:
-    """Python mirror of ``AgentTextStreamTranscriptV1`` in ``cgka_traits``."""
-
-    def __init__(self, stream_id_hex: str, start_message_id_hex: str, *, chunk_bytes: int):
-        self.stream_id = bytes.fromhex(_normalize_hex(stream_id_hex, "stream_id_hex"))
-        self.start_message_id = bytes.fromhex(_normalize_hex(start_message_id_hex, "start_message_id_hex"))
-        self.chunk_bytes = int(chunk_bytes)
-        self.next_seq = 1
-        self.chunk_count = 0
-
-        hasher = hashlib.sha256()
-        hasher.update(TRANSCRIPT_HASH_CONTEXT)
-        _hash_len_prefixed(hasher, self.stream_id)
-        _hash_len_prefixed(hasher, self.start_message_id)
-        self._hash = hasher.digest()
-
-    @property
-    def hash_hex(self) -> str:
-        return self._hash.hex()
-
-    def append_text(self, text: str) -> None:
-        self._append_record(TEXT_DELTA_RECORD, text)
-
-    def append_status(self, status: str) -> None:
-        self._append_record(STATUS_RECORD, status)
-
-    def append_progress(self, text: str) -> None:
-        self._append_record(PROGRESS_DELTA_RECORD, text)
-
-    def _append_record(self, record_type: int, text: str) -> None:
-        for chunk in split_text_deltas(text, self.chunk_bytes):
-            hasher = hashlib.sha256()
-            hasher.update(self._hash)
-            hasher.update(self.next_seq.to_bytes(8, "big"))
-            hasher.update(bytes([record_type]))
-            hasher.update(chunk)
-            self._hash = hasher.digest()
-            self.next_seq += 1
-            self.chunk_count += 1
-
-
 ProfileLookupStatus = Literal["profile_found", "profile_not_found", "indeterminate"]
 PROFILE_LOOKUP_BACKOFF_S = (1.0, 5.0, 30.0)
 
@@ -1165,7 +1118,6 @@ class MarmotLiveStream:
         stream_capability: str,
         start_message_id_hex: str,
         parent_message_id_hex: Optional[str],
-        chunk_bytes: int,
     ):
         self.client = client
         self.account_id_hex = account_id_hex
@@ -1178,11 +1130,6 @@ class MarmotLiveStream:
             "parent_message_id_hex",
         )
         self.text = AppendOnlyTextState()
-        self.transcript = AgentTextStreamTranscript(
-            stream_id_hex,
-            start_message_id_hex,
-            chunk_bytes=chunk_bytes,
-        )
         self.finalize_idempotency_key = uuid.uuid4().hex
         self.finalized = False
         self._mutation_lock = asyncio.Lock()
@@ -1224,7 +1171,6 @@ class MarmotLiveStream:
         account_id_hex: str,
         group_id_hex: str,
         quic_candidates: Iterable[str],
-        chunk_bytes: int,
         stream_id_hex: Optional[str] = None,
         parent_message_id_hex: Optional[str] = None,
     ) -> "MarmotLiveStream":
@@ -1264,10 +1210,6 @@ class MarmotLiveStream:
             stream_capability=_normalize_stream_capability(response["stream_capability"]),
             start_message_id_hex=response["start_message_id_hex"],
             parent_message_id_hex=parent_message_id_hex,
-            chunk_bytes=effective_stream_chunk_bytes(
-                chunk_bytes,
-                response.get("policy_max_plaintext_frame_len"),
-            ),
         )
 
     async def append_replacement(self, next_text: str) -> None:
@@ -1279,9 +1221,9 @@ class MarmotLiveStream:
         suffix = self.text.pending_suffix_for(next_text)
         if not suffix:
             return
-        # Commit local transcript/append-only state only AFTER the remote append
+        # Commit local append-only state only AFTER the remote append
         # succeeds, so a failed append leaves the stream consistent and the same
-        # text re-appendable (mirrors live.ts update() lines 99-116).
+        # text re-appendable like the OpenClaw preview adapter.
         await self._retry_preview_mutation(
             "append",
             suffix,
@@ -1289,7 +1231,6 @@ class MarmotLiveStream:
                 self.stream_id_hex, self.stream_capability, suffix, idempotency_key=key
             )
         )
-        self.transcript.append_text(suffix)
         self.text.commit(next_text)
 
     async def status(self, status: str) -> None:
@@ -1301,7 +1242,6 @@ class MarmotLiveStream:
                     self.stream_id_hex, self.stream_capability, status, idempotency_key=key
                 )
             )
-            self.transcript.append_status(status)
 
     async def progress(self, text: str) -> None:
         async with self._mutation_lock:
@@ -1312,7 +1252,6 @@ class MarmotLiveStream:
                     self.stream_id_hex, self.stream_capability, text, idempotency_key=key
                 ),
             )
-            self.transcript.append_progress(text)
 
     async def finalize(self, final_text: str) -> Dict[str, Any]:
         async with self._mutation_lock:
@@ -1323,12 +1262,10 @@ class MarmotLiveStream:
         response: Optional[Dict[str, Any]] = None
         for attempt in range(len(STREAM_FINALIZE_RETRY_BACKOFF_S) + 1):
             try:
-                response = await self.client.stream_finalize(
+                response = await self.client.stream_finish(
                     self.stream_id_hex,
                     self.stream_capability,
                     final_text,
-                    self.transcript.hash_hex,
-                    self.transcript.chunk_count,
                     idempotency_key=self.finalize_idempotency_key,
                 )
                 break
@@ -1384,7 +1321,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             "MARMOT_GROUP_ID_HEX",
         )
         self.quic_candidates = resolve_quic_candidates(extra)
-        self.stream_chunk_bytes = int(extra.get("stream_chunk_bytes") or DEFAULT_STREAM_CHUNK_BYTES)
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
         self.debounce_ms = resolve_debounce_ms(extra)
         self.group_activation = resolve_group_activation(extra)
@@ -2429,7 +2365,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             group_id_hex=chat_id,
             parent_message_id_hex=parent_message_id_hex,
             quic_candidates=self.quic_candidates,
-            chunk_bytes=self.stream_chunk_bytes,
         )
 
     async def _cancel_other_chat_streams(
@@ -4043,49 +3978,6 @@ def parse_profile_name_reply(text: str) -> tuple[str, Optional[str], str]:
     return ("name", value, "")
 
 
-def effective_plaintext_cap(policy_max_plaintext_frame_len: Any) -> int:
-    try:
-        policy_cap = int(policy_max_plaintext_frame_len)
-    except (TypeError, ValueError):
-        return AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
-    if policy_cap <= 0:
-        return AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
-    return min(policy_cap, AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN)
-
-
-def effective_stream_chunk_bytes(requested_chunk_bytes: int, policy_max_plaintext_frame_len: Any) -> int:
-    requested = int(requested_chunk_bytes)
-    if requested <= 0 or requested > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN:
-        return requested
-    return min(requested, effective_plaintext_cap(policy_max_plaintext_frame_len))
-
-
-def split_text_deltas(text: str, max_chunk_bytes: int) -> list[bytes]:
-    if max_chunk_bytes <= 0:
-        raise ValueError("max_chunk_bytes must be positive")
-    text = str(text or "")
-    if not text:
-        return []
-
-    chunks: list[bytes] = []
-    current: list[str] = []
-    current_len = 0
-    for ch in text:
-        encoded = ch.encode("utf-8")
-        if current and current_len + len(encoded) > max_chunk_bytes:
-            chunks.append("".join(current).encode("utf-8"))
-            current = []
-            current_len = 0
-        if not current and len(encoded) > max_chunk_bytes:
-            chunks.append(encoded)
-            continue
-        current.append(ch)
-        current_len += len(encoded)
-    if current:
-        chunks.append("".join(current).encode("utf-8"))
-    return chunks
-
-
 def is_retryable(exc: BaseException) -> bool:
     return bool(getattr(exc, "retryable", False) or isinstance(exc, OSError))
 
@@ -4151,26 +4043,6 @@ def _reply_to_from_send_context(
         if value is not None and str(value).strip():
             return _optional_hex(value, key)
     return _TURN_PARENT_MESSAGE_ID_HEX.get()
-
-
-def _encode_quic_varint(value: int) -> bytes:
-    value = int(value)
-    if value < 0:
-        raise ValueError("QUIC varint value must be non-negative")
-    if value < 0x40:
-        return value.to_bytes(1, "big")
-    if value < 0x4000:
-        return (value | 0x4000).to_bytes(2, "big")
-    if value < 0x40000000:
-        return (value | 0x80000000).to_bytes(4, "big")
-    if value < 0x4000000000000000:
-        return (value | 0xC000000000000000).to_bytes(8, "big")
-    raise ValueError("QUIC varint value exceeds 2^62-1")
-
-
-def _hash_len_prefixed(hasher: Any, data: bytes) -> None:
-    hasher.update(_encode_quic_varint(len(data)))
-    hasher.update(data)
 
 
 def _split_config_list(value: Any) -> list[str]:
