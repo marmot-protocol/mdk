@@ -1816,6 +1816,11 @@ impl<S: StorageProvider> Engine<S> {
                 // removed-copy send gate.
                 self.discard_queued_outbound_intents_for_removed_group(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                // Same for retained inbound rows: see
+                // `retire_deferred_peel_rows_for_terminal_group` for why no
+                // later sweep can reach them.
+                self.retire_deferred_peel_rows_for_terminal_group(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
             }
             self.push_group_state_change(
                 group_id,

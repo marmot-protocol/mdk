@@ -32,6 +32,35 @@ fn fresh_deferred_peel_lifecycle(
     }
 }
 
+/// Durable half of `Engine::retire_deferred_peel_rows_for_terminal_group`:
+/// flip every `PeelDeferred` row of a terminal group to `Failed` and hand back
+/// what was retired, for the caller's in-memory reconciliation. Takes `&S` so
+/// it can run inside a storage transaction.
+///
+/// Enumerates metadata, never payloads: this runs inside the disband write
+/// transaction, where loading up to `MAX_PEEL_DEFERRED_BYTES_PER_GROUP` of
+/// ciphertext nobody reads would be copied and held across the commit.
+///
+/// A partial application is a valid state, so the callers that run this
+/// outside a transaction need no compensation: some rows retired and the rest
+/// still `PeelDeferred` is exactly what a re-entry finishes, and rows whose
+/// in-memory slot was never returned stay conservatively charged until the
+/// next open recounts them.
+#[must_use = "every returned row still owes its in-memory capacity slot; pass \
+              them to Engine::release_retired_deferred_peel_rows once the \
+              durable flip is committed, or the group's deferred-peel budget \
+              stays charged for the rest of this engine incarnation"]
+pub(crate) fn fail_deferred_peel_rows_in_terminal_group<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<Vec<DeferredMessageMetadata>, EngineError> {
+    let retired = storage.list_deferred_message_metadata(group_id)?;
+    for row in &retired {
+        storage.update_message_state(&row.id, MessageState::Failed)?;
+    }
+    Ok(retired)
+}
+
 /// Promote or retire the non-deliverable Welcome artifacts produced beside one
 /// staged invite commit.
 ///
@@ -721,6 +750,74 @@ impl<S: StorageProvider> Engine<S> {
             });
         self.note_peel_deferred_row_retired(record);
         Ok(())
+    }
+
+    /// Retire this group's whole `PeelDeferred` backlog because the local copy
+    /// has become terminal — removed or disbanded.
+    ///
+    /// Why nothing else will: the only production driver that reaches the
+    /// deferred-peel sweep is `advance_convergence_inputs`, and its single
+    /// door is `prepare_convergence_input_advance`, whose terminal gate
+    /// refuses a terminal group before any sweep runs. A *disbanded* copy is
+    /// refused twice over (its `EpochState::Disbanded` also fails that
+    /// function's `Stable` check), but a *removed* copy stays `Stable` — the
+    /// terminal gate is the whole reason its rows never come back. (The `pub`
+    /// `retry_deferred_peels` would sweep a removed group happily; no
+    /// production path calls it.) So without this the rows sit forever holding
+    /// their share of the account byte budget — reconstructed from durable
+    /// rows on every open — and their per-group row slots.
+    ///
+    /// Silent by construction: the rows leave the retry lifecycle the way
+    /// [`Self::mark_raw_transport_message_failed_if_awaiting_retry`] retires
+    /// one, with no `TransportObjectResourceRefused` — nothing was refused,
+    /// the group they belonged to is gone.
+    ///
+    /// The tradeoff, taken deliberately: `removed` is reversible (branch
+    /// selection can supersede the removal that set it — see
+    /// `cgka_traits::group::Group::removed` and the heal in
+    /// `distributed_convergence::emit_convergence_events`), and a `Failed` row
+    /// blocks same-id redelivery, so a heal cannot get these rows back. That
+    /// is the same bet
+    /// [`Self::discard_queued_outbound_intents_for_removed_group`] already
+    /// makes beside every call site here, and the window is narrow because
+    /// the terminal gate refuses further advances until the heal lands.
+    pub(crate) fn retire_deferred_peel_rows_for_terminal_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let retired = fail_deferred_peel_rows_in_terminal_group(&self.storage, group_id)?;
+        self.release_retired_deferred_peel_rows(&retired);
+        Ok(())
+    }
+
+    /// In-memory half of [`Self::retire_deferred_peel_rows_for_terminal_group`]:
+    /// return each retired row's capacity slot and record the transition.
+    ///
+    /// Split from the durable half so a caller already inside a storage
+    /// transaction — `disband::settle_disband_after_convergence`, whose
+    /// idempotent re-entry never re-runs the settle body — can keep the row
+    /// flip inside that transaction and reconcile the engine's own counters
+    /// after it commits. Safe in that order: the counters are derived state,
+    /// rebuilt from the durable rows by
+    /// `ensure_peel_deferred_usage_initialized` on the next open, so a crash
+    /// between the two loses nothing.
+    pub(crate) fn release_retired_deferred_peel_rows(
+        &mut self,
+        retired: &[DeferredMessageMetadata],
+    ) {
+        for row in retired {
+            self.audit_group(
+                &row.group_id,
+                crate::audit_helpers::message_state_transition_event(
+                    hex::encode(row.id.as_slice()),
+                    Some(MessageState::PeelDeferred),
+                    MessageState::Failed,
+                    Some(row.epoch),
+                    "terminal_group",
+                ),
+            );
+            self.note_peel_deferred_row_retired_by_id(&row.group_id, &row.id);
+        }
     }
 
     pub(crate) fn mark_raw_transport_message_failed_if_awaiting_retry(
