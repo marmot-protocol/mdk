@@ -29,6 +29,10 @@ object, subscription objects, records, enums, and error variants.
 ## Audit v4 adoption
 
 Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
+App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
+root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
+key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
+call is needed.
 Regenerate Swift/Kotlin bindings and use `AuditLogTrackerConfigV4Ffi` with
 `AuditLogUploadSourceV4Ffi.hardwareModel` in place of the old source record and its `deviceLabel`.
 The versioned config type changes the setter ABI checksum so old generated bindings cannot silently

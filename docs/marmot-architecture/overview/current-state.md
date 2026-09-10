@@ -188,7 +188,8 @@ This repository now has the main engine candidate:
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
 - `crates/marmot-forensics` — opt-in v4 JSONL forensic audit schema and recorder traits. Account/device display names
   are excluded; platform, app version and optional system hardware model are retained. App uploads validate v4-only
-  snapshots and leave legacy files local. See [audit logging](../audit-logging.md).
+  snapshots. Exclusive-root app startup removes recognized legacy forensic files and segments, including failed-wipe
+  remnants, while preserving v4 files and the separate key-reveal log. See [audit logging](../audit-logging.md).
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
 - `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.
 - `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.
