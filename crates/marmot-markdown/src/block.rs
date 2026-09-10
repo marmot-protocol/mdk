@@ -83,7 +83,7 @@ enum Container {
 enum SummaryState {
     AwaitingFirstNonblank,
     Collecting {
-        collector: details::SummaryCollector,
+        collector: Box<details::SummaryCollector>,
         raw_lines: Vec<String>,
     },
     Done,
@@ -157,6 +157,7 @@ struct BlockParser {
     pending_source_gaps: [u8; MAX_CONTAINER_DEPTH + 1],
     /// UTF-8-safe source prefix in which complete details candidates may match.
     details_window: usize,
+    container_depth_limit: usize,
     line_start: usize,
 }
 
@@ -183,6 +184,7 @@ impl BlockParser {
             leaf_blank_lines_before: 0,
             pending_source_gaps: [0; MAX_CONTAINER_DEPTH + 1],
             details_window,
+            container_depth_limit: MAX_CONTAINER_DEPTH,
             line_start: 0,
         }
     }
@@ -393,7 +395,7 @@ impl BlockParser {
                     if rest[0] == b'>'
                         && let Some((nc, no)) = try_open_blockquote(bytes, probe_col, probe_off)
                     {
-                        if self.containers.len() >= MAX_CONTAINER_DEPTH {
+                        if self.containers.len() >= self.container_depth_limit {
                             self.append_paragraph_from(line, probe_off);
                             return;
                         }
@@ -420,7 +422,7 @@ impl BlockParser {
                         probe_off,
                         matches!(self.leaf, Some(Leaf::Paragraph(_))),
                     ) {
-                        if self.containers.len() + 2 > MAX_CONTAINER_DEPTH {
+                        if self.containers.len() + 2 > self.container_depth_limit {
                             self.append_paragraph_from(line, probe_off);
                             return;
                         }
@@ -1097,7 +1099,7 @@ impl BlockParser {
         if tag_end_abs > self.details_window {
             return false;
         }
-        if self.containers.len() >= MAX_CONTAINER_DEPTH {
+        if self.containers.len() >= self.container_depth_limit {
             return false;
         }
         self.close_leaf();
@@ -1321,7 +1323,7 @@ impl BlockParser {
                 {
                     *pre_summary_gap = gap;
                     *summary_state = SummaryState::Collecting {
-                        collector,
+                        collector: Box::new(collector),
                         raw_lines,
                     };
                 }
@@ -1424,12 +1426,9 @@ impl BlockParser {
             unreachable!("finish_details requires Details");
         };
 
-        let (still_collecting, collecting_raw, finalized) = match summary_state {
-            SummaryState::Collecting {
-                collector,
-                raw_lines,
-            } => (true, raw_lines, collector.finalize()),
-            _ => (false, summary_raw_lines, None),
+        let (still_collecting, collecting_raw) = match summary_state {
+            SummaryState::Collecting { raw_lines, .. } => (true, raw_lines),
+            _ => (false, summary_raw_lines),
         };
 
         let matched = !failed
@@ -1437,7 +1436,6 @@ impl BlockParser {
             && closer
                 .as_ref()
                 .is_some_and(|(_, end)| *end <= self.details_window);
-        let _ = finalized;
         if !matched {
             if !summary_replayed && !collecting_raw.is_empty() {
                 let (mut restored, mut restored_gaps) =
@@ -1476,158 +1474,29 @@ impl BlockParser {
         lines: Vec<String>,
         first_gap: u8,
     ) -> (Vec<Block>, Vec<u8>) {
-        let saved_leaf = self.leaf.take();
-        let saved_leaf_gap = self.leaf_blank_lines_before;
-        self.containers.push(Container::Details {
-            open: false,
-            opener_raw: String::new(),
-            children: Vec::new(),
-            blank_lines_before: Vec::new(),
-            leading_blank_lines: 0,
-            summary_inner: None,
-            summary_raw_lines: Vec::new(),
-            summary_replayed: true,
-            pre_summary_gap: 0,
-            summary_state: SummaryState::Done,
-            failed: true,
-        });
-        self.replay_ordinary_lines(lines, first_gap);
-        let popped = self.containers.pop();
-        self.leaf = saved_leaf;
-        self.leaf_blank_lines_before = saved_leaf_gap;
-        match popped {
-            Some(Container::Details {
-                children,
-                blank_lines_before,
-                ..
-            }) => (children, blank_lines_before),
-            _ => (Vec::new(), Vec::new()),
+        // Replay the bounded held source through the ordinary block parser so
+        // setext headings, verbatim leaves, tables, and container continuations
+        // have the same semantics as non-disclosure Markdown. A zero window
+        // prevents disclosure recognition (and recursive fallback) on replay.
+        let mut replay = Self::new(0);
+        replay.container_depth_limit = self
+            .container_depth_limit
+            .saturating_sub(self.containers.len());
+        replay.refs = std::mem::take(&mut self.refs);
+        replay.pending_source_gaps[0] = first_gap;
+        for line in lines {
+            replay.feed(&line, 0);
         }
+        replay.finish();
+        self.refs = replay.refs;
+        (replay.root, replay.root_blank_lines_before)
     }
 
     fn replay_ordinary_lines(&mut self, lines: Vec<String>, first_gap: u8) {
-        if lines.is_empty() {
-            return;
+        let (blocks, gaps) = self.parse_ordinary_line_blocks(lines, first_gap);
+        for (block, gap) in blocks.into_iter().zip(gaps) {
+            self.push_block(block, gap);
         }
-        if matches!(self.containers.last(), Some(Container::Details { .. })) {
-            self.pending_source_gaps[self.containers.len()] = first_gap;
-        }
-        for line in lines {
-            self.classify_ordinary_rest(&line);
-        }
-        self.close_leaf();
-    }
-
-    fn classify_ordinary_rest(&mut self, rest: &str) {
-        let bytes = rest.as_bytes();
-        let (sub_col, sub_off) = scanner::measure_indent(bytes);
-        if sub_col < 4 {
-            let rest_bytes = &bytes[sub_off..];
-            if !rest_bytes.is_empty() {
-                if let Some((level, text)) = parse_atx_heading(rest_bytes) {
-                    self.close_leaf();
-                    self.push_new_block(Block::Heading {
-                        level,
-                        inlines: vec![Inline::Text(text)],
-                    });
-                    return;
-                }
-                if let Some((fence, fence_len, info)) = parse_fence_open(rest_bytes) {
-                    self.close_leaf();
-                    self.begin_leaf();
-                    self.leaf = Some(Leaf::FencedCode {
-                        fence,
-                        fence_len,
-                        indent: sub_col,
-                        info,
-                        content: String::new(),
-                    });
-                    return;
-                }
-                if is_math_fence(rest_bytes) {
-                    self.close_leaf();
-                    self.begin_leaf();
-                    self.leaf = Some(Leaf::MathBlock {
-                        indent: sub_col,
-                        content: String::new(),
-                    });
-                    return;
-                }
-                if is_thematic_break(rest_bytes) {
-                    self.close_leaf();
-                    self.push_new_block(Block::ThematicBreak);
-                    return;
-                }
-                if rest_bytes[0] == b'>'
-                    && let Some((_, no)) = try_open_blockquote(bytes, 0, 0)
-                    && self.containers.len() < MAX_CONTAINER_DEPTH
-                {
-                    self.close_leaf();
-                    let leading_blank_lines = self.take_pending_source_gap();
-                    self.containers.push(Container::BlockQuote {
-                        children: Vec::new(),
-                        blank_lines_before: Vec::new(),
-                        leading_blank_lines,
-                    });
-                    if no < rest.len() {
-                        self.classify_ordinary_rest(&rest[no..]);
-                    }
-                    if let Some(Container::BlockQuote { .. }) = self.containers.last() {
-                        let quote = self.containers.pop().unwrap();
-                        self.close_container(quote);
-                    }
-                    return;
-                }
-                if let Some(open) =
-                    try_open_list_marker(bytes, 0, 0, matches!(self.leaf, Some(Leaf::Paragraph(_))))
-                    && self.containers.len() + 2 <= MAX_CONTAINER_DEPTH
-                {
-                    self.close_leaf();
-                    self.ensure_list_open(open.kind);
-                    self.containers.push(Container::ListItem {
-                        children: Vec::new(),
-                        blank_lines_before: Vec::new(),
-                        indent: open.indent,
-                    });
-                    if open.off_after < rest.len() {
-                        self.classify_ordinary_rest(&rest[open.off_after..]);
-                    } else {
-                        self.append_paragraph("");
-                    }
-                    self.close_leaf();
-                    if let Some(Container::ListItem { .. }) = self.containers.last() {
-                        let item = self.containers.pop().unwrap();
-                        self.close_container(item);
-                    }
-                    if let Some(Container::List { .. }) = self.containers.last() {
-                        let list = self.containers.pop().unwrap();
-                        self.close_container(list);
-                    }
-                    return;
-                }
-            }
-        }
-        if sub_col >= 4 && !matches!(self.leaf, Some(Leaf::Paragraph(_))) {
-            let stripped = indented_strip(rest, 0);
-            if let Some(Leaf::IndentedCode { content, .. }) = &mut self.leaf {
-                content.push_str(stripped);
-                content.push('\n');
-            } else {
-                self.close_leaf();
-                self.begin_leaf();
-                let mut content = String::new();
-                content.push_str(stripped);
-                content.push('\n');
-                self.leaf = Some(Leaf::IndentedCode {
-                    content,
-                    pending_blanks: 0,
-                    pending_source_gaps: Box::new([0; MAX_CONTAINER_DEPTH + 1]),
-                    pending_list_blanks: Box::new([false; MAX_CONTAINER_DEPTH]),
-                });
-            }
-            return;
-        }
-        self.append_paragraph_from(rest, 0);
     }
 
     fn fallback_details(

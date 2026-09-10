@@ -5,6 +5,7 @@
 //! linear scan bound.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
 /// Inclusive byte length from `<` through `>` for a structural tag.
 pub(crate) const MAX_DETAILS_TAG_BYTES: usize = 4096;
@@ -99,6 +100,7 @@ struct DeferredCloser {
 pub(crate) struct SummaryCollector {
     inner: String,
     unmatched: Vec<(usize, usize)>,
+    unmatched_by_length: HashMap<usize, usize>,
     deferred_closers: Vec<DeferredCloser>,
 }
 
@@ -181,16 +183,31 @@ impl SummaryCollector {
             if bytes[i] == b'`' {
                 let run_end = skip_backtick_run(bytes, i, limit);
                 let run_len = run_end - i;
-                if let Some(opener_start) = take_unmatched(&mut self.unmatched, run_len) {
-                    self.unmatched
-                        .retain(|(pos, _)| *pos <= opener_start || *pos >= i);
-                    self.deferred_closers
-                        .retain(|closer| closer.rel_start <= opener_start || closer.rel_start >= i);
-                    i = run_end;
+                Work::charge(1);
+                if let Some(&opener_index) = self.unmatched_by_length.get(&run_len) {
+                    let opener_start = self.unmatched[opener_index].0;
+                    // Matching a run protects everything after its opener.
+                    // Each pending run/closer is pushed and removed at most
+                    // once; do not rescan the unaffected prefix for each span.
+                    while self.unmatched.len() > opener_index {
+                        Work::charge(1);
+                        let (_, len) = self.unmatched.pop().unwrap();
+                        self.unmatched_by_length.remove(&len);
+                    }
+                    while self
+                        .deferred_closers
+                        .last()
+                        .is_some_and(|closer| closer.rel_start > opener_start)
+                    {
+                        Work::charge(1);
+                        self.deferred_closers.pop();
+                    }
                 } else {
+                    self.unmatched_by_length
+                        .insert(run_len, self.unmatched.len());
                     self.unmatched.push((i, run_len));
-                    i = run_end;
                 }
+                i = run_end;
                 continue;
             }
             if bytes[i] == b'<'
@@ -205,7 +222,7 @@ impl SummaryCollector {
                         if tag_end - i > MAX_DETAILS_TAG_BYTES {
                             return CloseSeek::Malformed;
                         }
-                        let unmatched_before = self.unmatched.iter().any(|(pos, _)| *pos < i);
+                        let unmatched_before = !self.unmatched.is_empty();
                         if unmatched_before {
                             self.deferred_closers.push(DeferredCloser {
                                 rel_start: i,
@@ -227,11 +244,6 @@ impl SummaryCollector {
         }
         CloseSeek::ProtectedOrAbsent
     }
-}
-
-fn take_unmatched(unmatched: &mut Vec<(usize, usize)>, run_len: usize) -> Option<usize> {
-    let idx = unmatched.iter().position(|(_, len)| *len == run_len)?;
-    Some(unmatched.remove(idx).0)
 }
 
 fn inner_end(rel_start: usize, inner: &str) -> usize {
@@ -762,6 +774,24 @@ mod tests {
                 );
             }
             prev = work;
+        }
+    }
+
+    #[test]
+    fn deferred_closers_and_later_code_spans_stay_linear() {
+        for n in [500, 1_000, 2_000] {
+            Work::reset();
+            let mut collector = SummaryCollector::from_after_open("`");
+            for _ in 0..n {
+                let _ = collector.push_line("</summary>", usize::MAX);
+            }
+            for _ in 0..n {
+                let _ = collector.push_line("``code``", usize::MAX);
+            }
+            let bytes = collector.inner().len();
+            let work = Work::get();
+            assert!(work <= bytes * 16, "bytes={bytes}, work={work}");
+            assert!(collector.finalize().is_some());
         }
     }
 

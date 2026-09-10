@@ -273,7 +273,7 @@ fn fallback_retains_blank_before_summary() {
 #[test]
 fn fallback_multiline_keeps_lists_code_refs_and_siblings() {
     let doc = parse(
-        "<details>\n<summary>one\n- item\n    code\n[lab]: /url\n\nsee [lab]\n# After\n</details>\n\nsibling",
+        "<details>\n<summary>one\n- item\n\n    code\n\n[lab]: /url\n\nsee [lab]\n# After\n</details>\n\nsibling",
     );
     assert!(!has_details(&doc));
     assert!(
@@ -444,4 +444,88 @@ fn indented_code_then_summary_in_quote() {
         )),
         _ => false,
     }));
+}
+
+#[test]
+fn failed_summary_replays_ordinary_block_semantics() {
+    for summary in [
+        "<summary>\nTitle\n---",
+        "<summary>\nTitle\n===",
+        "<summary>\n~~~rust\n# literal heading\n~~~",
+        "<summary>\n$$\nx + y\n$$",
+        "<summary>\n- first\n- second",
+        "<summary>\n> first\n> second",
+        "<summary>\nheader | value\n--- | ---\na | b",
+    ] {
+        let expected = parse(summary);
+        for ending in ["", "\n\n# After", "\n</details>\n# After"] {
+            let doc = parse(&format!("<details>\n{summary}{ending}"));
+            assert_eq!(doc.blocks[0], paragraph("<details>"));
+            assert_eq!(
+                &doc.blocks[1..1 + expected.blocks.len()],
+                expected.blocks.as_slice(),
+                "fallback changed ordinary Markdown: {summary:?}, ending={ending:?}: {doc:?}"
+            );
+            if !ending.is_empty() {
+                assert_eq!(doc.blocks.last(), Some(&common::heading(1, "After")));
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_summary_replay_respects_remaining_container_depth() {
+    let prefix = "> ".repeat(90);
+    let held = format!("<summary>\n{}content", "> ".repeat(200));
+    let input = held
+        .lines()
+        .map(|line| format!("{prefix}{line}\n"))
+        .collect::<String>();
+    let doc = parse(&format!("{prefix}<details>\n{input}"));
+    let mut blocks = doc.blocks.as_slice();
+    let mut depth = 0;
+    loop {
+        let quote = blocks.iter().find_map(|block| match block {
+            Block::BlockQuote { blocks, .. } => Some(blocks.as_slice()),
+            _ => None,
+        });
+        let Some(children) = quote else { break };
+        depth += 1;
+        assert!(depth <= 96, "fallback exceeded container depth: {depth}");
+        blocks = children;
+    }
+    assert!(texts(&doc).contains("content"));
+}
+
+#[test]
+fn many_line_open_summary_release_probe_compares_to_control() {
+    use std::time::Instant;
+    let n = 32_749usize;
+    let mut hostile = String::from("<details>\n<summary>\n");
+    for _ in 0..n {
+        hostile.push_str("x\n");
+    }
+    let mut control = String::from("<details>\n");
+    for _ in 0..n {
+        control.push_str("x\n");
+    }
+    let _ = parse(&hostile);
+    let _ = parse(&control);
+    let started = Instant::now();
+    let _ = parse(&hostile);
+    let hostile_us = started.elapsed().as_micros();
+    let started = Instant::now();
+    let _ = parse(&control);
+    let control_us = started.elapsed().as_micros();
+    eprintln!(
+        "many-line open-summary probe bytes={} hostile_us={} control_us={} ratio={:.2}",
+        hostile.len(),
+        hostile_us,
+        control_us,
+        hostile_us as f64 / control_us.max(1) as f64
+    );
+    assert!(
+        hostile_us < 5_000_000,
+        "hostile many-line summary must stay well under the previous multi-second stall, us={hostile_us}"
+    );
 }

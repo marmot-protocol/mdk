@@ -257,36 +257,17 @@ mod details_work_tests {
     }
 
     #[test]
-    fn many_line_open_summary_release_probe_compares_to_control() {
-        use std::time::Instant;
-        let n = 32_749usize;
-        let mut hostile = String::from("<details>\n<summary>\n");
-        for _ in 0..n {
-            hostile.push_str("x\n");
+    fn deferred_summary_closers_with_later_code_spans_stay_linear() {
+        for n in [500, 1_000, 2_000] {
+            let md = format!(
+                "<details>\n<summary>`\n{}{}",
+                "</summary>\n".repeat(n),
+                "``code``\n".repeat(n),
+            );
+            let _ = parse(&md);
+            let work = Work::get();
+            assert!(work <= md.len() * 16 + 4_096, "work={work}");
         }
-        let mut control = String::from("<details>\n");
-        for _ in 0..n {
-            control.push_str("x\n");
-        }
-        let _ = parse(&hostile);
-        let _ = parse(&control);
-        let started = Instant::now();
-        let _ = parse(&hostile);
-        let hostile_us = started.elapsed().as_micros();
-        let started = Instant::now();
-        let _ = parse(&control);
-        let control_us = started.elapsed().as_micros();
-        eprintln!(
-            "many-line open-summary probe bytes={} hostile_us={} control_us={} ratio={:.2}",
-            hostile.len(),
-            hostile_us,
-            control_us,
-            hostile_us as f64 / control_us.max(1) as f64
-        );
-        assert!(
-            hostile_us < 5_000_000,
-            "hostile many-line summary must stay well under the previous multi-second stall, us={hostile_us}"
-        );
     }
 
     #[test]
