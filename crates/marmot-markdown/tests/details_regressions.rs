@@ -524,8 +524,6 @@ fn many_line_open_summary_release_probe_compares_to_control() {
         control_us,
         hostile_us as f64 / control_us.max(1) as f64
     );
-    assert!(
-        hostile_us < 5_000_000,
-        "hostile many-line summary must stay well under the previous multi-second stall, us={hostile_us}"
-    );
+    // Timing is diagnostic only: CPU contention must not fail this probe.
+    // The library's counted-work tests enforce the linear complexity bound.
 }
