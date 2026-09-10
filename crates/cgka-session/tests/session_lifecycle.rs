@@ -711,7 +711,16 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
         ..CanonicalizationPolicy::default()
     })
     .expect("convergence policy accepted");
-    let advanced = bob.advance_convergence(&created.group_id).await.unwrap();
+    let mut advanced = bob.advance_convergence(&created.group_id).await.unwrap();
+    // Loaded runners can exhaust a background quantum before leave maintenance.
+    // Follow the pending work as a host would, without requiring a single tick.
+    for _ in 0..10 {
+        if !advanced.publish.is_empty() || !advanced.pending_convergence.contains(&created.group_id)
+        {
+            break;
+        }
+        advanced = bob.advance_convergence(&created.group_id).await.unwrap();
+    }
     assert!(
         advanced
             .publish
