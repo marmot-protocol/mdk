@@ -39,7 +39,13 @@ fn is_io_address_family_unavailable(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
-    ) || matches!(err.raw_os_error(), Some(47 | 49 | 97 | 99))
+    ) || matches!(
+        err.raw_os_error(),
+        // Unix EAFNOSUPPORT/EADDRNOTAVAIL (macOS 47/49, Linux 97/99) and
+        // Windows WSAEAFNOSUPPORT (10047). Rust maps 10047 to Uncategorized,
+        // so ErrorKind matching alone would fail IPv6-less Windows hosts.
+        Some(47 | 49 | 97 | 99 | 10047)
+    )
 }
 
 fn is_address_family_unavailable(err: &QuicTextStreamError) -> bool {
@@ -47,6 +53,32 @@ fn is_address_family_unavailable(err: &QuicTextStreamError) -> bool {
         QuicTextStreamError::Io(io_err) => is_io_address_family_unavailable(io_err),
         _ => false,
     }
+}
+
+#[test]
+fn address_family_unavailable_recognizes_windows_wsaeafnosupport() {
+    let err = std::io::Error::from_raw_os_error(10047);
+    assert!(
+        is_io_address_family_unavailable(&err),
+        "WSAEAFNOSUPPORT (10047) must skip IPv6 setup instead of failing: {err:?}"
+    );
+    assert!(is_address_family_unavailable(&QuicTextStreamError::Io(err)));
+}
+
+#[test]
+fn address_family_unavailable_predicate_covers_documented_raw_codes() {
+    for code in [47, 49, 97, 99, 10047] {
+        let err = std::io::Error::from_raw_os_error(code);
+        assert!(
+            is_io_address_family_unavailable(&err),
+            "raw OS error {code} should be treated as address-family unavailable: {err:?}"
+        );
+    }
+    let unrelated = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        !is_io_address_family_unavailable(&unrelated),
+        "unrelated I/O errors must not skip IPv6 tests: {unrelated:?}"
+    );
 }
 
 #[test]
