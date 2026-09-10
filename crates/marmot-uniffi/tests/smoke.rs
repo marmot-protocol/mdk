@@ -307,11 +307,15 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
     let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
     let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
 
+    let nprofile = marmot_app::nprofile_for_account_id(account_id, &[]).expect("nprofile");
     for reference in [
         account_id.to_string(),
         npub.to_string(),
         format!("nostr:{npub}"),
+        nprofile.clone(),
+        format!("nostr:{nprofile}"),
         format!("marmot://profile/{npub}?from=qr"),
+        format!("marmot://profile/{nprofile}?from=qr"),
     ] {
         let normalized = kit
             .normalize_member_ref(reference.clone())
@@ -331,6 +335,15 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
             .expect_err("invalid member ref should fail"),
         MarmotKitError::InvalidIdentity { .. }
     ));
+    assert_eq!(
+        kit.default_profile_pseudonym(account_id.to_owned()),
+        "Loyal Crane"
+    );
+    let random = kit.random_profile_pseudonym();
+    assert!(
+        random.split_once(' ').is_some(),
+        "random pseudonym should be two words"
+    );
 }
 
 #[tokio::test]

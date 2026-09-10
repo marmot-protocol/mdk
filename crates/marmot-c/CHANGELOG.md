@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_default_profile_pseudonym` and `marmot_random_profile_pseudonym`
+  for the shared cosmetic display-name helpers. Free the owned UTF-8
+  strings with `marmot_string_free`. Additive functions; existing status
+  values and struct layouts are unchanged.
 - Additive `MarmotMarkdownBlock::Details` with an indirect `MarmotMarkdownDetails`
   payload for bounded `<details>` / `<summary>` display blocks. Existing block
   discriminants and union stride are unchanged; C consumers must regenerate
@@ -18,6 +22,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
+  references and discards relay hints. Existing hex, `npub`, and
+  `marmot://profile/` forms keep their established OK-plus-NULL contract.
 - Search results include `is_followed_by_searcher`; streaming updates include keyed `updated_results` replacements
   and a `CachedResultsFound` trigger. Consumers must merge by account ID, including across radius pages, and use
   the explicit follow flag instead of radius 1 for badges. C consumers must rebuild against the matching generated

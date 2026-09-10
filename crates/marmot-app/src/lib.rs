@@ -59,7 +59,6 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use storage_sqlite::{
     SecurePruneAppEventsResult, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
     TimelineProjectionUpdate,
@@ -93,6 +92,7 @@ mod key_package_records;
 #[cfg(test)]
 mod local_open_test_gate;
 mod media;
+mod profile_pseudonyms;
 #[cfg(feature = "media-benchmarks")]
 #[doc(hidden)]
 pub use media::MediaDownloadBenchmarkTransport;
@@ -213,6 +213,7 @@ pub use notifications::{
     build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
     parse_provider_token, push_token_fingerprint,
 };
+pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
@@ -423,152 +424,6 @@ const DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER: &str =
 pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
-const DEFAULT_PROFILE_ADJECTIVES: &[&str] = &[
-    "Agile", "Amber", "Angry", "Balanced", "Bold", "Brave", "Breezy", "Bright", "Brisk", "Bubbly",
-    "Calm", "Caring", "Cheerful", "Clear", "Clever", "Coral", "Cosmic", "Cozy", "Crimson", "Crisp",
-    "Curious", "Daring", "Dawn", "Deep", "Diamond", "Dreamy", "Eager", "Earnest", "Easy",
-    "Electric", "Emerald", "Festive", "Fiery", "Fleet", "Forest", "Fresh", "Frosty", "Gentle",
-    "Glad", "Golden", "Graceful", "Grand", "Grateful", "Green", "Happy", "Hardy", "Hearty",
-    "Hidden", "Honest", "Hopeful", "Humble", "Indigo", "Ivory", "Jade", "Jolly", "Kind", "Lively",
-    "Loyal", "Lucky", "Majestic", "Maple", "Mellow", "Merry", "Mighty", "Mindful", "Misty",
-    "Modest", "Mossy", "Neat", "Nifty", "Nimble", "Noble", "Olive", "Open", "Patient", "Peaceful",
-    "Plum", "Polar", "Proud", "Quiet", "Radiant", "Rapid", "Ready", "Restful", "Rosy", "Ruby",
-    "Rustic", "Sage", "Scarlet", "Serene", "Sharp", "Shiny", "Silver", "Sincere", "Sky", "Smooth",
-    "Solar", "Solid", "Spirited", "Spry", "Steady", "Stellar", "Stormy", "Sturdy", "Sunlit",
-    "Sunny", "Swift", "Tame", "Tangy", "Tender", "Tidy", "Topaz", "Tranquil", "Trusty", "Twilight",
-    "Upbeat", "Valiant", "Verdant", "Vivid", "Warm", "Willing", "Winsome", "Wise", "Witty",
-    "Wondrous", "Woodland", "Young", "Zesty",
-];
-const DEFAULT_PROFILE_NOUNS: &[&str] = &[
-    "Albatross",
-    "Alpaca",
-    "Ant",
-    "Antelope",
-    "Armadillo",
-    "Badger",
-    "Bat",
-    "Bear",
-    "Beaver",
-    "Bee",
-    "Bison",
-    "Bluebird",
-    "Bobcat",
-    "Bullfrog",
-    "Bumblebee",
-    "Butterfly",
-    "Camel",
-    "Caribou",
-    "Cat",
-    "Caterpillar",
-    "Cheetah",
-    "Chickadee",
-    "Chinchilla",
-    "Chipmunk",
-    "Cobra",
-    "Condor",
-    "Cougar",
-    "Crab",
-    "Crane",
-    "Cricket",
-    "Crow",
-    "Deer",
-    "Dingo",
-    "Dolphin",
-    "Dove",
-    "Dragonfly",
-    "Duck",
-    "Eagle",
-    "Egret",
-    "Elephant",
-    "Elk",
-    "Falcon",
-    "Fawn",
-    "Ferret",
-    "Finch",
-    "Firefly",
-    "Flamingo",
-    "Flounder",
-    "Fox",
-    "Gazelle",
-    "Gecko",
-    "Giraffe",
-    "Goat",
-    "Goose",
-    "Gopher",
-    "Grouse",
-    "Hare",
-    "Hawk",
-    "Hedgehog",
-    "Heron",
-    "Hippo",
-    "Hornet",
-    "Horse",
-    "Hummingbird",
-    "Ibex",
-    "Iguana",
-    "Jackal",
-    "Jaguar",
-    "Jay",
-    "Kestrel",
-    "Kingfisher",
-    "Kiwi",
-    "Koala",
-    "Ladybug",
-    "Lark",
-    "Leopard",
-    "Lion",
-    "Llama",
-    "Lynx",
-    "Macaw",
-    "Magpie",
-    "Mallard",
-    "Manatee",
-    "Marmot",
-    "Meerkat",
-    "Mink",
-    "Mole",
-    "Mongoose",
-    "Monkey",
-    "Moose",
-    "Mouse",
-    "Narwhal",
-    "Newt",
-    "Nightingale",
-    "Octopus",
-    "Opossum",
-    "Orca",
-    "Oriole",
-    "Ostrich",
-    "Otter",
-    "Owl",
-    "Panda",
-    "Parrot",
-    "Peacock",
-    "Pelican",
-    "Penguin",
-    "Pheasant",
-    "Pigeon",
-    "Pony",
-    "Porcupine",
-    "Puffin",
-    "Quail",
-    "Rabbit",
-    "Raccoon",
-    "Ram",
-    "Raven",
-    "Reindeer",
-    "Rhino",
-    "Roadrunner",
-    "Robin",
-    "Salamander",
-    "Salmon",
-    "Seal",
-    "Swan",
-    "Tiger",
-    "Turtle",
-    "Wolf",
-    "Yak",
-];
 
 type AppRuntime = AccountDeviceRuntime<
     MarmotRelayPlaneAccountAdapter,
@@ -6423,18 +6278,6 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
 
 fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
     cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
-}
-
-fn default_profile_pseudonym(account_id_hex: &str) -> String {
-    let digest = Sha256::digest(account_id_hex.as_bytes());
-    let adjective_index =
-        u16::from_be_bytes([digest[0], digest[1]]) as usize % DEFAULT_PROFILE_ADJECTIVES.len();
-    let noun_index =
-        u16::from_be_bytes([digest[2], digest[3]]) as usize % DEFAULT_PROFILE_NOUNS.len();
-    format!(
-        "{} {}",
-        DEFAULT_PROFILE_ADJECTIVES[adjective_index], DEFAULT_PROFILE_NOUNS[noun_index]
-    )
 }
 
 fn unix_now_seconds() -> u64 {

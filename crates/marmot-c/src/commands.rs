@@ -1158,9 +1158,11 @@ pub unsafe extern "C" fn marmot_npub(
     })
 }
 
-/// Hex account id for an `npub`/hex reference; NULL with
-/// `MARMOT_STATUS_OK` when the input does not decode. Free with
-/// `marmot_string_free`.
+/// Hex account id for an `npub`/hex/`nprofile` reference; NULL with
+/// `MARMOT_STATUS_OK` when the input does not decode. Accepts hex,
+/// `npub`, `nostr:npub`, `nprofile`, `nostr:nprofile`, and
+/// `marmot://profile/` links. nprofile relay hints are discarded. Free
+/// with `marmot_string_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; `reference` a valid string; `out`
@@ -1177,6 +1179,55 @@ pub unsafe extern "C" fn marmot_account_id_hex(
         let reference = try_arg!(unsafe { required_str(reference) });
         deliver_plain_opt_string(client.marmot.account_id_hex(reference), out)
     })
+}
+
+/// Deterministic cosmetic display name for a canonical hex account id.
+/// Free with `marmot_string_free`. Decode a scanned reference with
+/// `marmot_account_id_hex` first; the seed is hashed as supplied text.
+///
+/// # Safety
+/// Same as `marmot_account_id_hex`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_default_profile_pseudonym(
+    client: *const MarmotClient,
+    account_id_hex: *const c_char,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_id_hex = try_arg!(unsafe { required_str(account_id_hex) });
+        deliver_plain_string(client.marmot.default_profile_pseudonym(account_id_hex), out)
+    })
+}
+
+/// Random cosmetic display name from the shared wordlists. Free with
+/// `marmot_string_free`. This does not create an account or generate a
+/// signing key.
+///
+/// # Safety
+/// `client` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_random_profile_pseudonym(
+    client: *const MarmotClient,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        deliver_plain_string(client.marmot.random_profile_pseudonym(), out)
+    })
+}
+
+fn deliver_plain_string(value: String, out: *mut *mut c_char) -> MarmotStatus {
+    let ptr = crate::memory::owned_c_string(value);
+    match unsafe { write_out(out, ptr) } {
+        Ok(()) => MarmotStatus::Ok,
+        Err(status) => {
+            unsafe { crate::memory::free_c_string(ptr) };
+            status
+        }
+    }
 }
 
 fn deliver_plain_opt_string(value: Option<String>, out: *mut *mut c_char) -> MarmotStatus {
@@ -2674,4 +2725,82 @@ pub unsafe extern "C" fn marmot_set_product_analytics_activity(
             ),
         )
     })
+}
+
+#[cfg(test)]
+mod identity_pointer_tests {
+    use super::{
+        marmot_account_id_hex, marmot_default_profile_pseudonym, marmot_random_profile_pseudonym,
+    };
+    use crate::MarmotStatus;
+    use std::ffi::CString;
+    use std::ptr;
+
+    #[test]
+    fn identity_wrappers_reject_null_out_before_work() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        assert_eq!(
+            unsafe { marmot_account_id_hex(ptr::null(), account.as_ptr(), ptr::null_mut()) },
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe {
+                marmot_default_profile_pseudonym(ptr::null(), account.as_ptr(), ptr::null_mut())
+            },
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe { marmot_random_profile_pseudonym(ptr::null(), ptr::null_mut()) },
+            MarmotStatus::NullPointer
+        );
+    }
+
+    #[test]
+    fn identity_wrappers_clear_out_when_client_or_input_is_null() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        let mut out = 0x10 as *mut std::ffi::c_char;
+        assert_eq!(
+            unsafe { marmot_account_id_hex(ptr::null(), account.as_ptr(), &raw mut out) },
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+
+        out = 0x10 as *mut std::ffi::c_char;
+        assert_eq!(
+            unsafe {
+                marmot_default_profile_pseudonym(ptr::null(), account.as_ptr(), &raw mut out)
+            },
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+
+        out = 0x10 as *mut std::ffi::c_char;
+        assert_eq!(
+            unsafe { marmot_random_profile_pseudonym(ptr::null(), &raw mut out) },
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn deliver_plain_string_balances_owned_output() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            super::deliver_plain_string("Loyal Crane".to_owned(), &raw mut out),
+            MarmotStatus::Ok
+        );
+        assert!(!out.is_null());
+        unsafe { crate::memory::free_c_string(out) };
+
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
 }

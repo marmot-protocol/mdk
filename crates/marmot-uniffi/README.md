@@ -20,6 +20,22 @@ same UniFFI surface, and releases publish it once.
 bindings to handle the new tag; older generated sources cannot render it.
 No generated Swift or Kotlin files are committed here.
 
+## Identity references and profile pseudonyms
+
+`accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
+`nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
+`nostr:npub`, and `marmot://profile/` links. Relay hints inside an
+nprofile are discarded and never used for routing or directory mutation.
+Decode a scanned reference first, then pass the canonical lowercase hex
+account id to `defaultProfilePseudonym` so the shared text-hash seed is
+preserved. `randomProfilePseudonym` replaces client-owned random-roll
+wordlists; it is cosmetic, may collide, and does not create an account.
+
+Regenerate Swift/Kotlin bindings after pulling this surface. Android
+mention/QR/edit-profile migration remains
+[whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
+MDK completion enables that follow-through but does not replace it.
+
 See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
 checksums, provenance, and generated-source synchronization rules.
 
