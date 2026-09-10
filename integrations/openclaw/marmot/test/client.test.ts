@@ -10,6 +10,7 @@ import {
   decodeAgentControlEvent,
   normalizeHex,
 } from "../src/client.js";
+import { MarmotLivePreview } from "../src/live.js";
 
 const PROTOCOL = "marmot.agent-control.v2";
 const HEX32 = (b: string) => b.repeat(32);
@@ -193,7 +194,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
   }
 }
 
-function startServer(socketPath: string, responseDelayMs = 0): Promise<Server> {
+function startServer(socketPath: string, responseDelayMs = 0, handle = handleRequest): Promise<Server> {
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0);
     socket.on("data", (chunk) => {
@@ -205,9 +206,9 @@ function startServer(socketPath: string, responseDelayMs = 0): Promise<Server> {
         if (line.length > 0) {
           const req = JSON.parse(line.toString("utf8"));
           if (responseDelayMs > 0) {
-            setTimeout(() => handleRequest(socket, req), responseDelayMs);
+            setTimeout(() => handle(socket, req), responseDelayMs);
           } else {
-            handleRequest(socket, req);
+            handle(socket, req);
           }
         }
         index = buffer.indexOf(0x0a);
@@ -441,7 +442,38 @@ describe("MarmotAgentControlClient", () => {
     await expect(client.request({ type: "explode" })).rejects.toMatchObject({
       name: "AgentControlError",
       code: "bad_request",
+      retryable: false,
     });
+  });
+
+  it("retries a retryable stream_finish response with the same key", async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const keys: unknown[] = [];
+    server = await startServer(socketPath, 0, (socket, req) => {
+      if (req.type === "stream_append") {
+        send(socket, req.id, { type: "ack" });
+        return;
+      }
+      if (req.type === "stream_finish") {
+        keys.push(req.idempotency_key);
+        if (keys.length === 1) {
+          send(socket, req.id, {
+            type: "error", code: "send_failed", message: "retry", retryable: true,
+          });
+          return;
+        }
+      }
+      handleRequest(socket, req);
+    });
+    const preview = new MarmotLivePreview(client, {
+      accountIdHex: HEX32("aa"), groupIdHex: HEX32("cc"), quicCandidates: [],
+    });
+    await expect(preview.finalize("done")).resolves.toMatchObject({
+      messageIdsHex: [HEX32("99")],
+    });
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toEqual(expect.any(String));
+    expect(keys[1]).toBe(keys[0]);
   });
 
   it("rejects a mismatched response id", async () => {

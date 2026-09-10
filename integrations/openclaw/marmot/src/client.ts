@@ -1104,6 +1104,7 @@ function raiseIfError(frame: Envelope): void {
   if (frame.type === "error") {
     throw new AgentControlError(String(frame.message ?? "agent control error"), {
       code: String(frame.code ?? "agent_control_error"),
+      retryable: frame.retryable === true,
     });
   }
 }
