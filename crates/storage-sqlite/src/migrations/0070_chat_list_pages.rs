@@ -40,12 +40,14 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
                 ELSE 1 END)";
     let archived = "COALESCE((SELECT archived FROM account_groups WHERE group_id_hex = chat_list_rows.group_id_hex), archived)";
     let pending = "COALESCE((SELECT pending_confirmation FROM account_groups WHERE group_id_hex = chat_list_rows.group_id_hex), pending_confirmation)";
-    let refresh = format!("UPDATE chat_list_rows SET
+    let refresh = format!(
+        "UPDATE chat_list_rows SET
         list_scope = CASE WHEN {left} THEN 2 WHEN {archived} != 0 THEN 1 ELSE 0 END,
-        list_unread = ({pending} = 0 AND (unread_count > 0 OR manually_marked_unread != 0)),
-        list_pin_ordinal = COALESCE((SELECT ordinal FROM chat_pin_positions WHERE group_id_hex = chat_list_rows.group_id_hex), -1),
-        list_pin_position = (SELECT (SELECT count(*) FROM chat_pin_positions earlier WHERE earlier.ordinal < pin.ordinal) FROM chat_pin_positions pin WHERE pin.group_id_hex = chat_list_rows.group_id_hex)");
-    tx.execute_batch(&format!("{refresh};
+        list_unread = ({pending} = 0 AND (unread_count > 0 OR manually_marked_unread != 0))"
+    );
+    let refresh_pins = "UPDATE chat_list_rows SET list_pin_ordinal = COALESCE((SELECT ordinal FROM chat_pin_positions WHERE group_id_hex = chat_list_rows.group_id_hex), -1),
+        list_pin_position = (SELECT (SELECT count(*) FROM chat_pin_positions earlier WHERE earlier.ordinal < pin.ordinal) FROM chat_pin_positions pin WHERE pin.group_id_hex = chat_list_rows.group_id_hex)";
+    tx.execute_batch(&format!("{refresh}; {refresh_pins};
         CREATE INDEX idx_chat_list_page ON chat_list_rows(list_scope, list_pin_section, list_pin_order, list_activity_order, group_id_hex);
         CREATE INDEX idx_chat_list_unread_page ON chat_list_rows(list_pin_section, list_pin_order, list_activity_order, group_id_hex)
             WHERE list_scope = 0 AND list_unread = 1;
@@ -115,9 +117,30 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
                 "DELETE" => format!("group_id_hex = {}", key("OLD")),
                 _ => format!("group_id_hex IN ({}, {})", key("OLD"), key("NEW")),
             };
+            let changed = if operation == "UPDATE" {
+                format!(
+                    "WHEN {}",
+                    updates
+                        .split(", ")
+                        .map(|column| format!("OLD.{column} IS NOT NEW.{column}"))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                )
+            } else {
+                String::new()
+            };
+            let pins = match (table, operation) {
+                ("chat_pin_positions", _) | ("chat_list_rows", "INSERT") => {
+                    format!("{refresh_pins} WHERE {filter};")
+                }
+                ("chat_list_rows", "UPDATE") => format!(
+                    "{refresh_pins} WHERE {filter} AND OLD.group_id_hex IS NOT NEW.group_id_hex;"
+                ),
+                _ => String::new(),
+            };
             tx.execute_batch(&format!(
                 "CREATE TRIGGER chat_list_keys_{table}_{operation}
-                AFTER {event} ON {table} BEGIN {refresh} WHERE {filter}; END;"
+                AFTER {event} ON {table} {changed} BEGIN {refresh} WHERE {filter}; {pins} END;"
             ))
             .storage()?;
         }

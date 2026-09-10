@@ -446,15 +446,7 @@ fn reopening_preserves_queued_leave_and_bounded_navigation() {
 
 #[test]
 fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
-    use rusqlite::{
-        StatementStatus,
-        trace::{TraceEvent, TraceEventCodes},
-    };
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static STEPS: AtomicI64 = AtomicI64::new(0);
-    thread_local! {
-        static START_STEPS: std::cell::RefCell<std::collections::HashMap<String, i32>> = std::cell::RefCell::new(std::collections::HashMap::new());
-    }
+    use crate::query_work_test_support::measure;
     for count in [256, 4096] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         {
@@ -483,48 +475,13 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                 (ChatListPageDirection::Forward, None),
                 (ChatListPageDirection::Backward, tail.first),
             ] {
-                {
-                    let conn = store.lock().unwrap();
-                    conn.flush_prepared_statement_cache();
-                    STEPS.store(0, Ordering::Relaxed);
-                    conn.trace_v2(
-                        TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_STMT,
-                        Some(|event| match event {
-                            TraceEvent::Stmt(statement, _) => {
-                                START_STEPS.with_borrow_mut(|steps| {
-                                    steps.insert(
-                                        statement.sql().into_owned(),
-                                        statement.get_status(StatementStatus::VmStep),
-                                    );
-                                })
-                            }
-                            TraceEvent::Profile(statement, _) => {
-                                // Cached statements keep cumulative counters. Measure each execution,
-                                // rather than counting all earlier executions again at every row.
-                                let before = START_STEPS.with_borrow(|steps| {
-                                    steps.get(statement.sql().as_ref()).copied().unwrap_or(0)
-                                });
-                                STEPS.fetch_add(
-                                    i64::from(
-                                        statement.get_status(StatementStatus::VmStep) - before,
-                                    ),
-                                    Ordering::Relaxed,
-                                );
-                            }
-                            _ => {}
-                        }),
-                    );
-                }
-                let result = store
-                    .chat_list_page(query(view, 10, direction, cursor.clone()))
-                    .unwrap();
-                store
-                    .lock()
-                    .unwrap()
-                    .trace_v2(TraceEventCodes::empty(), None);
-                let steps = STEPS.load(Ordering::Relaxed);
+                let (result, steps) = measure(&store, || {
+                    store
+                        .chat_list_page(query(view, 10, direction, cursor.clone()))
+                        .unwrap()
+                });
                 assert!(
-                    steps < 6000,
+                    steps < 2200,
                     "{count} {view:?} {direction:?}: {steps} VM steps"
                 );
                 assert!(!result.rows.is_empty() && result.rows.len() <= 10);
@@ -551,6 +508,29 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                 assert!(plan.contains(view.index()), "{plan}");
             }
         }
+        // Test late pinned and unpinned rows: ordinary message/read writes must not
+        // scan pin ranks or unrelated conversations while maintaining the navigation keys.
+        for id in [count - 2, count - 1] {
+            let group = format!("{id:032x}");
+            let (_, steps) = measure(&store, || {
+                store.lock().unwrap().execute(
+                    "UPDATE chat_list_rows SET unread_count = unread_count + 1, activity_sort_at = activity_sort_at + 1 WHERE group_id_hex = ?1", [&group]).unwrap();
+            });
+            eprintln!("rows={count} source_update_vm_steps={steps}");
+            assert!(steps < 1000, "{count} source write: {steps} VM steps");
+        }
+        let (_, rank_steps) = measure(&store, || {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM chat_pin_positions WHERE ordinal < ?1",
+                    [count - 2],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        });
+        eprintln!("rows={count} single_legacy_pin_rank_vm_steps={rank_steps}");
     }
 }
 
@@ -620,4 +600,98 @@ fn legacy_disband_record_without_status_retains_pending_semantics() {
     store.lock().unwrap().execute_batch("UPDATE cgka_disband_requests SET record = CAST(json_remove(CAST(record AS TEXT),'$.status') AS BLOB)").unwrap();
     assert!(page(&store, ChatListView::Left).rows[0].disbanding);
     assert!(page(&store, ChatListView::Chats).rows.is_empty());
+}
+
+#[test]
+fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_at_top() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for n in 1..=260 {
+        seed(&store, &format!("{n:04x}"), false, "member", 1, false);
+    }
+    for tick in 1..=3 {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE chat_list_rows SET activity_sort_at = ?1 WHERE group_id_hex = '0001'",
+                [tick],
+            )
+            .unwrap();
+        let anchored = store
+            .chat_list_page_from_anchor(
+                ChatListView::Chats,
+                "00c8",
+                50,
+                ChatListPageDirection::Forward,
+            )
+            .unwrap();
+        assert_eq!(anchored.rows.first().unwrap().group_id_hex, "00c8");
+        assert_eq!(anchored.rows.len(), 50);
+        assert!(anchored.has_more_before && anchored.has_more_after);
+        let preceding = store
+            .chat_list_page_from_anchor(
+                ChatListView::Chats,
+                "00c8",
+                50,
+                ChatListPageDirection::Backward,
+            )
+            .unwrap();
+        assert_eq!(preceding.rows.last().unwrap().group_id_hex, "00c8");
+    }
+    assert!(matches!(
+        store.chat_list_page_from_anchor(
+            ChatListView::Archived,
+            "00c8",
+            50,
+            ChatListPageDirection::Forward
+        ),
+        Err(ChatListPageError::AnchorUnavailable)
+    ));
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM chat_list_rows WHERE group_id_hex = '00c8'", [])
+        .unwrap();
+    assert!(matches!(
+        store.chat_list_page_from_anchor(
+            ChatListView::Chats,
+            "00c8",
+            50,
+            ChatListPageDirection::Forward
+        ),
+        Err(ChatListPageError::AnchorUnavailable)
+    ));
+}
+
+#[test]
+fn accepting_an_archived_invite_preserves_archive_and_source_fields() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "01", true, "member", 7, true);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET pending_confirmation = 0 WHERE group_id_hex = '01'",
+            [],
+        )
+        .unwrap();
+    let archived = page(&store, ChatListView::Archived);
+    assert_eq!(ids(&archived), ["01"]);
+    assert!(archived.rows[0].archived);
+    assert!(!archived.rows[0].pending_confirmation);
+    assert_eq!(archived.rows[0].unread_count, 7);
+    assert!(page(&store, ChatListView::Chats).rows.is_empty());
+    assert!(page(&store, ChatListView::Unread).rows.is_empty());
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET archived = 0 WHERE group_id_hex = '01'",
+            [],
+        )
+        .unwrap();
+    let active = page(&store, ChatListView::Unread);
+    assert!(!active.rows[0].archived);
+    // The source overlay is observable even before the legacy row is refreshed.
+    assert!(store.chat_list_row("01").unwrap().unwrap().archived);
 }

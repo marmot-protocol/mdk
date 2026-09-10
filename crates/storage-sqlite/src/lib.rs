@@ -17,6 +17,8 @@ mod migrations;
 mod openmls_storage;
 mod pending_welcome_delivery;
 mod prepared_group_image_upload;
+#[cfg(test)]
+mod query_work_test_support;
 mod recovery_health;
 mod shared;
 mod storage;
