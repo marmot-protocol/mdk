@@ -9,6 +9,26 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.21] - 2026-09-10
+
+### Release notes
+
+- Host-driven agent stream publishing is available through the runtime,
+  Swift/Kotlin, and C bindings.
+- Audit uploads use the v4 schema and hardware model metadata. Hosts must
+  adopt the v4 tracker config and regenerate bindings; startup removes
+  recognized legacy v1-v3 forensic files while preserving v4 and key-reveal logs.
+- Account storage advances through migrations 68–69 for bounded media-retention
+  and chat-readiness queries. Back up before upgrading; downgrade is unsupported.
+  Re-upgrade or restore a pre-upgrade database/export. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before 0.9.15 also cross migration 47: keep at least 3.25 times
+  the account database size free for its history-table rebuild.
+- Epoch-gap backfill intents are discarded for groups this device has left or
+  been removed from. Chat-list and media-retention database work is bounded.
+- Update generated source and native libraries together. C consumers must
+  rebuild against the matching header because record layouts changed.
+
 ### Added
 
 - App-message Markdown now emits a structured `Details` block for structural
