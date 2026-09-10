@@ -35,17 +35,21 @@ fn fresh_deferred_peel_lifecycle(
 /// Durable half of `Engine::retire_deferred_peel_rows_for_terminal_group`:
 /// flip every `PeelDeferred` row of a terminal group to `Failed` and hand back
 /// what was retired, for the caller's in-memory reconciliation. Takes `&S` so
-/// it can run inside a storage transaction.
+/// it runs inside the caller's storage transaction.
+///
+/// All rows flip or none do, and that is a contract on the caller: run this
+/// inside a transaction — the disband settle's own, or the one
+/// `Engine::retire_deferred_peel_rows_for_terminal_group` opens. Without one,
+/// each write autocommits, so a mid-loop failure would leave earlier rows
+/// durably `Failed` while the error skips the in-memory release: those rows
+/// would keep their capacity slot with no transition audit, and a retry
+/// enumerates only `PeelDeferred` rows so it would never revisit them. Inside
+/// a transaction a failed retire instead leaves every row `PeelDeferred` for
+/// the next pass, and nothing is ever charged without its audit row.
 ///
 /// Enumerates metadata, never payloads: this runs inside the disband write
 /// transaction, where loading up to `MAX_PEEL_DEFERRED_BYTES_PER_GROUP` of
 /// ciphertext nobody reads would be copied and held across the commit.
-///
-/// A partial application is a valid state, so the callers that run this
-/// outside a transaction need no compensation: some rows retired and the rest
-/// still `PeelDeferred` is exactly what a re-entry finishes, and rows whose
-/// in-memory slot was never returned stay conservatively charged until the
-/// next open recounts them.
 #[must_use = "every returned row still owes its in-memory capacity slot; pass \
               them to Engine::release_retired_deferred_peel_rows once the \
               durable flip is committed, or the group's deferred-peel budget \
@@ -785,7 +789,13 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
-        let retired = fail_deferred_peel_rows_in_terminal_group(&self.storage, group_id)?;
+        // One durable unit: see the free function's contract. Nesting is
+        // safe — the SQLite backend reuses a same-thread outer transaction
+        // rather than beginning a second one — so a caller that already holds
+        // one loses nothing by coming through here.
+        let retired = self.storage.with_transaction(|storage| {
+            fail_deferred_peel_rows_in_terminal_group(storage, group_id)
+        })?;
         self.release_retired_deferred_peel_rows(&retired);
         Ok(())
     }

@@ -282,6 +282,38 @@ impl LeaveWriteFault {
     }
 }
 
+/// Nth-write arm like [`LeaveWriteFault`], but scoped to
+/// `update_message_state(_, Failed)` so unrelated state transitions in the
+/// same ingest do not consume it.
+#[derive(Clone, Default)]
+struct FailedStateWriteFault(Arc<AtomicUsize>);
+
+impl FailedStateWriteFault {
+    #[cfg(feature = "test-policy-overrides")]
+    fn arm_on_write(&self, write: usize) {
+        assert!(write > 0);
+        self.0.store(write, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    fn disarm(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    fn should_fail(&self, new_state: MessageState) -> bool {
+        if new_state != MessageState::Failed {
+            return false;
+        }
+        matches!(
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                }),
+            Ok(1)
+        )
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
 /// selected record/cache writes. Every other call delegates unchanged.
 struct FaultStorage {
@@ -290,6 +322,7 @@ struct FaultStorage {
     capability_fault: CapabilityWriteFault,
     leave_write_fault: LeaveWriteFault,
     intent_write_fault: LeaveWriteFault,
+    failed_state_fault: FailedStateWriteFault,
     preparation_delay: PreparationDelay,
 }
 
@@ -365,6 +398,11 @@ impl MessageStorage for FaultStorage {
         self.inner.delete_message(id)
     }
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
+        if self.failed_state_fault.should_fail(new_state) {
+            return Err(StorageError::Busy(
+                "injected message-state write failure".into(),
+            ));
+        }
         self.inner.update_message_state(id, new_state)
     }
     fn list_messages(
@@ -761,6 +799,7 @@ fn build_fault_selfremove_client(
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -785,6 +824,7 @@ fn build_capability_fault_client(
         capability_fault,
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -810,6 +850,7 @@ fn build_leave_write_fault_client(
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault,
         intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -1622,6 +1663,7 @@ async fn slow_preparation_case(
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: delay.clone(),
     })
     .legacy_compatibility_profile()
@@ -1924,6 +1966,7 @@ async fn setup_own_intent_fault_case(
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: fault,
+        failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -2052,4 +2095,240 @@ async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
             1
         );
     }
+}
+
+/// Marker prefix for synthetic transport objects [`MarkerOpaquePeeler`]
+/// refuses to peel, so a test can retain `PeelDeferred` rows while real MLS
+/// traffic for the same group still peels and applies.
+#[cfg(feature = "test-policy-overrides")]
+const OPAQUE_MARKER: &[u8] = b"opaque-marker::";
+
+#[cfg(feature = "test-policy-overrides")]
+struct MarkerOpaquePeeler;
+
+#[cfg(feature = "test-policy-overrides")]
+#[async_trait]
+impl TransportPeeler for MarkerOpaquePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload.starts_with(OPAQUE_MARKER) {
+            return Err(PeelerError::DecryptFailed);
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn opaque_row(label: &[u8], group_id: &GroupId) -> TransportMessage {
+    let mut payload = OPAQUE_MARKER.to_vec();
+    payload.extend_from_slice(label);
+    payload.resize(OPAQUE_MARKER.len() + 32, 7);
+    TransportMessage {
+        id: MessageId::new(label.to_vec()),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+/// Retiring a terminal group's deferred-peel backlog is one durable unit.
+/// A storage failure part-way through must leave every row `PeelDeferred` —
+/// a row flipped `Failed` without its in-memory slot returned and without a
+/// transition audit row would be invisible to the retry, which enumerates
+/// `PeelDeferred` only, so it would hold its share of the account budget for
+/// the rest of the engine incarnation.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pass() {
+    let failed_state_fault = FailedStateWriteFault::default();
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let mut carol = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: failed_state_fault.clone(),
+        preparation_delay: PreparationDelay::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"carol-retire-atomic"))
+    .account_identity_proof_signer(proof_signer(b"carol-retire-atomic"))
+    .feature_registry(selfremove_registry())
+    .peeler(Box::new(MarkerOpaquePeeler))
+    .build()
+    .unwrap();
+    carol
+        .set_convergence_policy(cgka_engine::canonicalization::CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..cgka_engine::canonicalization::CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let mut alice = build_selfremove_client(b"alice-retire-atomic");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_a, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "retire atomically".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let welcome = welcomes
+        .iter()
+        .find(|welcome| {
+            matches!(&welcome.envelope, TransportEnvelope::Welcome { recipient }
+                if recipient == &MemberId::new(pad32(b"carol-retire-atomic")))
+        })
+        .cloned()
+        .expect("welcome for carol");
+    carol.join_welcome(welcome).await.unwrap();
+    carol.drain_events();
+
+    // Two retained rows in group A.
+    let rows = [
+        opaque_row(b"retire-atomic-0001", &group_a),
+        opaque_row(b"retire-atomic-0002", &group_a),
+    ];
+    for row in &rows {
+        assert!(matches!(
+            carol.ingest(row.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    let row_bytes = handle.get_message(&rows[0].id).unwrap().payload.len();
+
+    // A live group of carol's own, so the shared account budget is observable
+    // after group A goes terminal.
+    let (group_b, created_b) = carol
+        .create_group(CreateGroupRequest {
+            name: "carol's own".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created_b else {
+        panic!("group creation");
+    };
+    carol.confirm_published(pending).await.unwrap();
+    // Exactly the two group-A rows' worth of account budget.
+    carol.set_deferred_peel_limits_for_tests(512, usize::MAX, row_bytes.saturating_mul(2));
+
+    // Alice removes carol. The second row's `Failed` write fails mid-retire.
+    let removal = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_a.clone(),
+            members: vec![MemberId::new(pad32(b"carol-retire-atomic"))],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_a.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected group evolution, got {other:?}"),
+    };
+    failed_state_fault.arm_on_write(2);
+    // The removing commit may realize the removal on the direct apply or
+    // through a convergence pass; drive both so the retirement runs wherever
+    // this delivery happens to own it.
+    let mut error = carol.ingest(removal).await.err();
+    for _ in 0..4 {
+        if error.is_some()
+            || carol
+                .group_record(&group_a)
+                .is_ok_and(|group| group.removed)
+        {
+            break;
+        }
+        error = carol.advance_convergence(&group_a).await.err();
+    }
+    let error = error.expect("the injected mid-retire write failure must surface");
+    assert!(
+        format!("{error:?}").contains("injected message-state write failure"),
+        "unexpected retire error: {error:?}"
+    );
+
+    for row in &rows {
+        assert_eq!(
+            handle.get_message(&row.id).unwrap().state,
+            MessageState::PeelDeferred,
+            "a failed retirement must leave every row deferred for the next \
+             pass, never a mix the retry cannot see"
+        );
+    }
+    assert!(
+        matches!(
+            carol
+                .ingest(opaque_row(b"budget-probe-0001", &group_b))
+                .await
+                .unwrap(),
+            IngestOutcome::ResourceRefused { .. }
+        ),
+        "nothing was released, so the account budget is still fully charged"
+    );
+
+    // The terminal gate retries on the next advance and completes.
+    failed_state_fault.disarm();
+    carol.advance_convergence(&group_a).await.unwrap();
+    for row in &rows {
+        assert_eq!(
+            handle.get_message(&row.id).unwrap().state,
+            MessageState::Failed,
+            "the retry retires the whole backlog"
+        );
+    }
+    assert!(
+        matches!(
+            carol
+                .ingest(opaque_row(b"budget-probe-0002", &group_b))
+                .await
+                .unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "the completed retirement released the account bytes"
+    );
 }
