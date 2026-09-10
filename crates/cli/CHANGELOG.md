@@ -34,6 +34,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   revision advances only after a relay acknowledges the replacement, with retries across restarts. Older pending
   publications are superseded in the same slot with a newer timestamp while preserving their private bundles.
   Previous unused private bundles remain available until expiry; historical Welcome processing is unchanged.
+  **Compatibility:** inviting a peer still advertising an affected package fails with `InvalidKeyPackageCapabilities`
+  until that peer generates and publishes a conforming package. An upgraded sender cannot repair a recipient that
+  has not upgraded; automatic regeneration requires the recipient to upgrade, activate, and obtain a relay ACK.
+  This is a deliberate stricter admission policy to keep nonconforming signed leaves out of new membership state.
   The engine reports `InvalidKeyPackageCapabilities` with the affected member for typed callers, while diagnostic
   text omits identities and classifies the error as a deliberate protocol refusal.
 

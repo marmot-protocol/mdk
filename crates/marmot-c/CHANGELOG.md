@@ -22,7 +22,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   sibling accounts; cached packages no longer substitute when resolution fails. Prewarm retains discovery routes
   only, and `MarmotMemberKeyPackagePrewarmSummary::reused_members` remains present but always returns zero.
 - Create and Invite reject KeyPackages that explicitly advertise RFC 9420 default extension/proposal capabilities.
-  Local private-bundle retention and historical Welcome processing are unchanged.
+  **Compatibility:** inviting a peer still publishing an affected package fails (`InvalidKeyPackageCapabilities` in
+  the Rust engine) until that peer generates and publishes a conforming package. Upgraded recipients automatically
+  regenerate once on account activation; the durable generator revision advances only after a relay ACK, with
+  retries across restarts. Peers that have not upgraded are not repaired by a sender's upgrade. This deliberately
+  keeps nonconforming signed leaves out of new membership state. Previous unused private bundles retain their
+  expiry/consumption policy and historical Welcome processing is unchanged.
 
 - Search results include `is_followed_by_searcher`; streaming updates include keyed `updated_results` replacements
   and a `CachedResultsFound` trigger. Consumers must merge by account ID, including across radius pages, and use

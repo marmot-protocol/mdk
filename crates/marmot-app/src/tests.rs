@@ -8773,8 +8773,6 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         Some(old.clone())
     );
 
-    // A new sender on the same installation sees the existing shared directory.
-    app.account_home().create_account("new-sender").unwrap();
     let refreshed = fresh_key_package_for_account(&app, recipient, false).await;
     {
         let mut events = fetcher.events.lock().unwrap();
@@ -8986,6 +8984,38 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
         4,
         "create must reuse discovery routes but fetch KeyPackages again"
     );
+}
+
+#[tokio::test]
+async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_discovery() {
+    for incomplete in ["wss://directory.example", "wss://shared.example"] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+        let members = [accounts[0].account_id_hex.as_str()];
+        app.resolve_member_key_packages(&members).await.unwrap();
+        // Keep a usable durable inbox, but make its relay refresh incomplete.
+        // A successful KeyPackage fetch does not establish route freshness.
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
+        *fetcher.incomplete_endpoint.lock().unwrap() = Some(incomplete.to_owned());
+        app.prewarm_group_member_key_packages(&members)
+            .await
+            .unwrap();
+        fetcher.requests.lock().unwrap().clear();
+        *fetcher.incomplete_endpoint.lock().unwrap() = None;
+        app.resolve_member_key_packages(&members).await.unwrap();
+        assert!(
+            fetcher.requests.lock().unwrap().iter().any(|request| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == KIND_MARMOT_INBOX_RELAY_LIST)
+            }),
+            "Create must refresh metadata after an incomplete prewarm hop"
+        );
+    }
 }
 
 #[tokio::test]

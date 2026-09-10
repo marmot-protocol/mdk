@@ -190,6 +190,12 @@ struct MemberTarget {
     relay_records: Vec<crate::relay_plane::DirectoryRelayEventRecord>,
 }
 
+#[derive(Default)]
+struct RelayListResolution {
+    completed: HashSet<usize>,
+    errors: Vec<(usize, AppError)>,
+}
+
 #[allow(dead_code)]
 fn member_resolution_future_is_send(app: &MarmotApp) {
     fn assert_send<T: Send>(_: T) {}
@@ -346,7 +352,7 @@ impl MarmotApp {
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
-        let mut fresh_prewarmed_routes = HashSet::new();
+        let mut reused_prewarmed_routes = HashSet::new();
         for (index, target) in targets.iter_mut().enumerate() {
             // Recovery deliberately refreshes routes as well as packages.
             if purpose == MemberResolutionPurpose::CommitFresh {
@@ -376,7 +382,7 @@ impl MarmotApp {
                         )
                         .is_empty()
                 {
-                    fresh_prewarmed_routes.insert(index);
+                    reused_prewarmed_routes.insert(index);
                 }
             }
         }
@@ -385,15 +391,13 @@ impl MarmotApp {
         // refresh. Process-local prewarm entries have an enforced TTL and were
         // already resolved through the outbox path during composition.
         let relay_list_unresolved = (0..targets.len())
-            .filter(|index| !fresh_prewarmed_routes.contains(index))
+            .filter(|index| !reused_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
-        if !relay_list_unresolved.is_empty() {
-            for (index, error) in self
-                .resolve_missing_relay_lists(&mut targets, &relay_list_unresolved)
-                .await
-            {
-                outcomes[index] = Some(Err(error));
-            }
+        let relay_list_resolution = self
+            .resolve_missing_relay_lists(&mut targets, &relay_list_unresolved)
+            .await;
+        for (index, error) in relay_list_resolution.errors {
+            outcomes[index] = Some(Err(error));
         }
         let key_package_unresolved = (0..targets.len())
             .filter(|index| outcomes[*index].is_none())
@@ -437,9 +441,10 @@ impl MarmotApp {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for (index, target) in targets.iter().enumerate() {
-                    // Only new discovery renews the route deadline. A package
-                    // fetch through reused routes says nothing about their age.
-                    if !fresh_prewarmed_routes.contains(&index)
+                    // Only completed discovery renews the route deadline.
+                    // A usable package can arrive after an incomplete metadata
+                    // hop retained an older durable inbox/outbox projection.
+                    if relay_list_resolution.completed.contains(&index)
                         && matches!(outcomes[index], Some(Ok(_)))
                     {
                         cache.insert(target.account_id_hex.clone(), target.relay_lists.clone());
@@ -672,14 +677,14 @@ impl MarmotApp {
         &self,
         targets: &mut [MemberTarget],
         unresolved: &[usize],
-    ) -> Vec<(usize, AppError)> {
+    ) -> RelayListResolution {
         let needs_discovery = unresolved.to_vec();
         if needs_discovery.is_empty() {
-            return Vec::new();
+            return RelayListResolution::default();
         }
         let endpoints = self.directory_source_relays(&[]);
         if endpoints.is_empty() {
-            return Vec::new();
+            return RelayListResolution::default();
         }
         let completed_discovery = self
             .resolve_relay_list_hop(targets, vec![(endpoints.clone(), needs_discovery.clone())])
@@ -724,7 +729,12 @@ impl MarmotApp {
         let completed_outbox = self
             .resolve_relay_list_hop(targets, by_outboxes.into_iter().collect())
             .await;
-        needs_discovery
+        let completed = completed_discovery
+            .iter()
+            .copied()
+            .filter(|index| !attempted_outbox.contains(index) || completed_outbox.contains(index))
+            .collect();
+        let errors = needs_discovery
             .into_iter()
             .filter(|index| {
                 let has_inbox = !self
@@ -752,7 +762,8 @@ impl MarmotApp {
                     ),
                 )
             })
-            .collect()
+            .collect();
+        RelayListResolution { completed, errors }
     }
 
     async fn resolve_missing_key_packages(

@@ -32,6 +32,8 @@ Only a relay acknowledgement promotes the current revision; remaining targets ke
 An old pending replacement is superseded with a strictly newer authoring timestamp in the same stable slot, and
 its private bundle is retained until expiry because publication may already have occurred. Previous unused current
 bundles retain their existing expiry/consumption policy. Ordinary releases do not bump the generator revision.
+Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
+older pending revision because that requires generating new private material.
 
 ## Routing model
 

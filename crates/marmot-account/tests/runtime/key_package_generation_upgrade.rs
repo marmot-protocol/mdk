@@ -81,6 +81,8 @@ async fn key_package_generation_upgrade_retries_across_restart_and_rotates_only_
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(7)),
     );
+    // Pause still permits completion of this already prepared current-revision artifact.
+    restarted.pause_maintenance();
     restarted.run_due_maintenance().await.unwrap();
     let promoted = restarted.key_package_maintenance_status().unwrap().unwrap();
     assert_eq!(
@@ -201,6 +203,19 @@ async fn key_package_generation_upgrade_supersedes_old_pending_bundles_without_d
         );
         assert!(restarted.key_package_generation_upgrade_due().unwrap());
         assert!(restarted.key_package_network_maintenance_due().unwrap());
+        restarted.pause_maintenance();
+        restarted.run_due_maintenance().await.unwrap();
+        assert_eq!(
+            restarted.key_package_maintenance_status().unwrap(),
+            Some(old.clone()),
+            "paused maintenance must neither replace nor publish obsolete pending material"
+        );
+        assert_eq!(
+            restarted.durably_owned_key_packages().unwrap(),
+            vec![old_pending.key_package.clone()]
+        );
+        assert!(publisher.publications().is_empty());
+        restarted.resume_maintenance();
         restarted.run_due_maintenance().await.unwrap();
         let upgraded = restarted.key_package_maintenance_status().unwrap().unwrap();
         assert_eq!(

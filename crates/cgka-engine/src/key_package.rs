@@ -338,9 +338,15 @@ impl<S: StorageProvider> Engine<S> {
 }
 
 /// Enforce the RFC 9420 section 7.2 advertisement rule before using a
-/// KeyPackage for a new membership operation. Keep this out of the shared
-/// storage/maintenance validator: old private bundles may still be needed to
-/// process Welcomes sent before the peer refreshed its public KeyPackage.
+/// KeyPackage for a new membership operation. This is an intentional admission
+/// policy beyond RFC 9420 section 7.3 / OpenMLS validation: avoid copying known
+/// nonconforming signed leaves into new membership state. The inviter cannot
+/// repair the advertisement without invalidating its signature; the recipient
+/// must regenerate it. This accepts a cross-version availability cost until
+/// affected recipients upgrade and publish a conforming package.
+/// Keep this out of the shared storage/maintenance validator: old private
+/// bundles may still be needed to process Welcomes sent before the peer
+/// refreshed its public KeyPackage.
 fn validate_invitee_capabilities(
     key_package: &MlsKeyPackage,
     member: cgka_traits::MemberId,

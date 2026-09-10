@@ -1477,10 +1477,17 @@ where
             }
         }
         let key_package_due = self.key_package_network_maintenance_due()?;
+        // Paused maintenance may finish existing publication intent, but an
+        // obsolete pending generator revision requires fresh private material
+        // and therefore waits for resume like every other new preparation.
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
-            .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some());
+            .is_some_and(|lifecycle| {
+                lifecycle.pending_replacement.is_some_and(|pending| {
+                    pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                })
+            });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
             let result = self.publish_fresh_key_package().await;

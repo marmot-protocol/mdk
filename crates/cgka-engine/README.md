@@ -61,6 +61,13 @@ Create and Invite validate transported KeyPackages through OpenMLS and the Marmo
 adding members. They also reject LeafNode capabilities that explicitly advertise RFC 9420 section 7.2 default
 extension or proposal types. Unknown capability values remain accepted for protocol extensibility.
 
+This is an explicit admission policy beyond the [RFC 9420 section 7.3 validation checks](https://www.rfc-editor.org/rfc/rfc9420.html#section-7.3):
+OpenMLS accepts these advertisements, but MDK chooses to keep known nonconforming signed leaves out of new
+membership state. An inviter cannot repair a signed advertisement. The accepted compatibility cost is that
+Create/Invite to a peer still publishing an affected package fails with `InvalidKeyPackageCapabilities` until that
+peer regenerates and publishes a conforming package. Automatic migration in this release only helps recipients
+that upgrade and activate successfully; it cannot repair packages on peers that have not upgraded.
+
 Recipients whose published packages contain the former default-capability advertisement must generate a fresh
 package using the corrected client. The account runtime records a per-account-device generator revision and
 MarmotApp attempts a one-time fresh publication on activation after upgrading. Offline or signing failures remain
