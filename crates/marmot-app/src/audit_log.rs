@@ -26,6 +26,9 @@ use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_
 use crate::error::AppError;
 use crate::{MarmotApp, config};
 
+mod legacy_cleanup;
+pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
+
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// Always-on, append-only per-account key-reveal audit log (mdk#543).
