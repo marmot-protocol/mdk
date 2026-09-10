@@ -55,6 +55,15 @@ still agree after the world gets messy.
 
 See [`tests/AGENTS.md`](tests/AGENTS.md) for the test file map.
 
+## KeyPackage validation before membership changes
+
+Create and Invite validate transported KeyPackages through OpenMLS and the Marmot identity/profile checks before
+adding members. They also reject LeafNode capabilities that explicitly advertise RFC 9420 section 7.2 default
+extension or proposal types. Unknown capability values remain accepted for protocol extensibility.
+
+This membership check does not change local private-bundle retention or historical Welcome processing. Directory
+metadata can still describe an older package; that does not make it eligible for a new membership operation.
+
 ## Promoting state-bearing app components
 
 `upgrade_group_capabilities` only promotes state-bearing app components whose

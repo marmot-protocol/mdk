@@ -1529,16 +1529,14 @@ impl AppClient {
             key_packages.is_ok(),
         );
         let resolved = key_packages?;
-        record_app_performance(
-            telemetry,
-            if resolved.stats.network_resolved_members == 0 {
-                AppPerformanceOperation::GroupCreateKeyPackageCacheReuse
-            } else {
-                AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution
-            },
-            key_package_elapsed,
-            true,
-        );
+        if resolved.stats.unique_members > 0 {
+            record_app_performance(
+                telemetry,
+                AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
+                key_package_elapsed,
+                true,
+            );
+        }
         let members = resolved.key_packages;
         self.refresh_routing()?;
         let nostr_routing = self.app.new_nostr_routing()?;

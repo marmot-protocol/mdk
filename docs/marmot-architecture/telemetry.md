@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-08
+updated: 2026-09-10
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -240,10 +240,10 @@ Collected operations:
 | `inbound_delivery_projection` | Worker claims a live relay delivery through ingestion, incidental publication, and projection broadcast. | Includes non-chat deliveries that reach ingestion and failures. Excludes known receipts skipped before ingestion, transport queue residence, startup/catch-up batches, and host rendering. |
 | `host_outbound_message_visible` | Host measures user send action through first rendered local bubble. | Report `OutboundMessageVisible` through the existing host-performance API; never infer it from SDK completion. |
 | `host_inbound_message_visible` | Host receives a message update through its first rendered frame. | Report `InboundMessageVisible`. This measures host rendering delay, not sender-to-recipient latency. |
-| `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension; includes either cache-only reuse or create-time relay resolution below. |
-| `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Aggregate duration only. No member count label, account/relay identity, reservation, or package consumption. |
-| `group_create_key_package_cache_reuse` | Successful create-time lookup when every canonical member was satisfied by revalidated local/directory state. | Closed operation name, not a caller-supplied label. A prewarm should shift the later Create wait into this bucket. |
-| `group_create_key_package_network_resolution` | Successful create-time lookup that required relay-list or KeyPackage network work for at least one canonical member. | Closed operation name, not a member-count or relay label. |
+| `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension, including failures and empty rosters. Every non-empty roster fetches KeyPackages from relays. |
+| `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Every call fetches KeyPackages; bounded discovery routes may be reused. Aggregate duration only, with no member count label, identity, reservation, or package consumption. |
+| `group_create_key_package_cache_reuse` | Retired operation; retained in the snapshot/export schema for compatibility. | Create no longer emits samples, including for empty rosters. A prewarm only reuses discovery routes; final KeyPackages still come from relays. |
+| `group_create_key_package_network_resolution` | Successful create-time lookup for a non-empty roster; every member requires a relay KeyPackage fetch. | Closed operation name, not a member-count or relay label. |
 | `group_create_queue_wait` | Time from enqueueing `CreateGroup` until the account worker begins it. | Separates worker contention from create work. |
 | `group_create_image_preprocess` | Prepared founding-image validation, dimension inspection, encryption, and SQLCipher staging. | Contains no network time. Rejections occur before encryption and upload. |
 | `group_create_image_upload` | Optional initial image selection/upload. | Recorded only when an initial image was supplied. |
@@ -256,7 +256,7 @@ Collected operations:
 | `group_create_post_mutation_catch_up` | Detached account catch-up scheduled after the create command response. | Also contributes to aggregate account catch-up telemetry. |
 | `group_create_total_caller_latency` | Public runtime create entry through the row-bearing worker response. | Includes queue wait, lookup, canonical MLS persistence, derived-index preparation, app projection persistence, and response handoff; excludes Welcome fanout and detached catch-up. |
 | `group_invite_members` | `AccountManager::invite_members()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Measures the public runtime invite envelope after any UniFFI admin preflight. |
-| `group_invite_key_package_lookup` | Invite path KeyPackage resolution for every requested member before routing refresh. | Captures local cached lookups plus relay directory fetches used to obtain invitee KeyPackages. |
+| `group_invite_key_package_lookup` | Invite path KeyPackage resolution for every requested member before routing refresh. | Captures fresh relay KeyPackage resolution, including discovery work when bounded route metadata cannot be reused. |
 | `group_invite_routing_refresh` | Invite path `AppClient::refresh_routing()` after KeyPackage lookup and before pre-send runtime sync. | Captures local route/projection refresh work that affects publish targets. |
 | `group_invite_pre_send_sync` | Invite path `AppClient::sync_runtime_groups()` immediately before engine send. | Separates pre-send relay/runtime sync from MLS commit and publish. |
 | `group_invite_engine_publish` | Invite path `AccountDeviceRuntime::send_with_audit_context()` plus publish-failure check. | Covers MLS Add/Commit staging, commit publish, local publish confirmation, and Welcome publish. |

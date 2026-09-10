@@ -18,6 +18,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Group creation, invites, and composition prewarming fetch current KeyPackages from relays, including for local
+  sibling accounts; cached packages no longer substitute when resolution fails. Prewarm retains discovery routes
+  only, and `MarmotMemberKeyPackagePrewarmSummary::reused_members` remains present but always returns zero.
+- Create and Invite reject KeyPackages that explicitly advertise RFC 9420 default extension/proposal capabilities.
+  Local private-bundle retention and historical Welcome processing are unchanged.
+
 - Search results include `is_followed_by_searcher`; streaming updates include keyed `updated_results` replacements
   and a `CachedResultsFound` trigger. Consumers must merge by account ID, including across radius pages, and use
   the explicit follow flag instead of radius 1 for badges. C consumers must rebuild against the matching generated

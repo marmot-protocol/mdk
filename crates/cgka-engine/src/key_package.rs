@@ -323,6 +323,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let key_package = validate_key_package(kp_in, provider.crypto())?;
+        validate_invitee_capabilities(&key_package)?;
         // foundation/key-packages.md: reject a KeyPackage whose credential
         // identity is not a valid Marmot account identity. This single gate
         // covers both the create-group and invite invitee paths.
@@ -334,6 +335,31 @@ impl<S: StorageProvider> Engine<S> {
         ensure_key_package_profile(kp, protocol_profile)?;
         Ok(key_package)
     }
+}
+
+/// Enforce the RFC 9420 section 7.2 advertisement rule before using a
+/// KeyPackage for a new membership operation. Keep this out of the shared
+/// storage/maintenance validator: old private bundles may still be needed to
+/// process Welcomes sent before the peer refreshed its public KeyPackage.
+fn validate_invitee_capabilities(key_package: &MlsKeyPackage) -> Result<(), EngineError> {
+    use crate::capabilities::{DEFAULT_MLS_EXTENSION_TYPES, DEFAULT_MLS_PROPOSAL_TYPES};
+
+    let capabilities = key_package.leaf_node().capabilities();
+    if capabilities
+        .extensions()
+        .iter()
+        .any(|kind| DEFAULT_MLS_EXTENSION_TYPES.contains(&u16::from(*kind)))
+        || capabilities
+            .proposals()
+            .iter()
+            .any(|kind| DEFAULT_MLS_PROPOSAL_TYPES.contains(&u16::from(*kind)))
+    {
+        return Err(EngineError::Backend(
+            "key_package validate: default capabilities must not be advertised (RFC 9420 section 7.2)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_key_package_profile(

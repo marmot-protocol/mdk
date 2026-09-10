@@ -60,7 +60,6 @@ pub(crate) enum AppPerformanceOperation {
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
     GroupMemberKeyPackagePrewarm,
-    GroupCreateKeyPackageCacheReuse,
     GroupCreateKeyPackageNetworkResolution,
     GroupCreateImagePreprocess,
     GroupCreateImageUpload,
@@ -318,6 +317,7 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub group_member_key_package_prewarm: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    /// Retired counter retained for export/API compatibility; no new samples.
     pub group_create_key_package_cache_reuse: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_key_package_network_resolution: AppPerformanceOperationSnapshot,
@@ -811,11 +811,6 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm => {
                 inner
                     .group_member_key_package_prewarm
-                    .record(duration, success);
-            }
-            AppPerformanceOperation::GroupCreateKeyPackageCacheReuse => {
-                inner
-                    .group_create_key_package_cache_reuse
                     .record(duration, success);
             }
             AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution => {
@@ -1502,7 +1497,6 @@ mod tests {
             AppPerformanceOperation::GroupCreateQueueWait,
             AppPerformanceOperation::GroupCreateKeyPackageLookup,
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
-            AppPerformanceOperation::GroupCreateKeyPackageCacheReuse,
             AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
             AppPerformanceOperation::GroupCreateImagePreprocess,
             AppPerformanceOperation::GroupCreateImageUpload,
@@ -1520,11 +1514,11 @@ mod tests {
         }
 
         let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_create_key_package_cache_reuse.attempts, 0);
         for stage in [
             snapshot.group_create_queue_wait,
             snapshot.group_create_key_package_lookup,
             snapshot.group_member_key_package_prewarm,
-            snapshot.group_create_key_package_cache_reuse,
             snapshot.group_create_key_package_network_resolution,
             snapshot.group_create_image_preprocess,
             snapshot.group_create_image_upload,
