@@ -15,7 +15,8 @@ use crate::connection::CachedSql;
 use crate::{ChatListRow, SqliteAccountStorage, SqliteResultExt, deserialize};
 use cgka_traits::storage::StorageError;
 use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus, LeaveRequest};
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatListView {
@@ -28,12 +29,17 @@ pub enum ChatListView {
     /// Departed/disbanded groups and durably queued leave/active disband operations.
     Left,
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatListPageDirection {
     Forward,
     Backward,
 }
+
 /// Opaque account-local boundary. Not a resumable cross-restart sync token.
+/// Any navigation change in this account invalidates it, including changes in another view.
+/// Staleness is normal under traffic: runtime windows must reconcile using stable anchors,
+/// not retry the same cursor or append an independently recovered page to an old window.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChatListCursor {
     store_epoch: Vec<u8>,
@@ -41,6 +47,7 @@ pub struct ChatListCursor {
     view: ChatListView,
     key: SortKey,
 }
+
 #[derive(Clone, PartialEq, Eq)]
 struct SortKey {
     section: i64,
@@ -48,8 +55,9 @@ struct SortKey {
     activity: i64,
     group: String,
 }
+
 const KEY: &str = "(list_pin_section, list_pin_order, list_activity_order, group_id_hex)";
-const ORDER: &str = "list_pin_section, list_pin_order, list_activity_order, group_id_hex";
+const KEY_COLUMNS: &str = "list_pin_section, list_pin_order, list_activity_order, group_id_hex";
 const REVERSE: &str =
     "list_pin_section DESC, list_pin_order DESC, list_activity_order DESC, group_id_hex DESC";
 impl ChatListView {
@@ -69,6 +77,7 @@ impl ChatListView {
         }
     }
 }
+
 fn navigation_sql(
     view: ChatListView,
     relation: Option<&str>,
@@ -87,15 +96,16 @@ fn navigation_sql(
         return format!("SELECT EXISTS(SELECT 1 {from})");
     }
     let order = if direction == ChatListPageDirection::Forward {
-        ORDER
+        KEY_COLUMNS
     } else {
         REVERSE
     };
     format!(
-        "SELECT {ORDER} {from} ORDER BY {order} LIMIT ?{}",
+        "SELECT {KEY_COLUMNS} {from} ORDER BY {order} LIMIT ?{}",
         if relation.is_some() { 5 } else { 1 }
     )
 }
+
 fn key_params(key: &SortKey) -> Vec<Value> {
     vec![
         key.section.into(),
@@ -104,6 +114,7 @@ fn key_params(key: &SortKey) -> Vec<Value> {
         key.group.clone().into(),
     ]
 }
+
 fn has_rows(
     tx: &Connection,
     view: ChatListView,
@@ -111,18 +122,20 @@ fn has_rows(
     relation: &str,
 ) -> Result<bool, ChatListPageError> {
     Ok(tx
-        .query_row(
+        .query_row_cached(
             &navigation_sql(view, Some(relation), ChatListPageDirection::Forward, true),
             params_from_iter(key_params(key)),
             |r| r.get(0),
         )
         .storage()?)
 }
+
 impl std::fmt::Debug for ChatListCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatListCursor").finish_non_exhaustive()
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct ChatListPageQuery {
     pub view: ChatListView,
@@ -130,6 +143,7 @@ pub struct ChatListPageQuery {
     pub direction: ChatListPageDirection,
     pub cursor: Option<ChatListCursor>,
 }
+
 #[derive(Clone)]
 pub struct ChatListPage {
     pub rows: Vec<ChatListRow>,
@@ -138,6 +152,7 @@ pub struct ChatListPage {
     pub has_more_before: bool,
     pub has_more_after: bool,
 }
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChatListPageError {
     #[error("chat page limit must be between 1 and 100")]
@@ -151,6 +166,7 @@ pub enum ChatListPageError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
+
 impl SqliteAccountStorage {
     /// Recover around a stable row after cursor invalidation, without replaying earlier pages.
     /// Includes the anchor at the beginning (Forward) or end (Backward) of the returned page.
@@ -198,14 +214,22 @@ impl SqliteAccountStorage {
         }
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction().storage()?;
-        let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row(
+        let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row_cached(
             "SELECT p.store_epoch, n.revision FROM chat_presentation_meta p, chat_list_navigation_meta n WHERE p.id = 1 AND n.id = 1",
             [], |r|Ok((r.get(0)?, r.get(1)?))).storage()?;
+        if let Some(cursor) = &query.cursor {
+            if cursor.store_epoch != store_epoch || cursor.view != query.view {
+                return Err(ChatListPageError::CursorMismatch);
+            }
+            if cursor.revision != revision {
+                return Err(ChatListPageError::StaleCursor);
+            }
+        }
         if let Some(group) = anchor {
             let key = tx
                 .query_row_cached(
                     &format!(
-                        "SELECT {ORDER} FROM chat_list_rows WHERE group_id_hex = ?1 AND {}",
+                        "SELECT {KEY_COLUMNS} FROM chat_list_rows WHERE group_id_hex = ?1 AND {}",
                         query.view.predicate()
                     ),
                     [group],
@@ -227,14 +251,6 @@ impl SqliteAccountStorage {
                 view: query.view,
                 key,
             });
-        }
-        if let Some(cursor) = &query.cursor {
-            if cursor.store_epoch != store_epoch || cursor.view != query.view {
-                return Err(ChatListPageError::CursorMismatch);
-            }
-            if cursor.revision != revision {
-                return Err(ChatListPageError::StaleCursor);
-            }
         }
         let relation = query
             .cursor
@@ -296,11 +312,7 @@ impl SqliteAccountStorage {
                 None => (false, false),
             },
         };
-        let row_sql = page_row_sql();
-        let rows = keys
-            .iter()
-            .map(|key| page_row(&tx, &key.group, &row_sql))
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = page_rows(&tx, &keys)?;
         tx.commit().storage()?;
         Ok(ChatListPage {
             rows,
@@ -312,53 +324,71 @@ impl SqliteAccountStorage {
     }
 }
 
-fn page_row_sql() -> String {
-    // Keep the legacy normalized pin position without ranking all pins on each read.
-    // Group classification uses authoritative account fields even between source writes
-    // and legacy row refresh; all fields and operation overlays share this read snapshot.
-    let select = super::CHAT_LIST_PAGE_SELECT_LIST;
+fn page_rows_sql() -> String {
+    // One bounded batch for row data and operation overlays. Keep expression indexes:
+    // batching alone would still scan unrelated engine records without indexed joins.
+    // json_each supplies at most 100 keys; row order is restored from navigation below.
     format!(
-        "{select} row.list_pin_position {} {} WHERE row.group_id_hex = ?1",
+        "{} row.list_pin_position,
+            leave_request.record AS page_leave_record,
+            disband_request.record AS page_disband_record,
+            EXISTS(SELECT 1 FROM cgka_disband_candidates
+                WHERE lower(hex(group_id)) = lower(row.group_id_hex)) AS page_candidate
+         {} {}
+         LEFT JOIN cgka_leave_requests AS leave_request
+            ON lower(hex(leave_request.group_id)) = lower(row.group_id_hex)
+         LEFT JOIN cgka_disband_requests AS disband_request
+            ON lower(hex(disband_request.group_id)) = lower(row.group_id_hex)
+         WHERE row.group_id_hex IN (SELECT value FROM json_each(?1))",
+        super::CHAT_LIST_PAGE_SELECT_LIST,
         super::CHAT_LIST_ROW_JOINS,
         super::CHAT_PIN_JOIN
     )
 }
 
-fn page_row(tx: &Connection, group: &str, sql: &str) -> Result<ChatListRow, ChatListPageError> {
-    let mut row = tx
-        .query_row_cached(sql, [group], |r| {
-            super::chat_list_row_from_row(r, super::unix_now_ms())
+fn page_rows(tx: &Connection, keys: &[SortKey]) -> Result<Vec<ChatListRow>, ChatListPageError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = keys.iter().map(|key| &key.group).collect::<Vec<_>>();
+    let ids_json = serde_json::to_string(&ids)
+        .map_err(|_| StorageError::Serialization("chat page key encoding failed".into()))?;
+    let mut statement = tx.prepare_cached(&page_rows_sql()).storage()?;
+    let now = super::unix_now_ms();
+    let records = statement
+        .query_map([ids_json], |r| {
+            Ok((
+                super::chat_list_row_from_row(r, now)?,
+                r.get::<_, Option<Vec<u8>>>("page_leave_record")?,
+                r.get::<_, Option<Vec<u8>>>("page_disband_record")?,
+                r.get::<_, bool>("page_candidate")?,
+            ))
         })
         .storage()?;
-    let read_record = |table: &str| -> Result<Option<Vec<u8>>, ChatListPageError> {
-        Ok(tx
-            .query_row_cached(
-                &format!("SELECT record FROM {table} WHERE lower(hex(group_id)) = ?1"),
-                [group],
-                |r| r.get(0),
-            )
-            .optional()
-            .storage()?)
-    };
-    row.leave_requested_at_ms = read_record("cgka_leave_requests")?
-        .map(|b| deserialize::<LeaveRequest>(&b).map(|r| r.requested_at_ms))
-        .transpose()?;
-    row.disband_request = read_record("cgka_disband_requests")?
-        .map(|b| deserialize::<DisbandRequest>(&b))
-        .transpose()?;
-    let candidate: bool = tx
-        .query_row_cached(
-            "SELECT EXISTS(SELECT 1 FROM cgka_disband_candidates WHERE lower(hex(group_id)) = ?1)",
-            params![group],
-            |r| r.get(0),
-        )
-        .storage()?;
-    row.disbanding = candidate
-        || row
-            .disband_request
-            .as_ref()
-            .is_some_and(|r| r.status == DisbandRequestStatus::Pending);
-    Ok(row)
+    let mut rows = HashMap::with_capacity(keys.len());
+    for record in records {
+        let (mut row, leave, disband, candidate) = record.storage()?;
+        row.leave_requested_at_ms = leave
+            .map(|b| deserialize::<LeaveRequest>(&b).map(|r| r.requested_at_ms))
+            .transpose()?;
+        row.disband_request = disband
+            .map(|b| deserialize::<DisbandRequest>(&b))
+            .transpose()?;
+        row.disbanding = candidate
+            || row
+                .disband_request
+                .as_ref()
+                .is_some_and(|r| r.status == DisbandRequestStatus::Pending);
+        rows.insert(row.group_id_hex.clone(), row);
+    }
+    keys.iter()
+        .map(|key| {
+            rows.remove(&key.group).ok_or_else(|| {
+                StorageError::Backend("chat page row missing in read snapshot".into()).into()
+            })
+        })
+        .collect()
 }
+
 #[cfg(test)]
 mod tests;

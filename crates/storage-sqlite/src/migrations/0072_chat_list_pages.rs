@@ -15,6 +15,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
              GENERATED ALWAYS AS (max(list_pin_ordinal, 0)) VIRTUAL;
          ALTER TABLE chat_list_rows ADD COLUMN list_activity_order INTEGER
              GENERATED ALWAYS AS (-max(activity_sort_at, 0)) VIRTUAL;
+         CREATE INDEX idx_chat_list_group_id_lower ON chat_list_rows(lower(group_id_hex));
          CREATE INDEX idx_leave_requests_hex ON cgka_leave_requests(lower(hex(group_id)));
          CREATE INDEX idx_disband_requests_hex ON cgka_disband_requests(lower(hex(group_id)));
          CREATE INDEX idx_disband_candidates_hex ON cgka_disband_candidates(lower(hex(group_id)));
@@ -31,10 +32,10 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     // means Pending, matching serde(default). Invalid records stay conservatively gated;
     // decoding a returned row still reports the storage error.
     let left = "COALESCE((SELECT self_membership FROM account_groups WHERE group_id_hex = chat_list_rows.group_id_hex), self_membership) IN ('left', 'removed')
-        OR EXISTS(SELECT 1 FROM cgka_leave_requests WHERE lower(hex(group_id)) = chat_list_rows.group_id_hex)
-        OR EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE lower(hex(group_id)) = chat_list_rows.group_id_hex)
-        OR EXISTS(SELECT 1 FROM cgka_disband_candidates WHERE lower(hex(group_id)) = chat_list_rows.group_id_hex)
-        OR EXISTS(SELECT 1 FROM cgka_disband_requests WHERE lower(hex(group_id)) = chat_list_rows.group_id_hex
+        OR EXISTS(SELECT 1 FROM cgka_leave_requests WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex))
+        OR EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex))
+        OR EXISTS(SELECT 1 FROM cgka_disband_candidates WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex))
+        OR EXISTS(SELECT 1 FROM cgka_disband_requests WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex)
             AND CASE WHEN json_valid(CAST(record AS TEXT))
                 THEN COALESCE(json_extract(CAST(record AS TEXT), '$.status') = 'pending', 1)
                 ELSE 1 END)";
@@ -106,16 +107,28 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             }
         };
         for operation in ["INSERT", "UPDATE", "DELETE"] {
-            // Updating navigation fields never re-enters the row-source trigger.
+            // A deleted projected row has nothing left to refresh. Navigation deletion
+            // has its own revision trigger; pin-source deletion still updates surviving ranks.
+            if table == "chat_list_rows" && operation == "DELETE" {
+                continue;
+            }
+            // Row sources maintain classification; binary engine sources match decoded ids
+            // case-insensitively; pin sources also maintain ordinal/rank. Updating derived
+            // navigation fields never re-enters the row-source trigger.
             let event = if operation == "UPDATE" {
                 format!("UPDATE OF {updates}")
             } else {
                 operation.to_owned()
             };
+            let row_key = if binary {
+                "lower(group_id_hex)"
+            } else {
+                "group_id_hex"
+            };
             let filter = match operation {
-                "INSERT" => format!("group_id_hex = {}", key("NEW")),
-                "DELETE" => format!("group_id_hex = {}", key("OLD")),
-                _ => format!("group_id_hex IN ({}, {})", key("OLD"), key("NEW")),
+                "INSERT" => format!("{row_key} = {}", key("NEW")),
+                "DELETE" => format!("{row_key} = {}", key("OLD")),
+                _ => format!("{row_key} IN ({}, {})", key("OLD"), key("NEW")),
             };
             let changed = if operation == "UPDATE" {
                 format!(
@@ -170,6 +183,26 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 mod tests {
     use crate::migrations::{MIGRATIONS, run};
     use rusqlite::Connection;
+
+    #[test]
+    fn populated_upgrade_classifies_mixed_case_engine_ids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..69]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('aBcD','',0);
+            INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES ('aBcD',0);
+            INSERT INTO cgka_groups(id,epoch,record) VALUES(x'abcd',0,x'00');
+            INSERT INTO cgka_disband_tombstones VALUES(x'abcd',x'00');",
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT list_scope FROM chat_list_rows", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn populated_upgrade_backfills_navigation_and_rolls_back_failed_migration() {
