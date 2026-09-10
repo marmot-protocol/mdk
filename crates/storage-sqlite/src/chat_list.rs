@@ -530,7 +530,7 @@ impl SqliteAccountStorage {
         pinned: bool,
     ) -> Result<ChatPinState, ChatPinError> {
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
+            let mut conn = self.lock()?;
             let archived = conn
                 .query_row_cached(
                     "SELECT archived FROM account_groups WHERE group_id_hex = ?1",
@@ -552,11 +552,11 @@ impl SqliteAccountStorage {
             match (pinned, existing) {
                 (true, None) => {
                     ordered_group_ids.insert(0, group_id_hex.to_owned());
-                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                    rewrite_pinned_chat_order_tx(&mut conn, &ordered_group_ids)?;
                 }
                 (false, Some(position)) => {
                     ordered_group_ids.remove(position);
-                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                    rewrite_pinned_chat_order_tx(&mut conn, &ordered_group_ids)?;
                 }
                 _ => {}
             }
@@ -576,7 +576,7 @@ impl SqliteAccountStorage {
         ordered_group_ids: &[String],
     ) -> Result<ChatPinState, ChatPinError> {
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
+            let mut conn = self.lock()?;
             for group_id_hex in ordered_group_ids {
                 let exists = conn
                     .query_row_cached(
@@ -606,7 +606,7 @@ impl SqliteAccountStorage {
                 ));
             }
             if current != ordered_group_ids {
-                rewrite_pinned_chat_order_tx(&conn, ordered_group_ids)?;
+                rewrite_pinned_chat_order_tx(&mut conn, ordered_group_ids)?;
             }
             Ok(ChatPinState {
                 ordered_group_ids: ordered_group_ids.to_vec(),
@@ -935,23 +935,47 @@ fn pinned_chat_order_tx(tx: &Connection) -> Result<Vec<String>, ChatPinError> {
 }
 
 fn rewrite_pinned_chat_order_tx(
-    tx: &Connection,
+    conn: &mut Connection,
     ordered_group_ids: &[String],
 ) -> Result<(), ChatPinError> {
+    // A savepoint also protects callers that catch this command's error inside an outer
+    // transaction and then commit: the guard, source pins and derived keys roll back together.
+    let tx = conn.savepoint().storage()?;
+    tx.execute_cached(
+        "UPDATE chat_list_navigation_meta SET pin_rewrite_in_progress = 1 WHERE id = 1",
+        [],
+    )
+    .storage()?;
+    // Reset only previously pinned rows, never the complete chat list. The final order is
+    // already normalized by this command, so each insert can stamp its rank with one keyed
+    // update, including the ordinal occupied by any pin whose projected row is absent.
+    tx.execute_cached(
+        "UPDATE chat_list_rows INDEXED BY idx_chat_list_pin_ordinal
+        SET list_pin_ordinal = -1, list_pin_position = NULL WHERE list_pin_ordinal >= 0",
+        [],
+    )
+    .storage()?;
     tx.execute_cached("DELETE FROM chat_pin_positions", [])
         .storage()?;
     for (ordinal, group_id_hex) in ordered_group_ids.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?;
         tx.execute_cached(
-            "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
-             VALUES (?1, ?2)",
-            params![
-                group_id_hex,
-                i64::try_from(ordinal)
-                    .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?
-            ],
+            "INSERT INTO chat_pin_positions (group_id_hex, ordinal) VALUES (?1, ?2)",
+            params![group_id_hex, ordinal],
         )
         .storage()?;
+        tx.execute_cached(
+            "UPDATE chat_list_rows SET list_pin_ordinal = ?2, list_pin_position = ?2 WHERE group_id_hex = ?1",
+            params![group_id_hex, ordinal],
+        ).storage()?;
     }
+    tx.execute_cached(
+        "UPDATE chat_list_navigation_meta SET pin_rewrite_in_progress = 0 WHERE id = 1",
+        [],
+    )
+    .storage()?;
+    tx.commit().storage()?;
     Ok(())
 }
 

@@ -592,6 +592,26 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                 }
             }
         }
+        // Pin commands return/rewrite the complete pin set. Measure this separately from
+        // bounded page and ordinary-write work; the budget rejects per-pin rank rebuilds.
+        let new_pin = format!("{:032x}", count - 1);
+        let (pin_state, pin_steps) =
+            measure(&store, || store.set_chat_pinned(&new_pin, true).unwrap());
+        let mut reordered = pin_state.ordered_group_ids.clone();
+        reordered.reverse();
+        let (_, reorder_steps) =
+            measure(&store, || store.set_pinned_chat_order(&reordered).unwrap());
+        let (_, unpin_steps) = measure(&store, || store.set_chat_pinned(&new_pin, false).unwrap());
+        eprintln!(
+            "rows={count} pins={} pin_vm_steps={pin_steps} reorder_vm_steps={reorder_steps} unpin_vm_steps={unpin_steps}",
+            pin_state.ordered_group_ids.len()
+        );
+        for steps in [pin_steps, reorder_steps, unpin_steps] {
+            assert!(
+                steps < 5000 + 1500 * pin_state.ordered_group_ids.len() as i64,
+                "pin command: {steps}"
+            );
+        }
         // Test late pinned and unpinned rows: ordinary message/read writes must not
         // scan pin ranks or unrelated conversations while maintaining the navigation keys.
         for id in [count - 2, count - 1] {
@@ -778,4 +798,105 @@ fn accepting_an_archived_invite_preserves_archive_and_source_fields() {
     assert!(!active.rows[0].archived);
     // The source overlay is observable even before the legacy row is refreshed.
     assert!(store.chat_list_row("01").unwrap().unwrap().archived);
+}
+
+#[test]
+fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transaction() {
+    use cgka_traits::StorageProvider;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for id in ["01", "02", "03", "04"] {
+        seed(&store, id, false, "member", 1, false);
+    }
+    for id in ["01", "02", "03"] {
+        store.set_chat_pinned(id, true).unwrap();
+    }
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM chat_list_rows WHERE group_id_hex = '02'", [])
+        .unwrap();
+    let order = ["01", "02", "03"].map(String::from);
+    store.set_pinned_chat_order(&order).unwrap();
+    let current = page(&store, ChatListView::Chats);
+    assert_eq!(ids(&current), ["01", "03", "04"]);
+    assert_eq!(
+        current
+            .rows
+            .iter()
+            .map(|r| r.pinned_position)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(2), None]
+    );
+    let boundary = current.last;
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_pin_rebuild BEFORE UPDATE OF list_pin_ordinal ON chat_list_rows
+        WHEN NEW.group_id_hex = '04' AND NEW.list_pin_ordinal = 0
+        BEGIN SELECT RAISE(ABORT, 'injected pin rebuild failure'); END;",
+        )
+        .unwrap();
+    StorageProvider::with_transaction(&store, |store| -> Result<(), StorageError> {
+        assert!(store.set_chat_pinned("04", true).is_err());
+        // Catching the command error must not commit a disabled trigger or half-rebuilt pins.
+        assert_eq!(
+            store
+                .lock()?
+                .query_row(
+                    "SELECT pin_rewrite_in_progress FROM chat_list_navigation_meta",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .storage()?,
+            0
+        );
+        assert_eq!(
+            store.set_chat_pinned("01", true).unwrap().ordered_group_ids,
+            order
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        store
+            .chat_list_page(query(
+                ChatListView::Chats,
+                1,
+                ChatListPageDirection::Backward,
+                boundary
+            ))
+            .is_ok()
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER reject_pin_rebuild;
+        INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES ('02',0);",
+        )
+        .unwrap();
+    store.set_chat_pinned("03", false).unwrap();
+    let current = page(&store, ChatListView::Chats);
+    assert_eq!(ids(&current), ["01", "02", "03", "04"]);
+    assert_eq!(
+        current
+            .rows
+            .iter()
+            .map(|r| r.pinned_position)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1), None, None]
+    );
+    // Ordinary source writes still maintain ranks after the batched path, without a caller.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM chat_pin_positions WHERE group_id_hex = '01'",
+            [],
+        )
+        .unwrap();
+    let current = page(&store, ChatListView::Chats);
+    assert_eq!(current.rows[0].group_id_hex, "02");
+    assert_eq!(current.rows[0].pinned_position, Some(0));
 }
