@@ -6,7 +6,7 @@
 //! snapshot-and-replay messages for candidate materialization or apply a
 //! selected canonical branch to retained storage.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_event::AppMessageRetentionDecision;
@@ -39,6 +39,10 @@ use crate::canonicalization::{
     MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
 };
 use crate::convergence::BranchCandidate;
+
+#[cfg(test)]
+#[path = "openmls_projection/tests.rs"]
+mod graph_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMlsContentKind {
@@ -242,7 +246,7 @@ pub(crate) struct ReplayProfilePolicy {
 #[derive(Clone, Debug)]
 pub(crate) struct StoredCanonicalizationOptions<'a> {
     pub(crate) replay_profile: ReplayProfilePolicy,
-    pub(crate) admitted_message_ids: Option<&'a HashSet<MessageId>>,
+    pub(crate) admitted_message_ids: Option<&'a [MessageId]>,
     pub(crate) admit_app_witnesses: bool,
     pub(crate) replay_probe_budget_override: Option<u64>,
     /// Engine-path seen-id snapshot, shared instead of copied into
@@ -1193,15 +1197,38 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
-    admitted_message_ids: Option<&HashSet<MessageId>>,
+    admitted_message_ids: Option<&[MessageId]>,
 ) -> Result<StoredOpenMlsGraphInputs, OpenMlsProjectionError> {
     let current_epoch = storage
         .get_group(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
         .epoch
         .0;
+    // Keep one read snapshot across the keyed reads or state query batches.
     let records = storage
-        .list_messages(group_id, EpochId(0))
+        .with_transaction(|storage| {
+            if let Some(ids) = admitted_message_ids {
+                // Frozen membership already names the complete batch. Do not
+                // load unrelated history just to intersect it with these ids.
+                return ids.iter().map(|id| storage.get_message(id)).collect();
+            }
+            let mut records = Vec::new();
+            for state in OPENMLS_GRAPH_INPUT_STATES {
+                // Processed rows only witness the retained window. Unresolved
+                // rows below it must still receive their stale-commit verdict.
+                let floor = if state == MessageState::Processed {
+                    retained_anchor_epoch
+                } else {
+                    0
+                };
+                records.extend(storage.list_messages_in_states(
+                    group_id,
+                    &[state],
+                    EpochId(floor),
+                )?);
+            }
+            Ok::<Vec<MessageRecord>, StorageError>(records)
+        })
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     let mut commit_messages = Vec::new();
     let mut pending_messages = Vec::new();
@@ -1210,7 +1237,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     let mut own_commits = PrevalidatedOwnCommits::default();
 
     for record in records {
-        if admitted_message_ids.is_some_and(|admitted| !admitted.contains(&record.id)) {
+        if record.group_id != *group_id {
             continue;
         }
         if !record_state_can_contribute_to_openmls_graph(record.state) {
@@ -4713,6 +4740,37 @@ mod candidate_branch_peel_halt_tests {
             joiner.join_welcome(welcome).await.unwrap();
         }
         group_id
+    }
+
+    #[tokio::test]
+    async fn graph_seed_keeps_stale_commits() {
+        let (mut alice, storage) = build_client(b"graph-seed");
+        let (mut bob, _) = build_client(b"graph-seed-peer");
+        let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+        let epoch = storage.get_group(&group_id).unwrap().epoch.0;
+        let commit = rival_commit(&storage, &alice.self_id(), &group_id);
+        admit_rival(&storage, &group_id, &commit, epoch);
+
+        let retained =
+            super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch, None).unwrap();
+        assert!(
+            retained
+                .commit_messages
+                .iter()
+                .any(|row| row.message.id == commit.id)
+        );
+        let stale =
+            super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch + 1, None).unwrap();
+        assert!(stale.commit_messages.is_empty());
+        assert!(stale.stale_commit_drops.iter().any(|row| {
+            row.message_id == hex::encode(commit.id.as_slice())
+                && row.reason == super::DroppedMessageReason::BeyondAnchor
+        }));
+        // Seeding classifies; only canonical apply may persist the verdict.
+        assert_eq!(
+            storage.get_message(&commit.id).unwrap().state,
+            MessageState::ConvergenceDeferred
+        );
     }
 
     // --- Graph fixtures ------------------------------------------------------
