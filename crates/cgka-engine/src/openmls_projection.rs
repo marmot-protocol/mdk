@@ -1199,18 +1199,18 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     retained_anchor_epoch: u64,
     admitted_message_ids: Option<&[MessageId]>,
 ) -> Result<StoredOpenMlsGraphInputs, OpenMlsProjectionError> {
-    let current_epoch = storage
-        .get_group(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-        .epoch
-        .0;
-    // Keep one read snapshot across the keyed reads or state query batches.
-    let records = storage
+    // Keep the group epoch and message records in the same read snapshot.
+    let (current_epoch, records) = storage
         .with_transaction(|storage| {
+            let current_epoch = storage.get_group(group_id)?.epoch.0;
             if let Some(ids) = admitted_message_ids {
                 // Frozen membership already names the complete batch. Do not
                 // load unrelated history just to intersect it with these ids.
-                return ids.iter().map(|id| storage.get_message(id)).collect();
+                let records = ids
+                    .iter()
+                    .map(|id| storage.get_message(id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok((current_epoch, records));
             }
             let mut records = Vec::new();
             for state in OPENMLS_GRAPH_INPUT_STATES {
@@ -1227,7 +1227,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                     EpochId(floor),
                 )?);
             }
-            Ok::<Vec<MessageRecord>, StorageError>(records)
+            Ok::<_, StorageError>((current_epoch, records))
         })
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     let mut commit_messages = Vec::new();
