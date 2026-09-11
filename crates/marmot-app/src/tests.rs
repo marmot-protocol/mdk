@@ -14119,6 +14119,176 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     );
 }
 
+/// Distributed convergence can supersede a removal of this device: the winning
+/// branch keeps us in the group, the engine clears the terminal marker, and the
+/// roster diff reports the local account as `MemberAdded`. That arrival is a
+/// membership transition like any other, so the projection must follow it back
+/// to `Member` — otherwise the healed group keeps its unread suppressed and
+/// renders as departed forever, with no later join event to correct it.
+#[tokio::test]
+async fn a_self_member_added_restores_stored_self_membership_after_a_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://superseded-removal.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("superseded removal", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let state_change = |change| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: local.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+    );
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+        "a superseded removal that re-admits this device must un-suppress the group again"
+    );
+}
+
+/// The same restoration must clear a *voluntary* departure. `Left` is preserved
+/// against a realizing eviction (mdk#1746), but that preservation is about how
+/// a departure is classified, not a veto on coming back: once the roster says
+/// this device is a member again, the group is live and its unread must count.
+#[tokio::test]
+async fn a_self_member_added_clears_a_preserved_voluntary_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://superseded-leave.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("superseded leave", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let state_change = |change| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberLeft {
+                member: local.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Left),
+    );
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+        "re-admission must outrank a preserved voluntary departure"
+    );
+}
+
+/// A peer joining the group says nothing about this device's own membership.
+/// The arrival test is the same self-subject test the departure path uses, so
+/// the two cannot disagree about who arrived.
+#[tokio::test]
+async fn a_peer_member_added_leaves_stored_self_membership_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://peer-added.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("peer added", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let state_change = |change| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberAdded {
+                member: MemberId::new(
+                    hex::decode(nostr::Keys::generate().public_key().to_hex()).unwrap(),
+                ),
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+        "a peer's arrival must not re-admit this device"
+    );
+}
+
 /// A departure that takes this device out of the group is terminal for its
 /// copy, exactly as a disband is terminal for everyone's, so both must mark
 /// transport routes dirty. The ingest seam keys the pre-refresh projection save

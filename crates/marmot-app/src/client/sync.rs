@@ -4486,13 +4486,15 @@ impl AppClient {
                 .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
         }
         self.invalidate_terminal_pending_sends(event, local_account_id_hex, summary)?;
-        // A (re-)join or create restores the local account's membership so a
-        // re-add after removal un-suppresses the group's unread count. Same
-        // source-of-truth write as the departure path above: propagate the
-        // error rather than swallow it.
-        if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. }
-        | cgka_traits::engine::GroupEvent::GroupCreated { group_id } = event
-        {
+        // The local account arriving in a group restores its membership so the
+        // group's unread count stops being suppressed. A (re-)join or create is
+        // one such arrival; a roster diff that reports this device as
+        // `MemberAdded` is the other, and it is the only signal a convergence
+        // branch which supersedes our removal ever emits. Same source-of-truth
+        // write as the departure path above: propagate the error rather than
+        // swallow it. Writing `Member` also clears a preserved voluntary
+        // `Left`, which is the intended mdk#1746 behavior on a re-add.
+        if let Some(group_id) = self_arrival_group(event, local_account_id_hex) {
             let group_id_hex = hex::encode(group_id.as_slice());
             self.app.set_group_self_membership(
                 &self.state.label,
@@ -4734,6 +4736,32 @@ fn member_departure(
     match change {
         GroupStateChange::MemberLeft { member } => Some((member, SelfMembership::Left)),
         GroupStateChange::MemberRemoved { member } => Some((member, SelfMembership::Removed)),
+        _ => None,
+    }
+}
+
+/// Classify an engine event that puts the local account back in a group,
+/// returning the group it rejoined. The mirror of [`member_departure`]: a
+/// welcome-driven `GroupJoined` and a local `GroupCreated` are arrivals by
+/// construction, and a `GroupStateChanged` roster diff is one only when the
+/// added member is this device — the case distributed convergence produces when
+/// the winning branch supersedes a removal of us (the engine pins that emission
+/// in `superseded_self_removal_clears_removed_marker_and_restores_send`). Returns
+/// `None` otherwise, so a peer being added changes nothing locally.
+fn self_arrival_group<'a>(
+    event: &'a cgka_traits::engine::GroupEvent,
+    local_account_id_hex: &str,
+) -> Option<&'a cgka_traits::GroupId> {
+    match event {
+        cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. }
+        | cgka_traits::engine::GroupEvent::GroupCreated { group_id } => Some(group_id),
+        cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id,
+            change: cgka_traits::engine::GroupStateChange::MemberAdded { member },
+            ..
+        } if hex::encode(member.as_slice()).eq_ignore_ascii_case(local_account_id_hex) => {
+            Some(group_id)
+        }
         _ => None,
     }
 }
