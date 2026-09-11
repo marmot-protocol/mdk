@@ -1287,7 +1287,7 @@ impl<S: StorageProvider> Engine<S> {
             reject_legacy_group_additions: self.new_protocol_profile
                 == cgka_traits::group::ProtocolProfile::Current,
         };
-        let admitted_message_ids: HashSet<MessageId> = pass
+        let admitted_message_ids: Vec<MessageId> = pass
             .members
             .iter()
             .map(|member| member.message_id.clone())
