@@ -1,3 +1,4 @@
+mod pages;
 use crate::account_projection::chat_mute_is_effective;
 use crate::connection::CachedSql;
 use crate::storage::disband_requests::{
@@ -16,6 +17,10 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
 use cgka_traits::storage::StorageResult;
+pub use pages::{
+    ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
+    ChatListView,
+};
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -525,7 +530,7 @@ impl SqliteAccountStorage {
         pinned: bool,
     ) -> Result<ChatPinState, ChatPinError> {
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
+            let mut conn = self.lock()?;
             let archived = conn
                 .query_row_cached(
                     "SELECT archived FROM account_groups WHERE group_id_hex = ?1",
@@ -547,11 +552,11 @@ impl SqliteAccountStorage {
             match (pinned, existing) {
                 (true, None) => {
                     ordered_group_ids.insert(0, group_id_hex.to_owned());
-                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                    rewrite_pinned_chat_order_tx(&mut conn, &ordered_group_ids)?;
                 }
                 (false, Some(position)) => {
                     ordered_group_ids.remove(position);
-                    rewrite_pinned_chat_order_tx(&conn, &ordered_group_ids)?;
+                    rewrite_pinned_chat_order_tx(&mut conn, &ordered_group_ids)?;
                 }
                 _ => {}
             }
@@ -571,7 +576,7 @@ impl SqliteAccountStorage {
         ordered_group_ids: &[String],
     ) -> Result<ChatPinState, ChatPinError> {
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
+            let mut conn = self.lock()?;
             for group_id_hex in ordered_group_ids {
                 let exists = conn
                     .query_row_cached(
@@ -601,7 +606,7 @@ impl SqliteAccountStorage {
                 ));
             }
             if current != ordered_group_ids {
-                rewrite_pinned_chat_order_tx(&conn, ordered_group_ids)?;
+                rewrite_pinned_chat_order_tx(&mut conn, ordered_group_ids)?;
             }
             Ok(ChatPinState {
                 ordered_group_ids: ordered_group_ids.to_vec(),
@@ -930,23 +935,47 @@ fn pinned_chat_order_tx(tx: &Connection) -> Result<Vec<String>, ChatPinError> {
 }
 
 fn rewrite_pinned_chat_order_tx(
-    tx: &Connection,
+    conn: &mut Connection,
     ordered_group_ids: &[String],
 ) -> Result<(), ChatPinError> {
+    // A savepoint also protects callers that catch this command's error inside an outer
+    // transaction and then commit: the guard, source pins and derived keys roll back together.
+    let tx = conn.savepoint().storage()?;
+    tx.execute_cached(
+        "UPDATE chat_list_navigation_meta SET pin_rewrite_in_progress = 1 WHERE id = 1",
+        [],
+    )
+    .storage()?;
+    // Reset only previously pinned rows, never the complete chat list. The final order is
+    // already normalized by this command, so each insert can stamp its rank with one keyed
+    // update, including the ordinal occupied by any pin whose projected row is absent.
+    tx.execute_cached(
+        "UPDATE chat_list_rows INDEXED BY idx_chat_list_pin_ordinal
+        SET list_pin_ordinal = -1, list_pin_position = NULL WHERE list_pin_ordinal >= 0",
+        [],
+    )
+    .storage()?;
     tx.execute_cached("DELETE FROM chat_pin_positions", [])
         .storage()?;
     for (ordinal, group_id_hex) in ordered_group_ids.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?;
         tx.execute_cached(
-            "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
-             VALUES (?1, ?2)",
-            params![
-                group_id_hex,
-                i64::try_from(ordinal)
-                    .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?
-            ],
+            "INSERT INTO chat_pin_positions (group_id_hex, ordinal) VALUES (?1, ?2)",
+            params![group_id_hex, ordinal],
         )
         .storage()?;
+        tx.execute_cached(
+            "UPDATE chat_list_rows SET list_pin_ordinal = ?2, list_pin_position = ?2 WHERE group_id_hex = ?1",
+            params![group_id_hex, ordinal],
+        ).storage()?;
     }
+    tx.execute_cached(
+        "UPDATE chat_list_navigation_meta SET pin_rewrite_in_progress = 0 WHERE id = 1",
+        [],
+    )
+    .storage()?;
+    tx.commit().storage()?;
     Ok(())
 }
 
@@ -2440,9 +2469,15 @@ pub(crate) fn chat_list_row_tx(
     .transpose()
 }
 
-// All chat reads share these columns; only pin-rank computation differs.
-const CHAT_LIST_ROW_SELECT_LIST: &str =
-    "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
+// Keep positional decoding shared, with explicit source-field selection for bounded pages.
+macro_rules! chat_list_columns {
+    ($archived:literal, $pending:literal, $membership:literal) => {
+        concat!(
+            "SELECT row.group_id_hex, ",
+            $archived,
+            ", ",
+            $pending,
+            ",
             row.title, row.group_name, row.avatar_url,
             row.avatar_image_hash_hex, row.avatar_image_key_hex,
             row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
@@ -2454,7 +2489,9 @@ const CHAT_LIST_ROW_SELECT_LIST: &str =
             row.manually_marked_unread, row.unread_mention_count,
             row.first_unread_message_id_hex, row.last_read_message_id_hex,
             row.last_read_timeline_at, row.conversation_created_at,
-            row.activity_sort_at, row.updated_at, row.self_membership,
+            row.activity_sort_at, row.updated_at, ",
+            $membership,
+            ",
             ag.member_count,
             mute.group_id_hex IS NOT NULL,
             mute.muted_until_ms,
@@ -2462,7 +2499,25 @@ const CHAT_LIST_ROW_SELECT_LIST: &str =
                 SELECT 1 FROM cgka_disband_tombstones AS tomb
                 WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
             ),
-            pin.group_id_hex IS NOT NULL,";
+            pin.group_id_hex IS NOT NULL,"
+        )
+    };
+}
+const CHAT_LIST_ROW_SELECT_LIST: &str = chat_list_columns!(
+    "row.archived",
+    "row.pending_confirmation",
+    "row.self_membership"
+);
+// M1's new page contract observes committed account-source lifecycle fields immediately.
+// Legacy rows retain their existing projector publication timing. Copying source fields into
+// those rows from these new triggers would also change existing readers/subscriptions without
+// their refresh notifications. M2 owns runtime command/invalidation integration; migrating
+// legacy publication is a separate compatibility change, not a side effect of storage paging.
+const CHAT_LIST_PAGE_SELECT_LIST: &str = chat_list_columns!(
+    "COALESCE(ag.archived, row.archived)",
+    "COALESCE(ag.pending_confirmation, row.pending_confirmation)",
+    "COALESCE(ag.self_membership, row.self_membership)"
+);
 
 const CHAT_PIN_POSITION_SQL: &str = "CASE WHEN pin.ordinal IS NULL THEN NULL ELSE (
                 SELECT COUNT(*)
