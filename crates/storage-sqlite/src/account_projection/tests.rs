@@ -2401,7 +2401,7 @@ fn push_registration_preserves_created_at_when_token_rotates() {
 }
 
 #[test]
-fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh() {
+fn push_registration_preserves_progress_on_resume_and_requeues_changed_routing() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .save_account_projection_state(
@@ -2450,7 +2450,40 @@ fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh
         .mark_push_registration_shared("alice", "first", 10, 11)
         .unwrap();
 
+    let mut resumed = registration.clone();
+    resumed.updated_at_ms = 100;
+    let unchanged = store
+        .upsert_push_registration(resumed.clone(), vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(unchanged.registration.updated_at_ms, 10);
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["bb".to_owned()],
+        "foreground registration must retain partial delivery progress"
+    );
+    assert!(
+        store
+            .complete_push_registration_share("bb", "first", 10)
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 10, 101)
+            .unwrap()
+    );
+    let unchanged = store
+        .upsert_push_registration(resumed, vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(unchanged.registration.last_shared_at_ms, Some(101));
+    assert!(
+        store
+            .pending_push_registration_shares("first", 10)
+            .unwrap()
+            .is_empty()
+    );
+
     let mut refreshed = registration;
+    refreshed.relay_hint = Some("wss://relay.example".to_owned());
     refreshed.updated_at_ms = 10;
     let stored = store
         .upsert_push_registration(refreshed, vec![1, 2, 3])

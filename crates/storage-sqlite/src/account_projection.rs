@@ -2374,6 +2374,19 @@ impl SqliteAccountStorage {
     ) -> StorageResult<AccountStoredPushRegistration> {
         self.connection.with_transaction(|| {
             let existing = self.push_registration(&registration.account_label)?;
+            // Hosts re-register on foreground. Keep an unchanged registration's
+            // revision and partial gossip progress instead of requeueing every
+            // joined group each time the app resumes.
+            if let Some(existing) = &existing
+                && existing.registration.account_id_hex == registration.account_id_hex
+                && existing.registration.platform == registration.platform
+                && existing.registration.token_fingerprint == registration.token_fingerprint
+                && existing.registration.server_pubkey_hex == registration.server_pubkey_hex
+                && existing.registration.relay_hint == registration.relay_hint
+                && existing.token_bytes == token_bytes
+            {
+                return Ok(existing.clone());
+            }
             let created_at_ms = existing
                 .as_ref()
                 .map(|existing| existing.registration.created_at_ms)

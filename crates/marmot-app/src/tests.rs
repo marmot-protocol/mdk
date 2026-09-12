@@ -6024,6 +6024,53 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn foreground_push_registration_preserves_completed_gossip_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    client.create_group("alpha", &[]).await.unwrap();
+    client.create_group("beta", &[]).await.unwrap();
+    app.set_native_push_enabled("alice", true).unwrap();
+    let server = nostr::Keys::generate().public_key().to_hex();
+    let first = client
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "opaque-token", &server, None)
+        .await
+        .unwrap();
+    assert_eq!(first.share.succeeded_groups, 2);
+    drop(client);
+    drop(app);
+
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = reopened.client("alice").await.unwrap();
+    let before = relay.attempted_event_ids().len();
+    let resumed = client
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "opaque-token", &server, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.registration.updated_at_ms,
+        first.registration.updated_at_ms
+    );
+    assert_eq!(resumed.share.attempted_groups, 0);
+    assert_eq!(resumed.share.pending_groups, 0);
+    assert_eq!(relay.attempted_event_ids().len(), before);
+
+    let rotated = client
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "rotated-token", &server, None)
+        .await
+        .unwrap();
+    assert!(rotated.registration.updated_at_ms > resumed.registration.updated_at_ms);
+    assert_eq!(rotated.share.succeeded_groups, 2);
+    assert_eq!(rotated.share.pending_groups, 0);
+}
+
 #[test]
 fn runtime_start_returns_before_initial_directory_subscription_registration() {
     run_composed_app_runtime_test(
