@@ -5,8 +5,8 @@ use std::ffi::c_char;
 use marmot_uniffi::conversions::{GroupEventKindFfi, MarmotEventFfi};
 
 use super::group::MarmotAppGroupHydrationQuarantineReason;
-use super::message::MarmotRuntimeMessageReceived;
-use super::timeline::MarmotRuntimeProjectionUpdate;
+use super::message::{MarmotRuntimeMessageReceived, MarmotRuntimeMessageReceivedV2};
+use super::timeline::{MarmotRuntimeProjectionUpdate, MarmotRuntimeProjectionUpdateV2};
 use crate::memory::{CFree, free_c_string, owned_c_string, owned_opt_c_string};
 
 /// One per-group lifecycle event.
@@ -500,5 +500,269 @@ unsafe impl Send for MarmotEvent {}
 /// `event` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_event_free(event: *mut MarmotEvent) {
+    crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(event) });
+}
+
+/// One top-level runtime event with rich attachment outcomes.
+#[repr(C)]
+pub enum MarmotEventV2 {
+    GroupJoined {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+    },
+    GroupStateUpdated {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+    },
+    MessageReceived {
+        received: MarmotRuntimeMessageReceivedV2,
+    },
+    ProjectionUpdated {
+        update: MarmotRuntimeProjectionUpdateV2,
+    },
+    GroupEvent {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+        event: MarmotGroupEventKind,
+    },
+    AccountError {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        message: *mut c_char,
+    },
+    AgentStreamActivity {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    WelcomeDeliveryPending {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+        message_id_hex: *mut c_char,
+        recipient_hex: *mut c_char,
+    },
+    EpochStallEscalated {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+        stalled_epoch: u64,
+        arms: u32,
+    },
+    GroupChangeSuperseded {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+        commit_id_hex: *mut c_char,
+        kind: *mut c_char,
+        outcome: *mut c_char,
+        reason: *mut c_char,
+    },
+}
+
+impl From<MarmotEventFfi> for MarmotEventV2 {
+    fn from(value: MarmotEventFfi) -> Self {
+        use MarmotEventFfi as F;
+        match value {
+            F::GroupJoined {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+            } => Self::GroupJoined {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+            },
+            F::GroupStateUpdated {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+            } => Self::GroupStateUpdated {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+            },
+            F::MessageReceived { received } => Self::MessageReceived {
+                received: received.into(),
+            },
+            F::ProjectionUpdated { update } => Self::ProjectionUpdated {
+                update: update.into(),
+            },
+            F::GroupEvent {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                event,
+            } => Self::GroupEvent {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+                event: event.into(),
+            },
+            F::AccountError {
+                account_id_hex,
+                account_label,
+                message,
+            } => Self::AccountError {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                message: owned_c_string(message),
+            },
+            F::AgentStreamActivity {
+                account_id_hex,
+                account_label,
+            } => Self::AgentStreamActivity {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::WelcomeDeliveryPending {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                message_id_hex,
+                recipient_hex,
+            } => Self::WelcomeDeliveryPending {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+                message_id_hex: owned_c_string(message_id_hex),
+                recipient_hex: owned_c_string(recipient_hex),
+            },
+            F::EpochStallEscalated {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                stalled_epoch,
+                arms,
+            } => Self::EpochStallEscalated {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+                stalled_epoch,
+                arms,
+            },
+            F::GroupChangeSuperseded {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                commit_id_hex,
+                kind,
+                outcome,
+                reason,
+            } => Self::GroupChangeSuperseded {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+                commit_id_hex: owned_c_string(commit_id_hex),
+                kind: owned_c_string(kind),
+                outcome: owned_c_string(outcome),
+                reason: owned_c_string(reason),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotEventV2 {
+    unsafe fn free_in_place(&mut self) {
+        unsafe {
+            match self {
+                Self::GroupJoined {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                }
+                | Self::GroupStateUpdated {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*group_id_hex);
+                }
+                Self::MessageReceived { received } => received.free_in_place(),
+                Self::ProjectionUpdated { update } => update.free_in_place(),
+                Self::GroupEvent {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    event,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*group_id_hex);
+                    event.free_in_place();
+                }
+                Self::AccountError {
+                    account_id_hex,
+                    account_label,
+                    message,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*message);
+                }
+                Self::AgentStreamActivity {
+                    account_id_hex,
+                    account_label,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                }
+                Self::WelcomeDeliveryPending {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    message_id_hex,
+                    recipient_hex,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*group_id_hex);
+                    free_c_string(*message_id_hex);
+                    free_c_string(*recipient_hex);
+                }
+                Self::EpochStallEscalated {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    ..
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*group_id_hex);
+                }
+                Self::GroupChangeSuperseded {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    commit_id_hex,
+                    kind,
+                    outcome,
+                    reason,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*group_id_hex);
+                    free_c_string(*commit_id_hex);
+                    free_c_string(*kind);
+                    free_c_string(*outcome);
+                    free_c_string(*reason);
+                }
+            }
+        }
+    }
+}
+
+unsafe impl Send for MarmotEventV2 {}
+
+/// Free a rich event returned by this library. NULL is a no-op.
+///
+/// # Safety
+/// `event` must be NULL or an unfreed pointer returned by this library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_event_v2_free(event: *mut MarmotEventV2) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(event) });
 }

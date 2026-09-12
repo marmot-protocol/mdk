@@ -79,6 +79,12 @@ it never reinterprets an old device name as a hardware model. Both setters use t
 - Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is
   0); detail text for the calling thread's most recent failure comes from
   `marmot_last_error_message()` (free with `marmot_string_free`).
+  `MARMOT_STATUS_MEDIA_ATTACHMENT` also stores a typed diagnostic; take it
+  with `marmot_last_media_error()` (free with `marmot_media_diagnostic_free`).
+  Legacy `marmot_list_media`, `marmot_messages`, `marmot_timeline_messages`,
+  and the original event/message/timeline subscription payloads omit rejected
+  attachments. Use the matching `_v2` symbols for indexed Parsed/Rejected
+  outcomes.
 - Structs returned by pointer are freed ONLY with their matching
   `marmot_*_free`, which deep-frees every field. Never free fields
   individually, never free twice; NULL is always a no-op.

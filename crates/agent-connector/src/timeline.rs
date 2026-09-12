@@ -250,6 +250,7 @@ mod tests {
             reply_to_message_id_hex: Some("55".repeat(32)),
             reply_preview: None,
             media: None,
+            media_decode_failed: false,
             agent_text_stream: None,
             reactions: TimelineReactionSummary {
                 by_emoji: Default::default(),

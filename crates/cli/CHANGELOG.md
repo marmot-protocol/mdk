@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- MarmotKit and C bindings now preserve typed attachment rejection diagnostics
+  (closed stage/code/field enums plus the original attachment index) on
+  message, timeline, list-media, and explicit parse surfaces. Hosts must
+  regenerate bindings. Legacy C layouts remain diagnostic-loss compatibility
+  views; use the `_v2` symbols for the rich outcome tree.
+
 ## [0.9.21] - 2026-09-10
 
 ### Release notes

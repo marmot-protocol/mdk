@@ -2,6 +2,8 @@ use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::AppError;
 
+use crate::conversions::MediaDiagnosticFfi;
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
     #[error("usage and diagnostics consent required")]
@@ -52,6 +54,9 @@ pub enum MarmotKitError {
     /// the target group's selected media profile.
     #[error("invalid media reference: {details}")]
     InvalidMediaReference { details: String },
+    /// Typed attachment validation or operation failure.
+    #[error("media attachment failed: {diagnostic}")]
+    MediaAttachment { diagnostic: MediaDiagnosticFfi },
     #[error("invalid hex: {details}")]
     InvalidHex { details: String },
     #[error("invalid nostr identity: {details}")]
@@ -322,6 +327,9 @@ impl From<AppError> for MarmotKitError {
             // Encrypted-media validation failures are always media-boundary
             // errors; map them to the typed variant so send/upload/download
             // agree with build/parse even when a call site uses `?`/`From`.
+            AppError::MediaAttachment(diagnostic) => Self::MediaAttachment {
+                diagnostic: diagnostic.into(),
+            },
             AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
             AppError::UnsafeMediaFetch(details) => Self::InvalidMediaReference { details },
             AppError::Hex(err) => Self::InvalidHex {

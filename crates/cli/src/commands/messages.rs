@@ -926,6 +926,7 @@ mod tests {
             reply_to_message_id_hex: None,
             reply_preview: None,
             media: None,
+            media_decode_failed: false,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,

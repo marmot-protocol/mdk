@@ -7,6 +7,24 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Typed attachment diagnostics (`MarmotMediaDiagnostic`, closed stage/code/field
+  enums, `MarmotMediaAttachmentResult`, and `MarmotMediaAttachmentProjection`)
+  plus `_v2` query, snapshot, next, pagination, and event/projection mirrors
+  that retain rejected attachments and their original indices.
+- `marmot_last_media_error` takes and clears the thread-local typed diagnostic
+  after `MARMOT_STATUS_MEDIA_ATTACHMENT` (70). Non-media failures clear a stale
+  diagnostic.
+- `marmot_parse_media_imeta_tag` mirrors the existing UniFFI explicit parser.
+
+### Changed
+
+- Legacy `marmot_list_media`, message, timeline, and event layouts are
+  unchanged diagnostic-loss compatibility views: rejected attachments are
+  omitted and old records do not carry `media_attachments`. Use the `_v2`
+  symbols for the rich outcome tree. Rebuild against the regenerated header.
+
 ## [0.9.21] - 2026-09-10
 
 This cohort also exposes host-driven agent stream publishing and the v4 audit

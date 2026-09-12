@@ -66,12 +66,18 @@ use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatListSubscriptionUpdate,
 };
 use crate::types::directory::MarmotUserSearchUpdate;
-use crate::types::event::MarmotEvent;
+use crate::types::event::{MarmotEvent, MarmotEventV2};
 use crate::types::group::MarmotAppGroupRecord;
-use crate::types::message::{MarmotAppMessageRecordList, MarmotMessageUpdate};
+use crate::types::message::{
+    MarmotAppMessageRecordList, MarmotAppMessageRecordV2List, MarmotMessageUpdate,
+    MarmotMessageUpdateV2,
+};
 use crate::types::notification::MarmotNotificationUpdate;
 use crate::types::onboarding::MarmotOnboardingSnapshot;
-use crate::types::timeline::{MarmotTimelinePage, MarmotTimelineSubscriptionUpdate};
+use crate::types::timeline::{
+    MarmotTimelinePage, MarmotTimelinePageV2, MarmotTimelineSubscriptionUpdate,
+    MarmotTimelineSubscriptionUpdateV2,
+};
 use crate::{MarmotClient, block_on_handle, client_ref, ffi_guard, preflight_out_ptr, write_out};
 
 /// `user_data` travels into a tokio task; the C caller owns its thread
@@ -572,6 +578,97 @@ pub unsafe extern "C" fn marmot_timeline_subscription_paginate_forwards(
     })
 }
 
+/// Take the initial window snapshot with attachment outcomes. Yields the
+/// page exactly once: later calls write NULL with `MARMOT_STATUS_OK`.
+/// Free the page with `marmot_timeline_page_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out_page` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_snapshot_v2(
+    sub: *const MarmotTimelineSubscription,
+    out_page: *mut *mut MarmotTimelinePageV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_page) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let page = sub.inner.snapshot().map_or(std::ptr::null_mut(), |p| {
+            boxed(MarmotTimelinePageV2::from(p))
+        });
+        match unsafe { write_out(out_page, page) } {
+            Ok(()) => MarmotStatus::Ok,
+            Err(status) => {
+                unsafe { free_boxed(page) };
+                status
+            }
+        }
+    })
+}
+
+/// Block until the next rich delta (page replacement or projection
+/// update). Free with `marmot_timeline_subscription_update_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out_update` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_next_update_v2(
+    sub: *const MarmotTimelineSubscription,
+    timeout_ms: u32,
+    out_update: *mut *mut MarmotTimelineSubscriptionUpdateV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_update) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let inner = sub.inner.clone();
+        let result = sub.core.block_next(timeout_ms, inner.next_update());
+        unsafe { deliver_next(result, out_update) }
+    })
+}
+
+/// Extend the window toward older history and return the rich window.
+/// Free with `marmot_timeline_page_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out_page` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_paginate_backwards_v2(
+    sub: *const MarmotTimelineSubscription,
+    count: u32,
+    out_page: *mut *mut MarmotTimelinePageV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_page) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let inner = sub.inner.clone();
+        let result = block_on_handle(&sub.core.runtime, async move {
+            inner.paginate_backwards(count).await
+        });
+        unsafe { deliver(result, out_page) }
+    })
+}
+
+/// Extend the window toward the live head and return the rich window.
+/// Free with `marmot_timeline_page_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out_page` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_paginate_forwards_v2(
+    sub: *const MarmotTimelineSubscription,
+    count: u32,
+    out_page: *mut *mut MarmotTimelinePageV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_page) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let inner = sub.inner.clone();
+        let result = block_on_handle(&sub.core.runtime, async move {
+            inner.paginate_forwards(count).await
+        });
+        unsafe { deliver(result, out_page) }
+    })
+}
+
 c_subscription! {
     /// Opaque handle to the notification pipeline: local-notification
     /// updates produced by the runtime.
@@ -864,6 +961,69 @@ pub unsafe extern "C" fn marmot_messages_subscription_snapshot(
                 out_list,
             )
         }
+    })
+}
+
+/// Take the initial rich message-record snapshot with attachment
+/// outcomes. Yields the populated list exactly once: later calls write
+/// an EMPTY list, still with `MARMOT_STATUS_OK`. Free with
+/// `marmot_app_message_record_v2_list_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out_list` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_messages_subscription_snapshot_v2(
+    sub: *const MarmotMessagesSubscription,
+    out_list: *mut *mut MarmotAppMessageRecordV2List,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_list) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        unsafe {
+            deliver(
+                Ok::<_, marmot_uniffi::MarmotKitError>(sub.inner.snapshot()),
+                out_list,
+            )
+        }
+    })
+}
+
+/// Block until the next rich message update. Free with
+/// `marmot_message_update_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_messages_subscription_next_v2(
+    sub: *const MarmotMessagesSubscription,
+    timeout_ms: u32,
+    out: *mut *mut MarmotMessageUpdateV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let inner = sub.inner.clone();
+        let result = sub.core.block_next(timeout_ms, inner.next());
+        unsafe { deliver_next(result, out) }
+    })
+}
+
+/// Block until the next rich event. Free with `marmot_event_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_events_subscription_next_v2(
+    sub: *const MarmotEventsSubscription,
+    timeout_ms: u32,
+    out: *mut *mut MarmotEventV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let inner = sub.inner.clone();
+        let result = sub.core.block_next(timeout_ms, inner.next());
+        unsafe { deliver_next(result, out) }
     })
 }
 

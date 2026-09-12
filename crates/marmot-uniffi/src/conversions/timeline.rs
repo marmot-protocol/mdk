@@ -10,7 +10,10 @@ use marmot_app::{
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
-use super::media::{MediaAttachmentReferenceFfi, timeline_media_references_ffi};
+use super::media::{
+    MediaAttachmentProjectionFfi, MediaAttachmentReferenceFfi, parsed_media_references,
+    timeline_media_attachments_ffi,
+};
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -91,11 +94,10 @@ pub struct TimelineReplyPreviewFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub media_json: Option<String>,
-    /// Fully-resolved, downloadable media references for the previewed message,
-    /// built from its `imeta` tags + its own `source_epoch` using the same
-    /// resolution and validation as `list_media`. Empty when the previewed
-    /// message has no media or its `imeta` is malformed.
+    /// Parsed-only view of the previewed message's attachments.
     pub media: Vec<MediaAttachmentReferenceFfi>,
+    /// One ordered outcome per stored `imeta` entry, including rejections.
+    pub media_attachments: Vec<MediaAttachmentProjectionFfi>,
     pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
     /// Convergence invalidation reason for the previewed message. The content
@@ -106,7 +108,12 @@ pub struct TimelineReplyPreviewFfi {
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
-        let media = timeline_media_references_ffi(&value.media, value.source_epoch);
+        let media_attachments = timeline_media_attachments_ffi(
+            &value.media,
+            value.media_decode_failed,
+            value.source_epoch,
+        );
+        let media = parsed_media_references(&media_attachments);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -115,6 +122,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             kind: value.kind,
             media_json: value.media.map(|media| media.to_string()),
             media,
+            media_attachments,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             deleted: value.deleted,
             invalidation_status: value.invalidation_status,
@@ -192,13 +200,10 @@ pub struct TimelineMessageRecordFfi {
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
     pub media_json: Option<String>,
-    /// Fully-resolved, downloadable media references for this message, built
-    /// from its `imeta` tags + its own `source_epoch` using the same resolution
-    /// and validation as `list_media` (a `list_media` record and this row's
-    /// `media` resolve identically for the same message). Empty when the message
-    /// has no media; a malformed `imeta` attachment is dropped while the message
-    /// still appears as text.
+    /// Parsed-only view of this message's attachments.
     pub media: Vec<MediaAttachmentReferenceFfi>,
+    /// One ordered outcome per stored `imeta` entry, including rejections.
+    pub media_attachments: Vec<MediaAttachmentProjectionFfi>,
     pub agent_text_stream_json: Option<String>,
     /// Parsed view of kind-1210 group system rows. `None` for chat, reactions,
     /// stream rows, and malformed/free-text kind-1210 assertions.
@@ -217,7 +222,12 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = group_system_event_from_message(value.kind, &value.plaintext);
-        let media = timeline_media_references_ffi(&value.media, value.source_epoch);
+        let media_attachments = timeline_media_attachments_ffi(
+            &value.media,
+            value.media_decode_failed,
+            value.source_epoch,
+        );
+        let media = parsed_media_references(&media_attachments);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -237,6 +247,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             reply_preview: value.reply_preview.map(Into::into),
             media_json: value.media.map(|media| media.to_string()),
             media,
+            media_attachments,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             group_system: group_system.map(Into::into),
             reactions: value.reactions.into(),
@@ -616,6 +627,7 @@ mod tests {
             reply_to_message_id_hex: reply_preview.as_ref().map(|p| p.message_id_hex.clone()),
             reply_preview,
             media,
+            media_decode_failed: false,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
@@ -644,6 +656,34 @@ mod tests {
 
         assert!(record.media.is_empty());
         assert_eq!(record.plaintext, "see attached");
+        assert_eq!(record.media_attachments.len(), 1);
+        assert_eq!(record.media_attachments[0].attachment_index, Some(0));
+        assert!(matches!(
+            record.media_attachments[0].result,
+            crate::conversions::MediaAttachmentResultFfi::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_surfaces_decode_failed_container() {
+        let mut record = record_with_media(Some(7), None, None);
+        record.media_decode_failed = true;
+        let record: TimelineMessageRecordFfi = record.into();
+        assert_eq!(record.plaintext, "see attached");
+        assert!(record.media.is_empty());
+        assert_eq!(record.media_attachments.len(), 1);
+        assert_eq!(record.media_attachments[0].attachment_index, None);
+        match &record.media_attachments[0].result {
+            crate::conversions::MediaAttachmentResultFfi::Rejected { diagnostic } => {
+                assert_eq!(
+                    diagnostic.code,
+                    crate::conversions::MediaErrorCodeFfi::InvalidStructure
+                );
+            }
+            crate::conversions::MediaAttachmentResultFfi::Parsed { .. } => {
+                panic!("decode failure must be a container rejection")
+            }
+        }
     }
 
     #[test]
@@ -685,6 +725,7 @@ mod tests {
             // from the replying message's epoch.
             source_epoch: Some(3),
             media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
+            media_decode_failed: false,
             agent_text_stream: None,
             deleted: false,
             invalidation_status: Some("LosingBranch".to_owned()),

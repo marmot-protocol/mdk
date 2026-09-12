@@ -1,6 +1,7 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+use super::diagnostics::{MediaErrorCode, MediaErrorField, metadata_error};
 use super::{EncryptedMediaVersion, MediaAttachmentReference};
 use crate::AppError;
 
@@ -73,13 +74,25 @@ fn is_http_token_byte(byte: u8) -> bool {
         )
 }
 
-pub(crate) fn validate_sha256_hex(value: &str, label: &str) -> Result<(), AppError> {
-    let hash = hex::decode(value)
-        .map_err(|_| AppError::InvalidAppMessagePayload(format!("{label} must be hex")))?;
+pub(crate) fn validate_sha256_hex(value: &str, field: MediaErrorField) -> Result<(), AppError> {
+    let label = match field {
+        MediaErrorField::CiphertextSha256 => "media ciphertext_sha256",
+        MediaErrorField::PlaintextSha256 => "media plaintext_sha256",
+        _ => "media hash",
+    };
+    let hash = hex::decode(value).map_err(|_| {
+        metadata_error(
+            MediaErrorCode::MalformedField,
+            Some(field),
+            format!("{label} must be hex"),
+        )
+    })?;
     if hash.len() != 32 {
-        return Err(AppError::InvalidAppMessagePayload(format!(
-            "{label} must be 32 bytes"
-        )));
+        return Err(metadata_error(
+            MediaErrorCode::MalformedField,
+            Some(field),
+            format!("{label} must be 32 bytes"),
+        ));
     }
     Ok(())
 }

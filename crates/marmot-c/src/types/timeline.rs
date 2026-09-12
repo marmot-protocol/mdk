@@ -13,7 +13,7 @@ use marmot_uniffi::conversions::{
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
 use super::common::MarmotMessageTag;
 use super::markdown::MarmotMarkdownDocument;
-use super::media::MarmotMediaAttachmentReference;
+use super::media::{MarmotMediaAttachmentProjection, MarmotMediaAttachmentReference};
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, c_bool, free_c_string, optional_str, owned_c_string};
@@ -73,6 +73,23 @@ c_mirror! {
         copy deleted: bool,
         /// Convergence invalidation reason for the previewed message.
         /// Nullable.
+        opt_str invalidation_status,
+    }
+}
+
+c_mirror! {
+    /// Rich reply preview with attachment outcomes.
+    MarmotTimelineReplyPreviewV2 from TimelineReplyPreviewFfi {
+        str message_id_hex,
+        str sender,
+        str plaintext,
+        rec content_tokens: MarmotMarkdownDocument,
+        copy kind: u64,
+        opt_str media_json,
+        vec media/media_len: MarmotMediaAttachmentReference,
+        vec media_attachments/media_attachments_len: MarmotMediaAttachmentProjection,
+        opt_str agent_text_stream_json,
+        copy deleted: bool,
         opt_str invalidation_status,
     }
 }
@@ -173,10 +190,52 @@ c_mirror! {
 }
 
 c_mirror! {
+    /// Rich materialized timeline row with attachment outcomes.
+    MarmotTimelineMessageRecordV2 from TimelineMessageRecordFfi,
+    free marmot_timeline_message_record_v2_free {
+        str message_id_hex,
+        opt_str source_message_id_hex,
+        opt_copy has_source_epoch/source_epoch: u64,
+        opt_copy has_retention_seconds/retention_seconds: u64,
+        opt_copy has_retention_expires_at/retention_expires_at: u64,
+        str direction,
+        str group_id_hex,
+        str sender,
+        str plaintext,
+        rec content_tokens: MarmotMarkdownDocument,
+        copy kind: u64,
+        vec tags/tags_len: MarmotMessageTag,
+        copy timeline_at: u64,
+        copy received_at: u64,
+        opt_str reply_to_message_id_hex,
+        opt_rec reply_preview: MarmotTimelineReplyPreviewV2,
+        opt_str media_json,
+        vec media/media_len: MarmotMediaAttachmentReference,
+        vec media_attachments/media_attachments_len: MarmotMediaAttachmentProjection,
+        opt_str agent_text_stream_json,
+        opt_rec group_system: MarmotGroupSystemEvent,
+        rec reactions: MarmotTimelineReactionSummary,
+        copy deleted: bool,
+        opt_str deleted_by_message_id_hex,
+        opt_str invalidation_status,
+    }
+}
+
+c_mirror! {
     /// One rendered timeline window (sorted, deduplicated, capped).
     MarmotTimelinePage from TimelinePageFfi,
     free marmot_timeline_page_free {
         vec messages/messages_len: MarmotTimelineMessageRecord,
+        copy has_more_before: bool,
+        copy has_more_after: bool,
+    }
+}
+
+c_mirror! {
+    /// Rich timeline window with attachment outcomes.
+    MarmotTimelinePageV2 from TimelinePageFfi,
+    free marmot_timeline_page_v2_free {
+        vec messages/messages_len: MarmotTimelineMessageRecordV2,
         copy has_more_before: bool,
         copy has_more_after: bool,
     }
@@ -258,6 +317,48 @@ impl CFree for MarmotTimelineMessageChange {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+#[repr(C)]
+pub enum MarmotTimelineMessageChangeV2 {
+    Upsert {
+        trigger: MarmotTimelineUpdateTrigger,
+        message: MarmotTimelineMessageRecordV2,
+    },
+    Remove {
+        message_id_hex: *mut c_char,
+        reason: MarmotTimelineRemoveReason,
+    },
+}
+
+impl From<TimelineMessageChangeFfi> for MarmotTimelineMessageChangeV2 {
+    fn from(value: TimelineMessageChangeFfi) -> Self {
+        match value {
+            TimelineMessageChangeFfi::Upsert { trigger, message } => Self::Upsert {
+                trigger: trigger.into(),
+                message: message.into(),
+            },
+            TimelineMessageChangeFfi::Remove {
+                message_id_hex,
+                reason,
+            } => Self::Remove {
+                message_id_hex: owned_c_string(message_id_hex),
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotTimelineMessageChangeV2 {
+    unsafe fn free_in_place(&mut self) {
+        unsafe {
+            match self {
+                Self::Upsert { message, .. } => message.free_in_place(),
+                Self::Remove { message_id_hex, .. } => free_c_string(*message_id_hex),
+            }
+        }
+    }
+}
+
 c_mirror! {
     /// One group's projection delta: the changed rows plus the refreshed
     /// chat-list row.
@@ -276,6 +377,26 @@ c_mirror! {
         str account_id_hex,
         str account_label,
         rec update: MarmotTimelineProjectionUpdate,
+    }
+}
+
+c_mirror! {
+    /// Rich projection delta with attachment outcomes.
+    MarmotTimelineProjectionUpdateV2 from TimelineProjectionUpdateFfi {
+        str group_id_hex,
+        vec messages/messages_len: MarmotTimelineMessageRecordV2,
+        vec changes/changes_len: MarmotTimelineMessageChangeV2,
+        opt_rec chat_list_row: MarmotChatListRow,
+        copy chat_list_trigger: MarmotChatListUpdateTrigger,
+    }
+}
+
+c_mirror! {
+    /// Rich projection delta plus the account it belongs to.
+    MarmotRuntimeProjectionUpdateV2 from RuntimeProjectionUpdateFfi {
+        str account_id_hex,
+        str account_label,
+        rec update: MarmotTimelineProjectionUpdateV2,
     }
 }
 
@@ -321,6 +442,49 @@ impl CFree for MarmotTimelineSubscriptionUpdate {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_timeline_subscription_update_free(
     update: *mut MarmotTimelineSubscriptionUpdate,
+) {
+    crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
+}
+
+#[repr(C)]
+pub enum MarmotTimelineSubscriptionUpdateV2 {
+    Page {
+        page: MarmotTimelinePageV2,
+    },
+    Projection {
+        update: MarmotRuntimeProjectionUpdateV2,
+    },
+}
+
+impl From<TimelineSubscriptionUpdateFfi> for MarmotTimelineSubscriptionUpdateV2 {
+    fn from(value: TimelineSubscriptionUpdateFfi) -> Self {
+        match value {
+            TimelineSubscriptionUpdateFfi::Page { page } => Self::Page { page: page.into() },
+            TimelineSubscriptionUpdateFfi::Projection { update } => Self::Projection {
+                update: update.into(),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotTimelineSubscriptionUpdateV2 {
+    unsafe fn free_in_place(&mut self) {
+        unsafe {
+            match self {
+                Self::Page { page } => page.free_in_place(),
+                Self::Projection { update } => update.free_in_place(),
+            }
+        }
+    }
+}
+
+/// Free a rich timeline-subscription delta. NULL is a no-op.
+///
+/// # Safety
+/// `update` must be NULL or an unfreed pointer returned by this library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_update_v2_free(
+    update: *mut MarmotTimelineSubscriptionUpdateV2,
 ) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
 }

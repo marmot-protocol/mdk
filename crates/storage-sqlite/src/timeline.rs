@@ -194,6 +194,11 @@ pub struct TimelineMessageRecord {
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreview>,
     pub media: Option<Value>,
+    /// True when this row's stored `media_json` was present but not valid JSON.
+    /// Transient; not a schema column. Serde defaults keep historical records
+    /// decode-compatible.
+    #[serde(default)]
+    pub media_decode_failed: bool,
     pub agent_text_stream: Option<Value>,
     pub reactions: TimelineReactionSummary,
     pub deleted: bool,
@@ -227,10 +232,14 @@ pub struct TimelineReplyPreview {
     pub plaintext: String,
     pub kind: u64,
     /// Source epoch of the previewed (reply target) message, carried so callers
-    /// can resolve its `imeta` media into downloadable attachment references.
+    /// can project its `imeta` media into parsed or rejected attachment outcomes.
     /// `None` for local sends not yet committed to an epoch.
     pub source_epoch: Option<u64>,
     pub media: Option<Value>,
+    /// True when the previewed row's stored `media_json` was present but not
+    /// valid JSON. Transient; not a schema column.
+    #[serde(default)]
+    pub media_decode_failed: bool,
     pub agent_text_stream: Option<Value>,
     pub deleted: bool,
     /// Set when convergence invalidated the previewed message. Content remains
@@ -3569,6 +3578,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 }
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
+    let (media, media_decode_failed) = optional_media_from_json(row.get::<_, Option<String>>(14)?);
     Ok(TimelineMessageRecord {
         message_id_hex: row.get(0)?,
         source_message_id_hex: row.get(1)?,
@@ -3597,13 +3607,8 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
         reply_to_message_id_hex: row.get(13)?,
         reply_preview: None,
-        media: optional_value_from_json(row.get::<_, Option<String>>(14)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                14,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
+        media,
+        media_decode_failed,
         agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(15)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -3703,14 +3708,14 @@ fn load_reply_previews(
 }
 
 fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineReplyPreview> {
+    let (media, media_decode_failed) = optional_media_from_json(row.get::<_, Option<String>>(4)?);
     Ok(TimelineReplyPreview {
         message_id_hex: row.get(0)?,
         sender: row.get(1)?,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        media: optional_value_from_json(row.get::<_, Option<String>>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        media,
+        media_decode_failed,
         agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -3742,6 +3747,18 @@ fn optional_value_json(value: &Option<Value>) -> StorageResult<Option<String>> {
 
 fn optional_value_from_json(value: Option<String>) -> Result<Option<Value>, serde_json::Error> {
     value.map(|value| serde_json::from_str(&value)).transpose()
+}
+
+/// Media-only decoder: SQL NULL is `(None, false)`, valid JSON is
+/// `(Some(value), false)`, and a present syntax failure is `(None, true)`.
+fn optional_media_from_json(value: Option<String>) -> (Option<Value>, bool) {
+    match value {
+        None => (None, false),
+        Some(raw) => match serde_json::from_str(&raw) {
+            Ok(parsed) => (Some(parsed), false),
+            Err(_) => (None, true),
+        },
+    }
 }
 
 fn reaction_summary_json(summary: &TimelineReactionSummary) -> StorageResult<String> {

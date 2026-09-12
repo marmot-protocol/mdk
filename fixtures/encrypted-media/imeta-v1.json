@@ -104,6 +104,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "nonce",
+      "error_code": "MissingField",
+      "error_field": "Nonce",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -119,6 +121,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "exactly one m",
+      "error_code": "DuplicateField",
+      "error_field": "MediaType",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -136,6 +140,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "thumbhash",
+      "error_code": "UnsupportedFormat",
+      "error_field": "Thumbhash",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -153,6 +159,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "locator",
+      "error_code": "MalformedField",
+      "error_field": "Locator",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -169,6 +177,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "version",
+      "error_code": "UnsupportedVersion",
+      "error_field": "Version",
       "tag": [
         "imeta",
         "v encrypted-media-v3",
@@ -185,6 +195,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "file name",
+      "error_code": "MalformedField",
+      "error_field": "FileName",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -201,6 +213,8 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "nonce",
+      "error_code": "MalformedField",
+      "error_field": "Nonce",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -210,6 +224,325 @@
         "nonce 3333333333333333",
         "m image/png",
         "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-legacy-version",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "version",
+      "error_code": "UnsupportedVersion",
+      "error_field": "Version",
+      "tag": [
+        "imeta",
+        "v legacy-media-v0",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-old-format-url-field",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "ciphertext_sha256",
+      "error_code": "MissingField",
+      "error_field": "CiphertextSha256",
+      "tag": [
+        "imeta",
+        "url https://old.example/SYNTHETIC-old-format.png",
+        "m image/png",
+        "filename old.png"
+      ]
+    },
+    {
+      "name": "rejects-missing-version",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "missing v",
+      "error_code": "MissingField",
+      "error_field": "Version",
+      "tag": [
+        "imeta",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-missing-ciphertext",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "ciphertext_sha256",
+      "error_code": "MissingField",
+      "error_field": "CiphertextSha256",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-missing-plaintext",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "plaintext_sha256",
+      "error_code": "MissingField",
+      "error_field": "PlaintextSha256",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-missing-filename",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "filename",
+      "error_code": "MissingField",
+      "error_field": "FileName",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png"
+      ]
+    },
+    {
+      "name": "rejects-missing-media-type",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "missing m",
+      "error_code": "MissingField",
+      "error_field": "MediaType",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-missing-locator",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "locator",
+      "error_code": "MissingField",
+      "error_field": "Locator",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-duplicate-version",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "exactly one version",
+      "error_code": "DuplicateField",
+      "error_field": "Version",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png",
+        "v encrypted-media-v1"
+      ]
+    },
+    {
+      "name": "rejects-duplicate-ciphertext",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "exactly one ciphertext_sha256",
+      "error_code": "DuplicateField",
+      "error_field": "CiphertextSha256",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png",
+        "ciphertext_sha256 4444444444444444444444444444444444444444444444444444444444444444"
+      ]
+    },
+    {
+      "name": "rejects-duplicate-nonce",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "exactly one nonce",
+      "error_code": "DuplicateField",
+      "error_field": "Nonce",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png",
+        "nonce 444444444444444444444444"
+      ]
+    },
+    {
+      "name": "rejects-duplicate-filename",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "exactly one filename",
+      "error_code": "DuplicateField",
+      "error_field": "FileName",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png",
+        "filename other.png"
+      ]
+    },
+    {
+      "name": "rejects-bare-nonce",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "missing its value",
+      "error_code": "MissingField",
+      "error_field": "Nonce",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-bare-locator",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "missing its value",
+      "error_code": "MissingField",
+      "error_field": "Locator",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-invalid-locator-structure",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "kind and value",
+      "error_code": "MalformedField",
+      "error_field": "Locator",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-malformed-ciphertext-hash",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "sha256",
+      "error_code": "MalformedField",
+      "error_field": "CiphertextSha256",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 not-a-valid-hash",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-precedence-legacy-before-current-version",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "version",
+      "error_code": "UnsupportedVersion",
+      "error_field": "Version",
+      "tag": [
+        "imeta",
+        "v legacy-media-v0",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "nonce 333333333333333333333333",
+        "m image/png",
+        "filename diagram.png"
+      ]
+    },
+    {
+      "name": "rejects-precedence-blurhash-before-missing-nonce",
+      "source_epoch": 7,
+      "valid": false,
+      "error_contains": "thumbhash",
+      "error_code": "UnsupportedFormat",
+      "error_field": "Thumbhash",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v1",
+        "locator blossom-v1 https://media.example/1111111111111111111111111111111111111111111111111111111111111111.bin",
+        "ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111",
+        "plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222",
+        "m image/png",
+        "filename diagram.png",
+        "blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj"
       ]
     }
   ]

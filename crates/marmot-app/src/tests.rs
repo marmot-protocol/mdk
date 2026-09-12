@@ -13017,6 +13017,78 @@ fn received_media_message_with_malformed_v1_reference_is_rejected() {
 }
 
 #[test]
+fn received_media_message_with_valid_v1_reference_is_delivered() {
+    let event = build(AppMessageIntent::Media {
+        attachments: vec![MediaAttachmentReference {
+            locators: vec![MediaLocator {
+                kind: "blossom-v1".to_owned(),
+                value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
+            }],
+            ciphertext_sha256: hex::encode([0x33_u8; 32]),
+            plaintext_sha256: hex::encode([0x11_u8; 32]),
+            nonce_hex: hex::encode([0x22_u8; 12]),
+            file_name: "a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+            source_epoch: 7,
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: Some("valid v1".to_owned()),
+    });
+    let bytes = event.encode().unwrap();
+    let group_id = GroupId::new(vec![0x01]);
+    let message = groups::decode_received_event(
+        &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
+    )
+    .expect("a valid V1 attachment must still be admitted");
+    assert_eq!(message.plaintext, "valid v1");
+}
+
+#[test]
+fn received_media_message_with_unknown_version_keeps_the_message() {
+    let mut event = build(AppMessageIntent::Media {
+        attachments: vec![MediaAttachmentReference {
+            locators: vec![MediaLocator {
+                kind: "blossom-v1".to_owned(),
+                value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
+            }],
+            ciphertext_sha256: hex::encode([0x33_u8; 32]),
+            plaintext_sha256: hex::encode([0x11_u8; 32]),
+            nonce_hex: hex::encode([0x22_u8; 12]),
+            file_name: "a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+            source_epoch: 7,
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: Some("unknown version caption".to_owned()),
+    });
+    for tag in &mut event.tags {
+        for field in tag.iter_mut() {
+            if field.starts_with("v ") {
+                *field = "v encrypted-media-v3".to_owned();
+            }
+        }
+    }
+    event.id = cgka_traits::canonical_event_id(
+        &event.pubkey,
+        event.created_at,
+        event.kind,
+        &event.tags,
+        &event.content,
+    );
+    let bytes = event.encode().unwrap();
+    let group_id = GroupId::new(vec![0x01]);
+    let message = groups::decode_received_event(
+        &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
+    )
+    .expect("an unknown-version attachment must not drop its carrying message");
+    assert_eq!(message.plaintext, "unknown version caption");
+}
+
+#[test]
 fn received_media_message_with_malformed_v2_reference_keeps_the_message() {
     // V2 rejects malformed references attachment-locally, preserving the
     // caption, event, and any valid sibling attachments.
