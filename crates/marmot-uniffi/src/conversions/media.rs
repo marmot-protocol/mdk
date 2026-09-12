@@ -240,7 +240,7 @@ pub(crate) fn media_attachment_outcomes_ffi(
     if rejected > 0 {
         tracing::debug!(
             target: "marmot_uniffi::conversions",
-            method,
+            method = method,
             rejected_attachments = rejected,
             "projected media attachments the shared parser rejected",
         );
