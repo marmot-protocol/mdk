@@ -808,7 +808,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... [--adapter engine|retained-relay|app-runtime] | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|admin-churn/v1|adversarial-reliability/v1|bounded-convergence-pressure/v1|large-group-pressure/v1|offline-catchup-pressure/v1|membership-reentry/v1|cross-route-restart-permutations/v1|cross-route-exact-restart-permutations/v1|chat-journey/v1|public-app-send-leave/v1|public-app-membership-reentry/v1|public-app-offline-recovery/v1|public-app-admin-handoff/v1|public-app-admin-churn/v1|public-app-late-join/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay] [--minimization-wall-time-secs N] [--minimization-max-trials N] [--minimization-trial-timeout-secs N]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... [--adapter engine|retained-relay|app-runtime] | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|admin-churn/v1|adversarial-reliability/v1|bounded-convergence-pressure/v1|large-group-pressure/v1|offline-catchup-pressure/v1|membership-reentry/v1|cross-route-restart-permutations/v1|cross-route-exact-restart-permutations/v1|chat-journey/v1|public-app-send-leave/v1|public-app-membership-reentry/v1|public-app-offline-recovery/v1|public-app-admin-handoff/v1|public-app-admin-churn/v1|public-app-late-join/v1|public-app-backlog-recovery/v1|public-app-large-group/v1|public-app-stateful-recovery/v1|public-app-recovery-schedules/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay] [--minimization-wall-time-secs N] [--minimization-max-trials N] [--minimization-trial-timeout-secs N]"
 }
 
 #[cfg(test)]
@@ -843,6 +843,7 @@ mod tests {
             expanded_schedule: Vec::new(),
             assertion_observations: Vec::new(),
             relay_sync_observations: Vec::new(),
+            stimulus_observations: Vec::new(),
             expected_trace: None,
             expected_outcomes: Vec::new(),
             observed_trace: None,

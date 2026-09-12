@@ -51,6 +51,8 @@ pub enum SubjectCapability {
     WhiteBoxStorageFaults,
     SemanticTransportFaults,
     ParticipantConnectivity,
+    RelayInterruption,
+    ConcurrentGroupMutation,
     ProcessLifecycle,
     StorageFaultInjection,
     AssertionEvaluation,
@@ -79,6 +81,8 @@ impl SubjectCapability {
             Self::WhiteBoxStorageFaults => "white_box_storage_faults",
             Self::SemanticTransportFaults => "semantic_transport_faults",
             Self::ParticipantConnectivity => "participant_connectivity",
+            Self::RelayInterruption => "relay_interruption",
+            Self::ConcurrentGroupMutation => "concurrent_group_mutation",
             Self::ProcessLifecycle => "process_lifecycle",
             Self::StorageFaultInjection => "storage_fault_injection",
             Self::AssertionEvaluation => "assertion_evaluation",
@@ -502,6 +506,33 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    async fn interrupt_relay(
+        &mut self,
+        _action_id: &str,
+        _relay: &str,
+        _outage_ms: u64,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::RelayInterruption,
+        ))
+    }
+
+    async fn race_group_profiles(
+        &mut self,
+        _action_id: &str,
+        _updates: &[crate::ScenarioProfileUpdate],
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ConcurrentGroupMutation,
+        ))
+    }
+
+    /// Append-only evidence for this subject's lifetime. Each report includes
+    /// only observations appended during its own execution.
+    fn stimulus_observations(&self) -> Vec<crate::ScenarioStimulusObservation> {
+        Vec::new()
+    }
+
     fn crash_process(&mut self, _process: &str) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::ProcessLifecycle,
@@ -609,7 +640,10 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         }
         if matches!(
             predicate,
-            Some(crate::ScenarioPredicateV2::PublicGroupState { .. })
+            Some(
+                crate::ScenarioPredicateV2::PublicGroupState { .. }
+                    | crate::ScenarioPredicateV2::PublicPayloadMultiset { .. }
+            )
         ) {
             capabilities.push(SubjectCapability::PublicGroupStateObservation);
         }
@@ -655,6 +689,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
                 SubjectCapability::ActiveDecryptabilityProbe
             }
             ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
+            ScenarioStep::InterruptRelay { .. } => SubjectCapability::RelayInterruption,
+            ScenarioStep::RaceGroupProfiles { .. } => SubjectCapability::ConcurrentGroupMutation,
             ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
                 SubjectCapability::ParticipantConnectivity
@@ -2073,7 +2109,8 @@ impl ConvergenceSubject for EngineHarnessSubject {
     ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
         use crate::ScenarioPredicateV2;
         let (matched, actual) = match predicate {
-            ScenarioPredicateV2::PublicGroupState { .. } => {
+            ScenarioPredicateV2::PublicGroupState { .. }
+            | ScenarioPredicateV2::PublicPayloadMultiset { .. } => {
                 return Err(SubjectError::unsupported(
                     SubjectCapability::PublicGroupStateObservation,
                 ));

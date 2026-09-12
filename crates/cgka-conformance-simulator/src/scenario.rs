@@ -190,6 +190,16 @@ pub enum ScenarioStep {
         allow: Vec<String>,
     },
     ClearPartition,
+    /// Cut live relay sockets while all app runtimes remain alive, then restore service.
+    InterruptRelay {
+        relay: String,
+        outage_ms: u64,
+    },
+    /// Release independent public profile calls at one barrier. All must be accepted;
+    /// semantic expected outcomes still decide whether their effects survive.
+    RaceGroupProfiles {
+        updates: Vec<crate::ScenarioProfileUpdate>,
+    },
     RestartClient {
         client: String,
     },
@@ -270,6 +280,8 @@ impl ScenarioStep {
         "reorder_messages",
         "set_partition",
         "clear_partition",
+        "interrupt_relay",
+        "race_group_profiles",
         "restart_client",
         "set_client_offline",
         "reconnect_client",
@@ -336,6 +348,8 @@ impl ScenarioStep {
             ScenarioStep::ReorderMessages { .. } => "reorder_messages",
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
+            ScenarioStep::InterruptRelay { .. } => "interrupt_relay",
+            ScenarioStep::RaceGroupProfiles { .. } => "race_group_profiles",
             ScenarioStep::RestartClient { .. } => "restart_client",
             ScenarioStep::SetClientOffline { .. } => "set_client_offline",
             ScenarioStep::ReconnectClient { .. } => "reconnect_client",
@@ -369,6 +383,8 @@ pub struct ScenarioReport {
     pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_sync_observations: Vec<crate::RelaySyncObservationV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stimulus_observations: Vec<crate::ScenarioStimulusObservation>,
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
@@ -1133,6 +1149,14 @@ async fn execute_scenario_step(
         ScenarioStep::ClearPartition => subject_faults(subject, step_index)?
             .clear_partition()
             .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::InterruptRelay { relay, outage_ms } => subject
+            .interrupt_relay(action_id, relay, *outage_ms)
+            .await
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RaceGroupProfiles { updates } => subject
+            .race_group_profiles(action_id, updates)
+            .await
+            .map_err(|error| subject_step_error(step_index, error))?,
         ScenarioStep::RestartClient { client } => {
             subject
                 .restart(client)
@@ -1318,6 +1342,7 @@ async fn run_scenario_report_inner(
     let descriptor = subject.descriptor();
     let compiled = compile_scenario(spec)?;
     preflight_compiled_scenario(&compiled, &descriptor)?;
+    let stimulus_start = subject.stimulus_observations().len();
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
     let mut sampled_max_queue_depth = 0_usize;
@@ -1326,6 +1351,10 @@ async fn run_scenario_report_inner(
         let step_started = std::time::Instant::now();
         let step_index = action.schedule.source_step_index;
         let step = &action.step;
+        // Opt-in harness diagnostics contain only schedule metadata, never payloads or identities.
+        if std::env::var_os("MDK_SCENARIO_PROGRESS").is_some() {
+            eprintln!("scenario action {step_index}: {}", step.kind());
+        }
         let step_result = if let Some(group) = action.scenario_group.as_deref() {
             subject
                 .select_scenario_group(group, matches!(step, ScenarioStep::CreateGroup { .. }))
@@ -1442,6 +1471,20 @@ async fn run_scenario_report_inner(
             });
         }
     }
+    let stimulus_observations = subject
+        .stimulus_observations()
+        .into_iter()
+        .skip(stimulus_start)
+        .collect::<Vec<_>>();
+    if let Err(message) = crate::validate_scenario_stimulus_evidence(spec, &stimulus_observations) {
+        expectation_failures.push(ExpectationFailure {
+            kind: "runtime_stimulus_not_exercised".into(),
+            message,
+            expected: serde_json::json!("all requested runtime stimuli exercised"),
+            actual: serde_json::to_value(&stimulus_observations)
+                .expect("stimulus evidence serializes"),
+        });
+    }
     let invariant_failures = invariant_failures(&expectation_failures);
     let oracle = build_scenario_oracle_report(
         spec,
@@ -1471,6 +1514,7 @@ async fn run_scenario_report_inner(
         expanded_schedule: compiled.expanded_schedule(),
         assertion_observations,
         relay_sync_observations,
+        stimulus_observations,
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),

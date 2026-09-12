@@ -605,6 +605,8 @@ async fn run_four_party_cross_route_app_runtime_trial() -> AppRuntimeCrossRouteT
     let mut retained = RetainedRelaySubject::new(
         &clients,
         &strict_spec.topology,
+        // Independent legacy control requires debug compatibility in the engine
+        // and simulator crates; the app side still uses pinned production policy.
         ProtocolProfile::Legacy,
         HarnessStorageMode::TempFileBackedSqlite,
     )

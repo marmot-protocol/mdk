@@ -100,6 +100,9 @@ jobs:
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh
 
+      - name: Public app campaign contract
+        run: python3 -m unittest discover -s scripts/tests -p 'test_app_stack_campaign.py'
+
       - name: CI policy and path-classifier gates
         run: |
           ./scripts/check_convergence_constant_ledger.sh

@@ -27,6 +27,43 @@ Public app/process/container projections cannot establish exact MLS-private stat
 or active decryptability when those surfaces are not exposed by the adapter. Pair wider public runs with an
 engine-capable exact control when the claim requires those facts.
 
+## Seeded runtime-fault discovery
+
+Use `public-app-stateful-recovery/v1` for mixed membership/admin/traffic histories, live shared-relay
+interruptions and concurrent profile commands. Use `public-app-recovery-schedules/v1` for multiple
+restart points and different history-repair waves over competing branches. Unlike the fixed catalogs,
+the seed changes operation sequence and fault placement. Six cases in the unified entry point are a
+sample, not exhaustive coverage. Both families retain production timing and use a 900-second per-case
+budget. Start with a small sample and inspect `stimulus_observations`, not just the exit status.
+
+```sh
+cargo build --release --locked -p cgka-conformance-simulator --bin cgka-conformance-campaign
+RUST_MIN_STACK=4194304 target/release/cgka-conformance-campaign \
+  --family public-app-stateful-recovery/v1 --seed 7 --cases 1 \
+  --storage file --case-timeout-secs 900 --out target/app-stateful-canary-1
+cargo test --locked -p cgka-conformance-simulator --test app_generated_variance
+# Separate process-kill validation, including the strict public oracle:
+cargo test --release --locked -p cgka-conformance-simulator --test app_generated_variance \
+  seeded_recovery_schedule_survives_real_process_kills -- --ignored --exact
+```
+
+A concurrent-call refusal or a relay interruption with no live socket is an unexercised stimulus;
+retain and classify it before increasing run size. A successful barrier release proves concurrent
+command submission, not that MLS commits necessarily forked at the same epoch. Exact public outcomes
+and known cross-route branch construction provide separate checks. Do not reinterpret orderly app
+reopens as abrupt process crashes. The process canary exercises real kills at scenario action
+boundaries; it does not inject a kill halfway through a storage transaction.
+
+To recheck retained process evidence without executing its workload again, build
+`cgka-conformance-process` and run:
+
+```sh
+target/release/cgka-conformance-process --validate-cross-route INPUT.json REPORT.json
+```
+
+This checks the cross-route public outcome contract and requires kill evidence for participants that
+were running at each restart, and reopen evidence for every restart, including already stopped participants.
+
 ## Before the first run
 
 The public journey families `public-app-send-leave/v1`, `public-app-membership-reentry/v1`,
@@ -151,6 +188,7 @@ timeout, and the original failure artifacts remain authoritative.
 | `public-app-send-leave/v1`, `public-app-membership-reentry/v1` | Public departure/re-entry, exact visible histories and reopen persistence |
 | `public-app-offline-recovery/v1`, `public-app-admin-handoff/v1` | Public retained-history recovery and grant/edit/revoke authorization |
 | `public-app-admin-churn/v1` | Public sequential profile/admin churn with traffic and a reopen midway through the workload |
+| `public-app-large-group/v1` | Full app 10/20/50-member bulk and staged formation, offline cohorts and exact public histories |
 | `public-app-late-join/v1` | Fresh admission after 4/12/36 profile commits, exact admission histories and reopen persistence |
 
 `--cases` is a count, not a complexity dial. Case index selects a deterministic arm or generated history. More cases
@@ -376,3 +414,11 @@ A large green matrix raises confidence over the exact operation distribution, co
 and source revision it exercised. It does not prove universal correctness, optimal constants, full offline history, or
 administrator progress under infinite valid self-updates. Campaign results may motivate a policy change, but must not
 automatically tune production constants.
+
+## Unified public app-stack catalog
+
+Use `just app-stack-campaign target/app-stack-run-1 --mode canary` for the launch gate, or omit `--mode canary`
+to run that gate followed by every public catalog arm and fixed journey. The default full matrix uses seeds
+7, 42 and 17001 with two workers; `--seeds`, `--rounds` and `--jobs 1|2` control the bounded selection.
+See [APP_PATH_COVERAGE.md](APP_PATH_COVERAGE.md#unified-public-app-campaign) for production-policy builds,
+ignored-test selection, WIP provenance, outcome interpretation and the fresh-stack versus sustained-runtime boundary.

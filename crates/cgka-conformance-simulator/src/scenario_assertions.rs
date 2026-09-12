@@ -16,6 +16,11 @@ pub enum ScenarioPredicateV2 {
         description: String,
         minimum_epoch: u64,
     },
+    /// Exact visible history, including multiplicity, from one public snapshot.
+    PublicPayloadMultiset {
+        client: String,
+        payloads: Vec<String>,
+    },
     ClientState {
         client: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

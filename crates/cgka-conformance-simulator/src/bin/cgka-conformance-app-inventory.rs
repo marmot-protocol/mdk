@@ -12,6 +12,10 @@ use sha2::{Digest, Sha256};
 
 // Bounded first inventory: small/catalog arms; pressure blocks remain opt-in.
 const FAMILIES: &[(&str, u64)] = &[
+    ("public-app-large-group/v1", 6),
+    ("public-app-stateful-recovery/v1", 6),
+    ("public-app-recovery-schedules/v1", 6),
+    ("public-app-backlog-recovery/v1", 6),
     ("public-app-send-leave/v1", 6),
     ("public-app-membership-reentry/v1", 6),
     ("public-app-offline-recovery/v1", 6),

@@ -6,6 +6,8 @@
 //! adapters. Keeping both forms here prevents those execution routes from
 //! silently drifting onto different canonical inputs or terminal oracles.
 
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::process_orchestrator::{ProcessActionStatusV1, ProcessScenarioReportV1};
@@ -185,6 +187,25 @@ fn restart_permutation(seed: u64, case_index: u64) -> CrossRouteRestartPermutati
 fn build_cross_route_app_runtime_recovery_scenario(
     strict_engine_tail: bool,
     restart_permutation: Option<CrossRouteRestartPermutationV1>,
+) -> ScenarioSpec {
+    build_cross_route_with_schedule(strict_engine_tail, restart_permutation, None)
+}
+
+/// Multiple seeded restart boundaries plus request/wakeup ordering. On the app
+/// adapter these are orderly reopens; the isolated-process adapter kills and
+/// relaunches actual participant processes at the same boundaries.
+pub fn cross_route_seeded_recovery_scenario(seed: u64, case_index: u64) -> ScenarioSpec {
+    let mixed = seed ^ 0x5245_434f_5645_5259 ^ case_index.rotate_left(23);
+    let first = restart_permutation(seed, case_index);
+    let mut scenario = build_cross_route_with_schedule(false, Some(first), Some(mixed));
+    scenario.name = format!("public-app-recovery-schedules/v1/case-{case_index}");
+    scenario
+}
+
+fn build_cross_route_with_schedule(
+    strict_engine_tail: bool,
+    restart_permutation: Option<CrossRouteRestartPermutationV1>,
+    schedule_seed: Option<u64>,
 ) -> ScenarioSpec {
     let clients = vec![
         "zeta".into(),
@@ -402,6 +423,54 @@ fn build_cross_route_app_runtime_recovery_scenario(
     ];
     if let Some(permutation) = restart_permutation {
         insert_restart_permutation(&mut steps, permutation, &clients);
+    }
+    if let Some(seed) = schedule_seed {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut boundaries = CROSS_ROUTE_RESTART_PERMUTATIONS_V1
+            .iter()
+            .copied()
+            .filter(|boundary| Some(*boundary) != restart_permutation)
+            .collect::<Vec<_>>();
+        boundaries.shuffle(&mut rng);
+        for boundary in boundaries.into_iter().take(rng.gen_range(1..=3)) {
+            insert_restart_permutation(&mut steps, boundary, &clients);
+        }
+        // Keep the causal branch construction, but vary the order in which
+        // independent recipients request retained history and wake their workers.
+        for step in &mut steps {
+            match step {
+                ScenarioStep::SyncRelayHistory { clients, .. } | ScenarioStep::Tick { clients } => {
+                    clients.shuffle(&mut rng)
+                }
+                _ => {}
+            }
+        }
+        // Request histories in seeded waves, waking each wave before later
+        // recipients repair. This changes scheduling structure as well as labels.
+        let mut waves = Vec::new();
+        for step in steps {
+            if let ScenarioStep::SyncRelayHistory {
+                ref clients,
+                ref sync,
+            } = step
+                && clients.len() > 1
+                && rng.gen_bool(0.5)
+            {
+                let width = rng.gen_range(1..=clients.len());
+                for clients in clients.chunks(width) {
+                    waves.push(ScenarioStep::SyncRelayHistory {
+                        clients: clients.to_vec(),
+                        sync: sync.clone(),
+                    });
+                    waves.push(ScenarioStep::Tick {
+                        clients: clients.to_vec(),
+                    });
+                }
+            } else {
+                waves.push(step);
+            }
+        }
+        steps = waves;
     }
     bind_relay_visibility_action_ids(&mut steps);
     if strict_engine_tail {
@@ -793,10 +862,33 @@ pub fn validate_cross_route_public_process_report(
             "process participants disagree on their public state commitment: {settled:#?}"
         ));
     }
+    let mut running = spec.clients.iter().cloned().collect::<BTreeSet<_>>();
     for action in &schedule.actions {
+        match &action.step {
+            ScenarioStep::SetClientOffline { client } => {
+                running.remove(client);
+            }
+            ScenarioStep::ReconnectClient { client } => {
+                running.insert(client.clone());
+            }
+            _ => {}
+        }
         let ScenarioStep::RestartClient { client } = &action.step else {
             continue;
         };
+        if running.contains(client)
+            && !report.lifecycle.iter().any(|event| {
+                event.action_id == action.schedule.action_id
+                    && event.participant == *client
+                    && event.event == "killed"
+            })
+        {
+            return Err(format!(
+                "{client} was running but has no process-kill evidence at {}",
+                action.schedule.action_id
+            ));
+        }
+        running.insert(client.clone());
         if !report.lifecycle.iter().any(|event| {
             event.action_id == action.schedule.action_id
                 && event.participant == *client

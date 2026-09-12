@@ -175,6 +175,8 @@ impl Participant {
 /// In-process application harness backed by one real local Nostr relay.
 pub struct AppRuntimeHarness {
     _relay: LocalRelay,
+    relay_fault_proxy: crate::relay_fault_proxy::RelayFaultProxy,
+    stimulus_observations: Vec<crate::ScenarioStimulusObservation>,
     relay_control: RelayControl,
     relay_url: String,
     participants: BTreeMap<String, Participant>,
@@ -221,7 +223,17 @@ impl AppRuntimeHarness {
         let relay_control = RelayControl::new();
         let relay = LocalRelay::new(relay_control.relay_builder());
         relay.run().await.map_err(environment_error)?;
-        let relay_url = relay.url().await.to_string();
+        let upstream_url = relay.url().await.to_string();
+        let upstream = upstream_url
+            .strip_prefix("ws://")
+            .ok_or_else(|| environment_error("local relay must use ws"))?
+            .trim_end_matches('/')
+            .parse()
+            .map_err(environment_error)?;
+        let relay_fault_proxy = crate::relay_fault_proxy::RelayFaultProxy::start(upstream)
+            .await
+            .map_err(environment_error)?;
+        let relay_url = relay_fault_proxy.url();
         let endpoint = TransportEndpoint::from(relay_url.clone());
         let mut participants = BTreeMap::new();
         for client in clients {
@@ -273,6 +285,8 @@ impl AppRuntimeHarness {
         }
         Ok(Self {
             _relay: relay,
+            relay_fault_proxy,
+            stimulus_observations: Vec::new(),
             relay_control,
             relay_url,
             participants,
@@ -423,14 +437,39 @@ impl AppRuntimeHarness {
             .collect()
     }
 
+    /// Public, aggregate runtime telemetry without querying a busy account worker.
+    pub fn performance_snapshots(&self) -> BTreeMap<String, marmot_app::AppPerformanceSnapshot> {
+        self.participants
+            .iter()
+            .filter_map(|(label, participant)| {
+                participant
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| (label.clone(), runtime.app_performance_snapshot()))
+            })
+            .collect()
+    }
+
     pub async fn catch_up(&mut self, clients: &[String]) -> Result<(), SubjectError> {
-        for label in clients {
+        let progress = std::env::var_os("MDK_SCENARIO_PROGRESS").is_some();
+        for (index, label) in clients.iter().enumerate() {
             let participant = self.participant_mut(label)?;
             if !participant.online {
                 continue;
             }
             participant.catch_up_attempts = participant.catch_up_attempts.saturating_add(1);
+            let started = std::time::Instant::now();
+            if progress {
+                eprintln!("app catch-up started: participant_index={index}");
+            }
             let result = participant.runtime()?.catch_up_accounts().await;
+            if progress {
+                eprintln!(
+                    "app catch-up finished: participant_index={index} elapsed_ms={} success={}",
+                    started.elapsed().as_millis(),
+                    result.is_ok()
+                );
+            }
             if let Err(error) = result {
                 record_failure(participant, &error);
                 return Err(app_error(error));
@@ -626,9 +665,20 @@ impl AppRuntimeHarness {
     }
 
     pub async fn shutdown(&mut self) {
-        for participant in self.participants.values_mut() {
+        let progress = std::env::var_os("MDK_SCENARIO_PROGRESS").is_some();
+        for (index, participant) in self.participants.values_mut().enumerate() {
             if let Some(runtime) = participant.runtime.take() {
+                let started = std::time::Instant::now();
+                if progress {
+                    eprintln!("app shutdown started: participant_index={index}");
+                }
                 runtime.shutdown().await;
+                if progress {
+                    eprintln!(
+                        "app shutdown finished: participant_index={index} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
             }
             participant.online = false;
         }
@@ -677,6 +727,14 @@ impl AppRuntimeHarness {
                 "a concurrent mutation set needs at least one mutation",
             ));
         }
+        // Validate the entire batch before spawning any side effects.
+        for mutation in mutations {
+            self.participant(mutation.client())?.runtime()?;
+            if let ConcurrentMutation::InviteMembers { invitees, .. } = mutation {
+                self.account_ids(invitees)?;
+            }
+        }
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(mutations.len() + 1));
         let group_id = self.active_group()?;
         let before = self.relay_publication_cursor().await;
         let include_welcomes = mutations
@@ -688,6 +746,7 @@ impl AppRuntimeHarness {
             let runtime = participant.runtime()?.clone();
             let account_id = participant.account_id.clone();
             let group_id = group_id.clone();
+            let barrier = barrier.clone();
             match mutation {
                 ConcurrentMutation::UpdateGroupProfile {
                     name, description, ..
@@ -695,6 +754,7 @@ impl AppRuntimeHarness {
                     let name = name.map(str::to_owned);
                     let description = description.map(str::to_owned);
                     tasks.spawn(async move {
+                        barrier.wait().await;
                         let result = runtime
                             .update_group_profile(&account_id, &group_id, name, description)
                             .await;
@@ -704,6 +764,7 @@ impl AppRuntimeHarness {
                 ConcurrentMutation::InviteMembers { invitees, .. } => {
                     let invitees = self.account_ids(invitees)?;
                     tasks.spawn(async move {
+                        barrier.wait().await;
                         let result = runtime
                             .invite_members(&account_id, &group_id, &invitees)
                             .await;
@@ -712,6 +773,7 @@ impl AppRuntimeHarness {
                 }
             }
         }
+        barrier.wait().await;
         let mut results = (0..mutations.len()).map(|_| None).collect::<Vec<_>>();
         while let Some(joined) = tasks.join_next().await {
             let (index, result) = joined.map_err(|_| {
@@ -1094,6 +1156,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::CrashReopen,
                 SubjectCapability::OutboundPublication,
                 SubjectCapability::ParticipantConnectivity,
+                SubjectCapability::RelayInterruption,
+                SubjectCapability::ConcurrentGroupMutation,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
                 SubjectCapability::RetainedRelayControl,
@@ -1497,6 +1561,16 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 );
                 (matched, serde_json::json!(states))
             }
+            ScenarioPredicateV2::PublicPayloadMultiset { client, payloads } => {
+                let mut actual = self
+                    .layered_observation(client)?
+                    .application
+                    .visible_plaintexts;
+                let mut expected = payloads.clone();
+                actual.sort();
+                expected.sort();
+                (actual == expected, serde_json::json!({"payloads": actual}))
+            }
             ScenarioPredicateV2::ClientState {
                 client,
                 epoch,
@@ -1589,6 +1663,83 @@ impl ConvergenceSubject for AppRuntimeHarness {
             participant.runtime_events_observed = 0;
         }
         Ok(())
+    }
+
+    async fn interrupt_relay(
+        &mut self,
+        action_id: &str,
+        relay: &str,
+        outage_ms: u64,
+    ) -> Result<(), SubjectError> {
+        if !["relay:shared", "relay:default"].contains(&relay) || !(1..=30_000).contains(&outage_ms)
+        {
+            return Err(SubjectError::new(
+                "invalid_relay_interruption",
+                "unknown local relay or invalid outage duration",
+            ));
+        }
+        let runtimes_running = self
+            .participants
+            .values()
+            .filter(|p| p.runtime.is_some())
+            .count();
+        let (closed_connections, rejected_connections) = self
+            .relay_fault_proxy
+            .interrupt(Duration::from_millis(outage_ms))
+            .await
+            .map_err(environment_error)?;
+        self.stimulus_observations
+            .push(crate::ScenarioStimulusObservation::RelayInterruption {
+                action_id: action_id.into(),
+                requested_outage_ms: outage_ms,
+                closed_connections,
+                rejected_connections,
+                runtimes_running,
+            });
+        if closed_connections == 0 {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_interruption_not_exercised",
+                "no established relay connection was available to interrupt",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn race_group_profiles(
+        &mut self,
+        action_id: &str,
+        updates: &[crate::ScenarioProfileUpdate],
+    ) -> Result<(), SubjectError> {
+        let mutations = updates
+            .iter()
+            .map(|u| ConcurrentMutation::UpdateGroupProfile {
+                client: &u.client,
+                name: u.name.as_deref(),
+                description: u.description.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let report = self.race_mutations(action_id, &mutations).await?;
+        let all_accepted = report.outcomes.iter().all(|outcome| outcome.accepted);
+        self.stimulus_observations
+            .push(crate::ScenarioStimulusObservation::ConcurrentProfiles {
+                action_id: action_id.into(),
+                callers_released: updates.len(),
+                outcomes: report.outcomes,
+                admitted_publications: report.admitted_publications,
+            });
+        if !all_accepted {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "concurrent_profiles_not_all_accepted",
+                "the requested concurrent profile inputs were not all accepted; inspect stimulus evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn stimulus_observations(&self) -> Vec<crate::ScenarioStimulusObservation> {
+        self.stimulus_observations.clone()
     }
 
     fn restart(&mut self, client: &str) -> Result<(), SubjectError> {

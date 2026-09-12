@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 use crate::{
@@ -15,6 +16,8 @@ use crate::{
     ScenarioRelayV2, ScenarioSpec, ScenarioStep, ScenarioTopologyV2, SubjectOutboundOutcome,
     TraceExpectation,
 };
+
+pub const PUBLIC_APP_LARGE_GROUP_FAMILY: &str = "public-app-large-group/v1";
 
 pub const STATEFUL_CHAT_JOURNEY_FAMILY: &str = "chat-journey/v1";
 pub const STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION: &str = "2";
@@ -27,6 +30,10 @@ pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "4";
 pub const PUBLIC_APP_ADMIN_CHURN_FAMILY: &str = "public-app-admin-churn/v1";
 pub const PUBLIC_APP_LATE_JOIN_FAMILY: &str = "public-app-late-join/v1";
 pub const PUBLIC_APP_PRESSURE_GENERATOR_VERSION: &str = "1";
+pub const PUBLIC_APP_RECOVERY_SCHEDULES_FAMILY: &str = "public-app-recovery-schedules/v1";
+pub const PUBLIC_APP_STATEFUL_RECOVERY_FAMILY: &str = "public-app-stateful-recovery/v1";
+
+pub const PUBLIC_APP_BACKLOG_RECOVERY_FAMILY: &str = "public-app-backlog-recovery/v1";
 
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
@@ -79,7 +86,11 @@ impl JourneyAction {
 }
 
 struct JourneyModel {
+    clients: Vec<String>,
+    offline_client: String,
     public_app: bool,
+    batch_public_sends: bool,
+    compact_public_payload_checks: bool,
     profile: JourneyProfile,
     case_index: u64,
     epoch: u64,
@@ -100,8 +111,16 @@ struct JourneyModel {
 
 impl JourneyModel {
     fn new(case_index: u64, profile: JourneyProfile) -> Self {
+        Self::with_clients(case_index, profile, client_labels(), "bob".into())
+    }
+
+    fn with_clients(
+        case_index: u64,
+        profile: JourneyProfile,
+        clients: Vec<String>,
+        offline_client: String,
+    ) -> Self {
         let group_name = format!("chat-journey-{case_index}");
-        let clients = client_labels();
         let (members, non_members, founding_invitees) = match profile {
             JourneyProfile::Membership => (
                 BTreeSet::from(["alice".into(), "bob".into()]),
@@ -111,11 +130,19 @@ impl JourneyModel {
             JourneyProfile::OfflineRetainedHistory => (
                 clients.iter().cloned().collect(),
                 BTreeSet::new(),
-                vec!["bob".into(), "carol".into(), "david".into()],
+                clients
+                    .iter()
+                    .filter(|client| client.as_str() != "alice")
+                    .cloned()
+                    .collect(),
             ),
         };
         let mut model = Self {
+            clients: clients.clone(),
+            offline_client,
             public_app: false,
+            batch_public_sends: false,
+            compact_public_payload_checks: false,
             profile,
             case_index,
             epoch: 1,
@@ -174,7 +201,7 @@ impl JourneyModel {
                 .iter()
                 .filter(|member| {
                     member.as_str() != "alice"
-                        && member.as_str() != "bob"
+                        && member.as_str() != self.offline_client
                         && !self.admins.contains(*member)
                 })
                 .cloned()
@@ -209,7 +236,7 @@ impl JourneyModel {
                 .map(|client| JourneyAction::SelfUpdate { client }),
         );
         if self.profile == JourneyProfile::OfflineRetainedHistory {
-            if self.online.contains("bob") {
+            if self.online.contains(&self.offline_client) {
                 actions.push(JourneyAction::SetOffline);
             } else {
                 actions.push(JourneyAction::Reconnect);
@@ -299,9 +326,11 @@ impl JourneyModel {
                         .expect("all clients have a delivery ledger")
                         .push(payload.clone());
                 }
-                self.deliver_to_online();
-                if self.public_app {
-                    self.public_delivered_payload_checkpoint(&payload);
+                if !self.batch_public_sends {
+                    self.deliver_to_online();
+                    if self.public_app {
+                        self.public_delivered_payload_checkpoint(&payload);
+                    }
                 }
             }
             JourneyAction::UpdateProfile { actor } => {
@@ -372,13 +401,13 @@ impl JourneyModel {
                 self.confirmed_mutation(&client, &pending);
             }
             JourneyAction::SetOffline => {
-                debug_assert!(self.online.contains("bob"));
+                debug_assert!(self.online.contains(&self.offline_client));
                 self.steps.push(ScenarioStep::SetClientOffline {
-                    client: "bob".into(),
+                    client: self.offline_client.clone(),
                 });
-                self.online.remove("bob");
+                self.online.remove(&self.offline_client);
             }
-            JourneyAction::Reconnect => self.reconnect_bob(),
+            JourneyAction::Reconnect => self.reconnect_offline_client(),
             JourneyAction::Restart { client } => {
                 debug_assert!(self.public_app || self.members.contains(&client));
                 debug_assert!(self.online.contains(&client));
@@ -438,18 +467,18 @@ impl JourneyModel {
         });
     }
 
-    fn reconnect_bob(&mut self) {
-        debug_assert!(!self.online.contains("bob"));
+    fn reconnect_offline_client(&mut self) {
+        debug_assert!(!self.online.contains(&self.offline_client));
         self.steps.push(ScenarioStep::ReconnectClient {
-            client: "bob".into(),
+            client: self.offline_client.clone(),
         });
-        self.online.insert("bob".into());
+        self.online.insert(self.offline_client.clone());
         self.steps.push(ScenarioStep::SyncRelayHistory {
-            clients: vec!["bob".into()],
+            clients: vec![self.offline_client.clone()],
             sync: ScenarioRelaySyncModeV2::FullHistory,
         });
         self.steps.push(ScenarioStep::Tick {
-            clients: vec!["bob".into()],
+            clients: vec![self.offline_client.clone()],
         });
         if self.public_app {
             self.public_state_checkpoint();
@@ -459,7 +488,7 @@ impl JourneyModel {
 
     fn finish(mut self, seed: u64) -> GeneratedScenarioCase {
         if self.profile == JourneyProfile::OfflineRetainedHistory && !self.online.contains("bob") {
-            self.reconnect_bob();
+            self.reconnect_offline_client();
         }
 
         let active = self.members.iter().cloned().collect::<Vec<_>>();
@@ -608,6 +637,15 @@ impl JourneyModel {
     }
 
     fn public_payload_checkpoint(&mut self) {
+        if self.compact_public_payload_checks {
+            for client in self.online.iter().cloned().collect::<Vec<_>>() {
+                self.eventually(crate::ScenarioPredicateV2::PublicPayloadMultiset {
+                    payloads: self.received_payloads[&client].clone(),
+                    client,
+                });
+            }
+            return;
+        }
         // Public history includes the sender's accepted message and survives
         // reopen. The engine event ledger deliberately has different semantics.
         for client in self.online.iter().cloned().collect::<Vec<_>>() {
@@ -643,7 +681,7 @@ impl JourneyModel {
             clients: active.clone(),
         });
         self.steps.push(ScenarioStep::Observe {
-            clients: client_labels(),
+            clients: self.clients.clone(),
         });
         self.expected.push(TraceExpectation::ClientsConverged {
             clients: active.clone(),
@@ -679,8 +717,8 @@ impl JourneyModel {
             scenario: ScenarioSpec {
                 name: format!("{family}/case-{}", self.case_index),
                 spec_version: "3".into(),
-                clients: client_labels(),
-                topology: single_relay_topology(),
+                clients: self.clients.clone(),
+                topology: single_relay_topology_for(&self.clients),
                 steps: self.steps,
             },
             expected_outcomes: self.expected,
@@ -919,7 +957,417 @@ pub fn generate_public_app_pressure_case(
     case
 }
 
+/// Intermediate retained-history pressure, with a reopen after the first
+/// recovery request in half the cases. Socket scheduling may finish recovery
+/// before that reopen; the input pins the boundary, not a partial row count.
+pub fn generate_public_app_backlog_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4241_434b_4c4f_4753 ^ case_index.rotate_left(23));
+    let mut model = JourneyModel::new_public(case_index);
+    model.apply(JourneyAction::Send {
+        sender: "bob".into(),
+    });
+    model.apply(JourneyAction::SetOffline);
+    // Public sends already publish to the live relay. Batch projection checks
+    // at commit/recovery boundaries instead of doing a round trip per payload
+    // per participant. The terminal oracle still requires every payload once.
+    model.batch_public_sends = true;
+    let messages = [64, 128, 256][case_index as usize % 3];
+    for index in 0..messages {
+        if index % 16 == 8 {
+            let action = model.choose_kind(&mut rng, JourneyActionKind::UpdateProfile);
+            model.apply(action);
+        }
+        if index % 32 == 16 {
+            // Keep the offline recipient a non-admin throughout. Online
+            // delegates exercise their authority in subsequent profile edits.
+            model.apply(JourneyAction::UpdateAdminPolicy {
+                target: "carol".into(),
+            });
+        }
+        let action = model.choose_kind(&mut rng, JourneyActionKind::Send);
+        model.apply(action);
+    }
+    model.batch_public_sends = false;
+    if (case_index / 3).is_multiple_of(2) {
+        model.apply(JourneyAction::Reconnect);
+    } else {
+        // Do not call reconnect_bob(): that helper waits for full recovery
+        // before returning, which would erase this restart boundary.
+        model.steps.extend([
+            ScenarioStep::ReconnectClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::SyncRelayHistory {
+                clients: vec!["bob".into()],
+                sync: ScenarioRelaySyncModeV2::FullHistory,
+            },
+            ScenarioStep::RestartClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::SyncRelayHistory {
+                clients: vec!["bob".into()],
+                sync: ScenarioRelaySyncModeV2::FullHistory,
+            },
+        ]);
+        model.online.insert("bob".into());
+        model.deliver_to_online();
+        model.public_state_checkpoint();
+        model.public_payload_checkpoint();
+    }
+    for sender in CLIENTS {
+        model.apply(JourneyAction::Send {
+            sender: sender.into(),
+        });
+    }
+    model.apply(JourneyAction::Restart {
+        client: "bob".into(),
+    });
+    model.apply(JourneyAction::Send {
+        sender: "bob".into(),
+    });
+    let mut case = model.finish_public(PUBLIC_APP_BACKLOG_RECOVERY_FAMILY, seed);
+    case.generator_version = "2".into();
+    case
+}
+
+/// Six explicit scale/formation arms: bulk and staged formation at 10, 20 and 50.
+/// All participants own app runtimes and SQLCipher stores; no engine-only oracle.
+pub fn generate_public_app_large_group_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
+    let population = [10, 20, 50][(case_index / 2 % 3) as usize];
+    let staged = case_index % 2 == 1;
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4c41_5247_4541_5050 ^ case_index.rotate_left(19));
+    let clients = std::iter::once("alice".to_owned())
+        .chain((1..population).map(|index| format!("member-{index:03}")))
+        .collect::<Vec<_>>();
+    let mut peers = clients[1..].to_vec();
+    peers.shuffle(&mut rng);
+    let cohort = peers[..population / 5].to_vec();
+    let victim = peers[population / 5].clone();
+    let admin = peers[population / 5 + 1].clone();
+    let mut model = JourneyModel::with_clients(
+        case_index,
+        JourneyProfile::OfflineRetainedHistory,
+        clients.clone(),
+        cohort[0].clone(),
+    );
+    model.public_app = true;
+    model.compact_public_payload_checks = true;
+    model.batch_public_sends = true;
+    if staged {
+        let founders = peers[..3].to_vec();
+        let ScenarioStep::CreateGroup { invitees, .. } = &mut model.steps[0] else {
+            unreachable!()
+        };
+        *invitees = founders.clone();
+        model.members = founders
+            .into_iter()
+            .chain(std::iter::once("alice".into()))
+            .collect();
+        model.non_members = clients
+            .iter()
+            .filter(|client| !model.members.contains(*client))
+            .cloned()
+            .collect();
+        model.public_state_checkpoint();
+        let joiners = peers[3..].to_vec();
+        let batch_size = rng.gen_range(3..=5);
+        for batch in joiners.chunks(batch_size) {
+            let pending = model.next_publication("growth");
+            model.steps.push(ScenarioStep::InviteMembers {
+                inviter: "alice".into(),
+                invitees: batch.to_vec(),
+                pending: pending.clone(),
+            });
+            model.members.extend(batch.iter().cloned());
+            for client in batch {
+                model.non_members.remove(client);
+            }
+            model.confirmed_mutation("alice", &pending);
+        }
+    } else {
+        model.public_state_checkpoint();
+    }
+    let mut senders = clients.clone();
+    senders.shuffle(&mut rng);
+    for sender in senders {
+        model.apply(JourneyAction::Send { sender });
+    }
+    model.deliver_to_online();
+    model.public_payload_checkpoint();
+    for client in &cohort {
+        model.steps.push(ScenarioStep::SetClientOffline {
+            client: client.clone(),
+        });
+        model.online.remove(client);
+    }
+    model.apply(JourneyAction::UpdateAdminPolicy {
+        target: admin.clone(),
+    });
+    model.apply(JourneyAction::UpdateProfile { actor: admin });
+    model.apply(JourneyAction::Remove {
+        member: victim.clone(),
+    });
+    for _ in 0..rng.gen_range(3..=8) {
+        let action = model.choose_kind(&mut rng, JourneyActionKind::Send);
+        model.apply(action);
+    }
+    // Acceptance can queue an application send. Establish delivery while the
+    // victim is still excluded before assigning that history to the old epoch.
+    model.deliver_to_online();
+    model.public_payload_checkpoint();
+    model.apply(JourneyAction::Invite {
+        invitee: victim.clone(),
+    });
+    for client in &cohort {
+        model.steps.push(ScenarioStep::ReconnectClient {
+            client: client.clone(),
+        });
+        model.online.insert(client.clone());
+    }
+    model.steps.push(ScenarioStep::SyncRelayHistory {
+        clients: cohort.clone(),
+        sync: ScenarioRelaySyncModeV2::FullHistory,
+    });
+    model.deliver_to_online();
+    model.public_state_checkpoint();
+    model.public_payload_checkpoint();
+    model.apply(JourneyAction::Restart {
+        client: cohort[0].clone(),
+    });
+    model.apply(JourneyAction::Restart {
+        client: victim.clone(),
+    });
+    for sender in ["alice".to_owned(), cohort[0].clone(), victim] {
+        model.apply(JourneyAction::Send { sender });
+    }
+    model.deliver_to_online();
+    let admin_count = model.admins.len();
+    let applications = model.payload_sequence as usize;
+    let commits = model.epoch.saturating_sub(1) as usize;
+    let mut case = model.finish_public(PUBLIC_APP_LARGE_GROUP_FAMILY, seed);
+    case.generator_version = "2".into();
+    case.workload_profile = Some(crate::GeneratedWorkloadProfileV1 {
+        name: format!("{population}-{}", if staged { "staged" } else { "bulk" }),
+        version: "1".into(),
+        size_tier: format!("members-{population}"),
+        member_count: population,
+        admin_regime: "founder-then-two".into(),
+        initial_admin_count: 1,
+        final_admin_count: admin_count,
+        committer_mode: "sequential-2".into(),
+        active_committer_count: 2,
+        traffic_profile: "all-member-fanout-and-offline-cohort".into(),
+        application_message_count: applications,
+        workload_commit_count: commits,
+        formation: if staged {
+            "incremental-batches"
+        } else {
+            "bulk-create"
+        }
+        .into(),
+        disruption: "offline-cohort-remove-readd-reopen".into(),
+    });
+    case
+}
+
 /// Generate deterministic, product-shaped canonical scenarios.
+/// A bounded mixed recovery journey whose seed selects operation order, length,
+/// population, offline member, bursts, outage durations and recovery boundaries.
+/// The old finite families remain byte-for-byte replayable regression catalogs.
+pub fn generate_public_app_stateful_recovery_case(
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x5354_4154_4546_554c ^ case_index.rotate_left(23));
+    let population = rng.gen_range(3..=6);
+    let clients = ["alice", "bob", "carol", "david", "erin", "frank"][..population]
+        .iter()
+        .map(|label| (*label).to_owned())
+        .collect::<Vec<_>>();
+    let offline_client = clients[rng.gen_range(1..population)].clone();
+    let mut model = JourneyModel::with_clients(
+        case_index,
+        JourneyProfile::OfflineRetainedHistory,
+        clients,
+        offline_client.clone(),
+    );
+    model.public_app = true;
+    model.public_state_checkpoint();
+    model.apply(JourneyAction::Send {
+        sender: offline_client,
+    });
+
+    // Required motifs are shuffled, not merely their actors. Additional motifs
+    // and a second outage interval change the schedule itself across seeds.
+    let mut motifs = vec![0, 1, 2, 3, 4, 5, 6];
+    for _ in 0..rng.gen_range(0..=3) {
+        motifs.push(rng.gen_range(0..=6));
+    }
+    motifs.shuffle(&mut rng);
+    model.apply(JourneyAction::SetOffline);
+    for motif in motifs {
+        match motif {
+            0 => public_recovery_burst(&mut model, &mut rng, 4..=32),
+            1 => {
+                let action = model.choose_kind(&mut rng, JourneyActionKind::UpdateProfile);
+                model.apply(action);
+            }
+            2 => {
+                let target = public_online_peer(&model, &mut rng);
+                model.apply(JourneyAction::UpdateAdminPolicy { target });
+            }
+            3 => {
+                let target = public_online_peer(&model, &mut rng);
+                if model.admins.contains(&target) {
+                    model.apply(JourneyAction::UpdateAdminPolicy {
+                        target: target.clone(),
+                    });
+                }
+                model.apply(JourneyAction::Remove {
+                    member: target.clone(),
+                });
+                public_recovery_burst(&mut model, &mut rng, 1..=4);
+                if rng.gen_bool(0.5) {
+                    model.apply(JourneyAction::Restart {
+                        client: target.clone(),
+                    });
+                }
+                model.apply(JourneyAction::Invite {
+                    invitee: target.clone(),
+                });
+                model.apply(JourneyAction::Send { sender: target });
+            }
+            4 => {
+                let restart = model.choose_kind(&mut rng, JourneyActionKind::Restart);
+                model.apply(restart);
+            }
+            5 => {
+                // No tick between the accepted burst and the socket cut.
+                public_recovery_burst(&mut model, &mut rng, 2..=8);
+                model.steps.push(ScenarioStep::InterruptRelay {
+                    relay: "relay:default".into(),
+                    outage_ms: rng.gen_range(50..=500),
+                });
+                model.deliver_to_online();
+                model.public_state_checkpoint();
+                model.public_payload_checkpoint();
+            }
+            6 => {
+                let peer = public_online_peer(&model, &mut rng);
+                if !model.admins.contains(&peer) {
+                    model.apply(JourneyAction::UpdateAdminPolicy {
+                        target: peer.clone(),
+                    });
+                }
+                let mut authors = ["alice".to_owned(), peer];
+                authors.shuffle(&mut rng);
+                model.group_name = format!("mixed-{case_index}-name-{}", model.profile_sequence);
+                model.group_description =
+                    format!("mixed-{case_index}-description-{}", model.profile_sequence);
+                model.profile_sequence += 1;
+                model.steps.push(ScenarioStep::RaceGroupProfiles {
+                    updates: vec![
+                        crate::ScenarioProfileUpdate {
+                            client: authors[0].clone(),
+                            name: Some(model.group_name.clone()),
+                            description: None,
+                        },
+                        crate::ScenarioProfileUpdate {
+                            client: authors[1].clone(),
+                            name: None,
+                            description: Some(model.group_description.clone()),
+                        },
+                    ],
+                });
+                // At least one epoch must advance; concurrent resolution can
+                // add more. Pin both disjoint edits, not an arbitrary winner.
+                model.epoch += 1;
+                model.deliver_to_online();
+                model.public_state_checkpoint();
+            }
+            _ => unreachable!(),
+        }
+    }
+    public_varied_recovery(&mut model, &mut rng);
+    if rng.gen_bool(0.5) {
+        model.apply(JourneyAction::SetOffline);
+        public_recovery_burst(&mut model, &mut rng, 8..=48);
+        let action = model.choose_kind(&mut rng, JourneyActionKind::UpdateProfile);
+        model.apply(action);
+        public_varied_recovery(&mut model, &mut rng);
+    }
+    let mut senders = model.members.iter().cloned().collect::<Vec<_>>();
+    senders.shuffle(&mut rng);
+    for sender in senders {
+        model.apply(JourneyAction::Send { sender });
+    }
+    let restart = model.choose_kind(&mut rng, JourneyActionKind::Restart);
+    model.apply(restart);
+    model.apply(JourneyAction::Send {
+        sender: "alice".into(),
+    });
+    let mut case = model.finish_public(PUBLIC_APP_STATEFUL_RECOVERY_FAMILY, seed);
+    case.generator_version = "1".into();
+    case
+}
+
+fn public_online_peer(model: &JourneyModel, rng: &mut StdRng) -> String {
+    model
+        .members
+        .intersection(&model.online)
+        .filter(|client| client.as_str() != "alice")
+        .collect::<Vec<_>>()
+        .choose(rng)
+        .expect("an online peer remains")
+        .to_string()
+}
+
+fn public_recovery_burst(
+    model: &mut JourneyModel,
+    rng: &mut StdRng,
+    bounds: std::ops::RangeInclusive<usize>,
+) {
+    model.batch_public_sends = true;
+    for _ in 0..rng.gen_range(bounds) {
+        let action = model.choose_kind(rng, JourneyActionKind::Send);
+        model.apply(action);
+    }
+    model.batch_public_sends = false;
+}
+
+fn public_varied_recovery(model: &mut JourneyModel, rng: &mut StdRng) {
+    let client = model.offline_client.clone();
+    match rng.gen_range(0..3) {
+        0 => model.apply(JourneyAction::Reconnect),
+        boundary => {
+            model.steps.push(ScenarioStep::ReconnectClient {
+                client: client.clone(),
+            });
+            model.online.insert(client.clone());
+            if boundary == 1 {
+                model.steps.push(ScenarioStep::SyncRelayHistory {
+                    clients: vec![client.clone()],
+                    sync: ScenarioRelaySyncModeV2::FullHistory,
+                });
+                model.steps.push(ScenarioStep::RestartClient {
+                    client: client.clone(),
+                });
+            } else {
+                // Issue traffic before the explicit history-repair/checkpoint.
+                // This does not assert that background recovery is still partial.
+                public_recovery_burst(model, rng, 2..=8);
+            }
+            model.steps.push(ScenarioStep::SyncRelayHistory {
+                clients: vec![client],
+                sync: ScenarioRelaySyncModeV2::FullHistory,
+            });
+            model.deliver_to_online();
+            model.public_state_checkpoint();
+            model.public_payload_checkpoint();
+        }
+    }
+}
+
 pub fn generate_stateful_chat_journey_family(
     seed: u64,
     cases: usize,
@@ -1010,24 +1458,28 @@ fn client_labels() -> Vec<String> {
 }
 
 fn single_relay_topology() -> ScenarioTopologyV2 {
-    let accounts = CLIENTS
-        .into_iter()
+    single_relay_topology_for(&client_labels())
+}
+
+fn single_relay_topology_for(clients: &[String]) -> ScenarioTopologyV2 {
+    let accounts = clients
+        .iter()
         .map(|client| ScenarioAccountV2 {
-            id: client.into(),
+            id: client.clone(),
             roles: vec!["member".into()],
         })
         .collect();
-    let devices = CLIENTS
-        .into_iter()
+    let devices = clients
+        .iter()
         .map(|client| ScenarioDeviceV2 {
             id: format!("device:{client}"),
-            account: client.into(),
+            account: client.clone(),
             process: format!("process:{client}"),
-            client: client.into(),
+            client: client.clone(),
         })
         .collect();
-    let processes = CLIENTS
-        .into_iter()
+    let processes = clients
+        .iter()
         .map(|client| ScenarioProcessV2 {
             id: format!("process:{client}"),
             binary_version: "mdk-current".into(),

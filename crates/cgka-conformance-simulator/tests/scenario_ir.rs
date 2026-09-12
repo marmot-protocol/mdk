@@ -105,11 +105,11 @@ fn v3_schema_adds_post_v2_actions_without_rewriting_v2() {
         .iter()
         .filter_map(|variant| variant["properties"]["type"]["const"].as_str())
         .collect::<BTreeSet<_>>();
-    v3_declared_kinds.insert(
-        v3_schema["$defs"]["update_group_profile"]["properties"]["type"]["const"]
-            .as_str()
-            .expect("v3 profile action kind"),
-    );
+    for definition in v3_schema["$defs"].as_object().unwrap().values() {
+        if let Some(kind) = definition["properties"]["type"]["const"].as_str() {
+            v3_declared_kinds.insert(kind);
+        }
+    }
     let all_schema_kinds = v2_kinds
         .union(&v3_declared_kinds)
         .copied()

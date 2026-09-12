@@ -7,6 +7,10 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 ## Files
 
+- **File:** `app_large_group.rs`
+  - **Owns:** Public 10/20/50-member bulk/staged family contracts, whole-history assertion validation,
+    exclusion-delivery-before-reinvitation regression, and explicit production-policy scale canaries.
+
 - **File:** `support/offline_catchup.rs`
   - **Owns:** Compact reconstruction of the exact checkpoint 368/1,024-message inputs. Pinned SHA-256 values
     cover serialized metadata, actions and expected outcomes; compare against checkpoint `9282a643` before

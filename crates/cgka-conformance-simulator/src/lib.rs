@@ -26,6 +26,11 @@ pub mod bus;
 mod campaign_metrics;
 pub mod client;
 mod cross_route_scenario;
+mod relay_fault_proxy;
+mod scenario_stimuli;
+pub use scenario_stimuli::{
+    ScenarioProfileUpdate, ScenarioStimulusObservation, validate_scenario_stimulus_evidence,
+};
 mod decryptability;
 mod failure_capsule;
 pub mod family;
@@ -85,7 +90,8 @@ pub use cross_route_scenario::{
     cross_route_app_runtime_recovery_exact_scenario,
     cross_route_app_runtime_recovery_public_scenario,
     cross_route_restart_permutation_exact_scenario,
-    cross_route_restart_permutation_public_scenario, validate_cross_route_public_process_report,
+    cross_route_restart_permutation_public_scenario, cross_route_seeded_recovery_scenario,
+    validate_cross_route_public_process_report,
 };
 pub use decryptability::{
     BidirectionalDecryptabilityObservation, DecryptabilityProbeSendStatus,
@@ -201,12 +207,15 @@ pub use scenario_ir::{
 };
 pub use stateful_generator::{
     PUBLIC_APP_ADMIN_CHURN_FAMILY, PUBLIC_APP_ADMIN_HANDOFF_FAMILY,
-    PUBLIC_APP_JOURNEY_GENERATOR_VERSION, PUBLIC_APP_LATE_JOIN_FAMILY,
-    PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY, PUBLIC_APP_OFFLINE_RECOVERY_FAMILY,
-    PUBLIC_APP_PRESSURE_GENERATOR_VERSION, PUBLIC_APP_SEND_LEAVE_FAMILY,
-    STATEFUL_CHAT_JOURNEY_FAMILY, STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION,
+    PUBLIC_APP_BACKLOG_RECOVERY_FAMILY, PUBLIC_APP_JOURNEY_GENERATOR_VERSION,
+    PUBLIC_APP_LATE_JOIN_FAMILY, PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY,
+    PUBLIC_APP_OFFLINE_RECOVERY_FAMILY, PUBLIC_APP_PRESSURE_GENERATOR_VERSION,
+    PUBLIC_APP_RECOVERY_SCHEDULES_FAMILY, PUBLIC_APP_SEND_LEAVE_FAMILY,
+    PUBLIC_APP_STATEFUL_RECOVERY_FAMILY, STATEFUL_CHAT_JOURNEY_FAMILY,
+    STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION, generate_public_app_backlog_case,
     generate_public_app_journey_case, generate_public_app_pressure_case,
-    generate_stateful_chat_journey_case, generate_stateful_chat_journey_family,
+    generate_public_app_stateful_recovery_case, generate_stateful_chat_journey_case,
+    generate_stateful_chat_journey_family,
 };
 pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
@@ -226,3 +235,5 @@ pub use vector::{
     ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch, compare_trace_expectations,
     observe_client, observe_client_exact,
 };
+
+pub use stateful_generator::{PUBLIC_APP_LARGE_GROUP_FAMILY, generate_public_app_large_group_case};

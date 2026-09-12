@@ -140,3 +140,27 @@ Canonical JSON is the portable artifact stored in vectors, failure capsules, and
 only an authoring convenience: parsing YAML must produce `ScenarioAuthoringSpec`, and the resulting canonical JSON is
 the reviewed/replayable input. Changing expansion semantics requires a new authoring version; changing canonical action
 meaning or serialization requires a new Scenario IR version.
+
+
+## Real app-runtime stimuli (v3)
+
+- `interrupt_relay { relay, outage_ms }` requires `relay_interruption`. The local app harness cuts live
+  sockets and refuses connections for 1–30,000 ms, restores service, and records actual socket and
+  running-runtime counts. Zero interrupted connections fails the stimulus check. This is real wall
+  time; it does not advertise virtual-clock control or replace `set_client_offline`.
+- `race_group_profiles { updates: [{ client, name?, description? }, ...] }` requires
+  `concurrent_group_mutation`. Preflight requires 2–8 distinct clients with nonempty edits. The app
+  harness validates the batch, releases callers from a shared barrier and records each outcome. All
+  requests must be accepted to exercise this action; scenario expectations separately assert the
+  surviving effects. The generated disjoint-field race requires both edits to survive.
+
+Reports add optional `stimulus_observations`, bound to compiler action IDs. Missing evidence, zero
+socket cuts, or refused concurrent inputs cannot turn into a green assurance report. Older report
+JSON remains readable because the field defaults to an empty array. V2 documents cannot select
+these v3 actions; incapable adapters refuse them before action zero.
+
+The v3 `public_payload_multiset` predicate takes `client` and `payloads`. It compares the complete
+visible public history, including multiplicity, from one participant snapshot. Empty expectations
+are valid. It requires the public app observation capability and supports the existing assertion
+modes; virtual-time modes still require an adapter with virtual time. Large app families use bounded
+`eventually` checks and independent terminal trace expectations. V2 rejects this predicate.

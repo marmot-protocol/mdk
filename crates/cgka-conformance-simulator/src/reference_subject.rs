@@ -338,6 +338,7 @@ impl ReferenceModelSubject {
             }
             ScenarioPredicateV2::ClientsExactlyEquivalent { .. }
             | ScenarioPredicateV2::PublicGroupState { .. }
+            | ScenarioPredicateV2::PublicPayloadMultiset { .. }
             | ScenarioPredicateV2::NoPendingWork { .. } => {
                 return Err(SubjectError::new(
                     "unsupported_capability",

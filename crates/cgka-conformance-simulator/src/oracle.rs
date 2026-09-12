@@ -412,6 +412,13 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
                 stimuli.insert(ScenarioStimulus::Partition);
             }
+            ScenarioStep::RaceGroupProfiles { updates } => {
+                stimuli.insert(ScenarioStimulus::GroupDataUpdate);
+                commits += updates.len();
+            }
+            ScenarioStep::InterruptRelay { .. } => {
+                stimuli.insert(ScenarioStimulus::OfflineReconnect);
+            }
             ScenarioStep::RestartClient { .. } => {
                 stimuli.insert(ScenarioStimulus::Restart);
             }
@@ -507,10 +514,11 @@ fn payload_count_covers_delivery(assertion: &crate::ScenarioAssertionV2) -> bool
             return false;
         }
     };
-    matches!(
-        predicate,
-        crate::ScenarioPredicateV2::PayloadCount { count, .. } if *count > 0
-    )
+    match predicate {
+        crate::ScenarioPredicateV2::PayloadCount { count, .. } => *count > 0,
+        crate::ScenarioPredicateV2::PublicPayloadMultiset { payloads, .. } => !payloads.is_empty(),
+        _ => false,
+    }
 }
 
 pub fn expected_behaviors(
