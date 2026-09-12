@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -102,6 +104,8 @@ struct MediaOriginSlot {
 struct BlossomHttpTransportInner {
     origins: StdMutex<HashMap<MediaOrigin, MediaOriginSlot>>,
     resolver: DnsResolver,
+    #[cfg(test)]
+    clients_built: AtomicUsize,
 }
 
 /// Per-account HTTP setup shared by compatible Blossom downloads.
@@ -145,6 +149,8 @@ impl BlossomHttpTransport {
             inner: Arc::new(BlossomHttpTransportInner {
                 origins: StdMutex::new(HashMap::new()),
                 resolver,
+                #[cfg(test)]
+                clients_built: AtomicUsize::new(0),
             }),
             allow_loopback_http,
             address_lease,
@@ -248,11 +254,18 @@ impl BlossomHttpTransport {
             && url.host().map(is_loopback_host).unwrap_or(false);
         let pin = resolve_media_host_with(url, allow_loopback, &self.inner.resolver).await?;
         let client = build_pinned_media_http_client(pin)?;
+        #[cfg(test)]
+        self.inner.clients_built.fetch_add(1, Ordering::SeqCst);
         *generation = Some(CachedMediaClient {
             client: client.clone(),
             expires_at: now + self.address_lease,
         });
         Ok(client)
+    }
+
+    #[cfg(test)]
+    pub(super) fn clients_built(&self) -> usize {
+        self.inner.clients_built.load(Ordering::SeqCst)
     }
 
     /// Reuse the same safe origin cache through a view that rejects loopback

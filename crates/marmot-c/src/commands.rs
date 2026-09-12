@@ -899,9 +899,11 @@ c_cmd! {
     /// `marmot_app_message_record_list_free`.
     sync fn marmot_messages(account_ref: str, group_id_hex: opt_str, has_limit/limit: opt_val u32, kinds/kinds_len: opt_num_arr u64) -> rec(MarmotAppMessageRecordList) = messages;
 
-    /// Stored media records for the group, capped by `limit` when
-    /// `has_limit`. Free with `marmot_media_record_list_free`.
-    /// Compatibility view: rejected attachments are omitted.
+    /// Stored media records for the group, capped by the newest-message
+    /// query `limit` when `has_limit`. Free with
+    /// `marmot_media_record_list_free`. Compatibility view: rejected
+    /// attachments are omitted after that message-window cap, so a
+    /// newest rejected-only page can be shorter than `limit`.
     sync fn marmot_list_media(account_ref: str, group_id_hex: str, has_limit/limit: opt_val u32) -> rec(MarmotMediaRecordList) = list_media;
 
     /// Rich stored raw app messages with attachment outcomes. Free with

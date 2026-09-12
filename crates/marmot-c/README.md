@@ -83,11 +83,16 @@ it never reinterprets an old device name as a hardware model. Both setters use t
   with `marmot_last_media_error()` (free with `marmot_media_diagnostic_free`).
   Legacy `marmot_list_media`, `marmot_messages`, `marmot_timeline_messages`,
   and the original event/message/timeline subscription payloads omit rejected
-  attachments. Use the matching `_v2` symbols for indexed Parsed/Rejected
-  outcomes, including `marmot_events_subscription_set_callback_v2`,
+  attachments. `marmot_list_media` applies the existing newest-message query
+  `limit` before dropping rejected records, so a newest rejected-only window
+  can return fewer success records than `limit` (including none) even when
+  older parsed media exists. Use the matching `_v2` symbols for indexed
+  Parsed/Rejected outcomes, including `marmot_list_media_v2`,
+  `marmot_events_subscription_set_callback_v2`,
   `marmot_messages_subscription_set_callback_v2`,
   `marmot_timeline_subscription_set_callback_v2`, and
-  `marmot_timeline_subscription_next_v2`. Non-media subscription statuses
+  `marmot_timeline_subscription_next_v2`. Filling a success-only page by
+  fetching extra messages is out of scope. Non-media subscription statuses
   (`TIMEOUT`, `CLOSED`) clear a stale `marmot_last_media_error`.
 - Structs returned by pointer are freed ONLY with their matching
   `marmot_*_free`, which deep-frees every field. Never free fields

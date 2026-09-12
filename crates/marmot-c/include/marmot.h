@@ -2390,6 +2390,13 @@ typedef struct MarmotMediaRecord {
 
 /**
  * Owned list of legacy success-only media records.
+ *
+ * `marmot_list_media` applies the shared newest-message query `limit`
+ * before this conversion drops rejected attachments. A newest
+ * rejected-only window can therefore be shorter than `limit`, including
+ * empty, even when older parsed media exists. Use
+ * `marmot_list_media_v2` for complete Parsed/Rejected pages; fetching
+ * extra messages to fill a success-only page is out of scope.
  */
 typedef struct MarmotMediaRecordList {
   struct MarmotMediaRecord *items;
@@ -6227,9 +6234,11 @@ MarmotStatus marmot_messages(const struct MarmotClient *client,
                              struct MarmotAppMessageRecordList **out);
 
 /**
- * Stored media records for the group, capped by `limit` when
- * `has_limit`. Free with `marmot_media_record_list_free`.
- * Compatibility view: rejected attachments are omitted.
+ * Stored media records for the group, capped by the newest-message
+ * query `limit` when `has_limit`. Free with
+ * `marmot_media_record_list_free`. Compatibility view: rejected
+ * attachments are omitted after that message-window cap, so a
+ * newest rejected-only page can be shorter than `limit`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

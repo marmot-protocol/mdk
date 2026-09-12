@@ -26,6 +26,9 @@ static void on_timeline(const MarmotTimelinePageV2 *item, void *user_data) {
 }
 
 int main(void) {
+    MarmotEventCallbackV2 event_handler = on_event;
+    MarmotMessageUpdateCallbackV2 message_handler = on_message;
+    MarmotTimelinePageCallbackV2 timeline_handler = on_timeline;
     MarmotStatus (*event_cb)(const MarmotEventsSubscription *, MarmotEventCallbackV2, void *) =
         marmot_events_subscription_set_callback_v2;
     MarmotStatus (*message_cb)(const MarmotMessagesSubscription *, MarmotMessageUpdateCallbackV2,
@@ -34,12 +37,12 @@ int main(void) {
                                 void *) = marmot_timeline_subscription_set_callback_v2;
     MarmotStatus (*timeline_next)(const MarmotTimelineSubscription *, uint32_t,
                                   MarmotTimelinePageV2 **) = marmot_timeline_subscription_next_v2;
+    (void)event_handler;
+    (void)message_handler;
+    (void)timeline_handler;
     (void)event_cb;
     (void)message_cb;
     (void)timeline_cb;
     (void)timeline_next;
-    (void)on_event;
-    (void)on_message;
-    (void)on_timeline;
     return 0;
 }

@@ -17,7 +17,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   regenerate bindings. Legacy C layouts remain diagnostic-loss compatibility
   views; use the `_v2` symbols for the rich outcome tree, including C
   `marmot_*_subscription_set_callback_v2` and
-  `marmot_timeline_subscription_next_v2`.
+  `marmot_timeline_subscription_next_v2`. Legacy `marmot_list_media` still
+  applies the newest-message query `limit` before omitting rejected
+  attachments, so that success-only page can be shorter than `limit`.
 
 ### Changed
 

@@ -342,6 +342,13 @@ impl CFree for MarmotMediaRecord {
 }
 
 /// Owned list of legacy success-only media records.
+///
+/// `marmot_list_media` applies the shared newest-message query `limit`
+/// before this conversion drops rejected attachments. A newest
+/// rejected-only window can therefore be shorter than `limit`, including
+/// empty, even when older parsed media exists. Use
+/// `marmot_list_media_v2` for complete Parsed/Rejected pages; fetching
+/// extra messages to fill a success-only page is out of scope.
 #[repr(C)]
 pub struct MarmotMediaRecordList {
     pub items: *mut MarmotMediaRecord,
@@ -470,6 +477,23 @@ mod tests {
             assert_eq!((*list.items).attachment_index, 1);
             marmot_media_record_list_free(crate::memory::boxed(list));
         }
+    }
+
+    #[test]
+    fn legacy_list_media_empty_when_query_window_is_rejected_only() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let list = MarmotMediaRecordList::from(vec![rejected_record()]);
+        assert_eq!(
+            list.len, 0,
+            "legacy success-only conversion does not fetch older messages to refill limit"
+        );
+        unsafe {
+            marmot_media_record_list_free(crate::memory::boxed(list));
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
     }
 
     #[test]

@@ -24,10 +24,13 @@ No generated Swift or Kotlin files are committed here.
 
 `listMedia` now returns rejected attachments as well as parsed ones. Switch
 `MediaRecordFfi.attachment` on `MediaAttachmentResultFfi.Parsed` or
-`Rejected`; the old `reference` field is gone. Message, received-message,
-timeline-row, and reply-preview records expose `mediaAttachments` as the
-authoritative indexed outcomes. `media` / `mediaJson` remain the
-parsed-only view.
+`Rejected`; the old `reference` field is gone. The optional `limit` is still
+the newest-message query cap before expansion, not a post-filter success
+count. Message, received-message, timeline-row, and reply-preview records
+expose `mediaAttachments` as the authoritative indexed outcomes. `media` /
+`mediaJson` remain the parsed-only view. The C legacy `marmot_list_media`
+view then drops rejected rows from that same window; use
+`marmot_list_media_v2` for the complete page.
 
 Explicit parse/build/send failures that used to be
 `MarmotKitError.InvalidMediaReference` for attachment metadata now use

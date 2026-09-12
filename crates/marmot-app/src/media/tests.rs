@@ -394,6 +394,11 @@ async fn resolved_private_address_fetch_is_destination_policy_without_dialing() 
         resolutions.load(Ordering::SeqCst) >= 1,
         "policy rejection must inspect the resolved address set"
     );
+    assert_eq!(
+        transport.clients_built(),
+        0,
+        "private resolved addresses must be rejected before a pinned client is built"
+    );
 }
 
 #[tokio::test]
@@ -408,10 +413,17 @@ async fn unsafe_redirect_fetch_is_destination_policy_without_dialing_target() {
         value: format!("{redirecting_server}/{hash}.bin"),
     }];
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
-    let err = fetch_encrypted_media_blob(&reference, &[], &allowed, true)
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
         .await
         .expect_err("unsafe redirect target is a policy rejection");
     assert_fetch_destination_policy(err);
+    assert_eq!(
+        transport.clients_built(),
+        1,
+        "only the first-hop redirector may receive a pinned client"
+    );
 }
 
 #[tokio::test]

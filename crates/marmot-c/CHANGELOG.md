@@ -22,12 +22,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   after `MARMOT_STATUS_MEDIA_ATTACHMENT` (70). Non-media failures, including
   subscription `TIMEOUT` and `CLOSED`, clear a stale diagnostic.
 - `marmot_parse_media_imeta_tag` mirrors the existing UniFFI explicit parser.
+- `examples/media-diagnostics-v2.c` assignment-checks rich callback typedefs so
+  `-Werror` catches signature drift.
 
 ### Changed
 
 - Legacy `marmot_list_media`, message, timeline, and event layouts are
   unchanged diagnostic-loss compatibility views: rejected attachments are
-  omitted and old records do not carry `media_attachments`. Use the `_v2`
+  omitted and old records do not carry `media_attachments`. The shared
+  newest-message `limit` still applies before that omission, so a newest
+  rejected-only window can be shorter than `limit`. Use the `_v2`
   symbols for the rich outcome tree. Rebuild against the regenerated header.
 
 ## [0.9.21] - 2026-09-10
