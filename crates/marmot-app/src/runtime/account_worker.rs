@@ -1076,6 +1076,85 @@ async fn run_app_runtime_account_worker(
                     let _ = respond.send(());
                 }
             }
+            // Complete queued commands before starting another recovery quantum.
+            command = async {
+                match pending.pop_front() {
+                    Some(command) => Some(command),
+                    None => commands.recv().await,
+                }
+            } => {
+                match command {
+                    Some(command) => {
+                        pending.push_back(command);
+                        while let Some(command) = pending.pop_front() {
+                            let command = match command {
+                                AccountWorkerCommand::Drain { respond } => {
+                                    if let Some(recovery) = &mut welcome_recovery {
+                                        recovery.drain_waiters.push(respond);
+                                    } else {
+                                        let _ = respond.send(());
+                                    }
+                                    continue;
+                                }
+                                command => command,
+                            };
+                            let may_change_push_registration_work =
+                                command.may_change_push_registration_work();
+                            match command {
+                                AccountWorkerCommand::CatchUp { respond } => {
+                                    handle_account_worker_catch_up(
+                                        &mut client,
+                                        respond,
+                                        &mut commands,
+                                        &mut pending,
+                                        AccountWorkerCatchUpContext {
+                                            app: &app,
+                                            events: &events,
+                                            account_id_hex: &account_id_hex,
+                                            account_label: &account_label,
+                                            shared: &shared,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                command => {
+                                    handle_account_worker_command(
+                                        &mut client,
+                                        command,
+                                        AccountWorkerCommandContext {
+                                            commands: &mut commands,
+                                            pending: &mut pending,
+                                            app: &app,
+                                            events: &events,
+                                            account_id_hex: &account_id_hex,
+                                            account_label: &account_label,
+                                            shared: &shared,
+                                            media_http: &media_http,
+                                            scheduled_convergence: &mut scheduled_convergence,
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                            schedule_pending_convergence_groups(
+                                &mut scheduled_convergence,
+                                &mut client,
+                            );
+                            scheduled_runtime_group_subscription_refresh.observe_pending(
+                                client.has_pending_runtime_group_subscription_refresh(),
+                                &command_tx,
+                            );
+                            if may_change_push_registration_work {
+                                scheduled_push_retry.observe_pending(
+                                    client.has_pending_push_registration_work(),
+                                    &command_tx,
+                                );
+                            }
+                        }
+                    }
+                    None => return,
+                }
+            }
             _ = scheduled_convergence.timer.as_mut() => {
                 let groups = scheduled_convergence.take_ready();
                 // Recovery owns the live client, but member/roster reads can
@@ -1216,84 +1295,6 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                 ))
                 .await;
-            }
-            command = async {
-                match pending.pop_front() {
-                    Some(command) => Some(command),
-                    None => commands.recv().await,
-                }
-            } => {
-                match command {
-                    Some(command) => {
-                        pending.push_back(command);
-                        while let Some(command) = pending.pop_front() {
-                            let command = match command {
-                                AccountWorkerCommand::Drain { respond } => {
-                                    if let Some(recovery) = &mut welcome_recovery {
-                                        recovery.drain_waiters.push(respond);
-                                    } else {
-                                        let _ = respond.send(());
-                                    }
-                                    continue;
-                                }
-                                command => command,
-                            };
-                            let may_change_push_registration_work =
-                                command.may_change_push_registration_work();
-                            match command {
-                                AccountWorkerCommand::CatchUp { respond } => {
-                                    handle_account_worker_catch_up(
-                                        &mut client,
-                                        respond,
-                                        &mut commands,
-                                        &mut pending,
-                                        AccountWorkerCatchUpContext {
-                                            app: &app,
-                                            events: &events,
-                                            account_id_hex: &account_id_hex,
-                                            account_label: &account_label,
-                                            shared: &shared,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                command => {
-                                    handle_account_worker_command(
-                                        &mut client,
-                                        command,
-                                        AccountWorkerCommandContext {
-                                            commands: &mut commands,
-                                            pending: &mut pending,
-                                            app: &app,
-                                            events: &events,
-                                            account_id_hex: &account_id_hex,
-                                            account_label: &account_label,
-                                            shared: &shared,
-                                            media_http: &media_http,
-                                            scheduled_convergence: &mut scheduled_convergence,
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
-                            schedule_pending_convergence_groups(
-                                &mut scheduled_convergence,
-                                &mut client,
-                            );
-                            scheduled_runtime_group_subscription_refresh.observe_pending(
-                                client.has_pending_runtime_group_subscription_refresh(),
-                                &command_tx,
-                            );
-                            if may_change_push_registration_work {
-                                scheduled_push_retry.observe_pending(
-                                    client.has_pending_push_registration_work(),
-                                    &command_tx,
-                                );
-                            }
-                        }
-                    }
-                    None => return,
-                }
             }
             done = media_http_rx.recv() => {
                 match done {
@@ -4714,30 +4715,28 @@ impl ScheduledConvergence {
     }
 
     fn take_ready(&mut self) -> Vec<GroupId> {
-        let Some(earliest) = self.deadlines.values().copied().min() else {
+        // One group per worker turn: a pass can await relay recovery, so taking
+        // every overdue group would multiply that wait by the account's size.
+        // Earliest-first keeps an unsettled group from jumping ahead when it
+        // re-arms; undispatched groups retain their original deadlines.
+        let next = self
+            .deadlines
+            .iter()
+            .min_by(
+                |(left_group, left_deadline), (right_group, right_deadline)| {
+                    left_deadline
+                        .cmp(right_deadline)
+                        .then_with(|| left_group.as_slice().cmp(right_group.as_slice()))
+                },
+            )
+            .map(|(group_id, _)| group_id.clone());
+        let Some(group_id) = next else {
             self.reset_timer_to_earliest();
             return Vec::new();
         };
-        let now = TokioInstant::now();
-        let mut ready: Vec<GroupId> = self
-            .deadlines
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(group_id, _)| group_id.clone())
-            .collect();
-        if ready.is_empty() {
-            ready.extend(
-                self.deadlines
-                    .iter()
-                    .filter(|(_, deadline)| **deadline == earliest)
-                    .map(|(group_id, _)| group_id.clone()),
-            );
-        }
-        for group_id in &ready {
-            self.deadlines.remove(group_id);
-        }
+        self.deadlines.remove(&group_id);
         self.reset_timer_to_earliest();
-        ready
+        vec![group_id]
     }
 
     fn note_success(&mut self, group_id: &GroupId) {
@@ -6744,7 +6743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_ready_drains_every_overdue_group_in_one_tick() {
+    async fn take_ready_preserves_other_overdue_groups_for_later_worker_turns() {
         let first = test_group_id(24);
         let second = test_group_id(25);
         let future = test_group_id(26);
@@ -6760,13 +6759,34 @@ mod tests {
 
         let ready = scheduled.take_ready();
 
-        assert_eq!(ready.len(), 2);
-        assert!(ready.contains(&first));
-        assert!(ready.contains(&second));
+        assert_eq!(ready, vec![second]);
+        assert_eq!(scheduled.deadlines[&first], now);
+        assert_eq!(scheduled.take_ready(), vec![first]);
         assert_eq!(
             scheduled.deadlines.keys().collect::<Vec<_>>(),
             vec![&future]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fifty_overdue_groups_progress_despite_one_group_rearming() {
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let groups: Vec<_> = (1..=50).map(test_group_id).collect();
+        scheduled.schedule_groups(groups.clone());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let deadlines = scheduled.deadlines.clone();
+
+        for group in &groups {
+            assert_eq!(scheduled.take_ready(), vec![group.clone()]);
+            scheduled.schedule_unsettled_groups([group.clone()]);
+            for later in groups
+                .iter()
+                .filter(|later| later.as_slice() > group.as_slice())
+            {
+                assert_eq!(scheduled.deadlines[later], deadlines[later]);
+            }
+        }
+        assert_eq!(scheduled.deadlines.len(), 50);
     }
 
     #[tokio::test]
