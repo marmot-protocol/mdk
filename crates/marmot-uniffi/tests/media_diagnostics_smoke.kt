@@ -59,7 +59,7 @@ fun main() {
     try {
         parseMediaImetaTag(MessageTagFfi(listOf("imeta", "v encrypted-media-v1")), 1u)
         error("incomplete imeta must reject")
-    } catch (error: MarmotKitError.MediaAttachment) {
+    } catch (error: MarmotKitException.MediaAttachment) {
         check(error.diagnostic.code == MediaErrorCodeFfi.MISSING_FIELD)
     }
 

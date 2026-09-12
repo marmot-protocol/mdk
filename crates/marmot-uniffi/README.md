@@ -32,7 +32,9 @@ parsed-only view.
 Explicit parse/build/send failures that used to be
 `MarmotKitError.InvalidMediaReference` for attachment metadata now use
 `MarmotKitError.MediaAttachment { diagnostic }` with closed
-stage/code/field enums. Group-image and setup validation still use
+stage/code/field enums. Generated Kotlin raises
+`MarmotKitException.MediaAttachment`; Swift keeps `MarmotKitError.MediaAttachment`.
+Group-image and setup validation still use
 `InvalidMediaReference` / `InvalidEncryptedMedia`.
 
 Regenerate Swift/Kotlin bindings. Native lift/lower checks:

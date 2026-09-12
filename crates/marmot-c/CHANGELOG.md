@@ -11,11 +11,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Typed attachment diagnostics (`MarmotMediaDiagnostic`, closed stage/code/field
   enums, `MarmotMediaAttachmentResult`, and `MarmotMediaAttachmentProjection`)
-  plus `_v2` query, snapshot, next, pagination, and event/projection mirrors
-  that retain rejected attachments and their original indices.
+  plus `_v2` query, snapshot, next, pagination, callback, and event/projection
+  mirrors that retain rejected attachments and their original indices.
+- Rich event, message, and timeline callback pumps
+  (`marmot_events_subscription_set_callback_v2`,
+  `marmot_messages_subscription_set_callback_v2`,
+  `marmot_timeline_subscription_set_callback_v2`) and
+  `marmot_timeline_subscription_next_v2` for the full-window rich page.
 - `marmot_last_media_error` takes and clears the thread-local typed diagnostic
-  after `MARMOT_STATUS_MEDIA_ATTACHMENT` (70). Non-media failures clear a stale
-  diagnostic.
+  after `MARMOT_STATUS_MEDIA_ATTACHMENT` (70). Non-media failures, including
+  subscription `TIMEOUT` and `CLOSED`, clear a stale diagnostic.
 - `marmot_parse_media_imeta_tag` mirrors the existing UniFFI explicit parser.
 
 ### Changed
@@ -105,6 +110,7 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.21...HEAD
+[0.9.21]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...marmotc-v0.9.21
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

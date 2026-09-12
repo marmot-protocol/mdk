@@ -34,7 +34,7 @@ impl From<EncryptedMediaVersionFfi> for EncryptedMediaVersion {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MediaLocatorFfi {
     pub kind: String,
     pub value: String,
@@ -58,7 +58,7 @@ impl From<MediaLocatorFfi> for MediaLocator {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MediaAttachmentReferenceFfi {
     pub locators: Vec<MediaLocatorFfi>,
     pub ciphertext_sha256: String,
@@ -309,7 +309,7 @@ impl std::fmt::Display for MediaDiagnosticFfi {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum MediaAttachmentResultFfi {
     Parsed {
         reference: MediaAttachmentReferenceFfi,
@@ -340,7 +340,7 @@ impl From<MediaAttachmentResult> for MediaAttachmentResultFfi {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MediaAttachmentProjectionFfi {
     pub attachment_index: Option<u32>,
     pub result: MediaAttachmentResultFfi,
@@ -436,6 +436,7 @@ pub(crate) fn timeline_media_references_ffi(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversions::MessageTagFfi;
 
     fn imeta_tag(byte: u8, media_type: &str, file_name: &str, extra: &[&str]) -> Vec<String> {
         let mut tag = vec![
@@ -644,26 +645,45 @@ mod tests {
 
         assert_eq!(from_message.plaintext, "keep the caption");
         assert_eq!(from_message.media_attachments.len(), 4);
-        assert_eq!(from_received.media_attachments.len(), 4);
+        assert_eq!(
+            from_received.media_attachments,
+            from_message.media_attachments
+        );
         assert_eq!(from_list.len(), 4);
-        assert_eq!(from_timeline.len(), 4);
-        assert_eq!(preview.media_attachments.len(), 4);
-        for (index, (message_outcome, list_record, timeline_outcome, preview_outcome)) in
-            from_message
-                .media_attachments
-                .iter()
-                .zip(from_list.iter())
-                .zip(from_timeline.iter())
-                .zip(preview.media_attachments.iter())
-                .map(|(((a, b), c), d)| (a, b, c, d))
-                .enumerate()
+        assert_eq!(from_timeline, from_message.media_attachments);
+        assert_eq!(preview.media_attachments, from_message.media_attachments);
+        for (index, (message_outcome, list_record, received_outcome)) in from_message
+            .media_attachments
+            .iter()
+            .zip(from_list.iter())
+            .zip(from_received.media_attachments.iter())
+            .map(|((a, b), c)| (a, b, c))
+            .enumerate()
         {
             let index = u32::try_from(index).unwrap();
             assert_eq!(message_outcome.attachment_index, Some(index));
+            assert_eq!(received_outcome, message_outcome);
             assert_eq!(list_record.attachment_index, index);
-            assert_eq!(timeline_outcome.attachment_index, Some(index));
-            assert_eq!(preview_outcome.attachment_index, Some(index));
+            assert_eq!(&list_record.attachment, &message_outcome.result);
             assert_eq!(list_record.caption.as_deref(), Some("keep the caption"));
+            let tag = MessageTagFfi {
+                values: imeta_only[index as usize].clone(),
+            };
+            match crate::commands::parse_media_imeta_tag(tag, 7) {
+                Ok(reference) => {
+                    assert_eq!(
+                        message_outcome.result,
+                        MediaAttachmentResultFfi::Parsed { reference }
+                    );
+                }
+                Err(crate::errors::MarmotKitError::MediaAttachment { diagnostic }) => {
+                    assert_eq!(
+                        message_outcome.result,
+                        MediaAttachmentResultFfi::Rejected { diagnostic }
+                    );
+                }
+                Err(other) => panic!("explicit parser must return MediaAttachment, got {other:?}"),
+            }
         }
         assert_eq!(
             rejected_code(&from_message.media_attachments[0].result),
@@ -689,6 +709,25 @@ mod tests {
         assert_eq!(reference.version, EncryptedMediaVersionFfi::V2);
         assert_eq!(preview.media.len(), 2);
         assert_eq!(preview.plaintext, "keep the caption");
+    }
+
+    #[test]
+    fn cache_refresh_observes_media_decode_failed_change_only() {
+        let media = imeta_metadata(&[imeta_tag(0x11, "image/png", "diagram.png", &[])]);
+        let parsed = timeline_media_attachments_ffi(&Some(media.clone()), false, Some(7));
+        let refreshed = timeline_media_attachments_ffi(&Some(media), true, Some(7));
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(
+            parsed[0].result,
+            MediaAttachmentResultFfi::Parsed { .. }
+        ));
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].attachment_index, None);
+        assert_eq!(
+            rejected_code(&refreshed[0].result),
+            MediaErrorCodeFfi::InvalidStructure
+        );
+        assert_ne!(parsed, refreshed);
     }
 
     #[test]

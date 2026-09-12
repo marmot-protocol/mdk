@@ -4451,6 +4451,26 @@ typedef struct MarmotEventV2 {
 } MarmotEventV2;
 
 /**
+ * Callback invoked with each rich event (borrowed; valid only during the
+ * call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotEventCallbackV2)(const struct MarmotEventV2 *item, void *user_data);
+
+/**
+ * Callback invoked with each rich message update (borrowed; valid only
+ * during the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotMessageUpdateCallbackV2)(const struct MarmotMessageUpdateV2 *item,
+                                              void *user_data);
+
+/**
+ * Callback invoked with each rich full-window timeline page (borrowed;
+ * valid only during the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotTimelinePageCallbackV2)(const struct MarmotTimelinePageV2 *item,
+                                             void *user_data);
+
+/**
  * Callback invoked with each item (borrowed; valid only during
  * the call) and finally with NULL when the stream closes.
  */
@@ -8358,6 +8378,53 @@ MarmotStatus marmot_messages_subscription_next_v2(const struct MarmotMessagesSub
 MarmotStatus marmot_events_subscription_next_v2(const struct MarmotEventsSubscription *sub,
                                                 uint32_t timeout_ms,
                                                 struct MarmotEventV2 **out);
+
+/**
+ * Block until the next rich full-window timeline page. Free with
+ * `marmot_timeline_page_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_timeline_subscription_next_v2(const struct MarmotTimelineSubscription *sub,
+                                                  uint32_t timeout_ms,
+                                                  struct MarmotTimelinePageV2 **out);
+
+/**
+ * Install a rich event callback pump. Same ownership, cancellation, and
+ * thread-safety rules as `marmot_events_subscription_set_callback`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function pointer.
+ * `user_data` must outlive every callback invocation.
+ */
+MarmotStatus marmot_events_subscription_set_callback_v2(const struct MarmotEventsSubscription *sub,
+                                                        MarmotEventCallbackV2 callback,
+                                                        void *user_data);
+
+/**
+ * Install a rich message callback pump. Same ownership, cancellation, and
+ * thread-safety rules as `marmot_messages_subscription_set_callback`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function pointer.
+ * `user_data` must outlive every callback invocation.
+ */
+MarmotStatus marmot_messages_subscription_set_callback_v2(const struct MarmotMessagesSubscription *sub,
+                                                          MarmotMessageUpdateCallbackV2 callback,
+                                                          void *user_data);
+
+/**
+ * Install a rich timeline callback pump. Same ownership, cancellation, and
+ * thread-safety rules as `marmot_timeline_subscription_set_callback`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function pointer.
+ * `user_data` must outlive every callback invocation.
+ */
+MarmotStatus marmot_timeline_subscription_set_callback_v2(const struct MarmotTimelineSubscription *sub,
+                                                          MarmotTimelinePageCallbackV2 callback,
+                                                          void *user_data);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_app_group_record_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).

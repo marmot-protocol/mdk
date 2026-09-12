@@ -330,6 +330,114 @@ fn tag_with_locator(locator: String) -> Vec<String> {
     tag
 }
 
+fn v2_tag_with_locator(locator: String) -> Vec<String> {
+    let mut tag = valid_v2_imeta_tag();
+    tag[2] = format!("locator blossom-v1 {locator}");
+    tag
+}
+
+fn assert_fetch_destination_policy(err: AppError) {
+    let AppError::MediaAttachment(diagnostic) = err else {
+        panic!("expected typed DestinationPolicy, got {err:?}");
+    };
+    assert_eq!(diagnostic.stage, MediaErrorStage::Fetch);
+    assert_eq!(diagnostic.code, MediaErrorCode::DestinationPolicy);
+    assert_eq!(diagnostic.field, Some(MediaErrorField::Locator));
+}
+
+#[test]
+fn v2_loopback_https_locator_stays_parsed() {
+    let tag = v2_tag_with_locator(format!("https://127.0.0.1/{}.bin", valid_hash()));
+    let reference = media_attachment_from_imeta_tag(&tag, Some(7), false)
+        .expect("V2 locator validity is independent of local destination policy");
+    let outcomes = project_media_attachments(&[tag], Some(7), false);
+    assert!(matches!(
+        outcomes[0].result,
+        MediaAttachmentResult::Parsed { .. }
+    ));
+    assert_eq!(reference.version, ENCRYPTED_MEDIA_FORMAT_V2);
+}
+
+#[tokio::test]
+async fn v2_loopback_https_fetch_is_destination_policy_without_dialing() {
+    let tag = v2_tag_with_locator(format!("https://127.0.0.1:1/{}.bin", valid_hash()));
+    let reference = media_attachment_from_imeta_tag(&tag, Some(7), false)
+        .expect("V2 loopback HTTPS remains parsed");
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = fetch_encrypted_media_blob(&reference, &[], &allowed, false)
+        .await
+        .expect_err("literal loopback HTTPS is a fetch-time policy rejection");
+    assert_fetch_destination_policy(err);
+}
+
+#[tokio::test]
+async fn resolved_private_address_fetch_is_destination_policy_without_dialing() {
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_resolutions = resolutions.clone();
+    let resolver: DnsResolver = Arc::new(move |_domain, port| {
+        resolver_resolutions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(vec![format!("10.0.0.5:{port}").parse().unwrap()]) })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a hostname that resolves to a private address is policy, not download");
+    assert_fetch_destination_policy(err);
+    assert!(
+        resolutions.load(Ordering::SeqCst) >= 1,
+        "policy rejection must inspect the resolved address set"
+    );
+}
+
+#[tokio::test]
+async fn unsafe_redirect_fetch_is_destination_policy_without_dialing_target() {
+    let hash = valid_hash();
+    let redirecting_server = spawn_http_response(http_redirect_response(&format!(
+        "https://10.0.0.5/{hash}.bin"
+    )));
+    let mut reference = blossom_reference();
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("{redirecting_server}/{hash}.bin"),
+    }];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = fetch_encrypted_media_blob(&reference, &[], &allowed, true)
+        .await
+        .expect_err("unsafe redirect target is a policy rejection");
+    assert_fetch_destination_policy(err);
+}
+
+#[tokio::test]
+async fn destination_policy_failover_still_reaches_usable_locator() {
+    let body = b"usable ciphertext";
+    let hash = hex::encode(Sha256::digest(body));
+    let healthy = spawn_http_response(http_ok_response(body));
+    let mut reference = blossom_reference();
+    reference.ciphertext_sha256 = hash.clone();
+    reference.locators = vec![
+        MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://127.0.0.1:1/{hash}.bin"),
+        },
+        MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{healthy}/{hash}.bin"),
+        },
+    ];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let downloaded = fetch_encrypted_media_blob(&reference, &[], &allowed, true)
+        .await
+        .expect("a later usable locator must still succeed");
+    assert_eq!(downloaded, body);
+}
+
 #[test]
 fn imeta_parser_rejects_duplicate_single_occurrence_field() {
     // Baseline valid tag parses.

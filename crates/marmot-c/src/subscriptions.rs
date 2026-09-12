@@ -102,10 +102,12 @@ impl CallbackCtx {
 // only to allocations the value exclusively owns, so moving one across
 // threads is sound.
 unsafe impl Send for MarmotTimelinePage {}
+unsafe impl Send for MarmotTimelinePageV2 {}
 unsafe impl Send for MarmotNotificationUpdate {}
 unsafe impl Send for MarmotAppGroupRecord {}
 unsafe impl Send for MarmotChatListRow {}
 unsafe impl Send for MarmotMessageUpdate {}
+unsafe impl Send for MarmotMessageUpdateV2 {}
 unsafe impl Send for MarmotAgentStreamUpdate {}
 unsafe impl Send for MarmotUserSearchUpdate {}
 unsafe impl Send for MarmotOnboardingSnapshot {}
@@ -200,10 +202,14 @@ where
             MarmotStatus::Ok
         }
         Ok(None) => {
+            crate::status::clear_last_media_error();
             unsafe { out.write(std::ptr::null_mut()) };
             MarmotStatus::Closed
         }
         Err(status) => {
+            if matches!(status, MarmotStatus::Timeout | MarmotStatus::Closed) {
+                crate::status::clear_last_media_error();
+            }
             unsafe { out.write(std::ptr::null_mut()) };
             status
         }
@@ -1027,6 +1033,125 @@ pub unsafe extern "C" fn marmot_events_subscription_next_v2(
     })
 }
 
+/// Block until the next rich full-window timeline page. Free with
+/// `marmot_timeline_page_v2_free`.
+///
+/// # Safety
+/// `sub` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_next_v2(
+    sub: *const MarmotTimelineSubscription,
+    timeout_ms: u32,
+    out: *mut *mut MarmotTimelinePageV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let inner = sub.inner.clone();
+        let result = sub.core.block_next(timeout_ms, inner.next());
+        unsafe { deliver_next(result, out) }
+    })
+}
+
+/// Callback invoked with each rich event (borrowed; valid only during the
+/// call) and finally with NULL when the stream closes.
+pub type MarmotEventCallbackV2 =
+    Option<unsafe extern "C" fn(item: *const MarmotEventV2, user_data: *mut c_void)>;
+
+/// Install a rich event callback pump. Same ownership, cancellation, and
+/// thread-safety rules as `marmot_events_subscription_set_callback`.
+///
+/// # Safety
+/// `sub` must be a live handle; `callback` a valid function pointer.
+/// `user_data` must outlive every callback invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_events_subscription_set_callback_v2(
+    sub: *const MarmotEventsSubscription,
+    callback: MarmotEventCallbackV2,
+    user_data: *mut c_void,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let Some(callback) = callback else {
+            set_last_error("callback function pointer was NULL");
+            return MarmotStatus::NullPointer;
+        };
+        let inner = sub.inner.clone();
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
+                let inner = inner.clone();
+                async move { inner.next().await }
+            })
+        })
+    })
+}
+
+/// Callback invoked with each rich message update (borrowed; valid only
+/// during the call) and finally with NULL when the stream closes.
+pub type MarmotMessageUpdateCallbackV2 =
+    Option<unsafe extern "C" fn(item: *const MarmotMessageUpdateV2, user_data: *mut c_void)>;
+
+/// Install a rich message callback pump. Same ownership, cancellation, and
+/// thread-safety rules as `marmot_messages_subscription_set_callback`.
+///
+/// # Safety
+/// `sub` must be a live handle; `callback` a valid function pointer.
+/// `user_data` must outlive every callback invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_messages_subscription_set_callback_v2(
+    sub: *const MarmotMessagesSubscription,
+    callback: MarmotMessageUpdateCallbackV2,
+    user_data: *mut c_void,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let Some(callback) = callback else {
+            set_last_error("callback function pointer was NULL");
+            return MarmotStatus::NullPointer;
+        };
+        let inner = sub.inner.clone();
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
+                let inner = inner.clone();
+                async move { inner.next().await }
+            })
+        })
+    })
+}
+
+/// Callback invoked with each rich full-window timeline page (borrowed;
+/// valid only during the call) and finally with NULL when the stream closes.
+pub type MarmotTimelinePageCallbackV2 =
+    Option<unsafe extern "C" fn(item: *const MarmotTimelinePageV2, user_data: *mut c_void)>;
+
+/// Install a rich timeline callback pump. Same ownership, cancellation, and
+/// thread-safety rules as `marmot_timeline_subscription_set_callback`.
+///
+/// # Safety
+/// `sub` must be a live handle; `callback` a valid function pointer.
+/// `user_data` must outlive every callback invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_subscription_set_callback_v2(
+    sub: *const MarmotTimelineSubscription,
+    callback: MarmotTimelinePageCallbackV2,
+    user_data: *mut c_void,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let Some(callback) = callback else {
+            set_last_error("callback function pointer was NULL");
+            return MarmotStatus::NullPointer;
+        };
+        let inner = sub.inner.clone();
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
+                let inner = inner.clone();
+                async move { inner.next().await }
+            })
+        })
+    })
+}
+
 c_subscription! {
     /// Opaque handle to one group's state: an initial record snapshot,
     /// then the full record after each member/profile/roster change.
@@ -1212,6 +1337,7 @@ pub unsafe extern "C" fn marmot_agent_stream_subscription_stream_id_hex(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -1259,6 +1385,333 @@ mod tests {
             MarmotStatus::Ok
         );
         core.clear();
+    }
+
+    fn seed_media_error() {
+        let err = MarmotKitError::MediaAttachment {
+            diagnostic: marmot_uniffi::conversions::MediaDiagnosticFfi {
+                stage: marmot_uniffi::conversions::MediaErrorStageFfi::Metadata,
+                code: marmot_uniffi::conversions::MediaErrorCodeFfi::MissingField,
+                field: Some(marmot_uniffi::conversions::MediaErrorFieldFfi::Nonce),
+                message: "media attachment is missing nonce".into(),
+            },
+        };
+        assert_eq!(
+            crate::status::status_from_error(&err),
+            MarmotStatus::MediaAttachment
+        );
+        let diagnostic = crate::marmot_last_media_error();
+        assert!(!diagnostic.is_null());
+        unsafe { crate::types::media::marmot_media_diagnostic_free(diagnostic) };
+        let _ = crate::status::status_from_error(&err);
+    }
+
+    #[test]
+    fn timeout_and_closed_clear_stale_typed_media_error() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        seed_media_error();
+        let mut out: *mut MarmotEventV2 = std::ptr::null_mut();
+        let status = unsafe {
+            deliver_next::<marmot_uniffi::conversions::MarmotEventFfi, MarmotEventV2>(
+                Err(MarmotStatus::Timeout),
+                &mut out,
+            )
+        };
+        assert_eq!(status, MarmotStatus::Timeout);
+        assert!(out.is_null());
+        assert!(crate::marmot_last_media_error().is_null());
+
+        seed_media_error();
+        let status = unsafe {
+            deliver_next::<marmot_uniffi::conversions::MarmotEventFfi, MarmotEventV2>(
+                Ok(None),
+                &mut out,
+            )
+        };
+        assert_eq!(status, MarmotStatus::Closed);
+        assert!(out.is_null());
+        assert!(crate::marmot_last_media_error().is_null());
+
+        seed_media_error();
+        let first = crate::marmot_last_media_error();
+        assert!(!first.is_null());
+        unsafe { crate::types::media::marmot_media_diagnostic_free(first) };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    fn mixed_projections() -> Vec<marmot_uniffi::conversions::MediaAttachmentProjectionFfi> {
+        use marmot_uniffi::conversions::{
+            EncryptedMediaVersionFfi, MediaAttachmentProjectionFfi, MediaAttachmentReferenceFfi,
+            MediaAttachmentResultFfi, MediaDiagnosticFfi, MediaErrorCodeFfi, MediaErrorFieldFfi,
+            MediaErrorStageFfi, MediaLocatorFfi,
+        };
+        let parsed = |name: &str| MediaAttachmentResultFfi::Parsed {
+            reference: MediaAttachmentReferenceFfi {
+                locators: vec![MediaLocatorFfi {
+                    kind: "blossom-v1".into(),
+                    value: "https://media.example/aa.bin".into(),
+                }],
+                ciphertext_sha256: "11".repeat(32),
+                plaintext_sha256: "22".repeat(32),
+                nonce_hex: "33".repeat(12),
+                file_name: name.into(),
+                media_type: "image/png".into(),
+                version: EncryptedMediaVersionFfi::V1,
+                source_epoch: 7,
+                dim: None,
+                thumbhash: None,
+            },
+        };
+        let rejected = MediaAttachmentResultFfi::Rejected {
+            diagnostic: MediaDiagnosticFfi {
+                stage: MediaErrorStageFfi::Metadata,
+                code: MediaErrorCodeFfi::MissingField,
+                field: Some(MediaErrorFieldFfi::Nonce),
+                message: "media attachment is missing nonce".into(),
+            },
+        };
+        vec![
+            MediaAttachmentProjectionFfi {
+                attachment_index: Some(0),
+                result: rejected.clone(),
+            },
+            MediaAttachmentProjectionFfi {
+                attachment_index: Some(1),
+                result: parsed("first.png"),
+            },
+            MediaAttachmentProjectionFfi {
+                attachment_index: Some(2),
+                result: rejected,
+            },
+            MediaAttachmentProjectionFfi {
+                attachment_index: Some(3),
+                result: parsed("second.png"),
+            },
+        ]
+    }
+
+    fn received_with_mixed_attachments() -> marmot_uniffi::conversions::RuntimeMessageReceivedFfi {
+        use marmot_uniffi::conversions::{ReceivedMessageFfi, RuntimeMessageReceivedFfi};
+        RuntimeMessageReceivedFfi {
+            account_id_hex: "cc".repeat(32),
+            account_label: "acct".into(),
+            message: ReceivedMessageFfi {
+                message_id_hex: "aa".repeat(32),
+                group_id_hex: "bb".repeat(32),
+                sender: "alice".into(),
+                sender_display_name: None,
+                plaintext: "keep the caption".into(),
+                content_tokens: marmot_uniffi::MarkdownDocumentFfi::default(),
+                kind: 9,
+                tags: Vec::new(),
+                media_attachments: mixed_projections(),
+                source_epoch: 7,
+                retention_seconds: None,
+                retention_expires_at: None,
+                recorded_at: 10,
+                received_at: 11,
+            },
+        }
+    }
+
+    fn mixed_timeline_page() -> marmot_uniffi::conversions::TimelinePageFfi {
+        use marmot_uniffi::conversions::{
+            TimelineMessageRecordFfi, TimelinePageFfi, TimelineReactionSummaryFfi,
+            TimelineReplyPreviewFfi,
+        };
+        let preview = TimelineReplyPreviewFfi {
+            message_id_hex: "parent".into(),
+            sender: "bob".into(),
+            plaintext: "preview".into(),
+            content_tokens: marmot_uniffi::MarkdownDocumentFfi::default(),
+            kind: 9,
+            media_json: None,
+            media: Vec::new(),
+            media_attachments: mixed_projections()[..1].to_vec(),
+            agent_text_stream_json: None,
+            deleted: false,
+            invalidation_status: None,
+        };
+        TimelinePageFfi {
+            messages: vec![TimelineMessageRecordFfi {
+                message_id_hex: "aa".repeat(32),
+                source_message_id_hex: None,
+                source_epoch: Some(7),
+                retention_seconds: None,
+                retention_expires_at: None,
+                direction: "incoming".into(),
+                group_id_hex: "bb".repeat(32),
+                sender: "alice".into(),
+                plaintext: "keep the caption".into(),
+                content_tokens: marmot_uniffi::MarkdownDocumentFfi::default(),
+                kind: 9,
+                tags: Vec::new(),
+                timeline_at: 10,
+                received_at: 11,
+                reply_to_message_id_hex: Some("parent".into()),
+                reply_preview: Some(preview),
+                media_json: None,
+                media: Vec::new(),
+                media_attachments: mixed_projections(),
+                agent_text_stream_json: None,
+                group_system: None,
+                reactions: TimelineReactionSummaryFfi {
+                    by_emoji: Vec::new(),
+                    user_reactions: Vec::new(),
+                },
+                deleted: false,
+                deleted_by_message_id_hex: None,
+                invalidation_status: None,
+            }],
+            has_more_before: false,
+            has_more_after: false,
+        }
+    }
+
+    fn assert_mixed_projections(
+        items: *const crate::types::media::MarmotMediaAttachmentProjection,
+        len: usize,
+    ) {
+        assert_eq!(len, 4);
+        unsafe {
+            for index in 0..len {
+                let item = &*items.add(index);
+                assert!(item.has_attachment_index);
+                assert_eq!(item.attachment_index, index as u32);
+            }
+            match &(*items).result {
+                crate::types::media::MarmotMediaAttachmentResult::Rejected { diagnostic } => {
+                    assert_eq!(
+                        diagnostic.code,
+                        crate::types::media::MarmotMediaErrorCode::MissingField
+                    );
+                }
+                crate::types::media::MarmotMediaAttachmentResult::Parsed { .. } => {
+                    panic!("index 0 must be rejected")
+                }
+            }
+            match &(*items.add(1)).result {
+                crate::types::media::MarmotMediaAttachmentResult::Parsed { reference } => {
+                    let name = std::ffi::CStr::from_ptr(reference.file_name)
+                        .to_str()
+                        .expect("filename utf8");
+                    assert_eq!(name, "first.png");
+                }
+                crate::types::media::MarmotMediaAttachmentResult::Rejected { .. } => {
+                    panic!("index 1 must stay parsed")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rich_v2_mirrors_keep_mixed_outcomes_and_rejected_reply_previews() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let received = received_with_mixed_attachments();
+        let event = marmot_uniffi::conversions::MarmotEventFfi::MessageReceived {
+            received: received.clone(),
+        };
+        let message = marmot_uniffi::conversions::MessageUpdateFfi::Message {
+            received: received.clone(),
+        };
+        let timeline = mixed_timeline_page();
+
+        let mut event_v2 = MarmotEventV2::from(event);
+        let mut message_v2 = MarmotMessageUpdateV2::from(message);
+        let mut page_v2 = MarmotTimelinePageV2::from(timeline);
+        match &event_v2 {
+            MarmotEventV2::MessageReceived { received } => {
+                assert_mixed_projections(
+                    received.message.media_attachments,
+                    received.message.media_attachments_len,
+                );
+            }
+            _ => panic!("expected message event"),
+        }
+        match &message_v2 {
+            MarmotMessageUpdateV2::Message { received } => {
+                assert_mixed_projections(
+                    received.message.media_attachments,
+                    received.message.media_attachments_len,
+                );
+            }
+            _ => panic!("expected message update"),
+        }
+        assert_eq!(page_v2.messages_len, 1);
+        unsafe {
+            let row = &*page_v2.messages;
+            assert_mixed_projections(row.media_attachments, row.media_attachments_len);
+            let preview = &*row.reply_preview;
+            assert_eq!(preview.media_attachments_len, 1);
+            match &(*preview.media_attachments).result {
+                crate::types::media::MarmotMediaAttachmentResult::Rejected { diagnostic } => {
+                    assert_eq!(
+                        diagnostic.code,
+                        crate::types::media::MarmotMediaErrorCode::MissingField
+                    );
+                }
+                crate::types::media::MarmotMediaAttachmentResult::Parsed { .. } => {
+                    panic!("reply preview must keep the rejected attachment")
+                }
+            }
+        }
+        unsafe {
+            event_v2.free_in_place();
+            message_v2.free_in_place();
+            page_v2.free_in_place();
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn rich_timeline_callback_borrows_then_frees_mixed_page() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let rt = runtime();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_cb = seen.clone();
+        unsafe extern "C" fn callback(item: *const MarmotTimelinePageV2, user_data: *mut c_void) {
+            let seen = unsafe { &*(user_data as *const std::sync::atomic::AtomicUsize) };
+            if item.is_null() {
+                seen.store(usize::MAX, Ordering::SeqCst);
+                return;
+            }
+            unsafe {
+                let row = &*(*item).messages;
+                assert_eq!((*item).messages_len, 1);
+                assert_eq!(row.media_attachments_len, 4);
+                assert_eq!((*row.media_attachments).attachment_index, 0);
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        let page = mixed_timeline_page();
+        let mut items = vec![Some(page), None].into_iter();
+        let task = spawn_callback_pump(
+            rt.handle(),
+            CallbackCtx {
+                user_data: std::sync::Arc::as_ptr(&seen_cb) as *mut c_void,
+            },
+            callback,
+            move || {
+                let item = items.next().flatten();
+                async move { item }
+            },
+        );
+        rt.block_on(async {
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), usize::MAX);
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
     }
 }
 
