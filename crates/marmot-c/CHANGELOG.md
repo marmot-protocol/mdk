@@ -19,6 +19,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
   references and discards relay hints. Existing hex, `npub`, and
   `marmot://profile/` forms keep their established OK-plus-NULL contract.
+  Duplicate type-0 TLV entries keep the first key. After wrapper
+  normalization, encoded tokens longer than 1023 UTF-8 bytes are
+  rejected; a valid 1023-byte token still decodes when wrapped.
+- `marmot_normalize_member_ref` documents the same nprofile spellings,
+  first-wins type-0 rule, and 1023-byte encoded-token limit.
 
 ## [0.9.21] - 2026-09-10
 

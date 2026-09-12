@@ -572,6 +572,10 @@ impl Marmot {
     /// `npub`, `nostr:npub...`, `nprofile`, `nostr:nprofile...`, and
     /// `marmot://profile/...` references. nprofile relay hints are
     /// discarded and never used for routing or membership authorization.
+    /// Duplicate type-0 TLV entries keep the first key. After wrapper
+    /// normalization, the nprofile fallback rejects encoded tokens longer
+    /// than 1023 UTF-8 bytes; a valid 1023-byte token still decodes when
+    /// wrapped.
     pub fn normalize_member_ref(&self, member_ref: String) -> Result<MemberRefFfi, MarmotKitError> {
         normalize_member_ref_ffi(&member_ref)
     }

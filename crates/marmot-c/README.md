@@ -59,14 +59,21 @@ behind `MarmotMarkdownDetails`. Existing discriminants and union stride stay
 the same; regenerate `marmot.h` and consumer bindings to handle the new tag.
 Older clients cannot render it.
 
-`marmot_account_id_hex` now accepts `nprofile` and `nostr:nprofile`
-references (plus the existing hex/`npub`/`marmot://profile/` forms) and
-discards relay hints. `marmot_default_profile_pseudonym` hashes the
-supplied canonical hex account-id text; decode a scanned reference
-first. `marmot_random_profile_pseudonym` is a cosmetic random roll from
-the same wordlists. Free those strings with `marmot_string_free`.
-Regenerate `marmot.h` after pulling this surface. Android mention/QR
-migration remains a separate consumer issue.
+`marmot_account_id_hex` and `marmot_normalize_member_ref` now accept
+`nprofile` and `nostr:nprofile` references (plus the existing
+hex/`npub`/`marmot://profile/` forms) and discard relay hints.
+Duplicate type-0 TLV entries keep the first key. After wrapper
+normalization, encoded tokens longer than 1023 UTF-8 bytes are
+rejected; a valid 1023-byte token still decodes when wrapped. The
+legacy NIP-21 parser may still accept a colon-suffixed
+`nostr:<npub>:` form before that fallback. `marmot_default_profile_pseudonym`
+hashes the supplied canonical hex account-id text; decode a scanned
+reference first. `marmot_random_profile_pseudonym` is a cosmetic
+random roll from the same wordlists. Free those strings with
+`marmot_string_free` and normalized records with
+`marmot_member_ref_free`. Regenerate `marmot.h` after pulling this
+surface. Android mention/QR migration remains a separate consumer
+issue.
 
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort

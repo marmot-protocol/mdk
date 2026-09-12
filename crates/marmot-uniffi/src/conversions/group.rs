@@ -808,54 +808,33 @@ mod group_roster_tests {
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
     }
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
+
     #[test]
-    fn normalize_member_ref_ffi_accepts_nprofile_and_rejects_malformed() {
-        let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-        let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
-        let nprofile = marmot_app::nprofile_for_account_id(account_id, &[]).expect("nprofile");
-        let bootstrap = marmot_app::nprofile_for_account_id(
-            account_id,
-            &[
-                "wss://relay.eu.whitenoise.chat".to_owned(),
-                "wss://relay.us.whitenoise.chat".to_owned(),
-            ],
-        )
-        .expect("bootstrap nprofile");
-        let unknown_tlv =
-            "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0drrq3skycmyxne9kf";
-        let invalid_relay = "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpp9hx7apqvys82unvuca0cf";
-
-        for reference in [
-            account_id,
-            npub,
-            &format!("nostr:{npub}"),
-            nprofile.as_str(),
-            &format!("nostr:{nprofile}"),
-            bootstrap.as_str(),
-            unknown_tlv,
-            invalid_relay,
-            &format!(" {nprofile}"),
-            &format!("marmot://profile/{nprofile}?from=qr"),
-        ] {
-            let normalized = normalize_member_ref_ffi(reference).expect("valid identity ref");
-            assert_eq!(normalized.account_id_hex, account_id);
-        }
-
-        for reference in [
-            "nprofile1qqqsnhxh",
-            "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq7r0nzx",
-            "note1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq4ueyyt",
-            "nprofile1qy2hwumn8ghj7etcv9khqmr99e5kuanpd35kghsdudn",
-            "nprofile1qqg25n7gve04d9hr8km7rftjuwc028ngcqe",
-            "nprofile1qqs25n7gve04d9hrdfl42d",
-        ] {
-            assert!(
-                matches!(
-                    normalize_member_ref_ffi(reference),
-                    Err(MarmotKitError::InvalidIdentity { .. })
-                ),
-                "expected InvalidIdentity"
-            );
+    fn normalize_member_ref_ffi_matches_shared_corpus() {
+        for case in cases() {
+            match case.ffi_account_id_hex {
+                Some(expected) => {
+                    let normalized = normalize_member_ref_ffi(&case.reference)
+                        .unwrap_or_else(|_| panic!("case {} should decode", case.name));
+                    assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
+                    assert_eq!(normalized.member_ref, expected, "case {}", case.name);
+                    assert_eq!(normalized.npub, NPUB, "case {}", case.name);
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            normalize_member_ref_ffi(&case.reference),
+                            Err(MarmotKitError::InvalidIdentity { .. })
+                        ),
+                        "case {} should reject",
+                        case.name
+                    );
+                }
+            }
         }
     }
 

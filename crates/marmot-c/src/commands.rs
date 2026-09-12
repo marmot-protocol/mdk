@@ -623,7 +623,12 @@ c_cmd! {
     async fn marmot_create_group(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> string = create_group;
 
     /// Normalize a member reference (hex, `npub`, `nostr:npub...`,
-    /// `marmot://profile/...`). Free with `marmot_member_ref_free`.
+    /// `nprofile`, `nostr:nprofile...`, and `marmot://profile/...`).
+    /// nprofile relay hints are discarded. Duplicate type-0 TLV entries
+    /// keep the first key. After wrapper normalization, encoded tokens
+    /// longer than 1023 UTF-8 bytes are rejected; a valid 1023-byte
+    /// token still decodes when wrapped. Free with
+    /// `marmot_member_ref_free`.
     sync fn marmot_normalize_member_ref(member_ref: str) -> rec(MarmotMemberRef) = normalize_member_ref;
 
     /// Membership roster for `group_id_hex`. Free with
@@ -1162,7 +1167,10 @@ pub unsafe extern "C" fn marmot_npub(
 /// Hex account id for an `npub`/hex/`nprofile` reference; NULL with
 /// `MARMOT_STATUS_OK` when the input does not decode. Accepts hex,
 /// `npub`, `nostr:npub`, `nprofile`, `nostr:nprofile`, and
-/// `marmot://profile/` links. nprofile relay hints are discarded. Free
+/// `marmot://profile/` links. nprofile relay hints are discarded.
+/// Duplicate type-0 TLV entries keep the first key. After wrapper
+/// normalization, encoded tokens longer than 1023 UTF-8 bytes are
+/// rejected; a valid 1023-byte token still decodes when wrapped. Free
 /// with `marmot_string_free`.
 ///
 /// # Safety

@@ -4731,7 +4731,12 @@ MarmotStatus marmot_create_group(const struct MarmotClient *client,
 
 /**
  * Normalize a member reference (hex, `npub`, `nostr:npub...`,
- * `marmot://profile/...`). Free with `marmot_member_ref_free`.
+ * `nprofile`, `nostr:nprofile...`, and `marmot://profile/...`).
+ * nprofile relay hints are discarded. Duplicate type-0 TLV entries
+ * keep the first key. After wrapper normalization, encoded tokens
+ * longer than 1023 UTF-8 bytes are rejected; a valid 1023-byte
+ * token still decodes when wrapped. Free with
+ * `marmot_member_ref_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6483,7 +6488,10 @@ MarmotStatus marmot_npub(const struct MarmotClient *client, const char *account_
  * Hex account id for an `npub`/hex/`nprofile` reference; NULL with
  * `MARMOT_STATUS_OK` when the input does not decode. Accepts hex,
  * `npub`, `nostr:npub`, `nprofile`, `nostr:nprofile`, and
- * `marmot://profile/` links. nprofile relay hints are discarded. Free
+ * `marmot://profile/` links. nprofile relay hints are discarded.
+ * Duplicate type-0 TLV entries keep the first key. After wrapper
+ * normalization, encoded tokens longer than 1023 UTF-8 bytes are
+ * rejected; a valid 1023-byte token still decodes when wrapped. Free
  * with `marmot_string_free`.
  *
  * # Safety

@@ -22,6 +22,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../marmot-app/tests/support/identity_reference_vectors.rs"
+));
+
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
 /// targets (iOS/macOS) is always present but in headless CI (Linux Secret
 /// Service, no D-Bus daemon) is not. Install an in-memory mock as the default
@@ -304,39 +309,42 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
         vec!["wss://relay.invalid.test".to_string()],
     )
     .expect("open marmot kit");
-    let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-    let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
-
-    let nprofile = marmot_app::nprofile_for_account_id(account_id, &[]).expect("nprofile");
-    for reference in [
-        account_id.to_string(),
-        npub.to_string(),
-        format!("nostr:{npub}"),
-        nprofile.clone(),
-        format!("nostr:{nprofile}"),
-        format!("marmot://profile/{npub}?from=qr"),
-        format!("marmot://profile/{nprofile}?from=qr"),
-    ] {
-        let normalized = kit
-            .normalize_member_ref(reference.clone())
-            .expect("normalize member ref");
-        assert_eq!(normalized.member_ref, account_id);
-        assert_eq!(normalized.account_id_hex, account_id);
-        assert_eq!(normalized.npub, npub);
-        assert_eq!(
-            kit.account_id_hex(reference),
-            Some(account_id.to_string()),
-            "legacy account_id_hex should accept the same references"
-        );
+    for case in cases() {
+        match case.ffi_account_id_hex {
+            Some(expected) => {
+                let normalized = kit
+                    .normalize_member_ref(case.reference.clone())
+                    .unwrap_or_else(|_| panic!("case {} should normalize", case.name));
+                assert_eq!(normalized.member_ref, expected, "case {}", case.name);
+                assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
+                assert_eq!(normalized.npub, NPUB, "case {}", case.name);
+                assert_eq!(
+                    kit.account_id_hex(case.reference).as_deref(),
+                    Some(expected),
+                    "case {}",
+                    case.name
+                );
+            }
+            None => {
+                assert!(
+                    matches!(
+                        kit.normalize_member_ref(case.reference.clone()),
+                        Err(MarmotKitError::InvalidIdentity { .. })
+                    ),
+                    "case {} should reject",
+                    case.name
+                );
+                assert_eq!(
+                    kit.account_id_hex(case.reference),
+                    None,
+                    "case {}",
+                    case.name
+                );
+            }
+        }
     }
-
-    assert!(matches!(
-        kit.normalize_member_ref("not-a-member-ref".into())
-            .expect_err("invalid member ref should fail"),
-        MarmotKitError::InvalidIdentity { .. }
-    ));
     assert_eq!(
-        kit.default_profile_pseudonym(account_id.to_owned()),
+        kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
         "Loyal Crane"
     );
     let random = kit.random_profile_pseudonym();

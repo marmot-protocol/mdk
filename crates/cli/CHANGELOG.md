@@ -19,7 +19,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
   addition to hex, `npub`, and existing URI forms. nprofile relay hints are
-  discarded.
+  discarded. Duplicate type-0 TLV entries keep the first key. After one
+  lowercase `nostr:` prefix, the nprofile fallback rejects encoded tokens
+  longer than 1023 UTF-8 bytes; a valid 1023-byte token still decodes when
+  wrapped. FFI wrapper normalization is unchanged.
 
 ## [0.9.21] - 2026-09-10
 

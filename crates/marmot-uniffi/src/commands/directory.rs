@@ -31,9 +31,12 @@ impl Marmot {
     /// Normalize a public-key reference (hex, `npub`, `nostr:npub`,
     /// `nprofile`, `nostr:nprofile`, or a `marmot://profile/` link) to
     /// canonical hex. `None` if it isn't a valid public identity
-    /// reference. nprofile relay hints are discarded. Used to resolve a
-    /// scanned or deep-linked mention back to the account id the rest of
-    /// the API expects.
+    /// reference. nprofile relay hints are discarded. Duplicate type-0
+    /// TLV entries keep the first key. After wrapper normalization, the
+    /// nprofile fallback rejects encoded tokens longer than 1023 UTF-8
+    /// bytes; a valid 1023-byte token still decodes when wrapped. Used
+    /// to resolve a scanned or deep-linked mention back to the account
+    /// id the rest of the API expects.
     pub fn account_id_hex(&self, reference: String) -> Option<String> {
         normalize_member_ref_ffi(&reference)
             .ok()
@@ -225,6 +228,11 @@ mod tests {
     use crate::conversions::{
         MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserSearchUpdateFfi,
     };
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
 
     async fn wait_for_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -540,41 +548,21 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let runtime = app.runtime();
         let kit = Marmot { app, runtime };
-        let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-        let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
-        let nprofile = marmot_app::nprofile_for_account_id(account_id, &[]).expect("nprofile");
-
-        for reference in [
-            account_id,
-            npub,
-            &format!("nostr:{npub}"),
-            nprofile.as_str(),
-            &format!("nostr:{nprofile}"),
-            &format!("marmot://profile/{nprofile}?from=qr"),
-        ] {
+        for case in cases() {
             assert_eq!(
-                kit.account_id_hex(reference.to_owned()).as_deref(),
-                Some(account_id)
+                kit.account_id_hex(case.reference.clone()).as_deref(),
+                case.ffi_account_id_hex,
+                "case {}",
+                case.name
             );
         }
-        assert_eq!(kit.account_id_hex("not-a-public-key".to_owned()), None);
-        assert_eq!(
-            kit.account_id_hex("nprofile1qqqsnhxh".to_owned()),
-            None,
-            "truncated nprofile stays optional None"
-        );
-        assert_eq!(
-            kit.account_id_hex(format!(" {account_id}")).as_deref(),
-            Some(account_id),
-            "FFI trims whitespace before decoding"
-        );
 
         assert_eq!(
-            kit.default_profile_pseudonym(account_id.to_owned()),
-            marmot_app::default_profile_pseudonym(account_id)
+            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+            marmot_app::default_profile_pseudonym(ACCOUNT_ID)
         );
         assert_eq!(
-            kit.default_profile_pseudonym(account_id.to_owned()),
+            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
             "Loyal Crane"
         );
         let random = kit.random_profile_pseudonym();

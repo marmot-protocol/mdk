@@ -79,22 +79,49 @@ pub fn nprofile_for_account_id(
         .map_err(|_| AppError::InvalidPublicKey)
 }
 
+/// Matches the currently locked Bech32/Bech32m code-length ceiling
+/// (`bech32` 0.11.1), not a universal NIP-19 protocol limit.
+const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
+
 /// Normalize a public identity reference into a canonical hex account id.
 ///
 /// Accepts hex, `npub`, one lowercase `nostr:npub` prefix, bare `nprofile`,
 /// and one lowercase `nostr:nprofile` prefix. Existing hex/npub/NIP-21
 /// behavior stays on [`PublicKey::parse`]; nprofile is a fallback that
 /// returns only `profile.public_key` hex and discards every relay hint.
-/// This helper does not trim whitespace. Failures map to
-/// [`AppError::InvalidPublicKey`] without echoing the input.
+/// Duplicate type-0 TLV entries keep the first 32-byte key (SDK first-wins).
+///
+/// The fallback runs only after `PublicKey::parse` fails. It strips at most
+/// one exact lowercase `nostr:` prefix and then rejects encoded tokens
+/// longer than 1023 UTF-8 bytes, counting the
+/// HRP, separator, and checksum but excluding that one prefix. Decorated
+/// wrappers such as `marmot://profile/...` are not stripped here; FFI
+/// canonicalizes those before calling this helper. A valid 1023-byte token
+/// wrapped in `nostr:` therefore still decodes even though the complete
+/// wrapper is longer.
+///
+/// This helper does not trim whitespace, allocate, or normalize case. The
+/// legacy NIP-21 parser may still accept a colon-suffixed `nostr:<npub>:`
+/// form before the fallback runs. Failures map to
+/// [`AppError::InvalidPublicKey`] without echoing the input. The local
+/// token limit makes the fallback budget explicit; it does not bound
+/// `PublicKey::parse`, FFI allocation, or C NUL scanning.
 pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
     if let Ok(pubkey) = PublicKey::parse(reference) {
         return Ok(pubkey.to_hex());
     }
-    let profile_ref = reference.strip_prefix("nostr:").unwrap_or(reference);
+    let profile_ref = nprofile_fallback_token(reference)?;
     Nip19Profile::from_bech32(profile_ref)
         .map(|profile| profile.public_key.to_hex())
         .map_err(|_| AppError::InvalidPublicKey)
+}
+
+fn nprofile_fallback_token(reference: &str) -> Result<&str, AppError> {
+    let profile_ref = reference.strip_prefix("nostr:").unwrap_or(reference);
+    if profile_ref.len() > MAX_NPROFILE_REFERENCE_BYTES {
+        return Err(AppError::InvalidPublicKey);
+    }
+    Ok(profile_ref)
 }
 
 pub(crate) fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
@@ -104,48 +131,15 @@ pub(crate) fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
+        MAX_NPROFILE_REFERENCE_BYTES, account_id_hex_from_ref, nprofile_fallback_token,
+        nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
     };
     use crate::AppError;
-    use nostr::nips::nip01::Coordinate;
-    use nostr::nips::nip19::{Nip19Coordinate, Nip19Event};
-    use nostr::{EventId, Kind, SecretKey, ToBech32};
-    use nostr_sdk::prelude::PublicKey;
 
-    const ACCOUNT_ID: &str = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-    const NPUB: &str = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
-    const BOOTSTRAP_NPROFILE: &str = "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpremhxue69uhhyetvv9uju\
-         et49emks6t5v4hx76tnv5hxx6rpwsq3uamnwvaz7tmjv4kxz7fww4ejuamgd96x2mn0d9ek2tnrdpshggcu28s";
-    const NO_RELAY_NPROFILE: &str =
-        "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq7r0nz9";
-    const UNKNOWN_TLV_NPROFILE: &str =
-        "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0drrq3skycmyxne9kf";
-    const INVALID_RELAY_NPROFILE: &str =
-        "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpp9hx7apqvys82unvuca0cf";
-    const DUPLICATE_TYPE0_NPROFILE: &str = "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqqyzamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamkq4uk7z";
-    const MISSING_TYPE0_NPROFILE: &str = "nprofile1qy2hwumn8ghj7etcv9khqmr99e5kuanpd35kghsdudn";
-    const SHORT_TYPE0_NPROFILE: &str = "nprofile1qqg25n7gve04d9hr8km7rftjuwc028ngcqe";
-    const TRUNCATED_HEADER_NPROFILE: &str = "nprofile1qqqsnhxh";
-    const TRUNCATED_VALUE_NPROFILE: &str = "nprofile1qqs25n7gve04d9hrdfl42d";
-    const WRONG_HRP_NOTE: &str =
-        "note1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq4ueyyt";
-
-    fn assert_account_id(reference: &str) {
-        assert_eq!(
-            account_id_hex_from_ref(reference).expect("valid identity reference"),
-            ACCOUNT_ID
-        );
-    }
-
-    fn assert_invalid(reference: &str) {
-        assert!(
-            matches!(
-                account_id_hex_from_ref(reference),
-                Err(AppError::InvalidPublicKey)
-            ),
-            "expected InvalidPublicKey"
-        );
-    }
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/identity_reference_vectors.rs"
+    ));
 
     #[test]
     fn npub_and_nprofile_match_bootstrap_vectors() {
@@ -161,90 +155,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nprofile, BOOTSTRAP_NPROFILE);
-    }
 
-    #[test]
-    fn account_id_hex_from_ref_accepts_hex_npub_and_nprofile_spellings() {
         let no_relay = nprofile_for_account_id(ACCOUNT_ID, &[]).unwrap();
         assert_eq!(no_relay, NO_RELAY_NPROFILE);
         let other_relays =
             nprofile_for_account_id(ACCOUNT_ID, &["wss://relay.example.invalid".to_owned()])
                 .unwrap();
+        assert_eq!(other_relays, OTHER_RELAY_NPROFILE);
         assert_ne!(other_relays, BOOTSTRAP_NPROFILE);
+    }
 
-        for reference in [
-            ACCOUNT_ID,
-            &ACCOUNT_ID.to_ascii_uppercase(),
-            NPUB,
-            &format!("nostr:{NPUB}"),
-            BOOTSTRAP_NPROFILE,
-            &format!("nostr:{BOOTSTRAP_NPROFILE}"),
-            NO_RELAY_NPROFILE,
-            &format!("nostr:{NO_RELAY_NPROFILE}"),
-            &other_relays,
-            UNKNOWN_TLV_NPROFILE,
-            INVALID_RELAY_NPROFILE,
-            DUPLICATE_TYPE0_NPROFILE,
-        ] {
-            assert_account_id(reference);
+    #[test]
+    fn account_id_hex_from_ref_matches_shared_corpus() {
+        for case in cases() {
+            match case.app_account_id_hex {
+                Some(expected) => {
+                    assert_eq!(
+                        account_id_hex_from_ref(&case.reference)
+                            .unwrap_or_else(|_| panic!("case {} should decode", case.name)),
+                        expected,
+                        "case {}",
+                        case.name
+                    );
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            account_id_hex_from_ref(&case.reference),
+                            Err(AppError::InvalidPublicKey)
+                        ),
+                        "case {} should reject",
+                        case.name
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn account_id_hex_from_ref_keeps_untrimmed_whitespace_behavior() {
-        assert_invalid(&format!(" {ACCOUNT_ID}"));
-        assert_invalid(&format!("{NPUB} "));
-        assert_invalid(&format!(" {BOOTSTRAP_NPROFILE}"));
-    }
-
-    #[test]
-    fn account_id_hex_from_ref_rejects_checksum_damage_and_wrong_hrp() {
-        let mut damaged_npub = NPUB.to_owned();
-        damaged_npub.replace_range(damaged_npub.len() - 1.., "x");
-        assert_ne!(damaged_npub, NPUB);
-        assert_invalid(&damaged_npub);
-
-        let mut damaged_nprofile = NO_RELAY_NPROFILE.to_owned();
-        damaged_nprofile.replace_range(damaged_nprofile.len() - 1.., "x");
-        assert_ne!(damaged_nprofile, NO_RELAY_NPROFILE);
-        assert_invalid(&damaged_nprofile);
-
-        assert_invalid(WRONG_HRP_NOTE);
-        assert_invalid(
-            "NOSTR:nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq7r0nz9",
+    fn nprofile_fallback_token_rejects_oversized_tokens_before_sdk_decode() {
+        let accepted = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES);
+        assert_eq!(
+            nprofile_fallback_token(&accepted).expect("1023-byte token stays eligible"),
+            accepted.as_str()
         );
-        assert_invalid(&format!("nostr:nostr:{NO_RELAY_NPROFILE}"));
-    }
+        let wrapped = format!("nostr:{accepted}");
+        assert_eq!(
+            nprofile_fallback_token(&wrapped).expect("prefix is excluded from the budget"),
+            accepted.as_str()
+        );
 
-    #[test]
-    fn account_id_hex_from_ref_rejects_event_and_secret_hrps() {
-        let public_key = PublicKey::parse(ACCOUNT_ID).unwrap();
-        let event_id = EventId::from_slice(&[0x22; 32]).unwrap();
-        let note = event_id.to_bech32().unwrap();
-        let nevent = Nip19Event::new(event_id)
-            .author(public_key)
-            .to_bech32()
-            .unwrap();
-        let naddr = Nip19Coordinate::new(Coordinate::new(Kind::Metadata, public_key), [])
-            .to_bech32()
-            .unwrap();
-        let nsec = SecretKey::from_slice(&[0x11; 32])
-            .unwrap()
-            .to_bech32()
-            .unwrap();
-
-        assert_invalid(&note);
-        assert_invalid(&nevent);
-        assert_invalid(&naddr);
-        assert_invalid(&nsec);
-    }
-
-    #[test]
-    fn account_id_hex_from_ref_rejects_truncated_and_missing_type0() {
-        assert_invalid(MISSING_TYPE0_NPROFILE);
-        assert_invalid(SHORT_TYPE0_NPROFILE);
-        assert_invalid(TRUNCATED_HEADER_NPROFILE);
-        assert_invalid(TRUNCATED_VALUE_NPROFILE);
+        let oversized = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES + 1);
+        assert!(
+            matches!(
+                nprofile_fallback_token(&oversized),
+                Err(AppError::InvalidPublicKey)
+            ),
+            "1024-byte token must not reach Nip19Profile::from_bech32"
+        );
+        assert!(
+            matches!(
+                nprofile_fallback_token(&format!("nostr:{oversized}")),
+                Err(AppError::InvalidPublicKey)
+            ),
+            "prefixed oversized token must not reach Nip19Profile::from_bech32"
+        );
     }
 
     #[test]

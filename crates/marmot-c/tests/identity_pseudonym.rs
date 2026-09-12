@@ -7,13 +7,20 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use marmot_c::commands::{
-    marmot_account_id_hex, marmot_default_profile_pseudonym, marmot_random_profile_pseudonym,
+    marmot_account_id_hex, marmot_default_profile_pseudonym, marmot_normalize_member_ref,
+    marmot_random_profile_pseudonym,
 };
 use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
+use marmot_c::types::group::{MarmotMemberRef, marmot_member_ref_free};
 use marmot_c::{
     MarmotClient, MarmotStatus, marmot_client_free, marmot_client_new_with_secret_store,
     marmot_client_shutdown, marmot_string_free,
 };
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../marmot-app/tests/support/identity_reference_vectors.rs"
+));
 
 static ENTRIES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static DESTROYED: AtomicBool = AtomicBool::new(false);
@@ -136,45 +143,68 @@ fn take_string(ptr: *mut c_char) -> Option<String> {
 fn account_id_hex_and_pseudonyms_are_offline() {
     let root = tempfile::tempdir().expect("temp dir");
     let client = open_client(&root);
-    let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-    let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
-    let nprofile = "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq7r0nz9";
-    let unknown_tlv =
-        "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0drrq3skycmyxne9kf";
-    let invalid_relay =
-        "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpp9hx7apqvys82unvuca0cf";
+    for case in cases() {
+        let input = CString::new(case.reference.clone())
+            .unwrap_or_else(|_| panic!("case {} must be a C string", case.name));
 
-    for reference in [
-        account_id,
-        npub,
-        &format!("nostr:{npub}"),
-        nprofile,
-        &format!("nostr:{nprofile}"),
-        &format!(" {nprofile}"),
-        &format!("marmot://profile/{nprofile}?from=qr"),
-        unknown_tlv,
-        invalid_relay,
-    ] {
-        let input = CString::new(reference.to_owned()).unwrap();
-        let mut out: *mut c_char = 0x10 as *mut c_char;
-        let status = unsafe { marmot_account_id_hex(client, input.as_ptr(), &raw mut out) };
-        assert_eq!(status, MarmotStatus::Ok);
-        assert_eq!(take_string(out).as_deref(), Some(account_id));
-    }
+        let mut hex_out: *mut c_char = 0x10 as *mut c_char;
+        let hex_status = unsafe { marmot_account_id_hex(client, input.as_ptr(), &raw mut hex_out) };
+        match case.ffi_account_id_hex {
+            Some(expected) => {
+                assert_eq!(hex_status, MarmotStatus::Ok, "case {}", case.name);
+                assert_eq!(
+                    take_string(hex_out).as_deref(),
+                    Some(expected),
+                    "case {}",
+                    case.name
+                );
+            }
+            None => {
+                assert_eq!(hex_status, MarmotStatus::Ok, "case {}", case.name);
+                assert!(
+                    hex_out.is_null(),
+                    "case {} optional decode stays OK plus NULL",
+                    case.name
+                );
+            }
+        }
 
-    for invalid in [
-        "nprofile1qqqsnhxh",
-        "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq7r0nzx",
-        "note1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dq4ueyyt",
-        "nprofile1qy2hwumn8ghj7etcv9khqmr99e5kuanpd35kghsdudn",
-    ] {
-        let input = CString::new(invalid).unwrap();
-        let mut out: *mut c_char = 0x10 as *mut c_char;
-        assert_eq!(
-            unsafe { marmot_account_id_hex(client, input.as_ptr(), &raw mut out) },
-            MarmotStatus::Ok
-        );
-        assert!(out.is_null(), "non-decoding reference stays OK plus NULL");
+        let mut typed_out: *mut MarmotMemberRef = 0x10 as *mut MarmotMemberRef;
+        let typed_status =
+            unsafe { marmot_normalize_member_ref(client, input.as_ptr(), &raw mut typed_out) };
+        match case.ffi_account_id_hex {
+            Some(expected) => {
+                assert_eq!(typed_status, MarmotStatus::Ok, "case {}", case.name);
+                assert!(!typed_out.is_null(), "case {}", case.name);
+                let record = unsafe { &*typed_out };
+                let member_ref = unsafe { CStr::from_ptr(record.member_ref) }
+                    .to_str()
+                    .expect("utf-8");
+                let account_id = unsafe { CStr::from_ptr(record.account_id_hex) }
+                    .to_str()
+                    .expect("utf-8");
+                let npub = unsafe { CStr::from_ptr(record.npub) }
+                    .to_str()
+                    .expect("utf-8");
+                assert_eq!(member_ref, expected, "case {}", case.name);
+                assert_eq!(account_id, expected, "case {}", case.name);
+                assert_eq!(npub, NPUB, "case {}", case.name);
+                unsafe { marmot_member_ref_free(typed_out) };
+            }
+            None => {
+                assert_eq!(
+                    typed_status,
+                    MarmotStatus::InvalidIdentity,
+                    "case {}",
+                    case.name
+                );
+                assert!(
+                    typed_out.is_null(),
+                    "case {} typed normalize clears the output",
+                    case.name
+                );
+            }
+        }
     }
 
     let mut out: *mut c_char = 0x10 as *mut c_char;
@@ -190,7 +220,14 @@ fn account_id_hex_and_pseudonyms_are_offline() {
     );
     assert!(out.is_null());
 
-    let account = CString::new(account_id).unwrap();
+    let mut typed_null: *mut MarmotMemberRef = 0x10 as *mut MarmotMemberRef;
+    assert_eq!(
+        unsafe { marmot_normalize_member_ref(client, ptr::null(), &raw mut typed_null) },
+        MarmotStatus::NullPointer
+    );
+    assert!(typed_null.is_null());
+
+    let account = CString::new(ACCOUNT_ID).unwrap();
     let mut name_out: *mut c_char = 0x10 as *mut c_char;
     assert_eq!(
         unsafe { marmot_default_profile_pseudonym(client, account.as_ptr(), &raw mut name_out) },
