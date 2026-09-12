@@ -684,6 +684,33 @@ mod tests {
     }
 
     #[test]
+    fn timeline_message_record_ffi_reports_an_undecodable_media_container() {
+        // Storage hands a media column that no longer parses through as a JSON
+        // string so the page query survives; the projection must show one
+        // rejected attachment rather than a text-only row.
+        let corrupt = serde_json::Value::String("{not-json".to_owned());
+        let record: TimelineMessageRecordFfi =
+            record_with_media(Some(7), Some(corrupt), None).into();
+
+        assert_eq!(record.plaintext, "see attached");
+        assert_eq!(record.media.len(), 1);
+        match &record.media[0] {
+            MediaAttachmentOutcomeFfi::Rejected {
+                attachment_index,
+                rejection,
+            } => {
+                assert_eq!(*attachment_index, 0);
+                assert_eq!(
+                    rejection.kind,
+                    super::super::MediaAttachmentRejectionKindFfi::InvalidStructure
+                );
+            }
+            other => panic!("corrupt container must be a Rejected outcome, got {other:?}"),
+        }
+        assert_eq!(record.media_json.as_deref(), Some("\"{not-json\""));
+    }
+
+    #[test]
     fn timeline_message_record_ffi_with_no_media_yields_empty() {
         let record: TimelineMessageRecordFfi = record_with_media(Some(7), None, None).into();
         assert!(record.media.is_empty());

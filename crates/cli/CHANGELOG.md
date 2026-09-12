@@ -33,6 +33,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   nothing was dialed) from `MediaDownloadFailed` (transport, timeout, hash mismatch, or
   decryption failure after a locator was selected). Both previously surfaced as
   `InvalidMediaReference` or the untyped `Runtime` error.
+- Download classification does not depend on locator order: a candidate the destination
+  policy refuses before dialing (a private-IP literal, or a hostname whose DNS answer is a
+  non-public address) is unfetchable, and once any permitted server was contacted the
+  attachment reports `MediaDownloadFailed` even if later locators were unusable. Blossom
+  dial-safety refusals now carry the `UnsafeMediaFetch` class internally, so an upload or
+  group-image fetch to an unsafe endpoint surfaces as `InvalidMediaReference` rather than the
+  untyped `Runtime` error.
+- A stored timeline media container that no longer decodes (on-disk corruption) is preserved
+  as one `InvalidStructure` rejection on the row and its reply previews instead of failing the
+  page or reply query; a present non-object `media` value projects the same way.
 - The shared `imeta` parser judges the version field before other fields, so a tag with an
   absent or unknown `v`, including the legacy MIP-era `url`/`x`/`n` shape Amethyst once
   emitted, is always classified `UnsupportedFormat` regardless of field order. Strictness,

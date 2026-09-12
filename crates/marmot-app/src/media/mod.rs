@@ -91,7 +91,12 @@ impl Default for MediaDownloadBenchmarkTransport {
 pub(crate) fn classify_chat_list_attachments(
     media_json: Option<&str>,
 ) -> (Option<ChatListAttachmentKind>, u32) {
-    let media = media_json.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    // A stored container that no longer parses is corruption, not "no media":
+    // keep it as a JSON string so the shared projection reports one
+    // undecodable attachment instead of a text-only preview.
+    let media = media_json.map(|raw| {
+        serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+    });
     let mut kinds = Vec::new();
     for outcome in media_attachment_outcomes_from_media_json(media.as_ref(), None, false) {
         let MediaAttachmentOutcome::Accepted { reference, .. } = outcome else {
@@ -877,7 +882,8 @@ fn upload_error_summary(err: &AppError) -> String {
     match err {
         AppError::BlobStore(message)
         | AppError::InvalidEncryptedMedia(message)
-        | AppError::InvalidAppMessagePayload(message) => message.clone(),
+        | AppError::InvalidAppMessagePayload(message)
+        | AppError::UnsafeMediaFetch(message) => message.clone(),
         AppError::MediaUploadTimedOut => "request timed out".to_owned(),
         // `upload_blossom_blob` should currently surface upload failures through
         // the privacy-scrubbed variants above. Keep this fallback as a defensive
@@ -1090,9 +1096,12 @@ async fn fetch_encrypted_media_blob_with_observer(
                 // A URL that commits to a different blob cannot serve this
                 // reference: the locator is unusable, so this candidate is
                 // unfetchable rather than a failed download.
-                last_error = Some(AppError::MediaUnfetchable(
-                    "Blossom locator hash does not match media reference".into(),
-                ));
+                record_candidate_failure(
+                    &mut last_error,
+                    AppError::MediaUnfetchable(
+                        "Blossom locator hash does not match media reference".into(),
+                    ),
+                );
                 record_locator_failover_if_needed(
                     telemetry,
                     candidate_started,
@@ -1102,9 +1111,12 @@ async fn fetch_encrypted_media_blob_with_observer(
                 continue;
             }
             None => {
-                last_error = Some(AppError::MediaUnfetchable(
-                    "Blossom locator URL did not include encrypted blob hash".into(),
-                ));
+                record_candidate_failure(
+                    &mut last_error,
+                    AppError::MediaUnfetchable(
+                        "Blossom locator URL did not include encrypted blob hash".into(),
+                    ),
+                );
                 record_locator_failover_if_needed(
                     telemetry,
                     candidate_started,
@@ -1142,27 +1154,53 @@ async fn fetch_encrypted_media_blob_with_observer(
                 if matches {
                     return Ok(bytes);
                 }
-                last_error = Some(AppError::MediaDownloadFailed(
-                    "encrypted blob hash does not match media reference".into(),
-                ));
+                record_candidate_failure(
+                    &mut last_error,
+                    AppError::MediaDownloadFailed(
+                        "encrypted blob hash does not match media reference".into(),
+                    ),
+                );
             }
-            Err(err) => last_error = Some(media_download_failure(err)),
+            Err(err) => record_candidate_failure(&mut last_error, media_download_failure(err)),
         }
         record_locator_failover_if_needed(telemetry, candidate_started, index, candidate_count);
     }
     Err(last_error.unwrap_or_else(|| AppError::MediaDownloadFailed("download failed".into())))
 }
 
-/// Classify a failure raised after a fetchable locator was selected. Transport
-/// and integrity errors from the shared Blossom client arrive as `BlobStore` /
-/// `InvalidEncryptedMedia`; on the encrypted-media download path they mean the
-/// attachment is unavailable, never that the reference is invalid. Errors that
-/// already carry a media class pass through unchanged.
+/// Record one candidate's failure as the attachment's provisional outcome.
+///
+/// The outcome class must not depend on locator order: once a permitted server
+/// was contacted, the attachment is a (retryable) download failure, and a later
+/// unusable or policy-refused candidate must not downgrade it to "unfetchable",
+/// which the binding contract defines as "nothing was dialed".
+fn record_candidate_failure(last_error: &mut Option<AppError>, failure: AppError) {
+    if matches!(
+        (&*last_error, &failure),
+        (
+            Some(AppError::MediaDownloadFailed(_)),
+            AppError::MediaUnfetchable(_)
+        )
+    ) {
+        return;
+    }
+    *last_error = Some(failure);
+}
+
+/// Classify a failure raised for a candidate that passed the pre-dial filter.
+/// A destination-policy refusal from the shared Blossom client (the hostname
+/// resolved to a non-public address, or the URL failed the host-safety check)
+/// arrives as `UnsafeMediaFetch` and means nothing was sent: that candidate is
+/// unfetchable. Transport and integrity errors arrive as `BlobStore` /
+/// `InvalidEncryptedMedia` and mean the attachment is unavailable, never that
+/// the reference is invalid. Errors that already carry a media class pass
+/// through unchanged.
 fn media_download_failure(err: AppError) -> AppError {
     match err {
-        AppError::BlobStore(detail)
-        | AppError::InvalidEncryptedMedia(detail)
-        | AppError::UnsafeMediaFetch(detail) => AppError::MediaDownloadFailed(detail),
+        AppError::UnsafeMediaFetch(detail) => AppError::MediaUnfetchable(detail),
+        AppError::BlobStore(detail) | AppError::InvalidEncryptedMedia(detail) => {
+            AppError::MediaDownloadFailed(detail)
+        }
         other => other,
     }
 }
@@ -1391,10 +1429,13 @@ pub fn media_attachment_outcomes_from_tags(
 /// [`media_attachment_outcomes_from_tags`] yields for the raw message, so a
 /// timeline row and a `list_media` record for one message agree on every index.
 ///
-/// `None`, or metadata without an `imeta` list, means the message has no
-/// attachments. An entry that is not an array of strings is reported as an
-/// [`InvalidStructure`] rejection at its position; an `imeta` value that is not
-/// a list cannot be indexed and is reported once at index 0.
+/// `None`, or an object without an `imeta` list, means the message has no
+/// attachments. Anything else that is present but undecodable is preserved as
+/// a diagnostic rather than dropped: a container that is not a JSON object
+/// (storage hands a corrupt column through as a JSON string), or an `imeta`
+/// value that is not a list, cannot be indexed and is reported once as an
+/// [`InvalidStructure`] rejection at index 0; an entry that is not an array of
+/// strings is reported at its own position.
 ///
 /// [`InvalidStructure`]: MediaAttachmentRejectionKind::InvalidStructure
 pub fn media_attachment_outcomes_from_media_json(
@@ -1402,16 +1443,25 @@ pub fn media_attachment_outcomes_from_media_json(
     source_epoch: Option<u64>,
     allow_loopback_http: bool,
 ) -> Vec<MediaAttachmentOutcome> {
-    let Some(imeta) = media.and_then(|media| media.get("imeta")) else {
-        return Vec::new();
-    };
-    let Some(entries) = imeta.as_array() else {
-        return vec![MediaAttachmentOutcome::from_result(
+    let undecodable = || {
+        vec![MediaAttachmentOutcome::from_result(
             0,
             Err(MediaAttachmentRejection::structure(
                 "media metadata could not be decoded",
             )),
-        )];
+        )]
+    };
+    let Some(media) = media else {
+        return Vec::new();
+    };
+    let Some(container) = media.as_object() else {
+        return undecodable();
+    };
+    let Some(imeta) = container.get("imeta") else {
+        return Vec::new();
+    };
+    let Some(entries) = imeta.as_array() else {
+        return undecodable();
     };
     entries
         .iter()

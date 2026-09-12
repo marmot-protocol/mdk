@@ -116,7 +116,12 @@ fn chat_list_attachment_projection_counts_rejected_siblings_as_generic_files() {
         classify_chat_list_attachments(Some(&legacy_only)),
         (Some(ChatListAttachmentKind::File), 1)
     );
-    assert_eq!(classify_chat_list_attachments(Some("{not-json")), (None, 0));
+    // A media column that no longer parses is corruption of a message that
+    // did carry an attachment; it previews as one generic file, not as text.
+    assert_eq!(
+        classify_chat_list_attachments(Some("{not-json")),
+        (Some(ChatListAttachmentKind::File), 1)
+    );
     assert_eq!(classify_chat_list_attachments(None), (None, 0));
 }
 
@@ -2453,19 +2458,36 @@ fn media_attachment_outcomes_from_media_json_report_undecodable_entries() {
             if rejection.kind == MediaAttachmentRejectionKind::UnsupportedFormat
     ));
 
-    // No metadata, or metadata without an imeta list, means no attachments.
+    // No metadata, an object without an imeta list, or an empty imeta list
+    // means no attachments.
     assert!(media_attachment_outcomes_from_media_json(None, Some(5), false).is_empty());
-    let empty = serde_json::json!({});
-    assert!(media_attachment_outcomes_from_media_json(Some(&empty), Some(5), false).is_empty());
-    // An imeta value that is not a list cannot be indexed; report it once so
-    // the host still learns the row carried undisplayable media.
-    let corrupt = serde_json::json!({ "imeta": "nope" });
-    let outcomes = media_attachment_outcomes_from_media_json(Some(&corrupt), Some(5), false);
-    assert!(matches!(
-        outcomes.as_slice(),
-        [MediaAttachmentOutcome::Rejected { attachment_index: 0, rejection }]
-            if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
-    ));
+    for empty in [serde_json::json!({}), serde_json::json!({ "imeta": [] })] {
+        assert!(
+            media_attachment_outcomes_from_media_json(Some(&empty), Some(5), false).is_empty(),
+            "{empty} must project as no attachments"
+        );
+    }
+    // A present container that cannot be indexed (an imeta value that is not a
+    // list, or a container that is not an object, which is how storage hands
+    // through a corrupt column) is reported once so the host still learns the
+    // row carried undisplayable media.
+    for corrupt in [
+        serde_json::json!({ "imeta": "nope" }),
+        serde_json::json!([42]),
+        serde_json::json!("broken"),
+        serde_json::Value::Null,
+        serde_json::Value::String("{not-json".to_owned()),
+    ] {
+        let outcomes = media_attachment_outcomes_from_media_json(Some(&corrupt), Some(5), false);
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [MediaAttachmentOutcome::Rejected { attachment_index: 0, rejection }]
+                    if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+            ),
+            "{corrupt} must project as one undecodable attachment, got {outcomes:?}"
+        );
+    }
 }
 
 #[test]
@@ -2568,4 +2590,141 @@ async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
         matches!(&err, AppError::MediaDownloadFailed(message) if message.contains("decryption")),
         "expected MediaDownloadFailed, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn an_attempted_download_failure_outranks_an_unusable_locator_in_either_order() {
+    // A permitted server was contacted and answered 503; a sibling locator
+    // commits to a different blob and is never dialed. The attachment's class
+    // must be the retryable download failure whichever locator comes first,
+    // because `MediaUnfetchable` promises hosts that nothing was dialed.
+    let body = b"never served";
+    let hash = hex::encode(Sha256::digest(body));
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    for unusable_first in [false, true] {
+        let unavailable = spawn_http_response(http_status_response(503, "Service Unavailable"));
+        let dialed = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{unavailable}/{hash}.bin"),
+        };
+        let unusable = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{}.bin", "77".repeat(32)),
+        };
+        let mut reference = blossom_reference();
+        reference.ciphertext_sha256 = hash.clone();
+        reference.locators = if unusable_first {
+            vec![unusable, dialed]
+        } else {
+            vec![dialed, unusable]
+        };
+
+        let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect_err("a 503 with no other usable locator must fail the download");
+
+        assert!(
+            matches!(err, AppError::MediaDownloadFailed(_)),
+            "unusable_first={unusable_first}: expected MediaDownloadFailed, got {err:?}"
+        );
+    }
+}
+
+fn private_address_resolver() -> DnsResolver {
+    Arc::new(move |_domain, port| {
+        Box::pin(async move { Ok(vec![format!("10.0.0.5:{port}").parse().unwrap()]) })
+    })
+}
+
+#[tokio::test]
+async fn dns_destination_policy_rejection_is_unfetchable_not_a_download_failure() {
+    // The locator's hostname passes the literal-host prefilter, but DNS resolves
+    // it to a private address, so the dial policy refuses it before any request
+    // is sent. That is the same verdict as a private-IP literal: unfetchable.
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        private_address_resolver(),
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a hostname resolving to a private address must not be fetched");
+
+    assert!(
+        matches!(&err, AppError::MediaUnfetchable(message) if message.contains("public unicast")),
+        "expected MediaUnfetchable, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dns_lookup_failure_is_a_download_failure() {
+    let resolver: DnsResolver = Arc::new(move |_domain, _port| {
+        Box::pin(async move { Err(AppError::BlobStore("media host DNS lookup failed".into())) })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("an unresolvable host cannot serve the blob");
+
+    assert!(
+        matches!(err, AppError::MediaDownloadFailed(_)),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure() {
+    // One locator is refused by destination policy (DNS -> private address),
+    // the other is a permitted loopback server answering 503. Because a server
+    // was contacted, the outcome is a download failure in either order.
+    let body = b"never served";
+    let hash = hex::encode(Sha256::digest(body));
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        true,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        private_address_resolver(),
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    for refused_first in [false, true] {
+        let unavailable = spawn_http_response(http_status_response(503, "Service Unavailable"));
+        let dialed = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{unavailable}/{hash}.bin"),
+        };
+        let refused = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{hash}.bin"),
+        };
+        let mut reference = blossom_reference();
+        reference.ciphertext_sha256 = hash.clone();
+        reference.locators = if refused_first {
+            vec![refused, dialed]
+        } else {
+            vec![dialed, refused]
+        };
+
+        let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect_err("neither candidate can serve the blob");
+
+        assert!(
+            matches!(err, AppError::MediaDownloadFailed(_)),
+            "refused_first={refused_first}: expected MediaDownloadFailed, got {err:?}"
+        );
+    }
 }
