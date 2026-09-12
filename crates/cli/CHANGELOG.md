@@ -67,7 +67,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   `message_retention`, `disbanding`, `disbanded`, `disband_request`, `unrecoverable`, `self_membership`
   (`member`/`left`/`removed`), and `leave_requested_at_ms` keys. The `mls` object gains additive `protocol_profile`,
   `lifecycle_state`, `unrecoverable`, `disbanding_enabled`, `disbanding`, `disbanding_blockers`, and
-  `disband_request` keys. Existing keys are unchanged.
+  `disband_request` keys. Other existing keys are unchanged.
+- **Breaking (JSON):** the `image` object in group JSON (`groups show`/`list`, `group(s) create`, `chats` rows, and
+  the daemon `group_state` feed) is now the redacted summary `{component_id, component, present, image_hash_hex,
+  media_type}`. It no longer carries `image_key_hex`, `image_nonce_hex`, `image_upload_key_hex`, or the key-bearing
+  `data_hex`, because `wn` can now populate those capability keys through `groups set-image` and
+  `groups create --image` (mdk#1253). No `wn`, `wn tui`, or `wnd` consumer read them; use `groups download-image`
+  for the decrypted image.
 - The README documents canonical MLS group ids versus 32-byte Nostr routing ids, and relay publication versus
   durable completion, for the group and message surfaces.
 

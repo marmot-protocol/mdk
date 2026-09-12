@@ -1236,19 +1236,30 @@ async fn created_group_output(
     let members = runtime.group_members(&account.label, group_id).await?;
     Ok(CommandOutput {
         plain: format!("created group {group_id_hex}"),
-        json: json!({
-            "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex)?,
-            "group_id": group.group_id_hex,
-            "name": group.profile.name.clone(),
-            "profile": group.profile,
-            "image": group.image,
-            "admin_policy": group.admin_policy,
-            "agent_text_stream": group.agent_text_stream,
-            "message_retention": group.message_retention,
-            "members": group_members_json(members)?,
-        }),
+        json: created_group_json(&account.account_id_hex, group, members)?,
     })
+}
+
+/// The `groups create` / `group create` response. A founding `--image` is the
+/// path that populates the image component's capability keys, so the image is
+/// reported through the same redacted summary as the image commands (mdk#1253).
+pub(crate) fn created_group_json(
+    account_id_hex: &str,
+    group: AppGroupRecord,
+    members: Vec<AppGroupMemberRecord>,
+) -> Result<Value, WnError> {
+    Ok(json!({
+        "account_id": account_id_hex,
+        "npub": npub_for_account_id(account_id_hex)?,
+        "group_id": group.group_id_hex,
+        "name": group.profile.name.clone(),
+        "profile": group.profile,
+        "image": group_image_summary_json(&group.image),
+        "admin_policy": group.admin_policy,
+        "agent_text_stream": group.agent_text_stream,
+        "message_retention": group.message_retention,
+        "members": group_members_json(members)?,
+    }))
 }
 
 /// Resolve `--admin` refs to hex ids and require each one to be an invitee.

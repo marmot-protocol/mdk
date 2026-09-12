@@ -925,7 +925,10 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "group_id": group.group_id_hex,
         "endpoint": group.endpoint,
         "profile": group.profile,
-        "image": group.image,
+        // Presence, hash, and type only. The full component carries the avatar
+        // decryption key, the Blossom upload secret, and key-bearing `data_hex`;
+        // none of the CLI, TUI, or daemon consumers need them (mdk#1253).
+        "image": crate::commands::groups::group_image_summary_json(&group.image),
         "avatar_url": group.avatar_url,
         "admin_policy": group.admin_policy,
         "nostr_routing": group.nostr_routing,
@@ -3042,6 +3045,93 @@ mod tests {
             }
         }))
         .expect("sample group")
+    }
+
+    const SENTINEL_IMAGE_KEY: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const SENTINEL_UPLOAD_KEY: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const SENTINEL_IMAGE_NONCE: &str = "333333333333333333333333";
+    const SENTINEL_IMAGE_DATA: &str = "4444deadbeef4444";
+
+    /// A group whose encrypted image component carries sentinel capability keys.
+    fn sample_group_with_image_secrets() -> marmot_app::AppGroupRecord {
+        let mut group = sample_group("pictures");
+        group.image = serde_json::from_value(json!({
+            "component_id": 3,
+            "component": "marmot.group.blossom-image.v1",
+            "present": true,
+            "image_hash_hex": "55".repeat(32),
+            "image_key_hex": SENTINEL_IMAGE_KEY,
+            "image_nonce_hex": SENTINEL_IMAGE_NONCE,
+            "image_upload_key_hex": SENTINEL_UPLOAD_KEY,
+            "media_type": "image/png",
+            "data_hex": SENTINEL_IMAGE_DATA,
+        }))
+        .expect("image component");
+        group
+    }
+
+    fn assert_no_image_secrets(label: &str, value: &serde_json::Value) {
+        let rendered = value.to_string();
+        for secret in [
+            SENTINEL_IMAGE_KEY,
+            SENTINEL_UPLOAD_KEY,
+            SENTINEL_IMAGE_NONCE,
+            SENTINEL_IMAGE_DATA,
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "{label} must not carry image capability material: {rendered}"
+            );
+        }
+        let image = &value["image"];
+        for key in [
+            "image_key_hex",
+            "image_upload_key_hex",
+            "image_nonce_hex",
+            "data_hex",
+        ] {
+            assert!(image.get(key).is_none(), "{label} image must omit {key}");
+        }
+        assert_eq!(image["present"], true, "{label}");
+        assert_eq!(image["image_hash_hex"], "55".repeat(32), "{label}");
+        assert_eq!(image["media_type"], "image/png", "{label}");
+        assert_eq!(
+            image["component"], "marmot.group.blossom-image.v1",
+            "{label}"
+        );
+    }
+
+    /// mdk#1253: every `wn` surface that renders a group (`groups show`/`list`,
+    /// `chats` rows, the daemon group-state feed, and the create response)
+    /// reports image presence, hash, and type but never the decryption key,
+    /// upload secret, or key-bearing component bytes.
+    #[test]
+    fn group_json_surfaces_redact_image_capability_keys() {
+        let group = sample_group_with_image_secrets();
+        assert_no_image_secrets("group_json", &crate::group_json(group.clone()));
+        assert_no_image_secrets("chat_json", &crate::chat_json(group.clone(), None));
+        assert_no_image_secrets(
+            "group_state_stream_response",
+            &serde_json::to_value(crate::daemon::group_state_stream_response(
+                group.clone(),
+                "InitialGroupState",
+                None,
+            ))
+            .expect("stream response serializes")["result"]["group"],
+        );
+        let created =
+            crate::commands::groups::created_group_json(&"66".repeat(32), group, Vec::new())
+                .expect("create json");
+        assert_no_image_secrets("created_group_json", &created);
+        assert_eq!(created["name"], "pictures");
+        assert_no_image_secrets(
+            "group_image_summary_json",
+            &json!({ "image": crate::commands::groups::group_image_summary_json(
+                &sample_group_with_image_secrets().image
+            ) }),
+        );
     }
 
     #[test]

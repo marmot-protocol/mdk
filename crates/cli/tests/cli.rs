@@ -8096,6 +8096,9 @@ fn groups_disband_lifecycle_exposes_pending_and_terminal_state() {
 
     // The durable request gates ordinary outbound work before the terminal
     // commit lands, and the status surface distinguishes pending from terminal.
+    // Every `wn` invocation is a fresh process and runtime, so this read is
+    // also the restart case: the pending request survived the process that
+    // recorded it.
     let pending = run_json(
         home.path(),
         &["--account", &alice, "groups", "disband-status", group_id],
@@ -8454,11 +8457,34 @@ fn groups_image_commands_clear_validate_and_redact_capability_keys() {
     );
     assert_eq!(cleared["group_id"], group_id);
     assert_eq!(cleared["image"]["present"], false);
-    for secret in ["image_key_hex", "image_upload_key_hex", "data_hex"] {
-        assert!(
-            cleared["image"].get(secret).is_none(),
-            "clear-image output must not carry {secret}"
-        );
+    // Every surface that renders the image component uses the redacted
+    // summary: the image commands, the create response, and the shared group
+    // JSON behind `groups show` / `groups list` / `chats`. Uploading a real
+    // image needs the public Blossom server, so the sentinel-key coverage that
+    // proves populated keys stay out of the output lives in the crate unit
+    // test `group_json_surfaces_redact_image_capability_keys`.
+    let shown = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "show", group_id],
+    );
+    for value in [
+        &cleared["image"],
+        &created["image"],
+        &shown["group"]["image"],
+    ] {
+        for secret in [
+            "image_key_hex",
+            "image_upload_key_hex",
+            "image_nonce_hex",
+            "data_hex",
+        ] {
+            assert!(
+                value.get(secret).is_none(),
+                "image output must not carry {secret}: {value}"
+            );
+        }
+        assert!(value.get("present").is_some());
+        assert!(value.get("image_hash_hex").is_some());
     }
 }
 

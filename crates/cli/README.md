@@ -333,9 +333,12 @@ recreate the chat row. It is refused with `group_disbanding` while a disband is 
 Encrypted group images: `groups set-image` encrypts and uploads a PNG/JPEG/GIF/WebP file and commits the
 `marmot.group.blossom-image.v1` component, `groups clear-image` commits the absent state, and `groups download-image`
 fetches and decrypts the current image (`group_image_absent` when there is none). `groups create --image <path>` adds
-a founding image to the create commit. These commands report a redacted `image` summary (`present`, `image_hash_hex`,
-`media_type`) and never print the image key, upload secret, or key-bearing `data_hex` (see mdk#1253 for the wider
-`group_json` trust boundary). `set-avatar-url` changes the separate URL-avatar component.
+a founding image to the create commit. Every `wn` surface that renders the image component (these commands, the
+create response, `groups show` / `groups list`, `chats` rows, and the daemon `group_state` feed) reports the redacted
+summary (`component_id`, `component`, `present`, `image_hash_hex`, `media_type`) and never prints the image key,
+upload secret, nonce, or key-bearing `data_hex` (mdk#1253). There is no privileged CLI path for those keys;
+`groups download-image` is the supported way to obtain the decrypted image. `set-avatar-url` changes the separate
+URL-avatar component.
 
 `groups pending-welcomes` lists Welcomes that a confirmed create/invite could not deliver (`group_id`, `message_id`,
 `recipient`, `recorded_at`); create and invite still drain their fanout before returning, so this is normally empty.

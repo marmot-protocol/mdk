@@ -473,17 +473,8 @@ fn ensure_local_message_author(
     group_id_hex: &str,
     message_id: &str,
 ) -> Result<(), WnError> {
-    let messages = app.messages_with_query(
-        &account.label,
-        AppMessageQuery {
-            group_id_hex: Some(group_id_hex.to_owned()),
-            kinds: None,
-            limit: None,
-        },
-    )?;
-    let target = messages
-        .iter()
-        .find(|message| message.message_id_hex == message_id)
+    let target = app
+        .message_by_id(&account.label, group_id_hex, message_id)?
         .ok_or_else(|| WnError::UnknownMessage(message_id.to_owned()))?;
     if target.sender != account.account_id_hex {
         return Err(WnError::NotMessageAuthor {
