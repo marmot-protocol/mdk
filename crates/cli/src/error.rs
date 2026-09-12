@@ -137,6 +137,22 @@ pub(crate) enum WnError {
     InvalidMediaAttachment(String),
     #[error("invalid mute duration: {0}")]
     InvalidMuteDuration(String),
+    #[error("invalid retention duration: {0}")]
+    InvalidRetentionDuration(String),
+    #[error("message {0} is not in the local projection for this group")]
+    UnknownMessage(String),
+    #[error("message {message_id} was not authored by the selected account")]
+    NotMessageAuthor { message_id: String },
+    #[error("group image file is empty; use clear-image to remove the current image")]
+    EmptyGroupImage,
+    #[error("group {0} has no encrypted group image")]
+    GroupImageAbsent(String),
+    #[error("rejoin token must be 32 bytes of hex copied from recovery-status")]
+    InvalidRejoinToken,
+    #[error("welcome id must be non-empty hex")]
+    InvalidWelcomeId,
+    #[error("initial admin {0} is not one of the invited members")]
+    InitialAdminNotInvited(String),
     #[error("exporting private keys is disabled by White Noise CLI policy")]
     PrivateKeyExportDisabled,
     #[error("{command} requires {flag}: {reason}")]
@@ -411,6 +427,55 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "message": err.to_string(),
             "reason": reason,
         }),
+        WnError::InvalidRetentionDuration(duration) => json!({
+            "code": "invalid_retention_duration",
+            "message": err.to_string(),
+            "duration": duration,
+            "repair": {
+                "format": "seconds, or a number with s/m/h/d/w suffix; 0 or off disables",
+            },
+        }),
+        WnError::UnknownMessage(message_id) => json!({
+            "code": "unknown_message",
+            "message": err.to_string(),
+            "target_message_id": message_id,
+            "repair": {
+                "action": "sync the group and pass a message id from `messages list`",
+            },
+        }),
+        WnError::NotMessageAuthor { message_id } => json!({
+            "code": "not_message_author",
+            "message": err.to_string(),
+            "target_message_id": message_id,
+        }),
+        WnError::EmptyGroupImage => json!({
+            "code": "empty_group_image",
+            "message": err.to_string(),
+            "repair": {
+                "clear": "wn groups clear-image <group-hex>",
+            },
+        }),
+        WnError::GroupImageAbsent(group_id) => json!({
+            "code": "group_image_absent",
+            "message": err.to_string(),
+            "group_id": group_id,
+        }),
+        WnError::InvalidRejoinToken => json!({
+            "code": "invalid_rejoin_token",
+            "message": err.to_string(),
+            "repair": {
+                "source": "wn groups recovery-status <group-hex>",
+            },
+        }),
+        WnError::InvalidWelcomeId => json!({
+            "code": "invalid_welcome_id",
+            "message": err.to_string(),
+        }),
+        WnError::InitialAdminNotInvited(member) => json!({
+            "code": "initial_admin_not_invited",
+            "message": err.to_string(),
+            "member": member,
+        }),
         WnError::InvalidMuteDuration(duration) => json!({
             "code": "invalid_mute_duration",
             "message": err.to_string(),
@@ -602,6 +667,31 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "group_id": group_id,
         }),
+        // A durable disband request or an authenticated inbound disband
+        // candidate gates ordinary outbound work. Scripts must be able to
+        // tell "this group is ending" from a transient fault.
+        AppError::GroupDisbanding(group_id) => json!({
+            "code": "group_disbanding",
+            "message": err.to_string(),
+            "group_id": group_id,
+            "repair": {
+                "status": "wn groups disband-status <group-hex>",
+            },
+        }),
+        AppError::GroupInviteNotPending => json!({
+            "code": "group_invite_not_pending",
+            "message": err.to_string(),
+        }),
+        AppError::InvalidEncryptedMedia(reason) => json!({
+            "code": "invalid_encrypted_media",
+            "message": err.to_string(),
+            "reason": reason,
+        }),
+        AppError::InvalidAppMessagePayload(reason) => json!({
+            "code": "invalid_app_message_payload",
+            "message": err.to_string(),
+            "reason": reason,
+        }),
         AppError::Transport(err) => json!({
             "code": "relay_transport",
             "message": err.to_string(),
@@ -743,6 +833,28 @@ fn engine_error_json(err: &EngineError) -> Value {
         EngineError::InvalidTransition(transition) => json!({
             "code": "invalid_transition",
             "message": transition.to_string(),
+        }),
+        EngineError::LeaveAlreadyRequested { group_id } => json!({
+            "code": "leave_already_requested",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+        }),
+        EngineError::DisbandingNotEnabled { group_id } => json!({
+            "code": "disbanding_not_enabled",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+            "repair": {
+                "enable": "wn groups enable-disbanding <group-hex>",
+            },
+        }),
+        EngineError::DisbandingUnsupportedMembers { group_id, members } => json!({
+            "code": "disbanding_unsupported_members",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+            "members": members
+                .iter()
+                .map(|member| hex::encode(member.as_slice()))
+                .collect::<Vec<_>>(),
         }),
         other => json!({
             "code": "engine_error",

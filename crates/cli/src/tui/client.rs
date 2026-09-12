@@ -1760,7 +1760,7 @@ impl TuiApp {
     ) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
-        let mut args = vec!["group".to_owned(), "update".to_owned(), group_id.clone()];
+        let mut args = vec!["groups".to_owned(), "update".to_owned(), group_id.clone()];
         if let Some(name) = name {
             args.push("--name".to_owned());
             args.push(name);

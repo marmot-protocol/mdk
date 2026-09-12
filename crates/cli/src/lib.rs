@@ -925,17 +925,42 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "group_id": group.group_id_hex,
         "endpoint": group.endpoint,
         "profile": group.profile,
-        "image": group.image,
+        // Presence, hash, and type only. The full component carries the avatar
+        // decryption key, the Blossom upload secret, and key-bearing `data_hex`;
+        // none of the CLI, TUI, or daemon consumers need them (mdk#1253).
+        "image": crate::commands::groups::group_image_summary_json(&group.image),
         "avatar_url": group.avatar_url,
         "admin_policy": group.admin_policy,
         "nostr_routing": group.nostr_routing,
         "agent_text_stream": group.agent_text_stream,
         "encrypted_media": group.encrypted_media,
+        "message_retention": group.message_retention,
         "archived": group.archived,
         "pending_confirmation": group.pending_confirmation,
         "welcomer_account_id": group.welcomer_account_id_hex,
         "via_welcome_message_id": group.via_welcome_message_id_hex,
+        // Lifecycle projection (additive, mdk#1788): whether ordinary outbound
+        // work is gated by a disband in flight, the durable local request
+        // outcome, the terminal flag, and the local membership classification.
+        "disbanding": group.disbanding,
+        "disbanded": group.disbanded,
+        "disband_request": group.disband_request,
+        "unrecoverable": group.unrecoverable,
+        "self_membership": self_membership_json(&group),
+        "leave_requested_at_ms": group.leave_requested_at_ms,
     })
+}
+
+/// `member`, `left`, or `removed`: the local membership classification as a
+/// stable lowercase token, matching the other snake_case lifecycle strings in
+/// CLI JSON rather than the storage enum's Rust variant spelling.
+pub(crate) fn self_membership_json(group: &AppGroupRecord) -> Value {
+    json!(
+        json!(group.self_membership)
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "member".to_owned())
+    )
 }
 
 /// Render a `chats` row: the group record (`group_json`) enriched with the
@@ -2213,6 +2238,215 @@ mod tests {
     }
 
     #[test]
+    fn message_edit_parses_hyphen_leading_replacement_text() {
+        let cli = Cli::try_parse_from([
+            "wn", "messages", "edit", "GROUP", "TARGET", "fixed", "--typo",
+        ])
+        .expect("edit args parse");
+        match cli.command {
+            Command::Messages {
+                command:
+                    crate::MessageCommand::Edit {
+                        group_id,
+                        message_id,
+                        text,
+                    },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(message_id, "TARGET");
+                assert_eq!(text, vec!["fixed".to_owned(), "--typo".to_owned()]);
+            }
+            other => panic!("expected a messages edit command, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wn", "messages", "edit", "GROUP", "TARGET"]).is_err(),
+            "edit requires replacement text"
+        );
+    }
+
+    #[test]
+    fn message_retry_event_id_is_optional_context() {
+        let cli = Cli::try_parse_from(["wn", "messages", "retry", "GROUP"]).expect("retry parses");
+        match cli.command {
+            Command::Messages {
+                command: crate::MessageCommand::Retry { group_id, event_id },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(event_id, None);
+            }
+            other => panic!("expected a messages retry command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["wn", "message", "retry", "GROUP", "EVENT"])
+            .expect("legacy retry with event id parses");
+        match cli.command {
+            Command::Message {
+                command: crate::MessageCommand::Retry { event_id, .. },
+            } => assert_eq!(event_id.as_deref(), Some("EVENT")),
+            other => panic!("expected a message retry command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn groups_retention_disband_and_admin_flags_parse() {
+        let cli = Cli::try_parse_from(["wn", "groups", "retention", "GROUP", "--set", "1h"])
+            .expect("retention parses");
+        match cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::Retention { group_id, set },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(set.as_deref(), Some("1h"));
+            }
+            other => panic!("expected a groups retention command, got {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["wn", "groups", "disband", "GROUP"]).expect("disband parses");
+        match cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::Disband { confirm, .. },
+            } => assert!(
+                !confirm,
+                "confirmation is an explicit flag, never a default"
+            ),
+            other => panic!("expected a groups disband command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "wn",
+            "groups",
+            "add-members",
+            "GROUP",
+            "carol",
+            "dave",
+            "--admin",
+            "carol",
+        ])
+        .expect("add-members parses");
+        match cli.command {
+            Command::Groups {
+                command:
+                    crate::GroupsCommand::AddMembers {
+                        members, admins, ..
+                    },
+            } => {
+                assert_eq!(members, vec!["carol".to_owned(), "dave".to_owned()]);
+                assert_eq!(admins, vec!["carol".to_owned()]);
+            }
+            other => panic!("expected a groups add-members command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "wn",
+            "groups",
+            "create",
+            "ephemeral",
+            "--retention",
+            "1d",
+            "--image",
+            "avatar.png",
+        ])
+        .expect("create with founding options parses");
+        match cli.command {
+            Command::Groups {
+                command:
+                    crate::GroupsCommand::Create {
+                        retention, image, ..
+                    },
+            } => {
+                assert_eq!(retention.as_deref(), Some("1d"));
+                assert_eq!(image.as_deref(), Some("avatar.png"));
+            }
+            other => panic!("expected a groups create command, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wn", "groups", "update", "GROUP"]).is_err(),
+            "groups update needs --name or --description"
+        );
+        assert!(
+            Cli::try_parse_from(["wn", "group", "update", "GROUP"]).is_err(),
+            "legacy group update needs --name or --description"
+        );
+    }
+
+    #[test]
+    fn media_upload_accepts_many_files_and_send_takes_references() {
+        let cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "upload",
+            "GROUP",
+            "a.png",
+            "b.png",
+            "--send",
+            "--message",
+            "two",
+        ])
+        .expect("multi-file upload parses");
+        match cli.command {
+            Command::Media {
+                command:
+                    crate::MediaCommand::Upload {
+                        file_paths, send, ..
+                    },
+            } => {
+                assert_eq!(file_paths, vec!["a.png".to_owned(), "b.png".to_owned()]);
+                assert!(send);
+            }
+            other => panic!("expected a media upload command, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wn", "media", "upload", "GROUP"]).is_err(),
+            "upload needs at least one file"
+        );
+        let cli = Cli::try_parse_from(["wn", "media", "send", "GROUP", "{\"x\":1}", "ab"])
+            .expect("media send parses");
+        match cli.command {
+            Command::Media {
+                command: crate::MediaCommand::Send { attachments, .. },
+            } => assert_eq!(attachments.len(), 2),
+            other => panic!("expected a media send command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "set-endpoints",
+            "GROUP",
+            "https://a",
+            "https://b",
+        ])
+        .expect("set-endpoints parses");
+        match cli.command {
+            Command::Media {
+                command:
+                    crate::MediaCommand::SetEndpoints {
+                        urls, locator_kind, ..
+                    },
+            } => {
+                assert_eq!(urls.len(), 2);
+                assert_eq!(locator_kind, "blossom-v1");
+            }
+            other => panic!("expected a media set-endpoints command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_duration_parser_accepts_seconds_suffixes_and_off() {
+        use super::commands::groups::parse_retention_duration;
+        assert_eq!(parse_retention_duration("0").unwrap(), 0);
+        assert_eq!(parse_retention_duration("off").unwrap(), 0);
+        assert_eq!(parse_retention_duration("90").unwrap(), 90);
+        assert_eq!(parse_retention_duration("45s").unwrap(), 45);
+        assert_eq!(parse_retention_duration("2m").unwrap(), 120);
+        assert_eq!(parse_retention_duration("1h").unwrap(), 3_600);
+        assert_eq!(parse_retention_duration("1d").unwrap(), 86_400);
+        assert_eq!(parse_retention_duration("1w").unwrap(), 604_800);
+        for invalid in ["", "soon", "-1", "1x", "h", "1.5h"] {
+            assert!(
+                parse_retention_duration(invalid).is_err(),
+                "must reject {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn message_send_event_parses_kind_tags_and_content() {
         let cli = Cli::try_parse_from([
             "wn",
@@ -2811,6 +3045,93 @@ mod tests {
             }
         }))
         .expect("sample group")
+    }
+
+    const SENTINEL_IMAGE_KEY: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const SENTINEL_UPLOAD_KEY: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const SENTINEL_IMAGE_NONCE: &str = "333333333333333333333333";
+    const SENTINEL_IMAGE_DATA: &str = "4444deadbeef4444";
+
+    /// A group whose encrypted image component carries sentinel capability keys.
+    fn sample_group_with_image_secrets() -> marmot_app::AppGroupRecord {
+        let mut group = sample_group("pictures");
+        group.image = serde_json::from_value(json!({
+            "component_id": 3,
+            "component": "marmot.group.blossom-image.v1",
+            "present": true,
+            "image_hash_hex": "55".repeat(32),
+            "image_key_hex": SENTINEL_IMAGE_KEY,
+            "image_nonce_hex": SENTINEL_IMAGE_NONCE,
+            "image_upload_key_hex": SENTINEL_UPLOAD_KEY,
+            "media_type": "image/png",
+            "data_hex": SENTINEL_IMAGE_DATA,
+        }))
+        .expect("image component");
+        group
+    }
+
+    fn assert_no_image_secrets(label: &str, value: &serde_json::Value) {
+        let rendered = value.to_string();
+        for secret in [
+            SENTINEL_IMAGE_KEY,
+            SENTINEL_UPLOAD_KEY,
+            SENTINEL_IMAGE_NONCE,
+            SENTINEL_IMAGE_DATA,
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "{label} must not carry image capability material: {rendered}"
+            );
+        }
+        let image = &value["image"];
+        for key in [
+            "image_key_hex",
+            "image_upload_key_hex",
+            "image_nonce_hex",
+            "data_hex",
+        ] {
+            assert!(image.get(key).is_none(), "{label} image must omit {key}");
+        }
+        assert_eq!(image["present"], true, "{label}");
+        assert_eq!(image["image_hash_hex"], "55".repeat(32), "{label}");
+        assert_eq!(image["media_type"], "image/png", "{label}");
+        assert_eq!(
+            image["component"], "marmot.group.blossom-image.v1",
+            "{label}"
+        );
+    }
+
+    /// mdk#1253: every `wn` surface that renders a group (`groups show`/`list`,
+    /// `chats` rows, the daemon group-state feed, and the create response)
+    /// reports image presence, hash, and type but never the decryption key,
+    /// upload secret, or key-bearing component bytes.
+    #[test]
+    fn group_json_surfaces_redact_image_capability_keys() {
+        let group = sample_group_with_image_secrets();
+        assert_no_image_secrets("group_json", &crate::group_json(group.clone()));
+        assert_no_image_secrets("chat_json", &crate::chat_json(group.clone(), None));
+        assert_no_image_secrets(
+            "group_state_stream_response",
+            &serde_json::to_value(crate::daemon::group_state_stream_response(
+                group.clone(),
+                "InitialGroupState",
+                None,
+            ))
+            .expect("stream response serializes")["result"]["group"],
+        );
+        let created =
+            crate::commands::groups::created_group_json(&"66".repeat(32), group, Vec::new())
+                .expect("create json");
+        assert_no_image_secrets("created_group_json", &created);
+        assert_eq!(created["name"], "pictures");
+        assert_no_image_secrets(
+            "group_image_summary_json",
+            &json!({ "image": crate::commands::groups::group_image_summary_json(
+                &sample_group_with_image_secrets().image
+            ) }),
+        );
     }
 
     #[test]

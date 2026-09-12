@@ -39,13 +39,25 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
   `keys rotate` (alias `force-publish`), and fetch another account's latest KeyPackage.
 - `chats`: list, list-archived, show, subscribe, subscribe-archived, archive, unarchive, mute, unmute, and mark-read
   local chat projections/notification policy.
-- `group` and `groups`: create groups, list/show groups, list members/admins/relays, invite/add/remove members, update
-  profile fields, and subscribe to runtime-owned group-state updates through the daemon.
-- `messages`: send text messages, send app-defined custom events with any non-reserved kind (`messages send-event`,
-  repeatable `--tag` JSON arrays), list/search projected messages with Whitenoise-shaped cursor flags and repeatable
-  `--kind` filters, subscribe to runtime-owned typed message updates through the daemon (also `--kind`-filterable),
-  and the `timeline` subgroup (list/search/subscribe over the materialized message timeline). Reserved app-event
-  kinds stay rejected on the custom send path so the CLI cannot forge protocol-owned events.
+- `group` and `groups`: create groups (with founding `--retention` and `--image` options), list/show groups, list
+  members/admins/relays, invite/add/remove members (`--admin` grants admin to invitees in the same commit), update
+  profile fields (`groups update` is canonical; legacy `group update` stays), manage encrypted group images
+  (`set-image`/`clear-image`/`download-image`, redacted JSON per mdk#1253), show or set disappearing-message
+  retention, run the disband lifecycle (`enable-disbanding`, `disband --confirm`, `disband-status`,
+  `acknowledge-disband-failure`, `management`), inspect recovery (`recovery-status`, `confirm-rejoin`,
+  `decline-rejoin`, `quarantined`, `retry-hydrate`), delete local group data (`delete-local --confirm`), inspect
+  and repair Welcome delivery (`pending-welcomes`, `redeliver-welcome`), and subscribe to runtime-owned group-state
+  updates through the daemon. Keep irreversible or copy-discarding actions behind `--confirm`.
+- `messages`: send text messages, edit own messages (`messages edit`, kind 1009, local authorship check), publish
+  delete tombstones, retry group convergence (`messages retry`, group-scoped; the event id is optional context), run
+  the retention sweep on the production clock (`messages sweep-expired`), send app-defined custom events with any
+  non-reserved kind (`messages send-event`, repeatable `--tag` JSON arrays), list/search projected messages with
+  Whitenoise-shaped cursor flags and repeatable `--kind` filters, subscribe to runtime-owned typed message updates
+  through the daemon (also `--kind`-filterable), and the `timeline` subgroup (list/search/subscribe over the
+  materialized message timeline). Reserved app-event kinds stay rejected on the custom send path so the CLI cannot
+  forge protocol-owned events.
+- `media`: upload one or more files (optionally sent as one ordered message), send already-uploaded references
+  (`media send`), replace the group's encrypted-media blob endpoints (`media set-endpoints`), list, and download.
 - `follows`, `profile`, `relays`, `settings`, and `users`: expose the current Nostr directory/settings behavior.
 - Reaction, delete, retry, encrypted media, and admin/member management commands have implemented CLI behavior; keep
   their JSON shapes aligned with the `Unreleased` changelog entries when changing them.

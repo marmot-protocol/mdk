@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use cgka_traits::GroupId;
 use marmot_account::AccountHome;
 use marmot_app::{
-    AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppRuntime, MediaAttachmentReference,
-    MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
+    AppBlobEndpoint, AppError, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppRuntime,
+    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
@@ -35,7 +36,7 @@ pub(crate) async fn media_command_with_runtime(
     match command {
         MediaCommand::Upload {
             group,
-            file_path,
+            file_paths,
             send,
             message,
             media_type,
@@ -46,22 +47,30 @@ pub(crate) async fn media_command_with_runtime(
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-            let path = PathBuf::from(&file_path);
-            let plaintext = std::fs::read(&path)?;
-            let file_name = media_file_name(&path)?;
-            let media_type = media_type.unwrap_or_else(|| guess_media_type(&path).to_owned());
+            // Every file in one request so `--send` publishes a single kind-9
+            // message whose `imeta` tags keep the command-line order.
+            let mut attachments = Vec::with_capacity(file_paths.len());
+            for file_path in &file_paths {
+                let path = PathBuf::from(file_path);
+                let plaintext = std::fs::read(&path)?;
+                let file_name = media_file_name(&path)?;
+                let media_type = media_type
+                    .clone()
+                    .unwrap_or_else(|| guess_media_type(&path).to_owned());
+                attachments.push(MediaUploadAttachmentRequest {
+                    file_name,
+                    media_type,
+                    plaintext,
+                    dim: None,
+                    thumbhash: None,
+                });
+            }
             let upload = runtime
                 .upload_media(
                     &account.account_id_hex,
                     &group_id,
                     MediaUploadRequest {
-                        attachments: vec![MediaUploadAttachmentRequest {
-                            file_name,
-                            media_type,
-                            plaintext,
-                            dim: None,
-                            thumbhash: None,
-                        }],
+                        attachments,
                         caption: message,
                         send,
                         blossom_server: server,
@@ -71,16 +80,23 @@ pub(crate) async fn media_command_with_runtime(
             let first = upload.attachments.first().ok_or_else(|| {
                 WnError::InvalidMediaAttachment("upload returned no attachments".to_owned())
             })?;
+            let uploaded_names = upload
+                .attachments
+                .iter()
+                .map(|attachment| terminal_safe_text(&attachment.reference.file_name))
+                .collect::<Vec<_>>()
+                .join(", ");
             Ok(CommandOutput {
                 plain: if upload.sent.is_some() {
-                    format!(
-                        "uploaded and sent {}",
-                        terminal_safe_text(&first.reference.file_name)
-                    )
+                    format!("uploaded and sent {uploaded_names}")
                 } else {
                     format!(
                         "uploaded {}",
-                        terminal_safe_text(&first.reference.file_name)
+                        if upload.attachments.len() == 1 {
+                            terminal_safe_text(&first.reference.file_name)
+                        } else {
+                            uploaded_names
+                        }
                     )
                 },
                 json: json!({
@@ -166,7 +182,167 @@ pub(crate) async fn media_command_with_runtime(
                 }),
             })
         }
+        MediaCommand::Send {
+            group,
+            attachments,
+            message,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let allow_loopback = app.allow_loopback_blob_endpoints();
+            // Projected references are looked up lazily so a pure
+            // upload-output send never reads the whole group history.
+            let mut projected: Option<Vec<AppMessageRecord>> = None;
+            let mut references = Vec::with_capacity(attachments.len());
+            for attachment in &attachments {
+                let reference = match normalize_sha256_hex(attachment) {
+                    Ok(file_hash_hex) => {
+                        let messages = match projected.as_ref() {
+                            Some(messages) => messages,
+                            None => projected.insert(runtime.messages_with_query(
+                                &account.account_id_hex,
+                                AppMessageQuery {
+                                    group_id_hex: Some(group_id_hex.clone()),
+                                    kinds: None,
+                                    limit: None,
+                                },
+                            )?),
+                        };
+                        media_attachment_for_hash(messages.clone(), &file_hash_hex, allow_loopback)?
+                    }
+                    Err(_) => parse_media_reference_json(attachment)?,
+                };
+                references.push(reference);
+            }
+            // The runtime re-validates every reference against the group's
+            // media profile, locator policy, and version, and the reference
+            // keeps its original `source_epoch` so recipients derive the right
+            // media secret.
+            let summary = runtime
+                .send_media_attachments(
+                    &account.account_id_hex,
+                    &group_id,
+                    references.clone(),
+                    message,
+                )
+                .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "sent {} attachment(s) published={}",
+                    references.len(),
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group_id": group_id_hex,
+                    "attachments": references.iter().map(media_attachment_json).collect::<Vec<_>>(),
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
+                }),
+            })
+        }
+        MediaCommand::SetEndpoints {
+            group,
+            urls,
+            locator_kind,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let endpoints = urls
+                .iter()
+                .map(|url| AppBlobEndpoint {
+                    locator_kind: locator_kind.clone(),
+                    base_url: url.clone(),
+                })
+                .collect::<Vec<_>>();
+            let summary = runtime
+                .replace_encrypted_media_blob_endpoints(
+                    &account.account_id_hex,
+                    &group_id,
+                    endpoints,
+                )
+                .await?;
+            let group = app
+                .group(&account.label, &group_id_hex)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "replaced {} encrypted-media endpoint(s) for group {group_id_hex} published={}",
+                    group.encrypted_media.default_blob_endpoints.len(),
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group_id": group_id_hex,
+                    "encrypted_media": group.encrypted_media,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
+                }),
+            })
+        }
     }
+}
+
+/// The `media` object emitted by `media upload` / `media list`, accepted back
+/// as a `media send` attachment. Unknown keys are ignored so scripts can pass
+/// a whole list row too.
+#[derive(Deserialize)]
+struct MediaReferenceInput {
+    locators: Vec<MediaLocatorInput>,
+    ciphertext_sha256: String,
+    plaintext_sha256: String,
+    nonce_hex: String,
+    file_name: String,
+    media_type: String,
+    version: String,
+    source_epoch: u64,
+    #[serde(default)]
+    dim: Option<String>,
+    #[serde(default)]
+    thumbhash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MediaLocatorInput {
+    kind: String,
+    value: String,
+}
+
+fn parse_media_reference_json(raw: &str) -> Result<MediaAttachmentReference, WnError> {
+    let input: MediaReferenceInput = serde_json::from_str(raw).map_err(|error| {
+        WnError::InvalidMediaAttachment(format!(
+            "attachment must be a plaintext SHA-256 hex or a `media` JSON object: {error}"
+        ))
+    })?;
+    Ok(MediaAttachmentReference {
+        locators: input
+            .locators
+            .into_iter()
+            .map(|locator| MediaLocator {
+                kind: locator.kind,
+                value: locator.value,
+            })
+            .collect(),
+        ciphertext_sha256: input.ciphertext_sha256,
+        plaintext_sha256: input.plaintext_sha256,
+        nonce_hex: input.nonce_hex,
+        file_name: input.file_name,
+        media_type: input.media_type,
+        version: input.version,
+        source_epoch: input.source_epoch,
+        dim: input.dim,
+        thumbhash: input.thumbhash,
+    })
 }
 
 fn media_records_json(messages: Vec<AppMessageRecord>, allow_loopback_http: bool) -> Vec<Value> {
@@ -299,7 +475,7 @@ fn normalize_sha256_hex(value: &str) -> Result<String, WnError> {
     Ok(hex::encode(decoded))
 }
 
-fn media_file_name(path: &Path) -> Result<String, WnError> {
+pub(crate) fn media_file_name(path: &Path) -> Result<String, WnError> {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(str::trim)
@@ -320,7 +496,7 @@ fn media_output_path(output: Option<String>, file_name: &str) -> PathBuf {
     })
 }
 
-fn guess_media_type(path: &Path) -> &'static str {
+pub(crate) fn guess_media_type(path: &Path) -> &'static str {
     match path
         .extension()
         .and_then(|extension| extension.to_str())
