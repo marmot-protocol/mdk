@@ -571,7 +571,15 @@ pub(crate) fn vet_profile_fetch_resolved_addresses(addrs: &[SocketAddr]) -> Resu
 
 /// Shared manual redirect loop for Blossom blob and profile-image fetches.
 /// Keep policy differences in the caller-supplied client and redirect validators.
-async fn fetch_http_with_bounded_redirects<C, CFut, R>(
+/// Follow up to `MAX_BLOSSOM_REDIRECTS` redirects under one deadline.
+///
+/// A destination-policy refusal (`UnsafeMediaFetch`) from `client_for_url` is
+/// preserved only for the first hop, where it means nothing was dialed. On a
+/// redirect hop the origin server was already contacted and answered, so the
+/// same refusal for the redirect target is reported as a `BlobStore` transfer
+/// failure: the attachment is unavailable right now (the server may redirect
+/// elsewhere or serve the blob on retry), not unfetchable by policy.
+pub(super) async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     mut current: Url,
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
@@ -623,7 +631,14 @@ where
                     host_setup_started,
                     false,
                 );
-                return Err(error);
+                return Err(match error {
+                    AppError::UnsafeMediaFetch(detail) if redirects > 0 => {
+                        AppError::BlobStore(format!(
+                            "redirect target refused by destination policy after a permitted request: {detail}"
+                        ))
+                    }
+                    other => other,
+                });
             }
             Err(_) => {
                 record_download_phase(

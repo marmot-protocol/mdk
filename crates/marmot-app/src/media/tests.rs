@@ -13,7 +13,8 @@ use url::Url;
 use super::blossom::{
     BlossomHttpTransport, DnsResolver, MAX_BLOSSOM_DESCRIPTOR_BYTES,
     MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_observer,
-    fetch_blossom_blob_with_transport, read_limited_blossom_body,
+    fetch_blossom_blob_with_transport, fetch_http_with_bounded_redirects,
+    read_limited_blossom_body,
 };
 use super::host_safety::validate_blossom_fetch_url;
 
@@ -2727,4 +2728,76 @@ async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure(
             "refused_first={refused_first}: expected MediaDownloadFailed, got {err:?}"
         );
     }
+}
+
+/// Drive the bounded-redirect loop with a client factory that refuses the
+/// hop at `refused_hop` the way DNS destination-policy validation does.
+async fn redirect_loop_with_policy_refusal_at(refused_hop: usize) -> AppError {
+    let hash = valid_hash();
+    let redirecting = spawn_http_response(http_redirect_response(&format!(
+        "https://cdn.example/{hash}.bin"
+    )));
+    let start = Url::parse(&format!("{redirecting}/{hash}.bin")).unwrap();
+    let mut hop = 0_usize;
+    fetch_http_with_bounded_redirects(
+        start,
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+        None,
+        move |_url| {
+            let this_hop = hop;
+            hop += 1;
+            async move {
+                if this_hop == refused_hop {
+                    Err(AppError::UnsafeMediaFetch(
+                        "unsafe media host address: address is not public unicast".into(),
+                    ))
+                } else {
+                    // The loop owns redirect handling, exactly like the pinned
+                    // production clients, so the test client must not follow.
+                    Ok(reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .no_proxy()
+                        .build()
+                        .unwrap())
+                }
+            }
+        },
+        |current, location| Ok(current.join(location).unwrap()),
+    )
+    .await
+    .expect_err("a refused hop must fail the fetch")
+}
+
+#[tokio::test]
+async fn policy_refusal_on_a_redirect_hop_is_a_download_failure_not_unfetchable() {
+    // The origin server was contacted and answered with a redirect whose target
+    // resolves to a forbidden address. Hosts must not be told nothing was
+    // dialed: the server may redirect elsewhere or serve the blob on retry.
+    let err = redirect_loop_with_policy_refusal_at(1).await;
+    assert!(
+        matches!(&err, AppError::BlobStore(message) if message.contains("after a permitted request")),
+        "expected a transfer failure, got {err:?}"
+    );
+    assert!(
+        matches!(
+            media_download_failure(err),
+            AppError::MediaDownloadFailed(_)
+        ),
+        "the encrypted-media path must classify it as a download failure"
+    );
+}
+
+#[tokio::test]
+async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
+    let err = redirect_loop_with_policy_refusal_at(0).await;
+    assert!(
+        matches!(&err, AppError::UnsafeMediaFetch(_)),
+        "an initial refusal means nothing was dialed, got {err:?}"
+    );
+    assert!(matches!(
+        media_download_failure(err),
+        AppError::MediaUnfetchable(_)
+    ));
 }

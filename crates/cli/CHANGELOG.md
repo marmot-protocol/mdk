@@ -36,7 +36,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Download classification does not depend on locator order: a candidate the destination
   policy refuses before dialing (a private-IP literal, or a hostname whose DNS answer is a
   non-public address) is unfetchable, and once any permitted server was contacted the
-  attachment reports `MediaDownloadFailed` even if later locators were unusable. Blossom
+  attachment reports `MediaDownloadFailed` even if later locators were unusable, including
+  when a permitted server redirects to a target the policy then refuses. Blossom
   dial-safety refusals now carry the `UnsafeMediaFetch` class internally, so an upload or
   group-image fetch to an unsafe endpoint surfaces as `InvalidMediaReference` rather than the
   untyped `Runtime` error.
