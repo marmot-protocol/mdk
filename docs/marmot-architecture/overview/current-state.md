@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-10
+updated: 2026-09-12
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,18 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
+it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined
+conversation again. Changes to those registration inputs still queue the new revision for all joined groups.
+Account workers process scheduled convergence one group per turn, retaining the other groups' deadlines and
+checking queued commands before the next turn. A running engine or relay operation still completes before a queued
+command executes; this is not a wall-clock send latency guarantee.
+
+Accepted disband requests keep a worker wakeup even without other group work, and hydration restores that wakeup
+after restart. The selected inbound convergence replay retains authenticated disband evidence before removing the
+former roster. Terminal event projection uses the retained display components and authoritative tombstone instead
+of querying deleted MLS state. Failed requests and unrecoverable groups do not acquire an idle retry loop from this scheduling.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
