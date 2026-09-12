@@ -3825,6 +3825,32 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         rejection_category: None,
                     });
                 }
+                if retain_replayed_anchors.is_some()
+                    && crate::app_components::staged_commit_disbands(&mls_group, &staged)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                {
+                    // Ordinary inbound commits enter convergence before the
+                    // direct-ingest disband detector. Preserve the authenticated
+                    // terminal evidence while applying the selected branch,
+                    // before merge removes the former roster. Candidate probes
+                    // must not persist it; this write shares the apply transaction.
+                    storage.put_disband_candidate(&cgka_traits::storage::DisbandCandidate {
+                        group_id: group_id.clone(),
+                        source_epoch: EpochId(source_epoch),
+                        commit_id: message.id.clone(),
+                        content_commit_id: crate::message_processor::content_dedup_id(
+                            &message.payload,
+                        ),
+                        commit_digest: projection.message_digest,
+                        actor: sender_id
+                            .clone()
+                            .expect("authenticated sender checked above"),
+                        local_was_committer_leaf: committer_index == mls_group.own_leaf_index(),
+                        former_members: crate::disband::deduplicated_roster(&marmot_members(
+                            &mls_group,
+                        )),
+                    })?;
+                }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
                     .queued_proposals()
