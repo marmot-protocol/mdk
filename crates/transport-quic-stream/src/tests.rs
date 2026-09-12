@@ -1,7 +1,7 @@
 //! Cross-cutting unit and end-to-end tests exercising the protocol caps,
 //! splitter, framing, crypto round-trip, limits, and the send/receive loop.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::time::Duration;
 
@@ -25,13 +25,61 @@ use crate::limits::{
     AgentTextStreamReceiveLimits,
 };
 use crate::protocol::{
-    AGENT_TEXT_STREAM_FRAME_ALLOWANCE, LOCAL_BIND, QUIC_STREAM_ALPN_V1, QUIC_STREAM_PROTOCOL_V1,
+    AGENT_TEXT_STREAM_FRAME_ALLOWANCE, QUIC_STREAM_ALPN_V1, QUIC_STREAM_PROTOCOL_V1,
     SEND_CLOSE_WAIT, frame_len_cap,
 };
 use crate::receive::{QuicTextStreamReceiver, ServerTrust, stream_record_text};
 use crate::send::{SendTextStream, send_text_stream, split_text_deltas};
-use crate::tls::{client_endpoint, configure_server};
+use crate::tls::{client_bind_addr_for_server, client_endpoint, configure_server};
 use tokio::time::{sleep, timeout};
+
+const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+fn is_io_address_family_unavailable(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) || matches!(
+        err.raw_os_error(),
+        // Unix EAFNOSUPPORT/EADDRNOTAVAIL (macOS 47/49, Linux 97/99) and
+        // Windows WSAEAFNOSUPPORT (10047). Rust maps 10047 to Uncategorized,
+        // so ErrorKind matching alone would fail IPv6-less Windows hosts.
+        Some(47 | 49 | 97 | 99 | 10047)
+    )
+}
+
+fn is_address_family_unavailable(err: &QuicTextStreamError) -> bool {
+    match err {
+        QuicTextStreamError::Io(io_err) => is_io_address_family_unavailable(io_err),
+        _ => false,
+    }
+}
+
+#[test]
+fn address_family_unavailable_recognizes_windows_wsaeafnosupport() {
+    let err = std::io::Error::from_raw_os_error(10047);
+    assert!(
+        is_io_address_family_unavailable(&err),
+        "WSAEAFNOSUPPORT (10047) must skip IPv6 setup instead of failing: {err:?}"
+    );
+    assert!(is_address_family_unavailable(&QuicTextStreamError::Io(err)));
+}
+
+#[test]
+fn address_family_unavailable_predicate_covers_documented_raw_codes() {
+    for code in [47, 49, 97, 99, 10047] {
+        let err = std::io::Error::from_raw_os_error(code);
+        assert!(
+            is_io_address_family_unavailable(&err),
+            "raw OS error {code} should be treated as address-family unavailable: {err:?}"
+        );
+    }
+    let unrelated = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        !is_io_address_family_unavailable(&unrelated),
+        "unrelated I/O errors must not skip IPv6 tests: {unrelated:?}"
+    );
+}
 
 #[test]
 fn direct_path_alpn_is_the_pinned_wire_value() {
@@ -312,9 +360,152 @@ async fn insecure_local_rejects_remote_server_addr() {
 }
 
 #[tokio::test]
+async fn insecure_local_rejects_remote_ipv6_server_addr() {
+    let err = send_text_stream(SendTextStream {
+        server_addr: SocketAddr::new(IpAddr::V6("2001:db8::1".parse().unwrap()), 4450),
+        server_name: "example.com".to_owned(),
+        trust: ServerTrust::InsecureLocal,
+        stream_id: vec![0x42; 32],
+        start_event_id: MessageId::new(vec![0x24; 32]),
+        text: "hello".to_owned(),
+        max_chunk_bytes: 5,
+        chunk_delay: Duration::ZERO,
+        crypto: None,
+        max_plaintext_frame_len: None,
+    })
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        QuicTextStreamError::InsecureLocalRequiresLoopback(_)
+    ));
+}
+
+#[test]
+fn client_bind_addr_matches_server_address_family() {
+    let cases = [
+        ("127.0.0.1:4450", "0.0.0.0:0"),
+        ("93.184.216.34:443", "0.0.0.0:0"),
+        ("[::1]:4450", "[::]:0"),
+        ("[2606:4700::1]:443", "[::]:0"),
+        ("[::ffff:127.0.0.1]:4450", "[::]:0"),
+        ("[::ffff:10.0.0.1]:443", "[::]:0"),
+    ];
+    for (server, expected_bind) in cases {
+        let server: SocketAddr = server.parse().unwrap();
+        let expected_bind: SocketAddr = expected_bind.parse().unwrap();
+        let bind = client_bind_addr_for_server(server);
+        assert_eq!(bind, expected_bind, "server {server}");
+        assert!(bind.ip().is_unspecified(), "server {server}");
+        assert_eq!(bind.port(), 0, "server {server}");
+        assert_eq!(bind.is_ipv4(), server.is_ipv4(), "server {server}");
+        assert_eq!(bind.is_ipv6(), server.is_ipv6(), "server {server}");
+    }
+}
+
+#[tokio::test]
+async fn client_endpoint_binds_unspecified_family_matched_ephemeral_port() {
+    let (_server_config, cert_der) = configure_server().unwrap();
+    let ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450);
+    let verified = client_endpoint(ServerTrust::CertificateDer(cert_der.clone()), ipv4).unwrap();
+    let local = verified.local_addr().unwrap();
+    assert!(local.ip().is_unspecified(), "{local}");
+    assert!(local.is_ipv4(), "{local}");
+    assert_ne!(local.port(), 0, "{local}");
+
+    let insecure = client_endpoint(ServerTrust::InsecureLocal, ipv4).unwrap();
+    let local = insecure.local_addr().unwrap();
+    assert!(local.ip().is_unspecified(), "{local}");
+    assert!(local.is_ipv4(), "{local}");
+    assert_ne!(local.port(), 0, "{local}");
+
+    let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 4450);
+    match client_endpoint(ServerTrust::CertificateDer(cert_der), ipv6) {
+        Ok(endpoint) => {
+            let local = endpoint.local_addr().unwrap();
+            assert!(local.ip().is_unspecified(), "{local}");
+            assert!(local.is_ipv6(), "{local}");
+            assert_ne!(local.port(), 0, "{local}");
+        }
+        Err(err) if is_address_family_unavailable(&err) => {
+            eprintln!("skipping IPv6 client bind assertion: {err}");
+        }
+        Err(err) => panic!("unexpected IPv6 client endpoint failure: {err}"),
+    }
+}
+
+#[test]
+fn malformed_certificate_der_fails_without_trust_fallback() {
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450);
+    let err = client_endpoint(ServerTrust::CertificateDer(vec![0xff, 0x00]), server_addr)
+        .expect_err("malformed CertificateDer must fail");
+    assert!(!matches!(
+        err,
+        QuicTextStreamError::InsecureLocalRequiresLoopback(_)
+    ));
+    assert!(matches!(
+        err,
+        QuicTextStreamError::Rustls(_)
+            | QuicTextStreamError::Certificate(_)
+            | QuicTextStreamError::ClientConfig(_)
+    ));
+}
+
+#[tokio::test]
 async fn quic_receiver_renders_text_deltas_in_order() {
     let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
     let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let receive = tokio::spawn(receiver.receive_once(start_event_id.clone(), None));
+
+    let sent = send_text_stream(SendTextStream {
+        server_addr,
+        server_name: "localhost".to_owned(),
+        trust: ServerTrust::CertificateDer(server_cert),
+        stream_id: stream_id.clone(),
+        start_event_id,
+        text: "hello over quic".to_owned(),
+        max_chunk_bytes: 5,
+        chunk_delay: Duration::ZERO,
+        crypto: None,
+        max_plaintext_frame_len: None,
+    })
+    .await
+    .unwrap();
+
+    let received = receive.await.unwrap().unwrap();
+    assert_eq!(received.stream_id, stream_id);
+    assert_eq!(received.text, "hello over quic");
+    assert_eq!(
+        received
+            .chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hello", " over", " quic"]
+    );
+    assert_eq!(received.chunk_count, 3);
+    assert_eq!(sent.stream_id, stream_id);
+    assert_eq!(sent.chunk_count, 3);
+    assert_eq!(sent.transcript_hash, received.transcript_hash);
+}
+
+#[tokio::test]
+async fn quic_receiver_renders_text_deltas_over_ipv6_loopback() {
+    let ipv6_bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+    let receiver = match QuicTextStreamReceiver::bind(ipv6_bind) {
+        Ok(receiver) => receiver,
+        Err(err) if is_address_family_unavailable(&err) => {
+            eprintln!("skipping IPv6 loopback send/receive: {err}");
+            return;
+        }
+        Err(err) => panic!("unexpected IPv6 receiver bind failure: {err}"),
+    };
+    let server_addr = receiver.local_addr().unwrap();
+    assert!(server_addr.is_ipv6(), "{server_addr}");
     let server_cert = receiver.server_cert_der().to_vec();
     let stream_id = vec![0x42; 32];
     let start_event_id = MessageId::new(vec![0x24; 32]);

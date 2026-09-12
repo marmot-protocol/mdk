@@ -9,7 +9,11 @@ orchestration stay in higher layers.
 ## What this crate does
 
 - Sets up QUIC client/server endpoints with ALPN pinning and shared hardening defaults (connect deadline, frame caps,
-  early-data policy) also consumed by `transport-quic-broker`.
+  early-data policy) also consumed by `transport-quic-broker`. Direct clients bind the unspecified address of the
+  destination family (`0.0.0.0:0` / `[::]:0`) so IPv6 and normally routed off-host destinations are reachable. That
+  wildcard source bind is not authorization of the remote address: `SendTextStream` callers must supply an already
+  validated and pinned `SocketAddr` plus configuration-derived trust/`server_name`. The API has no resolver or
+  dev-flag context and does not infer permission from the destination IP.
 - Seals and opens length-delimited preview records with HKDF-derived keys and AAD.
 - Sends and receives text-stream preview chunks over ordered QUIC streams.
 - Requires encrypted publishers to reserve sequences through an account-device

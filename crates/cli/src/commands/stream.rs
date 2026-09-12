@@ -808,6 +808,7 @@ pub(crate) fn broker_trust(
         ensure_insecure_local_endpoint(server_addr)?;
         return Ok(BrokerServerTrust::InsecureLocal);
     }
+    ensure_public_quic_endpoint(server_addr)?;
     server_cert_der_hex
         .map(|value| hex::decode(value).map(BrokerServerTrust::CertificateDer))
         .transpose()
@@ -850,11 +851,16 @@ fn stream_trust(
         ensure_insecure_local_endpoint(server_addr)?;
         return Ok(ServerTrust::InsecureLocal);
     }
+    ensure_public_quic_endpoint(server_addr)?;
     server_cert_der_hex
         .map(|value| hex::decode(value).map(ServerTrust::CertificateDer))
         .transpose()
         .map(|trust| trust.unwrap_or(ServerTrust::Platform))
         .map_err(Into::into)
+}
+
+fn ensure_public_quic_endpoint(server_addr: SocketAddr) -> Result<(), WnError> {
+    reject_non_public_socket_addr(server_addr, false).map_err(|_| WnError::UnsafeQuicEndpoint)
 }
 
 fn ensure_insecure_local_endpoint(server_addr: SocketAddr) -> Result<(), WnError> {
@@ -883,4 +889,131 @@ fn resolve_selected_account(
         return Ok(None);
     };
     Ok(Some(resolve_account_ref(account_home, &account)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(raw: &str) -> SocketAddr {
+        raw.parse().expect("test socket address parses")
+    }
+
+    #[test]
+    fn explicit_send_trust_helpers_preserve_verified_modes_for_public_endpoints() {
+        // Local `stream send` and app-backed `stream send` both call these
+        // helpers before dialing, including the `--broker` sibling.
+        let cert_hex = hex::encode([0x11_u8; 8]);
+        for raw in ["93.184.216.34:4450", "[2606:4700::1]:4450"] {
+            let server = addr(raw);
+            assert!(matches!(
+                stream_trust(server, None, false),
+                Ok(ServerTrust::Platform)
+            ));
+            assert!(matches!(
+                broker_trust(server, None, false),
+                Ok(BrokerServerTrust::Platform)
+            ));
+            assert!(matches!(
+                stream_trust(server, Some(cert_hex.clone()), false),
+                Ok(ServerTrust::CertificateDer(_))
+            ));
+            assert!(matches!(
+                broker_trust(server, Some(cert_hex.clone()), false),
+                Ok(BrokerServerTrust::CertificateDer(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_send_trust_helpers_use_shared_classifier_for_unsafe_classes() {
+        for raw in [
+            "127.0.0.1:4450",
+            "[::1]:4450",
+            "10.0.0.1:4450",
+            "192.168.1.1:4450",
+            "100.64.0.1:4450",
+            "169.254.169.254:4450",
+            "0.0.0.0:4450",
+            "[::]:4450",
+            "[fc00::1]:4450",
+            "[fe80::1]:4450",
+            "[::ffff:10.0.0.1]:4450",
+            "[::ffff:127.0.0.1]:4450",
+        ] {
+            let server = addr(raw);
+            assert!(
+                reject_non_public_socket_addr(server, false).is_err(),
+                "{raw} must stay classified unsafe"
+            );
+            assert!(
+                matches!(
+                    stream_trust(server, None, false),
+                    Err(WnError::UnsafeQuicEndpoint)
+                ),
+                "{raw}"
+            );
+            assert!(
+                matches!(
+                    broker_trust(server, None, false),
+                    Err(WnError::UnsafeQuicEndpoint)
+                ),
+                "{raw}"
+            );
+            assert!(
+                matches!(
+                    stream_trust(server, Some(hex::encode([0x22_u8; 8])), false),
+                    Err(WnError::UnsafeQuicEndpoint)
+                ),
+                "certificate must not authorize {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_send_insecure_local_allows_only_literal_loopback() {
+        for raw in ["127.0.0.1:4450", "[::1]:4450"] {
+            let server = addr(raw);
+            assert!(matches!(
+                stream_trust(server, None, true),
+                Ok(ServerTrust::InsecureLocal)
+            ));
+            assert!(matches!(
+                broker_trust(server, None, true),
+                Ok(BrokerServerTrust::InsecureLocal)
+            ));
+        }
+        for raw in [
+            "10.0.0.1:4450",
+            "93.184.216.34:4450",
+            "[fc00::1]:4450",
+            "[2606:4700::1]:4450",
+        ] {
+            let server = addr(raw);
+            assert!(matches!(
+                stream_trust(server, None, true),
+                Err(WnError::InsecureLocalRequiresLoopback(_))
+            ));
+            assert!(matches!(
+                broker_trust(server, None, true),
+                Err(WnError::InsecureLocalRequiresLoopback(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_send_conflicting_trust_options_keep_existing_precedence() {
+        let cert_hex = hex::encode([0x33_u8; 8]);
+        for raw in ["127.0.0.1:4450", "93.184.216.34:4450"] {
+            let server = addr(raw);
+            assert!(matches!(
+                stream_trust(server, Some(cert_hex.clone()), true),
+                Err(WnError::ConflictingStreamTrust)
+            ));
+            assert!(matches!(
+                broker_trust(server, Some(cert_hex.clone()), true),
+                Err(WnError::ConflictingStreamTrust)
+            ));
+        }
+    }
 }

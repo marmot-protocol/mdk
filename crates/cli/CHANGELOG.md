@@ -68,6 +68,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   across pages. Search-discovered public profiles are searchable across accounts but remain outside live directory
   subscriptions. Local cache materialization is capped at 10,000 distinct identities per account cache, and cache result
   batches at 10,000 people.
+- `wn stream send` (direct and `--broker`) now applies the shared public-address gate to explicit `--connect`
+  destinations. Unflagged loopback, private, link-local, CGNAT, and other non-public targets return
+  `unsafe_quic_endpoint`. `--insecure-local` still opens loopback only; a pinned certificate is TLS trust, not address
+  authorization.
+
+### Fixed
+
+- Direct QUIC stream clients bind the unspecified address of the destination family so IPv6 and normally routed
+  off-host receivers are reachable. The wildcard source bind does not authorize the remote destination.
 
 ## [0.9.20] - 2026-09-08
 

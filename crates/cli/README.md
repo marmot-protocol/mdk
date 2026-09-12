@@ -409,7 +409,11 @@ wn --account <npub-or-hex> stream verify <group-hex> \
 starts include concrete `quic://host:port` candidates for that stream. `stream watch` reads the durable start payload,
 subscribes to the broker candidate, and prints the provisional text preview plus transcript hash. `stream send --broker`
 publishes ordered `TextDelta` records through the memory-only broker. Without `--broker`, `stream send` still connects
-directly to a peer receiver, which is useful with `wn stream receive --bind 127.0.0.1:4450` for local transport probes.
+directly to a peer receiver. Explicit `--connect` destinations on both send routes must be public unicast addresses;
+`--insecure-local` is the only exception, and it opens loopback only. A pinned `--server-cert-der-hex` is TLS trust, not
+address authorization, so unflagged loopback, private, link-local, and CGNAT targets are rejected. Local transport
+probes therefore need `wn stream receive --bind 127.0.0.1:4450` plus `--insecure-local` on send. The client source bind
+is a family-matched wildcard (`0.0.0.0:0` / `[::]:0`) and does not itself authorize the remote destination.
 `stream verify` compares a received QUIC transcript hash and chunk count against the latest durable final payload for the
 same stream id. QUIC chunks are transient preview data; normal Marmot messages remain the durable group history. Use
 `quic://quic-broker.ipf.dev:4450` with platform trust for the shared production broker, and use `--insecure-local` only

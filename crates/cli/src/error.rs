@@ -105,6 +105,10 @@ pub(crate) enum WnError {
     InvalidTranscriptHashLength(usize),
     #[error("choose either --server-cert-der-hex or --insecure-local")]
     ConflictingStreamTrust,
+    #[error(
+        "QUIC endpoint must be a public address; --insecure-local permits loopback endpoints only"
+    )]
+    UnsafeQuicEndpoint,
     #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
     InsecureLocalRequiresLoopback(SocketAddr),
     #[error("messages subscribe requires the daemon; start it with `wn daemon start`")]
@@ -326,6 +330,10 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
         }),
         WnError::ConflictingStreamTrust => json!({
             "code": "conflicting_stream_trust",
+            "message": err.to_string(),
+        }),
+        WnError::UnsafeQuicEndpoint => json!({
+            "code": "unsafe_quic_endpoint",
             "message": err.to_string(),
         }),
         WnError::InsecureLocalRequiresLoopback(addr) => json!({
@@ -748,6 +756,26 @@ mod tests {
     use marmot_account::AccountError;
 
     use super::*;
+
+    #[test]
+    fn unsafe_quic_endpoint_json_omits_addresses_and_certificates() {
+        let err = WnError::UnsafeQuicEndpoint;
+        let message = err.to_string();
+        assert!(message.contains("public address"));
+        assert!(message.contains("--insecure-local"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("::1"));
+        assert!(!message.contains("cert"));
+
+        let json = wn_error_json(&err);
+        assert_eq!(json["code"], "unsafe_quic_endpoint");
+        assert_eq!(json["message"], message);
+        assert!(json.get("addr").is_none());
+        assert!(json.get("candidate").is_none());
+        let rendered = json.to_string();
+        assert!(!rendered.contains("127.0.0.1"));
+        assert!(!rendered.contains("cert"));
+    }
 
     #[test]
     fn missing_key_package_errors_include_repair_guidance() {
