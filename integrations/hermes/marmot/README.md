@@ -85,6 +85,48 @@ from these same files. A community-index entry should pin an immutable commit
 or release tag; until such an entry is published, use the exact-checkout source
 command above.
 
+## Optional presence reactions
+
+Set `platforms.marmot.extra.presence_reactions: true` to show deterministic
+turn progress on inbound messages. It is off by default and does not call the
+LLM or change activation, sender authorization, or approval policy.
+
+```yaml
+platforms:
+  marmot:
+    extra:
+      presence_reactions: true
+      presence_emojis:                 # optional overrides
+        accepted: "👀"
+        thinking: "⏳"
+        construction: ["🛠️", "🔨", "⚙️", "🧱"]
+        completed: "✅"
+        failed: "❌"
+        superseded: "➡️"
+```
+
+Eyes appear when processing begins. Hermes' live-status callback maps tool
+start to the construction cycle and tool completion to the between-tools
+hourglass. Leave Hermes' `display.live_status` enabled (its default is `full`)
+to receive tool lifecycle signals, even with tool-progress messages disabled.
+Streaming text also switches to thinking when no tool is active.
+
+While a tool runs, the construction emoji advances after 120, 240, 480, then
+600 seconds, remaining capped at 600 seconds. Every new tool start resets the
+cycle and timer. New inbound messages retarget the active indicator; successful
+completion marks the original reply anchor with a checkmark. Failed turns get
+a cross, superseded turns get an arrow, and cancellation removes the temporary
+indicator. Terminal reactions are preserved.
+
+Presence is cosmetic: hooks enqueue work without awaiting daemon requests.
+Each group has at most one cycle timer and one serialized reaction worker;
+state is bounded to 256 groups with eight queued transitions per group.
+Each operation gets at most three attempts with a five-second timeout per
+attempt. Replacements remove only the exact presence emoji, never all own
+reactions. Disconnect cancels workers and timers without waiting for network
+cleanup; an unacknowledged/stale reaction may remain after a daemon failure.
+There is no persistence or reconnect timeline scan.
+
 ## Release Install (Hermes Already Installed)
 
 Versioned `wn-agent` builds and the Hermes plugin are published as
