@@ -91,6 +91,24 @@ optional state already exists in the GroupContext. Use two published commits:
 The upgrade fails closed without staging a commit when required state is
 missing. MDK does not currently expose an atomic require-and-populate API.
 
+## Speculative replay transaction checks
+
+Run the regression, paired SQLCipher measurement, and process-crash checks with:
+
+```sh
+cargo test --locked -p cgka-engine --lib replay_transaction_preserves
+cargo test --locked -p cgka-engine --lib replay_transaction_measurement -- --ignored --nocapture
+cargo test --locked --release -p cgka-engine --config 'profile.release.package.cgka-engine.debug-assertions=true' --lib replay_transaction_measurement -- --ignored --nocapture
+cargo test --locked -p cgka-engine --features test-crash-hooks,test-policy-overrides --test crash_recovery_sqlite
+```
+
+The measurement alternates the previous unbatched probe body and transactional replay on identical
+20-member inputs, using encrypted file storage with production WAL/FULL defaults. It measures three
+candidate probes per sample, checks restoration, and imposes no timing assertion. It is a microbenchmark;
+the simulator's 50-member public app canary measures the separate effect under runtime contention.
+The optimized unit-test command retains engine debug assertions because existing legacy-profile test
+helpers require them. Production app measurements should use the normal release build without that override.
+
 ## Reading order for a new contributor
 
 1. Target architecture: `../../docs/marmot-architecture/overview/target-architecture.md`

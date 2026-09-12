@@ -159,7 +159,11 @@ async fn crash_child_runs_late_commit_convergence() {
         return;
     }
     let path = PathBuf::from(std::env::var_os(DATABASE_ENV).expect("child database path"));
-    run_child_case(&path).await;
+    if std::env::var(CRASH_POINT_ENV).is_ok_and(|point| point.starts_with("candidate-replay-")) {
+        run_probe_child(&path).await;
+    } else {
+        run_child_case(&path).await;
+    }
     panic!("selected crash point was not reached");
 }
 
@@ -784,4 +788,169 @@ fn wal_path(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push("-wal");
     PathBuf::from(path)
+}
+
+fn probe_state(storage: &SqliteAccountStorage, group: &GroupId) -> serde_json::Value {
+    use cgka_traits::storage::StorageProvider;
+    let mls = openmls::group::MlsGroup::load(
+        storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    serde_json::json!({
+        "group": storage.get_group(group).unwrap(),
+        "epoch_authenticator": hex::encode(mls.epoch_authenticator().as_slice()),
+        "snapshots": storage.list_group_snapshots(group).unwrap(),
+        "messages": storage.list_messages(group, EpochId(0)).unwrap(),
+        "queue": storage.list_queued_outbound_intents(group).unwrap(),
+    })
+}
+
+#[test]
+fn candidate_replay_kill_restores_preprobe_state_without_hydration() {
+    for point in [
+        "candidate-replay-after-processing",
+        "candidate-replay-after-restoration",
+    ] {
+        for nested in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("probe.sqlite3");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "crash_child_runs_late_commit_convergence",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(DATABASE_ENV, &database)
+                .env(CRASH_POINT_ENV, point)
+                .env("MDK_CGKA_REPLAY_NESTED", if nested { "1" } else { "0" })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let (send, receive) = mpsc::channel();
+            let stdout = child.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    if send.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let ready = loop {
+                match receive.recv_timeout(Duration::from_secs(60)) {
+                    Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            drop(receive);
+            reader.join().unwrap();
+            assert!(ready, "probe child never reached {point}, nested={nested}");
+            assert!(!status.success());
+            let key = SqlCipherKey::new(DATABASE_KEY).unwrap();
+            let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+            let group = storage.list_groups().unwrap().pop().unwrap();
+            let expected: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(database.with_extension("expected.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                probe_state(&storage, &group) == expected,
+                "crash changed live state or work at {point}, nested={nested}"
+            );
+            let mut engine = build_client_with_storage(CAROL_SEED, storage.clone());
+            engine.hydrate_all_stored_groups().unwrap();
+            assert_eq!(engine.epoch(&group).unwrap(), EpochId(1));
+        }
+    }
+}
+
+async fn run_probe_child(database: &Path) {
+    use cgka_engine::openmls_projection::replay_openmls_messages;
+    use cgka_traits::storage::StorageProvider;
+    let (mut alice, _) = build_memory_client(b"probe-alice");
+    let storage =
+        SqliteAccountStorage::open_encrypted(database, &SqlCipherKey::new(DATABASE_KEY).unwrap())
+            .unwrap();
+    let mut carol = build_client_with_storage(CAROL_SEED, storage.clone());
+    let kp = carol.fresh_key_package().await.unwrap();
+    let (group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "transaction crash".into(),
+            description: String::new(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("legacy fixture");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+    let (commit, _) = evolution(
+        alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    storage
+        .put_message(&MessageRecord {
+            id: commit.id.clone(),
+            group_id: group.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Created,
+            payload: StoredMessagePayload::openmls_wire(commit.clone())
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(QUEUED_INTENT_ID.to_vec()),
+            group_id: group.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: app_payload_for(&carol, b"retained work"),
+            },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    // The parent-owned temp directory is private; create the evidence file
+    // owner-only too, before entering the transaction selected for termination.
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut expected = options
+        .open(database.with_extension("expected.json"))
+        .unwrap();
+    expected
+        .write_all(&serde_json::to_vec(&probe_state(&storage, &group)).unwrap())
+        .unwrap();
+    expected.sync_all().unwrap();
+    let probe = || replay_openmls_messages(&storage, &group, std::slice::from_ref(&commit));
+    if std::env::var("MDK_CGKA_REPLAY_NESTED").as_deref() == Ok("1") {
+        storage.with_transaction(|_| probe()).unwrap();
+    } else {
+        probe().unwrap();
+    }
 }

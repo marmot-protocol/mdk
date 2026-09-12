@@ -103,7 +103,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
     boundaries. Reopens encrypted SQLite, observes the stranded pre-hydration state, then verifies hydration restores
-    live state and releases convergence snapshots.
+    live state and releases convergence snapshots. Candidate replay kills after temporary processing and restoration
+    also verify exact pre-probe group state, epoch authenticator, snapshots, input ledger and queued work before
+    hydration, both standalone and inside an outer transaction.
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh

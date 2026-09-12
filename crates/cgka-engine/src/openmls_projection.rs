@@ -846,6 +846,23 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
+    // A probe restores its starting state before this transaction commits.
+    // Joining all temporary OpenMLS writes avoids a durable commit per value;
+    // the guard still restores state for nested/nontransactional backends.
+    storage.with_transaction(|storage| {
+        replay_openmls_messages_probe(storage, group_id, messages, own_commits, profile_policy)
+    })
+}
+
+// Keep the restoration body separate so tests can compare identical replay work
+// with and without the transaction. Production callers enter through the wrapper.
+fn replay_openmls_messages_probe<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
     let snapshot = replay_snapshot_name(group_id, messages);
     // RAII: on any unwind path (panic during replay, early error)
@@ -864,9 +881,19 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
         profile_policy,
         None,
     );
+    #[cfg(test)]
+    candidate_branch_peel_halt_tests::panic_after_replay_if_requested();
+    // A crash fixture must successfully process its candidate before signaling
+    // readiness; an invalid fixture must not pass by killing an unchanged probe.
+    if result.is_ok() {
+        crate::test_crash_hooks::pause_if_requested("candidate-replay-after-processing");
+    }
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    if result.is_ok() {
+        crate::test_crash_hooks::pause_if_requested("candidate-replay-after-restoration");
+    }
     result
 }
 
@@ -4708,12 +4735,19 @@ mod candidate_branch_peel_halt_tests {
             payload: &EncryptedPayload,
             recipient: &MemberId,
         ) -> Result<TransportMessage, PeelerError> {
-            Ok(transport_message(
+            let mut message = transport_message(
                 &payload.ciphertext,
                 TransportEnvelope::Welcome {
                     recipient: recipient.clone(),
                 },
-            ))
+            );
+            // Current-profile founding sends a distinct envelope per invitee,
+            // even when the underlying MLS Welcome bytes are shared.
+            let mut digest = Sha256::new();
+            digest.update(&payload.ciphertext);
+            digest.update(recipient.as_slice());
+            message.id = MessageId::new(digest.finalize().to_vec());
+            Ok(message)
         }
     }
 
@@ -4921,6 +4955,263 @@ mod candidate_branch_peel_halt_tests {
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
         )
         .expect("a branch survey over healthy storage")
+    }
+
+    thread_local! {
+        static PANIC_AFTER_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn panic_after_replay_if_requested() {
+        assert!(
+            !PANIC_AFTER_REPLAY.replace(false),
+            "injected replay panic after MLS writes"
+        );
+    }
+
+    fn replay_state(
+        storage: &SqliteAccountStorage,
+        group_id: &GroupId,
+    ) -> (Vec<u8>, String, Vec<String>) {
+        let mls = MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        (
+            serde_json::to_vec(&storage.get_group(group_id).unwrap()).unwrap(),
+            super::own_commit_post_merge_epoch_authenticator(&mls),
+            storage.list_group_snapshots(group_id).unwrap(),
+        )
+    }
+
+    async fn encrypted_replay_fixture(
+        size: usize,
+    ) -> (
+        tempfile::TempDir,
+        SqliteAccountStorage,
+        GroupId,
+        Vec<TransportMessage>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = SqliteAccountStorage::open_encrypted(
+            root.path().join("observer.sqlite3"),
+            &storage_sqlite::SqlCipherKey::new("replay transaction fixture").unwrap(),
+        )
+        .unwrap();
+        let build = |seed: &[u8], store: SqliteAccountStorage| {
+            EngineBuilder::new(store)
+                .identity(member_id(seed).as_slice().to_vec())
+                .account_identity_proof_signer(Arc::new(SeedProofSigner(signing_key(seed))))
+                .peeler(Box::new(PassthroughPeeler))
+                .build()
+                .unwrap()
+        };
+        let alice_store = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build(b"transaction-alice", alice_store.clone());
+        let mut joiners = vec![build(b"transaction-observer", storage.clone())];
+        for i in 2..size {
+            joiners.push(build(
+                format!("transaction-member-{i}").as_bytes(),
+                SqliteAccountStorage::in_memory().unwrap(),
+            ));
+        }
+        let mut packages = Vec::new();
+        for joiner in &mut joiners {
+            packages.push(joiner.fresh_key_package().await.unwrap());
+        }
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "replay transaction".into(),
+                description: String::new(),
+                members: packages,
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::FoundingGroupCreated { welcomes } = created else {
+            panic!("current-profile founding group");
+        };
+        for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
+            joiner.join_welcome(welcome).await.unwrap();
+        }
+        let messages = (0..3)
+            .map(|_| rival_commit(&alice_store, &alice.self_id(), &group_id))
+            .collect();
+        (root, storage, group_id, messages)
+    }
+
+    #[tokio::test]
+    async fn replay_transaction_preserves_results_and_restores_after_error_and_panic() {
+        use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent};
+        let (_root, storage, group_id, rivals) = encrypted_replay_fixture(4).await;
+        admit_rival(&storage, &group_id, &rivals[0], 1);
+        let queued = QueuedOutboundIntent {
+            id: MessageId::new(b"retained-replay-work".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"retained".to_vec(),
+            },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+        };
+        storage.put_queued_outbound_intent(&queued).unwrap();
+        let before = replay_state(&storage, &group_id);
+        let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+        let own = super::PrevalidatedOwnCommits::default();
+        let check = || {
+            assert!(
+                replay_state(&storage, &group_id) == before,
+                "live MLS/group/snapshots changed"
+            );
+            assert!(
+                storage.list_messages(&group_id, EpochId(0)).unwrap() == ledger,
+                "input ledger changed"
+            );
+            assert!(
+                storage.list_queued_outbound_intents(&group_id).unwrap() == vec![queued.clone()],
+                "queued work changed"
+            );
+        };
+        for rival in &rivals {
+            let messages = std::slice::from_ref(rival);
+            let previous = super::replay_openmls_messages_probe(
+                &storage,
+                &group_id,
+                messages,
+                &own,
+                ReplayProfilePolicy::default(),
+            )
+            .unwrap();
+            let changed = super::replay_openmls_messages_prevalidated_output(
+                &storage,
+                &group_id,
+                messages,
+                &own,
+                ReplayProfilePolicy::default(),
+            )
+            .unwrap();
+            assert!(
+                previous == changed,
+                "transaction changed replay observations"
+            );
+            assert_eq!(changed.final_epoch, 2);
+            check();
+        }
+        // A valid commit mutates MLS storage before the invalid suffix errors.
+        let mut invalid = rivals[0].clone();
+        invalid.payload = vec![0xff];
+        let messages = [rivals[0].clone(), invalid];
+        assert!(
+            super::replay_openmls_messages_prevalidated_output(
+                &storage,
+                &group_id,
+                &messages,
+                &own,
+                ReplayProfilePolicy::default()
+            )
+            .is_err()
+        );
+        check();
+        // A nested caller may catch a probe error and continue its own transaction.
+        storage
+            .with_transaction(|_| -> Result<(), super::OpenMlsProjectionError> {
+                assert!(
+                    super::replay_openmls_messages_prevalidated_output(
+                        &storage,
+                        &group_id,
+                        &messages,
+                        &own,
+                        ReplayProfilePolicy::default()
+                    )
+                    .is_err()
+                );
+                check();
+                Ok(())
+            })
+            .unwrap();
+        let check_caught_panic = || {
+            PANIC_AFTER_REPLAY.set(true);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::replay_openmls_messages_prevalidated_output(
+                    &storage,
+                    &group_id,
+                    &rivals[..1],
+                    &own,
+                    ReplayProfilePolicy::default(),
+                )
+            }));
+            assert!(panic.is_err());
+            check();
+        };
+        check_caught_panic();
+        // Nested transactions have no savepoint: the snapshot guard must also
+        // restore a panic caught by a caller that then commits its outer work.
+        storage
+            .with_transaction(|_| -> Result<(), super::OpenMlsProjectionError> {
+                check_caught_panic();
+                Ok(())
+            })
+            .unwrap();
+        check();
+        // A fresh successful call proves transaction ownership was released.
+        super::replay_openmls_messages_prevalidated_output(
+            &storage,
+            &group_id,
+            &rivals[..1],
+            &own,
+            ReplayProfilePolicy::default(),
+        )
+        .unwrap();
+        check();
+    }
+
+    #[tokio::test]
+    #[ignore = "paired encrypted WAL/FULL replay measurement; --nocapture"]
+    async fn replay_transaction_measurement() {
+        let (_root, storage, group_id, rivals) = encrypted_replay_fixture(20).await;
+        let before = replay_state(&storage, &group_id);
+        let own = super::PrevalidatedOwnCommits::default();
+        let mut elapsed = [Vec::new(), Vec::new()];
+        for round in 0..8 {
+            for batched in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = std::time::Instant::now();
+                for rival in &rivals {
+                    let output = if batched {
+                        super::replay_openmls_messages_prevalidated_output(
+                            &storage,
+                            &group_id,
+                            std::slice::from_ref(rival),
+                            &own,
+                            ReplayProfilePolicy::default(),
+                        )
+                    } else {
+                        super::replay_openmls_messages_probe(
+                            &storage,
+                            &group_id,
+                            std::slice::from_ref(rival),
+                            &own,
+                            ReplayProfilePolicy::default(),
+                        )
+                    }
+                    .unwrap();
+                    assert_eq!(output.final_epoch, 2);
+                }
+                elapsed[usize::from(batched)].push(start.elapsed().as_micros());
+                assert!(replay_state(&storage, &group_id) == before);
+            }
+        }
+        eprintln!(
+            "replay measurement: members=20 probes_per_sample=3 unbatched_us={:?} batched_us={:?}",
+            elapsed[0], elapsed[1]
+        );
     }
 
     // --- The halts -----------------------------------------------------------
