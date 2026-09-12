@@ -9,6 +9,18 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Shared profile-pseudonym helpers are now exported through UniFFI and C
+  (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
+  `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
+
+### Changed
+
+- Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
+  addition to hex, `npub`, and existing URI forms. nprofile relay hints are
+  discarded.
+
 ## [0.9.21] - 2026-09-10
 
 ### Release notes

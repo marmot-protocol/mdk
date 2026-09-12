@@ -28,13 +28,33 @@ impl Marmot {
         marmot_app::npub_for_account_id(&account_id_hex).ok()
     }
 
-    /// Normalize a public-key reference (npub or hex) to canonical hex.
-    /// `None` if it isn't a valid public key. Used to resolve a scanned or
-    /// deep-linked npub back to the account id the rest of the API expects.
+    /// Normalize a public-key reference (hex, `npub`, `nostr:npub`,
+    /// `nprofile`, `nostr:nprofile`, or a `marmot://profile/` link) to
+    /// canonical hex. `None` if it isn't a valid public identity
+    /// reference. nprofile relay hints are discarded. Used to resolve a
+    /// scanned or deep-linked mention back to the account id the rest of
+    /// the API expects.
     pub fn account_id_hex(&self, reference: String) -> Option<String> {
         normalize_member_ref_ffi(&reference)
             .ok()
             .map(|normalized| normalized.account_id_hex)
+    }
+
+    /// Deterministic cosmetic display name for a canonical hex account id.
+    ///
+    /// The seed is hashed as supplied UTF-8 text and is not normalized.
+    /// Decode a scanned reference with [`Self::account_id_hex`] first.
+    /// This does not start networking or mutate a profile.
+    pub fn default_profile_pseudonym(&self, account_id_hex: String) -> String {
+        marmot_app::default_profile_pseudonym(&account_id_hex)
+    }
+
+    /// Random cosmetic display name from the shared wordlists.
+    ///
+    /// This does not generate a signing key, create an account, or
+    /// promise uniqueness or anonymity.
+    pub fn random_profile_pseudonym(&self) -> String {
+        marmot_app::random_profile_pseudonym()
     }
 
     /// Parse plaintext message content into the same Markdown AST returned on
@@ -512,5 +532,66 @@ mod tests {
             SearchUpdateTriggerFfi::SearchCompleted
         ));
         assert!(subscription.next_update().await.is_none());
+    }
+
+    #[test]
+    fn account_id_hex_and_pseudonyms_are_offline_and_match_app_helpers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
+        let nprofile = marmot_app::nprofile_for_account_id(account_id, &[]).expect("nprofile");
+
+        for reference in [
+            account_id,
+            npub,
+            &format!("nostr:{npub}"),
+            nprofile.as_str(),
+            &format!("nostr:{nprofile}"),
+            &format!("marmot://profile/{nprofile}?from=qr"),
+        ] {
+            assert_eq!(
+                kit.account_id_hex(reference.to_owned()).as_deref(),
+                Some(account_id)
+            );
+        }
+        assert_eq!(kit.account_id_hex("not-a-public-key".to_owned()), None);
+        assert_eq!(
+            kit.account_id_hex("nprofile1qqqsnhxh".to_owned()),
+            None,
+            "truncated nprofile stays optional None"
+        );
+        assert_eq!(
+            kit.account_id_hex(format!(" {account_id}")).as_deref(),
+            Some(account_id),
+            "FFI trims whitespace before decoding"
+        );
+
+        assert_eq!(
+            kit.default_profile_pseudonym(account_id.to_owned()),
+            marmot_app::default_profile_pseudonym(account_id)
+        );
+        assert_eq!(
+            kit.default_profile_pseudonym(account_id.to_owned()),
+            "Loyal Crane"
+        );
+        let random = kit.random_profile_pseudonym();
+        let (adjective, noun) = random.split_once(' ').expect("adjective noun");
+        assert!(!noun.contains(' '));
+        assert!(
+            adjective
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        );
+        assert!(
+            noun.chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        );
+        assert!(adjective.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
+        assert!(noun.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
     }
 }

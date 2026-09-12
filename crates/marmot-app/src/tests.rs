@@ -9762,40 +9762,6 @@ fn legacy_projection_update_json_defaults_new_streaming_fields() {
     );
 }
 
-#[test]
-fn default_profile_word_lists_keep_expected_shape() {
-    assert_profile_word_list("adjectives", DEFAULT_PROFILE_ADJECTIVES);
-    assert_profile_word_list("nouns", DEFAULT_PROFILE_NOUNS);
-    assert_eq!(
-        DEFAULT_PROFILE_ADJECTIVES.len() * DEFAULT_PROFILE_NOUNS.len(),
-        16_384
-    );
-}
-
-fn assert_profile_word_list(name: &str, words: &[&str]) {
-    assert_eq!(words.len(), 128, "{name} should have 128 entries");
-    for word in words {
-        assert!(!word.is_empty(), "{name} should not contain empty words");
-        let mut chars = word.chars();
-        assert!(
-            chars.next().is_some_and(|ch| ch.is_ascii_uppercase()),
-            "{name} word should start uppercase: {word}"
-        );
-        assert!(
-            chars.all(|ch| ch.is_ascii_lowercase()),
-            "{name} word should be title-cased ASCII: {word}"
-        );
-    }
-    for pair in words.windows(2) {
-        assert!(
-            pair[0] < pair[1],
-            "{name} should be sorted and unique: {} before {}",
-            pair[0],
-            pair[1]
-        );
-    }
-}
-
 fn relay_delivery(marker: &str, pubkey: String) -> cgka_traits::TransportDelivery {
     // `to_transport_message` verifies the id against the event hash (#351), so
     // the distinguishing marker lives in the content and the id is computed.

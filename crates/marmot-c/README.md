@@ -59,6 +59,15 @@ behind `MarmotMarkdownDetails`. Existing discriminants and union stride stay
 the same; regenerate `marmot.h` and consumer bindings to handle the new tag.
 Older clients cannot render it.
 
+`marmot_account_id_hex` now accepts `nprofile` and `nostr:nprofile`
+references (plus the existing hex/`npub`/`marmot://profile/` forms) and
+discards relay hints. `marmot_default_profile_pseudonym` hashes the
+supplied canonical hex account-id text; decode a scanned reference
+first. `marmot_random_profile_pseudonym` is a cosmetic random roll from
+the same wordlists. Free those strings with `marmot_string_free`.
+Regenerate `marmot.h` after pulling this surface. Android mention/QR
+migration remains a separate consumer issue.
+
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it

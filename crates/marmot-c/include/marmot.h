@@ -6480,9 +6480,11 @@ MarmotStatus marmot_display_name(const struct MarmotClient *client,
 MarmotStatus marmot_npub(const struct MarmotClient *client, const char *account_id_hex, char **out);
 
 /**
- * Hex account id for an `npub`/hex reference; NULL with
- * `MARMOT_STATUS_OK` when the input does not decode. Free with
- * `marmot_string_free`.
+ * Hex account id for an `npub`/hex/`nprofile` reference; NULL with
+ * `MARMOT_STATUS_OK` when the input does not decode. Accepts hex,
+ * `npub`, `nostr:npub`, `nprofile`, `nostr:nprofile`, and
+ * `marmot://profile/` links. nprofile relay hints are discarded. Free
+ * with `marmot_string_free`.
  *
  * # Safety
  * `client` must be a live handle; `reference` a valid string; `out`
@@ -6491,6 +6493,28 @@ MarmotStatus marmot_npub(const struct MarmotClient *client, const char *account_
 MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
                                    const char *reference,
                                    char **out);
+
+/**
+ * Deterministic cosmetic display name for a canonical hex account id.
+ * Free with `marmot_string_free`. Decode a scanned reference with
+ * `marmot_account_id_hex` first; the seed is hashed as supplied text.
+ *
+ * # Safety
+ * Same as `marmot_account_id_hex`.
+ */
+MarmotStatus marmot_default_profile_pseudonym(const struct MarmotClient *client,
+                                              const char *account_id_hex,
+                                              char **out);
+
+/**
+ * Random cosmetic display name from the shared wordlists. Free with
+ * `marmot_string_free`. This does not create an account or generate a
+ * signing key.
+ *
+ * # Safety
+ * `client` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_random_profile_pseudonym(const struct MarmotClient *client, char **out);
 
 /**
  * Aggregate relay-pool health. Free with `marmot_relay_health_free`.

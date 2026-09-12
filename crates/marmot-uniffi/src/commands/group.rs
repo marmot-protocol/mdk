@@ -569,7 +569,9 @@ impl Marmot {
     }
 
     /// Normalize a member reference for group-management UI. Accepts hex,
-    /// `npub`, `nostr:npub...`, and `marmot://profile/...` references.
+    /// `npub`, `nostr:npub...`, `nprofile`, `nostr:nprofile...`, and
+    /// `marmot://profile/...` references. nprofile relay hints are
+    /// discarded and never used for routing or membership authorization.
     pub fn normalize_member_ref(&self, member_ref: String) -> Result<MemberRefFfi, MarmotKitError> {
         normalize_member_ref_ffi(&member_ref)
     }

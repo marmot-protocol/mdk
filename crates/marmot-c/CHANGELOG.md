@@ -7,6 +7,19 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot_default_profile_pseudonym` and `marmot_random_profile_pseudonym`
+  for the shared cosmetic display-name helpers. Free the owned UTF-8
+  strings with `marmot_string_free`. Additive functions; existing status
+  values and struct layouts are unchanged.
+
+### Changed
+
+- `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
+  references and discards relay hints. Existing hex, `npub`, and
+  `marmot://profile/` forms keep their established OK-plus-NULL contract.
+
 ## [0.9.21] - 2026-09-10
 
 This cohort also exposes host-driven agent stream publishing and the v4 audit
