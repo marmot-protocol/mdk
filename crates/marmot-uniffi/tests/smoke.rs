@@ -602,10 +602,10 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
 
     v2.values[6] = "m Text/Plain".into();
     let invalid = parse_media_imeta_tag(v2, 8).expect_err("noncanonical V2 type must fail");
-    assert!(matches!(
-        invalid,
-        MarmotKitError::InvalidMediaReference { .. }
-    ));
+    assert!(
+        matches!(invalid, MarmotKitError::MediaAttachment { .. }),
+        "expected MediaAttachment, got {invalid:?}"
+    );
 }
 
 #[tokio::test]

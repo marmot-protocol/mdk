@@ -102,15 +102,32 @@ pub enum MarmotStatus {
     InvalidProductAnalyticsConfiguration = 67,
     InvalidProductObservation = 68,
     ChatPresentationNotReady = 69,
+    MediaAttachment = 70,
 }
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LAST_MEDIA_ERROR: RefCell<Option<marmot_uniffi::conversions::MediaDiagnosticFfi>> =
+        const { RefCell::new(None) };
 }
 
 /// Record the detail string for the current thread's most recent failure.
 pub(crate) fn set_last_error(message: impl Into<String>) {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(message.into()));
+    clear_last_media_error();
+}
+
+fn set_last_media_error(diagnostic: marmot_uniffi::conversions::MediaDiagnosticFfi) {
+    LAST_MEDIA_ERROR.with(|slot| *slot.borrow_mut() = Some(diagnostic));
+}
+
+pub(crate) fn clear_last_media_error() {
+    LAST_MEDIA_ERROR.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Take (and clear) the current thread's most recent typed media diagnostic.
+pub(crate) fn take_last_media_error() -> Option<marmot_uniffi::conversions::MediaDiagnosticFfi> {
+    LAST_MEDIA_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
 /// Take (and clear) the current thread's most recent failure detail.
@@ -120,7 +137,12 @@ pub(crate) fn take_last_error() -> Option<String> {
 
 /// Map a runtime error to its status code and record its detail string.
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
-    set_last_error(err.to_string());
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(err.to_string()));
+    if let MarmotKitError::MediaAttachment { diagnostic } = err {
+        set_last_media_error(diagnostic.clone());
+    } else {
+        clear_last_media_error();
+    }
     match err {
         MarmotKitError::ConsentRequired => MarmotStatus::ConsentRequired,
         MarmotKitError::InvalidProductAnalyticsConfiguration => {
@@ -161,6 +183,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidChatPin { .. } => MarmotStatus::InvalidChatPin,
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
+        MarmotKitError::MediaAttachment { .. } => MarmotStatus::MediaAttachment,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
@@ -212,6 +235,8 @@ mod tests {
         assert_eq!(MarmotStatus::GroupRemoved as i32, 63);
         assert_eq!(MarmotStatus::OnboardingActionUnavailable as i32, 64);
         assert_eq!(MarmotStatus::OnboardingRequired as i32, 65);
+        assert_eq!(MarmotStatus::ChatPresentationNotReady as i32, 69);
+        assert_eq!(MarmotStatus::MediaAttachment as i32, 70);
     }
 
     #[test]

@@ -7,6 +7,33 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Typed attachment diagnostics (`MarmotMediaDiagnostic`, closed stage/code/field
+  enums, `MarmotMediaAttachmentResult`, and `MarmotMediaAttachmentProjection`)
+  plus `_v2` query, snapshot, next, pagination, callback, and event/projection
+  mirrors that retain rejected attachments and their original indices.
+- Rich event, message, and timeline callback pumps
+  (`marmot_events_subscription_set_callback_v2`,
+  `marmot_messages_subscription_set_callback_v2`,
+  `marmot_timeline_subscription_set_callback_v2`) and
+  `marmot_timeline_subscription_next_v2` for the full-window rich page.
+- `marmot_last_media_error` takes and clears the thread-local typed diagnostic
+  after `MARMOT_STATUS_MEDIA_ATTACHMENT` (70). Non-media failures, including
+  subscription `TIMEOUT` and `CLOSED`, clear a stale diagnostic.
+- `marmot_parse_media_imeta_tag` mirrors the existing UniFFI explicit parser.
+- `examples/media-diagnostics-v2.c` assignment-checks rich callback typedefs so
+  `-Werror` catches signature drift.
+
+### Changed
+
+- Legacy `marmot_list_media`, message, timeline, and event layouts are
+  unchanged diagnostic-loss compatibility views: rejected attachments are
+  omitted and old records do not carry `media_attachments`. The shared
+  newest-message `limit` still applies before that omission, so a newest
+  rejected-only window can be shorter than `limit`. Use the `_v2`
+  symbols for the rich outcome tree. Rebuild against the regenerated header.
+
 ## [0.9.21] - 2026-09-10
 
 This cohort also exposes host-driven agent stream publishing and the v4 audit
@@ -87,6 +114,7 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.21...HEAD
+[0.9.21]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...marmotc-v0.9.21
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

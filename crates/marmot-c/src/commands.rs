@@ -59,10 +59,11 @@ use crate::types::maintenance::{
 use crate::types::markdown::MarmotMarkdownDocument;
 use crate::types::media::{
     MarmotMediaAttachmentReference, MarmotMediaDownloadResult, MarmotMediaRecordList,
-    MarmotMediaUploadRequest, MarmotMediaUploadResult,
+    MarmotMediaRecordV2List, MarmotMediaUploadRequest, MarmotMediaUploadResult,
 };
 use crate::types::message::{
-    MarmotAppMessageRecordList, MarmotRetentionSweepReport, MarmotSecureDeleteExpiredResult,
+    MarmotAppMessageRecordList, MarmotAppMessageRecordV2List, MarmotRetentionSweepReport,
+    MarmotSecureDeleteExpiredResult,
 };
 use crate::types::notification::{
     MarmotBackgroundNotificationCollection, MarmotNotificationSettings,
@@ -79,7 +80,9 @@ use crate::types::relay::{
 use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
-use crate::types::timeline::{MarmotTimelineMessageQuery, MarmotTimelinePage};
+use crate::types::timeline::{
+    MarmotTimelineMessageQuery, MarmotTimelinePage, MarmotTimelinePageV2,
+};
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
 
 /// Shorthand used by every command wrapper: validate + read an argument,
@@ -896,9 +899,20 @@ c_cmd! {
     /// `marmot_app_message_record_list_free`.
     sync fn marmot_messages(account_ref: str, group_id_hex: opt_str, has_limit/limit: opt_val u32, kinds/kinds_len: opt_num_arr u64) -> rec(MarmotAppMessageRecordList) = messages;
 
-    /// Stored media records for the group, capped by `limit` when
-    /// `has_limit`. Free with `marmot_media_record_list_free`.
+    /// Stored media records for the group, capped by the newest-message
+    /// query `limit` when `has_limit`. Free with
+    /// `marmot_media_record_list_free`. Compatibility view: rejected
+    /// attachments are omitted after that message-window cap, so a
+    /// newest rejected-only page can be shorter than `limit`.
     sync fn marmot_list_media(account_ref: str, group_id_hex: str, has_limit/limit: opt_val u32) -> rec(MarmotMediaRecordList) = list_media;
+
+    /// Rich stored raw app messages with attachment outcomes. Free with
+    /// `marmot_app_message_record_v2_list_free`.
+    sync fn marmot_messages_v2(account_ref: str, group_id_hex: opt_str, has_limit/limit: opt_val u32, kinds/kinds_len: opt_num_arr u64) -> rec(MarmotAppMessageRecordV2List) = messages;
+
+    /// Rich stored media records including rejected attachments. Free
+    /// with `marmot_media_record_v2_list_free`.
+    sync fn marmot_list_media_v2(account_ref: str, group_id_hex: str, has_limit/limit: opt_val u32) -> rec(MarmotMediaRecordV2List) = list_media;
 
     /// Cached kind-0 profile for an account id; writes NULL with
     /// `MARMOT_STATUS_OK` when unknown. Free with
@@ -1567,6 +1581,60 @@ pub unsafe extern "C" fn marmot_timeline_messages(
         let query = try_arg!(unsafe { borrowed(query) });
         let query = try_arg!(unsafe { query.to_ffi() });
         unsafe { deliver(client.marmot.timeline_messages(account_ref, query), out) }
+    })
+}
+
+/// Rich materialized timeline read with attachment outcomes. Free the
+/// page with `marmot_timeline_page_v2_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `account_ref` a valid string; `query`
+/// a valid borrowed struct; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_timeline_messages_v2(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    query: *const MarmotTimelineMessageQuery,
+    out: *mut *mut MarmotTimelinePageV2,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let query = try_arg!(unsafe { borrowed(query) });
+        let query = try_arg!(unsafe { query.to_ffi() });
+        unsafe { deliver(client.marmot.timeline_messages(account_ref, query), out) }
+    })
+}
+
+/// Parse one authenticated encrypted-media `imeta` tag. On metadata
+/// rejection, returns `MARMOT_STATUS_MEDIA_ATTACHMENT` and stores the
+/// typed diagnostic for `marmot_last_media_error`. Free a successful
+/// reference with `marmot_media_attachment_reference_free`.
+///
+/// # Safety
+/// `tag` must be a valid borrowed tag; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_parse_media_imeta_tag(
+    tag: *const MarmotMessageTag,
+    source_epoch: u64,
+    out: *mut *mut MarmotMediaAttachmentReference,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let tag = try_arg!(unsafe { borrowed(tag) });
+        let values = try_arg!(unsafe {
+            crate::memory::str_array(tag.values.cast_const().cast(), tag.values_len)
+        });
+        unsafe {
+            deliver(
+                marmot_uniffi::parse_media_imeta_tag(
+                    marmot_uniffi::conversions::MessageTagFfi { values },
+                    source_epoch,
+                ),
+                out,
+            )
+        }
     })
 }
 

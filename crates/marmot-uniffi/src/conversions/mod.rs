@@ -487,6 +487,7 @@ mod tests {
                 kind: 9,
                 source_epoch: None,
                 media: None,
+                media_decode_failed: false,
                 agent_text_stream: None,
                 deleted: false,
                 invalidation_status: Some("LosingBranch".to_owned()),
@@ -494,6 +495,7 @@ mod tests {
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]
             })),
+            media_decode_failed: false,
             agent_text_stream: Some(serde_json::json!({
                 "stream_id_hex": "22"
             })),
@@ -605,6 +607,7 @@ mod tests {
             reply_to_message_id_hex: None,
             reply_preview: None,
             media: None,
+            media_decode_failed: false,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
@@ -651,6 +654,7 @@ mod tests {
             reply_to_message_id_hex: None,
             reply_preview: None,
             media: None,
+            media_decode_failed: false,
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,

@@ -9,7 +9,7 @@
 //! - absent (`null`) versus present-empty (`""`) optional fields survive the
 //!   FFI conversion unchanged;
 //! - malformed, noncanonical, and unknown-version tags surface as the typed
-//!   `MarmotKitError::InvalidMediaReference` error, never a panic;
+//!   `MarmotKitError::MediaAttachment` diagnostic, never a panic;
 //! - converting the FFI record back to the app-layer reference and rebuilding
 //!   through the checked outbound builder reproduces the fixture tag exactly,
 //!   so the conversion drops no field.
@@ -158,13 +158,31 @@ fn assert_fixture_file(file: &str) {
             let err = result.expect_err(&format!("{file}/{name} must be rejected over FFI"));
             let needle = case["error_contains"].as_str().expect("error_contains");
             match &err {
-                MarmotKitError::InvalidMediaReference { details } => assert!(
-                    details.contains(needle),
-                    "{file}/{name} typed error must mention {needle:?}, got: {details}"
-                ),
-                other => panic!(
-                    "{file}/{name} must surface as typed InvalidMediaReference, got {other:?}"
-                ),
+                MarmotKitError::MediaAttachment { diagnostic } => {
+                    assert!(
+                        diagnostic.message.contains(needle),
+                        "{file}/{name} typed diagnostic must mention {needle:?}, got: {}",
+                        diagnostic.message
+                    );
+                    if let Some(code) = case.get("error_code").and_then(serde_json::Value::as_str) {
+                        assert_eq!(
+                            format!("{:?}", diagnostic.code),
+                            code,
+                            "{file}/{name} error_code"
+                        );
+                    }
+                    if let Some(field) = case.get("error_field").and_then(serde_json::Value::as_str)
+                    {
+                        assert_eq!(
+                            diagnostic.field.map(|field| format!("{field:?}")),
+                            Some(field.to_owned()),
+                            "{file}/{name} error_field"
+                        );
+                    }
+                }
+                other => {
+                    panic!("{file}/{name} must surface as MediaAttachment, got {other:?}")
+                }
             }
         }
     }

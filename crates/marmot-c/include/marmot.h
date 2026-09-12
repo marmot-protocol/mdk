@@ -134,6 +134,7 @@ enum MarmotStatus
   MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67,
   MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68,
   MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY = 69,
+  MARMOT_STATUS_MEDIA_ATTACHMENT = 70,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -142,6 +143,49 @@ typedef enum MarmotStatus MarmotStatus;
 typedef int32_t MarmotStatus;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
+
+/**
+ * Attachment pipeline stage.
+ */
+typedef enum MarmotMediaErrorStage {
+  MARMOT_MEDIA_ERROR_STAGE_METADATA,
+  MARMOT_MEDIA_ERROR_STAGE_OUTBOUND,
+  MARMOT_MEDIA_ERROR_STAGE_FETCH,
+  MARMOT_MEDIA_ERROR_STAGE_DECRYPT,
+} MarmotMediaErrorStage;
+
+/**
+ * Closed attachment failure reason.
+ */
+typedef enum MarmotMediaErrorCode {
+  MARMOT_MEDIA_ERROR_CODE_INVALID_STRUCTURE,
+  MARMOT_MEDIA_ERROR_CODE_MISSING_FIELD,
+  MARMOT_MEDIA_ERROR_CODE_DUPLICATE_FIELD,
+  MARMOT_MEDIA_ERROR_CODE_MALFORMED_FIELD,
+  MARMOT_MEDIA_ERROR_CODE_UNSUPPORTED_VERSION,
+  MARMOT_MEDIA_ERROR_CODE_UNSUPPORTED_FORMAT,
+  MARMOT_MEDIA_ERROR_CODE_PROFILE_MISMATCH,
+  MARMOT_MEDIA_ERROR_CODE_DESTINATION_POLICY,
+  MARMOT_MEDIA_ERROR_CODE_NO_SUPPORTED_LOCATOR,
+  MARMOT_MEDIA_ERROR_CODE_DOWNLOAD_FAILED,
+  MARMOT_MEDIA_ERROR_CODE_DECRYPTION_FAILED,
+  MARMOT_MEDIA_ERROR_CODE_INTEGRITY_MISMATCH,
+} MarmotMediaErrorCode;
+
+/**
+ * Closed attachment field vocabulary.
+ */
+typedef enum MarmotMediaErrorField {
+  MARMOT_MEDIA_ERROR_FIELD_VERSION,
+  MARMOT_MEDIA_ERROR_FIELD_LOCATOR,
+  MARMOT_MEDIA_ERROR_FIELD_CIPHERTEXT_SHA256,
+  MARMOT_MEDIA_ERROR_FIELD_PLAINTEXT_SHA256,
+  MARMOT_MEDIA_ERROR_FIELD_NONCE,
+  MARMOT_MEDIA_ERROR_FIELD_MEDIA_TYPE,
+  MARMOT_MEDIA_ERROR_FIELD_FILE_NAME,
+  MARMOT_MEDIA_ERROR_FIELD_DIMENSIONS,
+  MARMOT_MEDIA_ERROR_FIELD_THUMBHASH,
+} MarmotMediaErrorField;
 
 typedef enum MarmotOnboardingStep {
   MARMOT_ONBOARDING_STEP_PROFILE,
@@ -948,6 +992,21 @@ typedef struct MarmotSecretStore {
    */
   MarmotSecretStoreDestroyFn destroy;
 } MarmotSecretStore;
+
+/**
+ * Privacy-safe attachment diagnostic. Also a root returned by
+ * `marmot_last_media_error`.
+ */
+typedef struct MarmotMediaDiagnostic {
+  enum MarmotMediaErrorStage stage;
+  enum MarmotMediaErrorCode code;
+  bool has_field;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotMediaErrorField field;
+  char *message;
+} MarmotMediaDiagnostic;
 
 /**
  * One signed-in (or signed-out but known) account.
@@ -2293,7 +2352,8 @@ typedef struct MarmotMediaLocator {
 /**
  * Fully-resolved encrypted attachment reference. Also a borrowed
  * input to `marmot_send_media_reference` /
- * `marmot_send_media_attachments` / `marmot_download_media`.
+ * `marmot_send_media_attachments` / `marmot_download_media`, and the
+ * success result of `marmot_parse_media_imeta_tag`.
  */
 typedef struct MarmotMediaAttachmentReference {
   struct MarmotMediaLocator *locators;
@@ -2313,7 +2373,8 @@ typedef struct MarmotMediaAttachmentReference {
 } MarmotMediaAttachmentReference;
 
 /**
- * One stored media record.
+ * Legacy success-only stored media record. Rejected attachments are
+ * omitted by `marmot_list_media`.
  */
 typedef struct MarmotMediaRecord {
   char *message_id_hex;
@@ -2328,12 +2389,120 @@ typedef struct MarmotMediaRecord {
 } MarmotMediaRecord;
 
 /**
- *Owned list; free the root with its `_free` function only.
+ * Owned list of legacy success-only media records.
+ *
+ * `marmot_list_media` applies the shared newest-message query `limit`
+ * before this conversion drops rejected attachments. A newest
+ * rejected-only window can therefore be shorter than `limit`, including
+ * empty, even when older parsed media exists. Use
+ * `marmot_list_media_v2` for complete Parsed/Rejected pages; fetching
+ * extra messages to fill a success-only page is out of scope.
  */
 typedef struct MarmotMediaRecordList {
   struct MarmotMediaRecord *items;
   uintptr_t len;
 } MarmotMediaRecordList;
+
+/**
+ * Parsed or rejected attachment outcome.
+ */
+typedef enum MarmotMediaAttachmentResult_Tag {
+  MARMOT_MEDIA_ATTACHMENT_RESULT_PARSED,
+  MARMOT_MEDIA_ATTACHMENT_RESULT_REJECTED,
+} MarmotMediaAttachmentResult_Tag;
+
+typedef struct MarmotMediaAttachmentResult_Parsed_Body {
+  struct MarmotMediaAttachmentReference reference;
+} MarmotMediaAttachmentResult_Parsed_Body;
+
+typedef struct MarmotMediaAttachmentResult_Rejected_Body {
+  struct MarmotMediaDiagnostic diagnostic;
+} MarmotMediaAttachmentResult_Rejected_Body;
+
+typedef struct MarmotMediaAttachmentResult {
+  MarmotMediaAttachmentResult_Tag tag;
+  union {
+    MarmotMediaAttachmentResult_Parsed_Body PARSED;
+    MarmotMediaAttachmentResult_Rejected_Body REJECTED;
+  };
+} MarmotMediaAttachmentResult;
+
+/**
+ * One ordered attachment outcome.
+ */
+typedef struct MarmotMediaAttachmentProjection {
+  bool has_attachment_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentResult result;
+} MarmotMediaAttachmentProjection;
+
+/**
+ * Rich stored raw app message with attachment outcomes.
+ */
+typedef struct MarmotAppMessageRecordV2 {
+  char *message_id_hex;
+  char *direction;
+  char *group_id_hex;
+  char *sender;
+  char *plaintext;
+  struct MarmotMarkdownDocument content_tokens;
+  uint64_t kind;
+  struct MarmotMessageTag *tags;
+  uintptr_t tags_len;
+  struct MarmotMediaAttachmentProjection *media_attachments;
+  uintptr_t media_attachments_len;
+  bool has_source_epoch;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t source_epoch;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
+  uint64_t recorded_at;
+  uint64_t received_at;
+} MarmotAppMessageRecordV2;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAppMessageRecordV2List {
+  struct MarmotAppMessageRecordV2 *items;
+  uintptr_t len;
+} MarmotAppMessageRecordV2List;
+
+/**
+ * Rich stored media record that retains rejected attachments.
+ */
+typedef struct MarmotMediaRecordV2 {
+  char *message_id_hex;
+  uint32_t attachment_index;
+  char *direction;
+  char *group_id_hex;
+  char *sender;
+  struct MarmotMediaAttachmentResult attachment;
+  char *caption;
+  uint64_t recorded_at;
+  uint64_t received_at;
+} MarmotMediaRecordV2;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotMediaRecordV2List {
+  struct MarmotMediaRecordV2 *items;
+  uintptr_t len;
+} MarmotMediaRecordV2List;
 
 /**
  * A freshly created identity plus its published profile and setup
@@ -3122,6 +3291,81 @@ typedef struct MarmotTimelinePage {
 } MarmotTimelinePage;
 
 /**
+ * Rich reply preview with attachment outcomes.
+ */
+typedef struct MarmotTimelineReplyPreviewV2 {
+  char *message_id_hex;
+  char *sender;
+  char *plaintext;
+  struct MarmotMarkdownDocument content_tokens;
+  uint64_t kind;
+  char *media_json;
+  struct MarmotMediaAttachmentReference *media;
+  uintptr_t media_len;
+  struct MarmotMediaAttachmentProjection *media_attachments;
+  uintptr_t media_attachments_len;
+  char *agent_text_stream_json;
+  bool deleted;
+  char *invalidation_status;
+} MarmotTimelineReplyPreviewV2;
+
+/**
+ * Rich materialized timeline row with attachment outcomes.
+ */
+typedef struct MarmotTimelineMessageRecordV2 {
+  char *message_id_hex;
+  char *source_message_id_hex;
+  bool has_source_epoch;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t source_epoch;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
+  char *direction;
+  char *group_id_hex;
+  char *sender;
+  char *plaintext;
+  struct MarmotMarkdownDocument content_tokens;
+  uint64_t kind;
+  struct MarmotMessageTag *tags;
+  uintptr_t tags_len;
+  uint64_t timeline_at;
+  uint64_t received_at;
+  char *reply_to_message_id_hex;
+  struct MarmotTimelineReplyPreviewV2 *reply_preview;
+  char *media_json;
+  struct MarmotMediaAttachmentReference *media;
+  uintptr_t media_len;
+  struct MarmotMediaAttachmentProjection *media_attachments;
+  uintptr_t media_attachments_len;
+  char *agent_text_stream_json;
+  struct MarmotGroupSystemEvent *group_system;
+  struct MarmotTimelineReactionSummary reactions;
+  bool deleted;
+  char *deleted_by_message_id_hex;
+  char *invalidation_status;
+} MarmotTimelineMessageRecordV2;
+
+/**
+ * Rich timeline window with attachment outcomes.
+ */
+typedef struct MarmotTimelinePageV2 {
+  struct MarmotTimelineMessageRecordV2 *messages;
+  uintptr_t messages_len;
+  bool has_more_before;
+  bool has_more_after;
+} MarmotTimelinePageV2;
+
+/**
  * Result of upserting a push registration.
  */
 typedef struct MarmotPushRegistrationSyncResult {
@@ -3887,6 +4131,72 @@ typedef struct MarmotTimelineSubscriptionUpdate {
   };
 } MarmotTimelineSubscriptionUpdate;
 
+typedef enum MarmotTimelineMessageChangeV2_Tag {
+  MARMOT_TIMELINE_MESSAGE_CHANGE_V2_UPSERT,
+  MARMOT_TIMELINE_MESSAGE_CHANGE_V2_REMOVE,
+} MarmotTimelineMessageChangeV2_Tag;
+
+typedef struct MarmotTimelineMessageChangeV2_Upsert_Body {
+  enum MarmotTimelineUpdateTrigger trigger;
+  struct MarmotTimelineMessageRecordV2 message;
+} MarmotTimelineMessageChangeV2_Upsert_Body;
+
+typedef struct MarmotTimelineMessageChangeV2_Remove_Body {
+  char *message_id_hex;
+  enum MarmotTimelineRemoveReason reason;
+} MarmotTimelineMessageChangeV2_Remove_Body;
+
+typedef struct MarmotTimelineMessageChangeV2 {
+  MarmotTimelineMessageChangeV2_Tag tag;
+  union {
+    MarmotTimelineMessageChangeV2_Upsert_Body UPSERT;
+    MarmotTimelineMessageChangeV2_Remove_Body REMOVE;
+  };
+} MarmotTimelineMessageChangeV2;
+
+/**
+ * Rich projection delta with attachment outcomes.
+ */
+typedef struct MarmotTimelineProjectionUpdateV2 {
+  char *group_id_hex;
+  struct MarmotTimelineMessageRecordV2 *messages;
+  uintptr_t messages_len;
+  struct MarmotTimelineMessageChangeV2 *changes;
+  uintptr_t changes_len;
+  struct MarmotChatListRow *chat_list_row;
+  enum MarmotChatListUpdateTrigger chat_list_trigger;
+} MarmotTimelineProjectionUpdateV2;
+
+/**
+ * Rich projection delta plus the account it belongs to.
+ */
+typedef struct MarmotRuntimeProjectionUpdateV2 {
+  char *account_id_hex;
+  char *account_label;
+  struct MarmotTimelineProjectionUpdateV2 update;
+} MarmotRuntimeProjectionUpdateV2;
+
+typedef enum MarmotTimelineSubscriptionUpdateV2_Tag {
+  MARMOT_TIMELINE_SUBSCRIPTION_UPDATE_V2_PAGE,
+  MARMOT_TIMELINE_SUBSCRIPTION_UPDATE_V2_PROJECTION,
+} MarmotTimelineSubscriptionUpdateV2_Tag;
+
+typedef struct MarmotTimelineSubscriptionUpdateV2_Page_Body {
+  struct MarmotTimelinePageV2 page;
+} MarmotTimelineSubscriptionUpdateV2_Page_Body;
+
+typedef struct MarmotTimelineSubscriptionUpdateV2_Projection_Body {
+  struct MarmotRuntimeProjectionUpdateV2 update;
+} MarmotTimelineSubscriptionUpdateV2_Projection_Body;
+
+typedef struct MarmotTimelineSubscriptionUpdateV2 {
+  MarmotTimelineSubscriptionUpdateV2_Tag tag;
+  union {
+    MarmotTimelineSubscriptionUpdateV2_Page_Body PAGE;
+    MarmotTimelineSubscriptionUpdateV2_Projection_Body PROJECTION;
+  };
+} MarmotTimelineSubscriptionUpdateV2;
+
 /**
  * Callback invoked with each item (borrowed; valid only during
  * the call) and finally with NULL when the stream closes.
@@ -3987,6 +4297,185 @@ typedef struct MarmotMessageUpdate {
  * the call) and finally with NULL when the stream closes.
  */
 typedef void (*MarmotMessageUpdateCallback)(const struct MarmotMessageUpdate *item, void *user_data);
+
+/**
+ * Rich live-received message with attachment outcomes.
+ */
+typedef struct MarmotReceivedMessageV2 {
+  char *message_id_hex;
+  char *group_id_hex;
+  char *sender;
+  char *sender_display_name;
+  char *plaintext;
+  struct MarmotMarkdownDocument content_tokens;
+  uint64_t kind;
+  struct MarmotMessageTag *tags;
+  uintptr_t tags_len;
+  struct MarmotMediaAttachmentProjection *media_attachments;
+  uintptr_t media_attachments_len;
+  uint64_t source_epoch;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
+  uint64_t recorded_at;
+  uint64_t received_at;
+} MarmotReceivedMessageV2;
+
+/**
+ * Rich received message plus the account it arrived on.
+ */
+typedef struct MarmotRuntimeMessageReceivedV2 {
+  char *account_id_hex;
+  char *account_label;
+  struct MarmotReceivedMessageV2 message;
+} MarmotRuntimeMessageReceivedV2;
+
+/**
+ * One rich message-subscription update with attachment outcomes.
+ */
+typedef enum MarmotMessageUpdateV2_Tag {
+  MARMOT_MESSAGE_UPDATE_V2_MESSAGE,
+  MARMOT_MESSAGE_UPDATE_V2_AGENT_STREAM_STARTED,
+} MarmotMessageUpdateV2_Tag;
+
+typedef struct MarmotMessageUpdateV2_Message_Body {
+  struct MarmotRuntimeMessageReceivedV2 received;
+} MarmotMessageUpdateV2_Message_Body;
+
+typedef struct MarmotMessageUpdateV2_AgentStreamStarted_Body {
+  struct MarmotRuntimeMessageReceivedV2 received;
+} MarmotMessageUpdateV2_AgentStreamStarted_Body;
+
+typedef struct MarmotMessageUpdateV2 {
+  MarmotMessageUpdateV2_Tag tag;
+  union {
+    MarmotMessageUpdateV2_Message_Body MESSAGE;
+    MarmotMessageUpdateV2_AgentStreamStarted_Body AGENT_STREAM_STARTED;
+  };
+} MarmotMessageUpdateV2;
+
+/**
+ * One top-level runtime event with rich attachment outcomes.
+ */
+typedef enum MarmotEventV2_Tag {
+  MARMOT_EVENT_V2_GROUP_JOINED,
+  MARMOT_EVENT_V2_GROUP_STATE_UPDATED,
+  MARMOT_EVENT_V2_MESSAGE_RECEIVED,
+  MARMOT_EVENT_V2_PROJECTION_UPDATED,
+  MARMOT_EVENT_V2_GROUP_EVENT,
+  MARMOT_EVENT_V2_ACCOUNT_ERROR,
+  MARMOT_EVENT_V2_AGENT_STREAM_ACTIVITY,
+  MARMOT_EVENT_V2_WELCOME_DELIVERY_PENDING,
+  MARMOT_EVENT_V2_EPOCH_STALL_ESCALATED,
+  MARMOT_EVENT_V2_GROUP_CHANGE_SUPERSEDED,
+} MarmotEventV2_Tag;
+
+typedef struct MarmotEventV2_GroupJoined_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+} MarmotEventV2_GroupJoined_Body;
+
+typedef struct MarmotEventV2_GroupStateUpdated_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+} MarmotEventV2_GroupStateUpdated_Body;
+
+typedef struct MarmotEventV2_MessageReceived_Body {
+  struct MarmotRuntimeMessageReceivedV2 received;
+} MarmotEventV2_MessageReceived_Body;
+
+typedef struct MarmotEventV2_ProjectionUpdated_Body {
+  struct MarmotRuntimeProjectionUpdateV2 update;
+} MarmotEventV2_ProjectionUpdated_Body;
+
+typedef struct MarmotEventV2_GroupEvent_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+  struct MarmotGroupEventKind event;
+} MarmotEventV2_GroupEvent_Body;
+
+typedef struct MarmotEventV2_AccountError_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *message;
+} MarmotEventV2_AccountError_Body;
+
+typedef struct MarmotEventV2_AgentStreamActivity_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEventV2_AgentStreamActivity_Body;
+
+typedef struct MarmotEventV2_WelcomeDeliveryPending_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+  char *message_id_hex;
+  char *recipient_hex;
+} MarmotEventV2_WelcomeDeliveryPending_Body;
+
+typedef struct MarmotEventV2_EpochStallEscalated_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+  uint64_t stalled_epoch;
+  uint32_t arms;
+} MarmotEventV2_EpochStallEscalated_Body;
+
+typedef struct MarmotEventV2_GroupChangeSuperseded_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+  char *commit_id_hex;
+  char *kind;
+  char *outcome;
+  char *reason;
+} MarmotEventV2_GroupChangeSuperseded_Body;
+
+typedef struct MarmotEventV2 {
+  MarmotEventV2_Tag tag;
+  union {
+    MarmotEventV2_GroupJoined_Body GROUP_JOINED;
+    MarmotEventV2_GroupStateUpdated_Body GROUP_STATE_UPDATED;
+    MarmotEventV2_MessageReceived_Body MESSAGE_RECEIVED;
+    MarmotEventV2_ProjectionUpdated_Body PROJECTION_UPDATED;
+    MarmotEventV2_GroupEvent_Body GROUP_EVENT;
+    MarmotEventV2_AccountError_Body ACCOUNT_ERROR;
+    MarmotEventV2_AgentStreamActivity_Body AGENT_STREAM_ACTIVITY;
+    MarmotEventV2_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING;
+    MarmotEventV2_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
+    MarmotEventV2_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
+  };
+} MarmotEventV2;
+
+/**
+ * Callback invoked with each rich event (borrowed; valid only during the
+ * call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotEventCallbackV2)(const struct MarmotEventV2 *item, void *user_data);
+
+/**
+ * Callback invoked with each rich message update (borrowed; valid only
+ * during the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotMessageUpdateCallbackV2)(const struct MarmotMessageUpdateV2 *item,
+                                              void *user_data);
+
+/**
+ * Callback invoked with each rich full-window timeline page (borrowed;
+ * valid only during the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotTimelinePageCallbackV2)(const struct MarmotTimelinePageV2 *item,
+                                             void *user_data);
 
 /**
  * Callback invoked with each item (borrowed; valid only during
@@ -4280,6 +4769,15 @@ void marmot_client_free(struct MarmotClient *client);
  * owned copy: free it with `marmot_string_free`. Reading clears the slot.
  */
 char *marmot_last_error_message(void);
+
+/**
+ * Return the typed media diagnostic for the current thread's most
+ * recent `MARMOT_STATUS_MEDIA_ATTACHMENT` failure, or NULL if there is
+ * none. Reading takes and clears the slot. Free with
+ * `marmot_media_diagnostic_free`. Non-media failures clear a stale
+ * diagnostic.
+ */
+struct MarmotMediaDiagnostic *marmot_last_media_error(void);
 
 /**
  * Free a string returned by this library (`marmot_last_error_message`,
@@ -5736,8 +6234,11 @@ MarmotStatus marmot_messages(const struct MarmotClient *client,
                              struct MarmotAppMessageRecordList **out);
 
 /**
- * Stored media records for the group, capped by `limit` when
- * `has_limit`. Free with `marmot_media_record_list_free`.
+ * Stored media records for the group, capped by the newest-message
+ * query `limit` when `has_limit`. Free with
+ * `marmot_media_record_list_free`. Compatibility view: rejected
+ * attachments are omitted after that message-window cap, so a
+ * newest rejected-only page can be shorter than `limit`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -5751,6 +6252,42 @@ MarmotStatus marmot_list_media(const struct MarmotClient *client,
                                uint8_t has_limit,
                                uint32_t limit,
                                struct MarmotMediaRecordList **out);
+
+/**
+ * Rich stored raw app messages with attachment outcomes. Free with
+ * `marmot_app_message_record_v2_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_messages_v2(const struct MarmotClient *client,
+                                const char *account_ref,
+                                const char *group_id_hex,
+                                uint8_t has_limit,
+                                uint32_t limit,
+                                const uint64_t *kinds,
+                                uintptr_t kinds_len,
+                                struct MarmotAppMessageRecordV2List **out);
+
+/**
+ * Rich stored media records including rejected attachments. Free
+ * with `marmot_media_record_v2_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_list_media_v2(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *group_id_hex,
+                                  uint8_t has_limit,
+                                  uint32_t limit,
+                                  struct MarmotMediaRecordV2List **out);
 
 /**
  * Cached kind-0 profile for an account id; writes NULL with
@@ -6670,6 +7207,32 @@ MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
                                       struct MarmotTimelinePage **out);
 
 /**
+ * Rich materialized timeline read with attachment outcomes. Free the
+ * page with `marmot_timeline_page_v2_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `account_ref` a valid string; `query`
+ * a valid borrowed struct; `out` valid.
+ */
+MarmotStatus marmot_timeline_messages_v2(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const struct MarmotTimelineMessageQuery *query,
+                                         struct MarmotTimelinePageV2 **out);
+
+/**
+ * Parse one authenticated encrypted-media `imeta` tag. On metadata
+ * rejection, returns `MARMOT_STATUS_MEDIA_ATTACHMENT` and stores the
+ * typed diagnostic for `marmot_last_media_error`. Free a successful
+ * reference with `marmot_media_attachment_reference_free`.
+ *
+ * # Safety
+ * `tag` must be a valid borrowed tag; `out` valid.
+ */
+MarmotStatus marmot_parse_media_imeta_tag(const struct MarmotMessageTag *tag,
+                                          uint64_t source_epoch,
+                                          struct MarmotMediaAttachmentReference **out);
+
+/**
  * Register (or update) the account's native push token and share it.
  * `platform` is a `MarmotPushPlatform` discriminant; out-of-range values
  * are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`. Free with
@@ -7451,6 +8014,50 @@ MarmotStatus marmot_timeline_subscription_paginate_forwards(const struct MarmotT
                                                             struct MarmotTimelinePage **out_page);
 
 /**
+ * Take the initial window snapshot with attachment outcomes. Yields the
+ * page exactly once: later calls write NULL with `MARMOT_STATUS_OK`.
+ * Free the page with `marmot_timeline_page_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out_page` valid.
+ */
+MarmotStatus marmot_timeline_subscription_snapshot_v2(const struct MarmotTimelineSubscription *sub,
+                                                      struct MarmotTimelinePageV2 **out_page);
+
+/**
+ * Block until the next rich delta (page replacement or projection
+ * update). Free with `marmot_timeline_subscription_update_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out_update` valid.
+ */
+MarmotStatus marmot_timeline_subscription_next_update_v2(const struct MarmotTimelineSubscription *sub,
+                                                         uint32_t timeout_ms,
+                                                         struct MarmotTimelineSubscriptionUpdateV2 **out_update);
+
+/**
+ * Extend the window toward older history and return the rich window.
+ * Free with `marmot_timeline_page_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out_page` valid.
+ */
+MarmotStatus marmot_timeline_subscription_paginate_backwards_v2(const struct MarmotTimelineSubscription *sub,
+                                                                uint32_t count,
+                                                                struct MarmotTimelinePageV2 **out_page);
+
+/**
+ * Extend the window toward the live head and return the rich window.
+ * Free with `marmot_timeline_page_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out_page` valid.
+ */
+MarmotStatus marmot_timeline_subscription_paginate_forwards_v2(const struct MarmotTimelineSubscription *sub,
+                                                               uint32_t count,
+                                                               struct MarmotTimelinePageV2 **out_page);
+
+/**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_notification_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
  *
  * # Safety
@@ -7747,6 +8354,86 @@ MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client,
  */
 MarmotStatus marmot_messages_subscription_snapshot(const struct MarmotMessagesSubscription *sub,
                                                    struct MarmotAppMessageRecordList **out_list);
+
+/**
+ * Take the initial rich message-record snapshot with attachment
+ * outcomes. Yields the populated list exactly once: later calls write
+ * an EMPTY list, still with `MARMOT_STATUS_OK`. Free with
+ * `marmot_app_message_record_v2_list_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out_list` valid.
+ */
+MarmotStatus marmot_messages_subscription_snapshot_v2(const struct MarmotMessagesSubscription *sub,
+                                                      struct MarmotAppMessageRecordV2List **out_list);
+
+/**
+ * Block until the next rich message update. Free with
+ * `marmot_message_update_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_messages_subscription_next_v2(const struct MarmotMessagesSubscription *sub,
+                                                  uint32_t timeout_ms,
+                                                  struct MarmotMessageUpdateV2 **out);
+
+/**
+ * Block until the next rich event. Free with `marmot_event_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_events_subscription_next_v2(const struct MarmotEventsSubscription *sub,
+                                                uint32_t timeout_ms,
+                                                struct MarmotEventV2 **out);
+
+/**
+ * Block until the next rich full-window timeline page. Free with
+ * `marmot_timeline_page_v2_free`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_timeline_subscription_next_v2(const struct MarmotTimelineSubscription *sub,
+                                                  uint32_t timeout_ms,
+                                                  struct MarmotTimelinePageV2 **out);
+
+/**
+ * Install a rich event callback pump. Same ownership, cancellation, and
+ * thread-safety rules as `marmot_events_subscription_set_callback`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function pointer.
+ * `user_data` must outlive every callback invocation.
+ */
+MarmotStatus marmot_events_subscription_set_callback_v2(const struct MarmotEventsSubscription *sub,
+                                                        MarmotEventCallbackV2 callback,
+                                                        void *user_data);
+
+/**
+ * Install a rich message callback pump. Same ownership, cancellation, and
+ * thread-safety rules as `marmot_messages_subscription_set_callback`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function pointer.
+ * `user_data` must outlive every callback invocation.
+ */
+MarmotStatus marmot_messages_subscription_set_callback_v2(const struct MarmotMessagesSubscription *sub,
+                                                          MarmotMessageUpdateCallbackV2 callback,
+                                                          void *user_data);
+
+/**
+ * Install a rich timeline callback pump. Same ownership, cancellation, and
+ * thread-safety rules as `marmot_timeline_subscription_set_callback`.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function pointer.
+ * `user_data` must outlive every callback invocation.
+ */
+MarmotStatus marmot_timeline_subscription_set_callback_v2(const struct MarmotTimelineSubscription *sub,
+                                                          MarmotTimelinePageCallbackV2 callback,
+                                                          void *user_data);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_app_group_record_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
@@ -8411,6 +9098,14 @@ void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList
 void marmot_event_free(struct MarmotEvent *event);
 
 /**
+ * Free a rich event returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `event` must be NULL or an unfreed pointer returned by this library.
+ */
+void marmot_event_v2_free(struct MarmotEventV2 *event);
+
+/**
  * Free a disband request returned by `marmot_disband_group`. NULL is a
  * no-op. (Embedded copies inside a chat row are released by the row.)
  *
@@ -8652,6 +9347,16 @@ void marmot_markdown_document_free(struct MarmotMarkdownDocument *ptr);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_media_attachment_reference_free(struct MarmotMediaAttachmentReference *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_media_upload_result_free(struct MarmotMediaUploadResult *ptr);
 
 /**
@@ -8665,13 +9370,41 @@ void marmot_media_upload_result_free(struct MarmotMediaUploadResult *ptr);
 void marmot_media_download_result_free(struct MarmotMediaDownloadResult *ptr);
 
 /**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_media_diagnostic_free(struct MarmotMediaDiagnostic *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this library.
+ */
+void marmot_media_record_list_free(struct MarmotMediaRecordList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_media_record_v2_free(struct MarmotMediaRecordV2 *ptr);
+
+/**
  * Free a list returned by this library. NULL is a no-op.
  *
  * # Safety
  * `list` must be NULL or an unfreed pointer returned by this
  * library.
  */
-void marmot_media_record_list_free(struct MarmotMediaRecordList *list);
+void marmot_media_record_v2_list_free(struct MarmotMediaRecordV2List *list);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -8700,6 +9433,25 @@ void marmot_app_message_record_list_free(struct MarmotAppMessageRecordList *list
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_app_message_record_v2_free(struct MarmotAppMessageRecordV2 *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_app_message_record_v2_list_free(struct MarmotAppMessageRecordV2List *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_secure_delete_expired_result_free(struct MarmotSecureDeleteExpiredResult *ptr);
 
 /**
@@ -8713,12 +9465,30 @@ void marmot_secure_delete_expired_result_free(struct MarmotSecureDeleteExpiredRe
 void marmot_runtime_message_received_free(struct MarmotRuntimeMessageReceived *ptr);
 
 /**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_runtime_message_received_v2_free(struct MarmotRuntimeMessageReceivedV2 *ptr);
+
+/**
  * Free a message update returned by this library. NULL is a no-op.
  *
  * # Safety
  * `update` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_message_update_free(struct MarmotMessageUpdate *update);
+
+/**
+ * Free a rich message update returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `update` must be NULL or an unfreed pointer returned by this library.
+ */
+void marmot_message_update_v2_free(struct MarmotMessageUpdateV2 *update);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -8877,7 +9647,27 @@ void marmot_timeline_message_record_free(struct MarmotTimelineMessageRecord *ptr
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_timeline_message_record_v2_free(struct MarmotTimelineMessageRecordV2 *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_timeline_page_free(struct MarmotTimelinePage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_timeline_page_v2_free(struct MarmotTimelinePageV2 *ptr);
 
 /**
  * Free a timeline-subscription delta returned by this library. NULL is a
@@ -8887,6 +9677,14 @@ void marmot_timeline_page_free(struct MarmotTimelinePage *ptr);
  * `update` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_timeline_subscription_update_free(struct MarmotTimelineSubscriptionUpdate *update);
+
+/**
+ * Free a rich timeline-subscription delta. NULL is a no-op.
+ *
+ * # Safety
+ * `update` must be NULL or an unfreed pointer returned by this library.
+ */
+void marmot_timeline_subscription_update_v2_free(struct MarmotTimelineSubscriptionUpdateV2 *update);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -4,6 +4,7 @@ use cgka_traits::app_components::{BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPO
 pub(crate) use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
 use url::{Host, Url};
 
+use super::diagnostics::{MediaErrorCode, MediaErrorField, metadata_error};
 use super::{EncryptedMediaVersion, MediaLocator};
 use crate::AppError;
 
@@ -20,16 +21,23 @@ pub(crate) fn validate_locator(
     allow_loopback_http: bool,
 ) -> Result<(), AppError> {
     if locator.kind.trim().is_empty() || locator.value.trim().is_empty() {
-        return Err(AppError::InvalidAppMessagePayload(
-            "media locator kind and value cannot be empty".into(),
+        return Err(metadata_error(
+            MediaErrorCode::MalformedField,
+            Some(MediaErrorField::Locator),
+            "media locator kind and value cannot be empty",
         ));
     }
     // The locator KIND is a fetchability concern, not a validity condition: an
     // out-of-policy or client-unsupported kind (e.g. a non-Blossom `ipfs://`
     // locator) is kept and handled at fetch time, never dropped here, because
     // media is authenticated by its hashes + AEAD independent of the locator.
-    let url = Url::parse(&locator.value)
-        .map_err(|_| AppError::InvalidAppMessagePayload("media locator URL is invalid".into()))?;
+    let url = Url::parse(&locator.value).map_err(|_| {
+        metadata_error(
+            MediaErrorCode::MalformedField,
+            Some(MediaErrorField::Locator),
+            "media locator URL is invalid",
+        )
+    })?;
     // Host safety is the exception that DOES drop: a Blossom locator is one this
     // client will fetch over HTTP, so an unsafe host (loopback / non-public /
     // IPv6-transition) or cleartext scheme is a hostile request vector that
@@ -40,14 +48,18 @@ pub(crate) fn validate_locator(
         match version {
             EncryptedMediaVersion::V1 => {
                 validate_blossom_fetch_url(&url, allow_loopback_http).map_err(|err| {
-                    AppError::InvalidAppMessagePayload(format!(
-                        "media locator URL is unsafe: {err}"
-                    ))
+                    metadata_error(
+                        MediaErrorCode::DestinationPolicy,
+                        Some(MediaErrorField::Locator),
+                        format!("media locator URL is unsafe: {err}"),
+                    )
                 })?;
             }
             EncryptedMediaVersion::V2 if !matches!(url.scheme(), "http" | "https") => {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "Blossom media locator URL scheme must be http or https".into(),
+                return Err(metadata_error(
+                    MediaErrorCode::MalformedField,
+                    Some(MediaErrorField::Locator),
+                    "Blossom media locator URL scheme must be http or https",
                 ));
             }
             EncryptedMediaVersion::V2 => {}

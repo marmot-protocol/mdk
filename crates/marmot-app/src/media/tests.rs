@@ -294,10 +294,160 @@ fn invalid_media_attachment_is_local_to_that_attachment() {
     ));
 }
 
+#[test]
+fn well_formed_unsupported_locator_stays_parsed() {
+    let mut tag = valid_imeta_tag();
+    tag[2] = format!("locator ipfs https://media.example/{}.bin", "11".repeat(32));
+    let reference = media_attachment_from_imeta_tag(&tag, Some(3), false)
+        .expect("unsupported locator kind is fetchability, not metadata");
+    assert_eq!(reference.locators[0].kind, "ipfs");
+    let outcomes = project_media_attachments(&[tag], Some(3), false);
+    assert!(matches!(
+        outcomes[0].result,
+        MediaAttachmentResult::Parsed { .. }
+    ));
+}
+
+#[test]
+fn v1_loopback_locator_is_destination_policy_not_download_failed() {
+    let err = media_attachment_from_imeta_tag(
+        &tag_with_locator(format!("http://127.0.0.1/{}.bin", "11".repeat(32))),
+        Some(1),
+        false,
+    )
+    .expect_err("V1 loopback without the explicit flag is a policy rejection");
+    let AppError::MediaAttachment(diagnostic) = err else {
+        panic!("expected typed media diagnostic, got {err:?}");
+    };
+    assert_eq!(diagnostic.stage, MediaErrorStage::Metadata);
+    assert_eq!(diagnostic.code, MediaErrorCode::DestinationPolicy);
+    assert_eq!(diagnostic.field, Some(MediaErrorField::Locator));
+}
+
 fn tag_with_locator(locator: String) -> Vec<String> {
     let mut tag = valid_imeta_tag();
     tag[2] = format!("locator blossom-v1 {locator}");
     tag
+}
+
+fn v2_tag_with_locator(locator: String) -> Vec<String> {
+    let mut tag = valid_v2_imeta_tag();
+    tag[2] = format!("locator blossom-v1 {locator}");
+    tag
+}
+
+fn assert_fetch_destination_policy(err: AppError) {
+    let AppError::MediaAttachment(diagnostic) = err else {
+        panic!("expected typed DestinationPolicy, got {err:?}");
+    };
+    assert_eq!(diagnostic.stage, MediaErrorStage::Fetch);
+    assert_eq!(diagnostic.code, MediaErrorCode::DestinationPolicy);
+    assert_eq!(diagnostic.field, Some(MediaErrorField::Locator));
+}
+
+#[test]
+fn v2_loopback_https_locator_stays_parsed() {
+    let tag = v2_tag_with_locator(format!("https://127.0.0.1/{}.bin", valid_hash()));
+    let reference = media_attachment_from_imeta_tag(&tag, Some(7), false)
+        .expect("V2 locator validity is independent of local destination policy");
+    let outcomes = project_media_attachments(&[tag], Some(7), false);
+    assert!(matches!(
+        outcomes[0].result,
+        MediaAttachmentResult::Parsed { .. }
+    ));
+    assert_eq!(reference.version, ENCRYPTED_MEDIA_FORMAT_V2);
+}
+
+#[tokio::test]
+async fn v2_loopback_https_fetch_is_destination_policy_without_dialing() {
+    let tag = v2_tag_with_locator(format!("https://127.0.0.1:1/{}.bin", valid_hash()));
+    let reference = media_attachment_from_imeta_tag(&tag, Some(7), false)
+        .expect("V2 loopback HTTPS remains parsed");
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = fetch_encrypted_media_blob(&reference, &[], &allowed, false)
+        .await
+        .expect_err("literal loopback HTTPS is a fetch-time policy rejection");
+    assert_fetch_destination_policy(err);
+}
+
+#[tokio::test]
+async fn resolved_private_address_fetch_is_destination_policy_without_dialing() {
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_resolutions = resolutions.clone();
+    let resolver: DnsResolver = Arc::new(move |_domain, port| {
+        resolver_resolutions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(vec![format!("10.0.0.5:{port}").parse().unwrap()]) })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a hostname that resolves to a private address is policy, not download");
+    assert_fetch_destination_policy(err);
+    assert!(
+        resolutions.load(Ordering::SeqCst) >= 1,
+        "policy rejection must inspect the resolved address set"
+    );
+    assert_eq!(
+        transport.clients_built(),
+        0,
+        "private resolved addresses must be rejected before a pinned client is built"
+    );
+}
+
+#[tokio::test]
+async fn unsafe_redirect_fetch_is_destination_policy_without_dialing_target() {
+    let hash = valid_hash();
+    let redirecting_server = spawn_http_response(http_redirect_response(&format!(
+        "https://10.0.0.5/{hash}.bin"
+    )));
+    let mut reference = blossom_reference();
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("{redirecting_server}/{hash}.bin"),
+    }];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("unsafe redirect target is a policy rejection");
+    assert_fetch_destination_policy(err);
+    assert_eq!(
+        transport.clients_built(),
+        1,
+        "only the first-hop redirector may receive a pinned client"
+    );
+}
+
+#[tokio::test]
+async fn destination_policy_failover_still_reaches_usable_locator() {
+    let body = b"usable ciphertext";
+    let hash = hex::encode(Sha256::digest(body));
+    let healthy = spawn_http_response(http_ok_response(body));
+    let mut reference = blossom_reference();
+    reference.ciphertext_sha256 = hash.clone();
+    reference.locators = vec![
+        MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://127.0.0.1:1/{hash}.bin"),
+        },
+        MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{healthy}/{hash}.bin"),
+        },
+    ];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let downloaded = fetch_encrypted_media_blob(&reference, &[], &allowed, true)
+        .await
+        .expect("a later usable locator must still succeed");
+    assert_eq!(downloaded, body);
 }
 
 #[test]
@@ -1479,13 +1629,16 @@ async fn production_config_does_not_fetch_loopback_endpoint() {
         .await
         .expect_err("loopback-only reference must be unfetchable in production");
     match err {
-        AppError::InvalidEncryptedMedia(message) => {
+        AppError::MediaAttachment(diagnostic) => {
+            assert_eq!(diagnostic.stage, MediaErrorStage::Fetch);
+            assert_eq!(diagnostic.code, MediaErrorCode::NoSupportedLocator);
             assert!(
-                message.contains("no supported locators"),
-                "expected unfetchable error, got: {message}"
+                diagnostic.message.contains("no supported locators"),
+                "expected unfetchable error, got: {}",
+                diagnostic.message
             );
         }
-        other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        other => panic!("expected MediaAttachment, got {other:?}"),
     }
 }
 
@@ -1512,11 +1665,15 @@ async fn loopback_fallback_endpoint_is_skipped_in_production() {
         .await
         .expect_err("loopback fallback must be unfetchable in production");
     match err {
-        AppError::InvalidEncryptedMedia(message) => assert!(
-            message.contains("no supported locators"),
-            "expected unfetchable error, got: {message}"
-        ),
-        other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        AppError::MediaAttachment(diagnostic) => {
+            assert_eq!(diagnostic.code, MediaErrorCode::NoSupportedLocator);
+            assert!(
+                diagnostic.message.contains("no supported locators"),
+                "expected unfetchable error, got: {}",
+                diagnostic.message
+            );
+        }
+        other => panic!("expected MediaAttachment, got {other:?}"),
     }
     // The loopback fallback would survive the candidate filter only when the
     // dev/test gate is on; assert the classifier agrees so the gate stays the
@@ -1549,11 +1706,16 @@ async fn out_of_policy_blossom_locator_is_unfetchable_not_a_hard_error() {
         .await
         .expect_err("an out-of-policy blossom locator must be unfetchable");
     match err {
-        AppError::InvalidEncryptedMedia(message) => assert!(
-            message.contains("no supported locators"),
-            "expected unfetchable error, got: {message}"
-        ),
-        other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        AppError::MediaAttachment(diagnostic) => {
+            assert_eq!(diagnostic.stage, MediaErrorStage::Fetch);
+            assert_eq!(diagnostic.code, MediaErrorCode::NoSupportedLocator);
+            assert!(
+                diagnostic.message.contains("no supported locators"),
+                "expected unfetchable error, got: {}",
+                diagnostic.message
+            );
+        }
+        other => panic!("expected MediaAttachment, got {other:?}"),
     }
     // The reference is still structurally valid: out-of-policy is a
     // fetchability concern, not a structural one.
@@ -2188,6 +2350,23 @@ fn assert_shared_media_fixture_file(file: &str) {
                 err.to_string().contains(needle),
                 "{file}/{name} error must mention {needle:?}, got: {err}"
             );
+            let AppError::MediaAttachment(diagnostic) = &err else {
+                panic!("{file}/{name} must surface as MediaAttachment, got {err:?}");
+            };
+            if let Some(code) = case.get("error_code").and_then(serde_json::Value::as_str) {
+                assert_eq!(
+                    format!("{:?}", diagnostic.code),
+                    code,
+                    "{file}/{name} error_code"
+                );
+            }
+            if let Some(field) = case.get("error_field").and_then(serde_json::Value::as_str) {
+                assert_eq!(
+                    diagnostic.field.map(|field| format!("{field:?}")),
+                    Some(field.to_owned()),
+                    "{file}/{name} error_field"
+                );
+            }
         }
     }
 }
@@ -2200,4 +2379,64 @@ fn shared_golden_v1_fixtures_parse_validate_and_round_trip_exactly() {
 #[test]
 fn shared_golden_v2_fixtures_parse_validate_and_round_trip_exactly() {
     assert_shared_media_fixture_file("imeta-v2.json");
+}
+
+#[tokio::test]
+async fn fetch_and_decrypt_failures_use_distinct_stages_and_codes() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let failing = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let err = fetch_encrypted_media_blob(
+        &blob_reference_for_servers(b"unused", &[failing]),
+        &[],
+        &allowed,
+        true,
+    )
+    .await
+    .expect_err("HTTP 500 is a fetch failure");
+    let AppError::MediaAttachment(diagnostic) = err else {
+        panic!("expected MediaAttachment, got {err:?}");
+    };
+    assert_eq!(diagnostic.stage, MediaErrorStage::Fetch);
+    assert_eq!(diagnostic.code, MediaErrorCode::DownloadFailed);
+
+    let wrong_body = spawn_http_response(http_ok_response(b"not-the-ciphertext"));
+    let err = fetch_encrypted_media_blob(
+        &blob_reference_for_servers(b"expected-ciphertext", &[wrong_body]),
+        &[],
+        &allowed,
+        true,
+    )
+    .await
+    .expect_err("body hash mismatch is integrity, not metadata");
+    let AppError::MediaAttachment(diagnostic) = err else {
+        panic!("expected MediaAttachment, got {err:?}");
+    };
+    assert_eq!(diagnostic.stage, MediaErrorStage::Fetch);
+    assert_eq!(diagnostic.code, MediaErrorCode::IntegrityMismatch);
+    assert_eq!(diagnostic.field, Some(MediaErrorField::CiphertextSha256));
+
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let mut reference = upload.attachments[0].reference.clone();
+    reference.nonce_hex = "aa".repeat(12);
+    let err = download_encrypted_media(reference, &secret, &endpoints, &allowed, true)
+        .await
+        .expect_err("wrong nonce must fail decryption");
+    let AppError::MediaAttachment(diagnostic) = err else {
+        panic!("expected MediaAttachment, got {err:?}");
+    };
+    assert_eq!(diagnostic.stage, MediaErrorStage::Decrypt);
+    assert_eq!(diagnostic.code, MediaErrorCode::DecryptionFailed);
+    assert!(!diagnostic.message.contains("http"));
 }

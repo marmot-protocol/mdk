@@ -140,6 +140,9 @@ impl Marmot {
 
 fn media_reference_error(error: marmot_app::AppError) -> MarmotKitError {
     match error {
+        marmot_app::AppError::MediaAttachment(diagnostic) => MarmotKitError::MediaAttachment {
+            diagnostic: diagnostic.into(),
+        },
         marmot_app::AppError::InvalidAppMessagePayload(details)
         | marmot_app::AppError::InvalidEncryptedMedia(details) => {
             MarmotKitError::InvalidMediaReference { details }

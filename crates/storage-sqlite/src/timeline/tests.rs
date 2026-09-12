@@ -1575,6 +1575,76 @@ fn reply_preview_carries_parent_source_epoch_and_media() {
 }
 
 #[test]
+fn malformed_media_json_preserves_the_row_and_siblings() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("good", "alice", 1, "unaffected"))
+        .unwrap();
+    let mut media = chat("bad-json", "bob", 2, "caption stays");
+    media.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        "m image/png".to_owned(),
+        "filename diagram.png".to_owned(),
+    ]];
+    store.record_app_event(&media).unwrap();
+    store
+        .record_app_event(&chat("later", "carol", 3, "also ok"))
+        .unwrap();
+
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE message_timeline SET media_json = '{not-json' WHERE message_id_hex = 'bad-json'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(page.messages.len(), 3);
+    let bad = page
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "bad-json")
+        .expect("corrupt-media row remains");
+    assert!(bad.media_decode_failed);
+    assert!(bad.media.is_none());
+    assert_eq!(bad.plaintext, "caption stays");
+    assert!(
+        page.messages
+            .iter()
+            .filter(|message| message.message_id_hex != "bad-json")
+            .all(|message| !message.media_decode_failed && message.media.is_none())
+    );
+
+    store
+        .record_app_event(&reply("reply-to-bad", "dave", "bad-json", 4, "quoting bad"))
+        .unwrap();
+    let reply_page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+    let reply = reply_page
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "reply-to-bad")
+        .expect("reply row remains");
+    let preview = reply.reply_preview.as_ref().expect("reply preview");
+    assert!(preview.media_decode_failed);
+    assert!(preview.media.is_none());
+    assert_eq!(preview.plaintext, "caption stays");
+    assert_eq!(reply.plaintext, "quoting bad");
+}
+
+#[test]
 fn record_app_event_returns_projection_shaped_reply_delta() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

@@ -3,6 +3,7 @@ use marmot_account::{AccountError, AccountHomeError};
 
 use crate::MissingRelayListKind;
 use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
+use crate::media::MediaDiagnostic;
 
 /// Worker-safe account catch-up failure. The human-facing message remains for
 /// compatibility, while telemetry propagation uses only the closed
@@ -159,6 +160,10 @@ pub enum AppError {
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
+    /// Typed attachment validation or operation failure. Display is the
+    /// library-owned diagnostic message; hosts should switch on the enums.
+    #[error("{0}")]
+    MediaAttachment(MediaDiagnostic),
     #[error("blob store request failed: {0}")]
     BlobStore(String),
     /// A Blossom upload exhausted its bounded transfer/response budget before
@@ -312,6 +317,7 @@ impl AppError {
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
+            Self::MediaAttachment(_) => "media_attachment",
             Self::BlobStore(_) => "blob_store",
             Self::MediaUploadTimedOut => "media_upload_timed_out",
             Self::UnsafeMediaFetch(_) => "unsafe_media_fetch",
@@ -367,6 +373,7 @@ impl AppError {
             Self::Json(_)
             | Self::Hex(_)
             | Self::InvalidAppMessagePayload(_)
+            | Self::MediaAttachment(_)
             | Self::InvalidNostrRouting(_)
             | Self::InvalidKeyPackageEvent(_) => SyncErrorClass::Protocol,
             _ => SyncErrorClass::Unknown,

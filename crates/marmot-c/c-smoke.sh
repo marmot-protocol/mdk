@@ -58,6 +58,12 @@ run() {
 }
 
 for cc in "${COMPILERS[@]}"; do
+    echo "==> [$cc] Compiling media-diagnostics-v2.c against the shared object"
+    "$cc" "${CFLAGS[@]}" "$CRATE_DIR/examples/media-diagnostics-v2.c" \
+        -L"$TARGET_DIR/$PROFILE_DIR" -lmarmot_c -o "$WORK/media-diagnostics-v2-shared-$cc"
+    echo "==> [$cc] Running media-diagnostics-v2 (shared)"
+    run "$WORK/media-diagnostics-v2-shared-$cc"
+
     echo "==> [$cc] Compiling smoke.c against the shared object"
     "$cc" "${CFLAGS[@]}" "$CRATE_DIR/examples/smoke.c" \
         -L"$TARGET_DIR/$PROFILE_DIR" -lmarmot_c -o "$WORK/smoke-shared-$cc"

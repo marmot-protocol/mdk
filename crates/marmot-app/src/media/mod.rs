@@ -16,9 +16,11 @@ use sha2::{Digest, Sha256};
 
 use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
+use diagnostics::{field_from_media_key, metadata_error};
 
 mod blossom;
 mod crypto;
+mod diagnostics;
 mod group_image;
 mod host_safety;
 
@@ -36,6 +38,11 @@ pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
 #[cfg(test)]
 pub(crate) use blossom::fetch_blossom_blob;
 pub(crate) use blossom::{BlossomHttpTransport, blossom_blob_url};
+pub use diagnostics::{
+    MediaAttachmentProjection, MediaAttachmentResult, MediaDiagnostic, MediaErrorCode,
+    MediaErrorField, MediaErrorStage, project_media_attachments,
+    project_timeline_media_attachments,
+};
 pub use group_image::{MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS};
 pub(crate) use group_image::{
     fetch_group_image_with_transport, prepare_group_image_upload, upload_group_image,
@@ -174,8 +181,10 @@ impl EncryptedMediaVersion {
         match value {
             ENCRYPTED_MEDIA_FORMAT_V1 => Ok(Self::V1),
             ENCRYPTED_MEDIA_FORMAT_V2 => Ok(Self::V2),
-            _ => Err(AppError::InvalidAppMessagePayload(
-                "media version is not supported".into(),
+            _ => Err(metadata_error(
+                MediaErrorCode::UnsupportedVersion,
+                Some(MediaErrorField::Version),
+                "media version is not supported",
             )),
         }
     }
@@ -319,19 +328,28 @@ impl MediaAttachmentReference {
     /// regardless of its value.
     pub(crate) fn validate(&self, allow_loopback_http: bool) -> Result<(), AppError> {
         let version = EncryptedMediaVersion::parse(&self.version)?;
-        validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")?;
-        validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")?;
+        validate_sha256_hex(&self.ciphertext_sha256, MediaErrorField::CiphertextSha256)?;
+        validate_sha256_hex(&self.plaintext_sha256, MediaErrorField::PlaintextSha256)?;
         let expected_ciphertext_sha256 = self.ciphertext_sha256.to_ascii_lowercase();
-        let nonce = hex::decode(&self.nonce_hex)
-            .map_err(|_| AppError::InvalidAppMessagePayload("media nonce must be hex".into()))?;
+        let nonce = hex::decode(&self.nonce_hex).map_err(|_| {
+            metadata_error(
+                MediaErrorCode::MalformedField,
+                Some(MediaErrorField::Nonce),
+                "media nonce must be hex",
+            )
+        })?;
         if nonce.len() != 12 {
-            return Err(AppError::InvalidAppMessagePayload(
-                "media nonce must be 12 bytes".into(),
+            return Err(metadata_error(
+                MediaErrorCode::MalformedField,
+                Some(MediaErrorField::Nonce),
+                "media nonce must be 12 bytes",
             ));
         }
         if self.locators.is_empty() {
-            return Err(AppError::InvalidAppMessagePayload(
-                "media attachment must include at least one locator".into(),
+            return Err(metadata_error(
+                MediaErrorCode::MissingField,
+                Some(MediaErrorField::Locator),
+                "media attachment must include at least one locator",
             ));
         }
         for locator in &self.locators {
@@ -345,21 +363,27 @@ impl MediaAttachmentReference {
             if version == EncryptedMediaVersion::V1 && locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
                 let locator_hash =
                     blossom_content_hash_from_url(&locator.value).ok_or_else(|| {
-                        AppError::InvalidAppMessagePayload(
-                            "Blossom locator URL must include the encrypted blob hash".into(),
+                        metadata_error(
+                            MediaErrorCode::MalformedField,
+                            Some(MediaErrorField::Locator),
+                            "Blossom locator URL must include the encrypted blob hash",
                         )
                     })?;
                 if locator_hash != expected_ciphertext_sha256 {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "Blossom locator hash does not match media reference".into(),
+                    return Err(metadata_error(
+                        MediaErrorCode::MalformedField,
+                        Some(MediaErrorField::Locator),
+                        "Blossom locator hash does not match media reference",
                     ));
                 }
             }
         }
         match version {
             EncryptedMediaVersion::V1 if self.file_name.trim().is_empty() => {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "media file name cannot be empty".into(),
+                return Err(metadata_error(
+                    MediaErrorCode::MalformedField,
+                    Some(MediaErrorField::FileName),
+                    "media file name cannot be empty",
                 ));
             }
             EncryptedMediaVersion::V2
@@ -367,21 +391,37 @@ impl MediaAttachmentReference {
                     || self.file_name.len() > 255
                     || self.file_name.contains('\0') =>
             {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "media file name must be 1..255 UTF-8 bytes and contain no NUL".into(),
+                return Err(metadata_error(
+                    MediaErrorCode::MalformedField,
+                    Some(MediaErrorField::FileName),
+                    "media file name must be 1..255 UTF-8 bytes and contain no NUL",
                 ));
             }
             _ => {}
         }
         match version {
             EncryptedMediaVersion::V1 => {
-                canonical_media_type_v1(&self.media_type)?;
+                canonical_media_type_v1(&self.media_type).map_err(|_| {
+                    metadata_error(
+                        MediaErrorCode::MalformedField,
+                        Some(MediaErrorField::MediaType),
+                        "media type must be a MIME type",
+                    )
+                })?;
             }
             EncryptedMediaVersion::V2 => {
-                let canonical = canonical_media_type_v2(&self.media_type)?;
+                let canonical = canonical_media_type_v2(&self.media_type).map_err(|_| {
+                    metadata_error(
+                        MediaErrorCode::MalformedField,
+                        Some(MediaErrorField::MediaType),
+                        "media type is not a canonicalizable MIME type",
+                    )
+                })?;
                 if canonical != self.media_type {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "media type is not canonical for encrypted-media-v2".into(),
+                    return Err(metadata_error(
+                        MediaErrorCode::MalformedField,
+                        Some(MediaErrorField::MediaType),
+                        "media type is not canonical for encrypted-media-v2",
                     ));
                 }
             }
@@ -405,28 +445,42 @@ impl MediaAttachmentReference {
     ) -> Result<(), AppError> {
         self.validate(allow_loopback_http)?;
         if self.version != expected_version.as_str() {
-            return Err(AppError::InvalidEncryptedMedia(format!(
-                "group requires {} references",
-                expected_version.as_str()
-            )));
+            return Err(diagnostics::MediaDiagnostic::outbound(
+                MediaErrorCode::ProfileMismatch,
+                Some(MediaErrorField::Version),
+                format!("group requires {} references", expected_version.as_str()),
+            )
+            .into());
         }
         // Ingest still accepts noncanonical V1 `m` values for legacy wire
         // compatibility, but the checked outbound builder must emit the
         // canonical stored form exactly (same rule V2 already enforces in
         // `validate`).
         if expected_version == EncryptedMediaVersion::V1 {
-            let canonical = canonical_media_type_v1(&self.media_type)?;
+            let canonical = canonical_media_type_v1(&self.media_type).map_err(|_| {
+                diagnostics::MediaDiagnostic::outbound(
+                    MediaErrorCode::MalformedField,
+                    Some(MediaErrorField::MediaType),
+                    "media type must be a MIME type",
+                )
+            })?;
             if canonical != self.media_type {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "media type is not canonical for encrypted-media-v1".into(),
-                ));
+                return Err(diagnostics::MediaDiagnostic::outbound(
+                    MediaErrorCode::MalformedField,
+                    Some(MediaErrorField::MediaType),
+                    "media type is not canonical for encrypted-media-v1",
+                )
+                .into());
             }
         }
         for locator in &self.locators {
             if !locator_kind_allowed(&locator.kind, allowed_locator_kinds) {
-                return Err(AppError::InvalidEncryptedMedia(
-                    "media locator kind is not allowed by the group policy".into(),
-                ));
+                return Err(diagnostics::MediaDiagnostic::outbound(
+                    MediaErrorCode::DestinationPolicy,
+                    Some(MediaErrorField::Locator),
+                    "media locator kind is not allowed by the group policy",
+                )
+                .into());
             }
         }
         Ok(())
@@ -731,6 +785,7 @@ fn upload_error_summary(err: &AppError) -> String {
         AppError::BlobStore(message)
         | AppError::InvalidEncryptedMedia(message)
         | AppError::InvalidAppMessagePayload(message) => message.clone(),
+        AppError::MediaAttachment(diagnostic) => diagnostic.message.clone(),
         AppError::MediaUploadTimedOut => "request timed out".to_owned(),
         // `upload_blossom_blob` should currently surface upload failures through
         // the privacy-scrubbed variants above. Keep this fallback as a defensive
@@ -818,9 +873,12 @@ pub(crate) async fn download_encrypted_media_with_transport(
             decrypt_started,
             false,
         );
-        return Err(AppError::InvalidEncryptedMedia(
-            "media decryption failed".into(),
-        ));
+        return Err(diagnostics::MediaDiagnostic::decrypt(
+            MediaErrorCode::DecryptionFailed,
+            None,
+            "media decryption failed",
+        )
+        .into());
     }
     record_media_download_phase(
         telemetry,
@@ -837,9 +895,12 @@ pub(crate) async fn download_encrypted_media_with_transport(
             plaintext_verify_started,
             false,
         );
-        return Err(AppError::InvalidEncryptedMedia(
-            "media plaintext hash does not match reference".into(),
-        ));
+        return Err(diagnostics::MediaDiagnostic::decrypt(
+            MediaErrorCode::IntegrityMismatch,
+            Some(MediaErrorField::PlaintextSha256),
+            "media plaintext hash does not match reference",
+        )
+        .into());
     }
     record_media_download_phase(
         telemetry,
@@ -908,9 +969,12 @@ async fn fetch_encrypted_media_blob_with_observer(
     // reference degrades to unfetchable (not invalid): the reference may still
     // be valid and the message delivered, only the blob is unreachable here.
     if !locator_kind_allowed(BLOSSOM_LOCATOR_KIND_V1, allowed_locator_kinds) {
-        return Err(AppError::InvalidEncryptedMedia(
-            "media reference has no supported locators".into(),
-        ));
+        return Err(diagnostics::MediaDiagnostic::fetch(
+            MediaErrorCode::NoSupportedLocator,
+            Some(MediaErrorField::Locator),
+            "media reference has no supported locators",
+        )
+        .into());
     }
     let mut candidates = encrypted_media_fetch_candidates(reference, fallback_endpoints);
     if !transport.allow_loopback_http {
@@ -921,9 +985,12 @@ async fn fetch_encrypted_media_blob_with_observer(
         candidates.retain(|candidate| !is_loopback_http_endpoint(candidate));
     }
     if candidates.is_empty() {
-        return Err(AppError::InvalidEncryptedMedia(
-            "media reference has no supported locators".into(),
-        ));
+        return Err(diagnostics::MediaDiagnostic::fetch(
+            MediaErrorCode::NoSupportedLocator,
+            Some(MediaErrorField::Locator),
+            "media reference has no supported locators",
+        )
+        .into());
     }
     let mut last_error = None;
     let expected_hash = reference.ciphertext_sha256.to_ascii_lowercase();
@@ -934,9 +1001,14 @@ async fn fetch_encrypted_media_blob_with_observer(
         match blossom_content_hash_from_url(&candidate) {
             Some(hash) if hash == expected_hash => {}
             Some(_) => {
-                last_error = Some(AppError::InvalidEncryptedMedia(
-                    "Blossom locator hash does not match media reference".into(),
-                ));
+                last_error = Some(
+                    diagnostics::MediaDiagnostic::fetch(
+                        MediaErrorCode::IntegrityMismatch,
+                        Some(MediaErrorField::CiphertextSha256),
+                        "Blossom locator hash does not match media reference",
+                    )
+                    .into(),
+                );
                 record_locator_failover_if_needed(
                     telemetry,
                     candidate_started,
@@ -946,9 +1018,14 @@ async fn fetch_encrypted_media_blob_with_observer(
                 continue;
             }
             None => {
-                last_error = Some(AppError::InvalidEncryptedMedia(
-                    "Blossom locator URL did not include encrypted blob hash".into(),
-                ));
+                last_error = Some(
+                    diagnostics::MediaDiagnostic::fetch(
+                        MediaErrorCode::MalformedField,
+                        Some(MediaErrorField::Locator),
+                        "Blossom locator URL did not include encrypted blob hash",
+                    )
+                    .into(),
+                );
                 record_locator_failover_if_needed(
                     telemetry,
                     candidate_started,
@@ -962,7 +1039,12 @@ async fn fetch_encrypted_media_blob_with_observer(
             .saturating_duration_since(tokio::time::Instant::now())
             .is_zero()
         {
-            return Err(AppError::BlobStore("media download timed out".into()));
+            return Err(diagnostics::MediaDiagnostic::fetch(
+                MediaErrorCode::DownloadFailed,
+                None,
+                "media download timed out",
+            )
+            .into());
         }
         let fetched = blossom::fetch_blossom_blob_with_observer_until(
             &candidate,
@@ -984,9 +1066,38 @@ async fn fetch_encrypted_media_blob_with_observer(
                 if matches {
                     return Ok(bytes);
                 }
-                last_error = Some(AppError::InvalidEncryptedMedia(
-                    "encrypted blob hash does not match media reference".into(),
-                ));
+                last_error = Some(
+                    diagnostics::MediaDiagnostic::fetch(
+                        MediaErrorCode::IntegrityMismatch,
+                        Some(MediaErrorField::CiphertextSha256),
+                        "encrypted blob hash does not match media reference",
+                    )
+                    .into(),
+                );
+            }
+            Err(AppError::UnsafeMediaFetch(_)) => {
+                last_error = Some(
+                    diagnostics::MediaDiagnostic::fetch(
+                        MediaErrorCode::DestinationPolicy,
+                        Some(MediaErrorField::Locator),
+                        "media locator URL is unsafe",
+                    )
+                    .into(),
+                );
+            }
+            Err(AppError::BlobStore(message)) => {
+                last_error = Some(
+                    diagnostics::MediaDiagnostic::fetch(
+                        MediaErrorCode::DownloadFailed,
+                        None,
+                        if message.contains("timed out") {
+                            "media download timed out"
+                        } else {
+                            "media download failed"
+                        },
+                    )
+                    .into(),
+                );
             }
             Err(err) => last_error = Some(err),
         }
@@ -1051,8 +1162,10 @@ pub fn media_attachment_from_imeta_tag(
     allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, AppError> {
     if tag.first().map(String::as_str) != Some("imeta") {
-        return Err(AppError::InvalidAppMessagePayload(
-            "media tag must be imeta".into(),
+        return Err(metadata_error(
+            MediaErrorCode::InvalidStructure,
+            None,
+            "media tag must be imeta",
         ));
     }
     let mut locators = Vec::new();
@@ -1070,23 +1183,29 @@ pub fn media_attachment_from_imeta_tag(
     // duplicate rather than overwriting (spec/features/encrypted-media.md).
     let set_once = |slot: &mut Option<String>, value: &str, label: &str| -> Result<(), AppError> {
         if slot.is_some() {
-            return Err(AppError::InvalidAppMessagePayload(format!(
-                "media tag must contain exactly one {label}"
-            )));
+            return Err(metadata_error(
+                MediaErrorCode::DuplicateField,
+                field_from_media_key(label),
+                format!("media tag must contain exactly one {label}"),
+            ));
         }
         *slot = Some(value.to_owned());
         Ok(())
     };
     for field in tag.iter().skip(1) {
         if field == "blurhash" || field.starts_with("blurhash ") {
-            return Err(AppError::InvalidAppMessagePayload(
-                "encrypted media uses thumbhash, not blurhash".into(),
+            return Err(metadata_error(
+                MediaErrorCode::UnsupportedFormat,
+                Some(MediaErrorField::Thumbhash),
+                "encrypted media uses thumbhash, not blurhash",
             ));
         }
         if let Some(rest) = field.strip_prefix("locator ") {
             let (kind, value) = rest.split_once(' ').ok_or_else(|| {
-                AppError::InvalidAppMessagePayload(
-                    "media locator must include kind and value".into(),
+                metadata_error(
+                    MediaErrorCode::MalformedField,
+                    Some(MediaErrorField::Locator),
+                    "media locator must include kind and value",
                 )
             })?;
             locators.push(MediaLocator {
@@ -1108,9 +1227,11 @@ pub fn media_attachment_from_imeta_tag(
                     | "dim"
                     | "thumbhash"
             ) {
-                return Err(AppError::InvalidAppMessagePayload(format!(
-                    "media field {field} is missing its value"
-                )));
+                return Err(metadata_error(
+                    MediaErrorCode::MissingField,
+                    field_from_media_key(field),
+                    format!("media field {field} is missing its value"),
+                ));
             }
             continue;
         };
@@ -1130,9 +1251,13 @@ pub fn media_attachment_from_imeta_tag(
         }
     }
     let required = |name: &'static str, value: Option<String>| {
-        value
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AppError::InvalidAppMessagePayload(format!("media tag missing {name}")))
+        value.filter(|value| !value.is_empty()).ok_or_else(|| {
+            metadata_error(
+                MediaErrorCode::MissingField,
+                field_from_media_key(name),
+                format!("media tag missing {name}"),
+            )
+        })
     };
     let reference = MediaAttachmentReference {
         locators,
@@ -1206,12 +1331,17 @@ fn validate_outbound_file_name(
     if valid {
         Ok(())
     } else {
-        Err(AppError::InvalidEncryptedMedia(match version {
-            EncryptedMediaVersion::V1 => "media file name cannot be empty".into(),
-            EncryptedMediaVersion::V2 => {
-                "media file name must be 1..255 UTF-8 bytes and contain no NUL".into()
-            }
-        }))
+        Err(diagnostics::MediaDiagnostic::outbound(
+            MediaErrorCode::MalformedField,
+            Some(MediaErrorField::FileName),
+            match version {
+                EncryptedMediaVersion::V1 => "media file name cannot be empty",
+                EncryptedMediaVersion::V2 => {
+                    "media file name must be 1..255 UTF-8 bytes and contain no NUL"
+                }
+            },
+        )
+        .into())
     }
 }
 

@@ -1,9 +1,11 @@
 //! Media locator, attachment, upload/download, and media-record FFI conversions.
 
 use marmot_app::{
-    AppError, AppMessageRecord, EncryptedMediaVersion, MediaAttachmentReference,
-    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
-    MediaUploadResult,
+    AppError, AppMessageRecord, EncryptedMediaVersion, MediaAttachmentProjection,
+    MediaAttachmentReference, MediaAttachmentResult, MediaDiagnostic, MediaDownloadResult,
+    MediaErrorCode, MediaErrorField, MediaErrorStage, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadRequest, MediaUploadResult, project_media_attachments,
+    project_timeline_media_attachments,
 };
 
 use super::account::SendSummaryFfi;
@@ -32,7 +34,7 @@ impl From<EncryptedMediaVersionFfi> for EncryptedMediaVersion {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MediaLocatorFfi {
     pub kind: String,
     pub value: String,
@@ -56,7 +58,7 @@ impl From<MediaLocatorFfi> for MediaLocator {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MediaAttachmentReferenceFfi {
     pub locators: Vec<MediaLocatorFfi>,
     pub ciphertext_sha256: String,
@@ -199,6 +201,193 @@ impl From<MediaDownloadResult> for MediaDownloadResultFfi {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaErrorStageFfi {
+    Metadata,
+    Outbound,
+    Fetch,
+    Decrypt,
+}
+
+impl From<MediaErrorStage> for MediaErrorStageFfi {
+    fn from(value: MediaErrorStage) -> Self {
+        match value {
+            MediaErrorStage::Metadata => Self::Metadata,
+            MediaErrorStage::Outbound => Self::Outbound,
+            MediaErrorStage::Fetch => Self::Fetch,
+            MediaErrorStage::Decrypt => Self::Decrypt,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaErrorCodeFfi {
+    InvalidStructure,
+    MissingField,
+    DuplicateField,
+    MalformedField,
+    UnsupportedVersion,
+    UnsupportedFormat,
+    ProfileMismatch,
+    DestinationPolicy,
+    NoSupportedLocator,
+    DownloadFailed,
+    DecryptionFailed,
+    IntegrityMismatch,
+}
+
+impl From<MediaErrorCode> for MediaErrorCodeFfi {
+    fn from(value: MediaErrorCode) -> Self {
+        match value {
+            MediaErrorCode::InvalidStructure => Self::InvalidStructure,
+            MediaErrorCode::MissingField => Self::MissingField,
+            MediaErrorCode::DuplicateField => Self::DuplicateField,
+            MediaErrorCode::MalformedField => Self::MalformedField,
+            MediaErrorCode::UnsupportedVersion => Self::UnsupportedVersion,
+            MediaErrorCode::UnsupportedFormat => Self::UnsupportedFormat,
+            MediaErrorCode::ProfileMismatch => Self::ProfileMismatch,
+            MediaErrorCode::DestinationPolicy => Self::DestinationPolicy,
+            MediaErrorCode::NoSupportedLocator => Self::NoSupportedLocator,
+            MediaErrorCode::DownloadFailed => Self::DownloadFailed,
+            MediaErrorCode::DecryptionFailed => Self::DecryptionFailed,
+            MediaErrorCode::IntegrityMismatch => Self::IntegrityMismatch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaErrorFieldFfi {
+    Version,
+    Locator,
+    CiphertextSha256,
+    PlaintextSha256,
+    Nonce,
+    MediaType,
+    FileName,
+    Dimensions,
+    Thumbhash,
+}
+
+impl From<MediaErrorField> for MediaErrorFieldFfi {
+    fn from(value: MediaErrorField) -> Self {
+        match value {
+            MediaErrorField::Version => Self::Version,
+            MediaErrorField::Locator => Self::Locator,
+            MediaErrorField::CiphertextSha256 => Self::CiphertextSha256,
+            MediaErrorField::PlaintextSha256 => Self::PlaintextSha256,
+            MediaErrorField::Nonce => Self::Nonce,
+            MediaErrorField::MediaType => Self::MediaType,
+            MediaErrorField::FileName => Self::FileName,
+            MediaErrorField::Dimensions => Self::Dimensions,
+            MediaErrorField::Thumbhash => Self::Thumbhash,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MediaDiagnosticFfi {
+    pub stage: MediaErrorStageFfi,
+    pub code: MediaErrorCodeFfi,
+    pub field: Option<MediaErrorFieldFfi>,
+    pub message: String,
+}
+
+impl From<MediaDiagnostic> for MediaDiagnosticFfi {
+    fn from(value: MediaDiagnostic) -> Self {
+        Self {
+            stage: value.stage.into(),
+            code: value.code.into(),
+            field: value.field.map(Into::into),
+            message: value.message,
+        }
+    }
+}
+
+impl std::fmt::Display for MediaDiagnosticFfi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaAttachmentResultFfi {
+    Parsed {
+        reference: MediaAttachmentReferenceFfi,
+    },
+    Rejected {
+        diagnostic: MediaDiagnosticFfi,
+    },
+}
+
+impl From<MediaAttachmentResult> for MediaAttachmentResultFfi {
+    fn from(value: MediaAttachmentResult) -> Self {
+        match value {
+            MediaAttachmentResult::Parsed { reference } => match reference.try_into() {
+                Ok(reference) => Self::Parsed { reference },
+                Err(_) => Self::Rejected {
+                    diagnostic: MediaDiagnosticFfi {
+                        stage: MediaErrorStageFfi::Metadata,
+                        code: MediaErrorCodeFfi::UnsupportedVersion,
+                        field: Some(MediaErrorFieldFfi::Version),
+                        message: "media version is not supported".to_owned(),
+                    },
+                },
+            },
+            MediaAttachmentResult::Rejected { diagnostic } => Self::Rejected {
+                diagnostic: diagnostic.into(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MediaAttachmentProjectionFfi {
+    pub attachment_index: Option<u32>,
+    pub result: MediaAttachmentResultFfi,
+}
+
+impl From<MediaAttachmentProjection> for MediaAttachmentProjectionFfi {
+    fn from(value: MediaAttachmentProjection) -> Self {
+        Self {
+            attachment_index: value.attachment_index,
+            result: value.result.into(),
+        }
+    }
+}
+
+pub(crate) fn parsed_media_references(
+    projections: &[MediaAttachmentProjectionFfi],
+) -> Vec<MediaAttachmentReferenceFfi> {
+    projections
+        .iter()
+        .filter_map(|projection| match &projection.result {
+            MediaAttachmentResultFfi::Parsed { reference } => Some(reference.clone()),
+            MediaAttachmentResultFfi::Rejected { .. } => None,
+        })
+        .collect()
+}
+
+pub(crate) fn message_media_attachments_ffi(
+    tags: &[Vec<String>],
+    source_epoch: Option<u64>,
+) -> Vec<MediaAttachmentProjectionFfi> {
+    project_media_attachments(tags, source_epoch, false)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+pub(crate) fn timeline_media_attachments_ffi(
+    media: &Option<serde_json::Value>,
+    decode_failed: bool,
+    source_epoch: Option<u64>,
+) -> Vec<MediaAttachmentProjectionFfi> {
+    project_timeline_media_attachments(media.as_ref(), decode_failed, source_epoch, false)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MediaRecordFfi {
     pub message_id_hex: String,
@@ -206,7 +395,7 @@ pub struct MediaRecordFfi {
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
-    pub reference: MediaAttachmentReferenceFfi,
+    pub attachment: MediaAttachmentResultFfi,
     pub caption: Option<String>,
     pub recorded_at: u64,
     pub received_at: u64,
@@ -216,25 +405,15 @@ pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRec
     let mut records = Vec::new();
     for message in messages {
         let caption = (!message.plaintext.is_empty()).then_some(message.plaintext.clone());
-        for (attachment_index, reference) in media_attachments_from_message(&message)
-            .into_iter()
-            .enumerate()
-        {
-            let Ok(reference) = MediaAttachmentReferenceFfi::try_from(reference) else {
-                tracing::warn!(
-                    target: "marmot_uniffi::conversions",
-                    method = "media_records_ffi",
-                    "dropping media reference with unsupported version at FFI boundary",
-                );
-                continue;
-            };
+        for projection in message_media_attachments_ffi(&message.tags, message.source_epoch) {
+            let attachment_index = projection.attachment_index.unwrap_or(u32::MAX);
             records.push(MediaRecordFfi {
                 message_id_hex: message.message_id_hex.clone(),
-                attachment_index: attachment_index.try_into().unwrap_or(u32::MAX),
+                attachment_index,
                 direction: message.direction.clone(),
                 group_id_hex: message.group_id_hex.clone(),
                 sender: message.sender.clone(),
-                reference,
+                attachment: projection.result,
                 caption: caption.clone(),
                 recorded_at: message.recorded_at,
                 received_at: message.received_at,
@@ -244,71 +423,20 @@ pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRec
     records
 }
 
-fn media_attachments_from_message(message: &AppMessageRecord) -> Vec<MediaAttachmentReference> {
-    message
-        .tags
-        .iter()
-        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .filter_map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch))
-        .collect()
-}
-
-/// Resolve a materialized timeline row's `media` metadata (`{ "imeta": [..] }`,
-/// produced by the storage timeline projection) plus the message's own
-/// `source_epoch` into fully-downloadable attachment references.
-///
-/// Shares the exact `imeta` parsing and validation that `list_media` applies
-/// via [`media_attachment_from_imeta_tag`], so a row's `media` and the
-/// `list_media` records for the same message resolve identically. A malformed
-/// `imeta` tag is dropped (the message still renders as text); a row with no
-/// media yields an empty vec.
+/// Parsed-only view of a timeline row's media, derived from the same
+/// outcomes as [`timeline_media_attachments_ffi`].
+#[cfg(test)]
 pub(crate) fn timeline_media_references_ffi(
     media: &Option<serde_json::Value>,
     source_epoch: Option<u64>,
 ) -> Vec<MediaAttachmentReferenceFfi> {
-    let Some(imeta) = media
-        .as_ref()
-        .and_then(|value| value.get("imeta"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Vec::new();
-    };
-    imeta
-        .iter()
-        .filter_map(|tag| {
-            let tag: Vec<String> = serde_json::from_value(tag.clone()).ok()?;
-            // Match `media_attachments_from_message` (the `list_media` path):
-            // only tags marked `imeta` are resolved, so both paths reject the
-            // same malformed payloads identically.
-            if tag.first().map(String::as_str) != Some("imeta") {
-                return None;
-            }
-            media_attachment_from_imeta_tag(&tag, source_epoch)
-        })
-        .filter_map(|reference| {
-            MediaAttachmentReferenceFfi::try_from(reference)
-                .inspect_err(|_| {
-                    tracing::warn!(
-                        target: "marmot_uniffi::conversions",
-                        method = "timeline_media_references_ffi",
-                        "dropping media reference with unsupported version at FFI boundary",
-                    );
-                })
-                .ok()
-        })
-        .collect()
-}
-
-fn media_attachment_from_imeta_tag(
-    tag: &[String],
-    source_epoch: Option<u64>,
-) -> Option<MediaAttachmentReference> {
-    marmot_app::media_attachment_from_imeta_tag(tag, source_epoch, false).ok()
+    parsed_media_references(&timeline_media_attachments_ffi(media, false, source_epoch))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversions::MessageTagFfi;
 
     fn imeta_tag(byte: u8, media_type: &str, file_name: &str, extra: &[&str]) -> Vec<String> {
         let mut tag = vec![
@@ -364,21 +492,30 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].attachment_index, 0);
         assert_eq!(records[0].caption.as_deref(), Some("album caption"));
-        assert_eq!(records[0].reference.media_type, "image/png");
-        assert_eq!(records[0].reference.file_name, "diagram.png");
-        assert_eq!(records[0].reference.source_epoch, 7);
-        assert_eq!(records[0].reference.dim.as_deref(), Some("800x600"));
+        let MediaAttachmentResultFfi::Parsed { reference } = &records[0].attachment else {
+            panic!("expected parsed first attachment");
+        };
+        assert_eq!(reference.media_type, "image/png");
+        assert_eq!(reference.file_name, "diagram.png");
+        assert_eq!(reference.source_epoch, 7);
+        assert_eq!(reference.dim.as_deref(), Some("800x600"));
         assert_eq!(
-            records[0].reference.thumbhash.as_deref(),
+            reference.thumbhash.as_deref(),
             Some("1QcSHQRnh493V4dIh4eXh1h4kJUI")
         );
+        let MediaAttachmentResultFfi::Parsed { reference } = &records[1].attachment else {
+            panic!("expected parsed second attachment");
+        };
         assert_eq!(records[1].attachment_index, 1);
-        assert_eq!(records[1].reference.media_type, "video/mp4");
-        assert_eq!(records[1].reference.file_name, "clip.mp4");
-        assert_eq!(records[1].reference.dim.as_deref(), Some("1920x1080"));
+        assert_eq!(reference.media_type, "video/mp4");
+        assert_eq!(reference.file_name, "clip.mp4");
+        assert_eq!(reference.dim.as_deref(), Some("1920x1080"));
+        let MediaAttachmentResultFfi::Parsed { reference } = &records[2].attachment else {
+            panic!("expected parsed third attachment");
+        };
         assert_eq!(records[2].attachment_index, 2);
-        assert_eq!(records[2].reference.media_type, "audio/ogg");
-        assert_eq!(records[2].reference.file_name, "voice.ogg");
+        assert_eq!(reference.media_type, "audio/ogg");
+        assert_eq!(reference.file_name, "voice.ogg");
     }
 
     fn imeta_metadata(tags: &[Vec<String>]) -> serde_json::Value {
@@ -431,16 +568,222 @@ mod tests {
         assert!(references.iter().all(|r| r.source_epoch == 4));
     }
 
+    fn rejected_code(result: &MediaAttachmentResultFfi) -> MediaErrorCodeFfi {
+        match result {
+            MediaAttachmentResultFfi::Rejected { diagnostic } => diagnostic.code,
+            MediaAttachmentResultFfi::Parsed { .. } => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn mixed_invalid_valid_album_agrees_across_message_list_timeline_and_preview() {
+        let invalid = vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()];
+        let mut valid_v2 = imeta_tag(0x22, "image/png", "second.png", &[]);
+        valid_v2[1] = "v encrypted-media-v2".to_owned();
+        let tags = vec![
+            vec!["p".to_owned(), "aa".repeat(32)],
+            invalid.clone(),
+            imeta_tag(0x11, "image/png", "first.png", &[]),
+            vec!["e".to_owned(), "bb".repeat(32)],
+            invalid.clone(),
+            valid_v2.clone(),
+        ];
+        let message = AppMessageRecord {
+            message_id_hex: "aa".repeat(32),
+            direction: "incoming".to_owned(),
+            group_id_hex: "bb".repeat(32),
+            sender: "alice".to_owned(),
+            plaintext: "keep the caption".to_owned(),
+            kind: 9,
+            tags: tags.clone(),
+            source_epoch: Some(7),
+            retention: None,
+            recorded_at: 10,
+            received_at: 11,
+            insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
+        };
+        let received = marmot_app::ReceivedMessage {
+            message_id_hex: message.message_id_hex.clone(),
+            source_message_id_hex: message.message_id_hex.clone(),
+            group_id: cgka_traits::GroupId::new(vec![0xbb; 16]),
+            sender: message.sender.clone(),
+            sender_display_name: None,
+            plaintext: message.plaintext.clone(),
+            kind: message.kind,
+            tags: tags.clone(),
+            source_epoch: 7,
+            retention: None,
+            recorded_at: 10,
+            received_at: 11,
+        };
+
+        let from_message = crate::conversions::AppMessageRecordFfi::from(message.clone());
+        let from_received = crate::conversions::ReceivedMessageFfi::from(&received);
+        let from_list = media_records_ffi(vec![message.clone()]);
+        let imeta_only = tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let media = imeta_metadata(&imeta_only);
+        let from_timeline = timeline_media_attachments_ffi(&Some(media.clone()), false, Some(7));
+        let preview =
+            crate::conversions::TimelineReplyPreviewFfi::from(marmot_app::TimelineReplyPreview {
+                message_id_hex: message.message_id_hex.clone(),
+                sender: message.sender.clone(),
+                plaintext: message.plaintext.clone(),
+                kind: message.kind,
+                source_epoch: Some(7),
+                media: Some(media),
+                media_decode_failed: false,
+                agent_text_stream: None,
+                deleted: false,
+                invalidation_status: None,
+            });
+
+        assert_eq!(from_message.plaintext, "keep the caption");
+        assert_eq!(from_message.media_attachments.len(), 4);
+        assert_eq!(
+            from_received.media_attachments,
+            from_message.media_attachments
+        );
+        assert_eq!(from_list.len(), 4);
+        assert_eq!(from_timeline, from_message.media_attachments);
+        assert_eq!(preview.media_attachments, from_message.media_attachments);
+        for (index, (message_outcome, list_record, received_outcome)) in from_message
+            .media_attachments
+            .iter()
+            .zip(from_list.iter())
+            .zip(from_received.media_attachments.iter())
+            .map(|((a, b), c)| (a, b, c))
+            .enumerate()
+        {
+            let index = u32::try_from(index).unwrap();
+            assert_eq!(message_outcome.attachment_index, Some(index));
+            assert_eq!(received_outcome, message_outcome);
+            assert_eq!(list_record.attachment_index, index);
+            assert_eq!(&list_record.attachment, &message_outcome.result);
+            assert_eq!(list_record.caption.as_deref(), Some("keep the caption"));
+            let tag = MessageTagFfi {
+                values: imeta_only[index as usize].clone(),
+            };
+            match crate::commands::parse_media_imeta_tag(tag, 7) {
+                Ok(reference) => {
+                    assert_eq!(
+                        message_outcome.result,
+                        MediaAttachmentResultFfi::Parsed { reference }
+                    );
+                }
+                Err(crate::errors::MarmotKitError::MediaAttachment { diagnostic }) => {
+                    assert_eq!(
+                        message_outcome.result,
+                        MediaAttachmentResultFfi::Rejected { diagnostic }
+                    );
+                }
+                Err(other) => panic!("explicit parser must return MediaAttachment, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            rejected_code(&from_message.media_attachments[0].result),
+            MediaErrorCodeFfi::MissingField
+        );
+        assert_eq!(
+            rejected_code(&from_message.media_attachments[2].result),
+            MediaErrorCodeFfi::MissingField
+        );
+        let MediaAttachmentResultFfi::Parsed { reference } =
+            &from_message.media_attachments[1].result
+        else {
+            panic!("index 1 must stay parsed");
+        };
+        assert_eq!(reference.file_name, "first.png");
+        assert_eq!(reference.version, EncryptedMediaVersionFfi::V1);
+        let MediaAttachmentResultFfi::Parsed { reference } =
+            &from_message.media_attachments[3].result
+        else {
+            panic!("index 3 must stay parsed");
+        };
+        assert_eq!(reference.file_name, "second.png");
+        assert_eq!(reference.version, EncryptedMediaVersionFfi::V2);
+        assert_eq!(preview.media.len(), 2);
+        assert_eq!(preview.plaintext, "keep the caption");
+    }
+
+    #[test]
+    fn cache_refresh_observes_media_decode_failed_change_only() {
+        let media = imeta_metadata(&[imeta_tag(0x11, "image/png", "diagram.png", &[])]);
+        let parsed = timeline_media_attachments_ffi(&Some(media.clone()), false, Some(7));
+        let refreshed = timeline_media_attachments_ffi(&Some(media), true, Some(7));
+        assert_eq!(parsed.len(), 1);
+        assert!(matches!(
+            parsed[0].result,
+            MediaAttachmentResultFfi::Parsed { .. }
+        ));
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].attachment_index, None);
+        assert_eq!(
+            rejected_code(&refreshed[0].result),
+            MediaErrorCodeFfi::InvalidStructure
+        );
+        assert_ne!(parsed, refreshed);
+    }
+
+    #[test]
+    fn all_invalid_media_only_message_still_lists_rejected_records() {
+        let tags = vec![
+            vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()],
+            vec!["imeta".to_owned(), "v encrypted-media-v2".to_owned()],
+        ];
+        let message = AppMessageRecord {
+            message_id_hex: "aa".repeat(32),
+            direction: "incoming".to_owned(),
+            group_id_hex: "bb".repeat(32),
+            sender: "alice".to_owned(),
+            plaintext: String::new(),
+            kind: 9,
+            tags,
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: 10,
+            received_at: 11,
+            insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
+        };
+        let records = media_records_ffi(vec![message.clone()]);
+        let projected = crate::conversions::AppMessageRecordFfi::from(message);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            matches!(record.attachment, MediaAttachmentResultFfi::Rejected { .. })
+        }));
+        assert_eq!(projected.media_attachments.len(), 2);
+        assert!(projected.plaintext.is_empty());
+    }
+
     #[test]
     fn timeline_media_references_ffi_drops_malformed_imeta_keeps_others() {
         // A tag missing the required ciphertext_sha256/nonce/etc. fields.
         let malformed = vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()];
         let media = imeta_metadata(&[imeta_tag(0x11, "image/png", "ok.png", &[]), malformed]);
 
-        let references = timeline_media_references_ffi(&Some(media), Some(1));
-
+        let references = timeline_media_references_ffi(&Some(media.clone()), Some(1));
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].file_name, "ok.png");
+
+        let outcomes = timeline_media_attachments_ffi(&Some(media), false, Some(1));
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].attachment_index, Some(0));
+        assert!(matches!(
+            outcomes[0].result,
+            MediaAttachmentResultFfi::Parsed { .. }
+        ));
+        assert_eq!(outcomes[1].attachment_index, Some(1));
+        assert!(matches!(
+            outcomes[1].result,
+            MediaAttachmentResultFfi::Rejected { .. }
+        ));
     }
 
     #[test]
@@ -490,7 +833,12 @@ mod tests {
 
         let from_list: Vec<MediaAttachmentReference> = media_records_ffi(vec![message])
             .into_iter()
-            .map(|record| record.reference.into())
+            .map(|record| match record.attachment {
+                MediaAttachmentResultFfi::Parsed { reference } => reference.into(),
+                MediaAttachmentResultFfi::Rejected { diagnostic } => {
+                    panic!("expected parsed list-media record, got {diagnostic:?}")
+                }
+            })
             .collect();
         let from_row: Vec<MediaAttachmentReference> =
             timeline_media_references_ffi(&Some(imeta_metadata(&tags)), Some(7))

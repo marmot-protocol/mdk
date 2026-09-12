@@ -1,16 +1,17 @@
 //! C mirrors of the encrypted-media conversions.
 
 use marmot_uniffi::conversions::{
-    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
-    MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi,
+    MediaAttachmentProjectionFfi, MediaAttachmentReferenceFfi, MediaAttachmentResultFfi,
+    MediaDiagnosticFfi, MediaDownloadResultFfi, MediaErrorCodeFfi, MediaErrorFieldFfi,
+    MediaErrorStageFfi, MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
+    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
 };
 
 use super::account::MarmotSendSummary;
 use super::group::MarmotEncryptedMediaVersion;
 use crate::MarmotStatus;
-use crate::macros::c_mirror;
-use crate::memory::{c_bool, optional_str, required_str};
+use crate::macros::{c_enum, c_mirror};
+use crate::memory::{CFree, c_bool, optional_str, required_str};
 use crate::status::set_last_error;
 
 c_mirror! {
@@ -35,8 +36,10 @@ impl MarmotMediaLocator {
 c_mirror! {
     /// Fully-resolved encrypted attachment reference. Also a borrowed
     /// input to `marmot_send_media_reference` /
-    /// `marmot_send_media_attachments` / `marmot_download_media`.
-    MarmotMediaAttachmentReference from MediaAttachmentReferenceFfi {
+    /// `marmot_send_media_attachments` / `marmot_download_media`, and the
+    /// success result of `marmot_parse_media_imeta_tag`.
+    MarmotMediaAttachmentReference from MediaAttachmentReferenceFfi,
+    free marmot_media_attachment_reference_free {
         vec locators/locators_len: MarmotMediaLocator,
         str ciphertext_sha256,
         str plaintext_sha256,
@@ -189,18 +192,388 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Attachment pipeline stage.
+    MarmotMediaErrorStage from MediaErrorStageFfi {
+        Metadata,
+        Outbound,
+        Fetch,
+        Decrypt,
+    }
+}
+
+c_enum! {
+    /// Closed attachment failure reason.
+    MarmotMediaErrorCode from MediaErrorCodeFfi {
+        InvalidStructure,
+        MissingField,
+        DuplicateField,
+        MalformedField,
+        UnsupportedVersion,
+        UnsupportedFormat,
+        ProfileMismatch,
+        DestinationPolicy,
+        NoSupportedLocator,
+        DownloadFailed,
+        DecryptionFailed,
+        IntegrityMismatch,
+    }
+}
+
+c_enum! {
+    /// Closed attachment field vocabulary.
+    MarmotMediaErrorField from MediaErrorFieldFfi {
+        Version,
+        Locator,
+        CiphertextSha256,
+        PlaintextSha256,
+        Nonce,
+        MediaType,
+        FileName,
+        Dimensions,
+        Thumbhash,
+    }
+}
+
+// Derived Default would need a #[default] variant attr the c_enum! spec
+// grammar doesn't carry; manual impl is equivalent.
+#[allow(clippy::derivable_impls)]
+impl Default for MarmotMediaErrorField {
+    fn default() -> Self {
+        Self::Version
+    }
+}
+
 c_mirror! {
-    /// One stored media record.
-    MarmotMediaRecord from MediaRecordFfi,
-    list(MarmotMediaRecordList, marmot_media_record_list_free) {
+    /// Privacy-safe attachment diagnostic. Also a root returned by
+    /// `marmot_last_media_error`.
+    MarmotMediaDiagnostic from MediaDiagnosticFfi,
+    free marmot_media_diagnostic_free {
+        copy stage: MarmotMediaErrorStage,
+        copy code: MarmotMediaErrorCode,
+        opt_copy has_field/field: MarmotMediaErrorField,
+        str message,
+    }
+}
+
+/// Parsed or rejected attachment outcome.
+#[repr(C)]
+pub enum MarmotMediaAttachmentResult {
+    Parsed {
+        reference: MarmotMediaAttachmentReference,
+    },
+    Rejected {
+        diagnostic: MarmotMediaDiagnostic,
+    },
+}
+
+impl From<MediaAttachmentResultFfi> for MarmotMediaAttachmentResult {
+    fn from(value: MediaAttachmentResultFfi) -> Self {
+        match value {
+            MediaAttachmentResultFfi::Parsed { reference } => Self::Parsed {
+                reference: reference.into(),
+            },
+            MediaAttachmentResultFfi::Rejected { diagnostic } => Self::Rejected {
+                diagnostic: diagnostic.into(),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotMediaAttachmentResult {
+    unsafe fn free_in_place(&mut self) {
+        match self {
+            Self::Parsed { reference } => unsafe { reference.free_in_place() },
+            Self::Rejected { diagnostic } => unsafe { diagnostic.free_in_place() },
+        }
+    }
+}
+
+c_mirror! {
+    /// One ordered attachment outcome.
+    MarmotMediaAttachmentProjection from MediaAttachmentProjectionFfi {
+        opt_copy has_attachment_index/attachment_index: u32,
+        rec result: MarmotMediaAttachmentResult,
+    }
+}
+
+/// Legacy success-only stored media record. Rejected attachments are
+/// omitted by `marmot_list_media`.
+#[repr(C)]
+pub struct MarmotMediaRecord {
+    pub message_id_hex: *mut ::std::ffi::c_char,
+    pub attachment_index: u32,
+    pub direction: *mut ::std::ffi::c_char,
+    pub group_id_hex: *mut ::std::ffi::c_char,
+    pub sender: *mut ::std::ffi::c_char,
+    pub reference: MarmotMediaAttachmentReference,
+    pub caption: *mut ::std::ffi::c_char,
+    pub recorded_at: u64,
+    pub received_at: u64,
+}
+
+impl MarmotMediaRecord {
+    fn from_parsed(value: MediaRecordFfi, reference: MediaAttachmentReferenceFfi) -> Self {
+        Self {
+            message_id_hex: crate::memory::owned_c_string(value.message_id_hex),
+            attachment_index: value.attachment_index,
+            direction: crate::memory::owned_c_string(value.direction),
+            group_id_hex: crate::memory::owned_c_string(value.group_id_hex),
+            sender: crate::memory::owned_c_string(value.sender),
+            reference: reference.into(),
+            caption: crate::memory::owned_opt_c_string(value.caption),
+            recorded_at: value.recorded_at,
+            received_at: value.received_at,
+        }
+    }
+}
+
+impl CFree for MarmotMediaRecord {
+    unsafe fn free_in_place(&mut self) {
+        unsafe {
+            crate::memory::free_c_string(self.message_id_hex);
+            crate::memory::free_c_string(self.direction);
+            crate::memory::free_c_string(self.group_id_hex);
+            crate::memory::free_c_string(self.sender);
+            self.reference.free_in_place();
+            crate::memory::free_c_string(self.caption);
+        }
+    }
+}
+
+/// Owned list of legacy success-only media records.
+///
+/// `marmot_list_media` applies the shared newest-message query `limit`
+/// before this conversion drops rejected attachments. A newest
+/// rejected-only window can therefore be shorter than `limit`, including
+/// empty, even when older parsed media exists. Use
+/// `marmot_list_media_v2` for complete Parsed/Rejected pages; fetching
+/// extra messages to fill a success-only page is out of scope.
+#[repr(C)]
+pub struct MarmotMediaRecordList {
+    pub items: *mut MarmotMediaRecord,
+    pub len: usize,
+}
+
+impl From<Vec<MediaRecordFfi>> for MarmotMediaRecordList {
+    fn from(value: Vec<MediaRecordFfi>) -> Self {
+        let items = value
+            .into_iter()
+            .filter_map(|record| {
+                let reference = match &record.attachment {
+                    MediaAttachmentResultFfi::Parsed { reference } => reference.clone(),
+                    MediaAttachmentResultFfi::Rejected { .. } => return None,
+                };
+                Some(MarmotMediaRecord::from_parsed(record, reference))
+            })
+            .collect();
+        let (items, len) = crate::memory::owned_vec(items);
+        Self { items, len }
+    }
+}
+
+impl CFree for MarmotMediaRecordList {
+    unsafe fn free_in_place(&mut self) {
+        unsafe { crate::memory::free_vec(self.items, self.len) };
+    }
+}
+
+/// Free a list returned by this library. NULL is a no-op.
+///
+/// # Safety
+/// `list` must be NULL or an unfreed pointer returned by this library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_media_record_list_free(list: *mut MarmotMediaRecordList) {
+    crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(list) });
+}
+
+c_mirror! {
+    /// Rich stored media record that retains rejected attachments.
+    MarmotMediaRecordV2 from MediaRecordFfi,
+    free marmot_media_record_v2_free,
+    list(MarmotMediaRecordV2List, marmot_media_record_v2_list_free) {
         str message_id_hex,
         copy attachment_index: u32,
         str direction,
         str group_id_hex,
         str sender,
-        rec reference: MarmotMediaAttachmentReference,
+        rec attachment: MarmotMediaAttachmentResult,
         opt_str caption,
         copy recorded_at: u64,
         copy received_at: u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot_uniffi::MarmotKitError;
+    use marmot_uniffi::conversions::{
+        EncryptedMediaVersionFfi, MediaAttachmentResultFfi, MediaDiagnosticFfi, MediaErrorCodeFfi,
+        MediaErrorFieldFfi, MediaErrorStageFfi, MediaLocatorFfi, MediaRecordFfi,
+    };
+
+    fn sample_reference() -> MediaAttachmentReferenceFfi {
+        MediaAttachmentReferenceFfi {
+            locators: vec![MediaLocatorFfi {
+                kind: "blossom-v1".into(),
+                value: "https://media.example/aa.bin".into(),
+            }],
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_sha256: "22".repeat(32),
+            nonce_hex: "33".repeat(12),
+            file_name: "diagram.png".into(),
+            media_type: "image/png".into(),
+            version: EncryptedMediaVersionFfi::V1,
+            source_epoch: 7,
+            dim: None,
+            thumbhash: None,
+        }
+    }
+
+    fn rejected_record() -> MediaRecordFfi {
+        MediaRecordFfi {
+            message_id_hex: "aa".repeat(32),
+            attachment_index: 0,
+            direction: "incoming".into(),
+            group_id_hex: "bb".repeat(32),
+            sender: "alice".into(),
+            attachment: MediaAttachmentResultFfi::Rejected {
+                diagnostic: MediaDiagnosticFfi {
+                    stage: MediaErrorStageFfi::Metadata,
+                    code: MediaErrorCodeFfi::MissingField,
+                    field: Some(MediaErrorFieldFfi::Nonce),
+                    message: "media attachment is missing nonce".into(),
+                },
+            },
+            caption: Some("keep me".into()),
+            recorded_at: 1,
+            received_at: 2,
+        }
+    }
+
+    fn parsed_record() -> MediaRecordFfi {
+        MediaRecordFfi {
+            message_id_hex: "cc".repeat(32),
+            attachment_index: 1,
+            direction: "incoming".into(),
+            group_id_hex: "bb".repeat(32),
+            sender: "bob".into(),
+            attachment: MediaAttachmentResultFfi::Parsed {
+                reference: sample_reference(),
+            },
+            caption: None,
+            recorded_at: 3,
+            received_at: 4,
+        }
+    }
+
+    #[test]
+    fn legacy_list_media_omits_rejected_records() {
+        let _guard = crate::memory::audit::test_lock();
+        let list = MarmotMediaRecordList::from(vec![rejected_record(), parsed_record()]);
+        assert_eq!(list.len, 1);
+        unsafe {
+            assert_eq!((*list.items).attachment_index, 1);
+            marmot_media_record_list_free(crate::memory::boxed(list));
+        }
+    }
+
+    #[test]
+    fn legacy_list_media_empty_when_query_window_is_rejected_only() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let list = MarmotMediaRecordList::from(vec![rejected_record()]);
+        assert_eq!(
+            list.len, 0,
+            "legacy success-only conversion does not fetch older messages to refill limit"
+        );
+        unsafe {
+            marmot_media_record_list_free(crate::memory::boxed(list));
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn v2_list_media_keeps_rejected_records() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let list = MarmotMediaRecordV2List::from(vec![rejected_record(), parsed_record()]);
+        assert_eq!(list.len, 2);
+        unsafe {
+            match &(*list.items).attachment {
+                MarmotMediaAttachmentResult::Rejected { diagnostic } => {
+                    assert_eq!(diagnostic.code, MarmotMediaErrorCode::MissingField);
+                }
+                MarmotMediaAttachmentResult::Parsed { .. } => {
+                    panic!("first row should be rejected")
+                }
+            }
+            marmot_media_record_v2_list_free(crate::memory::boxed(list));
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn last_media_error_is_taken_and_cleared_by_non_media_failures() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let err = MarmotKitError::MediaAttachment {
+            diagnostic: MediaDiagnosticFfi {
+                stage: MediaErrorStageFfi::Fetch,
+                code: MediaErrorCodeFfi::DownloadFailed,
+                field: Some(MediaErrorFieldFfi::Locator),
+                message: "media download failed".into(),
+            },
+        };
+        assert_eq!(
+            crate::status::status_from_error(&err),
+            crate::MarmotStatus::MediaAttachment
+        );
+        let first = crate::marmot_last_media_error();
+        assert!(!first.is_null());
+        unsafe { marmot_media_diagnostic_free(first) };
+        assert!(crate::marmot_last_media_error().is_null());
+
+        let _ = crate::status::status_from_error(&err);
+        let _ = crate::status::status_from_error(&MarmotKitError::Runtime {
+            details: "unrelated".into(),
+        });
+        assert!(crate::marmot_last_media_error().is_null());
+        let detail = crate::marmot_last_error_message();
+        unsafe { crate::marmot_string_free(detail) };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn parse_media_imeta_tag_null_out_is_preflighted() {
+        let status = unsafe {
+            crate::commands::marmot_parse_media_imeta_tag(std::ptr::null(), 1, std::ptr::null_mut())
+        };
+        assert_eq!(status, crate::MarmotStatus::NullPointer);
+        assert!(crate::marmot_last_media_error().is_null());
+    }
+
+    #[test]
+    fn media_record_array_strides_are_stable_within_each_layout() {
+        assert!(std::mem::size_of::<MarmotMediaRecord>() > 0);
+        assert_ne!(
+            std::mem::size_of::<MarmotMediaRecord>(),
+            std::mem::size_of::<MarmotMediaRecordV2>()
+        );
+        assert_eq!(
+            std::mem::size_of::<[MarmotMediaRecord; 2]>(),
+            std::mem::size_of::<MarmotMediaRecord>() * 2
+        );
+        assert_eq!(
+            std::mem::size_of::<[MarmotMediaRecordV2; 2]>(),
+            std::mem::size_of::<MarmotMediaRecordV2>() * 2
+        );
     }
 }

@@ -9,6 +9,25 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- MarmotKit and C bindings now preserve typed attachment rejection diagnostics
+  (closed stage/code/field enums plus the original attachment index) on
+  message, timeline, list-media, and explicit parse surfaces. Hosts must
+  regenerate bindings. Legacy C layouts remain diagnostic-loss compatibility
+  views; use the `_v2` symbols for the rich outcome tree, including C
+  `marmot_*_subscription_set_callback_v2` and
+  `marmot_timeline_subscription_next_v2`. Legacy `marmot_list_media` still
+  applies the newest-message query `limit` before omitting rejected
+  attachments, so that success-only page can be shorter than `limit`.
+
+### Changed
+
+- Attachment fetch host-safety rejections (literal, resolved, or redirect
+  destination) now surface as `DestinationPolicy` rather than
+  `DownloadFailed`. Upload and profile `BlobStore` classification is
+  unchanged.
+
 ## [0.9.21] - 2026-09-10
 
 ### Release notes

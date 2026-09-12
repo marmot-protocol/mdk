@@ -622,6 +622,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         reply_to_message_id_hex: None,
         reply_preview: None,
         media: None,
+        media_decode_failed: false,
         agent_text_stream: None,
         reactions: Default::default(),
     }

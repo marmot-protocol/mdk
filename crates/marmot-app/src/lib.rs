@@ -195,9 +195,11 @@ pub use ids::{
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
-    MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS, MediaAttachmentReference,
-    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
-    MediaUploadRequest, MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
+    MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS, MediaAttachmentProjection,
+    MediaAttachmentReference, MediaAttachmentResult, MediaDiagnostic, MediaDownloadResult,
+    MediaErrorCode, MediaErrorField, MediaErrorStage, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadAttachmentResult, MediaUploadRequest, MediaUploadResult, download_profile_image,
+    media_attachment_from_imeta_tag, project_media_attachments, project_timeline_media_attachments,
 };
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;

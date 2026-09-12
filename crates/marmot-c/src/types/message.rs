@@ -8,6 +8,7 @@ use marmot_uniffi::conversions::{
 
 use super::common::MarmotMessageTag;
 use super::markdown::MarmotMarkdownDocument;
+use super::media::MarmotMediaAttachmentProjection;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::CFree;
 
@@ -34,6 +35,28 @@ c_mirror! {
         /// Sender-authenticated inner app-event timestamp.
         copy recorded_at: u64,
         /// Local wall-clock time when this device observed the delivery.
+        copy received_at: u64,
+    }
+}
+
+c_mirror! {
+    /// Rich stored raw app message with attachment outcomes.
+    MarmotAppMessageRecordV2 from AppMessageRecordFfi,
+    free marmot_app_message_record_v2_free,
+    list(MarmotAppMessageRecordV2List, marmot_app_message_record_v2_list_free) {
+        str message_id_hex,
+        str direction,
+        str group_id_hex,
+        str sender,
+        str plaintext,
+        rec content_tokens: MarmotMarkdownDocument,
+        copy kind: u64,
+        vec tags/tags_len: MarmotMessageTag,
+        vec media_attachments/media_attachments_len: MarmotMediaAttachmentProjection,
+        opt_copy has_source_epoch/source_epoch: u64,
+        opt_copy has_retention_seconds/retention_seconds: u64,
+        opt_copy has_retention_expires_at/retention_expires_at: u64,
+        copy recorded_at: u64,
         copy received_at: u64,
     }
 }
@@ -74,12 +97,42 @@ c_mirror! {
 }
 
 c_mirror! {
+    /// Rich live-received message with attachment outcomes.
+    MarmotReceivedMessageV2 from ReceivedMessageFfi {
+        str message_id_hex,
+        str group_id_hex,
+        str sender,
+        opt_str sender_display_name,
+        str plaintext,
+        rec content_tokens: MarmotMarkdownDocument,
+        copy kind: u64,
+        vec tags/tags_len: MarmotMessageTag,
+        vec media_attachments/media_attachments_len: MarmotMediaAttachmentProjection,
+        copy source_epoch: u64,
+        opt_copy has_retention_seconds/retention_seconds: u64,
+        opt_copy has_retention_expires_at/retention_expires_at: u64,
+        copy recorded_at: u64,
+        copy received_at: u64,
+    }
+}
+
+c_mirror! {
     /// A received message plus the account it arrived on.
     MarmotRuntimeMessageReceived from RuntimeMessageReceivedFfi,
     free marmot_runtime_message_received_free {
         str account_id_hex,
         str account_label,
         rec message: MarmotReceivedMessage,
+    }
+}
+
+c_mirror! {
+    /// Rich received message plus the account it arrived on.
+    MarmotRuntimeMessageReceivedV2 from RuntimeMessageReceivedFfi,
+    free marmot_runtime_message_received_v2_free {
+        str account_id_hex,
+        str account_label,
+        rec message: MarmotReceivedMessageV2,
     }
 }
 
@@ -127,6 +180,49 @@ impl CFree for MarmotMessageUpdate {
 /// `update` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_message_update_free(update: *mut MarmotMessageUpdate) {
+    crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
+}
+
+/// One rich message-subscription update with attachment outcomes.
+#[repr(C)]
+pub enum MarmotMessageUpdateV2 {
+    Message {
+        received: MarmotRuntimeMessageReceivedV2,
+    },
+    AgentStreamStarted {
+        received: MarmotRuntimeMessageReceivedV2,
+    },
+}
+
+impl From<MessageUpdateFfi> for MarmotMessageUpdateV2 {
+    fn from(value: MessageUpdateFfi) -> Self {
+        match value {
+            MessageUpdateFfi::Message { received } => Self::Message {
+                received: received.into(),
+            },
+            MessageUpdateFfi::AgentStreamStarted { received } => Self::AgentStreamStarted {
+                received: received.into(),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotMessageUpdateV2 {
+    unsafe fn free_in_place(&mut self) {
+        match self {
+            Self::Message { received } | Self::AgentStreamStarted { received } => unsafe {
+                received.free_in_place()
+            },
+        }
+    }
+}
+
+/// Free a rich message update returned by this library. NULL is a no-op.
+///
+/// # Safety
+/// `update` must be NULL or an unfreed pointer returned by this library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_message_update_v2_free(update: *mut MarmotMessageUpdateV2) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
 }
 

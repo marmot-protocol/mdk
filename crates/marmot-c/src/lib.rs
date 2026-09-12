@@ -481,6 +481,19 @@ pub extern "C" fn marmot_last_error_message() -> *mut c_char {
     }
 }
 
+/// Return the typed media diagnostic for the current thread's most
+/// recent `MARMOT_STATUS_MEDIA_ATTACHMENT` failure, or NULL if there is
+/// none. Reading takes and clears the slot. Free with
+/// `marmot_media_diagnostic_free`. Non-media failures clear a stale
+/// diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn marmot_last_media_error() -> *mut types::media::MarmotMediaDiagnostic {
+    match std::panic::catch_unwind(status::take_last_media_error) {
+        Ok(Some(diagnostic)) => memory::boxed(diagnostic.into()),
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// Free a string returned by this library (`marmot_last_error_message`,
 /// string out-params). NULL is a no-op.
 ///

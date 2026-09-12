@@ -171,6 +171,8 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "canonical",
+      "error_code": "MalformedField",
+      "error_field": "MediaType",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -187,6 +189,8 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "file name",
+      "error_code": "MalformedField",
+      "error_field": "FileName",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -203,6 +207,8 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "file name",
+      "error_code": "MalformedField",
+      "error_field": "FileName",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -219,6 +225,8 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "exactly one plaintext_sha256",
+      "error_code": "DuplicateField",
+      "error_field": "PlaintextSha256",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -236,6 +244,8 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "missing v",
+      "error_code": "MissingField",
+      "error_field": "Version",
       "tag": [
         "imeta",
         "locator blossom-v1 https://media.example/abababababababababababababababababababababababababababababababab.bin",

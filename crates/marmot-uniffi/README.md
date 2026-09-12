@@ -20,6 +20,33 @@ same UniFFI surface, and releases publish it once.
 bindings to handle the new tag; older generated sources cannot render it.
 No generated Swift or Kotlin files are committed here.
 
+## Encrypted-media attachment diagnostics
+
+`listMedia` now returns rejected attachments as well as parsed ones. Switch
+`MediaRecordFfi.attachment` on `MediaAttachmentResultFfi.Parsed` or
+`Rejected`; the old `reference` field is gone. The optional `limit` is still
+the newest-message query cap before expansion, not a post-filter success
+count. Message, received-message, timeline-row, and reply-preview records
+expose `mediaAttachments` as the authoritative indexed outcomes. `media` /
+`mediaJson` remain the parsed-only view. The C legacy `marmot_list_media`
+view then drops rejected rows from that same window; use
+`marmot_list_media_v2` for the complete page.
+
+Explicit parse/build/send failures that used to be
+`MarmotKitError.InvalidMediaReference` for attachment metadata now use
+`MarmotKitError.MediaAttachment { diagnostic }` with closed
+stage/code/field enums. Generated Kotlin raises
+`MarmotKitException.MediaAttachment`; Swift keeps `MarmotKitError.MediaAttachment`.
+Group-image and setup validation still use
+`InvalidMediaReference` / `InvalidEncryptedMedia`.
+
+Regenerate Swift/Kotlin bindings. Native lift/lower checks:
+`./crates/marmot-uniffi/media-diagnostics-smoke.sh swift` and
+`MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
+./crates/marmot-uniffi/media-diagnostics-smoke.sh kotlin`. These regenerate
+host bindings and exercise Parsed/Rejected unions plus the explicit parser;
+platform package builds remain separate.
+
 See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
 checksums, provenance, and generated-source synchronization rules.
 
