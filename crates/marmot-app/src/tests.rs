@@ -4972,7 +4972,7 @@ async fn inbound_disband_candidate_blocks_local_delete_body() {
 }
 
 #[tokio::test]
-async fn pending_disband_keeps_a_worker_wakeup_after_acceptance() {
+async fn pending_disband_keeps_a_worker_wakeup_after_acceptance_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -4992,6 +4992,75 @@ async fn pending_disband_keeps_a_worker_wakeup_after_acceptance() {
         ),
         "an accepted disband must keep a wakeup even without other group work"
     );
+    drop(client);
+    drop(app);
+
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut reopened = app.client("alice").await.unwrap();
+    reopened.drain_pending_session_events().await.unwrap();
+    assert!(
+        reopened
+            .take_pending_convergence_groups()
+            .contains(&group_id),
+        "hydration must restore the disband's scheduling edge"
+    );
+    assert!(matches!(
+        reopened.runtime.disband_request(&group_id).unwrap(),
+        Some(cgka_traits::DisbandRequest {
+            status: cgka_traits::DisbandRequestStatus::Pending,
+            ..
+        })
+    ));
+    assert!(
+        !matches!(
+            reopened.convergence_schedule_state(&group_id).unwrap(),
+            ConvergenceScheduleState::Idle
+        ),
+        "reopening must rediscover the pending disband's wakeup"
+    );
+}
+
+#[tokio::test]
+async fn failed_or_unrecoverable_disband_does_not_create_an_idle_poll_loop() {
+    use cgka_traits::storage::{DisbandRequestStorage, GroupStorage};
+
+    for unrecoverable in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("paused closure", &[]).await.unwrap();
+        client.disband_group(&group_id).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        if unrecoverable {
+            let mut group = storage.get_group(&group_id).unwrap();
+            group.unrecoverable = true;
+            storage.put_group(&group).unwrap();
+        } else {
+            let mut request = storage.disband_request(&group_id).unwrap().unwrap();
+            request.status = cgka_traits::DisbandRequestStatus::Failed(
+                cgka_traits::DisbandFailureReason::NoLongerAdmin,
+            );
+            storage.put_disband_request(&request).unwrap();
+        }
+        drop(client);
+        let mut reopened = app.client("alice").await.unwrap();
+        reopened.drain_pending_session_events().await.unwrap();
+        assert!(
+            !reopened
+                .take_pending_convergence_groups()
+                .contains(&group_id)
+        );
+        assert_eq!(
+            reopened.convergence_schedule_state(&group_id).unwrap(),
+            ConvergenceScheduleState::Idle,
+            "failed or halted disband work must not cause idle polling"
+        );
+    }
 }
 
 async fn pending_disband_composer_gate_body() {

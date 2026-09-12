@@ -2109,10 +2109,18 @@ impl<S: StorageProvider> Engine<S> {
                 &stored_message_records,
             )
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        // An accepted disband may have no commit or ordinary queued intent
+        // yet. Recreate its scheduling edge from the durable request on open.
+        let has_pending_disband = !group.is_terminal()
+            && !group.unrecoverable
+            && self
+                .disband_request_pending(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         if has_queued_intents
             || has_convergence_inputs
             || has_deferred_peels
             || restored_self_remove_work
+            || has_pending_disband
         {
             self.schedule_pending_convergence_group(group_id);
         }
