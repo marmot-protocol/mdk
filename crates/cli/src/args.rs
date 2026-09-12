@@ -430,13 +430,17 @@ pub(crate) enum ChatsCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum MediaCommand {
-    #[command(about = "Encrypt and upload a media file to Blossom")]
+    #[command(about = "Encrypt and upload one or more media files to Blossom")]
     Upload {
         #[arg(help = "Group id that owns the media key")]
         group: String,
-        #[arg(help = "Path to the plaintext media file")]
-        file_path: String,
-        #[arg(long, help = "Send a kind-9 media message after upload")]
+        #[arg(
+            value_name = "FILE_PATH",
+            required = true,
+            help = "Paths to the plaintext media files, sent in this order"
+        )]
+        file_paths: Vec<String>,
+        #[arg(long, help = "Send one kind-9 media message carrying every upload")]
         send: bool,
         #[arg(long, help = "Caption to send with --send")]
         message: Option<String>,
@@ -467,6 +471,36 @@ pub(crate) enum MediaCommand {
         #[arg(help = "Group id to inspect")]
         group: String,
     },
+    #[command(about = "Send already-uploaded media references as one ordered kind-9 media message")]
+    Send {
+        #[arg(help = "Group id to send to")]
+        group: String,
+        #[arg(
+            value_name = "ATTACHMENT",
+            required = true,
+            help = "A `media` object from `media upload` JSON, or the plaintext SHA-256 of a projected attachment"
+        )]
+        attachments: Vec<String>,
+        #[arg(long, help = "Caption to send with the attachments")]
+        message: Option<String>,
+    },
+    #[command(
+        name = "set-endpoints",
+        about = "Replace the group's encrypted-media default blob endpoints (admin only)"
+    )]
+    SetEndpoints {
+        #[arg(help = "Group id to update")]
+        group: String,
+        #[arg(value_name = "URL", required = true, help = "Blob endpoint base URLs")]
+        urls: Vec<String>,
+        #[arg(
+            long,
+            value_name = "KIND",
+            default_value = "blossom-v1",
+            help = "Locator kind for every endpoint"
+        )]
+        locator_kind: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -485,17 +519,20 @@ pub(crate) enum GroupCommand {
         group: String,
         #[arg(value_name = "MEMBER", required = true)]
         members: Vec<String>,
+        #[arg(long = "admin", value_name = "MEMBER")]
+        admins: Vec<String>,
     },
     Remove {
         group: String,
         #[arg(value_name = "MEMBER", required = true)]
         members: Vec<String>,
     },
+    #[command(group = clap::ArgGroup::new("group_update_fields").required(true).multiple(true))]
     Update {
         group: String,
-        #[arg(long)]
+        #[arg(long, group = "group_update_fields")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, group = "group_update_fields")]
         description: Option<String>,
     },
     #[command(name = "set-avatar-url")]
@@ -524,13 +561,35 @@ pub(crate) enum GroupsCommand {
         members: Vec<String>,
         #[arg(long, help = "Optional group description")]
         description: Option<String>,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            help = "Founding disappearing-message retention: seconds, or a number with s/m/h/d/w suffix; 0 or off disables"
+        )]
+        retention: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Founding encrypted group image file (PNG, JPEG, GIF, or WebP)"
+        )]
+        image: Option<String>,
+        #[arg(
+            long,
+            value_name = "MIME",
+            requires = "image",
+            help = "Override the founding image MIME type"
+        )]
+        image_media_type: Option<String>,
     },
     #[command(about = "Show group metadata and membership state")]
     Show {
         #[arg(help = "Group id to show")]
         group_id: String,
     },
-    #[command(name = "add-members", about = "Add members to a group")]
+    #[command(
+        name = "add-members",
+        about = "Add members to a group, optionally granting admin to some invitees in the same commit"
+    )]
     AddMembers {
         #[arg(help = "Group id to update")]
         group_id: String,
@@ -540,6 +599,12 @@ pub(crate) enum GroupsCommand {
             help = "Member npub or hex pubkey to add"
         )]
         members: Vec<String>,
+        #[arg(
+            long = "admin",
+            value_name = "MEMBER",
+            help = "Invitee to make an admin in the same invite commit (repeatable)"
+        )]
+        admins: Vec<String>,
     },
     #[command(name = "remove-members", about = "Remove members from a group")]
     RemoveMembers {
@@ -578,6 +643,174 @@ pub(crate) enum GroupsCommand {
         group_id: String,
         #[arg(help = "New group name")]
         name: String,
+    },
+    #[command(
+        about = "Update the group name and/or description",
+        group = clap::ArgGroup::new("groups_update_fields").required(true).multiple(true)
+    )]
+    Update {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+        #[arg(long, group = "groups_update_fields", help = "New group name")]
+        name: Option<String>,
+        #[arg(long, group = "groups_update_fields", help = "New group description")]
+        description: Option<String>,
+    },
+    #[command(about = "Show or set the group's disappearing-message retention policy")]
+    Retention {
+        #[arg(help = "Group id to inspect or update")]
+        group_id: String,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            help = "Set the policy: seconds, or a number with s/m/h/d/w suffix; 0 or off disables. Omit to show it"
+        )]
+        set: Option<String>,
+    },
+    #[command(
+        name = "enable-disbanding",
+        about = "Install and require lifecycle-v1 so admins can disband the group"
+    )]
+    EnableDisbanding {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+    },
+    #[command(
+        about = "Durably request an irreversible group disband; completion is observed through disband-status"
+    )]
+    Disband {
+        #[arg(help = "Group id to disband")]
+        group_id: String,
+        #[arg(long, help = "Required safety flag; disbanding cannot be undone")]
+        confirm: bool,
+    },
+    #[command(
+        name = "disband-status",
+        about = "Show the durable disband request, gating, and terminal state for a group"
+    )]
+    DisbandStatus {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "acknowledge-disband-failure",
+        about = "Clear a failed disband request after reviewing its failure reason"
+    )]
+    AcknowledgeDisbandFailure {
+        #[arg(help = "Group id whose failed request should be cleared")]
+        group_id: String,
+    },
+    #[command(
+        about = "Show which group-management actions the selected account can take right now"
+    )]
+    Management {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "recovery-status",
+        about = "Show the durable recovery snapshot and pending rejoin offers for a group"
+    )]
+    RecoveryStatus {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "confirm-rejoin",
+        about = "Replace the local group copy with a reviewed rejoin offer; needs the exact offer id and token"
+    )]
+    ConfirmRejoin {
+        #[arg(
+            value_name = "WELCOME_ID",
+            help = "Rejoin offer (Welcome) id from recovery-status"
+        )]
+        welcome_id: String,
+        #[arg(
+            long,
+            value_name = "HEX",
+            help = "The local_state_token shown by recovery-status for that offer"
+        )]
+        local_state_token: String,
+        #[arg(
+            long,
+            help = "Required safety flag; the current local copy is discarded"
+        )]
+        confirm: bool,
+    },
+    #[command(name = "decline-rejoin", about = "Decline a pending rejoin offer")]
+    DeclineRejoin {
+        #[arg(
+            value_name = "WELCOME_ID",
+            help = "Rejoin offer (Welcome) id from recovery-status"
+        )]
+        welcome_id: String,
+    },
+    #[command(about = "List stored groups that failed hydration and were quarantined")]
+    Quarantined,
+    #[command(
+        name = "retry-hydrate",
+        about = "Re-attempt hydration of one quarantined group without discarding state"
+    )]
+    RetryHydrate {
+        #[arg(help = "Quarantined group id to retry")]
+        group_id: String,
+    },
+    #[command(
+        name = "delete-local",
+        about = "Delete this group's local app data without leaving, disbanding, or archiving"
+    )]
+    DeleteLocal {
+        #[arg(help = "Group id whose local data should be deleted")]
+        group_id: String,
+        #[arg(long, help = "Required safety flag before deleting local group data")]
+        confirm: bool,
+    },
+    #[command(
+        name = "set-image",
+        about = "Encrypt, upload, and commit a new group image (PNG, JPEG, GIF, or WebP)"
+    )]
+    SetImage {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+        #[arg(help = "Path to the plaintext image file")]
+        file_path: String,
+        #[arg(long, value_name = "MIME", help = "Override the image MIME type")]
+        media_type: Option<String>,
+    },
+    #[command(name = "clear-image", about = "Remove the encrypted group image")]
+    ClearImage {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+    },
+    #[command(
+        name = "download-image",
+        about = "Download and decrypt the encrypted group image to a file"
+    )]
+    DownloadImage {
+        #[arg(help = "Group id whose image to download")]
+        group_id: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Output path; defaults to group-image.<ext> in the current directory"
+        )]
+        output: Option<String>,
+    },
+    #[command(
+        name = "pending-welcomes",
+        about = "List Welcomes a confirmed create/invite could not deliver yet"
+    )]
+    PendingWelcomes,
+    #[command(
+        name = "redeliver-welcome",
+        about = "Re-publish one undelivered Welcome by its stored message id without re-committing"
+    )]
+    RedeliverWelcome {
+        #[arg(
+            value_name = "MESSAGE_ID",
+            help = "Stored Welcome message id from pending-welcomes"
+        )]
+        message_id: String,
     },
     #[command(
         name = "set-avatar-url",
@@ -701,20 +934,47 @@ pub(crate) enum MessageCommand {
         )]
         args: Vec<String>,
     },
-    #[command(about = "Delete a message for the selected account's local view")]
+    #[command(
+        about = "Edit one of your own messages by publishing a kind-1009 replacement to the group"
+    )]
+    Edit {
+        #[arg(help = "Group id containing the message")]
+        group_id: String,
+        #[arg(help = "Message id to edit; it must be authored by the selected account")]
+        message_id: String,
+        #[arg(
+            value_name = "TEXT",
+            required = true,
+            allow_hyphen_values = true,
+            help = "Replacement text"
+        )]
+        text: Vec<String>,
+    },
+    #[command(
+        about = "Publish an authenticated delete tombstone (kind 5) for a message to the group"
+    )]
     Delete {
         #[arg(help = "Group id containing the message")]
         group_id: String,
-        #[arg(help = "Message id to delete")]
+        #[arg(help = "Message id to delete; recipients hide it, but this is not secure erasure")]
         message_id: String,
     },
-    #[command(about = "Retry a failed outbound message event")]
+    #[command(
+        about = "Retry pending group convergence for a group; retained events are republished, never fresh plaintext"
+    )]
     Retry {
-        #[arg(help = "Group id containing the failed event")]
+        #[arg(help = "Group id whose durable pending work should be retried")]
         group_id: String,
-        #[arg(help = "Event id to retry")]
-        event_id: String,
+        #[arg(
+            help = "Optional event id echoed back for context; the retry is always group-scoped"
+        )]
+        event_id: Option<String>,
     },
+    #[command(
+        name = "sweep-expired",
+        about = "Run the disappearing-message retention sweep for the selected account using the current clock"
+    )]
+    SweepExpired,
     #[command(about = "React to a message")]
     React {
         #[arg(help = "Group id containing the message")]

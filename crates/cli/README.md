@@ -214,8 +214,10 @@ Group commands:
 ```sh
 wn --account <npub-or-hex> groups list
 wn --account <npub-or-hex> groups create <name> [member-npub-or-hex ...] [--description <description>]
+wn --account <npub-or-hex> groups create <name> [member ...] --retention 1d [--image <path> [--image-media-type <mime>]]
 wn --account <npub-or-hex> groups show <group-hex>
 wn --account <npub-or-hex> groups add-members <group-hex> <member-npub-or-hex> [...]
+wn --account <npub-or-hex> groups add-members <group-hex> <member-npub-or-hex> [...] --admin <member-npub-or-hex>
 wn --account <npub-or-hex> groups remove-members <group-hex> <member-npub-or-hex> [...]
 wn --account <npub-or-hex> groups members <group-hex>
 wn --account <npub-or-hex> groups admins <group-hex>
@@ -225,8 +227,28 @@ wn --account <npub-or-hex> groups accept <group-hex>
 wn --account <npub-or-hex> groups decline <group-hex>
 wn --account <npub-or-hex> groups leave <group-hex>
 wn --account <npub-or-hex> groups rename <group-hex> <name>
+wn --account <npub-or-hex> groups update <group-hex> [--name <name>] [--description <description>]
 wn --account <npub-or-hex> groups set-avatar-url <group-hex> --url <https-url> [--dim <WxH>] [--thumbhash <hex>]
 wn --account <npub-or-hex> groups set-avatar-url <group-hex> --clear
+wn --account <npub-or-hex> groups set-image <group-hex> <image-path> [--media-type <mime>]
+wn --account <npub-or-hex> groups clear-image <group-hex>
+wn --account <npub-or-hex> groups download-image <group-hex> [--output <path>]
+wn --account <npub-or-hex> groups retention <group-hex>
+wn --account <npub-or-hex> groups retention <group-hex> --set 1d
+wn --account <npub-or-hex> groups retention <group-hex> --set 0
+wn --account <npub-or-hex> groups management <group-hex>
+wn --account <npub-or-hex> groups enable-disbanding <group-hex>
+wn --account <npub-or-hex> groups disband <group-hex> --confirm
+wn --account <npub-or-hex> groups disband-status <group-hex>
+wn --account <npub-or-hex> groups acknowledge-disband-failure <group-hex>
+wn --account <npub-or-hex> groups recovery-status <group-hex>
+wn --account <npub-or-hex> groups confirm-rejoin <welcome-id-hex> --local-state-token <hex> --confirm
+wn --account <npub-or-hex> groups decline-rejoin <welcome-id-hex>
+wn --account <npub-or-hex> groups quarantined
+wn --account <npub-or-hex> groups retry-hydrate <group-hex>
+wn --account <npub-or-hex> groups delete-local <group-hex> --confirm
+wn --account <npub-or-hex> groups pending-welcomes
+wn --account <npub-or-hex> groups redeliver-welcome <message-id-hex>
 wn --account <npub-or-hex> groups promote <group-hex> <member-npub-or-hex>
 wn --account <npub-or-hex> groups demote <group-hex> <member-npub-or-hex>
 wn --account <npub-or-hex> groups self-demote <group-hex>
@@ -242,7 +264,7 @@ wn --account <npub-or-hex> groups subscribe-state <group-hex>
 
 wn --account <npub-or-hex> group create <name> [member-npub-or-hex ...]
 wn --account <npub-or-hex> group members <group-hex>
-wn --account <npub-or-hex> group invite <group-hex> <member-npub-or-hex> [...]
+wn --account <npub-or-hex> group invite <group-hex> <member-npub-or-hex> [...] [--admin <member-npub-or-hex>]
 wn --account <npub-or-hex> group remove <group-hex> <member-npub-or-hex> [...]
 wn --account <npub-or-hex> group update <group-hex> --name <name>
 wn --account <npub-or-hex> group update <group-hex> --description <description>
@@ -256,6 +278,68 @@ changing their enrollment. Pause/resume is process-local: it stops new preparati
 obligations and already-prepared publication recovery. Application-message JSON results include
 `maintenance_disposition`, which is `ready` or `post_join_rotation_pending_retryable`; a pending post-join rotation
 does not block the send.
+
+Group identifiers: every `<group-hex>` above is the canonical MLS group id (`group_id` in JSON, opaque bytes, 16
+bytes for OpenMLS-created groups). It is not the 32-byte Nostr routing handle shown under `nostr_routing.nostr_group_id_hex`,
+which is transport state that the group can rotate. Filters, lookups, and JSON always key on the MLS group id.
+
+Publication versus durable completion: `published` and `message_ids` on a mutation result mean the relay accepted
+the events this device sent. They do not prove that any other member has processed them. Durable outcomes that
+finish later are queryable after the command returns and after a restart: `groups disband-status`,
+`groups recovery-status`, `groups pending-welcomes`, and `groups maintenance-status`.
+
+`groups update` is the canonical spelling for name and/or description changes; `groups rename` and the legacy
+`group update` keep working. `groups add-members ... --admin <member>` (and legacy `group invite --admin`) grants
+admin to an invitee inside the same invite commit instead of a follow-up promotion; an `--admin` that is not one of
+the invitees fails with `initial_admin_not_invited` before anything is published. Every invite result now carries an
+additive `initial_admins` list.
+
+`groups retention <group-hex>` shows the group's disappearing-message policy (`disappearing_message_secs`, `enabled`,
+and the full `message_retention` component). `--set <duration>` publishes a component update: a bare integer is
+seconds, `s`/`m`/`h`/`d`/`w` suffixes scale a positive integer, and `0` or `off` disables retention explicitly.
+`groups create --retention <duration>` makes the policy part of the founding commit itself (via
+`create_group_with_options`) rather than a second post-create commit. Only admins may change the policy
+(`not_group_admin`). A message keeps the policy of the epoch that delivered it: `messages list` rows carry an additive
+`retention` object (`retention_seconds`, `expires_at`, or `null` for legacy rows) and timeline rows carry
+`retention_seconds` / `retention_expires_at`, so changing the group policy never re-labels older messages.
+
+Disbanding is a coherent lifecycle. `groups enable-disbanding` installs and requires lifecycle-v1 in one admin commit
+(idempotent: `published=0` when the group already requires it; `disbanding_unsupported_members` lists leaves that
+do not advertise it yet). `groups disband --confirm` durably records the irreversible request and returns
+`disband_request` plus a one-word `state`; the terminal commit is prepared by the runtime's convergence pass
+(a running `wnd`, or `messages retry <group-hex>` from a one-shot `wn`), so a returned request is never proof that the
+group has ended or that any member observed it. `groups disband-status` distinguishes `not_enabled`, `enabled`,
+`pending` (durable local request awaiting its terminal commit), `converging` (an authenticated inbound disband is
+settling), `failed` (see `disband_request.failed.reason`, then `groups acknowledge-disband-failure` to clear it), and
+the terminal `disbanded`, alongside `lifecycle_state`, `disbanding` (ordinary outbound work is gated), `disbanded`,
+`unrecoverable`, and `self_membership` (`member`, `left`, or `removed`). Ordinary sends into a disbanding group fail
+with `group_disbanding`. Today a removed member's copy records its own removal (`self_membership: removed`) when the
+terminal commit lands; report both fields rather than inferring the end from one. `groups management` mirrors the
+MarmotKit management state (`is_self_admin`, `can_invite`, `can_leave`, `requires_self_demote_before_leave`,
+`can_enable_disbanding`, `can_disband`, `disbanding_blockers`, per-member `member_actions`) from one runtime read.
+
+Recovery and rejoin consent are branch-bound. `groups recovery-status` returns the durable snapshot
+(`automatic_recovery_failed`, `pending_reinvites`, `failed_reinvites`, and `rejoin_invitations` with each offer's
+`welcome_id_hex`, authenticated `welcomer_account_id_hex`, `epoch`, and `local_state_token`). `groups confirm-rejoin`
+needs the exact offer id and token from that snapshot plus `--confirm`, because it discards the current local copy;
+ordinary `groups accept` never stands in for rejoin authorization. `groups quarantined` lists stored groups that failed
+hydration with a `reason`, and `groups retry-hydrate` re-attempts one without discarding state (`recovered` is the
+engine outcome; an id that is not quarantined is `unknown_group`).
+
+`groups delete-local --confirm` deletes only this device's local app data for a group (messages, timeline, chat row,
+cached media secrets) without an MLS leave, a disband, or archiving; MLS state stays intact and a fresh delivery can
+recreate the chat row. It is refused with `group_disbanding` while a disband is in flight.
+
+Encrypted group images: `groups set-image` encrypts and uploads a PNG/JPEG/GIF/WebP file and commits the
+`marmot.group.blossom-image.v1` component, `groups clear-image` commits the absent state, and `groups download-image`
+fetches and decrypts the current image (`group_image_absent` when there is none). `groups create --image <path>` adds
+a founding image to the create commit. These commands report a redacted `image` summary (`present`, `image_hash_hex`,
+`media_type`) and never print the image key, upload secret, or key-bearing `data_hex` (see mdk#1253 for the wider
+`group_json` trust boundary). `set-avatar-url` changes the separate URL-avatar component.
+
+`groups pending-welcomes` lists Welcomes that a confirmed create/invite could not deliver (`group_id`, `message_id`,
+`recipient`, `recorded_at`); create and invite still drain their fanout before returning, so this is normally empty.
+`groups redeliver-welcome <message-id-hex>` re-publishes one without re-committing.
 
 Message commands:
 
@@ -271,8 +355,10 @@ wn --account <npub-or-hex> messages search <group-hex> <query> --limit 20
 wn --account <npub-or-hex> messages search-all <query> --limit 20
 wn --account <npub-or-hex> messages react <group-hex> <message-id> +
 wn --account <npub-or-hex> messages unreact <group-hex> <message-id>
+wn --account <npub-or-hex> messages edit <group-hex> <message-id> "corrected text"
 wn --account <npub-or-hex> messages delete <group-hex> <message-id>
-wn --account <npub-or-hex> messages retry <group-hex> <event-id>
+wn --account <npub-or-hex> messages retry <group-hex> [event-id]
+wn --account <npub-or-hex> messages sweep-expired
 wn --account <npub-or-hex> messages send-event <group-hex> <kind> [content]
 wn --account <npub-or-hex> messages send-event <group-hex> 30100 '{"cursor":7}' --tag '["e","<event-id-hex>"]'
 wn --account <npub-or-hex> messages list <group-hex> --kind 9 --kind 30100
@@ -286,6 +372,30 @@ wn --account <npub-or-hex> messages timeline subscribe <group-hex>
 `messages react` is idempotent for an already-active reaction and reports
 `published=0` in that case. `messages unreact` removes all of the account's
 active reactions from the target in one deletion event.
+
+`messages edit <group-hex> <message-id> <text>` publishes a kind-1009 edit whose `e` tag references the target and
+whose content is the replacement text (trailing text is hyphen-tolerant, like `send`). The target must be a locally
+projected message authored by the selected account: a foreign target fails with `not_message_author` and an unknown
+id with `unknown_message` before anything is published, because recipients only honour edits whose authenticated
+author matches the target's author. Recipients see the edit as a kind-1009 row in `messages list` and the timeline
+(`messages list --kind 1009` filters to edits); hosts resolve the latest text per target from those rows. Kind 1009
+stays reserved on `messages send-event`. The JSON response is a send result plus `target_message_id` and `kind`.
+
+`messages delete <group-hex> <message-id>` publishes an authenticated kind-5 delete tombstone to the group. Every
+member that honours it hides the target; it is a group-visible deletion request, not secure erasure, and it does not
+touch relay copies of the original event.
+
+`messages retry <group-hex> [event-id]` retries durable pending work for the whole group through
+`retry_group_convergence`: retained events and pending commits are republished exactly, and fresh plaintext is never
+re-encrypted to satisfy the command spelling. The optional event id is echoed as `target_event_id` for scripts
+(`null` when omitted) and does not scope the action; `retry_scope` is always `group_convergence`.
+
+`messages sweep-expired` runs the engine-owned disappearing-message sweep for the selected account now, using the
+current wall clock (the engine applies its own clock-skew tolerance, unread deferral, and scan bounds; there is no
+flag to supply an arbitrary time). It returns `now_ms`, total `pruned_messages` / `secrets_deleted`, and a per-group
+`groups` array with `status` (`no_expired_messages`, `pruned`, `deferred_clock_skew`, `deferred_unread`,
+`deferred_scan_exhausted`, or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
+`failure_kind`. A running `wnd` does not schedule this sweep on its own; call it explicitly.
 
 `messages send --reply-to <message-id>` sends the text as a reply to an existing message. It uses the same wire
 format other Marmot clients produce, so recipients see the row with its reply reference and a hydrated reply preview
@@ -330,7 +440,11 @@ Media commands:
 ```sh
 wn --account <npub-or-hex> media list <group-hex>
 wn --account <npub-or-hex> media upload <group-hex> <file-path> --send --message <caption>
+wn --account <npub-or-hex> media upload <group-hex> <first.jpg> <second.jpg> --send --message <caption>
 wn --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.divine.video
+wn --account <npub-or-hex> media send <group-hex> '<media-json>' ['<media-json>' ...] --message <caption>
+wn --account <npub-or-hex> media send <group-hex> <plaintext-sha256>
+wn --account <npub-or-hex> media set-endpoints <group-hex> https://blossom.example [https://mirror.example]
 wn --account <npub-or-hex> media download <group-hex> <file-hash> --output ./file.jpg
 ```
 
@@ -341,9 +455,17 @@ in the group's exact versioned encrypted-media component: frozen V1 (`0x8008`) f
 (`0x800b`) for current-profile groups. Newly created current groups use MDK's ciphertext-compatible built-in endpoint
 list unless the application was compiled with `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`.
 
-Endpoint policy is signed group state. Upgrading MDK changes the defaults for new groups only; an active group admin can
-call `replace_encrypted_media_blob_endpoints` to change endpoints without changing that group's media version.
+Endpoint policy is signed group state. Upgrading MDK changes the defaults for new groups only; an active group admin
+runs `media set-endpoints <group-hex> <url> [...]` (`--locator-kind` defaults to `blossom-v1`) to replace the group's
+default blob endpoints without changing that group's media version. Non-admins get `not_group_admin`; the response
+carries the refreshed `encrypted_media` component.
 Upload JSON returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators.
+`media upload` accepts several files; with `--send` they go out as one kind-9 message whose `imeta` tags keep the
+command-line order (`attachment_index` in `media list`). `media send` publishes already-uploaded references as one
+ordered message without re-uploading: each `<attachment>` is either the `media` JSON object from `media upload` /
+`media list` output, or the plaintext SHA-256 of an attachment already projected in the group (re-send/forward within
+the group). The runtime re-validates every reference against the group's media profile, locator policy, and version,
+and each reference keeps its original `source_epoch` so recipients derive the right media secret.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
 decrypts it, and writes the plaintext file.
 

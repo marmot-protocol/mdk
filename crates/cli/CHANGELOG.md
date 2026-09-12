@@ -9,6 +9,68 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `wn messages edit <group-hex> <message-id> <text>` publishes a kind-1009 edit through the runtime's
+  `edit_message`. The target must be a locally projected message authored by the selected account; a foreign target
+  fails with `not_message_author` and an unknown id with `unknown_message` before anything is published. The JSON
+  response is a send result plus `target_message_id` and `kind`. Kind 1009 stays reserved on `messages send-event`.
+- `wn groups retention <group-hex> [--set <duration>]` shows or sets the disappearing-message policy through
+  `update_message_retention` (`0`/`off` disables explicitly; bare seconds or `s`/`m`/`h`/`d`/`w` suffixes), and
+  `wn groups create --retention <duration>` makes the policy part of the founding commit via
+  `create_group_with_options`. `messages list` rows carry an additive `retention` object and timeline rows carry
+  `retention_seconds` / `retention_expires_at` so the delivering epoch's policy stays visible per message.
+- `wn messages sweep-expired` runs the engine-owned retention sweep for the selected account on the current wall
+  clock and reports `now_ms`, totals, and a per-group `groups` array with a snake_case `status`.
+- Disband lifecycle: `wn groups enable-disbanding`, `wn groups disband --confirm`, `wn groups disband-status`,
+  and `wn groups acknowledge-disband-failure`. `disband-status` reports a one-word `state` (`not_enabled`,
+  `enabled`, `pending`, `converging`, `failed`, `disbanded`) alongside `lifecycle_state`, `disbanding`,
+  `disbanded`, `disband_request`, `disbanding_blockers`, `unrecoverable`, and `self_membership`. A returned disband
+  request is durable local intent; the terminal commit is prepared by the runtime convergence pass (a running `wnd`
+  or `messages retry <group-hex>`). `wn groups management <group-hex>` mirrors the MarmotKit management state.
+- Recovery: `wn groups recovery-status`, `wn groups confirm-rejoin <welcome-id> --local-state-token <hex>
+  --confirm`, `wn groups decline-rejoin`, `wn groups quarantined`, and `wn groups retry-hydrate`. Rejoin consent
+  is bound to the exact reviewed offer id and token; ordinary invite acceptance never stands in for it.
+- `wn groups delete-local <group-hex> --confirm` deletes only this device's local group data through
+  `delete_group_local`, distinct from leaving, disbanding, and archiving.
+- Encrypted group images: `wn groups set-image`, `wn groups clear-image`, `wn groups download-image`, and
+  `wn groups create --image <path> [--image-media-type <mime>]`. Their JSON reports a redacted `image` summary
+  (`present`, `image_hash_hex`, `media_type`) and never the image key, upload secret, or key-bearing `data_hex`.
+- `wn groups add-members ... --admin <member>` (and legacy `wn group invite --admin`) grants admin to an invitee in
+  the same invite commit via `invite_members_with_initial_admins`; a non-invitee admin fails with
+  `initial_admin_not_invited`. Invite results carry an additive `initial_admins` list.
+- `wn groups pending-welcomes` lists undelivered Welcomes from `pending_welcome_deliveries` and
+  `wn groups redeliver-welcome <message-id>` re-publishes one without re-committing.
+- `wn media upload` accepts several files and `--send` publishes them as one ordered kind-9 message.
+  `wn media send <group-hex> <attachment> [...]` sends already-uploaded references (the `media` JSON object from
+  upload/list output, or the plaintext SHA-256 of a projected attachment) through `send_media_attachments`,
+  preserving order and each reference's `source_epoch`. `wn media set-endpoints <group-hex> <url> [...]` replaces
+  the group's encrypted-media default blob endpoints through `replace_encrypted_media_blob_endpoints`.
+- `wn groups update <group-hex> [--name] [--description]` is the canonical plural spelling of the legacy
+  `wn group update`; both now require at least one field at parse time. `wn tui` `/chat describe` and
+  `/chat rename` use it.
+- Typed JSON error codes for the new surface: `group_disbanding`, `disbanding_not_enabled`,
+  `disbanding_unsupported_members`, `leave_already_requested`, `group_invite_not_pending`,
+  `invalid_encrypted_media`, `invalid_app_message_payload`, `invalid_retention_duration`, `unknown_message`,
+  `not_message_author`, `empty_group_image`, `group_image_absent`, `invalid_rejoin_token`, `invalid_welcome_id`,
+  and `initial_admin_not_invited`.
+
+### Changed
+
+- `wn messages delete` help now describes what the handler does: it publishes an authenticated kind-5 delete
+  tombstone to the group, which is a group-visible deletion request rather than a local-view change or secure
+  erasure.
+- `wn messages retry <group-hex> [event-id]` documents its real contract: it retries durable pending work for the
+  whole group through `retry_group_convergence` and never re-encrypts fresh plaintext. The event id is now optional
+  and only echoed as `target_event_id` (`null` when omitted); `retry_scope` stays `group_convergence`.
+- Group JSON (`groups show`, `groups list`, `chats` rows, and the `groups subscribe-state` feed) gains additive
+  `message_retention`, `disbanding`, `disbanded`, `disband_request`, `unrecoverable`, `self_membership`
+  (`member`/`left`/`removed`), and `leave_requested_at_ms` keys. The `mls` object gains additive `protocol_profile`,
+  `lifecycle_state`, `unrecoverable`, `disbanding_enabled`, `disbanding`, `disbanding_blockers`, and
+  `disband_request` keys. Existing keys are unchanged.
+- The README documents canonical MLS group ids versus 32-byte Nostr routing ids, and relay publication versus
+  durable completion, for the group and message surfaces.
+
 ## [0.9.21] - 2026-09-10
 
 ### Release notes

@@ -759,6 +759,64 @@ fn whitenoise_command_surface_names_are_present() {
             "wn groups --help should expose invite command {expected}"
         );
     }
+    for expected in [
+        "update",
+        "retention",
+        "enable-disbanding",
+        "disband",
+        "disband-status",
+        "acknowledge-disband-failure",
+        "management",
+        "recovery-status",
+        "confirm-rejoin",
+        "decline-rejoin",
+        "quarantined",
+        "retry-hydrate",
+        "delete-local",
+        "set-image",
+        "clear-image",
+        "download-image",
+        "pending-welcomes",
+        "redeliver-welcome",
+    ] {
+        assert!(
+            groups_help.contains(expected),
+            "wn groups --help should expose runtime parity command {expected}"
+        );
+    }
+
+    let messages_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .args(["messages", "--help"])
+        .output()
+        .expect("messages help should run");
+    assert!(
+        messages_help.status.success(),
+        "{}",
+        command_output_summary(&messages_help)
+    );
+    let messages_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&messages_help.stdout),
+        String::from_utf8_lossy(&messages_help.stderr)
+    );
+    for (command, description) in [
+        ("edit", "Edit one of your own messages"),
+        ("delete", "Publish an authenticated delete tombstone"),
+        ("retry", "Retry pending group convergence"),
+        (
+            "sweep-expired",
+            "Run the disappearing-message retention sweep",
+        ),
+    ] {
+        assert!(
+            messages_help.contains(command),
+            "wn messages --help should expose {command}"
+        );
+        assert!(
+            messages_help.contains(description),
+            "wn messages --help should describe {command} as: {description}"
+        );
+    }
 
     let chats_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["chats", "--help"])
@@ -795,7 +853,7 @@ fn whitenoise_command_surface_names_are_present() {
         String::from_utf8_lossy(&media_help.stdout),
         String::from_utf8_lossy(&media_help.stderr)
     );
-    for command in ["upload", "download", "list"] {
+    for command in ["upload", "download", "list", "send", "set-endpoints"] {
         assert!(
             media_help.contains(command),
             "media help should expose real {command}"
@@ -5642,6 +5700,35 @@ fn daemon_executes_cli_commands_over_socket() {
             .unwrap()
             .starts_with("npub1")
     );
+    let account_id = value["result"]["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    // Runtime-hosted inspection commands execute through the forwarded `wnd`
+    // path with the selected account preserved.
+    for (args, key) in [
+        (["groups", "quarantined"], "quarantined"),
+        (["groups", "pending-welcomes"], "pending_welcome_deliveries"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--json")
+            .args(["--account", &account_id])
+            .args(args)
+            .output()
+            .expect("wn should start");
+        assert!(
+            output.status.success(),
+            "wn {args:?} failed\n{}",
+            command_output_summary(&output)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["result"]["account_id"], account_id);
+        assert_eq!(value["result"][key], serde_json::json!([]));
+    }
 
     stop_daemon(&socket, &mut child);
 }
@@ -7598,4 +7685,970 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     assert!(message.contains('\u{1b}'));
     assert!(message.contains('\u{7}'));
     assert!(message.contains('\u{202e}'));
+}
+
+// ---------------------------------------------------------------------------
+// Runtime parity: message edits, retention, disbanding, recovery, media (#1788)
+// ---------------------------------------------------------------------------
+
+/// Poll `sync` then `predicate(command output)` until it holds or the bounded
+/// deadline passes. Returns the last command output that satisfied the check.
+fn poll_after_sync_until(
+    home: &std::path::Path,
+    account: &str,
+    args: &[&str],
+    timeout: Duration,
+    mut predicate: impl FnMut(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let _ = try_run_json(home, &["--account", account, "sync"]);
+        let mut full = vec!["--account", account];
+        full.extend_from_slice(args);
+        match try_run_json(home, &full) {
+            Ok(value) if predicate(&value) => return value,
+            Ok(value) => last = value,
+            Err(_) => {}
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> never satisfied {args:?}; {}",
+        json_value_summary("last", &last)
+    );
+}
+
+#[test]
+fn messages_edit_publishes_replacement_and_enforces_local_authorship() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "edits", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "orignal",
+            "text",
+        ],
+    );
+    let target_message_id = sent["message_ids"][0].as_str().expect("message id");
+    sync_until_message(home.path(), test_relay_url(), &bob, "orignal text");
+
+    // Authorship is enforced before anything is published: Bob cannot edit
+    // Alice's message, and an unknown target is rejected rather than sent.
+    let foreign = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "edit",
+            group_id,
+            target_message_id,
+            "hijacked",
+        ],
+    );
+    assert_eq!(foreign["code"], "not_message_author");
+    assert_eq!(foreign["target_message_id"], target_message_id);
+    let unknown_id = "ab".repeat(32);
+    let unknown = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "edit",
+            group_id,
+            &unknown_id,
+            "nothing",
+        ],
+    );
+    assert_eq!(unknown["code"], "unknown_message");
+
+    let edited = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "edit",
+            group_id,
+            target_message_id,
+            "original",
+            "--text",
+        ],
+    );
+    assert_eq!(edited["target_message_id"], target_message_id);
+    assert_eq!(edited["published"], 1);
+    assert_eq!(edited["kind"], 1009);
+    let edit_message_id = edited["message_ids"][0]
+        .as_str()
+        .expect("edit message id")
+        .to_owned();
+
+    // The edit is an inner kind-1009 event: `e` references the target and the
+    // content is the replacement text (hyphen-leading tokens are literal text).
+    let edit_sync =
+        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 1009, target_message_id);
+    let edit = first_message_with_kind_and_target(&edit_sync, 1009, target_message_id)
+        .expect("edit message");
+    assert_eq!(edit["plaintext"], "original --text");
+    assert_eq!(edit["message_id"], edit_message_id);
+    assert_eq!(edit["from"], alice);
+
+    // The materialized timeline carries the edit row, so edited state is
+    // visible to timeline consumers as well as the raw message list.
+    let timeline = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "timeline", "list", group_id],
+    );
+    let timeline_edit = timeline["messages"]
+        .as_array()
+        .expect("timeline rows")
+        .iter()
+        .find(|row| row["kind"] == 1009 && message_e_tag(row) == Some(target_message_id))
+        .expect("timeline edit row");
+    assert_eq!(timeline_edit["plaintext"], "original --text");
+
+    // Kind 1009 stays reserved on the custom-event path.
+    let reserved = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send-event",
+            group_id,
+            "1009",
+            "forged",
+        ],
+    );
+    assert_eq!(reserved["code"], "reserved_app_event_kind");
+
+    // `messages retry` is a group-scoped convergence retry; the event id is
+    // optional context and never scopes the action.
+    let retry = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "retry", group_id],
+    );
+    assert_eq!(retry["retry_scope"], "group_convergence");
+    assert_eq!(retry["group_id"], group_id);
+    assert_eq!(retry["target_event_id"], Value::Null);
+}
+
+#[test]
+fn groups_retention_is_inspectable_settable_and_founding() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "create",
+            "ephemeral",
+            &bob,
+            "--retention",
+            "1h",
+        ],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    assert_eq!(
+        created["message_retention"]["disappearing_message_secs"],
+        3600
+    );
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let shown = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "retention", group_id],
+    );
+    assert_eq!(shown["group_id"], group_id);
+    assert_eq!(shown["disappearing_message_secs"], 3600);
+    assert_eq!(shown["enabled"], true);
+    assert_eq!(
+        shown["message_retention"]["component"],
+        "marmot.group.message-retention.v1"
+    );
+
+    // A message sent under the founding policy carries that policy durably.
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "expires",
+            "later",
+        ],
+    );
+    let message_id = sent["message_ids"][0].as_str().expect("message id");
+    let listed = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "list", group_id],
+    );
+    let message = listed["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == message_id)
+        .expect("sent message");
+    assert_eq!(message["retention"]["retention_seconds"], 3600);
+    assert!(message["retention"]["expires_at"].as_u64().is_some());
+
+    // Only admins change the policy, and the duration must parse.
+    let denied = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "retention",
+            group_id,
+            "--set",
+            "1d",
+        ],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+    let invalid = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "retention",
+            group_id,
+            "--set",
+            "soon",
+        ],
+    );
+    assert_eq!(invalid["code"], "invalid_retention_duration");
+
+    // Explicit zero disables retention through a real component update.
+    let disabled = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "retention",
+            group_id,
+            "--set",
+            "0",
+        ],
+    );
+    assert_eq!(disabled["disappearing_message_secs"], 0);
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["published"], 1);
+
+    // Bob observes the new policy, while the older message keeps the policy
+    // of the epoch that delivered it.
+    sync_until_message(home.path(), test_relay_url(), &bob, "expires later");
+    let bob_policy = poll_after_sync_until(
+        home.path(),
+        &bob,
+        &["groups", "retention", group_id],
+        POLL_TIMEOUT,
+        |value| value["disappearing_message_secs"] == 0,
+    );
+    assert_eq!(bob_policy["enabled"], false);
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "list", group_id],
+    );
+    let bob_message = bob_messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == message_id)
+        .expect("received message");
+    assert_eq!(bob_message["retention"]["retention_seconds"], 3600);
+
+    let sent_after = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "send", group_id, "stays"],
+    );
+    let after_id = sent_after["message_ids"][0].as_str().expect("message id");
+    sync_until_message(home.path(), test_relay_url(), &bob, "stays");
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "list", group_id],
+    );
+    let bob_after = bob_messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == after_id)
+        .expect("received message");
+    assert_eq!(
+        bob_after["retention"]["retention_seconds"]
+            .as_u64()
+            .unwrap_or(0),
+        0
+    );
+
+    // The sweep runs on the production clock and reports per-group outcomes.
+    let sweep = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "sweep-expired"],
+    );
+    assert!(sweep["now_ms"].as_u64().is_some());
+    assert!(sweep["groups"].is_array());
+    assert_eq!(sweep["pruned_messages"], 0);
+}
+
+#[test]
+fn groups_disband_lifecycle_exposes_pending_and_terminal_state() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "farewell", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let status = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "disband-status", group_id],
+    );
+    assert_eq!(status["group_id"], group_id);
+    assert_eq!(status["lifecycle_state"], "stable");
+    assert_eq!(status["disbanding"], false);
+    assert_eq!(status["disbanded"], false);
+    assert_eq!(status["disband_request"], Value::Null);
+
+    // Non-admins can neither enable disbanding nor disband.
+    let denied = run_json_error(
+        home.path(),
+        &["--account", &bob, "groups", "enable-disbanding", group_id],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+    let denied = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "disband",
+            group_id,
+            "--confirm",
+        ],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+
+    let enabled = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "enable-disbanding", group_id],
+    );
+    assert_eq!(enabled["disbanding_enabled"], true);
+    assert_eq!(enabled["group_id"], group_id);
+
+    // Disbanding is irreversible and requires explicit confirmation.
+    let unconfirmed = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "disband", group_id],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+
+    let requested = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "disband",
+            group_id,
+            "--confirm",
+        ],
+    );
+    assert_eq!(requested["state"], "pending");
+    assert_eq!(requested["disbanded"], false);
+    assert!(
+        requested["disband_request"]["pending"]["requested_at_ms"]
+            .as_u64()
+            .is_some()
+    );
+
+    // The durable request gates ordinary outbound work before the terminal
+    // commit lands, and the status surface distinguishes pending from terminal.
+    let pending = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "disband-status", group_id],
+    );
+    assert_eq!(pending["disbanding"], true);
+    assert_eq!(pending["disbanded"], false);
+    assert_eq!(pending["state"], "pending");
+    let blocked = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "too",
+            "late",
+        ],
+    );
+    assert_eq!(blocked["code"], "group_disbanding");
+
+    // Driving the group's convergence pass publishes the terminal commit.
+    let deadline = Instant::now() + POLL_TIMEOUT * 3;
+    let terminal = loop {
+        let _ = try_run_json(
+            home.path(),
+            &["--account", &alice, "messages", "retry", group_id],
+        );
+        let status = run_json(
+            home.path(),
+            &["--account", &alice, "groups", "disband-status", group_id],
+        );
+        if status["disbanded"] == true {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disband never reached terminal state; {}",
+            json_value_summary("last_status", &status)
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    assert_eq!(terminal["state"], "disbanded");
+    assert_eq!(terminal["lifecycle_state"], "disbanded");
+    assert_eq!(terminal["disband_request"], Value::Null);
+
+    // The other member observes the end of the group from their own copy
+    // through ordinary sync. The terminal commit removes every other leaf, so
+    // today a removed member's engine records its own removal
+    // (`self_membership: removed`) rather than the Disbanded lifecycle; the
+    // status surface reports both so scripts can tell either apart from a
+    // live group. A returned request was never proof of this observation.
+    let bob_end = poll_after_sync_until(
+        home.path(),
+        &bob,
+        &["groups", "disband-status", group_id],
+        POLL_TIMEOUT * 3,
+        |value| value["disbanded"] == true || value["self_membership"] == "removed",
+    );
+    assert!(
+        bob_end["disbanded"] == true || bob_end["self_membership"] == "removed",
+        "{bob_end}"
+    );
+    let bob_blocked = run_json_error(
+        home.path(),
+        &["--account", &bob, "messages", "send", group_id, "gone"],
+    );
+    assert!(
+        ["group_disbanding", "group_removed"].contains(&bob_blocked["code"].as_str().unwrap_or("")),
+        "{bob_blocked}"
+    );
+
+    // Acknowledging a failure is a no-op when no failed request exists.
+    let acknowledged = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "acknowledge-disband-failure",
+            group_id,
+        ],
+    );
+    assert_eq!(acknowledged["acknowledged"], false);
+}
+
+#[test]
+fn groups_update_is_canonical_and_legacy_group_update_still_works() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let alice = create_account(home.path());
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "docs"],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+
+    let described = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "update",
+            group_id,
+            "--description",
+            "canonical description",
+        ],
+    );
+    assert_eq!(
+        described["group"]["profile"]["description"],
+        "canonical description"
+    );
+    assert_eq!(described["group"]["profile"]["name"], "docs");
+    assert_eq!(described["published"], 1);
+
+    let both = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "update",
+            group_id,
+            "--name",
+            "docs-2",
+            "--description",
+            "second",
+        ],
+    );
+    assert_eq!(both["group"]["profile"]["name"], "docs-2");
+    assert_eq!(both["group"]["profile"]["description"], "second");
+
+    let legacy = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "group",
+            "update",
+            group_id,
+            "--description",
+            "legacy",
+        ],
+    );
+    assert_eq!(legacy["group"]["profile"]["description"], "legacy");
+
+    assert_eq!(
+        run_json_error(
+            home.path(),
+            &["--account", &alice, "groups", "update", group_id]
+        )["code"],
+        "usage"
+    );
+}
+
+#[test]
+fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_contracts() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "recovery", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let recovery = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "recovery-status", group_id],
+    );
+    assert_eq!(recovery["group_id"], group_id);
+    assert_eq!(recovery["automatic_recovery_failed"], false);
+    assert_eq!(recovery["pending_reinvites"], 0);
+    assert_eq!(recovery["failed_reinvites"], 0);
+    assert_eq!(recovery["rejoin_invitations"], serde_json::json!([]));
+
+    let quarantined = run_json(home.path(), &["--account", &alice, "groups", "quarantined"]);
+    assert_eq!(quarantined["quarantined"], serde_json::json!([]));
+    let not_quarantined = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "retry-hydrate", group_id],
+    );
+    assert_eq!(not_quarantined["code"], "unknown_group");
+
+    // Rejoin consent is branch-bound: it needs the exact offer id and token
+    // from a reviewed recovery snapshot plus an explicit confirmation.
+    let welcome_id = "cd".repeat(32);
+    let token = "ef".repeat(32);
+    let unconfirmed = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "confirm-rejoin",
+            &welcome_id,
+            "--local-state-token",
+            &token,
+        ],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+    let bad_token = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "confirm-rejoin",
+            &welcome_id,
+            "--local-state-token",
+            "zz",
+            "--confirm",
+        ],
+    );
+    assert_eq!(bad_token["code"], "invalid_rejoin_token");
+    let declined = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "decline-rejoin", &welcome_id],
+    );
+    assert!(declined["code"].is_string());
+
+    // Create/invite already drained their Welcomes, so nothing is pending;
+    // re-delivering an unknown Welcome is a typed error, not a silent success.
+    let pending = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "pending-welcomes"],
+    );
+    assert_eq!(pending["pending_welcome_deliveries"], serde_json::json!([]));
+    let redeliver = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "redeliver-welcome",
+            &welcome_id,
+        ],
+    );
+    assert!(redeliver["code"].is_string());
+
+    let alice_management = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "management", group_id],
+    );
+    assert_eq!(alice_management["is_self_admin"], true);
+    assert_eq!(alice_management["is_last_admin"], true);
+    assert_eq!(alice_management["can_invite"], true);
+    assert_eq!(alice_management["can_leave"], false);
+    assert_eq!(alice_management["requires_self_demote_before_leave"], true);
+    assert_eq!(alice_management["lifecycle_state"], "stable");
+    assert_eq!(alice_management["disbanding"], false);
+    assert_eq!(
+        alice_management["member_actions"]
+            .as_array()
+            .expect("member actions")
+            .len(),
+        2
+    );
+    let bob_management = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "management", group_id],
+    );
+    assert_eq!(bob_management["is_self_admin"], false);
+    assert_eq!(bob_management["can_invite"], false);
+    assert_eq!(bob_management["can_leave"], true);
+    assert_eq!(bob_management["can_disband"], false);
+}
+
+#[test]
+fn groups_delete_local_removes_the_local_copy_without_leaving() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "local-only", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let unconfirmed = run_json_error(
+        home.path(),
+        &["--account", &bob, "groups", "delete-local", group_id],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+
+    let deleted = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "delete-local",
+            group_id,
+            "--confirm",
+        ],
+    );
+    assert_eq!(deleted["group_id"], group_id);
+    assert_eq!(deleted["deleted"], true);
+    let bob_groups = run_json(home.path(), &["--account", &bob, "groups", "list"]);
+    assert!(
+        !bob_groups["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .any(|group| group["group_id"] == group_id)
+    );
+
+    // No MLS leave was sent: Alice still sees Bob in the roster.
+    let members = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "members", group_id],
+    );
+    assert_eq!(member_accounts(&members), sorted_accounts([&alice, &bob]));
+}
+
+#[test]
+fn groups_image_commands_clear_validate_and_redact_capability_keys() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let alice = create_account(home.path());
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "pictures"],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+
+    let empty_path = home.path().join("empty.png");
+    std::fs::write(&empty_path, b"").expect("write empty image");
+    let empty = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-image",
+            group_id,
+            empty_path.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(empty["code"], "empty_group_image");
+
+    let absent = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "download-image", group_id],
+    );
+    assert_eq!(absent["code"], "group_image_absent");
+
+    let cleared = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "clear-image", group_id],
+    );
+    assert_eq!(cleared["group_id"], group_id);
+    assert_eq!(cleared["image"]["present"], false);
+    for secret in ["image_key_hex", "image_upload_key_hex", "data_hex"] {
+        assert!(
+            cleared["image"].get(secret).is_none(),
+            "clear-image output must not carry {secret}"
+        );
+    }
+}
+
+#[test]
+fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoch() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let blossom = TestBlossom::new();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "albums", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let first_path = home.path().join("first.txt");
+    let second_path = home.path().join("second.txt");
+    std::fs::write(&first_path, b"first attachment").expect("write first");
+    std::fs::write(&second_path, b"second attachment").expect("write second");
+    let upload = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "upload",
+            group_id,
+            first_path.to_str().expect("utf-8 path"),
+            second_path.to_str().expect("utf-8 path"),
+            "--server",
+            blossom.url(),
+        ],
+    );
+    let attachments = upload["attachments"].as_array().expect("attachments");
+    assert_eq!(attachments.len(), 2);
+    assert_eq!(upload["sent"], Value::Null);
+    let first_reference = attachments[0]["media"].to_string();
+    let second_reference = attachments[1]["media"].to_string();
+    let source_epoch = attachments[0]["media"]["source_epoch"]
+        .as_u64()
+        .expect("source epoch");
+    let first_hash = attachments[0]["media"]["plaintext_sha256"]
+        .as_str()
+        .expect("plaintext hash")
+        .to_owned();
+
+    // Already-uploaded references are sent as one ordered message.
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &first_reference,
+            &second_reference,
+            "--message",
+            "two files",
+        ],
+    );
+    assert_eq!(sent["published"], 1);
+    assert_eq!(sent["attachments"].as_array().expect("sent refs").len(), 2);
+    let message_id = sent["message_ids"][0].as_str().expect("message id");
+
+    let listed = poll_after_sync_until(
+        home.path(),
+        &bob,
+        &["media", "list", group_id],
+        POLL_TIMEOUT,
+        |value| {
+            value["media"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .filter(|row| row["message_id"] == message_id)
+                    .count()
+                    == 2
+            })
+        },
+    );
+    let rows = listed["media"]
+        .as_array()
+        .expect("media rows")
+        .iter()
+        .filter(|row| row["message_id"] == message_id)
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0]["attachment_index"], 0);
+    assert_eq!(rows[0]["file_name"], "first.txt");
+    assert_eq!(rows[0]["caption"], "two files");
+    assert_eq!(rows[0]["source_epoch"], source_epoch);
+    assert_eq!(rows[1]["attachment_index"], 1);
+    assert_eq!(rows[1]["file_name"], "second.txt");
+    assert_eq!(rows[1]["source_epoch"], source_epoch);
+
+    // A projected attachment can be re-sent by plaintext hash.
+    let forwarded = run_json(
+        home.path(),
+        &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(forwarded["published"], 1);
+    assert_eq!(forwarded["attachments"][0]["plaintext_sha256"], first_hash);
+
+    // Endpoint policy is signed group state: admins replace it, others cannot.
+    let denied = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "media",
+            "set-endpoints",
+            group_id,
+            blossom.url(),
+        ],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+    let replaced = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "set-endpoints",
+            group_id,
+            blossom.url(),
+        ],
+    );
+    assert_eq!(replaced["published"], 1);
+    let endpoints = replaced["encrypted_media"]["default_blob_endpoints"]
+        .as_array()
+        .expect("endpoints");
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0]["locator_kind"], "blossom-v1");
+    assert!(
+        endpoints[0]["base_url"]
+            .as_str()
+            .is_some_and(|url| url.trim_end_matches('/') == blossom.url().trim_end_matches('/'))
+    );
+}
+
+#[test]
+fn groups_add_members_can_assign_initial_admins_in_one_commit() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    let carol = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    run_json(home.path(), &["--account", &carol, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "staff", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+
+    // An initial admin must be one of the invitees.
+    let not_invited = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "add-members",
+            group_id,
+            &carol,
+            "--admin",
+            &bob,
+        ],
+    );
+    assert_eq!(not_invited["code"], "initial_admin_not_invited");
+
+    let added = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "add-members",
+            group_id,
+            &carol,
+            "--admin",
+            &carol,
+        ],
+    );
+    assert_eq!(added["published"], 1);
+    assert_eq!(added["initial_admins"], serde_json::json!([carol]));
+    let admins = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "admins", group_id],
+    );
+    assert_eq!(admin_accounts(&admins), sorted_accounts([&alice, &carol]));
 }
