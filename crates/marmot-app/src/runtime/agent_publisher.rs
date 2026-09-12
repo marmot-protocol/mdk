@@ -140,6 +140,9 @@ impl MarmotAppRuntime {
                 &start_id,
             )
             .await?;
+        // The composer never dials `open`: connections come from `candidates`
+        // below, and `open` only supplies stream_id, start_event_id, crypto,
+        // and max_plaintext_frame_len. The address fields are placeholders.
         let open = OpenBrokerTextPublisher {
             broker_addr: routes
                 .first()
@@ -238,11 +241,17 @@ impl AgentPublisher {
         self.policy_max_plaintext_frame_len
     }
 
-    /// Only idle active publishers may be evicted; preserve a sealed retry.
-    pub fn is_active(&self) -> bool {
-        self.state
-            .try_lock()
-            .is_ok_and(|state| matches!(*state, PublisherState::Active))
+    /// Whether an idle sweeper may evict this publisher: no other handle
+    /// exists and the stream is still active. Sealed and finished publishers
+    /// are retained because the sealed transcript is the durable-send retry
+    /// handle. The `try_lock` is sound only under the sole-handle check, since
+    /// every state-lock holder also owns an `Arc` handle.
+    pub fn is_idle_evictable(self: &Arc<Self>) -> bool {
+        Arc::strong_count(self) == 1
+            && self
+                .state
+                .try_lock()
+                .is_ok_and(|state| matches!(*state, PublisherState::Active))
     }
 
     /// Append a transcript record. The ack never copies the accumulated text.
@@ -307,7 +316,8 @@ impl AgentPublisher {
                     let report = response
                         .await
                         .map_err(|_| closed())?
-                        .map_err(AppError::AgentStreamPublisher)?;
+                        // The composer only rejects a Finish on expectation mismatch.
+                        .map_err(|_| AppError::AgentStreamFinishMismatch)?;
                     let hash = hex::decode(report.transcript_hash.ok_or_else(closed)?)?;
                     let transcript_hash = hash.try_into().map_err(|_| closed())?;
                     *state = PublisherState::Sealed(AgentTextStreamFinishRequest {
@@ -329,7 +339,8 @@ impl AgentPublisher {
             let (_, summary) = this
                 .runtime
                 .finish_agent_text_stream(&this.account, &this.group, request.clone())
-                .await?;
+                .await
+                .map_err(|err| AppError::AgentStreamSendFailed(Box::new(err)))?;
             *state = PublisherState::Finished(request, summary.clone());
             Ok(summary)
         })
@@ -375,9 +386,7 @@ fn check_expected(
             .chunk_count
             .is_some_and(|count| count != request.chunk_count)
     {
-        return Err(AppError::AgentStreamPublisher(
-            "stream finalize does not match the sealed transcript".into(),
-        ));
+        return Err(AppError::AgentStreamFinishMismatch);
     }
     Ok(())
 }
@@ -435,11 +444,11 @@ mod tests {
             panic!("expected finalization");
         };
         // Stop at the composer boundary: no network or account is needed.
-        respond.send(Err("fixture failure".into())).unwrap();
-        assert!(
-            matches!(finish.await, Err(AppError::AgentStreamPublisher(error))
-            if error == "fixture failure")
-        );
+        respond.send(Err("mismatch fixture".into())).unwrap();
+        assert!(matches!(
+            finish.await,
+            Err(AppError::AgentStreamFinishMismatch)
+        ));
         cancel.await;
     }
     #[tokio::test]
@@ -469,7 +478,7 @@ mod tests {
             abort: task.abort_handle(),
             state: Arc::new(Mutex::new(PublisherState::Sealed(request))),
         });
-        assert!(!publisher.is_active());
+        assert!(!publisher.is_idle_evictable());
         let mismatch = StreamFinishExpectation {
             final_text: "different".into(),
             transcript_hash_hex: None,
@@ -477,7 +486,7 @@ mod tests {
         };
         assert!(matches!(
             publisher.finish(Some(mismatch)).await,
-            Err(AppError::AgentStreamPublisher(_))
+            Err(AppError::AgentStreamFinishMismatch)
         ));
         let expected = StreamFinishExpectation {
             final_text: "done".into(),
@@ -487,7 +496,10 @@ mod tests {
         // The absent account fails the durable send. Retrying still uses the
         // sealed request, without consulting the finished composer.
         for _ in 0..2 {
-            assert!(publisher.finish(Some(expected.clone())).await.is_err());
+            assert!(matches!(
+                publisher.finish(Some(expected.clone())).await,
+                Err(AppError::AgentStreamSendFailed(_))
+            ));
             assert!(matches!(
                 *publisher.state.lock().await,
                 PublisherState::Sealed(_)

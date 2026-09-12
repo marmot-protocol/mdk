@@ -438,7 +438,7 @@ impl AgentConnector {
         // Durable final published: it is now safe to drop the session.
         let _ = self.streams.remove_if_same(&stream_id_hex, &session);
         Ok(AgentControlResponse::StreamFinalized {
-            stream_id_hex: stream_id_hex.to_owned(),
+            stream_id_hex,
             message_ids_hex: summary.message_ids,
         })
     }

@@ -55,6 +55,8 @@ impl ConnectorError {
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
+            Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
+            Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(_) => "app_error",
             Self::Control(_) => "control_error",
             Self::Hex(_) => "invalid_hex",
@@ -87,6 +89,12 @@ impl ConnectorError {
             Self::Stream(_) | Self::App(AppError::AgentStreamPublisher(_)) => {
                 "agent stream request failed"
             }
+            Self::App(AppError::AgentStreamFinishMismatch) => {
+                "stream finalize does not match the sealed transcript"
+            }
+            Self::App(AppError::AgentStreamSendFailed(_)) => {
+                "stream durable send failed; retry the same finish request"
+            }
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {
@@ -113,7 +121,8 @@ impl ConnectorError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::SendInProgress | Self::App(AppError::MediaUploadTimedOut)
+            Self::SendInProgress
+                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
         )
     }
 

@@ -1321,6 +1321,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             "MARMOT_GROUP_ID_HEX",
         )
         self.quic_candidates = resolve_quic_candidates(extra)
+        if extra.get("stream_chunk_bytes") or os.getenv("MARMOT_STREAM_CHUNK_BYTES"):
+            logger.warning("Marmot stream_chunk_bytes is ignored; wn-agent chunks live previews")
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
         self.debounce_ms = resolve_debounce_ms(extra)
         self.group_activation = resolve_group_activation(extra)

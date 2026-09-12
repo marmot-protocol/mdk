@@ -59,6 +59,9 @@ Prerequisites:
   host and never installs or upgrades OpenClaw.
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors.
 
 ```sh
 install_verified() (

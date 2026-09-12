@@ -103,6 +103,14 @@ pub enum AppError {
     AgentStreamMissingStart,
     #[error("agent publisher: {0}")]
     AgentStreamPublisher(String),
+    /// The finish expectation disagrees with the sealed transcript. Retrying
+    /// with the same inputs cannot succeed.
+    #[error("stream finalize does not match the sealed transcript")]
+    AgentStreamFinishMismatch,
+    /// The durable final send failed after sealing. The sealed transcript is
+    /// retained, so the same finish request may be retried.
+    #[error("agent stream durable send failed: {0}")]
+    AgentStreamSendFailed(#[source] Box<AppError>),
     #[error("agent text stream start has no confirmed message id yet")]
     AgentStreamStartNotConfirmed,
     #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
@@ -288,6 +296,8 @@ impl AppError {
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
             Self::AgentStreamPublisher(_) => "agent_stream_publisher",
+            Self::AgentStreamFinishMismatch => "agent_stream_finish_mismatch",
+            Self::AgentStreamSendFailed(_) => "agent_stream_send_failed",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
             Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",
             Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",

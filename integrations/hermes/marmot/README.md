@@ -93,6 +93,10 @@ pre-releases.
 
 Prerequisites:
 
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors. The former `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES`
+  setting is ignored; the connector now chunks live previews itself.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set

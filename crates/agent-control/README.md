@@ -25,13 +25,19 @@ begin inputs is an error, and trying to begin another active stream with an occu
 `stream_finish` accepts `stream_id_hex`, `stream_capability`, `final_text`, and an
 optional `idempotency_key`. The shared publisher derives the hash and chunk count
 from acknowledged text, status, and progress records. A text mismatch leaves the
-stream active; a failed durable send retains the sealed transcript for retry.
-Successful retries with the same inputs and key return the original message ids,
-including after the connector restarts. Both paths return `stream_finalized`.
+stream active and returns the non-retryable `stream_finalize_mismatch` code; a
+failed durable send retains the sealed transcript and returns the retryable
+`stream_send_failed` code, so clients retry the same finish request. Successful
+retries with the same inputs and key return the original message ids, including
+after the connector restarts. Both paths return `stream_finalized`.
 
 The existing `stream_finalize` remains supported and additionally validates the
 client's `transcript_hash_hex` and `chunk_count`. New clients use `stream_finish`;
-it is an additive v2 operation shipped with the companion connector.
+it is an additive v2 operation shipped with the companion connector. The
+Hermes and OpenClaw plugins call `stream_finish` without a `stream_finalize`
+fallback, so they are cohort-locked to the `wn-agent` release they ship with;
+an older connector answers `control_error` and the plugins degrade to a plain
+durable send without a live preview.
 
 ## What this crate does
 

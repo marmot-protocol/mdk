@@ -870,8 +870,7 @@ impl StreamSessionStore {
             let keys: Vec<_> = sessions
                 .iter()
                 .filter(|(_, session)| {
-                    Arc::strong_count(&session.publisher) == 1
-                        && session.publisher.is_active()
+                    session.publisher.is_idle_evictable()
                         && now.duration_since(session.last_activity) >= max_idle
                 })
                 .map(|(id, _)| id.clone())

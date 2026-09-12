@@ -1015,7 +1015,75 @@ async fn stream_store_evicts_idle() {
     );
     let active = store.remove(&"BB".repeat(32)).unwrap();
     active.publisher.cancel().await;
-    assert!(!active.publisher.is_active());
+    assert!(!active.publisher.is_idle_evictable());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// #366: a sealed transcript whose durable send failed is the only retry
+/// handle, so the idle sweeper must never evict it.
+#[tokio::test]
+async fn stream_store_sweep_spares_sealed_session() {
+    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
+    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
+    let account = runtime
+        .create_identity(
+            AccountSetupRequest {
+                default_relays: vec![crate::validation::endpoint(&url)],
+                bootstrap_relays: vec![crate::validation::endpoint(&url)],
+                ..Default::default()
+            }
+            .relay_options_only(),
+        )
+        .await
+        .unwrap();
+    let group = runtime
+        .create_group(&account.account.account_id_hex, "sealed streams", &[], None)
+        .await
+        .unwrap();
+    let publisher = runtime
+        .open_agent_publisher(
+            account.account.account_id_hex.clone(),
+            group.clone(),
+            vec![0xcc; 32],
+            AgentPublisherOptions {
+                candidates: Vec::new(),
+                routing: AgentPublisherRouting::BestEffort,
+                parent_message_id: None,
+                chunk_bytes: 1024,
+                server_cert_der: None,
+                insecure_local: false,
+            },
+        )
+        .await
+        .unwrap();
+    // Dropping the group makes the durable final fail after sealing.
+    runtime
+        .delete_group_local(&account.account.account_id_hex, &group)
+        .await
+        .unwrap();
+    assert!(matches!(
+        publisher.finish(None).await,
+        Err(marmot_app::AppError::AgentStreamSendFailed(_))
+    ));
+    let store = StreamSessionStore::default();
+    store.insert(
+        hex::encode([0xcc; 32]),
+        ActiveStreamSession {
+            publisher,
+            stream_capability: [0x77; 32],
+            last_activity: Instant::now() - Duration::from_secs(3600),
+        },
+    );
+    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 0);
+    let sealed = store.remove(&"CC".repeat(32)).unwrap();
+    assert!(!sealed.publisher.is_idle_evictable());
+    sealed.publisher.cancel().await;
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -3598,7 +3666,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
     let AgentControlResponse::Error { code, .. } = mismatched.payload else {
         panic!("expected finalize mismatch error");
     };
-    assert_eq!(code, "stream_error");
+    assert_eq!(code, "stream_finalize_mismatch");
 
     // The compose session must have survived the mismatch: a further append
     // still succeeds.
