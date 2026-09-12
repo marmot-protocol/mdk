@@ -3381,6 +3381,7 @@ fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
 /// undecryptable threshold through the receive seam the way production does,
 /// and every replay is a real drain the scripted pump confirms EOSE for.
 #[test]
+#[cfg(feature = "test-policy-overrides")]
 fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
     run_composed_app_runtime_test("frozen-epoch-fruitless-escalation", || async {
         let dir = tempfile::tempdir().unwrap();
@@ -3468,6 +3469,7 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
 /// shape, where frozen devices plateau at two arms and restarts wipe the count.
 /// So the evidence and the wall-clock arm mark are durable, and the run is not.
 #[test]
+#[cfg(feature = "test-policy-overrides")]
 fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
     run_composed_app_runtime_test("frozen-epoch-evidence-restart", || async {
         let dir = tempfile::tempdir().unwrap();
@@ -3604,6 +3606,7 @@ fn a_restart_inside_the_pacing_interval_does_not_buy_a_rearm() {
 /// history it wanted exists, and must never accumulate toward a report however
 /// many times it happens.
 #[test]
+#[cfg(feature = "test-policy-overrides")]
 fn drains_that_never_confirmed_stored_history_are_not_evidence() {
     run_composed_app_runtime_test("frozen-epoch-unconfirmed-drains", || async {
         let dir = tempfile::tempdir().unwrap();
