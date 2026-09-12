@@ -4971,6 +4971,29 @@ async fn inbound_disband_candidate_blocks_local_delete_body() {
     ));
 }
 
+#[tokio::test]
+async fn pending_disband_keeps_a_worker_wakeup_after_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("pending closure", &[]).await.unwrap();
+    client.take_pending_convergence_groups();
+    client.disband_group(&group_id).await.unwrap();
+    assert!(client.take_pending_convergence_groups().contains(&group_id));
+    assert!(
+        !matches!(
+            client.convergence_schedule_state(&group_id).unwrap(),
+            ConvergenceScheduleState::Idle
+        ),
+        "an accepted disband must keep a wakeup even without other group work"
+    );
+}
+
 async fn pending_disband_composer_gate_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

@@ -572,7 +572,22 @@ impl AppClient {
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
                     })
-                } else if self.runtime.has_queued_outbound_intents(group_id)? {
+                } else if self.runtime.has_queued_outbound_intents(group_id)?
+                    || (matches!(
+                        self.runtime.epoch_state(group_id),
+                        Some(cgka_traits::EpochState::Stable { .. })
+                    ) && self
+                        .runtime
+                        .disband_request(group_id)?
+                        .is_some_and(|request| {
+                            request.status == cgka_traits::DisbandRequestStatus::Pending
+                        }))
+                {
+                    // Acceptance stores a separate durable request, not a queued
+                    // outbound intent or convergence input. Keep its wakeup so
+                    // the next advance can prepare the closing commit. Existing
+                    // convergence and frozen publications retain their precedence;
+                    // an unrecoverable group stays paused.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: None,
                     })
