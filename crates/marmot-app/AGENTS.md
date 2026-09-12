@@ -41,6 +41,13 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).
+- Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
+  typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
+  `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment
+  outcomes indexed by position among the message's `imeta` tags. Bindings surface `Rejected` entries in place; tracing
+  logs only aggregate counts and kinds. Keep the three download error classes distinct: `MediaAttachmentRejected`
+  (structural), `MediaUnfetchable` (valid reference, no locator fetchable under group/client policy, nothing dialed),
+  and `MediaDownloadFailed` (transport, integrity, or decryption after a locator was selected).
 - Keep the mechanical `storage_sqlite` `Stored*` <-> app-DTO mapper free functions (account state, groups, components,
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.

@@ -193,7 +193,7 @@ impl BlossomHttpTransport {
     /// exact origin, refreshing it when the bounded lease expires.
     pub(super) async fn client_for_url(&self, url: &Url) -> Result<reqwest::Client, AppError> {
         validate_blossom_fetch_url(url, self.allow_loopback_http)
-            .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+            .map_err(|err| AppError::UnsafeMediaFetch(format!("unsafe Blossom URL: {err}")))?;
         let origin = MediaOrigin::from_url(url)?;
         let generation = {
             let now = Instant::now();
@@ -468,7 +468,7 @@ pub(super) async fn fetch_blossom_blob_with_observer_until(
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, transport.allow_loopback_http)
-        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+        .map_err(|err| AppError::UnsafeMediaFetch(format!("unsafe Blossom URL: {err}")))?;
     fetch_http_with_bounded_redirects(
         current,
         MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
@@ -571,7 +571,15 @@ pub(crate) fn vet_profile_fetch_resolved_addresses(addrs: &[SocketAddr]) -> Resu
 
 /// Shared manual redirect loop for Blossom blob and profile-image fetches.
 /// Keep policy differences in the caller-supplied client and redirect validators.
-async fn fetch_http_with_bounded_redirects<C, CFut, R>(
+/// Follow up to `MAX_BLOSSOM_REDIRECTS` redirects under one deadline.
+///
+/// A destination-policy refusal (`UnsafeMediaFetch`) from `client_for_url` is
+/// preserved only for the first hop, where it means nothing was dialed. On a
+/// redirect hop the origin server was already contacted and answered, so the
+/// same refusal for the redirect target is reported as a `BlobStore` transfer
+/// failure: the attachment is unavailable right now (the server may redirect
+/// elsewhere or serve the blob on retry), not unfetchable by policy.
+pub(super) async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     mut current: Url,
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
@@ -623,7 +631,14 @@ where
                     host_setup_started,
                     false,
                 );
-                return Err(error);
+                return Err(match error {
+                    AppError::UnsafeMediaFetch(detail) if redirects > 0 => {
+                        AppError::BlobStore(format!(
+                            "redirect target refused by destination policy after a permitted request: {detail}"
+                        ))
+                    }
+                    other => other,
+                });
             }
             Err(_) => {
                 record_download_phase(
@@ -730,8 +745,9 @@ fn validated_media_domain_pin(
         ));
     }
     for addr in addrs {
-        reject_non_public_ip(addr.ip(), allow_loopback)
-            .map_err(|err| AppError::BlobStore(format!("unsafe media host address: {err}")))?;
+        reject_non_public_ip(addr.ip(), allow_loopback).map_err(|err| {
+            AppError::UnsafeMediaFetch(format!("unsafe media host address: {err}"))
+        })?;
     }
     Ok((domain.to_ascii_lowercase(), addrs.to_vec()))
 }
@@ -850,7 +866,7 @@ async fn resolve_pinned_media_host_for_url(
     allow_loopback_http: bool,
 ) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
     validate_blossom_fetch_url(url, allow_loopback_http)
-        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+        .map_err(|err| AppError::UnsafeMediaFetch(format!("unsafe Blossom URL: {err}")))?;
     let allow_loopback = url.scheme() == "http"
         && allow_loopback_http
         && url.host().map(is_loopback_host).unwrap_or(false);
@@ -928,13 +944,15 @@ async fn resolve_media_host_with(
             validated_media_domain_pin(domain, &addrs, allow_loopback).map(Some)
         }
         Host::Ipv4(addr) => {
-            reject_non_public_ip(IpAddr::V4(addr), allow_loopback)
-                .map_err(|err| AppError::BlobStore(format!("unsafe media host address: {err}")))?;
+            reject_non_public_ip(IpAddr::V4(addr), allow_loopback).map_err(|err| {
+                AppError::UnsafeMediaFetch(format!("unsafe media host address: {err}"))
+            })?;
             Ok(None)
         }
         Host::Ipv6(addr) => {
-            reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
-                .map_err(|err| AppError::BlobStore(format!("unsafe media host address: {err}")))?;
+            reject_non_public_ip(IpAddr::V6(addr), allow_loopback).map_err(|err| {
+                AppError::UnsafeMediaFetch(format!("unsafe media host address: {err}"))
+            })?;
             Ok(None)
         }
     }

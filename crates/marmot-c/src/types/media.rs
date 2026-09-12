@@ -1,7 +1,8 @@
 //! C mirrors of the encrypted-media conversions.
 
 use marmot_uniffi::conversions::{
-    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
+    MediaAttachmentOutcomeFfi, MediaAttachmentReferenceFfi, MediaAttachmentRejectionFfi,
+    MediaAttachmentRejectionKindFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
     MediaUploadResultFfi,
 };
@@ -9,8 +10,8 @@ use marmot_uniffi::conversions::{
 use super::account::MarmotSendSummary;
 use super::group::MarmotEncryptedMediaVersion;
 use crate::MarmotStatus;
-use crate::macros::c_mirror;
-use crate::memory::{c_bool, optional_str, required_str};
+use crate::macros::{c_enum, c_mirror};
+use crate::memory::{CFree, c_bool, optional_str, required_str};
 use crate::status::set_last_error;
 
 c_mirror! {
@@ -83,6 +84,85 @@ impl MarmotMediaAttachmentReference {
             dim: unsafe { optional_str(self.dim) }?,
             thumbhash: unsafe { optional_str(self.thumbhash) }?,
         })
+    }
+}
+
+c_enum! {
+    /// Stable category of a rejected encrypted-media attachment (mdk#1787).
+    /// Branch on this rather than on `detail`; the set only grows.
+    MarmotMediaAttachmentRejectionKind from MediaAttachmentRejectionKindFfi {
+        /// Not a decodable encrypted-media `imeta` tag.
+        InvalidStructure,
+        /// The `v` field is absent or names a format this build does not
+        /// implement (legacy MIP-era and future shapes).
+        UnsupportedFormat,
+        /// A required field is absent or empty.
+        MissingField,
+        /// A single-occurrence field appears more than once.
+        DuplicateField,
+        /// A present field has an invalid value.
+        MalformedField,
+    }
+}
+
+c_mirror! {
+    /// Why one attachment was rejected. `detail` is privacy-safe
+    /// presentation text from the shared parser; it never echoes tag
+    /// content.
+    MarmotMediaAttachmentRejection from MediaAttachmentRejectionFfi {
+        copy kind: MarmotMediaAttachmentRejectionKind,
+        str detail,
+    }
+}
+
+/// One `imeta` attachment of a message, in tag order. `attachment_index`
+/// is the position among the message's `imeta` tags, rejected siblings
+/// included, so a host can render media and placeholders in order and
+/// correlate a timeline row with `MarmotMediaRecord` entries for the same
+/// message. Pass an `Accepted` reference to `marmot_download_media`;
+/// render `Rejected` as an unsupported/invalid attachment placeholder
+/// using `rejection.kind`.
+#[repr(C)]
+pub enum MarmotMediaAttachmentOutcome {
+    Accepted {
+        attachment_index: u32,
+        reference: MarmotMediaAttachmentReference,
+    },
+    Rejected {
+        attachment_index: u32,
+        rejection: MarmotMediaAttachmentRejection,
+    },
+}
+
+impl From<MediaAttachmentOutcomeFfi> for MarmotMediaAttachmentOutcome {
+    fn from(value: MediaAttachmentOutcomeFfi) -> Self {
+        match value {
+            MediaAttachmentOutcomeFfi::Accepted {
+                attachment_index,
+                reference,
+            } => Self::Accepted {
+                attachment_index,
+                reference: reference.into(),
+            },
+            MediaAttachmentOutcomeFfi::Rejected {
+                attachment_index,
+                rejection,
+            } => Self::Rejected {
+                attachment_index,
+                rejection: rejection.into(),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotMediaAttachmentOutcome {
+    unsafe fn free_in_place(&mut self) {
+        unsafe {
+            match self {
+                Self::Accepted { reference, .. } => reference.free_in_place(),
+                Self::Rejected { rejection, .. } => rejection.free_in_place(),
+            }
+        }
     }
 }
 
@@ -194,6 +274,8 @@ c_mirror! {
     MarmotMediaRecord from MediaRecordFfi,
     list(MarmotMediaRecordList, marmot_media_record_list_free) {
         str message_id_hex,
+        /// Position among the source message's `imeta` tags, rejected
+        /// siblings included, matching the timeline row's outcome index.
         copy attachment_index: u32,
         str direction,
         str group_id_hex,

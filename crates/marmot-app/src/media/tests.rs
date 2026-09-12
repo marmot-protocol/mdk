@@ -13,7 +13,8 @@ use url::Url;
 use super::blossom::{
     BlossomHttpTransport, DnsResolver, MAX_BLOSSOM_DESCRIPTOR_BYTES,
     MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_observer,
-    fetch_blossom_blob_with_transport, read_limited_blossom_body,
+    fetch_blossom_blob_with_transport, fetch_http_with_bounded_redirects,
+    read_limited_blossom_body,
 };
 use super::host_safety::validate_blossom_fetch_url;
 
@@ -96,16 +97,33 @@ fn chat_list_attachment_projection_is_bounded_and_typed() {
 }
 
 #[test]
-fn chat_list_attachment_projection_drops_malformed_siblings_safely() {
+fn chat_list_attachment_projection_counts_rejected_siblings_as_generic_files() {
+    // A rejected attachment is still an attachment: the timeline shows a
+    // placeholder for it, so the list preview must agree that the message
+    // carries one. Its declared media type is not trusted (the tag failed
+    // validation), so it classifies as the generic `File` glyph.
     let valid = valid_imeta_tag();
     let malformed = vec!["imeta".to_owned(), "m audio/mpeg".to_owned()];
-    let raw = serde_json::json!({ "imeta": [malformed, valid] }).to_string();
+    let raw = serde_json::json!({ "imeta": [malformed.clone(), valid] }).to_string();
 
     assert_eq!(
         classify_chat_list_attachments(Some(&raw)),
-        (Some(ChatListAttachmentKind::Photo), 1)
+        (Some(ChatListAttachmentKind::Mixed), 2)
     );
-    assert_eq!(classify_chat_list_attachments(Some("{not-json")), (None, 0));
+    // The reported #1787 case: a message whose only attachment is the legacy
+    // shape must not look like a text-only row.
+    let legacy_only = serde_json::json!({ "imeta": [legacy_mip04_tag(false)] }).to_string();
+    assert_eq!(
+        classify_chat_list_attachments(Some(&legacy_only)),
+        (Some(ChatListAttachmentKind::File), 1)
+    );
+    // A media column that no longer parses is corruption of a message that
+    // did carry an attachment; it previews as one generic file, not as text.
+    assert_eq!(
+        classify_chat_list_attachments(Some("{not-json")),
+        (Some(ChatListAttachmentKind::File), 1)
+    );
+    assert_eq!(classify_chat_list_attachments(None), (None, 0));
 }
 
 #[test]
@@ -1479,13 +1497,13 @@ async fn production_config_does_not_fetch_loopback_endpoint() {
         .await
         .expect_err("loopback-only reference must be unfetchable in production");
     match err {
-        AppError::InvalidEncryptedMedia(message) => {
+        AppError::MediaUnfetchable(message) => {
             assert!(
                 message.contains("no supported locators"),
                 "expected unfetchable error, got: {message}"
             );
         }
-        other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        other => panic!("expected MediaUnfetchable, got {other:?}"),
     }
 }
 
@@ -1512,11 +1530,11 @@ async fn loopback_fallback_endpoint_is_skipped_in_production() {
         .await
         .expect_err("loopback fallback must be unfetchable in production");
     match err {
-        AppError::InvalidEncryptedMedia(message) => assert!(
+        AppError::MediaUnfetchable(message) => assert!(
             message.contains("no supported locators"),
             "expected unfetchable error, got: {message}"
         ),
-        other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        other => panic!("expected MediaUnfetchable, got {other:?}"),
     }
     // The loopback fallback would survive the candidate filter only when the
     // dev/test gate is on; assert the classifier agrees so the gate stays the
@@ -1549,11 +1567,11 @@ async fn out_of_policy_blossom_locator_is_unfetchable_not_a_hard_error() {
         .await
         .expect_err("an out-of-policy blossom locator must be unfetchable");
     match err {
-        AppError::InvalidEncryptedMedia(message) => assert!(
+        AppError::MediaUnfetchable(message) => assert!(
             message.contains("no supported locators"),
             "expected unfetchable error, got: {message}"
         ),
-        other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        other => panic!("expected MediaUnfetchable, got {other:?}"),
     }
     // The reference is still structurally valid: out-of-policy is a
     // fetchability concern, not a structural one.
@@ -2188,7 +2206,41 @@ fn assert_shared_media_fixture_file(file: &str) {
                 err.to_string().contains(needle),
                 "{file}/{name} error must mention {needle:?}, got: {err}"
             );
+            // The typed parser and the `AppError` wrapper must agree on the
+            // stable category and carry the same presentation text.
+            let rejection = parse_media_attachment(&tag, Some(source_epoch), false).expect_err(
+                &format!("{file}/{name} must be rejected by the typed parser"),
+            );
+            assert_eq!(
+                rejection.kind,
+                fixture_rejection_kind(&case),
+                "{file}/{name} stable rejection kind"
+            );
+            assert!(
+                rejection.detail.contains(needle),
+                "{file}/{name} rejection detail must mention {needle:?}, got: {}",
+                rejection.detail
+            );
+            assert!(
+                matches!(&err, AppError::MediaAttachmentRejected(wrapped) if *wrapped == rejection),
+                "{file}/{name} AppError must wrap the identical typed rejection, got: {err:?}"
+            );
         }
+    }
+}
+
+/// Map a fixture's `rejection_kind` label onto the stable category enum.
+pub(super) fn fixture_rejection_kind(case: &serde_json::Value) -> MediaAttachmentRejectionKind {
+    match case["rejection_kind"]
+        .as_str()
+        .expect("rejection fixture names its rejection_kind")
+    {
+        "invalid_structure" => MediaAttachmentRejectionKind::InvalidStructure,
+        "unsupported_format" => MediaAttachmentRejectionKind::UnsupportedFormat,
+        "missing_field" => MediaAttachmentRejectionKind::MissingField,
+        "duplicate_field" => MediaAttachmentRejectionKind::DuplicateField,
+        "malformed_field" => MediaAttachmentRejectionKind::MalformedField,
+        other => panic!("unknown fixture rejection_kind {other:?}"),
     }
 }
 
@@ -2200,4 +2252,552 @@ fn shared_golden_v1_fixtures_parse_validate_and_round_trip_exactly() {
 #[test]
 fn shared_golden_v2_fixtures_parse_validate_and_round_trip_exactly() {
     assert_shared_media_fixture_file("imeta-v2.json");
+}
+
+fn legacy_mip04_tag(version_first: bool) -> Vec<String> {
+    // The MIP-era shape Amethyst's writer produced before the adopted format:
+    // `url` / `x` / `n` with a `blurhash` and a `v mip04-v2` marker. Neither
+    // field order may change the verdict a client is told about.
+    let mut fields = vec![
+        "url https://media.example/legacy-upload.bin".to_owned(),
+        "blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_owned(),
+        "m image/jpeg".to_owned(),
+        "filename photo.jpg".to_owned(),
+        format!("x {}", "cd".repeat(32)),
+        "n efefefefefefefefefefefef".to_owned(),
+    ];
+    if version_first {
+        fields.insert(0, "v mip04-v2".to_owned());
+    } else {
+        fields.push("v mip04-v2".to_owned());
+    }
+    let mut tag = vec!["imeta".to_owned()];
+    tag.extend(fields);
+    tag
+}
+
+#[test]
+fn legacy_mip04_shape_is_unsupported_format_regardless_of_field_order() {
+    for tag in [legacy_mip04_tag(false), legacy_mip04_tag(true)] {
+        let rejection = parse_media_attachment(&tag, Some(3), false)
+            .expect_err("the legacy shape must be rejected");
+        assert_eq!(
+            rejection.kind,
+            MediaAttachmentRejectionKind::UnsupportedFormat,
+            "legacy shape {tag:?} must classify as an unsupported format, got {rejection:?}"
+        );
+        assert!(rejection.detail.contains("version"), "{}", rejection.detail);
+        assert!(
+            !rejection.detail.contains("media.example"),
+            "rejection detail must never echo tag content: {}",
+            rejection.detail
+        );
+    }
+}
+
+#[test]
+fn parser_rejections_carry_stable_kinds() {
+    use MediaAttachmentRejectionKind::*;
+
+    let mut missing_version = valid_imeta_tag();
+    missing_version.retain(|field| !field.starts_with("v "));
+    let mut unknown_version = valid_imeta_tag();
+    unknown_version[1] = "v encrypted-media-v9".to_owned();
+    let mut duplicate_media_type = valid_imeta_tag();
+    duplicate_media_type.push("m image/jpeg".to_owned());
+    let mut duplicate_version = valid_imeta_tag();
+    duplicate_version.push("v encrypted-media-v1".to_owned());
+    let mut missing_nonce = valid_imeta_tag();
+    missing_nonce.retain(|field| !field.starts_with("nonce "));
+    let mut missing_locator = valid_imeta_tag();
+    missing_locator.retain(|field| !field.starts_with("locator "));
+    let mut bad_hash = valid_imeta_tag();
+    bad_hash[3] = "ciphertext_sha256 not-hex".to_owned();
+    let mut blurhash = valid_imeta_tag();
+    blurhash.push("blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_owned());
+    let mut bare_field = valid_imeta_tag();
+    bare_field.push("dim".to_owned());
+    let mut locator_without_value = valid_imeta_tag();
+    locator_without_value[2] = "locator blossom-v1".to_owned();
+    let mut not_imeta = valid_imeta_tag();
+    not_imeta[0] = "notimeta".to_owned();
+
+    for (label, tag, expected) in [
+        ("missing version", missing_version, UnsupportedFormat),
+        ("unknown version", unknown_version, UnsupportedFormat),
+        ("duplicate media type", duplicate_media_type, DuplicateField),
+        ("duplicate version", duplicate_version, DuplicateField),
+        ("missing nonce", missing_nonce, MissingField),
+        ("missing locator", missing_locator, MissingField),
+        ("non-hex hash", bad_hash, MalformedField),
+        ("blurhash present", blurhash, MalformedField),
+        ("field without value", bare_field, InvalidStructure),
+        (
+            "locator without value",
+            locator_without_value,
+            InvalidStructure,
+        ),
+        ("not an imeta tag", not_imeta, InvalidStructure),
+    ] {
+        let rejection = parse_media_attachment(&tag, None, false)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: tag must be rejected"));
+        assert_eq!(rejection.kind, expected, "{label}: {rejection:?}");
+        assert!(
+            !rejection.detail.is_empty(),
+            "{label}: detail must be presentable"
+        );
+    }
+}
+
+#[test]
+fn typed_rejection_converts_to_app_error_without_losing_the_reason() {
+    let mut missing_nonce = valid_imeta_tag();
+    missing_nonce.retain(|field| !field.starts_with("nonce "));
+
+    let rejection = parse_media_attachment(&missing_nonce, None, false).unwrap_err();
+    let err: AppError = rejection.clone().into();
+
+    assert!(matches!(&err, AppError::MediaAttachmentRejected(wrapped) if *wrapped == rejection));
+    assert!(err.to_string().contains("nonce"), "{err}");
+    assert_eq!(
+        media_attachment_from_imeta_tag(&missing_nonce, None, false)
+            .unwrap_err()
+            .to_string(),
+        err.to_string(),
+        "the AppError entry point must report the identical rejection"
+    );
+}
+
+#[test]
+fn media_attachment_outcomes_preserve_position_and_skip_non_imeta_tags() {
+    let mut broken = valid_imeta_tag();
+    broken.retain(|field| !field.starts_with("nonce "));
+    let tags = vec![
+        vec!["p".to_owned(), "aa".repeat(32)],
+        valid_imeta_tag(),
+        broken,
+        valid_v2_imeta_tag(),
+        vec!["q".to_owned(), "bb".repeat(32)],
+    ];
+
+    let outcomes = media_attachment_outcomes_from_tags(&tags, Some(7), false);
+
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "only imeta tags are attachments: {outcomes:?}"
+    );
+    match &outcomes[0] {
+        MediaAttachmentOutcome::Accepted {
+            attachment_index,
+            reference,
+        } => {
+            assert_eq!(*attachment_index, 0);
+            assert_eq!(reference.file_name, "diagram.png");
+            assert_eq!(reference.source_epoch, 7);
+        }
+        other => panic!("first attachment must be accepted, got {other:?}"),
+    }
+    match &outcomes[1] {
+        MediaAttachmentOutcome::Rejected {
+            attachment_index,
+            rejection,
+        } => {
+            assert_eq!(*attachment_index, 1);
+            assert_eq!(rejection.kind, MediaAttachmentRejectionKind::MissingField);
+            assert!(rejection.detail.contains("nonce"));
+        }
+        other => panic!("second attachment must be rejected, got {other:?}"),
+    }
+    match &outcomes[2] {
+        MediaAttachmentOutcome::Accepted {
+            attachment_index,
+            reference,
+        } => {
+            assert_eq!(*attachment_index, 2);
+            assert_eq!(reference.version, ENCRYPTED_MEDIA_FORMAT_V2);
+        }
+        other => panic!("third attachment must be accepted, got {other:?}"),
+    }
+    // A message with no imeta tags has no attachments and no rejections.
+    assert!(media_attachment_outcomes_from_tags(&tags[..1], Some(7), false).is_empty());
+}
+
+#[test]
+fn media_attachment_outcomes_from_media_json_report_undecodable_entries() {
+    let media = serde_json::json!({
+        "imeta": [
+            valid_imeta_tag(),
+            42,
+            ["notimeta", "m image/png"],
+            legacy_mip04_tag(false),
+        ]
+    });
+
+    let outcomes = media_attachment_outcomes_from_media_json(Some(&media), Some(5), false);
+
+    assert_eq!(outcomes.len(), 4);
+    assert!(matches!(
+        &outcomes[0],
+        MediaAttachmentOutcome::Accepted { attachment_index: 0, reference }
+            if reference.source_epoch == 5
+    ));
+    assert!(matches!(
+        &outcomes[1],
+        MediaAttachmentOutcome::Rejected { attachment_index: 1, rejection }
+            if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+    ));
+    assert!(matches!(
+        &outcomes[2],
+        MediaAttachmentOutcome::Rejected { attachment_index: 2, rejection }
+            if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+    ));
+    assert!(matches!(
+        &outcomes[3],
+        MediaAttachmentOutcome::Rejected { attachment_index: 3, rejection }
+            if rejection.kind == MediaAttachmentRejectionKind::UnsupportedFormat
+    ));
+
+    // No metadata, an object without an imeta list, or an empty imeta list
+    // means no attachments.
+    assert!(media_attachment_outcomes_from_media_json(None, Some(5), false).is_empty());
+    for empty in [serde_json::json!({}), serde_json::json!({ "imeta": [] })] {
+        assert!(
+            media_attachment_outcomes_from_media_json(Some(&empty), Some(5), false).is_empty(),
+            "{empty} must project as no attachments"
+        );
+    }
+    // A present container that cannot be indexed (an imeta value that is not a
+    // list, or a container that is not an object, which is how storage hands
+    // through a corrupt column) is reported once so the host still learns the
+    // row carried undisplayable media.
+    for corrupt in [
+        serde_json::json!({ "imeta": "nope" }),
+        serde_json::json!([42]),
+        serde_json::json!("broken"),
+        serde_json::Value::Null,
+        serde_json::Value::String("{not-json".to_owned()),
+    ] {
+        let outcomes = media_attachment_outcomes_from_media_json(Some(&corrupt), Some(5), false);
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [MediaAttachmentOutcome::Rejected { attachment_index: 0, rejection }]
+                    if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+            ),
+            "{corrupt} must project as one undecodable attachment, got {outcomes:?}"
+        );
+    }
+}
+
+#[test]
+fn media_attachment_outcomes_agree_between_tags_and_media_json() {
+    // The storage row's `media.imeta` is exactly the message's imeta tags in
+    // order, so both entry points must yield identical outcomes and indices.
+    let mut broken = valid_v2_imeta_tag();
+    broken.push("m image/jpeg".to_owned());
+    let tags = vec![
+        vec!["e".to_owned(), "cc".repeat(32)],
+        valid_imeta_tag(),
+        broken,
+        valid_v2_imeta_tag(),
+    ];
+    let imeta: Vec<&Vec<String>> = tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .collect();
+    let media = serde_json::json!({ "imeta": imeta });
+
+    assert_eq!(
+        media_attachment_outcomes_from_tags(&tags, Some(9), false),
+        media_attachment_outcomes_from_media_json(Some(&media), Some(9), false),
+    );
+}
+
+#[tokio::test]
+async fn ciphertext_mismatch_on_every_locator_is_a_download_failure_not_a_reference_error() {
+    // The reference is structurally valid and its locator is fetchable; only
+    // the bytes served do not verify. Per encrypted-media.md that is an
+    // attachment-availability failure, which must not be reported to hosts as
+    // an invalid reference.
+    let body = b"integrity-valid ciphertext";
+    let corrupt_url = spawn_http_response(http_ok_response(b"corrupt"));
+    let reference = blob_reference_for_servers(body, &[corrupt_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a blob that does not verify must fail the download");
+
+    assert!(
+        matches!(&err, AppError::MediaDownloadFailed(message) if message.contains("hash does not match")),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn transport_rejection_is_a_download_failure() {
+    let body = b"never served";
+    let missing_url = spawn_http_response(http_not_found_response());
+    let reference = blob_reference_for_servers(body, &[missing_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a 404 must fail the download");
+
+    assert!(
+        matches!(err, AppError::MediaDownloadFailed(_)),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let wrong_secret = [0x77_u8; 32];
+
+    let err = download_encrypted_media_with_transport(
+        upload.attachments[0].reference.clone(),
+        &wrong_secret,
+        &endpoints,
+        &allowed,
+        &transport,
+        None,
+    )
+    .await
+    .expect_err("a wrong epoch secret cannot decrypt the blob");
+
+    assert!(
+        matches!(&err, AppError::MediaDownloadFailed(message) if message.contains("decryption")),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_attempted_download_failure_outranks_an_unusable_locator_in_either_order() {
+    // A permitted server was contacted and answered 503; a sibling locator
+    // commits to a different blob and is never dialed. The attachment's class
+    // must be the retryable download failure whichever locator comes first,
+    // because `MediaUnfetchable` promises hosts that nothing was dialed.
+    let body = b"never served";
+    let hash = hex::encode(Sha256::digest(body));
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    for unusable_first in [false, true] {
+        let unavailable = spawn_http_response(http_status_response(503, "Service Unavailable"));
+        let dialed = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{unavailable}/{hash}.bin"),
+        };
+        let unusable = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{}.bin", "77".repeat(32)),
+        };
+        let mut reference = blossom_reference();
+        reference.ciphertext_sha256 = hash.clone();
+        reference.locators = if unusable_first {
+            vec![unusable, dialed]
+        } else {
+            vec![dialed, unusable]
+        };
+
+        let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect_err("a 503 with no other usable locator must fail the download");
+
+        assert!(
+            matches!(err, AppError::MediaDownloadFailed(_)),
+            "unusable_first={unusable_first}: expected MediaDownloadFailed, got {err:?}"
+        );
+    }
+}
+
+fn private_address_resolver() -> DnsResolver {
+    Arc::new(move |_domain, port| {
+        Box::pin(async move { Ok(vec![format!("10.0.0.5:{port}").parse().unwrap()]) })
+    })
+}
+
+#[tokio::test]
+async fn dns_destination_policy_rejection_is_unfetchable_not_a_download_failure() {
+    // The locator's hostname passes the literal-host prefilter, but DNS resolves
+    // it to a private address, so the dial policy refuses it before any request
+    // is sent. That is the same verdict as a private-IP literal: unfetchable.
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        private_address_resolver(),
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a hostname resolving to a private address must not be fetched");
+
+    assert!(
+        matches!(&err, AppError::MediaUnfetchable(message) if message.contains("public unicast")),
+        "expected MediaUnfetchable, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dns_lookup_failure_is_a_download_failure() {
+    let resolver: DnsResolver = Arc::new(move |_domain, _port| {
+        Box::pin(async move { Err(AppError::BlobStore("media host DNS lookup failed".into())) })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("an unresolvable host cannot serve the blob");
+
+    assert!(
+        matches!(err, AppError::MediaDownloadFailed(_)),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure() {
+    // One locator is refused by destination policy (DNS -> private address),
+    // the other is a permitted loopback server answering 503. Because a server
+    // was contacted, the outcome is a download failure in either order.
+    let body = b"never served";
+    let hash = hex::encode(Sha256::digest(body));
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        true,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        private_address_resolver(),
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    for refused_first in [false, true] {
+        let unavailable = spawn_http_response(http_status_response(503, "Service Unavailable"));
+        let dialed = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{unavailable}/{hash}.bin"),
+        };
+        let refused = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{hash}.bin"),
+        };
+        let mut reference = blossom_reference();
+        reference.ciphertext_sha256 = hash.clone();
+        reference.locators = if refused_first {
+            vec![refused, dialed]
+        } else {
+            vec![dialed, refused]
+        };
+
+        let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect_err("neither candidate can serve the blob");
+
+        assert!(
+            matches!(err, AppError::MediaDownloadFailed(_)),
+            "refused_first={refused_first}: expected MediaDownloadFailed, got {err:?}"
+        );
+    }
+}
+
+/// Drive the bounded-redirect loop with a client factory that refuses the
+/// hop at `refused_hop` the way DNS destination-policy validation does.
+async fn redirect_loop_with_policy_refusal_at(refused_hop: usize) -> AppError {
+    let hash = valid_hash();
+    let redirecting = spawn_http_response(http_redirect_response(&format!(
+        "https://cdn.example/{hash}.bin"
+    )));
+    let start = Url::parse(&format!("{redirecting}/{hash}.bin")).unwrap();
+    let mut hop = 0_usize;
+    fetch_http_with_bounded_redirects(
+        start,
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+        None,
+        move |_url| {
+            let this_hop = hop;
+            hop += 1;
+            async move {
+                if this_hop == refused_hop {
+                    Err(AppError::UnsafeMediaFetch(
+                        "unsafe media host address: address is not public unicast".into(),
+                    ))
+                } else {
+                    // The loop owns redirect handling, exactly like the pinned
+                    // production clients, so the test client must not follow.
+                    Ok(reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .no_proxy()
+                        .build()
+                        .unwrap())
+                }
+            }
+        },
+        |current, location| Ok(current.join(location).unwrap()),
+    )
+    .await
+    .expect_err("a refused hop must fail the fetch")
+}
+
+#[tokio::test]
+async fn policy_refusal_on_a_redirect_hop_is_a_download_failure_not_unfetchable() {
+    // The origin server was contacted and answered with a redirect whose target
+    // resolves to a forbidden address. Hosts must not be told nothing was
+    // dialed: the server may redirect elsewhere or serve the blob on retry.
+    let err = redirect_loop_with_policy_refusal_at(1).await;
+    assert!(
+        matches!(&err, AppError::BlobStore(message) if message.contains("after a permitted request")),
+        "expected a transfer failure, got {err:?}"
+    );
+    assert!(
+        matches!(
+            media_download_failure(err),
+            AppError::MediaDownloadFailed(_)
+        ),
+        "the encrypted-media path must classify it as a download failure"
+    );
+}
+
+#[tokio::test]
+async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
+    let err = redirect_loop_with_policy_refusal_at(0).await;
+    assert!(
+        matches!(&err, AppError::UnsafeMediaFetch(_)),
+        "an initial refusal means nothing was dialed, got {err:?}"
+    );
+    assert!(matches!(
+        media_download_failure(err),
+        AppError::MediaUnfetchable(_)
+    ));
 }

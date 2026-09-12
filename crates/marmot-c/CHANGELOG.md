@@ -7,6 +7,34 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `MarmotMediaAttachmentOutcome` (tagged union: `Accepted { attachment_index, reference }` /
+  `Rejected { attachment_index, rejection }`), `MarmotMediaAttachmentRejection`, and
+  `MarmotMediaAttachmentRejectionKind` for per-attachment parse outcomes (#1787).
+- `MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED` (70), `MARMOT_STATUS_MEDIA_UNFETCHABLE` (71), and
+  `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` (72), appended after the existing codes.
+
+### Changed
+
+- **In-place ABI break, recompile required.** `MarmotTimelineMessageRecord.media` and
+  `MarmotTimelineReplyPreview.media` hold `MarmotMediaAttachmentOutcome` items rather than
+  `MarmotMediaAttachmentReference`, so the element type and array stride change; a binary built
+  against the previous header would misread the array. This is an Unreleased 0.9 change with no
+  in-place dylib swap supported: rebuild C consumers against the new `include/marmot.h` and
+  switch on the outcome tag. No `…V2` compatibility mirror is provided because no shipped C
+  consumer upgrades the library without a rebuild. A malformed or unsupported attachment now keeps
+  its position with a typed reason instead of disappearing; the parent record's deep-free releases
+  either payload.
+- `MarmotMediaRecord.attachment_index` counts the position among the message's `imeta` tags,
+  rejected siblings included, matching the timeline outcome index.
+- `marmot_download_media` returns `MARMOT_STATUS_MEDIA_UNFETCHABLE` when no locator may be
+  fetched under the current policy and `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` for transport,
+  integrity, and decryption failures. Structurally invalid host-supplied references return
+  `MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED` from every media command instead of
+  `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`, which now covers group-profile/policy mismatches
+  and unusable upload requests.
+
 ## [0.9.21] - 2026-09-10
 
 This cohort also exposes host-driven agent stream publishing and the v4 audit

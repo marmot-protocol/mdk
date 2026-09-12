@@ -1575,6 +1575,70 @@ fn reply_preview_carries_parent_source_epoch_and_media() {
 }
 
 #[test]
+fn corrupt_media_json_is_preserved_without_failing_the_page_or_reply_query() {
+    // mdk#1787: a media column that no longer parses is corruption, not "no
+    // media". The row and its siblings must still load, the text must remain,
+    // and the container must reach the app layer as a diagnostic (a JSON
+    // string) so the projection can report one undecodable attachment.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    let mut parent = chat("parent", "alice", 1, "look at this");
+    parent.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        "m image/png".to_owned(),
+        "filename diagram.png".to_owned(),
+    ]];
+    store.record_app_event(&parent).unwrap();
+    store
+        .record_app_event(&reply("reply", "bob", "parent", 2, "answer"))
+        .unwrap();
+    store
+        .record_app_event(&chat("healthy", "carol", 3, "unrelated"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE message_timeline SET media_json = '{not-json'
+             WHERE group_id_hex = ?1 AND message_id_hex = 'parent'",
+            params![&group_id],
+        )
+        .unwrap();
+
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_id),
+            ..TimelineMessageQuery::default()
+        })
+        .expect("a corrupt media column must not fail the page query");
+
+    assert_eq!(page.messages.len(), 3);
+    let by_id = |id: &str| {
+        page.messages
+            .iter()
+            .find(|message| message.message_id_hex == id)
+            .unwrap()
+    };
+    let corrupt = by_id("parent");
+    assert_eq!(corrupt.plaintext, "look at this");
+    assert_eq!(
+        corrupt.media,
+        Some(serde_json::Value::String("{not-json".to_owned()))
+    );
+    let preview = by_id("reply")
+        .reply_preview
+        .as_ref()
+        .expect("reply preview");
+    assert_eq!(preview.plaintext, "look at this");
+    assert_eq!(
+        preview.media,
+        Some(serde_json::Value::String("{not-json".to_owned()))
+    );
+    assert!(by_id("healthy").media.is_none());
+}
+
+#[test]
 fn record_app_event_returns_projection_shaped_reply_delta() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
