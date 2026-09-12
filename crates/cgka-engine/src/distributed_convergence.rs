@@ -1287,7 +1287,7 @@ impl<S: StorageProvider> Engine<S> {
             reject_legacy_group_additions: self.new_protocol_profile
                 == cgka_traits::group::ProtocolProfile::Current,
         };
-        let admitted_message_ids: HashSet<MessageId> = pass
+        let admitted_message_ids: Vec<MessageId> = pass
             .members
             .iter()
             .map(|member| member.message_id.clone())
@@ -1815,6 +1815,11 @@ impl<S: StorageProvider> Engine<S> {
                 // so later drains do not re-fail them forever against the
                 // removed-copy send gate.
                 self.discard_queued_outbound_intents_for_removed_group(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                // Same for retained inbound rows: see
+                // `retire_deferred_peel_rows_for_terminal_group` for why no
+                // later sweep can reach them.
+                self.retire_deferred_peel_rows_for_terminal_group(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
             }
             self.push_group_state_change(

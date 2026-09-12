@@ -119,20 +119,20 @@ pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
-    AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult,
-    AgentStreamWatchOptions, AgentTextStreamCryptoContext, CatchUpAccountsSummary,
-    ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport, ManagedAccount, MarmotAppEvent,
-    MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery, OnboardingDevicePackage,
-    OnboardingFinding, OnboardingIssue, OnboardingOptions, OnboardingRepairProposal,
-    OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
-    OnboardingStepState, OnboardingSubscription, RelayFailure, RuntimeAccountError,
-    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
-    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult, AgentPublisher,
+    AgentPublisherOptions, AgentPublisherRecord, AgentStreamWatchOptions,
+    AgentTextStreamCryptoContext, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
+    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
+    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,
+    OnboardingOptions, OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot,
+    OnboardingStatus, OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
+    RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
+    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
+    SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
     default_directory_discovery_relays,
 };
 pub use runtime::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
@@ -1457,6 +1457,7 @@ impl MarmotApp {
     ) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        audit_log::cleanup_legacy_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
         *app.root_runtime_lease
@@ -1736,6 +1737,26 @@ impl MarmotApp {
                         .app
                         .clear_key_package_cutover_replacement_pending(&client.state.label);
                 }
+            }
+        }
+        // A generator revision is account-device state, independent of the
+        // strict protocol-profile cutover markers. Local-only/frozen opens
+        // must not start network maintenance.
+        if self.cursor_persistence() == CursorPersistence::Advance {
+            let result = async {
+                if client.runtime.key_package_generation_upgrade_due()? {
+                    client.runtime.publish_fresh_key_package().await?;
+                }
+                Ok::<_, marmot_account::AccountError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "key package generator upgrade remains retryable"
+                );
             }
         }
     }
@@ -3501,7 +3522,7 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v3.jsonl`. The v3 schema contains
+        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::new(
@@ -5754,9 +5775,13 @@ impl MarmotApp {
     }
 
     #[cfg(test)]
-    fn with_test_relay_client(mut self, client: Arc<dyn NostrRelayClient>) -> Self {
-        self.relay_plane = MarmotRelayPlane::new_with_loopback(
+    fn with_test_relay_client<C>(mut self, client: Arc<C>) -> Self
+    where
+        C: NostrRelayClient + crate::relay_plane::DirectoryRelayFetcher + 'static,
+    {
+        self.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
             None,
+            client.clone(),
             client.clone(),
             self.config.allow_loopback_relay_endpoints,
         );

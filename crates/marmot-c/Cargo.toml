@@ -27,3 +27,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+keyring-core.workspace = true
+nostr-relay-builder.workspace = true
+transport-quic-broker.workspace = true

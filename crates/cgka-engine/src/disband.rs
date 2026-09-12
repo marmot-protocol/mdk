@@ -15,6 +15,7 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
 use cgka_traits::error::EngineError;
+use cgka_traits::message::DeferredMessageMetadata;
 use cgka_traits::storage::{
     DisbandCandidate, DisbandFailureReason, DisbandRequest, DisbandRequestStatus, StorageError,
     StorageProvider,
@@ -545,8 +546,8 @@ impl<S: StorageProvider> Engine<S> {
             announced: false,
         };
 
-        self.storage
-            .with_transaction(|storage| -> Result<(), EngineError> {
+        let retired_deferred_rows = self.storage.with_transaction(
+            |storage| -> Result<Vec<DeferredMessageMetadata>, EngineError> {
                 storage.put_disband_tombstone(group_id, &tombstone)?;
                 let mut group = storage.get_group(group_id)?;
                 group.epoch = epoch;
@@ -573,6 +574,16 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 storage.delete_convergence_pass(group_id)?;
                 storage.delete_deferred_peel_generation(group_id)?;
+                // The generation barrier is gone and the rows it tracked
+                // must go with it (see
+                // `Engine::retire_deferred_peel_rows_for_terminal_group`).
+                // Durably retired on this transaction, not after it: the early
+                // return above makes a re-entry after a crash skip this body
+                // forever.
+                let retired_deferred_rows =
+                    crate::message_processor::fail_deferred_peel_rows_in_terminal_group(
+                        storage, group_id,
+                    )?;
                 for snapshot in storage.list_group_snapshots(group_id)? {
                     storage.release_group_snapshot(group_id, &snapshot)?;
                 }
@@ -597,8 +608,10 @@ impl<S: StorageProvider> Engine<S> {
                 mls_group.delete(tx_provider.storage()).map_err(|error| {
                     EngineError::Backend(format!("delete MLS group: {error:?}"))
                 })?;
-                Ok(())
-            })?;
+                Ok(retired_deferred_rows)
+            },
+        )?;
+        self.release_retired_deferred_peel_rows(&retired_deferred_rows);
 
         self.transport_group_id_index
             .retain(|_, mapped_group| mapped_group != group_id);

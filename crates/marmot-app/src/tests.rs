@@ -844,6 +844,34 @@ impl ScriptedPushRelayClient {
     }
 }
 
+// Directory reads must use the same simulated relay publications as writes;
+// invitation tests can no longer rely on a local KeyPackage cache shortcut.
+#[async_trait]
+impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
+    async fn fetch_directory_events(
+        &self,
+        request: crate::relay_plane::DirectoryFetchRequest,
+    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        Ok(self
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
+            })
+            .cloned()
+            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: request.endpoints.clone(),
+                event,
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
     async fn subscribe(
@@ -1552,7 +1580,13 @@ fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
             std::fs::read_to_string(file.path)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|line| {
+                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    crate::audit_log::AUDIT_UPLOAD_SCHEMA
+                        .validate(&row)
+                        .expect("real recorder output must satisfy the upload schema");
+                    row
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -7016,6 +7050,7 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
             lifecycle.publication_targets = replacement.targets;
             lifecycle.refresh_at = Some(replacement.refresh_at);
             lifecycle.upgrade_rotation_recorded = true;
+            lifecycle.generation_revision = replacement.generation_revision;
             storage.put_key_package_lifecycle(&lifecycle).unwrap();
         }
         runtime.shutdown().await;
@@ -7164,6 +7199,106 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
         "projection recovery should issue one idempotent bootstrap batch"
     );
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
+    use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    for label in ["alice", "bob"] {
+        let mut client = app.client(label).await.unwrap();
+        client.runtime.publish_fresh_key_package().await.unwrap();
+        let storage = app.account_storage(label).unwrap();
+        let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+        assert_eq!(
+            lifecycle.generation_revision,
+            KEY_PACKAGE_GENERATION_REVISION
+        );
+        lifecycle.generation_revision = 0;
+        storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    }
+    let before = app
+        .account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    // A frozen notification/read pass leaves this network migration pending.
+    let frozen = MarmotApp::with_relay_and_config(
+        directory.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            cursor_persistence: CursorPersistence::Frozen,
+            ..Default::default()
+        },
+    )
+    .with_test_relay_client(relay);
+    drop(frozen.client("alice").await.unwrap());
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap(),
+        Some(before.clone())
+    );
+    drop(frozen);
+
+    drop(app.client("alice").await.unwrap());
+    let upgraded = app
+        .account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        upgraded.generation_revision,
+        KEY_PACKAGE_GENERATION_REVISION
+    );
+    assert_ne!(
+        upgraded.current_key_package_ref,
+        before.current_key_package_ref
+    );
+    assert_eq!(upgraded.stable_slot_id, before.stable_slot_id);
+    assert!(
+        upgraded
+            .retained_private_material
+            .iter()
+            .any(|old| Some(&old.key_package) == before.current_key_package.as_ref())
+    );
+    assert_eq!(
+        app.account_storage("bob")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap()
+            .generation_revision,
+        0,
+        "opening one account cannot complete another account's migration"
+    );
+    drop(app.client("alice").await.unwrap());
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap(),
+        Some(upgraded)
+    );
+    drop(app.client("bob").await.unwrap());
+    assert_eq!(
+        app.account_storage("bob")
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .unwrap()
+            .generation_revision,
+        KEY_PACKAGE_GENERATION_REVISION
+    );
 }
 
 #[tokio::test]
@@ -7854,41 +7989,9 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
 
 #[tokio::test]
 async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() {
-    let directory = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(directory.path());
-    let bob = home.create_account("bob").unwrap();
-    let carol = home.create_account("carol").unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
-
-    for account in [&bob, &carol] {
-        let current = fresh_key_package_for_account(&app, account, false).await;
-        let metadata = cgka_engine::key_package::key_package_metadata(&current).unwrap();
-        let mut relay_lists = AccountRelayListStatus::empty();
-        relay_lists.inbox.created_at = 1;
-        relay_lists.inbox.relays = vec!["wss://inbox.example".into()];
-        relay_lists.refresh();
-        app.save_directory_entry(&UserDirectoryRecord {
-            account_id_hex: account.account_id_hex.clone(),
-            npub: npub_for_account_id_lossy(&account.account_id_hex),
-            local_account: Some(UserDirectoryLocalAccount {
-                label: account.label.clone(),
-                local_signing: true,
-            }),
-            profile: None,
-            follows: Vec::new(),
-            follow_source_relays: Vec::new(),
-            relay_lists,
-            key_package: Some(DirectoryKeyPackage {
-                key_package_id: format!("{}-slot", account.label),
-                key_package_ref_hex: metadata.key_package_ref_hex,
-                key_package_event_id: String::new(),
-                key_package_hex: hex::encode(current.bytes()),
-                created_at: 1,
-                source_relays: Vec::new(),
-            }),
-        })
-        .unwrap();
-    }
+    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(2, false).await;
+    let bob = accounts[0].clone();
+    let carol = accounts[1].clone();
 
     let bob_npub = npub_for_account_id_lossy(&bob.account_id_hex);
     let resolved = app
@@ -7998,7 +8101,12 @@ pub(crate) async fn member_resolution_fixture(
                 String::new(),
             ));
     }
-    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(relay, fetcher.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay,
+        fetcher.clone(),
+        false,
+    );
     (directory, app, accounts, fetcher)
 }
 
@@ -8357,11 +8465,11 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
         "a cached NIP-65 list must not suppress independent inbox discovery"
     );
     assert!(
-        requests.iter().all(|request| request
+        requests.iter().any(|request| request
             .queries
             .iter()
-            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)),
-        "the KeyPackage fetched during failed prewarm must remain reusable"
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)),
+        "the KeyPackage fetched during failed prewarm must still be refreshed"
     );
 }
 
@@ -8464,13 +8572,13 @@ async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
     client
         .invite_members(&group_id, &[account_id.as_str()])
         .await
-        .expect("the explicit retry should reuse the unconsumed KeyPackage");
+        .expect("the explicit retry should refetch the unconsumed KeyPackage");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
-    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
         request
             .queries
             .iter()
-            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
 }
 
@@ -8518,13 +8626,13 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
     let group_id = client
         .create_group("create route readiness", &[account_id.as_str()])
         .await
-        .expect("the explicit retry should reuse the unconsumed KeyPackage");
+        .expect("the explicit retry should refetch the unconsumed KeyPackage");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
-    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
         request
             .queries
             .iter()
-            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
 }
 
@@ -8580,7 +8688,7 @@ async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_me
     client
         .invite_members(&group_id, &member_refs)
         .await
-        .expect("the explicit retry should reuse both fetched KeyPackages");
+        .expect("the explicit retry should refetch both unconsumed KeyPackages");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 3);
     assert!(
         fetcher
@@ -8588,11 +8696,11 @@ async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_me
             .lock()
             .unwrap()
             .iter()
-            .all(|request| request
+            .any(|request| request
                 .queries
                 .iter()
-                .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)),
-        "the failed preflight must not consume or discard valid fetched KeyPackages"
+                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)),
+        "the retry must refetch packages even though failed preflight did not consume them"
     );
 }
 
@@ -8634,18 +8742,145 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     }
 }
 
-/// Fresh reinvites must not resurrect a cached package when relays only return
+/// The public directory is shared by accounts on a device. Its old package may
+/// still validate cryptographically even after the recipient has rotated it.
+#[tokio::test]
+async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let recipient = &accounts[0];
+    let members = [recipient.account_id_hex.as_str()];
+    let old = app
+        .resolve_member_key_packages(&members)
+        .await
+        .unwrap()
+        .remove(0);
+    let old_directory = app
+        .directory_entry_for_account_id(&recipient.account_id_hex)
+        .unwrap()
+        .unwrap()
+        .key_package
+        .unwrap();
+
+    write_json(
+        app.key_package_record_path(&recipient.label),
+        &KeyPackageRecord {
+            account_label: recipient.label.clone(),
+            account_id_hex: recipient.account_id_hex.clone(),
+            key_package_id: old_directory.key_package_id.clone(),
+            key_package_ref_hex: old_directory.key_package_ref_hex.clone(),
+            key_package_event_id: old_directory.key_package_event_id.clone(),
+            published_at: old_directory.created_at,
+            key_package_hex: old_directory.key_package_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        app.validated_current_local_key_package(&recipient.label),
+        Some(old.clone())
+    );
+
+    let refreshed = fresh_key_package_for_account(&app, recipient, false).await;
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        events.push(member_resolution_key_package_event(
+            recipient,
+            refreshed.clone(),
+        ));
+    }
+    let prewarm = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .unwrap();
+    assert_eq!(prewarm.reused_members, 0);
+    assert_eq!(prewarm.network_resolved_members, 1);
+    assert_eq!(
+        app.directory_entry_for_account_id(&recipient.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .key_package
+            .unwrap()
+            .key_package_hex,
+        old_directory.key_package_hex,
+        "prewarm must preserve the durable discovery projection"
+    );
+
+    // Rotation after prewarming must also be observed at the invitation boundary.
+    let latest = fresh_key_package_for_account(&app, recipient, false).await;
+    assert_ne!(old, latest);
+    assert_ne!(refreshed, latest);
+    {
+        let mut events = fetcher.events.lock().unwrap();
+        events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        events.push(member_resolution_key_package_event(
+            recipient,
+            latest.clone(),
+        ));
+    }
+    fetcher.requests.lock().unwrap().clear();
+    assert_eq!(
+        app.resolve_member_key_packages(&members).await.unwrap(),
+        vec![latest]
+    );
+    let requests = fetcher.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "prewarmed routes should avoid repeating discovery"
+    );
+    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+}
+
+#[tokio::test]
+async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
+    for relay_failure in [false, true] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+        let members = [accounts[0].account_id_hex.as_str()];
+        app.resolve_member_key_packages(&members).await.unwrap();
+        app.prewarm_group_member_key_packages(&members)
+            .await
+            .unwrap();
+        if relay_failure {
+            *fetcher.failing_single_author.lock().unwrap() = Some(members[0].to_owned());
+        } else {
+            fetcher
+                .events
+                .lock()
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        }
+        assert!(
+            app.resolve_member_key_packages(&members).await.is_err(),
+            "neither a relay error nor a relay miss may authorize using the cached package"
+        );
+        assert!(
+            app.prewarm_group_member_key_packages(&members)
+                .await
+                .is_err(),
+            "prewarm must also refresh instead of returning cached readiness"
+        );
+        assert!(
+            app.directory_entry_for_account_id(members[0])
+                .unwrap()
+                .unwrap()
+                .key_package
+                .is_some(),
+            "failed refresh must preserve cached discovery information"
+        );
+    }
+}
+
+/// Invitations and prewarming must not resurrect a cached package when relays only return
 /// future-dated records, including when the batch falls back to single authors.
 #[tokio::test]
-async fn fresh_reinvite_resolution_never_falls_back_to_cached_key_packages() {
+async fn member_key_package_resolution_never_falls_back_to_cached_key_packages() {
     for reject_batch in [false, true] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         let members = accounts
             .iter()
             .map(|account| account.account_id_hex.clone())
             .collect::<Vec<_>>();
-        let cached = app
-            .resolve_fresh_reinvite_key_packages(&members)
+        app.resolve_fresh_reinvite_key_packages(&members)
             .await
             .unwrap();
         for member in &members {
@@ -8680,19 +8915,19 @@ async fn fresh_reinvite_resolution_never_falls_back_to_cached_key_packages() {
             }),
             "single-author fallback must also reject cached material"
         );
-        let ordinary = app
-            .resolve_member_key_packages(&members.iter().map(String::as_str).collect::<Vec<_>>())
+        let refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+        let ordinary = app.resolve_member_key_packages(&refs).await.unwrap_err();
+        assert!(matches!(ordinary, AppError::MissingKeyPackage(id) if id == members[0]));
+        let prewarm = app
+            .prewarm_group_member_key_packages(&refs)
             .await
-            .unwrap();
-        assert_eq!(
-            ordinary, cached,
-            "ordinary resolution still permits cached packages"
-        );
+            .unwrap_err();
+        assert!(matches!(prewarm, AppError::MissingKeyPackage(id) if id == members[0]));
     }
 }
 
 #[tokio::test]
-async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
+async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
     let members = accounts
         .iter()
@@ -8752,9 +8987,41 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        3,
-        "fresh prewarm entries must eliminate create-time relay requests"
+        4,
+        "create must reuse discovery routes but fetch KeyPackages again"
     );
+}
+
+#[tokio::test]
+async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_discovery() {
+    for incomplete in ["wss://directory.example", "wss://shared.example"] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+        let members = [accounts[0].account_id_hex.as_str()];
+        app.resolve_member_key_packages(&members).await.unwrap();
+        // Keep a usable durable inbox, but make its relay refresh incomplete.
+        // A successful KeyPackage fetch does not establish route freshness.
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
+        *fetcher.incomplete_endpoint.lock().unwrap() = Some(incomplete.to_owned());
+        app.prewarm_group_member_key_packages(&members)
+            .await
+            .unwrap();
+        fetcher.requests.lock().unwrap().clear();
+        *fetcher.incomplete_endpoint.lock().unwrap() = None;
+        app.resolve_member_key_packages(&members).await.unwrap();
+        assert!(
+            fetcher.requests.lock().unwrap().iter().any(|request| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == KIND_MARMOT_INBOX_RELAY_LIST)
+            }),
+            "Create must refresh metadata after an incomplete prewarm hop"
+        );
+    }
 }
 
 #[tokio::test]
@@ -8793,8 +9060,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        2,
-        "fresh prewarm must not repeat either query"
+        3,
+        "create must repeat only the KeyPackage query"
     );
 }
 
@@ -8894,12 +9161,12 @@ async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() 
         .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
         .await
         .expect("the valid sibling should remain reusable after the partial failure");
-    assert_eq!(summary.reused_members, 1);
-    assert_eq!(summary.network_resolved_members, 0);
+    assert_eq!(summary.reused_members, 0);
+    assert_eq!(summary.network_resolved_members, 1);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        requests_after_partial,
-        "reusing the valid sibling must not issue another relay request"
+        requests_after_partial + 1,
+        "reuse the valid sibling routes but refresh its KeyPackage"
     );
 }
 
@@ -8954,12 +9221,12 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
         .prewarm_group_member_key_packages(&[valid_account.as_str()])
         .await
         .expect("the valid member from the partial batch remains safely reusable");
-    assert_eq!(summary.reused_members, 1);
-    assert_eq!(summary.network_resolved_members, 0);
+    assert_eq!(summary.reused_members, 0);
+    assert_eq!(summary.network_resolved_members, 1);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        requests_after_partial,
-        "reusing the valid partial result must not issue another relay request"
+        requests_after_partial + 1,
+        "reuse the valid partial routes but refresh its KeyPackage"
     );
 }
 
@@ -13815,6 +14082,176 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
             .unwrap(),
         Some(SelfMembership::Member),
         "a drained re-join must un-suppress the group's unread aggregate again"
+    );
+}
+
+/// Distributed convergence can supersede a removal of this device: the winning
+/// branch keeps us in the group, the engine clears the terminal marker, and the
+/// roster diff reports the local account as `MemberAdded`. That arrival is a
+/// membership transition like any other, so the projection must follow it back
+/// to `Member` — otherwise the healed group keeps its unread suppressed and
+/// renders as departed forever, with no later join event to correct it.
+#[tokio::test]
+async fn a_self_member_added_restores_stored_self_membership_after_a_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://superseded-removal.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("superseded removal", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let state_change = |change| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: local.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+    );
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+        "a superseded removal that re-admits this device must un-suppress the group again"
+    );
+}
+
+/// The same restoration must clear a *voluntary* departure. `Left` is preserved
+/// against a realizing eviction (mdk#1746), but that preservation is about how
+/// a departure is classified, not a veto on coming back: once the roster says
+/// this device is a member again, the group is live and its unread must count.
+#[tokio::test]
+async fn a_self_member_added_clears_a_preserved_voluntary_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://superseded-leave.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("superseded leave", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let state_change = |change| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberLeft {
+                member: local.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Left),
+    );
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Member),
+        "re-admission must outrank a preserved voluntary departure"
+    );
+}
+
+/// A peer joining the group says nothing about this device's own membership.
+/// The arrival test is the same self-subject test the departure path uses, so
+/// the two cannot disagree about who arrived.
+#[tokio::test]
+async fn a_peer_member_added_leaves_stored_self_membership_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://peer-added.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("peer added", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let state_change = |change| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .observe_drained_session_events(&state_change(
+            cgka_traits::engine::GroupStateChange::MemberAdded {
+                member: MemberId::new(
+                    hex::decode(nostr::Keys::generate().public_key().to_hex()).unwrap(),
+                ),
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        app.stored_group_self_membership("alice", &group_id_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+        "a peer's arrival must not re-admit this device"
     );
 }
 

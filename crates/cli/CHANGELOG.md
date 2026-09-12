@@ -11,6 +11,38 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Shared profile-pseudonym helpers are now exported through UniFFI and C
+  (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
+  `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
+
+### Changed
+
+- Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
+  addition to hex, `npub`, and existing URI forms. nprofile relay hints are
+  discarded.
+
+## [0.9.21] - 2026-09-10
+
+### Release notes
+
+- Host-driven agent stream publishing is available through the runtime,
+  Swift/Kotlin, and C bindings.
+- Audit uploads use the v4 schema and hardware model metadata. Hosts must
+  adopt the v4 tracker config and regenerate bindings; startup removes
+  recognized legacy v1-v3 forensic files while preserving v4 and key-reveal logs.
+- Account storage advances through migrations 68–69 for bounded media-retention
+  and chat-readiness queries. Back up before upgrading; downgrade is unsupported.
+  Re-upgrade or restore a pre-upgrade database/export. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before 0.9.15 also cross migration 47: keep at least 3.25 times
+  the account database size free for its history-table rebuild.
+- Epoch-gap backfill intents are discarded for groups this device has left or
+  been removed from. Chat-list and media-retention database work is bounded.
+- Update generated source and native libraries together. C consumers must
+  rebuild against the matching header because record layouts changed.
+
+### Added
+
 - App-message Markdown now emits a structured `Details` block for structural
   `<details>` / `<summary>` lines, including UniFFI and C display trees. Hosts
   must regenerate bindings to render the new variant.
@@ -26,6 +58,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Group creation, invites, and composition prewarming fetch current KeyPackages from relays, including for local
+  sibling accounts; unavailable relay material no longer falls back to cached packages. MarmotKit's prewarm
+  `reusedMembers` remains present but always returns zero. Prewarm caches only discovery routes.
+- Create and Invite reject packages advertising RFC 9420 default capabilities. Recipients with older affected
+  packages automatically regenerate on account activation after upgrading. A durable per-account-device generator
+  revision advances only after a relay acknowledges the replacement, with retries across restarts. Older pending
+  publications are superseded in the same slot with a newer timestamp while preserving their private bundles.
+  Previous unused private bundles remain available until expiry; historical Welcome processing is unchanged.
+  **Compatibility:** inviting a peer still advertising an affected package fails with `InvalidKeyPackageCapabilities`
+  until that peer generates and publishes a conforming package. An upgraded sender cannot repair a recipient that
+  has not upgraded; automatic regeneration requires the recipient to upgrade, activate, and obtain a relay ACK.
+  This is a deliberate stricter admission policy to keep nonconforming signed leaves out of new membership state.
+  The engine reports `InvalidKeyPackageCapabilities` with the affected member for typed callers, while diagnostic
+  text omits identities and classifies the error as a deliberate protocol refusal.
+
 - User search includes cached public identities from every connected account and delivers Vertex matches without
   waiting for graph traversal. Swift/Kotlin and C expose a cache-only search and explicit selected-account follow
   labels. Streaming consumers must apply `updated_results` as keyed replacements; CLI search merges them into one
@@ -33,6 +80,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   across pages. Search-discovered public profiles are searchable across accounts but remain outside live directory
   subscriptions. Local cache materialization is capped at 10,000 distinct identities per account cache, and cache result
   batches at 10,000 people.
+- `wn stream send` (direct and `--broker`) now applies the shared public-address gate to explicit `--connect`
+  destinations. Unflagged loopback, private, link-local, CGNAT, and other non-public targets return
+  `unsafe_quic_endpoint`. `--insecure-local` still opens loopback only; a pinned certificate is TLS trust, not address
+  authorization.
+
+### Fixed
+
+- Direct QUIC stream clients bind the unspecified address of the destination family so IPv6 and normally routed
+  off-host receivers are reachable. The wildcard source bind does not authorize the remote destination.
 
 ## [0.9.20] - 2026-09-08
 

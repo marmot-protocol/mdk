@@ -54,7 +54,9 @@ impl<S: StorageProvider> Engine<S> {
         // fail with an opaque `UseAfterEviction` backend error anyway. Gate
         // here (not just `do_send`) so queued-intent drains hit the same
         // deterministic terminal error. Every intent kind is blocked,
-        // including `Leave` — there is nothing left to leave.
+        // including `Leave` — there is nothing left to leave. Disband reaches
+        // the tombstone gate above first, so the message below stays
+        // accurate.
         let group = self.stored_group_record(&group_id)?;
         if group.as_ref().is_some_and(|group| group.removed) {
             return Err(EngineError::InvalidTransition(

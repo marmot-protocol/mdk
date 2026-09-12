@@ -4,7 +4,8 @@ When a locally published invite loses branch selection, its Welcome may already 
 on the recipient. The inviter's success report does not prove that the invitation survived convergence (#1735).
 
 The engine retains the original invitation intent with a durable recovery record. The app resolves fresh KeyPackages
-using the ordinary safe directory-discovery path, bypassing the initial cache/prewarm shortcut. The engine rejects
+using the ordinary safe directory-discovery path. Every invite fetches fresh packages; recovery additionally
+refreshes relay discovery instead of reusing prewarmed routes. The engine rejects
 packages consumed by the lost invitation, changed or duplicate recipient identities, and loss of inviter authority.
 Only recipients absent from the canonical roster are invited again. Fresh intent replaces the recovery record in the
 same transaction that queues it; publication uses the ordinary outbound queue and acknowledgement rules.

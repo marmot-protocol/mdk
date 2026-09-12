@@ -1652,6 +1652,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         publication_targets: Vec::new(),
         refresh_at: None,
         upgrade_rotation_recorded: false,
+        generation_revision: 0,
         last_consumed_key_package_ref: None,
         last_consumed_at: None,
         retained_private_material: Vec::new(),
@@ -1669,6 +1670,36 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     );
     assert!(handle.key_package_lifecycle().unwrap().is_none());
     assert!(state.pending_replacement.is_none());
+
+    engine
+        .stage_key_package_replacement(&mut state, Timestamp(10_000), 60, Vec::new())
+        .unwrap();
+    state
+        .pending_replacement
+        .as_mut()
+        .unwrap()
+        .generation_revision = 0;
+    engine.put_key_package_lifecycle(&state).unwrap();
+    let old_state = state.clone();
+    let old_bundles = handle.stored_key_package_bundles().unwrap();
+    lifecycle_fault.arm(1);
+    engine
+        .stage_key_package_replacement(&mut state, Timestamp(10_001), 60, Vec::new())
+        .expect_err("superseding an old pending bundle must also be atomic");
+    assert_eq!(state, old_state);
+    assert_eq!(
+        handle.key_package_lifecycle().unwrap(),
+        Some(old_state.clone())
+    );
+    assert_eq!(handle.stored_key_package_bundles().unwrap(), old_bundles);
+    engine
+        .stage_key_package_replacement(&mut state, Timestamp(10_001), 60, Vec::new())
+        .unwrap();
+    assert_eq!(
+        state.retained_private_material[0].key_package,
+        old_state.pending_replacement.unwrap().key_package
+    );
+    assert_eq!(handle.stored_key_package_bundles().unwrap().len(), 2);
 }
 
 #[tokio::test]

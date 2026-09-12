@@ -31,7 +31,8 @@ use crate::types::account::{
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
     MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
-    MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerUpdateResult, MarmotAuditLogUploadResult,
+    MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
+    MarmotAuditLogUploadResult,
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
@@ -1343,6 +1344,27 @@ pub unsafe extern "C" fn marmot_set_audit_log_tracker_config(
     client: *const MarmotClient,
     config: *const MarmotAuditLogTrackerConfig,
     out: *mut *mut MarmotAuditLogTrackerConfig,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let config = try_arg!(unsafe { borrowed(config) });
+        let config = try_arg!(unsafe { config.to_ffi() });
+        unsafe { deliver(client.marmot.set_audit_log_tracker_config(config), out) }
+    })
+}
+
+/// Replace the audit-log tracker endpoint config. Free the result with
+/// `marmot_audit_log_tracker_config_v4_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `config` a valid borrowed struct;
+/// `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_audit_log_tracker_config_v4(
+    client: *const MarmotClient,
+    config: *const MarmotAuditLogTrackerConfigV4,
+    out: *mut *mut MarmotAuditLogTrackerConfigV4,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });

@@ -31,11 +31,13 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.9.20"
+version = "0.9.21"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
+# Offline audit-schema validation; never enable remote reference resolution.
+jsonschema = { version = "0.56.0", default-features = false }
 # OpenMLS family — exact-pinned to the draft-10 last-resort KeyPackage fix.
 # Keep every companion crate on the same repository commit to prevent source skew.
 # Migration: once an upstream OpenMLS release contains this fix, replace all five

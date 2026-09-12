@@ -1,7 +1,7 @@
 //! TLS 1.3 setup for both peers: the self-signed server config, the ALPN-pinned
 //! client endpoint per trust mode, and the loopback-only insecure verifier.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -11,7 +11,7 @@ use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::error::QuicTextStreamError;
 use crate::hardening::QuicPreviewTransportProfile;
-use crate::protocol::{LOCAL_BIND, QUIC_STREAM_ALPN_V1};
+use crate::protocol::QUIC_STREAM_ALPN_V1;
 use crate::receive::ServerTrust;
 
 pub(crate) fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStreamError> {
@@ -107,9 +107,19 @@ pub(crate) fn client_endpoint(
     client_config.transport_config(Arc::new(
         QuicPreviewTransportProfile::client().transport_config()?,
     ));
-    let mut endpoint = Endpoint::client(LOCAL_BIND)?;
+    let mut endpoint = Endpoint::client(client_bind_addr_for_server(server_addr))?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+/// Family-matched unspecified client bind. Source wildcard selection is not
+/// authorization of the remote destination; callers must validate and pin
+/// `server_addr` before dialing.
+pub(crate) fn client_bind_addr_for_server(server_addr: SocketAddr) -> SocketAddr {
+    match server_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
 }
 
 #[derive(Debug)]

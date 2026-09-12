@@ -3171,6 +3171,70 @@ fn stream_send_insecure_local_rejects_remote_endpoints() {
 }
 
 #[test]
+fn stream_send_rejects_non_public_endpoints_without_insecure_local() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    for args in [
+        ["stream", "send", "--connect", "127.0.0.1:4450", "hello"].as_slice(),
+        [
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            "127.0.0.1:4450",
+            "hello",
+        ]
+        .as_slice(),
+        ["stream", "send", "--connect", "10.0.0.1:4450", "hello"].as_slice(),
+        [
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            "[fc00::1]:4450",
+            "hello",
+        ]
+        .as_slice(),
+        [
+            "stream",
+            "send",
+            "--connect",
+            "127.0.0.1:4450",
+            "--server-cert-der-hex",
+            "00",
+            "hello",
+        ]
+        .as_slice(),
+        [
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            "[::1]:4450",
+            "--server-cert-der-hex",
+            "00",
+            "hello",
+        ]
+        .as_slice(),
+    ] {
+        let error = run_json_error(home.path(), args);
+        assert_eq!(
+            error["code"], "unsafe_quic_endpoint",
+            "args={args:?} error={error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("127.0.0.1")
+                && !rendered.contains("10.0.0.1")
+                && !rendered.contains("fc00")
+                && !rendered.contains("::1"),
+            "endpoint-free diagnostic leaked an address: {rendered}"
+        );
+        assert!(error.get("addr").is_none(), "{error}");
+    }
+}
+
+#[test]
 fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     let home = tempfile::tempdir().expect("tempdir");
     let broker = spawn_quic_broker();

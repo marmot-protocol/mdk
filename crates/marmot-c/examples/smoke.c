@@ -147,6 +147,34 @@ int main(int argc, char **argv) {
     st = marmot_client_is_stopping(client, &stopping);
     check(st == MARMOT_STATUS_OK && !stopping, "client not stopping");
 
+    MarmotAuditLogTrackerConfigV4 audit_config = {
+        .endpoint = NULL,
+        .authorization_bearer_token = "test-upload-token",
+        .source = {.hardware_model = "TestModel", .platform = "linux", .app_version = "test"},
+    };
+    MarmotAuditLogTrackerConfigV4 *audit_result = NULL;
+    st = marmot_set_audit_log_tracker_config_v4(client, &audit_config, &audit_result);
+    check(st == MARMOT_STATUS_OK && audit_result != NULL, "v4 audit config crosses the ABI");
+    if (audit_result) {
+        check(audit_result->authorization_bearer_token == NULL, "audit token is write-only");
+        check(audit_result->source.hardware_model &&
+              strcmp(audit_result->source.hardware_model, "TestModel") == 0,
+              "v4 audit hardware model survives the ABI");
+        marmot_audit_log_tracker_config_v4_free(audit_result);
+    }
+
+    MarmotAuditLogTrackerConfig legacy_audit_config = {
+        .endpoint = NULL, .authorization_bearer_token = NULL,
+        .source = {.device_label = "PRIVATE_DEVICE_NAME", .platform = "linux", .app_version = "test"},
+    };
+    MarmotAuditLogTrackerConfig *legacy_audit_result = NULL;
+    st = marmot_set_audit_log_tracker_config(client, &legacy_audit_config, &legacy_audit_result);
+    check(st == MARMOT_STATUS_OK && legacy_audit_result != NULL, "legacy audit config remains callable");
+    if (legacy_audit_result) {
+        check(legacy_audit_result->source.device_label == NULL, "legacy audit device label is discarded");
+        marmot_audit_log_tracker_config_free(legacy_audit_result);
+    }
+
     st = marmot_client_start(client);
     if (st == MARMOT_STATUS_OK) {
         ok("client started");

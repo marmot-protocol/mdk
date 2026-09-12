@@ -171,7 +171,7 @@ impl<S: StorageProvider> Engine<S> {
                 None,
             )));
         };
-        if group.removed || group.disbanded.is_some() {
+        if group.is_terminal() {
             return Ok(Some((
                 report(
                     SupersededIntentOutcome::NotMember,
@@ -468,10 +468,7 @@ impl<S: StorageProvider> Engine<S> {
             outcome,
             reason,
         };
-        if group
-            .as_ref()
-            .is_none_or(|group| group.removed || group.disbanded.is_some())
-        {
+        if group.as_ref().is_none_or(|group| group.is_terminal()) {
             self.storage.delete_own_commit_intent(commit_id)?;
             return Ok(Some(report(
                 SupersededIntentOutcome::NotMember,

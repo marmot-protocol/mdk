@@ -48,6 +48,16 @@ App runtime bridge for the first real Marmot app surfaces.
   the upload client, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for
   audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and HTTP upload. Audit-log
   unit tests live in its own `#[cfg(test)] mod tests`.
+- Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
+  or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
+  by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
+  reserved v1-v3 filenames and their segments from `accounts/` and failed-wipe `.wipe-tombstones/` remnants
+  without reading payloads, even when recording is disabled. Match the frozen 32-lowercase-hex legacy engine ID,
+  not the current audit ID width; pin the live layout through AccountHome-backed tests.
+  Keep this after lease acquisition and before exposing the app; never traverse symlinks or delete v4/future
+  filenames, names outside the reserved legacy forms, or the separate key-reveal log. Unexpected containers
+  and other cleanup errors are reported with aggregate counts, are nonfatal, and retry on next open.
+  Account/device names are forbidden in rows and headers; hardware model is system-sourced, never a label.
 - Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
   never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
   Checkpoint only complete immutable upload snapshots after successful upload.
@@ -66,7 +76,7 @@ App runtime bridge for the first real Marmot app surfaces.
   and retries like any other rejection.
   Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  Retention/deletion of sealed segments is mdk#1014, not this contract.
+  Retention/deletion of v4 sealed segments is mdk#1014, not this contract.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
   prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
   segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and

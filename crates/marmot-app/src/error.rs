@@ -101,6 +101,8 @@ pub enum AppError {
     InvalidMessageDraft(String),
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
+    #[error("agent publisher: {0}")]
+    AgentStreamPublisher(String),
     #[error("agent text stream start has no confirmed message id yet")]
     AgentStreamStartNotConfirmed,
     #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
@@ -285,6 +287,7 @@ impl AppError {
             Self::GroupRemoved(_) => "group_removed",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
+            Self::AgentStreamPublisher(_) => "agent_stream_publisher",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
             Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",
             Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",
@@ -426,6 +429,7 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
         | EngineError::InvalidAppMessagePayload(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::InvalidKeyPackageCapabilities { .. }
         | EngineError::InvalidWelcome
         | EngineError::Serialize(_)
         | EngineError::ForkedEpoch { .. }
@@ -534,6 +538,24 @@ mod tests {
     use crate::SyncFailureClassification;
     use cgka_traits::error::EngineError;
     use cgka_traits::types::{EpochId, GroupId};
+
+    #[test]
+    fn invalid_key_package_capabilities_preserve_member_and_protocol_classification() {
+        let member = cgka_traits::MemberId::new(vec![0xBB; 32]);
+        let error = AppError::Session(cgka_session::SessionError::Engine(
+            EngineError::InvalidKeyPackageCapabilities {
+                member: member.clone(),
+            },
+        ));
+        assert_eq!(
+            error.privacy_safe_kind(),
+            "invalid_key_package_capabilities"
+        );
+        assert_eq!(error.sync_error_class(), crate::SyncErrorClass::Protocol);
+        assert!(matches!(error.as_engine_error(),
+            Some(EngineError::InvalidKeyPackageCapabilities { member: rejected }) if rejected == &member));
+        assert!(!error.to_string().contains(&hex::encode(member.as_slice())));
+    }
 
     // Kind strings leave the runtime: `account_error_message` interpolates
     // them into messages the CLI daemon persists and host apps log. Pin the

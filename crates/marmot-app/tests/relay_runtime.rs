@@ -3790,7 +3790,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
             authorization_bearer_token: Some("goggles_runtime_secret".to_owned()),
             source: AuditLogUploadSource {
-                device_label: Some("Alice iPhone".to_owned()),
+                hardware_model: Some("iPhone17,3".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
             },
@@ -11567,6 +11567,10 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
         })
         .await
         .expect("reactivation must resolve kind 10050 from the advertised outbox");
+
+    // Moving the advertised outbox requires publishing the public package
+    // there as well. Invitation resolution must not rely on the local cache.
+    runtime.publish_key_package(&carol_id).await.unwrap();
 
     let mut events = runtime.subscribe();
     let group_id = runtime

@@ -317,22 +317,24 @@ async fn welcome_for_key_package(
         })
         .await
         .unwrap();
-    match &created.effects.publish[0] {
+    let welcomes = match &created.effects.publish[0] {
         PublishWork::GroupCreated { welcomes, pending } => {
             inviter.confirm_published(*pending).await.unwrap();
             welcomes
-                .iter()
-                .find(|message| {
-                    matches!(
-                        &message.envelope,
-                        TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
-                    )
-                })
-                .expect("welcome addressed to key package owner")
-                .clone()
         }
-        other => panic!("expected GroupCreated publish work, got {other:?}"),
-    }
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes,
+        _ => panic!("expected group creation publish work"),
+    };
+    welcomes
+        .iter()
+        .find(|message| {
+            matches!(
+                &message.envelope,
+                TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
+            )
+        })
+        .expect("welcome addressed to key package owner")
+        .clone()
 }
 
 /// MIP-03 self-remove feature registration, mirroring the cgka-session
@@ -669,6 +671,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 }
 
 include!("runtime/frozen_fanout.rs");
+include!("runtime/key_package_generation_upgrade.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {

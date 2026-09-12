@@ -34,6 +34,7 @@ hex.workspace = true
 httpdate.workspace = true
 hkdf.workspace = true
 image.workspace = true
+jsonschema.workspace = true
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 marmot-markdown.workspace = true
@@ -56,6 +57,7 @@ tracing.workspace = true
 transport-nostr-adapter = { workspace = true, features = ["sdk"] }
 transport-nostr-peeler.workspace = true
 transport-quic-broker.workspace = true
+agent-stream-compose.workspace = true
 transport-quic-stream.workspace = true
 url.workspace = true
 zeroize.workspace = true

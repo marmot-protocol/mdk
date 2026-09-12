@@ -2347,6 +2347,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::InvalidCredentialIdentity(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::InvalidKeyPackageCapabilities { .. }
         | EngineError::UnsupportedCiphersuite { .. }
         | EngineError::InvalidAppMessagePayload(_)
         // A halted group refusing new work is deliberate, not a protocol
@@ -2421,6 +2422,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
+        EngineError::InvalidKeyPackageCapabilities { .. } => "invalid_key_package_capabilities",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
@@ -2641,6 +2643,17 @@ mod tests {
             classify_engine_error(&EngineError::Serialize("malformed internal state".into()));
         assert_eq!(category, SubjectFailureCategory::Protocol);
         assert_eq!(code, "serialize");
+    }
+
+    #[test]
+    fn invalid_key_package_capabilities_are_an_expected_refusal() {
+        let error = EngineError::InvalidKeyPackageCapabilities {
+            member: cgka_traits::MemberId::new(vec![0xBB; 32]),
+        };
+        let (category, code) = classify_engine_error(&error);
+        assert_eq!(category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(code, "invalid_key_package_capabilities");
+        assert_eq!(code, error.privacy_safe_kind());
     }
 
     #[test]
