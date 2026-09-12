@@ -30,9 +30,12 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
   emitting it would collide with the iOS asset name on the shared release. The release job asserts both hashes match.
 - Timeline and reply-preview `media` is an ordered `Vec<MediaAttachmentOutcomeFfi>`; a rejected `imeta` attachment
   stays in place as `Rejected { attachment_index, rejection }` with a stable `MediaAttachmentRejectionKindFfi`
-  (mdk#1787). Route every media projection and the standalone parser through `marmot_app::parse_media_attachment` /
-  the shared outcome helpers so `list_media`, timeline rows, and `parse_media_imeta_tag` agree on kind, detail, and
-  `attachment_index` for the same tag. Do not reintroduce a `filter_map(.ok())` that drops the verdict.
+  (mdk#1787). Timeline rows and `parse_media_imeta_tag` are the surfaces that carry the typed reason, and they must
+  report the same kind and detail for the same tag. `list_media` is the downloadable-only gallery view: it returns
+  accepted records only, numbered by tag position so its `attachment_index` matches the timeline outcome, and it
+  deliberately does not emit a record for a rejected attachment (a gallery host renders placeholders from the timeline
+  row, and mdk#1448 replaces `list_media`). Route all three through `marmot_app::parse_media_attachment` / the shared
+  outcome helpers; do not reintroduce a `filter_map(.ok())` that drops the verdict in the timeline projection.
 - Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes, not Nostr `nostr_group_id` route handles.
   Accept non-empty opaque MLS group ids, including the 16-byte ids OpenMLS generates for MDK today, and do not validate
   them with the 32-byte route-id/pubkey/message-id rule.

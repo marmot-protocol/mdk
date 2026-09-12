@@ -37,6 +37,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   absent or unknown `v`, including the legacy MIP-era `url`/`x`/`n` shape Amethyst once
   emitted, is always classified `UnsupportedFormat` regardless of field order. Strictness,
   duplicate-field, and cryptographic checks are unchanged.
+- The chat-list latest-message attachment preview counts a rejected `imeta` attachment as a
+  generic `File` (and toward the attachment count) instead of ignoring it, so a message whose
+  only attachment was rejected no longer previews as text-only while its timeline row shows a
+  placeholder. Its declared media type is not trusted for classification.
 - The shared encrypted-media fixtures (`fixtures/encrypted-media/`) carry a `rejection_kind`
   for every rejection case plus new legacy-shape, field-without-value, and missing-locator
   cases; marmot-app, MarmotKit, and `wn` assert against them.

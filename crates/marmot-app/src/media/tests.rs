@@ -96,16 +96,28 @@ fn chat_list_attachment_projection_is_bounded_and_typed() {
 }
 
 #[test]
-fn chat_list_attachment_projection_drops_malformed_siblings_safely() {
+fn chat_list_attachment_projection_counts_rejected_siblings_as_generic_files() {
+    // A rejected attachment is still an attachment: the timeline shows a
+    // placeholder for it, so the list preview must agree that the message
+    // carries one. Its declared media type is not trusted (the tag failed
+    // validation), so it classifies as the generic `File` glyph.
     let valid = valid_imeta_tag();
     let malformed = vec!["imeta".to_owned(), "m audio/mpeg".to_owned()];
-    let raw = serde_json::json!({ "imeta": [malformed, valid] }).to_string();
+    let raw = serde_json::json!({ "imeta": [malformed.clone(), valid] }).to_string();
 
     assert_eq!(
         classify_chat_list_attachments(Some(&raw)),
-        (Some(ChatListAttachmentKind::Photo), 1)
+        (Some(ChatListAttachmentKind::Mixed), 2)
+    );
+    // The reported #1787 case: a message whose only attachment is the legacy
+    // shape must not look like a text-only row.
+    let legacy_only = serde_json::json!({ "imeta": [legacy_mip04_tag(false)] }).to_string();
+    assert_eq!(
+        classify_chat_list_attachments(Some(&legacy_only)),
+        (Some(ChatListAttachmentKind::File), 1)
     );
     assert_eq!(classify_chat_list_attachments(Some("{not-json")), (None, 0));
+    assert_eq!(classify_chat_list_attachments(None), (None, 0));
 }
 
 #[test]

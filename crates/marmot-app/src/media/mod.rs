@@ -81,8 +81,13 @@ impl Default for MediaDownloadBenchmarkTransport {
 }
 
 /// Validate and compact the latest-message encrypted-media metadata for the
-/// chat-list surface. Malformed attachments are dropped independently; raw
-/// tags and metadata never cross the app boundary.
+/// chat-list surface. Raw tags and metadata never cross the app boundary.
+///
+/// A rejected attachment still counts as an attachment and classifies as
+/// `File` (the generic glyph): the timeline renders a placeholder for it, so
+/// the list preview must not describe the same message as text-only
+/// (mdk#1787). Its media type is not trusted for classification because the
+/// tag failed validation.
 pub(crate) fn classify_chat_list_attachments(
     media_json: Option<&str>,
 ) -> (Option<ChatListAttachmentKind>, u32) {
@@ -90,6 +95,7 @@ pub(crate) fn classify_chat_list_attachments(
     let mut kinds = Vec::new();
     for outcome in media_attachment_outcomes_from_media_json(media.as_ref(), None, false) {
         let MediaAttachmentOutcome::Accepted { reference, .. } = outcome else {
+            kinds.push(ChatListAttachmentKind::File);
             continue;
         };
         let media_type = reference.media_type.to_ascii_lowercase();
