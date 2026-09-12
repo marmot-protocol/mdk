@@ -603,6 +603,35 @@ impl AppClient {
         group_id: &GroupId,
         group_metadata: Option<&'a cgka_traits::group::Group>,
     ) -> Result<EventGroupProjection<'a>, AppError> {
+        if group_metadata.is_some_and(|group| group.disbanded.is_some()) {
+            // Terminal settlement deletes live MLS state before emitting its
+            // effects. Preserve the last display components and project the
+            // authoritative tombstone instead of querying deleted MLS state.
+            let previous = match self.state_group_record(group_id) {
+                Some(previous) => previous,
+                None => self
+                    .app
+                    .group(&self.state.label, &hex::encode(group_id.as_slice()))?
+                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            };
+            return Ok(EventGroupProjection {
+                group_metadata,
+                nostr_routing: previous.nostr_routing,
+                profile: previous.profile,
+                admin_policy: previous.admin_policy,
+                message_retention: previous.message_retention,
+                agent_text_stream: previous.agent_text_stream,
+                avatar_url: previous.avatar_url,
+                encrypted_media: previous.encrypted_media,
+                image: AppGroupImageInput {
+                    image_hash_hex: previous.image.image_hash_hex,
+                    image_key_hex: previous.image.image_key_hex,
+                    image_nonce_hex: previous.image.image_nonce_hex,
+                    image_upload_key_hex: previous.image.image_upload_key_hex,
+                    media_type: previous.image.media_type,
+                },
+            });
+        }
         let protocol_profile = protocol_profile_of(group_metadata);
         let media_component_id = Self::encrypted_media_component_id(protocol_profile);
         let component_ids = [

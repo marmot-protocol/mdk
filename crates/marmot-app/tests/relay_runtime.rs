@@ -6673,6 +6673,79 @@ fn row_title(app: &MarmotApp, label: &str, group_id_hex: &str) -> Option<String>
         .map(|row| row.title)
 }
 
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn accepted_disband_finishes_for_both_members_without_followup_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(100),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(&alice_id, "closure", std::slice::from_ref(&bob_id), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob_id && joined == &group_id)
+    })
+    .await;
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut alice_state = runtime
+        .subscribe_group_state(&alice_id, &group_id_hex)
+        .await
+        .unwrap();
+    let mut bob_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
+        .unwrap();
+
+    let request = runtime.disband_group(&alice_id, &group_id).await.unwrap();
+    assert!(matches!(
+        request,
+        marmot_app::AppDisbandRequest::Pending { .. }
+    ));
+    // Only observe: no sends, explicit catch-up or manual convergence calls
+    // may rescue the accepted request's autonomous scheduling.
+    async fn observe_closure(
+        state: &mut marmot_app::RuntimeGroupStateSubscription,
+        role: &str,
+    ) -> bool {
+        let mut last = state.snapshot.clone();
+        let completed = timeout(Duration::from_secs(20), async {
+            while !last.disbanded {
+                last = state.recv().await.expect("group state stream stays open");
+            }
+        })
+        .await;
+        assert!(completed.is_ok(), "{role} did not observe terminal disband");
+        last.disbanded
+    }
+    let (alice_group, bob_group) = tokio::join!(
+        observe_closure(&mut alice_state, "admin"),
+        observe_closure(&mut bob_state, "member"),
+    );
+    assert!(alice_group && bob_group);
+    runtime.shutdown().await;
+}
+
 async fn wait_for_group_state_update<F>(
     subscription: &mut marmot_app::RuntimeGroupStateSubscription,
     mut matches_update: F,
