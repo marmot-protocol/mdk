@@ -64,7 +64,12 @@ impl Marmot {
                 group,
                 stream_id,
                 marmot_app::AgentPublisherOptions {
-                    candidate: options.candidate,
+                    candidates: vec![options.candidate],
+                    routing: marmot_app::AgentPublisherRouting::Required,
+                    parent_message_id: None,
+                    chunk_bytes:
+                        cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
+                            as usize,
                     server_cert_der: options.server_cert_der,
                     insecure_local: matches!(options.trust, PublisherTrustFfi::AllowLoopback),
                 },
@@ -101,7 +106,7 @@ impl AgentTextPublisher {
     }
 
     pub async fn finish(&self) -> Result<SendSummaryFfi, MarmotKitError> {
-        Ok(self.inner.finish().await?.into())
+        Ok(self.inner.finish(None).await?.into())
     }
 
     pub async fn cancel(&self) {

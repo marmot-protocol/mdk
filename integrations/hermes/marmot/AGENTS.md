@@ -7,8 +7,7 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first
 
 - A thin, **control-plane-only** Hermes platform plugin. `wn-agent` owns the Marmot account, MLS state, Nostr
   transport, and QUIC previews; this plugin only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
-- Keep transcript hashing and stream chunking byte-for-byte with the authoritative Rust
-  `AgentTextStreamTranscriptV1` (`crates/traits/src/agent_text_stream.rs`).
+- Use `stream_finish` with acknowledged final text; Rust owns transcript hashing and chunking.
 - No QUIC, crypto, relay, or MLS logic here.
 - Privacy-safe logging only: no account ids, group ids, message ids, pubkeys, relay URLs, payloads, ciphertext,
   plaintext, or key material.
@@ -22,8 +21,6 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first
 
 ## Rules
 
-- Regenerate OpenClaw transcript parity vectors in `integrations/openclaw/marmot/test/vectors/` from Rust if transcript
-  hashing changes; keep Hermes chunking aligned with the same Rust source.
 - Treat release installs (`install-hermes-marmot.sh`) and dev harness scripts (`just hermes-dev-*`) as the operational
   verification path for end-to-end behavior.
 

@@ -2045,6 +2045,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)
+        | AppError::AgentStreamFinishMismatch
+        | AppError::AgentStreamSendFailed(_)
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
         | AppError::AgentStreamUnsupportedRoute

@@ -1179,8 +1179,8 @@ async fn finish_with_matching_expectation_finishes_session() {
     tx.send(StreamComposeCommand::Finish {
         expected: Some(StreamFinishExpectation {
             final_text: "hello ".to_owned(),
-            transcript_hash_hex: expected_hash.clone(),
-            chunk_count: 1,
+            transcript_hash_hex: Some(expected_hash.clone()),
+            chunk_count: Some(1),
         }),
         respond: finish_tx,
     })
@@ -1237,8 +1237,8 @@ async fn finish_with_mismatched_expectation_keeps_session_alive_and_retryable() 
     tx.send(StreamComposeCommand::Finish {
         expected: Some(StreamFinishExpectation {
             final_text: "hello ".to_owned(),
-            transcript_hash_hex: first_hash.clone(),
-            chunk_count: 7,
+            transcript_hash_hex: Some(first_hash.clone()),
+            chunk_count: Some(7),
         }),
         respond: finish_tx,
     })
@@ -1259,8 +1259,8 @@ async fn finish_with_mismatched_expectation_keeps_session_alive_and_retryable() 
     tx.send(StreamComposeCommand::Finish {
         expected: Some(StreamFinishExpectation {
             final_text: "hello ".to_owned(),
-            transcript_hash_hex: hex::encode([0u8; 32]),
-            chunk_count: 1,
+            transcript_hash_hex: Some(hex::encode([0u8; 32])),
+            chunk_count: Some(1),
         }),
         respond: finish_tx,
     })
@@ -1281,8 +1281,8 @@ async fn finish_with_mismatched_expectation_keeps_session_alive_and_retryable() 
     tx.send(StreamComposeCommand::Finish {
         expected: Some(StreamFinishExpectation {
             final_text: "goodbye".to_owned(),
-            transcript_hash_hex: first_hash,
-            chunk_count: 1,
+            transcript_hash_hex: Some(first_hash),
+            chunk_count: Some(1),
         }),
         respond: finish_tx,
     })
@@ -1324,8 +1324,8 @@ async fn finish_with_mismatched_expectation_keeps_session_alive_and_retryable() 
     tx.send(StreamComposeCommand::Finish {
         expected: Some(StreamFinishExpectation {
             final_text: "hello world".to_owned(),
-            transcript_hash_hex: corrected_hash.clone(),
-            chunk_count: 2,
+            transcript_hash_hex: Some(corrected_hash.clone()),
+            chunk_count: Some(2),
         }),
         respond: finish_tx,
     })
@@ -1366,8 +1366,8 @@ async fn finish_with_expectation_on_empty_transcript_validates_empty_hash() {
     tx.send(StreamComposeCommand::Finish {
         expected: Some(StreamFinishExpectation {
             final_text: String::new(),
-            transcript_hash_hex: empty_hash.clone(),
-            chunk_count: 0,
+            transcript_hash_hex: Some(empty_hash.clone()),
+            chunk_count: Some(0),
         }),
         respond: finish_tx,
     })

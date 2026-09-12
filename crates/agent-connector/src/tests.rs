@@ -955,135 +955,136 @@ async fn invite_policy_retry_delay_starts_after_the_failed_attempt_returns() {
 }
 
 #[tokio::test]
-async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
+async fn stream_store_evicts_idle() {
     use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
-    use agent_stream_compose::StreamComposeCommand;
-    use cgka_traits::GroupId;
-    use std::time::{Duration, Instant};
+    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
+    use std::time::Instant;
 
-    let store = StreamSessionStore::default();
-
-    // An idle session: last activity well beyond the timeout. Its compose
-    // task stands in for run_stream_compose_session: it exits when it
-    // observes the dedicated cancel signal (modeling the graceful Abort
-    // path), and otherwise blocks on the command channel.
-    let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
-    let (idle_cancel_tx, mut idle_cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let idle_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = idle_cancel_rx.recv() => break,
-                cmd = idle_rx.recv() => {
-                    if cmd.is_none() {
-                        break;
-                    }
-                }
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
+    let account = runtime
+        .create_identity(
+            AccountSetupRequest {
+                default_relays: vec![crate::validation::endpoint(&url)],
+                bootstrap_relays: vec![crate::validation::endpoint(&url)],
+                ..Default::default()
             }
-        }
-    });
-    store.insert(
-        "aa".to_owned(),
-        ActiveStreamSession {
-            account_label: "agent".to_owned(),
-            group_id: GroupId::new(vec![1]),
-            stream_id: vec![0xaa],
-            stream_capability: [0x77; 32],
-            start_message_id_hex: "00".to_owned(),
-            tx: idle_tx,
-            cancel_tx: idle_cancel_tx,
-            abort: idle_handle.abort_handle(),
-            last_activity: Instant::now() - Duration::from_secs(3600),
-            finalized: None,
-        },
-    );
-
-    // A fresh session that must survive the sweep.
-    let (active_tx, mut active_rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
-    let (active_cancel_tx, _active_cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let active_handle = tokio::spawn(async move { while active_rx.recv().await.is_some() {} });
-    store.insert(
-        "bb".to_owned(),
-        ActiveStreamSession {
-            account_label: "agent".to_owned(),
-            group_id: GroupId::new(vec![2]),
-            stream_id: vec![0xbb],
-            stream_capability: [0x77; 32],
-            start_message_id_hex: "00".to_owned(),
-            tx: active_tx,
-            cancel_tx: active_cancel_tx,
-            abort: active_handle.abort_handle(),
-            last_activity: Instant::now(),
-            finalized: None,
-        },
-    );
-
-    let swept = store.sweep_idle(Duration::from_secs(300));
-    assert_eq!(swept, 1, "exactly the idle session should be swept");
-
-    // Idle session is gone and its compose task observed the graceful
-    // cancel, then finished — dropping the mpsc Sender / transcript / quinn
-    // endpoint it was holding open.
-    assert!(
-        store.remove("aa").is_err(),
-        "idle session should be removed"
-    );
-    let _ = tokio::time::timeout(Duration::from_secs(5), idle_handle)
+            .relay_options_only(),
+        )
         .await
-        .expect("swept compose task should finish promptly");
-
-    // Active session is untouched and still usable.
-    assert!(store.get("bb").is_ok(), "active session should remain");
-    active_handle.abort();
+        .unwrap();
+    let group = runtime
+        .create_group(&account.account.account_id_hex, "idle streams", &[], None)
+        .await
+        .unwrap();
+    let store = StreamSessionStore::default();
+    for (id, age) in [(0xaa, 3600), (0xbb, 0)] {
+        let publisher = runtime
+            .open_agent_publisher(
+                account.account.account_id_hex.clone(),
+                group.clone(),
+                vec![id; 32],
+                AgentPublisherOptions {
+                    candidates: Vec::new(),
+                    routing: AgentPublisherRouting::BestEffort,
+                    parent_message_id: None,
+                    chunk_bytes: 1024,
+                    server_cert_der: None,
+                    insecure_local: false,
+                },
+            )
+            .await
+            .unwrap();
+        store.insert(
+            hex::encode([id; 32]),
+            ActiveStreamSession {
+                publisher,
+                stream_capability: [0x77; 32],
+                last_activity: Instant::now() - Duration::from_secs(age),
+            },
+        );
+    }
+    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 1);
+    assert!(store.get(&"AA".repeat(32)).is_err());
+    assert!(
+        store
+            .get_authorized(&"BB".repeat(32), &"77".repeat(32))
+            .is_ok()
+    );
+    let active = store.remove(&"BB".repeat(32)).unwrap();
+    active.publisher.cancel().await;
+    assert!(!active.publisher.is_idle_evictable());
+    runtime.shutdown_and_close().await.unwrap();
 }
 
-/// A finalized-but-unpublished session must survive the idle sweep even when
-/// its last activity is well past the timeout: its compose task has exited and
-/// the frozen transcript is the only handle for retrying a failed durable
-/// finish. Sweeping it would recreate the #366 failure mode.
+/// #366: a sealed transcript whose durable send failed is the only retry
+/// handle, so the idle sweeper must never evict it.
 #[tokio::test]
-async fn stream_session_sweep_spares_finalized_session_despite_idle() {
-    use crate::stream_session::{ActiveStreamSession, FinalizedStream, StreamSessionStore};
-    use agent_stream_compose::StreamComposeCommand;
-    use cgka_traits::GroupId;
-    use std::time::{Duration, Instant};
+async fn stream_store_sweep_spares_sealed_session() {
+    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
+    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
+    use std::time::Instant;
 
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
+    let account = runtime
+        .create_identity(
+            AccountSetupRequest {
+                default_relays: vec![crate::validation::endpoint(&url)],
+                bootstrap_relays: vec![crate::validation::endpoint(&url)],
+                ..Default::default()
+            }
+            .relay_options_only(),
+        )
+        .await
+        .unwrap();
+    let group = runtime
+        .create_group(&account.account.account_id_hex, "sealed streams", &[], None)
+        .await
+        .unwrap();
+    let publisher = runtime
+        .open_agent_publisher(
+            account.account.account_id_hex.clone(),
+            group.clone(),
+            vec![0xcc; 32],
+            AgentPublisherOptions {
+                candidates: Vec::new(),
+                routing: AgentPublisherRouting::BestEffort,
+                parent_message_id: None,
+                chunk_bytes: 1024,
+                server_cert_der: None,
+                insecure_local: false,
+            },
+        )
+        .await
+        .unwrap();
+    // Dropping the group makes the durable final fail after sealing.
+    runtime
+        .delete_group_local(&account.account.account_id_hex, &group)
+        .await
+        .unwrap();
+    assert!(matches!(
+        publisher.finish(None).await,
+        Err(marmot_app::AppError::AgentStreamSendFailed(_))
+    ));
     let store = StreamSessionStore::default();
-
-    // The compose task has already exited after a validated Finish; model that
-    // with an immediately-finished task so its Sender is closed like the real
-    // post-finalize session.
-    let (tx, rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
-    drop(rx);
-    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let handle = tokio::spawn(async {});
     store.insert(
-        "aa".to_owned(),
+        hex::encode([0xcc; 32]),
         ActiveStreamSession {
-            account_label: "agent".to_owned(),
-            group_id: GroupId::new(vec![1]),
-            stream_id: vec![0xaa],
+            publisher,
             stream_capability: [0x77; 32],
-            start_message_id_hex: "00".to_owned(),
-            tx,
-            cancel_tx,
-            abort: handle.abort_handle(),
-            // Idle far beyond the timeout, but finalized: must be spared.
             last_activity: Instant::now() - Duration::from_secs(3600),
-            finalized: Some(FinalizedStream {
-                final_text: "frozen".to_owned(),
-                transcript_hash: [0x22; 32],
-                chunk_count: 1,
-            }),
         },
     );
-
-    let swept = store.sweep_idle(Duration::from_secs(300));
-    assert_eq!(swept, 0, "a finalized session must never be swept");
-    assert!(
-        store.get("aa").is_ok(),
-        "the finalized session (and its retry handle) must survive the sweep"
-    );
+    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 0);
+    let sealed = store.remove(&"CC".repeat(32)).unwrap();
+    assert!(!sealed.publisher.is_idle_evictable());
+    sealed.publisher.cancel().await;
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2274,54 +2275,6 @@ fn invite_policy_defaults_to_allowlist_for_legacy_records_and_preserves_entries(
 }
 
 #[tokio::test]
-async fn stream_session_store_resolves_non_canonical_stream_id() {
-    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
-    use agent_stream_compose::StreamComposeCommand;
-    use cgka_traits::GroupId;
-    use std::time::Instant;
-
-    let store = StreamSessionStore::default();
-    // Sessions are always inserted under a lowercase-canonical hex key
-    // (`hex::encode`), as `stream_begin_response` does.
-    let canonical_stream_id_hex = "aabb".to_owned();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
-    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let handle = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    store.insert(
-        canonical_stream_id_hex.clone(),
-        ActiveStreamSession {
-            account_label: "agent".to_owned(),
-            group_id: GroupId::new(vec![1]),
-            stream_id: vec![0xaa, 0xbb],
-            stream_capability: [0x77; 32],
-            start_message_id_hex: "00".to_owned(),
-            tx,
-            cancel_tx,
-            abort: handle.abort_handle(),
-            last_activity: Instant::now(),
-            finalized: None,
-        },
-    );
-
-    // A non-canonical (uppercase) but valid hex id must resolve the same session
-    // through both the lookup and the removal paths, because the store
-    // normalizes the query key before matching.
-    assert!(
-        store.get("AABB").is_ok(),
-        "uppercase stream id should resolve the canonically stored session"
-    );
-    assert!(
-        store.remove("AABB").is_ok(),
-        "uppercase stream id should remove the canonically stored session"
-    );
-    assert!(
-        store.get("aabb").is_err(),
-        "session should be gone after removal via the non-canonical id"
-    );
-    handle.abort();
-}
-
-#[tokio::test]
 async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
     use crate::stream_session::{StreamBeginReceipt, StreamBeginReservation, StreamSessionStore};
 
@@ -2422,59 +2375,6 @@ async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
             if completed.stream_id_hex == receipt.stream_id_hex
                 && completed.stream_capability == receipt.stream_capability
     ));
-}
-
-#[tokio::test]
-async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() {
-    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
-    use agent_stream_compose::StreamComposeCommand;
-    use cgka_traits::GroupId;
-    use std::time::{Duration, Instant};
-
-    let store = StreamSessionStore::default();
-    // Depth-1 cancel channel that we pre-fill so the sweeper's `try_send`
-    // observes `TrySendError::Full` rather than a closed channel. The receiver
-    // is kept alive (held in `_cancel_rx`) but never drained, modeling a session
-    // that already has a cancel pending.
-    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    cancel_tx.try_send(()).expect("prime the cancel channel");
-
-    let (tx, _rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
-    // A live task whose abort would set the AbortHandle's finished flag; if the
-    // sweeper force-aborts on `Full`, this task would be cancelled.
-    let handle = tokio::spawn(async move {
-        std::future::pending::<()>().await;
-    });
-    let abort = handle.abort_handle();
-    store.insert(
-        "aa".to_owned(),
-        ActiveStreamSession {
-            account_label: "agent".to_owned(),
-            group_id: GroupId::new(vec![1]),
-            stream_id: vec![0xaa],
-            stream_capability: [0x77; 32],
-            start_message_id_hex: "00".to_owned(),
-            tx,
-            cancel_tx,
-            abort,
-            last_activity: Instant::now() - Duration::from_secs(3600),
-            finalized: None,
-        },
-    );
-
-    let swept = store.sweep_idle(Duration::from_secs(300));
-    assert_eq!(swept, 1, "the idle session is still swept from the store");
-
-    // A `Full` cancel channel means a cancel is already pending, so the sweeper
-    // must NOT force-abort the task — it is left to drain its cancel and emit a
-    // live `Abort`. Give the runtime a moment, then confirm the task was not
-    // cancelled out from under us.
-    sleep(Duration::from_millis(50)).await;
-    assert!(
-        !handle.is_finished(),
-        "a Full cancel channel must not trigger a forced abort"
-    );
-    handle.abort();
 }
 
 #[tokio::test]
@@ -3470,13 +3370,15 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
     // Matching same-key preview requests may race after an ambiguous client
     // timeout. Both callers receive Ack, while the compose transcript below
     // proves the append was dispatched exactly once.
-    let first_append = connector.stream_append_response(
+    let first_append = connector.stream_record_response(
+        marmot_app::AgentPublisherRecord::Text,
         &stream_id_hex,
         &stream_capability,
         "hello stream".to_owned(),
         Some("preview-key".to_owned()),
     );
-    let second_append = connector.stream_append_response(
+    let second_append = connector.stream_record_response(
+        marmot_app::AgentPublisherRecord::Text,
         &stream_id_hex,
         &stream_capability,
         "hello stream".to_owned(),
@@ -3764,7 +3666,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
     let AgentControlResponse::Error { code, .. } = mismatched.payload else {
         panic!("expected finalize mismatch error");
     };
-    assert_eq!(code, "stream_error");
+    assert_eq!(code, "stream_finalize_mismatch");
 
     // The compose session must have survived the mismatch: a further append
     // still succeeds.
@@ -3819,15 +3721,10 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
     assert!(!message_ids_hex[0].is_empty());
 }
 
-/// Regression for #366 (review follow-up): once the compose task has validated
-/// and exited, the durable `finish_agent_text_stream` publish can still fail.
-/// The frozen transcript on the still-registered session must let a re-issued
-/// finalize complete that publish WITHOUT the (now-dead) compose task, and a
-/// retry that disagrees with the frozen transcript must be rejected.
+// A lost control receipt must not publish another durable final.
 #[tokio::test]
-async fn connector_finalize_retries_durable_finish_without_compose_task() {
+async fn connector_finish_reuses_receipt() {
     use crate::error::ConnectorError;
-    use crate::stream_session::FinalizedStream;
     use crate::validation::normalize_hex;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3893,41 +3790,35 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         panic!("expected stream begun response");
     };
 
-    // Reconstruct the exact state left after a validated finalize whose durable
-    // publish then failed: the compose task has exited (abort it here to prove
-    // the retry never talks to it) and the transcript is frozen on the still
-    // registered session.
+    // Model a successful publisher finish whose control response was lost.
+    // The retained publisher must return its receipt without a second send.
     let stream_id_norm = normalize_hex(&stream_id_hex).unwrap();
     let session = connector.streams.get(&stream_id_norm).unwrap();
-    session.abort.abort();
-    let transcript_hash = [0x11u8; 32];
-    assert!(
-        connector.streams.mark_finalized(
-            &stream_id_norm,
-            &session,
-            FinalizedStream {
-                final_text: "frozen final".to_owned(),
-                transcript_hash,
-                chunk_count: 1,
-            },
-        ),
-        "freeze must land on the still-current session"
-    );
-
+    session
+        .publisher
+        .append(
+            marmot_app::AgentPublisherRecord::Text,
+            "frozen final".into(),
+        )
+        .await
+        .unwrap();
+    let original = session.publisher.finish(None).await.unwrap();
+    assert_eq!(connector.streams.sweep_idle(Duration::ZERO).await, 0);
     // A retry that disagrees with the frozen transcript is rejected and leaves
     // the session registered.
     let mismatch = connector
-        .stream_finalize_response(
+        .stream_finish_response(
             &stream_id_hex,
             &stream_capability,
             "different final".to_owned(),
-            &hex::encode(transcript_hash),
-            1,
             Some("frozen-finalize".to_owned()),
         )
         .await;
     assert!(
-        matches!(mismatch, Err(ConnectorError::Stream(_))),
+        matches!(
+            mismatch,
+            Err(ConnectorError::App(AppError::AgentStreamPublisher(_)))
+        ),
         "a retry disagreeing with the frozen transcript must be rejected"
     );
     assert!(
@@ -3935,22 +3826,17 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         "a rejected retry must not drop the session"
     );
 
-    // Two matching retries race the durable publish from the frozen transcript.
-    // The compose task was aborted above, so the leader cannot consult it; the
-    // follower must reuse the leader's result instead of publishing again.
-    let transcript_hash_hex = hex::encode(transcript_hash);
+    // Matching concurrent retries reuse the publisher receipt.
     let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
     let first_start = std::sync::Arc::clone(&start);
     let second_start = std::sync::Arc::clone(&start);
     let first_finalize = async {
         first_start.wait().await;
         connector
-            .stream_finalize_response(
+            .stream_finish_response(
                 &stream_id_hex,
                 &stream_capability,
                 "frozen final".to_owned(),
-                &transcript_hash_hex,
-                1,
                 Some("frozen-finalize".to_owned()),
             )
             .await
@@ -3958,12 +3844,10 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let second_finalize = async {
         second_start.wait().await;
         connector
-            .stream_finalize_response(
+            .stream_finish_response(
                 &stream_id_hex,
                 &stream_capability,
                 "frozen final".to_owned(),
-                &transcript_hash_hex,
-                1,
                 Some("frozen-finalize".to_owned()),
             )
             .await
@@ -3979,8 +3863,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     else {
         panic!("expected stream finalized response");
     };
-    assert_eq!(message_ids_hex.len(), 1);
-    assert!(!message_ids_hex[0].is_empty());
+    assert_eq!(message_ids_hex, original.message_ids);
     let AgentControlResponse::StreamFinalized {
         message_ids_hex: concurrent_ids,
         ..
@@ -4000,21 +3883,23 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     // A client retry after receiving a timeout from the successful durable
     // publish path must return the original ids even though the stream session
     // is gone. This is the post-success half of stream_finalize idempotency.
-    let retried_after_success = connector
-        .stream_finalize_response(
-            &stream_id_hex,
-            &stream_capability,
-            "frozen final".to_owned(),
-            &hex::encode(transcript_hash),
-            1,
-            Some("frozen-finalize".to_owned()),
-        )
-        .await
-        .expect("idempotent stream_finalize retry returns cached ids");
+    let retried_after_success = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "retry-finish",
+        AgentControlRequest::StreamFinish {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            final_text: "frozen final".to_owned(),
+            idempotency_key: Some("frozen-finalize".to_owned()),
+        },
+    )
+    .await;
     let AgentControlResponse::StreamFinalized {
         message_ids_hex: retried_ids,
         ..
-    } = retried_after_success
+    } = retried_after_success.payload
     else {
         panic!("expected stream finalized response");
     };
@@ -4022,12 +3907,10 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
 
     let wrong_capability = hex::encode([0x99; 32]);
     let wrong_capability_retry = connector
-        .stream_finalize_response(
+        .stream_finish_response(
             &stream_id_hex,
             &wrong_capability,
             "frozen final".to_owned(),
-            &hex::encode(transcript_hash),
-            1,
             Some("frozen-finalize".to_owned()),
         )
         .await;
@@ -6158,125 +6041,6 @@ async fn create_media_download_dir_rejects_non_directory_per_blob_child() {
         root.join(subdir).is_file(),
         "the pre-existing file child must be left untouched"
     );
-}
-
-#[test]
-fn quic_candidate_parser_ignores_path_query_and_fragment() {
-    use crate::quic::parse_quic_candidate;
-
-    // Per transports/quic.md the authority ends at the first of '/', '?', '#';
-    // the connector must accept the same candidates the app/CLI parsers do
-    // (regression: it previously only split on '/').
-    for (candidate, expected_authority, expected_server_name) in [
-        (
-            "quic://broker.example:4450",
-            "broker.example:4450",
-            "broker.example",
-        ),
-        (
-            "quic://broker.example:4450?x=1",
-            "broker.example:4450",
-            "broker.example",
-        ),
-        (
-            "quic://broker.example:4450/path?x=1#frag",
-            "broker.example:4450",
-            "broker.example",
-        ),
-        (
-            "quic://broker.example:4450#frag",
-            "broker.example:4450",
-            "broker.example",
-        ),
-    ] {
-        let parsed = parse_quic_candidate(candidate).expect("candidate parses");
-        assert_eq!(parsed.authority, expected_authority, "{candidate}");
-        assert_eq!(parsed.server_name, expected_server_name, "{candidate}");
-    }
-}
-
-#[test]
-fn broker_trust_requires_explicit_opt_in_and_a_literal_loopback_host() {
-    use transport_quic_broker::BrokerServerTrust;
-
-    use crate::quic::broker_trust_for_candidate;
-
-    // Off by default: even a literal loopback candidate verifies certificates.
-    assert!(matches!(
-        broker_trust_for_candidate("127.0.0.1", false),
-        BrokerServerTrust::Platform
-    ));
-    assert!(matches!(
-        broker_trust_for_candidate("localhost", false),
-        BrokerServerTrust::Platform
-    ));
-
-    // With the dev opt-in only LITERAL loopback hosts skip verification.
-    assert!(matches!(
-        broker_trust_for_candidate("127.0.0.1", true),
-        BrokerServerTrust::InsecureLocal
-    ));
-    assert!(matches!(
-        broker_trust_for_candidate("localhost", true),
-        BrokerServerTrust::InsecureLocal
-    ));
-    assert!(matches!(
-        broker_trust_for_candidate("::1", true),
-        BrokerServerTrust::InsecureLocal
-    ));
-
-    // A DOMAIN that could resolve to loopback never selects insecure trust
-    // (resolution-dependent downgrade, issue #356).
-    assert!(matches!(
-        broker_trust_for_candidate("evil.example", true),
-        BrokerServerTrust::Platform
-    ));
-}
-
-// Agent-supplied `quic://` candidates must clear the shared dial-safety gate
-// at resolve time: literal-IP authorities resolve without DNS, so these cover
-// the canonical non-public classes end to end (issue #385).
-#[tokio::test]
-async fn quic_candidate_resolve_rejects_non_public_addresses_without_opt_in() {
-    use crate::quic::{parse_quic_candidate, resolve_quic_candidate_addr};
-
-    for authority in [
-        "quic://10.0.0.5:4433",
-        "quic://169.254.169.254:80",
-        "quic://100.64.0.1:4433",
-        "quic://127.0.0.1:4433",
-        "quic://[::1]:4433",
-        "quic://[fc00::1]:4433",
-    ] {
-        let candidate = parse_quic_candidate(authority).expect("candidate parses");
-        let result = resolve_quic_candidate_addr(&candidate, false).await;
-        assert!(
-            result.is_err(),
-            "{authority} must be rejected without the dev opt-in"
-        );
-    }
-}
-
-#[tokio::test]
-async fn quic_candidate_resolve_opt_in_admits_loopback_only() {
-    use crate::quic::{parse_quic_candidate, resolve_quic_candidate_addr};
-
-    let candidate = parse_quic_candidate("quic://127.0.0.1:4433").expect("candidate parses");
-    let addr = resolve_quic_candidate_addr(&candidate, true)
-        .await
-        .expect("loopback resolves under the dev opt-in");
-    assert!(addr.ip().is_loopback());
-
-    // The opt-in opens loopback only; private/link-local candidates stay
-    // rejected even in dev mode.
-    for authority in ["quic://10.0.0.5:4433", "quic://169.254.169.254:80"] {
-        let candidate = parse_quic_candidate(authority).expect("candidate parses");
-        let result = resolve_quic_candidate_addr(&candidate, true).await;
-        assert!(
-            result.is_err(),
-            "{authority} must be rejected even with the dev opt-in"
-        );
-    }
 }
 
 // ---- mdk#1380 opt-in large-session reconciliation benchmark ----

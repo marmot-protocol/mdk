@@ -3,24 +3,19 @@ import { describe, expect, it } from "vitest";
 import { NonAppendOnlyUpdateError } from "../src/append-only.js";
 import { AgentControlError } from "../src/client.js";
 import { MarmotLivePreview, type StreamControlClient } from "../src/live.js";
-import { AgentTextStreamTranscript } from "../src/transcript.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 const STREAM_ID = HEX32("11");
 const START_ID = HEX32("22");
 const CAPABILITY = HEX32("33");
 
-// Rust-anchored expectations from test/vectors/transcript-vectors.json with
-// stream_id=0x11*32, start=0x22*32, chunk_bytes=1024.
-const SINGLE_TEXT_HASH = "7484dc0c66dd50ac2fb0dbb11e59d65e9d967eee2c4b73b01e172ed4c5bd218a";
-const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81";
 
 interface Calls {
   begin: { account: string; group: string; quic: string[]; requestId?: string }[];
   append: { streamId: string; capability: string; text: string }[];
   status: { streamId: string; capability: string; text: string }[];
   progress: { streamId: string; capability: string; text: string }[];
-  finalize: { streamId: string; capability: string; finalText: string; hash: string; count: number; idempotencyKey?: string }[];
+  finalize: { streamId: string; capability: string; finalText: string; idempotencyKey?: string }[];
   cancel: { streamId: string; capability: string; reason: string | null }[];
 }
 
@@ -53,15 +48,13 @@ function stubStreamClient(calls: Calls): StreamControlClient {
       calls.progress.push({ streamId, capability, text });
       return { type: "ack" };
     },
-    async streamFinalize(
+    async streamFinish(
       streamId: string,
       capability: string,
       finalText: string,
-      hash: string,
-      count: number,
       idempotencyKey?: string,
     ) {
-      calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
+      calls.finalize.push({ streamId, capability, finalText, idempotencyKey });
       return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
     },
     async streamCancel(streamId: string, capability: string, reason?: string | null) {
@@ -114,7 +107,7 @@ function gatedBeginClient(calls: Calls): {
 }
 
 describe("MarmotLivePreview", () => {
-  it("begins lazily and finalizes with the Rust transcript hash for one chunk", async () => {
+  it("begins lazily and finalizes the acknowledged text without client hashing", async () => {
     const calls = emptyCalls();
     const live = preview(calls);
     await live.update("hello world");
@@ -130,13 +123,11 @@ describe("MarmotLivePreview", () => {
       streamId: STREAM_ID,
       capability: CAPABILITY,
       finalText: "hello world",
-      hash: SINGLE_TEXT_HASH,
-      count: 1,
     });
     expect(result.messageIdsHex).toEqual([HEX32("ab")]);
   });
 
-  it("reduces incremental updates to append-only deltas matching the Rust hash", async () => {
+  it("reduces incremental updates to acknowledged append-only deltas", async () => {
     const calls = emptyCalls();
     const live = preview(calls);
     await live.update("hel");
@@ -145,7 +136,6 @@ describe("MarmotLivePreview", () => {
     await live.finalize("hello world");
 
     expect(calls.append.map((a) => a.text)).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toMatchObject({ hash: INCREMENTAL_HASH, count: 3 });
   });
 
   it("appends explicit deltas without requiring a full snapshot", async () => {
@@ -158,7 +148,6 @@ describe("MarmotLivePreview", () => {
     await live.finalize("hello world");
 
     expect(calls.append.map((a) => a.text)).toEqual(["hel", "lo", " world"]);
-    expect(calls.finalize[0]).toMatchObject({ hash: INCREMENTAL_HASH, count: 3 });
   });
 
   it("retries stream_finalize with the same idempotency key before falling back", async () => {
@@ -166,16 +155,14 @@ describe("MarmotLivePreview", () => {
     let attempts = 0;
     const client = {
       ...stubStreamClient(calls),
-      async streamFinalize(
+      async streamFinish(
         streamId: string,
         capability: string,
         finalText: string,
-        hash: string,
-        count: number,
         idempotencyKey?: string,
       ) {
         attempts += 1;
-        calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
+        calls.finalize.push({ streamId, capability, finalText, idempotencyKey });
         if (attempts === 1) {
           throw new AgentControlError("timed out waiting for stream finalize", {
             code: "timeout",
@@ -206,7 +193,6 @@ describe("MarmotLivePreview", () => {
     expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
     expect(calls.status).toEqual([]);
     expect(calls.progress).toEqual([]);
-    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
   });
 
   it("streams the whole final when finalize is called without prior updates", async () => {
@@ -214,7 +200,6 @@ describe("MarmotLivePreview", () => {
     const live = preview(calls);
     await live.finalize("hello world");
     expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
-    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
   });
 
   it("includes progress/status records in the transcript without changing final text", async () => {
@@ -224,21 +209,12 @@ describe("MarmotLivePreview", () => {
     await live.progress("searching");
     await live.finalize("done");
 
-    const transcript = new AgentTextStreamTranscript(
-      Buffer.from(STREAM_ID, "hex"),
-      Buffer.from(START_ID, "hex"),
-    );
-    transcript.appendStatus("thinking");
-    transcript.appendProgress("searching");
-    transcript.appendText("done");
 
     expect(calls.status.map((c) => c.text)).toEqual(["thinking"]);
     expect(calls.progress.map((c) => c.text)).toEqual(["searching"]);
     expect(calls.append.map((a) => a.text)).toEqual(["done"]);
     expect(calls.finalize[0]).toMatchObject({
       finalText: "done",
-      hash: transcript.hashHex,
-      count: transcript.chunkCount,
     });
   });
 
@@ -331,15 +307,13 @@ describe("MarmotLivePreview", () => {
     });
     const client = {
       ...stubStreamClient(calls),
-      async streamFinalize(
+      async streamFinish(
         streamId: string,
         capability: string,
         finalText: string,
-        hash: string,
-        count: number,
         idempotencyKey?: string,
       ) {
-        calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
+        calls.finalize.push({ streamId, capability, finalText, idempotencyKey });
         firstFinalizeFailed();
         throw new AgentControlError("timed out waiting for stream finalize", {
           code: "timeout",
@@ -449,8 +423,8 @@ describe("MarmotLivePreview", () => {
         calls.progress.push({ streamId, capability, text });
         return { type: "ack" };
       },
-      async streamFinalize(streamId: string, capability: string, finalText: string, hash: string, count: number) {
-        calls.finalize.push({ streamId, capability, finalText, hash, count });
+      async streamFinish(streamId: string, capability: string, finalText: string) {
+        calls.finalize.push({ streamId, capability, finalText });
         return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
       },
       async streamCancel() {
@@ -509,8 +483,8 @@ describe("MarmotLivePreview", () => {
       async streamProgress() {
         return { type: "ack" };
       },
-      async streamFinalize(streamId: string, capability: string, finalText: string, hash: string, count: number) {
-        calls.finalize.push({ streamId, capability, finalText, hash, count });
+      async streamFinish(streamId: string, capability: string, finalText: string) {
+        calls.finalize.push({ streamId, capability, finalText });
         return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
       },
       async streamCancel() {
@@ -535,7 +509,6 @@ describe("MarmotLivePreview", () => {
     expect(beginRequestIds[1]).toBe(beginRequestIds[0]);
     expect(calls.begin).toHaveLength(1);
     expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
-    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
   });
 
   it("does not advance local state when streamAppend fails (retry-safe)", async () => {
@@ -565,8 +538,8 @@ describe("MarmotLivePreview", () => {
       async streamProgress() {
         return { type: "ack" };
       },
-      async streamFinalize(streamId: string, capability: string, finalText: string, hash: string, count: number) {
-        calls.finalize.push({ streamId, capability, finalText, hash, count });
+      async streamFinish(streamId: string, capability: string, finalText: string) {
+        calls.finalize.push({ streamId, capability, finalText });
         return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
       },
       async streamCancel() {
@@ -582,19 +555,14 @@ describe("MarmotLivePreview", () => {
 
     await expect(live.update("hello world")).rejects.toThrow("boom");
     // The failed append must not have advanced local state; retrying the same
-    // text reproduces the Rust single-chunk hash.
+    // text remains aligned with the acknowledged server appends.
     await live.update("hello world");
     await live.finalize("hello world");
     expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
-    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
   });
 
   it("deduplicates post-success timeout retries for append, status, and progress", async () => {
     const calls = emptyCalls();
-    const serverTranscript = new AgentTextStreamTranscript(
-      Buffer.from(STREAM_ID, "hex"),
-      Buffer.from(START_ID, "hex"),
-    );
     const appliedKeys = new Set<string>();
     const attempts = new Map<string, string[]>();
 
@@ -627,32 +595,25 @@ describe("MarmotLivePreview", () => {
       async streamAppend(streamId: string, capability: string, text: string, key?: string) {
         return applyThenLoseFirstAck("append", key, () => {
           calls.append.push({ streamId, capability, text });
-          serverTranscript.appendText(text);
         });
       },
       async streamStatus(streamId: string, capability: string, text: string, key?: string) {
         return applyThenLoseFirstAck("status", key, () => {
           calls.status.push({ streamId, capability, text });
-          serverTranscript.appendStatus(text);
         });
       },
       async streamProgress(streamId: string, capability: string, text: string, key?: string) {
         return applyThenLoseFirstAck("progress", key, () => {
           calls.progress.push({ streamId, capability, text });
-          serverTranscript.appendProgress(text);
         });
       },
-      async streamFinalize(
+      async streamFinish(
         streamId: string,
         capability: string,
         finalText: string,
-        hash: string,
-        count: number,
         idempotencyKey?: string,
       ) {
-        calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
-        expect(hash).toBe(serverTranscript.hashHex);
-        expect(count).toBe(serverTranscript.chunkCount);
+        calls.finalize.push({ streamId, capability, finalText, idempotencyKey });
         return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
       },
     } as unknown as StreamControlClient;
@@ -675,8 +636,6 @@ describe("MarmotLivePreview", () => {
     expect(calls.finalize).toHaveLength(1);
     expect(calls.finalize[0]).toMatchObject({
       finalText: "hello world",
-      hash: serverTranscript.hashHex,
-      count: serverTranscript.chunkCount,
     });
   });
 });

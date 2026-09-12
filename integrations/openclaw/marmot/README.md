@@ -59,6 +59,9 @@ Prerequisites:
   host and never installs or upgrades OpenClaw.
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors.
 
 ```sh
 install_verified() (
@@ -327,8 +330,8 @@ for any plugin or tenant that is not in the same trust boundary.
   retries. Every retry of one logical mutation reuses its original idempotency
   key and payload. `wn-agent` therefore applies a mutation at most once even
   when it committed the record but its Ack was lost, while the plugin advances
-  its local transcript only after an Ack; the client and server transcript
-  hashes remain aligned for `stream_finalize`.
+  its append-only text only after an Ack. `stream_finish` checks this text;
+  the shared Rust publisher owns transcript hashing and chunk counts.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call

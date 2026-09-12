@@ -1143,6 +1143,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamPublisher(_) => "read_marker_failed:agent_stream_publisher",
+        AppError::AgentStreamFinishMismatch => "read_marker_failed:agent_stream_finish_mismatch",
+        AppError::AgentStreamSendFailed(_) => "read_marker_failed:agent_stream_send_failed",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {
             "read_marker_failed:agent_stream_start_not_confirmed"
