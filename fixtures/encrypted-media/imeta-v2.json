@@ -1,6 +1,6 @@
 {
   "schema": "mdk-encrypted-media-imeta-fixture/v1",
-  "description": "Golden and rejection imeta fixtures for encrypted-media-v2. Shared by marmot-app, marmot-uniffi, and wn-cli tests so every layer agrees on validation verdicts and exact wire round-trips. `expected.dim`/`expected.thumbhash` distinguish absent (null) from present-empty (\"\").",
+  "description": "Golden and rejection imeta fixtures for encrypted-media-v2. Shared by marmot-app, marmot-uniffi, and wn-cli tests so every layer agrees on validation verdicts and exact wire round-trips. `expected.dim`/`expected.thumbhash` distinguish absent (null) from present-empty (\"\"). Rejection cases carry `rejection_kind`, the stable category every layer must report for that tag.",
   "media_version": "encrypted-media-v2",
   "cases": [
     {
@@ -171,6 +171,7 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "canonical",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -187,6 +188,7 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "file name",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -203,6 +205,7 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "file name",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -219,6 +222,7 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "exactly one plaintext_sha256",
+      "rejection_kind": "duplicate_field",
       "tag": [
         "imeta",
         "v encrypted-media-v2",
@@ -236,9 +240,60 @@
       "source_epoch": 9,
       "valid": false,
       "error_contains": "missing v",
+      "rejection_kind": "unsupported_format",
       "tag": [
         "imeta",
         "locator blossom-v1 https://media.example/abababababababababababababababababababababababababababababababab.bin",
+        "ciphertext_sha256 abababababababababababababababababababababababababababababababab",
+        "plaintext_sha256 cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "nonce efefefefefefefefefefefef",
+        "m image/jpeg",
+        "filename photo.jpg"
+      ]
+    },
+    {
+      "name": "rejects-legacy-mip04-shape",
+      "source_epoch": 9,
+      "valid": false,
+      "error_contains": "version",
+      "rejection_kind": "unsupported_format",
+      "tag": [
+        "imeta",
+        "url https://media.example/legacy-upload.bin",
+        "blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj",
+        "m image/jpeg",
+        "filename photo.jpg",
+        "x cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "n efefefefefefefefefefefef",
+        "v mip04-v2"
+      ]
+    },
+    {
+      "name": "rejects-field-without-value",
+      "source_epoch": 9,
+      "valid": false,
+      "error_contains": "missing its value",
+      "rejection_kind": "invalid_structure",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v2",
+        "locator blossom-v1 https://media.example/abababababababababababababababababababababababababababababababab.bin",
+        "ciphertext_sha256 abababababababababababababababababababababababababababababababab",
+        "plaintext_sha256 cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "nonce",
+        "m image/jpeg",
+        "filename photo.jpg"
+      ]
+    },
+    {
+      "name": "rejects-missing-locator",
+      "source_epoch": 9,
+      "valid": false,
+      "error_contains": "locator",
+      "rejection_kind": "missing_field",
+      "tag": [
+        "imeta",
+        "v encrypted-media-v2",
         "ciphertext_sha256 abababababababababababababababababababababababababababababababab",
         "plaintext_sha256 cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
         "nonce efefefefefefefefefefefef",

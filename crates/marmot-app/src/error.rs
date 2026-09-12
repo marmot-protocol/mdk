@@ -159,6 +159,24 @@ pub enum AppError {
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
+    /// An inbound or host-supplied encrypted-media `imeta` reference failed the
+    /// shared strict parser. Carries the stable rejection category plus
+    /// privacy-safe presentation text so bindings can surface a typed reason
+    /// instead of a Rust error string (mdk#1787). Attachment-local: the
+    /// carrying message and its valid sibling attachments are unaffected.
+    #[error("invalid encrypted media reference: {0}")]
+    MediaAttachmentRejected(crate::MediaAttachmentRejection),
+    /// A structurally valid reference has no locator this client may fetch
+    /// under the group's `allowed_locator_kinds` or its own host-safety policy.
+    /// Distinct from [`AppError::MediaAttachmentRejected`] (the reference is
+    /// fine) and from [`AppError::MediaDownloadFailed`] (nothing was dialed).
+    #[error("encrypted media is unfetchable: {0}")]
+    MediaUnfetchable(String),
+    /// Fetching, verifying, or decrypting an encrypted-media blob failed after
+    /// the reference validated and a locator was selected: transport errors,
+    /// timeouts, ciphertext/plaintext hash mismatches, and AEAD failures.
+    #[error("encrypted media download failed: {0}")]
+    MediaDownloadFailed(String),
     #[error("blob store request failed: {0}")]
     BlobStore(String),
     /// A Blossom upload exhausted its bounded transfer/response budget before
@@ -312,6 +330,9 @@ impl AppError {
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
+            Self::MediaAttachmentRejected(_) => "media_attachment_rejected",
+            Self::MediaUnfetchable(_) => "media_unfetchable",
+            Self::MediaDownloadFailed(_) => "media_download_failed",
             Self::BlobStore(_) => "blob_store",
             Self::MediaUploadTimedOut => "media_upload_timed_out",
             Self::UnsafeMediaFetch(_) => "unsafe_media_fetch",

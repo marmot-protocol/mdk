@@ -9,6 +9,38 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- MarmotKit timeline rows and reply previews expose `media` as an ordered list of
+  `MediaAttachmentOutcome` values, `Accepted { attachment_index, reference }` or
+  `Rejected { attachment_index, rejection }`, instead of a list of accepted references only.
+  A malformed or unsupported `imeta` attachment keeps its position and carries a stable
+  `MediaAttachmentRejectionKind` (`InvalidStructure`, `UnsupportedFormat`, `MissingField`,
+  `DuplicateField`, `MalformedField`) plus privacy-safe detail text, so hosts can render an
+  unsupported/invalid attachment placeholder instead of an empty attachment list (#1787).
+  Swift/Kotlin consumers of `TimelineMessageRecord.media` and `TimelineReplyPreview.media`
+  switch on the outcome; the message text and valid sibling attachments are unaffected.
+- `list_media` numbers `attachment_index` by position among the message's `imeta` tags,
+  rejected siblings included, so it matches the timeline outcome index. Only accepted
+  attachments are returned; rejections are visible on the timeline row.
+- `parse_media_imeta_tag`, `build_media_imeta_tag`, `send_media_attachments`,
+  `send_media_reference`, `upload_media`, and `download_media` report a structurally invalid
+  reference as `MarmotKitError.MediaAttachmentRejected { kind, details }` with the same kind
+  and text the timeline projection reports for that tag. `InvalidMediaReference` now covers
+  group-profile and locator-policy mismatches and unusable upload requests.
+- `download_media` distinguishes `MediaUnfetchable` (valid reference, but no locator may be
+  fetched under the group's `allowed_locator_kinds` or this client's host-safety policy;
+  nothing was dialed) from `MediaDownloadFailed` (transport, timeout, hash mismatch, or
+  decryption failure after a locator was selected). Both previously surfaced as
+  `InvalidMediaReference` or the untyped `Runtime` error.
+- The shared `imeta` parser judges the version field before other fields, so a tag with an
+  absent or unknown `v`, including the legacy MIP-era `url`/`x`/`n` shape Amethyst once
+  emitted, is always classified `UnsupportedFormat` regardless of field order. Strictness,
+  duplicate-field, and cryptographic checks are unchanged.
+- The shared encrypted-media fixtures (`fixtures/encrypted-media/`) carry a `rejection_kind`
+  for every rejection case plus new legacy-shape, field-without-value, and missing-locator
+  cases; marmot-app, MarmotKit, and `wn` assert against them.
+
 ## [0.9.21] - 2026-09-10
 
 ### Release notes

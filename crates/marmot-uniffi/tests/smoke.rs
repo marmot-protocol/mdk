@@ -604,7 +604,10 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     let invalid = parse_media_imeta_tag(v2, 8).expect_err("noncanonical V2 type must fail");
     assert!(matches!(
         invalid,
-        MarmotKitError::InvalidMediaReference { .. }
+        MarmotKitError::MediaAttachmentRejected {
+            kind: marmot_uniffi::MediaAttachmentRejectionKindFfi::MalformedField,
+            ..
+        }
     ));
 }
 

@@ -2010,6 +2010,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::Publish(_)
         | AppError::BlobStore(_)
         | AppError::MediaUploadTimedOut
+        | AppError::MediaDownloadFailed(_)
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
         | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,
@@ -2030,6 +2031,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)
         | AppError::InvalidEncryptedMedia(_)
+        | AppError::MediaAttachmentRejected(_)
+        | AppError::MediaUnfetchable(_)
         | AppError::UnsafeMediaFetch(_)
         | AppError::InvalidAppMessagePayload(_)
         | AppError::InvalidPushToken(_)

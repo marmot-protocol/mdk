@@ -102,6 +102,15 @@ pub enum MarmotStatus {
     InvalidProductAnalyticsConfiguration = 67,
     InvalidProductObservation = 68,
     ChatPresentationNotReady = 69,
+    /// An `imeta` reference failed the shared strict parser (mdk#1787).
+    /// The detail string carries the stable rejection kind label and the
+    /// presentation text.
+    MediaAttachmentRejected = 70,
+    /// The reference is valid but no locator may be fetched under the
+    /// current policy; nothing was dialed.
+    MediaUnfetchable = 71,
+    /// Fetch, integrity, or decryption failed after a locator was selected.
+    MediaDownloadFailed = 72,
 }
 
 thread_local! {
@@ -161,6 +170,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidChatPin { .. } => MarmotStatus::InvalidChatPin,
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
+        MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
+        MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
+        MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
