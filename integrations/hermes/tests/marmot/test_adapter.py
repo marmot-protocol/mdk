@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 from contextlib import suppress
 import enum
 import importlib.util
@@ -6,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 import unittest.mock
@@ -15,6 +17,8 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
+TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="mdk-hermes-spool-suite-")
+atexit.register(TEST_SPOOL_ROOT.cleanup)
 
 
 def wire_event(event):
@@ -110,6 +114,15 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         reply_to_mode: str = "first"
         gateway_restart_notification: bool = True
         extra: dict = field(default_factory=dict)
+        _inbound_spool_test_path: str = field(init=False, repr=False)
+
+        def __post_init__(self):
+            # Unit adapters directly invoke inbound hooks without connect(). Give
+            # each instance a private spool so tests exercise the real durability
+            # boundary without touching the operator's default Marmot home.
+            self._inbound_spool_test_path = str(
+                Path(tempfile.mkdtemp(dir=TEST_SPOOL_ROOT.name)) / "inbound.sqlite3"
+            )
 
     class BasePlatformAdapter:
         def __init__(self, config, platform):
@@ -983,15 +996,19 @@ class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
         adapter = load_adapter_module()
         platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
 
-        disabled = await adapter.probe_readiness(platform_config(enabled=False))
-        self.assertEqual(disabled["state"], "disabled")
-
-        with unittest.mock.patch.dict(
+        with tempfile.TemporaryDirectory() as empty_home, unittest.mock.patch.dict(
             os.environ,
-            {"MARMOT_AGENT_SOCKET": "", "MARMOT_HOME": ""},
+            {
+                "HOME": empty_home,
+                "MARMOT_AGENT_SOCKET": "",
+                "MARMOT_HOME": empty_home,
+            },
             clear=False,
         ):
-            invalid = await adapter.probe_readiness(platform_config(enabled=True))
+            disabled = await adapter.probe_readiness(platform_config(enabled=False))
+            self.assertEqual(disabled["state"], "disabled")
+            with unittest.mock.patch.dict(os.environ, {"MARMOT_HOME": ""}):
+                invalid = await adapter.probe_readiness(platform_config(enabled=True))
         self.assertEqual(invalid["state"], "invalid_config")
 
         class ReadyClient:
@@ -1024,6 +1041,37 @@ class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("account_id_hex", ready)
         self.assertNotIn("group_id_hex", ready)
         self.assertEqual(client.group_lookup, ("11" * 32, "22" * 32))
+
+    async def test_probe_ignores_malformed_account_entries_individually(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        None,
+                        "malformed",
+                        {"local_signing": True, "account_id_hex": "not-hex"},
+                        {"local_signing": False, "account_id_hex": "33" * 32},
+                        {"local_signing": True, "account_id_hex": "11" * 32},
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        readiness = await adapter.probe_readiness(
+            platform_config(
+                enabled=True,
+                extra={
+                    "socket_path": "/tmp/passive-probe.sock",
+                    "group_id_hex": "22" * 32,
+                },
+            ),
+            client=ReadyClient(),
+        )
+        self.assertEqual("ready", readiness["state"])
 
     async def test_probe_distinguishes_unreachable_and_account_unselected(self):
         adapter = load_adapter_module()
@@ -3845,12 +3893,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         release_blocker.set()
         await adapter._inbound_queue.join()
+        # Connector replay finds the durable deferred batch and admits its
+        # representative directly; it must not rebuild an in-memory debounce
+        # timer or duplicate either source id.
         await adapter._handle_control_event(wire_event(event))
         await adapter._handle_control_event(wire_event(sibling))
-        timer = adapter._debounce_tasks[key]
-        timer.cancel()
-        await asyncio.gather(timer, return_exceptions=True)
-        await adapter._flush_debounced(key)
         await adapter._inbound_queue.join()
 
         self.assertEqual(len(adapter.events), 1)
@@ -3858,6 +3905,88 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("second source", adapter.events[0].text)
         for source in (event, sibling):
             self.assertIn(source["message_id_hex"], adapter._recent_inbound_ids)
+
+    async def test_retry_loop_cannot_bypass_live_debounce_or_duplicate_replay(self):
+        first = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "first",
+            "mentions_self": True,
+        }
+        second = dict(first, message_id_hex="55" * 32, text="second")
+        adapter = self._adapter(client=object(), extra={"debounce_ms": 50})
+
+        await adapter._handle_control_event(wire_event(first))
+        await adapter._handle_control_event(wire_event(second))
+        # Connector replay of the first id while its batch is still live must
+        # retain debounce ownership rather than claim the durable row directly.
+        await adapter._handle_control_event(wire_event(first))
+
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        adapter._inbound_spool_wakeup.set()
+        key = adapter._debounce_key(first)
+        try:
+            await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
+            # Let the queue task's done callback retire it before join() samples
+            # the queue's pending set.
+            await asyncio.sleep(0)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+
+        self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
+        self.assertEqual(
+            "unresolved",
+            adapter._inbound_spool.get(first["message_id_hex"]).state,
+        )
+        self.assertEqual(
+            "unresolved",
+            adapter._inbound_spool.get(second["message_id_hex"]).state,
+        )
+
+    async def test_pre_handoff_poison_dead_letters_and_unblocks_group_fifo(self):
+        first = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "poison",
+            "mentions_self": True,
+        }
+        second = dict(first, message_id_hex="55" * 32, text="later")
+        adapter = self._adapter(client=object())
+        await adapter._ensure_inbound_spool_open()
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+
+        async def fail_before_handoff(_event):
+            raise ValueError("synthetic poison")
+
+        adapter._should_run_turn = fail_before_handoff
+        async def suppress_admission():
+            return None
+
+        adapter._admit_due_spooled = suppress_admission
+        for _ in range(len(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S) + 1):
+            claim = adapter._inbound_spool.claim(
+                first["message_id_hex"],
+                ignore_backoff=True,
+            )
+            await adapter._dispatch_inbound_message(
+                claim.event,
+                spool_message_id=claim.message_id,
+            )
+
+        failed = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("failed", failed.state)
+        self.assertEqual("pre_handoff_retry_exhausted", failed.disposition)
+        admitted = adapter._inbound_spool.claim(second["message_id_hex"])
+        self.assertEqual(second["message_id_hex"], admitted.message_id)
 
     # --- Behavior 3: stream_progress wire type --------------------------------
     async def test_stream_progress_sends_progress_wire_type(self):
@@ -4336,14 +4465,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 for value in events:
                     yield wire_event(value)
 
-        adapter = self._adapter(FakeClient(), {"debounce_ms": 5})
+        adapter = self._adapter(
+            FakeClient(),
+            {"debounce_ms": 500, "group_activation": "always"},
+        )
         await adapter._consume_inbound_once()
         # Wait for the debounce flush task to fire, then drain the per-group queue
         # (the flush enqueues the coalesced turn onto it).
-        for _ in range(200):
-            if adapter.events:
-                break
-            await asyncio.sleep(0.005)
+        await asyncio.gather(*list(adapter._debounce_tasks.values()))
         await adapter._inbound_queue.join()
 
         self.assertEqual(len(adapter.events), 1)
@@ -4457,9 +4586,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         try:
             loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 0.0))
             for _ in range(300):
-                if attempts["n"] >= 2 and delays:
+                if attempts["n"] >= 2 and delays and adapter.events:
                     break
                 await asyncio.sleep(0.005)
+            await adapter._inbound_queue.join()
         finally:
             self.adapter_module.reconnect_backoff_ms = real_backoff
             loop_task.cancel()
@@ -6258,7 +6388,7 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
+    async def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -6279,6 +6409,15 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["schema"]["properties"], {})
         self.assertTrue(callable(status["handler"]))
         self.assertTrue(status["is_async"])
+        status_result = json.loads(
+            await status["handler"](
+                {},
+                task_id="status-task",
+                session_id="status-session",
+                user_task="status-user-task",
+            )
+        )
+        self.assertIn("state", status_result)
         history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
@@ -6317,7 +6456,13 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
         live_adapter = FakeAdapter()
         self.adapter_module._remember_live_adapter(live_adapter)
-        result = json.loads(await self.adapter_module._marmot_status_tool({}))
+        result = json.loads(
+            await self.adapter_module._marmot_status_tool(
+                {},
+                tool_call_id="status-probe",
+                dispatcher_context={"source": "test"},
+            )
+        )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["state"], "ready")
@@ -6611,6 +6756,633 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await queue.join()
+
+
+class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def make_event(self, *, message_id="33", text="durable", mentions_self=True):
+        return wire_event(
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": message_id * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": text,
+                "mentions_self": mentions_self,
+            }
+        )
+
+    def make_adapter(self, *, extra=None, client=None):
+        merged = {"account_id_hex": "11" * 32, "profile_name_onboarding": False}
+        merged.update(extra or {})
+        return self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=merged), client=client if client is not None else object()
+        )
+
+    async def test_journal_commit_precedes_queue_admission(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        message_id = "33" * 32
+        observed = []
+        original_enqueue = adapter._inbound_queue.enqueue
+
+        def checked_enqueue(key, factory):
+            observed.append(adapter._inbound_spool.get(message_id).state)
+            return original_enqueue(key, factory)
+
+        adapter._inbound_queue.enqueue = checked_enqueue
+        await adapter._handle_control_event(self.make_event())
+        await adapter._inbound_queue.join()
+        self.assertEqual(["claimed"], observed)
+        record = adapter._inbound_spool.get(message_id)
+        self.assertEqual("unresolved", record.state)
+        self.assertEqual("host_handoff_outcome_unknown", record.disposition)
+        self.assertEqual("durable", record.event["text"])
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_queue_full_stays_pending_then_retries_without_connector_replay(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._inbound_queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=1)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocker():
+            started.set()
+            await release.wait()
+
+        adapter._inbound_queue.enqueue("22" * 32, blocker)
+        await started.wait()
+        await adapter._handle_control_event(self.make_event())
+        deferred = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("pending", deferred.state)
+        self.assertEqual("queue_full", deferred.disposition)
+        attempts = deferred.attempts
+        release.set()
+        await adapter._inbound_queue.join()
+        await asyncio.sleep(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S[0] + 0.02)
+        await adapter._admit_due_spooled()
+        await adapter._inbound_queue.join()
+        delivered = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("unresolved", delivered.state)
+        self.assertEqual(attempts, delivered.attempts)
+        self.assertEqual([item.text for item in adapter.events], ["durable"])
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_mention_policy_skip_is_explicit_terminal_disposition(self):
+        class MultiPartyClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"type": "group_info", "is_direct": False, "member_count": 3}
+
+        adapter = self.make_adapter(
+            extra={"group_activation": "mention"}, client=MultiPartyClient()
+        )
+        await adapter._handle_control_event(self.make_event(mentions_self=False))
+        await adapter._inbound_queue.join()
+        record = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("intentionally_skipped", record.state)
+        self.assertEqual("mention_policy_skip", record.disposition)
+        self.assertEqual([], adapter.events)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_group_info_error_defers_then_recovery_unblocks_group_fifo(self):
+        class RecoveringClient:
+            fail_lookup = True
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                if self.fail_lookup:
+                    raise RuntimeError("synthetic group lookup failure")
+                return {"type": "group_info", "is_direct": True, "member_count": 2}
+
+        client = RecoveringClient()
+        adapter = self.make_adapter(
+            extra={"group_activation": "mention"}, client=client
+        )
+        await adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first", mentions_self=False)
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second", mentions_self=False)
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        async def suppress_admission():
+            return None
+
+        adapter._admit_due_spooled = suppress_admission
+
+        first_claim = adapter._inbound_spool.claim(
+            first["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            first_claim.event, spool_message_id=first_claim.message_id
+        )
+        deferred = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("pending", deferred.state)
+        self.assertEqual("dispatch_failed_before_handoff", deferred.disposition)
+        with self.assertRaises(self.adapter_module.StaleClaim):
+            adapter._inbound_spool.claim(
+                second["message_id_hex"], ignore_backoff=True
+            )
+
+        client.fail_lookup = False
+        first_claim = adapter._inbound_spool.claim(
+            first["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            first_claim.event, spool_message_id=first_claim.message_id
+        )
+        second_claim = adapter._inbound_spool.claim(
+            second["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            second_claim.event, spool_message_id=second_claim.message_id
+        )
+
+        self.assertEqual(["first", "second"], [event.text for event in adapter.events])
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+        )
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(second["message_id_hex"]).state
+        )
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_retry_loop_survives_one_admission_error(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        adapter._inbound_spool.record(event)
+        original_admit = adapter._try_admit_spooled
+        attempts = 0
+        failed_once = asyncio.Event()
+
+        async def flaky_admit(message_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                failed_once.set()
+                raise self.adapter_module.InboundSpoolError("synthetic admission failure")
+            return await original_admit(message_id)
+
+        adapter._try_admit_spooled = flaky_admit
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            adapter._inbound_spool_wakeup.set()
+            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            self.assertFalse(retry.done())
+            adapter._inbound_spool_wakeup.set()
+            for _ in range(20):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([item.text for item in adapter.events], ["durable"])
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_debounce_enqueue_failure_releases_and_preserves_same_group_fifo(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 10}
+        )
+        original_enqueue = adapter._enqueue_debounced
+
+        def fail_after_buffering(event):
+            key = adapter._debounce_key(event)
+            adapter._debounce_pending.setdefault(key, []).append(event)
+            raise RuntimeError("synthetic timer registration failure")
+
+        adapter._enqueue_debounced = fail_after_buffering
+        with self.assertRaisesRegex(RuntimeError, "timer registration"):
+            await adapter._handle_control_event(
+                self.make_event(message_id="33", text="first")
+            )
+        adapter._enqueue_debounced = original_enqueue
+        for _ in range(100):
+            if len(adapter.events) == 1:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual([item.text for item in adapter.events], ["first"])
+        await adapter._handle_control_event(
+            self.make_event(message_id="55", text="second")
+        )
+        normalized_second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        key = adapter._debounce_key(normalized_second)
+        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
+        for _ in range(100):
+            if len(adapter.events) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual([item.text for item in adapter.events], ["first", "second"])
+        self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("55" * 32).state)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_failed_debounce_release_retries_without_restart(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 10}
+        )
+        original_enqueue = adapter._enqueue_debounced
+        original_release = adapter._inbound_spool.release_debounce
+        release_attempts = 0
+
+        def fail_after_buffering(event):
+            key = adapter._debounce_key(event)
+            adapter._debounce_pending.setdefault(key, []).append(event)
+            raise RuntimeError("synthetic timer registration failure")
+
+        def fail_release_once(message_ids, *, reason):
+            nonlocal release_attempts
+            release_attempts += 1
+            if release_attempts == 1:
+                raise self.adapter_module.sqlite3.OperationalError(
+                    "synthetic debounce release failure"
+                )
+            return original_release(message_ids, reason=reason)
+
+        adapter._enqueue_debounced = fail_after_buffering
+        adapter._inbound_spool.release_debounce = fail_release_once
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            with self.assertRaisesRegex(RuntimeError, "timer registration"):
+                await adapter._handle_control_event(
+                    self.make_event(message_id="33", text="first")
+                )
+            adapter._enqueue_debounced = original_enqueue
+            for _ in range(150):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual(2, release_attempts)
+            self.assertEqual([item.text for item in adapter.events], ["first"])
+            self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+            self.assertEqual({}, adapter._debounce_release_pending)
+            self.assertFalse(retry.done())
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_post_commit_debounce_release_error_retries_idempotently_and_preserves_fifo(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 10}
+        )
+        original_enqueue = adapter._enqueue_debounced
+        original_release = adapter._inbound_spool.release_debounce
+        release_attempts = 0
+
+        def fail_after_buffering(event):
+            key = adapter._debounce_key(event)
+            adapter._debounce_pending.setdefault(key, []).append(event)
+            raise RuntimeError("synthetic timer registration failure")
+
+        def fail_after_commit_once(message_ids, *, reason):
+            nonlocal release_attempts
+            release_attempts += 1
+            changed = original_release(message_ids, reason=reason)
+            if release_attempts == 1:
+                raise self.adapter_module.InboundSpoolError(
+                    "synthetic post-commit release failure"
+                )
+            return changed
+
+        adapter._enqueue_debounced = fail_after_buffering
+        adapter._inbound_spool.release_debounce = fail_after_commit_once
+        with self.assertRaisesRegex(RuntimeError, "timer registration"):
+            await adapter._handle_control_event(
+                self.make_event(message_id="33", text="first")
+            )
+        for _ in range(100):
+            if adapter.events:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual([item.text for item in adapter.events], ["first"])
+        self.assertIn("33" * 32, adapter._debounce_release_pending)
+
+        # The first mutation committed before surfacing an error. Repeating the
+        # CAS release changes zero rows but still retires the process-local handle.
+        await adapter._retry_pending_debounce_releases()
+        self.assertEqual({}, adapter._debounce_release_pending)
+
+        adapter._enqueue_debounced = original_enqueue
+        await adapter._handle_control_event(
+            self.make_event(message_id="55", text="second")
+        )
+        normalized_second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        key = adapter._debounce_key(normalized_second)
+        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
+        for _ in range(100):
+            if len(adapter.events) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(2, release_attempts)
+        self.assertEqual([item.text for item in adapter.events], ["first", "second"])
+        self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("55" * 32).state)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_disconnect_survives_unexpected_release_exception_and_reopen_recovers_once(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 60_000}
+        )
+        event = self.make_event(message_id="33", text="recover after reopen")
+        await adapter._handle_control_event(event)
+        original_release = adapter._inbound_spool.release_debounce
+
+        def fail_release(message_ids, *, reason):
+            raise ValueError("synthetic unexpected disconnect failure")
+
+        adapter._inbound_spool.release_debounce = fail_release
+        await adapter.disconnect()
+
+        self.assertEqual({}, adapter._debounce_release_pending)
+        self.assertEqual({}, adapter._debounce_pending)
+        self.assertEqual({}, adapter._debounce_tasks)
+        self.assertEqual(set(), adapter._pending_inbound_ids)
+        self.assertFalse(adapter._inbound_spool.is_open)
+
+        adapter._inbound_spool.release_debounce = original_release
+        await adapter._ensure_inbound_spool_open()
+        adapter._inbound_spool_admission_enabled = True
+        recovered = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("pending", recovered.state)
+        self.assertEqual("recovered_debounce_buffer", recovered.disposition)
+        await adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        await adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual([item.text for item in adapter.events], ["recover after reopen"])
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_disconnect_fences_successor_admission_before_queue_cancel(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first")
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        first_claim = adapter._inbound_spool.claim(first["message_id_hex"])
+        handed = asyncio.Event()
+        calls = []
+
+        async def blocking_handle(message):
+            calls.append(message.text)
+            handed.set()
+            await asyncio.Event().wait()
+
+        adapter.handle_message = blocking_handle
+        adapter._inbound_queue.enqueue(
+            first_claim.group_id,
+            lambda: adapter._dispatch_inbound_message(
+                first_claim.event, spool_message_id=first_claim.message_id
+            ),
+        )
+        await asyncio.wait_for(handed.wait(), timeout=1)
+
+        await adapter.disconnect()
+
+        self.assertEqual(["first"], calls)
+        self.assertFalse(adapter._inbound_spool_admission_enabled)
+        self.assertEqual(set(), adapter._inbound_queue._pending)
+        self.assertFalse(adapter._inbound_spool.is_open)
+        adapter._inbound_spool.open()
+        try:
+            self.assertEqual(
+                "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+            )
+            self.assertEqual(
+                "pending", adapter._inbound_spool.get(second["message_id_hex"]).state
+            )
+        finally:
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_post_commit_claim_verification_error_retries_once_and_preserves_fifo(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first")
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        original_verify = adapter._inbound_spool._checkpoint_and_verify_bound
+        failed_once = False
+
+        def fail_once():
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise self.adapter_module.InboundSpoolError(
+                    "synthetic post-commit claim verification failure"
+                )
+            return original_verify()
+
+        adapter._inbound_spool._checkpoint_and_verify_bound = fail_once
+        with self.assertRaisesRegex(
+            self.adapter_module.InboundSpoolError, "post-commit claim"
+        ):
+            await adapter._try_admit_spooled(first["message_id_hex"])
+        recovered = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("pending", recovered.state)
+        self.assertEqual("claim_post_commit_verification_failed", recovered.disposition)
+
+        adapter._inbound_spool._checkpoint_and_verify_bound = original_verify
+        await adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual(["first", "second"], [message.text for message in adapter.events])
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+        )
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(second["message_id_hex"]).state
+        )
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_retry_loop_survives_unexpected_debounce_release_exception(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event, debounce_buffered=True)
+        adapter._debounce_release_pending[message_id] = "debounce_enqueue_failed"
+        original_retry = adapter._retry_pending_debounce_releases
+        failed_once = asyncio.Event()
+
+        async def flaky_retry():
+            if not failed_once.is_set():
+                failed_once.set()
+                raise ValueError("synthetic unexpected release failure")
+            return await original_retry()
+
+        adapter._retry_pending_debounce_releases = flaky_retry
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            adapter._inbound_spool_wakeup.set()
+            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            self.assertFalse(retry.done())
+            adapter._inbound_spool_wakeup.set()
+            for _ in range(250):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([item.text for item in adapter.events], ["durable"])
+            self.assertEqual({}, adapter._debounce_release_pending)
+            self.assertFalse(retry.done())
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_debounce_release_reason_is_latest_reason_wins(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event, debounce_buffered=True)
+        original_release = adapter._inbound_spool.release_debounce
+
+        def fail_release(message_ids, *, reason):
+            raise self.adapter_module.InboundSpoolError("synthetic release failure")
+
+        adapter._inbound_spool.release_debounce = fail_release
+        await adapter._release_debounce_items([event], reason="older_reason")
+        await adapter._release_debounce_items([event], reason="latest_reason")
+        self.assertEqual("latest_reason", adapter._debounce_release_pending[message_id])
+
+        adapter._inbound_spool.release_debounce = original_release
+        await adapter._retry_pending_debounce_releases()
+        self.assertEqual({}, adapter._debounce_release_pending)
+        self.assertEqual("latest_reason", adapter._inbound_spool.get(message_id).disposition)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_retry_loop_survives_raw_sqlite_read_error(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        adapter._inbound_spool.record(event)
+        original_due = adapter._inbound_spool.due
+        failed_once = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def flaky_due(*, now=None):
+            if not failed_once.is_set():
+                loop.call_soon_threadsafe(failed_once.set)
+                raise self.adapter_module.sqlite3.OperationalError(
+                    "synthetic raw sqlite failure"
+                )
+            return original_due(now=now)
+
+        adapter._inbound_spool.due = flaky_due
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            adapter._inbound_spool_wakeup.set()
+            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            self.assertFalse(retry.done())
+            adapter._inbound_spool_wakeup.set()
+            for _ in range(150):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([item.text for item in adapter.events], ["durable"])
+            self.assertFalse(retry.done())
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_cancel_after_handoff_preserves_cancellation_and_recovers_unresolved(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event)
+        adapter._inbound_spool.claim(message_id)
+        handed = asyncio.Event()
+
+        async def blocking_handle(message):
+            handed.set()
+            await asyncio.Event().wait()
+
+        adapter.handle_message = blocking_handle
+        dispatch = asyncio.create_task(
+            adapter._dispatch_inbound_message(event, spool_message_id=message_id)
+        )
+        await asyncio.wait_for(handed.wait(), timeout=1)
+        self.assertEqual("handed", adapter._inbound_spool.get(message_id).state)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
+        dispatch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await dispatch
+
+        recovery = adapter._inbound_spool.open()
+        self.assertEqual({"reclaimed": 0, "unresolved": 1}, recovery)
+        record = adapter._inbound_spool.get(message_id)
+        self.assertEqual("unresolved", record.state)
+        self.assertEqual("host_handoff_outcome_unknown", record.disposition)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_blocking_spool_record_keeps_event_loop_responsive(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        original_record = adapter._inbound_spool.record
+
+        def slow_record(*args, **kwargs):
+            time.sleep(0.15)
+            return original_record(*args, **kwargs)
+
+        adapter._inbound_spool.record = slow_record
+        started = time.monotonic()
+        handling = asyncio.create_task(adapter._handle_control_event(self.make_event()))
+        await asyncio.sleep(0.02)
+        self.assertFalse(handling.done())
+        self.assertLess(time.monotonic() - started, 0.10)
+        await asyncio.wait_for(handling, timeout=1)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual(["durable"], [message.text for message in adapter.events])
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_cancel_before_handoff_preserves_cancellation_when_defer_fails(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event)
+        adapter._inbound_spool.claim(message_id)
+        entered = asyncio.Event()
+
+        async def block_before_handoff(_event):
+            entered.set()
+            await asyncio.Event().wait()
+
+        def fail_defer(*args, **kwargs):
+            raise self.adapter_module.InboundSpoolError("synthetic cancellation persistence failure")
+
+        adapter._should_run_turn = block_before_handoff
+        adapter._inbound_spool.defer = fail_defer
+        dispatch = asyncio.create_task(
+            adapter._dispatch_inbound_message(event, spool_message_id=message_id)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        dispatch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await dispatch
+        await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
 
 
 if __name__ == "__main__":

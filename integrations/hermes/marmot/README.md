@@ -16,6 +16,40 @@ model-callable `marmot_history` tool can fetch one exact message id or page olde
 messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
 lookup is best-effort and never drops the current inbound message if it fails.
 
+## Inbound durability boundary
+
+Every normalized `inbound_message` is committed to a private, schema-versioned
+SQLite WAL journal before the adapter reserves its id, places it in a debounce
+batch, or attempts per-group queue admission. The default journal is
+`$MARMOT_HOME/hermes/inbound-spool-v1.sqlite3`; `MARMOT_INBOUND_SPOOL_PATH`
+may select another private parent directory. The parent must be mode `0700` and
+the database, lock, WAL, and shared-memory files are kept mode `0600`.
+
+One process owns a spool through a non-blocking advisory lock and a persisted
+generation. On startup, an exclusive new owner reclaims prior-generation
+`claimed` rows in per-group FIFO order. Queue-capacity rejection leaves the row
+pending with bounded backoff rather than dropping it. Debounce-buffered rows
+are explicitly ineligible for live retry-loop claims until their batch is
+persisted; a new exclusive owner releases an abandoned buffer for FIFO replay.
+Debounce batches retain all source ids, the effective reply anchor, and explicit
+coalesced dispositions. Mention-policy and profile-onboarding decisions are
+terminal explicit skips.
+Pending rows are never evicted to satisfy a bound; an exhausted, corrupt,
+newer-schema, unsafe-permission, or unwritable spool fails connection/intake
+closed and preserves the existing state for operator recovery.
+
+Hermes does not yet expose a typed durable turn-start or finality callback. The
+adapter therefore records `handed` immediately before calling the host and
+`completed` after the host returns normally. If the process dies while the host
+call is in flight, the next owner marks the remaining `handed` obligation
+`unresolved` and does not replay it blindly into a possibly recovering Hermes
+turn. Pre-handoff dispatch failures use the bounded retry ladder and then move
+to `failed`, allowing later same-group work to proceed. This slice closes the
+queue/debounce crash windows without
+claiming exactly-once external tool effects, complete session lineage, or
+general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state
+counts only; payloads and identifiers are never logged.
+
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
 id or the latest inbound message and accept arbitrary non-blank, control-free
@@ -59,7 +93,7 @@ install a moving branch for production:
 
 ```sh
 set -eu
-MDK_PLUGIN_REF=<40-character-reviewed-MDK-commit>
+MDK_PLUGIN_REF="${MDK_PLUGIN_REF:?set MDK_PLUGIN_REF to the reviewed 40-character commit}"
 case "$MDK_PLUGIN_REF" in
   *[!0-9a-f]*|'') printf '%s\n' "MDK_PLUGIN_REF must be lowercase hexadecimal" >&2; exit 1 ;;
 esac

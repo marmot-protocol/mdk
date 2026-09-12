@@ -80,6 +80,7 @@ SCRIPT
         cp "$INTEGRATION_PLUGIN_SOURCE/__init__.py" \
             "$INTEGRATION_PLUGIN_SOURCE/adapter.py" \
             "$INTEGRATION_PLUGIN_SOURCE/agent_control.py" \
+            "$INTEGRATION_PLUGIN_SOURCE/inbound_spool.py" \
             "$INTEGRATION_PLUGIN_SOURCE/plugin.yaml" \
             "$plugin_dir/"
         cp "$CONFIGURE_GATEWAY_SOURCE" "$plugin_dir/configure_gateway.py"

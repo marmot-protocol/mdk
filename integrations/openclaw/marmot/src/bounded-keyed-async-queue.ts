@@ -4,6 +4,7 @@
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/core";
 
 export const DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32;
+export const DEFAULT_INBOUND_QUEUE_MAX_TRACKED_GROUPS = 256;
 
 // Copied from the OpenClaw host assertion. This classification is best-effort:
 // an upstream wording change safely degrades to the generic `error` bucket.
@@ -28,29 +29,58 @@ export function classifyInboundDispatchFailure(error: unknown): string {
   return "non_error";
 }
 
+export type InboundQueueOverloadReason = "per_group_depth" | "tracked_group_limit";
+
+export interface InboundQueuePressureSignal {
+  reason: InboundQueueOverloadReason;
+  activeGroups: number;
+  maxDepthPerGroup: number;
+  maxTrackedGroups: number;
+}
+
+export type InboundQueueAdmission =
+  | { outcome: "admitted" }
+  | { outcome: "overloaded"; reason: InboundQueueOverloadReason };
+
 /**
- * Per-key FIFO dispatch with a bounded queue depth. When a key is at capacity,
- * the incoming turn is shed (not the already-queued work) and an optional
- * privacy-safe log hook fires.
+ * Per-group FIFO dispatch with bounded per-group depth and bounded group state.
+ * Rejection is explicit so callers can keep the inbound event retryable. The
+ * pressure callback contains aggregate counts only, never group/message ids.
  */
 export class BoundedKeyedAsyncQueue {
   private readonly queue = new KeyedAsyncQueue();
   private readonly depths = new Map<string, number>();
   private readonly maxDepthPerKey: number;
+  private readonly maxTrackedKeys: number;
 
   constructor(
     maxDepthPerKey: number = DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
-    private readonly onShed?: (message: string) => void,
+    private readonly onPressure?: (signal: InboundQueuePressureSignal) => void,
+    maxTrackedKeys: number = DEFAULT_INBOUND_QUEUE_MAX_TRACKED_GROUPS,
+    private readonly onTaskFailure?: (message: string) => void,
   ) {
-    this.maxDepthPerKey = Math.max(1, maxDepthPerKey);
+    this.maxDepthPerKey = Math.max(1, Math.trunc(maxDepthPerKey));
+    this.maxTrackedKeys = Math.max(1, Math.trunc(maxTrackedKeys));
   }
 
-  enqueue(key: string, task: () => Promise<void>): void {
+  enqueue(key: string, task: () => Promise<void>): InboundQueueAdmission {
     const depth = this.depths.get(key) ?? 0;
-    if (depth >= this.maxDepthPerKey) {
-      this.onShed?.("marmot: inbound queue depth exceeded; shedding turn");
-      return;
+    const reason: InboundQueueOverloadReason | undefined =
+      depth >= this.maxDepthPerKey
+        ? "per_group_depth"
+        : depth === 0 && this.depths.size >= this.maxTrackedKeys
+          ? "tracked_group_limit"
+          : undefined;
+    if (reason) {
+      this.onPressure?.({
+        reason,
+        activeGroups: this.depths.size,
+        maxDepthPerGroup: this.maxDepthPerKey,
+        maxTrackedGroups: this.maxTrackedKeys,
+      });
+      return { outcome: "overloaded", reason };
     }
+
     this.depths.set(key, depth + 1);
     void this.queue
       .enqueue(key, async () => {
@@ -66,9 +96,10 @@ export class BoundedKeyedAsyncQueue {
         }
       })
       .catch((error: unknown) =>
-        this.onShed?.(
+        this.onTaskFailure?.(
           `marmot: inbound dispatch task failed (class=${classifyInboundDispatchFailure(error)})`,
         ),
       );
+    return { outcome: "admitted" };
   }
 }

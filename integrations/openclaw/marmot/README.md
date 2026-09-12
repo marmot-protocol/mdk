@@ -45,6 +45,13 @@ older messages using the returned `(recorded_at, message_id_hex)` cursor.
 History reads are best-effort for turn activation, so a temporary read failure
 does not suppress the new inbound message.
 
+Inbound dispatch uses a bounded per-group FIFO and a bounded active-group set.
+Queue admission is explicit: accepted, debounce-coalesced, onboarding-intercepted,
+and overload outcomes remain distinguishable through completion. Queued/running
+message ids stay reserved so replay cannot start a second active turn; overload
+releases the reservation so a later connector replay can retry. Pressure logs
+contain only fixed reason classes and aggregate limits/counts, never identifiers.
+
 - Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
 
