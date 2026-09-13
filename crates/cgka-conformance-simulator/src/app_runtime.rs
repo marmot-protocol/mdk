@@ -2031,6 +2031,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)
         | AppError::InvalidEncryptedMedia(_)
+        | AppError::MediaReferenceStaleEpoch { .. }
         | AppError::MediaAttachmentRejected(_)
         | AppError::MediaUnfetchable(_)
         | AppError::UnsafeMediaFetch(_)
