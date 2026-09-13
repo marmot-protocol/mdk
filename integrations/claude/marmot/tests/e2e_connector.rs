@@ -63,7 +63,7 @@ fi
 prompt="$(cat)"
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
 if [ "$mode" = resume ]; then
-  printf '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"ignore"},{"type":"text","text":"marmot-e2e-resume-ok: %s"},{"type":"tool_use","name":"Read"}]}}\n' "$prompt"
+  printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"ignore"},{"type":"text","text":"marmot-e2e-resume-ok: %s"},{"type":"tool_use","name":"Read"}]}}\n' "$session" "$prompt"
   printf '{"type":"result","subtype":"success","is_error":false,"result":"marmot-e2e-resume-ok: %s","session_id":"%s"}\n' "$prompt" "$session"
   exit 0
 fi
@@ -71,7 +71,7 @@ tail=""
 for _ in $(seq 1 40); do
   tail="${tail}chunk "
 done
-printf '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"ignore"},{"type":"text","text":"marmot-e2e-ok: %s %s"},{"type":"tool_use","name":"Read"}]}}\n' "$prompt" "$tail"
+printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"ignore"},{"type":"text","text":"marmot-e2e-ok: %s %s"},{"type":"tool_use","name":"Read"}]}}\n' "$session" "$prompt" "$tail"
 printf '{"type":"result","subtype":"success","is_error":false,"result":"marmot-e2e-ok: %s %s","session_id":"%s"}\n' "$prompt" "$tail" "$session"
 "#,
     )

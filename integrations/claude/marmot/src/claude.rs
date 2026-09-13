@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
@@ -11,6 +14,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 0);
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct ClaudeBackend {
@@ -69,6 +73,7 @@ async fn run_with_bin(
         Some(value) => normalize_session_id(&value).ok_or_else(invalid_session_failure)?,
         None => Uuid::new_v4().to_string(),
     };
+    let expected_session_id = session_id.clone();
     run_jsonl_process(
         ProcessSpec {
             executable: bin.to_owned(),
@@ -82,7 +87,7 @@ async fn run_with_bin(
             idle_timeout,
         },
         tx,
-        parse_event_line,
+        move |line| parse_event_line(line, &expected_session_id),
     )
     .await
 }
@@ -123,29 +128,24 @@ fn build_run_args(
     args
 }
 
-fn parse_event_line(line: &str) -> Result<ParsedEvent> {
+fn parse_event_line(line: &str, expected_session_id: &str) -> Result<ParsedEvent> {
     let value: Value = serde_json::from_str(line)?;
     let event_type = value.get("type").and_then(Value::as_str);
     match event_type {
         Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
-            parse_session_event(&value)
+            parse_session_event(&value, expected_session_id)
         }
-        Some("assistant") => parse_assistant_event(&value),
-        Some("result") => parse_result_event(&value),
+        Some("assistant") => parse_assistant_event(&value, expected_session_id),
+        Some("result") => parse_result_event(&value, expected_session_id),
         _ => Ok(ParsedEvent::Ignored),
     }
 }
 
-fn parse_session_event(value: &Value) -> Result<ParsedEvent> {
-    let Some(session_id) = value.get("session_id").and_then(Value::as_str) else {
-        return Ok(ParsedEvent::Ignored);
-    };
-    normalize_session_id(session_id)
-        .map(ParsedEvent::Session)
-        .ok_or(HarnessError::Json)
+fn parse_session_event(value: &Value, expected_session_id: &str) -> Result<ParsedEvent> {
+    validated_session_id(value, expected_session_id).map(ParsedEvent::Session)
 }
 
-fn parse_assistant_event(value: &Value) -> Result<ParsedEvent> {
+fn parse_assistant_event(value: &Value, expected_session_id: &str) -> Result<ParsedEvent> {
     if value
         .get("parent_tool_use_id")
         .is_some_and(|parent| !parent.is_null())
@@ -162,6 +162,7 @@ fn parse_assistant_event(value: &Value) -> Result<ParsedEvent> {
     if text.trim().is_empty() {
         return Ok(ParsedEvent::Ignored);
     }
+    validated_session_id(value, expected_session_id)?;
     Ok(ParsedEvent::Text(text))
 }
 
@@ -180,11 +181,20 @@ fn assistant_text(content: Option<&Value>) -> String {
         .join("")
 }
 
-fn parse_result_event(value: &Value) -> Result<ParsedEvent> {
-    let session_id = match value.get("session_id").and_then(Value::as_str) {
-        Some(value) => Some(normalize_session_id(value).ok_or(HarnessError::Json)?),
-        None => None,
-    };
+fn validated_session_id(value: &Value, expected_session_id: &str) -> Result<String> {
+    let session_id = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(normalize_session_id)
+        .ok_or(HarnessError::Json)?;
+    if session_id != expected_session_id {
+        return Err(HarnessError::Json);
+    }
+    Ok(session_id)
+}
+
+fn parse_result_event(value: &Value, expected_session_id: &str) -> Result<ParsedEvent> {
+    let session_id = validated_session_id(value, expected_session_id)?;
     let subtype = value.get("subtype").and_then(Value::as_str);
     let is_error = value
         .get("is_error")
@@ -192,7 +202,7 @@ fn parse_result_event(value: &Value) -> Result<ParsedEvent> {
         .unwrap_or(subtype != Some("success"));
     if is_error || subtype != Some("success") {
         return Ok(ParsedEvent::Error {
-            session_id,
+            session_id: Some(session_id),
             summary: result_error_summary(subtype).to_owned(),
         });
     }
@@ -214,16 +224,49 @@ fn normalize_session_id(value: &str) -> Option<String> {
 }
 
 fn validate_cli_version(bin: &str) -> Result<()> {
-    let output = Command::new(bin)
-        .arg("--version")
-        .output()
+    validate_cli_version_with_timeout(bin, VERSION_PROBE_TIMEOUT)
+}
+
+fn validate_cli_version_with_timeout(bin: &str, timeout: Duration) -> Result<()> {
+    let mut command = Command::new(bin);
+    command.arg("--version");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|_| HarnessError::BackendSpawn)?;
-    if !output.status.success() {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                terminate_version_probe(&mut child);
+                return Err(HarnessError::BackendSpawn);
+            }
+            Err(_) => {
+                terminate_version_probe(&mut child);
+                return Err(HarnessError::BackendSpawn);
+            }
+        }
+    };
+    if !status.success() {
         return Err(HarnessError::Config(
             "Claude Code version check failed".to_owned(),
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or(HarnessError::BackendSpawn)?
+        .read_to_string(&mut stdout)
+        .map_err(|_| HarnessError::BackendSpawn)?;
     let version = parse_version(&stdout).ok_or_else(|| {
         HarnessError::Config("Claude Code returned an unsupported version string".to_owned())
     })?;
@@ -235,16 +278,26 @@ fn validate_cli_version(bin: &str) -> Result<()> {
     Ok(())
 }
 
+fn terminate_version_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
-    value
-        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .find_map(|candidate| {
-            let mut parts = candidate.split('.');
-            let major = parts.next()?.parse().ok()?;
-            let minor = parts.next()?.parse().ok()?;
-            let patch = parts.next()?.parse().ok()?;
-            (parts.next().is_none()).then_some((major, minor, patch))
-        })
+    let value = value.trim();
+    let candidate = value
+        .strip_suffix(" (Claude Code)")
+        .or_else(|| value.strip_prefix("claude-code "))?;
+    let mut parts = candidate.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
 }
 
 #[cfg(test)]
@@ -254,7 +307,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -314,22 +367,24 @@ mod tests {
     #[test]
     fn parser_emits_main_assistant_text_without_result_duplication() {
         assert_eq!(
-            parse_event_line(&format!(
-                r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#
-            ))
+            parse_event_line(
+                &format!(r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#),
+                SESSION
+            )
             .unwrap(),
             ParsedEvent::Session(SESSION.to_owned())
         );
         assert_eq!(
             parse_event_line(&format!(
                 r#"{{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"{SESSION}"}}"#
-            ))
+            ), SESSION)
             .unwrap(),
             ParsedEvent::Ignored
         );
         assert_eq!(
             parse_event_line(
-                r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"checking "},{"type":"tool_use","name":"Read"},{"type":"text","text":"done"}]}}"#
+                &format!(r#"{{"type":"assistant","session_id":"{SESSION}","parent_tool_use_id":null,"message":{{"role":"assistant","content":[{{"type":"thinking","thinking":"secret"}},{{"type":"text","text":"checking "}},{{"type":"tool_use","name":"Read"}},{{"type":"text","text":"done"}}]}}}}"#),
+                SESSION,
             )
             .unwrap(),
             ParsedEvent::Text("checking done".to_owned())
@@ -341,9 +396,12 @@ mod tests {
             r#"{"type":"user","message":{"content":"prompt"}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta"}}"#,
         ] {
-            assert_eq!(parse_event_line(line).unwrap(), ParsedEvent::Ignored);
+            assert_eq!(
+                parse_event_line(line, SESSION).unwrap(),
+                ParsedEvent::Ignored
+            );
         }
-        assert!(parse_event_line("{").is_err());
+        assert!(parse_event_line("{", SESSION).is_err());
     }
 
     #[test]
@@ -351,7 +409,7 @@ mod tests {
         assert_eq!(
             parse_event_line(&format!(
                 r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"result":"private failure","session_id":"{SESSION}"}}"#
-            ))
+            ), SESSION)
             .unwrap(),
             ParsedEvent::Error {
                 session_id: Some(SESSION.to_owned()),
@@ -359,9 +417,26 @@ mod tests {
             }
         );
         assert!(
-            parse_event_line(r#"{"type":"system","subtype":"init","session_id":"not-a-uuid"}"#)
-                .is_err()
+            parse_event_line(
+                r#"{"type":"system","subtype":"init","session_id":"not-a-uuid"}"#,
+                SESSION
+            )
+            .is_err()
         );
+    }
+
+    #[test]
+    fn parser_rejects_missing_or_mismatched_session_identity_before_output() {
+        let other = "123e4567-e89b-12d3-a456-426614174000";
+        for line in [
+            format!(r#"{{"type":"system","subtype":"init","session_id":"{other}"}}"#),
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"unbound"}]}}"#.to_owned(),
+            format!(r#"{{"type":"assistant","session_id":"{other}","parent_tool_use_id":null,"message":{{"role":"assistant","content":[{{"type":"text","text":"wrong lane"}}]}}}}"#),
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#.to_owned(),
+            format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"{other}"}}"#),
+        ] {
+            assert!(parse_event_line(&line, SESSION).is_err(), "accepted {line}");
+        }
     }
 
     #[test]
@@ -369,6 +444,8 @@ mod tests {
         assert_eq!(parse_version("2.1.270 (Claude Code)"), Some((2, 1, 270)));
         assert_eq!(parse_version("claude-code 2.1.0"), Some((2, 1, 0)));
         assert_eq!(parse_version("Claude Code"), None);
+        assert_eq!(parse_version("warning 9.0.0\nClaude Code"), None);
+        assert_eq!(parse_version("warning 9.0.0\n2.1.270 (Claude Code)"), None);
     }
 
     #[cfg(unix)]
@@ -377,6 +454,49 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_active(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        !process_is_active(pid)
+    }
+
+    #[cfg(unix)]
+    fn process_is_active(pid: &str) -> bool {
+        let exists = Command::new("kill")
+            .args(["-0", pid])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !exists {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+                .and_then(|rest| rest.chars().next());
+            state != Some('Z')
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Command::new("ps")
+                .args(["-o", "state=", "-p", pid])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    output
+                        .stdout
+                        .into_iter()
+                        .find(|byte| !byte.is_ascii_whitespace())
+                })
+                .is_some_and(|state| state != b'Z')
+        }
     }
 
     #[cfg(unix)]
@@ -405,6 +525,35 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn version_probe_times_out_and_reaps_a_hung_cli() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("hanging");
+        let pid_path = root.path().join("descendant.pid");
+        write_executable(
+            &script,
+            &format!(
+                "#!/usr/bin/env bash\nsleep 30 &\necho $! > {}\nwait\n",
+                pid_path.display()
+            ),
+        );
+        let started = Instant::now();
+
+        let error =
+            validate_cli_version_with_timeout(script.to_str().unwrap(), Duration::from_millis(100))
+                .expect_err("hung version probe must fail within the configured timeout");
+
+        assert!(matches!(error, HarnessError::BackendSpawn));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(&pid_path).unwrap();
+        let pid = pid.trim();
+        assert!(
+            wait_for_process_exit(pid),
+            "version-probe descendant {pid} survived timeout"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn runner_pipes_prompt_and_returns_completed_assistant_messages() {
         let root = tempfile::tempdir().unwrap();
@@ -421,8 +570,8 @@ test "$5" = "--session-id"
 session="$6"
 prompt="$(cat)"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$session"'"}'
-printf '%s\n' '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"intermediate"},{"type":"thinking","thinking":"secret"},{"type":"tool_use","name":"Read"}]}}'
-printf '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"reply: %s"}]}}\n' "$prompt"
+printf '%s\n' '{"type":"assistant","session_id":"'"$session"'","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"intermediate"},{"type":"thinking","thinking":"secret"},{"type":"tool_use","name":"Read"}]}}'
+printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"reply: %s"}]}}\n' "$session" "$prompt"
 printf '{"type":"result","subtype":"success","is_error":false,"result":"reply: %s","session_id":"%s"}\n' "$prompt" "$session"
 "#,
         );

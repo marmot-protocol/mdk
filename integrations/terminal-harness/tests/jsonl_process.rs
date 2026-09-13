@@ -566,7 +566,8 @@ async fn cancellation_terminates_descendant_processes() {
         root.path(),
         "cancellation-descendant-backend",
         &format!(
-            "#!/bin/sh\nsleep 30 &\necho $! > {}\nwait\n",
+            "#!/bin/sh\n: > {}\nsleep 0.1\nsleep 30 &\necho $! > {}\nwait\n",
+            pid_path.display(),
             pid_path.display()
         ),
     );
@@ -577,7 +578,11 @@ async fn cancellation_terminates_descendant_processes() {
 
     let task = tokio::spawn(async move { run_jsonl_process(spec, tx, parse_event).await });
     tokio::time::timeout(Duration::from_secs(2), async {
-        while !pid_path.exists() {
+        while fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .is_none_or(|pid| pid == 0)
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -587,6 +592,10 @@ async fn cancellation_terminates_descendant_processes() {
     let _ = task.await;
 
     let pid = fs::read_to_string(pid_path).unwrap();
+    assert!(
+        pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0),
+        "test fixture did not publish a positive descendant pid"
+    );
     assert!(
         wait_for_process_exit(pid.trim()).await,
         "descendant process survived cancellation cleanup"
