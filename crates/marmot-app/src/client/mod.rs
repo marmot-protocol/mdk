@@ -2674,14 +2674,11 @@ impl AppClient {
                 .retain(|event| &event.group_id != group_id);
         }
         self.app.presentation_signals.wake();
-        self.pending_runtime_group_subscription_refresh = true;
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
         if self.sync_runtime_groups().await.is_err() {
             tracing::warn!(target: "marmot_app::client", method = "forget_group_local",
                 "forgotten group subscription cleanup remains pending");
-        } else {
-            self.pending_runtime_group_subscription_refresh = false;
         }
         if let Some((_, route)) = self
             .post_join_maintenance_subscriptions

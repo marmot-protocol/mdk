@@ -1094,71 +1094,68 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = true;
                 match command {
                     Some(command) => {
-                        pending.push_front(command);
-                        if let Some(command) = pending.pop_front() {
-                            let command = match command {
-                                AccountWorkerCommand::Drain { respond } => {
-                                    if let Some(recovery) = &mut welcome_recovery {
-                                        recovery.drain_waiters.push(respond);
-                                    } else {
-                                        let _ = respond.send(());
-                                    }
-                                    continue;
+                        let command = match command {
+                            AccountWorkerCommand::Drain { respond } => {
+                                if let Some(recovery) = &mut welcome_recovery {
+                                    recovery.drain_waiters.push(respond);
+                                } else {
+                                    let _ = respond.send(());
                                 }
-                                command => command,
-                            };
-                            let may_change_push_registration_work =
-                                command.may_change_push_registration_work();
-                            match command {
-                                AccountWorkerCommand::CatchUp { respond } => {
-                                    handle_account_worker_catch_up(
-                                        &mut client,
-                                        respond,
-                                        &mut commands,
-                                        &mut pending,
-                                        AccountWorkerCatchUpContext {
-                                            app: &app,
-                                            events: &events,
-                                            account_id_hex: &account_id_hex,
-                                            account_label: &account_label,
-                                            shared: &shared,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                command => {
-                                    handle_account_worker_command(
-                                        &mut client,
-                                        command,
-                                        AccountWorkerCommandContext {
-                                            commands: &mut commands,
-                                            pending: &mut pending,
-                                            app: &app,
-                                            events: &events,
-                                            account_id_hex: &account_id_hex,
-                                            account_label: &account_label,
-                                            shared: &shared,
-                                            media_http: &media_http,
-                                            scheduled_convergence: &mut scheduled_convergence,
-                                        },
-                                    )
-                                    .await;
-                                }
+                                continue;
                             }
-                            schedule_pending_convergence_groups(
-                                &mut scheduled_convergence,
-                                &mut client,
-                            );
-                            scheduled_runtime_group_subscription_refresh.observe_pending(
-                                client.has_pending_runtime_group_subscription_refresh(),
+                            command => command,
+                        };
+                        let may_change_push_registration_work =
+                            command.may_change_push_registration_work();
+                        match command {
+                            AccountWorkerCommand::CatchUp { respond } => {
+                                handle_account_worker_catch_up(
+                                    &mut client,
+                                    respond,
+                                    &mut commands,
+                                    &mut pending,
+                                    AccountWorkerCatchUpContext {
+                                        app: &app,
+                                        events: &events,
+                                        account_id_hex: &account_id_hex,
+                                        account_label: &account_label,
+                                        shared: &shared,
+                                    },
+                                )
+                                .await;
+                            }
+                            command => {
+                                handle_account_worker_command(
+                                    &mut client,
+                                    command,
+                                    AccountWorkerCommandContext {
+                                        commands: &mut commands,
+                                        pending: &mut pending,
+                                        app: &app,
+                                        events: &events,
+                                        account_id_hex: &account_id_hex,
+                                        account_label: &account_label,
+                                        shared: &shared,
+                                        media_http: &media_http,
+                                        scheduled_convergence: &mut scheduled_convergence,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        if may_change_push_registration_work {
+                            scheduled_push_retry.observe_pending(
+                                client.has_pending_push_registration_work(),
                                 &command_tx,
                             );
-                            if may_change_push_registration_work {
-                                scheduled_push_retry.observe_pending(
-                                    client.has_pending_push_registration_work(),
-                                    &command_tx,
-                                );
-                            }
                         }
                     }
                     None => return,
@@ -1253,7 +1250,6 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                             Err(err) => {
-                                let account_inactive = err.is_account_not_active();
                                 scheduled_convergence.schedule_retry_groups([group_id]);
                                 publish_app_runtime_account_error(
                                     &events,
@@ -1261,19 +1257,6 @@ async fn run_app_runtime_account_worker(
                                     &account_label,
                                     account_error_message("scheduled convergence sync failed", &err),
                                 );
-                                if account_inactive
-                                    && let Err(activation_error) = client.prepare_transport().await
-                                {
-                                    publish_app_runtime_account_error(
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        account_error_message(
-                                            "scheduled convergence transport reactivation failed",
-                                            &activation_error,
-                                        ),
-                                    );
-                                }
                             }
                         }
                     },
