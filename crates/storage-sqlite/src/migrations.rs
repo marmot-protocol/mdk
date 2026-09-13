@@ -136,6 +136,10 @@ mod migration_0067_invitation_recovery;
 mod migration_0068_media_epoch_index;
 #[path = "migrations/0069_chat_readiness_index.rs"]
 mod migration_0069_chat_readiness_index;
+#[path = "migrations/0070_forgotten_groups.rs"]
+mod migration_0070_forgotten_groups;
+#[path = "migrations/0071_group_reset_cutoff.rs"]
+mod migration_0071_group_reset_cutoff;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -498,6 +502,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 69,
         name: "0069_chat_readiness_index",
         apply: migration_0069_chat_readiness_index::apply,
+    },
+    Migration {
+        version: 70,
+        name: "0070_forgotten_groups",
+        apply: migration_0070_forgotten_groups::apply,
+    },
+    Migration {
+        version: 71,
+        name: "0071_group_reset_cutoff",
+        apply: migration_0071_group_reset_cutoff::apply,
     },
 ];
 
@@ -1269,7 +1283,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 69,
+                found: 71,
                 latest_supported: 46,
             }
         ));
@@ -1325,7 +1339,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 69,
+                found: 71,
                 latest_supported: 46,
             }
         ));
@@ -1629,7 +1643,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 69,
+                found: 71,
                 latest_supported: 46,
             }
         ));
@@ -3020,5 +3034,46 @@ mod tests {
         stmt.query_map([], |row| row.get::<_, String>("name"))
             .unwrap()
             .any(|name| name.as_deref() == Ok(index))
+    }
+}
+
+#[cfg(test)]
+mod group_reset_tests {
+    use super::*;
+
+    #[test]
+    fn permanent_forget_marker_migrates_to_awaiting_fresh_welcome() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..70]).unwrap();
+        conn.execute(
+            "INSERT INTO locally_forgotten_groups(group_id) VALUES (x'aa')",
+            [],
+        )
+        .unwrap();
+        let before = crate::codec::unix_now_seconds_i64();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let (cutoff, awaiting): (i64, bool) = conn.query_row(
+            "SELECT forgotten_at, awaiting_welcome FROM locally_forgotten_groups WHERE group_id = x'aa'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(cutoff >= before && cutoff <= crate::codec::unix_now_seconds_i64());
+        assert!(awaiting);
+        assert!(
+            conn.execute(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
+                []
+            )
+            .is_err()
+        );
+        // Upgrading/reopening again must not advance the user's reset boundary.
+        run(&mut conn, MIGRATIONS).unwrap();
+        let unchanged: i64 = conn
+            .query_row(
+                "SELECT forgotten_at FROM locally_forgotten_groups WHERE group_id = x'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, cutoff);
     }
 }

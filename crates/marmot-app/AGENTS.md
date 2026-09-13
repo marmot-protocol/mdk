@@ -162,6 +162,12 @@ App runtime bridge for the first real Marmot app surfaces.
 
 ```sh
 cargo test -p marmot-app
+# Accelerated recovery/retry scenarios (also enabled by workspace CI):
+cargo test -p marmot-app --features test-policy-overrides
 # Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):
 cargo test -p marmot-app --features otlp-export
 ```
+
+Tests that require shortened production policy intervals must use
+`#[cfg(feature = "test-policy-overrides")]`; normal test builds deliberately
+ignore those configuration overrides.

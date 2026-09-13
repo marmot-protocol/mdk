@@ -1133,7 +1133,7 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
 
-            let locally_deleted_group_ids = if state.groups.is_empty() {
+            let mut locally_deleted_group_ids = if state.groups.is_empty() {
                 std::collections::HashSet::new()
             } else {
                 let mut statement = conn
@@ -1145,6 +1145,19 @@ impl SqliteAccountStorage {
                     .collect::<Result<std::collections::HashSet<_>, _>>()
                     .storage()?
             };
+            // Probe only groups in this write, not the lifetime collection of
+            // forgotten ids. Ordinary delta checkpoints usually contain one.
+            if !state.groups.is_empty() {
+                let mut forgotten = conn.prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM locally_forgotten_groups WHERE group_id = ?1 AND awaiting_welcome = 1)"
+                ).storage()?;
+                for group in &state.groups {
+                    if let Ok(id) = hex::decode(&group.group_id_hex)
+                        && forgotten.query_row(params![id], |row| row.get::<_, bool>(0)).storage()? {
+                        locally_deleted_group_ids.insert(group.group_id_hex.clone());
+                    }
+                }
+            }
             let retained_group_ids = state
                 .groups
                 .iter()
@@ -1409,6 +1422,30 @@ impl SqliteAccountStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<DeleteLocalGroupDataResult> {
+        self.delete_local_group_data_inner(group_id_hex, None)
+    }
+
+    pub(crate) fn forget_group_local_data(
+        &self,
+        group_id_hex: &str,
+        at: cgka_traits::Timestamp,
+    ) -> StorageResult<bool> {
+        use cgka_traits::storage::GroupStorage;
+        let id = cgka_traits::GroupId::new(
+            hex::decode(group_id_hex)
+                .map_err(|_| StorageError::Serialization("invalid local group id".into()))?,
+        );
+        let already_forgotten = self.is_group_forgotten(&id)?;
+        self.delete_local_group_data_inner(group_id_hex, Some(at))?;
+        Ok(!already_forgotten)
+    }
+
+    fn delete_local_group_data_inner(
+        &self,
+        group_id_hex: &str,
+        forgotten_at: Option<cgka_traits::Timestamp>,
+    ) -> StorageResult<DeleteLocalGroupDataResult> {
+        let forget = forgotten_at.is_some();
         if group_id_hex.trim().is_empty() {
             return Err(StorageError::Backend(
                 "local group delete id must not be empty".to_owned(),
@@ -1488,7 +1525,7 @@ impl SqliteAccountStorage {
                         },
                     )
                     .storage()?;
-                if active && !terminal {
+                if active && !terminal && !forget {
                     tx.execute_cached(
                         "INSERT INTO local_group_deletion_frontiers (
                             group_id_hex, message_insert_order, prior_nostr_routes_json
@@ -1511,7 +1548,7 @@ impl SqliteAccountStorage {
                     )
                     .storage()?;
                 }
-                if terminal {
+                if terminal && !forget {
                     tx.execute_cached(
                         "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
                         params![hex::encode(&group_id)],
@@ -1524,6 +1561,41 @@ impl SqliteAccountStorage {
                         )
                         .storage()?,
                     );
+                }
+                if let Some(at) = forgotten_at {
+                    deleted += tx.execute_cached(
+                        "INSERT INTO locally_forgotten_groups(group_id, forgotten_at, awaiting_welcome)
+                         VALUES (?1, ?2, 1) ON CONFLICT(group_id) DO UPDATE SET
+                         forgotten_at = MAX(locally_forgotten_groups.forgotten_at, excluded.forgotten_at),
+                         awaiting_welcome = 1 WHERE locally_forgotten_groups.awaiting_welcome = 0",
+                        params![&group_id, u64_to_i64(at.0)?],
+                    ).storage()?;
+                    crate::storage::groups::delete_group_tx(
+                        &tx,
+                        &cgka_traits::GroupId::new(group_id.clone()),
+                    )?;
+                    for table in ["cgka_welcomes", "cgka_disband_tombstones"] {
+                        tx.execute_cached(
+                            &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                            params![&group_id],
+                        )
+                        .storage()?;
+                    }
+                    for table in [
+                        "local_group_deletion_frontiers",
+                        "app_pending_welcome_delivery",
+                        "pending_push_registration_removals",
+                        "app_prepared_group_image_upload",
+                        "message_drafts",
+                        "chat_pin_positions",
+                    ] {
+                        tx.execute_cached(
+                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
+                            params![group_id_hex],
+                        )
+                        .storage()?;
+                    }
+                    self.connection.note_openmls_write();
                 }
                 if deleted > 0 {
                     merge_local_group_delete_intent_tx(&tx, group_id_hex, deleted)?;
@@ -2374,6 +2446,19 @@ impl SqliteAccountStorage {
     ) -> StorageResult<AccountStoredPushRegistration> {
         self.connection.with_transaction(|| {
             let existing = self.push_registration(&registration.account_label)?;
+            // Hosts re-register on foreground. Keep an unchanged registration's
+            // revision and partial gossip progress instead of requeueing every
+            // joined group each time the app resumes.
+            if let Some(existing) = &existing
+                && existing.registration.account_id_hex == registration.account_id_hex
+                && existing.registration.platform == registration.platform
+                && existing.registration.token_fingerprint == registration.token_fingerprint
+                && existing.registration.server_pubkey_hex == registration.server_pubkey_hex
+                && existing.registration.relay_hint == registration.relay_hint
+                && existing.token_bytes == token_bytes
+            {
+                return Ok(existing.clone());
+            }
             let created_at_ms = existing
                 .as_ref()
                 .map(|existing| existing.registration.created_at_ms)

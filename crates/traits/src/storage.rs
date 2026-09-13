@@ -127,6 +127,36 @@ pub trait GroupStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()>;
     fn get_group(&self, id: &GroupId) -> StorageResult<Group>;
     fn delete_group(&self, id: &GroupId) -> StorageResult<()>;
+
+    /// Atomically erase a group's local state and retain a reset cutoff.
+    /// Repeated calls while awaiting a Welcome preserve the original cutoff.
+    /// This is not an MLS leave or a protocol tombstone.
+    /// Unsupported backends must fail without deleting anything.
+    fn forget_group_local(&self, _id: &GroupId, _at: crate::Timestamp) -> StorageResult<bool> {
+        Err(StorageError::Backend(
+            "local group forgetting is unsupported".into(),
+        ))
+    }
+
+    /// Whether this account-device is awaiting a fresh Welcome after a reset.
+    fn is_group_forgotten(&self, _id: &GroupId) -> StorageResult<bool> {
+        Ok(false)
+    }
+
+    /// Durable reset cutoff, retained even after a fresh join to reject old replay.
+    fn group_local_reset_cutoff(&self, _id: &GroupId) -> StorageResult<Option<crate::Timestamp>> {
+        Ok(None)
+    }
+
+    /// Permit group insertion after a fully validated fresh Welcome. The caller
+    /// must include this write in the same transaction as the MLS join. The
+    /// cutoff remains intact; failed joins must roll back this transition.
+    fn complete_group_local_reset(&self, _id: &GroupId) -> StorageResult<()> {
+        Err(StorageError::Backend(
+            "local group reset is unsupported".into(),
+        ))
+    }
+
     fn list_groups(&self) -> StorageResult<Vec<GroupId>>;
 
     /// Every stored group record in one pass. The engine's session-open seed

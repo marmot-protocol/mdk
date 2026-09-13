@@ -62,6 +62,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   `invalid_encrypted_media`, `invalid_app_message_payload`, `invalid_retention_duration`, `unknown_message`,
   `not_message_author`, `empty_group_image`, `group_image_absent`, `invalid_rejoin_token`, `invalid_welcome_id`,
   and `initial_admin_not_invited`.
+- Runtime `forget_group_local` and Swift/Kotlin `forgetGroupLocal` for recovery from an
+  unusable local group copy: erase chat history and MLS state, cancel group work, and
+  wait for a fresh authenticated Welcome. Invitations must be created strictly after
+  the reset's Unix-second cutoff; equal-second invitations are rejected. Hosts retain
+  responsibility for their own media caches and active group views.
 - Shared profile-pseudonym helpers are now exported through UniFFI and C
   (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
   `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
@@ -91,6 +96,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   for the decrypted image.
 - The README documents canonical MLS group ids versus 32-byte Nostr routing ids, and relay publication versus
   durable completion, for the group and message surfaces.
+- Account storage advances through migrations 70–71. Back up before upgrading;
+  downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
+  Keep native libraries and generated bindings on matching versions.
 - Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
   addition to hex, `npub`, and existing URI forms. nprofile relay hints are
   discarded. Duplicate type-0 TLV entries keep the first key. After one
@@ -142,6 +150,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The shared encrypted-media fixtures (`fixtures/encrypted-media/`) carry a `rejection_kind`
   for every rejection case plus new legacy-shape, field-without-value, and missing-locator
   cases; marmot-app, MarmotKit, and `wn` assert against them.
+
+### Fixed
+
+- Foreground recovery services commands between group passes without starving due
+  convergence under a busy command queue; unchanged group subscriptions stay in place.
+- Unchanged push registrations retain their gossip progress.
+- Accepted disbands remain scheduled across restart and project completion after MLS
+  state deletion, including completion through inbound convergence.
 
 ## [0.9.21] - 2026-09-10
 

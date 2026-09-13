@@ -2607,6 +2607,107 @@ impl AppClient {
         Ok(self.runtime.acknowledge_disband_failure(group_id)?)
     }
 
+    /// Forget a group on this account-device without publishing a leave.
+    /// Old Welcomes stay rejected; a valid invitation created strictly after
+    /// this reset can join the same MLS group id with fresh state.
+    pub async fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        let changed = self.runtime.forget_group_local(group_id)?;
+        let group_hex = hex::encode(group_id.as_slice());
+        self.state
+            .groups
+            .retain(|group| group.group_id_hex != group_hex);
+        self.routing.replace_group_routes(group_id, Vec::new());
+        self.pending_group_projection_updates.remove(&group_hex);
+        self.pending_local_group_deletion_frontier_clears
+            .remove(&group_hex);
+        self.pending_recovery_status_updates.remove(group_id);
+        self.pending_projection_updates
+            .retain(|update| update.group_id_hex != group_hex);
+        self.pending_welcome_delivery_events
+            .retain(|event| event.group_id_hex != group_hex);
+        self.pending_superseded_change_events
+            .retain(|event| &event.group_id != group_id);
+        if self
+            .unpublished_welcome_delivery
+            .as_ref()
+            .is_some_and(|work| &work.group_id == group_id)
+        {
+            self.unpublished_welcome_delivery = None;
+        }
+        self.pending_epoch_stall_escalations
+            .retain(|event| &event.group_id != group_id);
+        self.epoch_stall.clear_recovered_group(group_id);
+        for pending in self
+            .pending_epoch_backfill
+            .iter_mut()
+            .chain(self.queued_epoch_backfills.iter_mut())
+        {
+            pending.groups.remove(group_id);
+        }
+        if self
+            .pending_epoch_backfill
+            .as_ref()
+            .is_some_and(|pending| pending.groups.is_empty())
+        {
+            self.pending_epoch_backfill = None;
+        }
+        self.queued_epoch_backfills
+            .retain(|pending| !pending.groups.is_empty());
+        self.encrypted_media_not_required_epochs.remove(&group_hex);
+        self.pending_convergence_groups.remove(group_id);
+        for summary in [
+            &mut self.pending_applied_sync_summary,
+            &mut self.pending_failed_sync_summary,
+        ] {
+            summary.joined_groups.retain(|group| group != group_id);
+            summary
+                .messages
+                .retain(|message| &message.group_id != group_id);
+            summary
+                .events
+                .retain(|event| crate::groups::event_group_id(event) != Some(group_id));
+            summary
+                .projection_updates
+                .retain(|update| update.group_id_hex != group_hex);
+            summary
+                .epoch_stall_escalations
+                .retain(|event| &event.group_id != group_id);
+        }
+        self.app.presentation_signals.wake();
+        // Deletion already committed. A failed transport refresh must not make
+        // the caller believe the group still exists; ordinary maintenance retries.
+        if self.sync_runtime_groups().await.is_err() {
+            tracing::warn!(target: "marmot_app::client", method = "forget_group_local",
+                "forgotten group subscription cleanup remains pending");
+        }
+        if let Some((_, route)) = self
+            .post_join_maintenance_subscriptions
+            .get(group_id)
+            .cloned()
+        {
+            if self
+                .adapter
+                .remove_group_maintenance_subscription(&route)
+                .await
+                .is_ok()
+            {
+                self.post_join_maintenance_subscriptions.remove(group_id);
+            } else {
+                tracing::warn!(target: "marmot_app::client", method = "forget_group_local",
+                    "forgotten group maintenance subscription cleanup remains pending");
+            }
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn is_group_forgotten(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        use cgka_traits::storage::GroupStorage;
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .is_group_forgotten(group_id)?)
+    }
+
     /// Delete only this group's app-local data. This intentionally does not send
     /// an MLS leave and does not delete the stored MLS/OpenMLS group state; a
     /// future fresh group delivery can recreate the chat-list projection.

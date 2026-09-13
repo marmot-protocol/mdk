@@ -4953,6 +4953,23 @@ MarmotStatus marmot_delete_group_local(const struct MarmotClient *client,
                                        bool *out);
 
 /**
+ * Reset this group on this account-device without publishing.
+ * Deletes local app and MLS state; only a valid Welcome created after the reset can rejoin.
+ * Close group UI subscriptions and clear host-owned media caches first.
+ * Writes true for a new forget, false if already forgotten.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_forget_group_local(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       bool *out);
+
+/**
  * Set the per-group disappearing-message retention.
  * `disappearing_message_secs` of `0` disables expiry. Free with
  * `marmot_send_summary_free`.

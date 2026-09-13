@@ -180,6 +180,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -3832,4 +3833,44 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn forgotten_group_rejects_welcome_without_authenticated_creation_time() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, storage) = build_with_storage(b"bob");
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "missing invitation time".into(),
+            description: String::new(),
+            members: vec![key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(bob.forget_group_local(&group_id).unwrap());
+    let cutoff = storage.group_local_reset_cutoff(&group_id).unwrap();
+    let mut welcome = welcomes.remove(0);
+    // The mock transport supplies no authenticated inner time. A later outer
+    // time must not substitute for it, even though the MLS Welcome is valid.
+    welcome.timestamp = Timestamp(u64::MAX);
+    assert!(matches!(
+        bob.join_welcome(welcome).await,
+        Err(cgka_traits::EngineError::InvalidWelcome)
+    ));
+    assert!(storage.is_group_forgotten(&group_id).unwrap());
+    assert_eq!(storage.group_local_reset_cutoff(&group_id).unwrap(), cutoff);
+    assert!(storage.list_groups().unwrap().is_empty());
+    assert!(bob.drain_events().is_empty());
 }

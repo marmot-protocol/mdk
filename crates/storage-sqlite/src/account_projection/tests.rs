@@ -2401,7 +2401,7 @@ fn push_registration_preserves_created_at_when_token_rotates() {
 }
 
 #[test]
-fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh() {
+fn push_registration_preserves_progress_on_resume_and_requeues_changed_routing() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .save_account_projection_state(
@@ -2450,7 +2450,40 @@ fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh
         .mark_push_registration_shared("alice", "first", 10, 11)
         .unwrap();
 
+    let mut resumed = registration.clone();
+    resumed.updated_at_ms = 100;
+    let unchanged = store
+        .upsert_push_registration(resumed.clone(), vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(unchanged.registration.updated_at_ms, 10);
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["bb".to_owned()],
+        "foreground registration must retain partial delivery progress"
+    );
+    assert!(
+        store
+            .complete_push_registration_share("bb", "first", 10)
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 10, 101)
+            .unwrap()
+    );
+    let unchanged = store
+        .upsert_push_registration(resumed, vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(unchanged.registration.last_shared_at_ms, Some(101));
+    assert!(
+        store
+            .pending_push_registration_shares("first", 10)
+            .unwrap()
+            .is_empty()
+    );
+
     let mut refreshed = registration;
+    refreshed.relay_hint = Some("wss://relay.example".to_owned());
     refreshed.updated_at_ms = 10;
     let stored = store
         .upsert_push_registration(refreshed, vec![1, 2, 3])
@@ -3885,4 +3918,205 @@ fn seen_event_prune_query_work() {
             measurements[1]
         );
     }
+}
+
+#[test]
+fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
+    use cgka_traits::storage::GroupStorage;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".into(),
+        seen_events: vec![],
+        last_transport_timestamp: None,
+        groups: vec![group("aa", "forgotten"), group("bb", "kept")],
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    insert_protocol_group_marker(&store, &[0xbb]);
+    store
+        .record_app_event(&app_event("msg-aa", "aa", 10))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO pending_push_registration_removals (
+            group_id_hex, account_label, account_id_hex, platform, token_fingerprint,
+            server_pubkey_hex, registration_created_at_ms, registration_updated_at_ms, queued_at_ms
+         ) VALUES ('aa', 'alice', 'account', 1, 'token', 'server', 0, 0, 0);",
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_forget BEFORE DELETE ON cgka_groups
+         WHEN OLD.id = x'aa' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    let id = cgka_traits::GroupId::new(vec![0xaa]);
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .is_err()
+    );
+    assert!(!store.is_group_forgotten(&id).unwrap());
+    assert!(store.list_groups().unwrap().contains(&id));
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM app_events WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_forget")
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(
+        store
+            .pending_push_registration_removals()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.list_groups().unwrap(),
+        vec![cgka_traits::GroupId::new(vec![0xbb])]
+    );
+    assert!(store.local_group_deletion_frontier("aa").unwrap().is_none());
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_groups WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "a stale app snapshot cannot restore the chat"
+    );
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
+                []
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_groups WHERE group_id_hex = 'bb'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
+    use cgka_traits::storage::{GroupStorage, StorageProvider};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let id = cgka_traits::GroupId::new(vec![0xaa]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![group("aa", "old membership")],
+                ..Default::default()
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .forget_group_local(&id, cgka_traits::Timestamp(200))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
+    assert!(
+        !store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    let failed: Result<(), StorageError> = store.with_transaction(|storage| {
+        storage.complete_group_local_reset(&id)?;
+        insert_protocol_group_marker(storage, id.as_slice());
+        Err(StorageError::Backend("injected join failure".into()))
+    });
+    assert!(failed.is_err());
+    assert!(
+        !store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(store.list_groups().unwrap().is_empty());
+    store
+        .with_transaction::<_, StorageError, _>(|storage| {
+            storage.complete_group_local_reset(&id)?;
+            insert_protocol_group_marker(storage, id.as_slice());
+            Ok(())
+        })
+        .unwrap();
+    assert!(!store.is_group_forgotten(&id).unwrap());
+    assert!(
+        store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
+    assert!(store.list_groups().unwrap().contains(&id));
+    // A second reset cannot move the boundary backward if the local clock regresses.
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(90))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
 }

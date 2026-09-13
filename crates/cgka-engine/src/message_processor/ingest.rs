@@ -357,6 +357,15 @@ impl<S: StorageProvider> Engine<S> {
         let reported = |outcome| Ok(GroupMessageIngestOutcome::Outcome(outcome));
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
+        // Before a fresh Welcome, no group message may restart abandoned work.
+        // After joining, use MLS validation and its join-epoch bound: outer
+        // transport timestamps cannot safely reject traffic from skewed clocks.
+        if self.storage.is_group_forgotten(&group_id)? {
+            return reported(IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup,
+            });
+        }
+
         // Authenticated terminal evidence is permanent. Drop late traffic
         // before the missing-OpenMLS fallback can retain it as retryable
         // unknown-group input.

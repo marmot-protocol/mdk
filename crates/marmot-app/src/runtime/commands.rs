@@ -890,6 +890,42 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn forget_group_local(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if !account.is_active_local_signing() {
+            use cgka_traits::storage::GroupStorage;
+            let changed = self
+                .app
+                .account_storage(&account.label)?
+                .forget_group_local(group_id, cgka_traits::Timestamp(crate::unix_now_seconds()))?;
+            if changed {
+                publish_app_runtime_group_state_updated(
+                    &self.events,
+                    &account.account_id_hex,
+                    &account.label,
+                    group_id,
+                );
+            }
+            return Ok(changed);
+        }
+
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ForgetGroupLocal {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn delete_group_local(
         &self,
         account_ref: &str,

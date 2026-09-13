@@ -9,6 +9,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_forget_group_local` deletes local chat and MLS state without publishing a leave,
+  stops group work, and permits a fresh authenticated invitation to rejoin. Rebuild with
+  matching headers/libraries; hosts must clear their own media caches and close group views.
 - `marmot_default_profile_pseudonym` and `marmot_random_profile_pseudonym`
   for the shared cosmetic display-name helpers. Free the owned UTF-8
   strings with `marmot_string_free`. These functions add no status values or
@@ -21,6 +24,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Account storage advances through migrations 70–71 for local group reset boundaries.
+  Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in
+  [the CLI changelog](../cli/CHANGELOG.md#unreleased).
 - `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
   references and discards relay hints. Existing hex, `npub`, and
   `marmot://profile/` forms keep their established OK-plus-NULL contract.

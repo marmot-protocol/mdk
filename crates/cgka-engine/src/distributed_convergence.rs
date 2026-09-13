@@ -2520,6 +2520,7 @@ pub(crate) mod tests {
                 group_id: None,
                 sender: None,
                 content: PeeledContent::Welcome {
+                    created_at: None,
                     bytes: msg.payload.clone(),
                 },
                 origin: msg.clone(),

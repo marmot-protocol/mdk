@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-10
+updated: 2026-09-13
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,38 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
+it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined
+conversation again. Changes to those registration inputs still queue the new revision for all joined groups.
+Account workers process scheduled convergence one group per turn, retaining the other groups' deadlines and
+alternating queued commands with due recovery passes so neither queue starves the other. Each pass retries group
+subscriptions only when a refresh is pending; an unchanged group set needs no account-wide refresh. A running
+engine or relay operation still completes before a queued command executes; this is not a wall-clock send latency
+guarantee.
+
+Accepted disband requests keep a worker wakeup even without other group work, and hydration restores that wakeup
+after restart. The selected inbound convergence replay retains authenticated disband evidence before removing the
+former roster. Terminal event projection uses the retained display components and authoritative tombstone instead
+of querying deleted MLS state. Failed requests and unrecoverable groups do not acquire an idle retry loop from this scheduling.
+
+`forget_group_local` is a separate account-device operation from leaving, disbanding, and deleting chat history.
+It transactionally deletes local app and MLS state with a durable reset cutoff, then removes runtime scheduling and
+subscriptions. It needs no peer acknowledgement and works on stalled or pending-disband groups. While awaiting a
+new Welcome it cannot resume group work. A fully validated Welcome for the same MLS group id may join with clean
+state only when its sender-authenticated inner creation time is strictly newer than the cutoff and its author
+matches the MLS inviter. Missing timestamps and equal-second/older invitations are rejected, even when received
+later or rewrapped. Normal invitation confirmation policy still applies. The cutoff survives the new join and
+restart for Welcome admission. Ordinary post-join messages pass normal MLS validation and the new join-epoch floor,
+without a wall-clock drop filter that could mute peers with skewed clocks. Unreadable transport traffic follows the
+normal bounded deferred-peel policy; previous chat history and rewind anchors remain erased. Repeated forgetting while awaiting
+a Welcome preserves the cutoff; forgetting after a successful join establishes a new one. Clock skew can cause a
+legitimate invitation to fall before the boundary; generate another invitation after the sender clock crosses it.
+Timestamp filtering is replay policy, not proof against an authorized inviter deliberately redating old content.
+Legacy permanent markers migrate to a cutoff at migration time. Ordinary `delete_group_local` still retains
+membership and permits fresh messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
+must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
+network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must

@@ -806,6 +806,26 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Reset a group on this account-device, without sending an
+    /// MLS leave or disband. Erases local history and protocol state, cancels
+    /// group work, and rejects old welcomes. A valid Welcome whose authenticated
+    /// inner creation time is strictly newer than the reset's Unix-second
+    /// cutoff can join the same group with fresh state. Equal-second invitations
+    /// are rejected; receipt time and outer wrapper time do not establish freshness. Hosts
+    /// should close the group's UI subscriptions and clear their media caches.
+    /// Returns true when resetting, false when already awaiting a fresh Welcome.
+    pub async fn forget_group_local(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .forget_group_local(&account_ref, &group_id)
+            .await?)
+    }
+
     /// Delete this group's local app data without performing an MLS leave. The
     /// caller should cancel any active UI subscriptions for the group before
     /// invoking the wipe. The runtime removes the active transport route, then

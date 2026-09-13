@@ -2031,6 +2031,19 @@ impl MarmotAppRuntime {
         self.accounts.leave_group(account_ref, group_id).await
     }
 
+    pub async fn forget_group_local(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .forget_group_local(account_ref, group_id)
+            .await
+    }
+
+    /// Delete local chat data while retaining MLS membership and state.
+    /// Fresh group traffic may recreate the chat; use `forget_group_local`
+    /// to discard an unusable MLS copy and wait for a fresh invitation.
     pub async fn delete_group_local(
         &self,
         account_ref: &str,
