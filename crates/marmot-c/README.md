@@ -64,9 +64,10 @@ Older clients cannot render it.
 hex/`npub`/`marmot://profile/` forms) and discard relay hints.
 Duplicate type-0 TLV entries keep the first key. After wrapper
 normalization, encoded tokens longer than 1023 UTF-8 bytes are
-rejected; a valid 1023-byte token still decodes when wrapped. The
-legacy NIP-21 parser may still accept a colon-suffixed
-`nostr:<npub>:` form before that fallback. `marmot_default_profile_pseudonym`
+rejected; a valid 1023-byte token still decodes when wrapped. The app
+helper's legacy NIP-21 parser may still accept a colon-suffixed
+`nostr:<npub>:` form, but C/UniFFI wrapper normalization rejects it.
+`marmot_default_profile_pseudonym`
 hashes the supplied canonical hex account-id text; decode a scanned
 reference first. `marmot_random_profile_pseudonym` is a cosmetic
 random roll from the same wordlists. Free those strings with

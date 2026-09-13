@@ -1,6 +1,6 @@
 {
   "schema": "mdk-encrypted-media-imeta-fixture/v1",
-  "description": "Golden and rejection imeta fixtures for encrypted-media-v1. Shared by marmot-app, marmot-uniffi, and wn-cli tests so every layer agrees on validation verdicts and exact wire round-trips. `expected.dim`/`expected.thumbhash` distinguish absent (null) from present-empty (\"\").",
+  "description": "Golden and rejection imeta fixtures for encrypted-media-v1. Shared by marmot-app, marmot-uniffi, and wn-cli tests so every layer agrees on validation verdicts and exact wire round-trips. `expected.dim`/`expected.thumbhash` distinguish absent (null) from present-empty (\"\"). Rejection cases carry `rejection_kind`, the stable category every layer must report for that tag.",
   "media_version": "encrypted-media-v1",
   "cases": [
     {
@@ -104,6 +104,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "nonce",
+      "rejection_kind": "missing_field",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -119,6 +120,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "exactly one m",
+      "rejection_kind": "duplicate_field",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -136,6 +138,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "thumbhash",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -153,6 +156,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "locator",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -169,6 +173,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "version",
+      "rejection_kind": "unsupported_format",
       "tag": [
         "imeta",
         "v encrypted-media-v3",
@@ -185,6 +190,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "file name",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v1",
@@ -201,6 +207,7 @@
       "source_epoch": 7,
       "valid": false,
       "error_contains": "nonce",
+      "rejection_kind": "malformed_field",
       "tag": [
         "imeta",
         "v encrypted-media-v1",

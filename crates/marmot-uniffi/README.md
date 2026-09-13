@@ -30,9 +30,11 @@ Duplicate type-0 TLV entries keep the first key. After FFI wrapper
 normalization, the nprofile fallback rejects encoded tokens longer than
 1023 UTF-8 bytes (the locked Bech32/Bech32m ceiling); a valid 1023-byte
 token still decodes when wrapped in `nostr:` or `marmot://profile/...`.
-The app helper does not strip those wrappers itself, and the legacy
-NIP-21 parser may still accept a colon-suffixed `nostr:<npub>:` form
-before the fallback runs. Decode a scanned reference first, then pass
+The app helper strips one lowercase `nostr:` prefix itself; profile-link
+and whitespace normalization belong to FFI. The app helper's legacy NIP-21
+parser may still accept a colon-suffixed `nostr:<npub>:` form before the
+fallback runs; FFI normalization rejects that form. Decode a scanned reference
+first, then pass
 the canonical lowercase hex account id to `defaultProfilePseudonym` so
 the shared text-hash seed is preserved. `randomProfilePseudonym`
 replaces client-owned random-roll wordlists; it is cosmetic, may

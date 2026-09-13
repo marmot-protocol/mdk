@@ -134,6 +134,21 @@ enum MarmotStatus
   MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67,
   MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68,
   MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY = 69,
+  /**
+   * An `imeta` reference failed the shared strict parser (mdk#1787).
+   * The detail string carries the stable rejection kind label and the
+   * presentation text.
+   */
+  MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED = 70,
+  /**
+   * The reference is valid but no locator may be fetched under the
+   * current policy; nothing was dialed.
+   */
+  MARMOT_STATUS_MEDIA_UNFETCHABLE = 71,
+  /**
+   * Fetch, integrity, or decryption failed after a locator was selected.
+   */
+  MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED = 72,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -548,6 +563,34 @@ typedef enum MarmotRetentionSweepStatus {
   MARMOT_RETENTION_SWEEP_STATUS_DEFERRED_SCAN_EXHAUSTED,
   MARMOT_RETENTION_SWEEP_STATUS_FAILED,
 } MarmotRetentionSweepStatus;
+
+/**
+ * Stable category of a rejected encrypted-media attachment (mdk#1787).
+ * Branch on this rather than on `detail`; the set only grows.
+ */
+typedef enum MarmotMediaAttachmentRejectionKind {
+  /**
+   * Not a decodable encrypted-media `imeta` tag.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_INVALID_STRUCTURE,
+  /**
+   * The `v` field is absent or names a format this build does not
+   * implement (legacy MIP-era and future shapes).
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_UNSUPPORTED_FORMAT,
+  /**
+   * A required field is absent or empty.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MISSING_FIELD,
+  /**
+   * A single-occurrence field appears more than once.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_DUPLICATE_FIELD,
+  /**
+   * A present field has an invalid value.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MALFORMED_FIELD,
+} MarmotMediaAttachmentRejectionKind;
 
 /**
  * Outcome class of a background collection.
@@ -2317,6 +2360,10 @@ typedef struct MarmotMediaAttachmentReference {
  */
 typedef struct MarmotMediaRecord {
   char *message_id_hex;
+  /**
+   * Position among the source message's `imeta` tags, rejected
+   * siblings included, matching the timeline row's outcome index.
+   */
   uint32_t attachment_index;
   char *direction;
   char *group_id_hex;
@@ -2945,6 +2992,48 @@ typedef struct MarmotTimelineMessageQuery {
 } MarmotTimelineMessageQuery;
 
 /**
+ * Why one attachment was rejected. `detail` is privacy-safe
+ * presentation text from the shared parser; it never echoes tag
+ * content.
+ */
+typedef struct MarmotMediaAttachmentRejection {
+  enum MarmotMediaAttachmentRejectionKind kind;
+  char *detail;
+} MarmotMediaAttachmentRejection;
+
+/**
+ * One `imeta` attachment of a message, in tag order. `attachment_index`
+ * is the position among the message's `imeta` tags, rejected siblings
+ * included, so a host can render media and placeholders in order and
+ * correlate a timeline row with `MarmotMediaRecord` entries for the same
+ * message. Pass an `Accepted` reference to `marmot_download_media`;
+ * render `Rejected` as an unsupported/invalid attachment placeholder
+ * using `rejection.kind`.
+ */
+typedef enum MarmotMediaAttachmentOutcome_Tag {
+  MARMOT_MEDIA_ATTACHMENT_OUTCOME_ACCEPTED,
+  MARMOT_MEDIA_ATTACHMENT_OUTCOME_REJECTED,
+} MarmotMediaAttachmentOutcome_Tag;
+
+typedef struct MarmotMediaAttachmentOutcome_Accepted_Body {
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentReference reference;
+} MarmotMediaAttachmentOutcome_Accepted_Body;
+
+typedef struct MarmotMediaAttachmentOutcome_Rejected_Body {
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentRejection rejection;
+} MarmotMediaAttachmentOutcome_Rejected_Body;
+
+typedef struct MarmotMediaAttachmentOutcome {
+  MarmotMediaAttachmentOutcome_Tag tag;
+  union {
+    MarmotMediaAttachmentOutcome_Accepted_Body ACCEPTED;
+    MarmotMediaAttachmentOutcome_Rejected_Body REJECTED;
+  };
+} MarmotMediaAttachmentOutcome;
+
+/**
  * Preview of the message a timeline row replies to.
  */
 typedef struct MarmotTimelineReplyPreview {
@@ -2955,9 +3044,10 @@ typedef struct MarmotTimelineReplyPreview {
   uint64_t kind;
   char *media_json;
   /**
-   * Fully-resolved media references for the previewed message.
+   * Ordered per-attachment outcomes for the previewed message:
+   * accepted references plus typed rejections at their positions.
    */
-  struct MarmotMediaAttachmentReference *media;
+  struct MarmotMediaAttachmentOutcome *media;
   uintptr_t media_len;
   char *agent_text_stream_json;
   bool deleted;
@@ -3090,10 +3180,12 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotTimelineReplyPreview *reply_preview;
   char *media_json;
   /**
-   * Fully-resolved media references for this message; empty when
-   * it has no media.
+   * Ordered per-attachment outcomes for this message; empty when
+   * it has no media. A malformed or unsupported `imeta` attachment
+   * is a `Rejected` entry at its position with a typed reason; the
+   * text and valid sibling attachments are unaffected.
    */
-  struct MarmotMediaAttachmentReference *media;
+  struct MarmotMediaAttachmentOutcome *media;
   uintptr_t media_len;
   char *agent_text_stream_json;
   /**

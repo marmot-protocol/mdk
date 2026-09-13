@@ -100,7 +100,8 @@ const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
 /// wrapped in `nostr:` therefore still decodes even though the complete
 /// wrapper is longer.
 ///
-/// This helper does not trim whitespace, allocate, or normalize case. The
+/// The fallback borrows the token without trimming whitespace or normalizing
+/// case; successful decoding allocates the returned hex string. The
 /// legacy NIP-21 parser may still accept a colon-suffixed `nostr:<npub>:`
 /// form before the fallback runs. Failures map to
 /// [`AppError::InvalidPublicKey`] without echoing the input. The local

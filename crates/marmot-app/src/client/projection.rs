@@ -1178,6 +1178,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:invalid_agent_text_stream_policy"
         }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
+        AppError::MediaAttachmentRejected(_) => "read_marker_failed:media_attachment_rejected",
+        AppError::MediaUnfetchable(_) => "read_marker_failed:media_unfetchable",
+        AppError::MediaDownloadFailed(_) => "read_marker_failed:media_download_failed",
         AppError::BlobStore(_) => "read_marker_failed:blob_store",
         AppError::MediaUploadTimedOut => "read_marker_failed:media_upload_timed_out",
         AppError::UnsafeMediaFetch(_) => "read_marker_failed:unsafe_media_fetch",
