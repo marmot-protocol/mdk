@@ -7,6 +7,18 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot_forget_group_local` deletes local chat and MLS state without publishing a leave,
+  stops group work, and permits a fresh authenticated invitation to rejoin. Rebuild with
+  matching headers/libraries; hosts must clear their own media caches and close group views.
+
+### Changed
+
+- Account storage advances through migrations 70–71 for local group reset boundaries.
+  Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in
+  [the CLI changelog](../cli/CHANGELOG.md#unreleased).
+
 ## [0.9.21] - 2026-09-10
 
 This cohort also exposes host-driven agent stream publishing and the v4 audit

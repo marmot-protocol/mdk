@@ -2041,8 +2041,9 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Durable recovery snapshot; refresh on GroupStateUpdated. Undecryptable
-    /// evidence is advisory and never grants permission to replace MLS state.
+    /// Delete local chat data while retaining MLS membership and state.
+    /// Fresh group traffic may recreate the chat; use `forget_group_local`
+    /// to discard an unusable MLS copy and wait for a fresh invitation.
     pub async fn delete_group_local(
         &self,
         account_ref: &str,

@@ -304,12 +304,10 @@ pub struct Engine<S: StorageProvider> {
     /// commit-apply site therefore calls [`Self::reindex_transport_group_id`],
     /// which additively inserts the new id while leaving the prior id in place
     /// for the rotation overlap window (this map is intentionally many-to-one).
-    /// The engine has no group-deletion path today (`StorageProvider::delete_group`
-    /// is never called from engine code; a left group's record is retained), so an
-    /// entry cannot outlive its group — and even a hypothetical stale entry is
-    /// self-correcting, since the resolved `GroupId` is loaded by the caller and a
-    /// missing group is dropped as unknown. If engine-side group deletion is ever
-    /// added, that site MUST remove the corresponding index entries.
+    /// Leaving retains the group record. Local forgetting deletes it and removes
+    /// every corresponding index entry in `forget_group_local`. A stale entry
+    /// is also self-correcting: callers load the resolved group and drop missing
+    /// groups as unknown rather than retaining their traffic.
     pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
 
     /// #636: cached hex-encoded snapshot of `seen_message_ids` for the

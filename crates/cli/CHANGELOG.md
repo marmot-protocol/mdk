@@ -9,6 +9,28 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Runtime `forget_group_local` and Swift/Kotlin `forgetGroupLocal` for recovery from an
+  unusable local group copy: erase chat history and MLS state, cancel group work, and
+  wait for a fresh authenticated Welcome. Invitations must be created strictly after
+  the reset's Unix-second cutoff; equal-second invitations are rejected. Hosts retain
+  responsibility for their own media caches and active group views.
+
+### Changed
+
+- Account storage advances through migrations 70–71. Back up before upgrading;
+  downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
+  Keep native libraries and generated bindings on matching versions.
+
+### Fixed
+
+- Foreground recovery services commands between group passes without starving due
+  convergence under a busy command queue; unchanged group subscriptions stay in place.
+- Unchanged push registrations retain their gossip progress.
+- Accepted disbands remain scheduled across restart and project completion after MLS
+  state deletion, including completion through inbound convergence.
+
 ## [0.9.21] - 2026-09-10
 
 ### Release notes

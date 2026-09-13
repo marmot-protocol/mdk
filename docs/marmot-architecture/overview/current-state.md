@@ -23,8 +23,10 @@ Foreground push registration is idempotent when the provider token, platform, se
 it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined
 conversation again. Changes to those registration inputs still queue the new revision for all joined groups.
 Account workers process scheduled convergence one group per turn, retaining the other groups' deadlines and
-checking queued commands before the next turn. A running engine or relay operation still completes before a queued
-command executes; this is not a wall-clock send latency guarantee.
+alternating queued commands with due recovery passes so neither queue starves the other. Each pass retries group
+subscriptions only when a refresh is pending; an unchanged group set needs no account-wide refresh. A running
+engine or relay operation still completes before a queued command executes; this is not a wall-clock send latency
+guarantee.
 
 Accepted disband requests keep a worker wakeup even without other group work, and hydration restores that wakeup
 after restart. The selected inbound convergence replay retains authenticated disband evidence before removing the
@@ -38,8 +40,9 @@ new Welcome it cannot resume group work. A fully validated Welcome for the same 
 state only when its sender-authenticated inner creation time is strictly newer than the cutoff and its author
 matches the MLS inviter. Missing timestamps and equal-second/older invitations are rejected, even when received
 later or rewrapped. Normal invitation confirmation policy still applies. The cutoff survives the new join and
-restart: older transport traffic is discarded before it can schedule deferred recovery. The new Welcome establishes
-the MLS join-epoch floor; previous chat history and rewind anchors remain erased. Repeated forgetting while awaiting
+restart for Welcome admission. Ordinary post-join messages pass normal MLS validation and the new join-epoch floor,
+without a wall-clock drop filter that could mute peers with skewed clocks. Unreadable transport traffic follows the
+normal bounded deferred-peel policy; previous chat history and rewind anchors remain erased. Repeated forgetting while awaiting
 a Welcome preserves the cutoff; forgetting after a successful join establishes a new one. Clock skew can cause a
 legitimate invitation to fall before the boundary; generate another invitation after the sender clock crosses it.
 Timestamp filtering is replay policy, not proof against an authorized inviter deliberately redating old content.
