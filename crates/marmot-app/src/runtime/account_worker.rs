@@ -5358,15 +5358,35 @@ mod tests {
         timeout(Duration::from_secs(30), next_pass.wait())
             .await
             .expect("recovery progresses despite queued commands");
-        let completed = responses
-            .iter_mut()
-            .map(|response| usize::from(response.try_recv().is_ok()))
-            .sum::<usize>();
+        let queued_count = responses.len();
+        let mut remaining = Vec::new();
+        for mut response in responses {
+            match response.try_recv() {
+                Ok(result) => {
+                    result.expect("a completed queued command must succeed");
+                }
+                Err(oneshot::error::TryRecvError::Empty) => remaining.push(response),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    panic!("the worker dropped a queued command without replying");
+                }
+            }
+        }
+        let completed = queued_count - remaining.len();
         assert!(
             completed <= 1,
             "a due group must run after at most one queued command, observed {completed}"
         );
         next_pass.wait().await;
+        timeout(Duration::from_secs(5), async {
+            for response in remaining {
+                response
+                    .await
+                    .expect("the worker must reply to every queued command")
+                    .expect("every queued command must succeed");
+            }
+        })
+        .await
+        .expect("recovery must not starve the queued commands");
         runtime.drain_in_flight_work().await.unwrap();
         runtime.shutdown_and_close().await.unwrap();
     }
