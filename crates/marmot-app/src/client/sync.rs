@@ -549,6 +549,9 @@ impl AppClient {
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<ConvergenceScheduleState, AppError> {
+        if self.is_group_forgotten(group_id)? {
+            return Ok(ConvergenceScheduleState::Idle);
+        }
         let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
         match convergence_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
@@ -4016,6 +4019,9 @@ impl AppClient {
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<SyncSummary, AppError> {
+        if self.is_group_forgotten(group_id)? {
+            return Ok(SyncSummary::default());
+        }
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;

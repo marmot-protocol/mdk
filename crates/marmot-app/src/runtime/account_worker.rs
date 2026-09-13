@@ -212,6 +212,11 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    ForgetGroupLocal {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+
     DeleteGroupLocal {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -442,6 +447,7 @@ impl AccountWorkerCommand {
                 | Self::ClearPushRegistration { .. }
                 | Self::SetNativePushEnabled { .. }
                 | Self::RemovePushRegistration { .. }
+                | Self::ForgetGroupLocal { .. }
         )
     }
 }
@@ -3518,6 +3524,19 @@ fn account_worker_command_future<'a>(
                 account_label,
                 &group_id,
             );
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::ForgetGroupLocal { group_id, respond } => Box::pin(async move {
+            let result = client.forget_group_local(&group_id).await;
+            if matches!(result, Ok(true)) {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

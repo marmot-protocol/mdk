@@ -623,6 +623,11 @@ impl AccountDeviceSession {
         Ok(self.engine.put_periodic_maintenance_policy(policy)?)
     }
 
+    /// Abandon a group locally without sending a leave or disband.
+    pub fn forget_group_local(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.forget_group_local(group_id)?)
+    }
+
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
         Ok(self.engine.group_record(group_id)?)
     }

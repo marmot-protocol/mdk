@@ -2031,6 +2031,18 @@ impl MarmotAppRuntime {
         self.accounts.leave_group(account_ref, group_id).await
     }
 
+    pub async fn forget_group_local(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .forget_group_local(account_ref, group_id)
+            .await
+    }
+
+    /// Durable recovery snapshot; refresh on GroupStateUpdated. Undecryptable
+    /// evidence is advisory and never grants permission to replace MLS state.
     pub async fn delete_group_local(
         &self,
         account_ref: &str,

@@ -461,6 +461,11 @@ where
         &mut self.session
     }
 
+    /// Abandon a group locally without sending a leave or disband.
+    pub fn forget_group_local(&mut self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.forget_group_local(group_id)?)
+    }
+
     pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
         Ok(self.session.group_record(group_id)?)
     }

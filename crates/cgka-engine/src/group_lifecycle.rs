@@ -1154,7 +1154,9 @@ impl<S: StorageProvider> Engine<S> {
             // GroupInfo is still unverified here. Every tentative replacement
             // write is rolled back unless OpenMLS and Marmot checks succeed
             // and the local state permits this join.
-            if storage.disband_tombstone(&group_id)?.is_some() {
+            if storage.disband_tombstone(&group_id)?.is_some()
+                || storage.is_group_forgotten(&group_id)?
+            {
                 return Err(EngineError::InvalidWelcome);
             }
 

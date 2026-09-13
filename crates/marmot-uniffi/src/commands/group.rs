@@ -800,6 +800,23 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Permanently forget a group on this account-device, without sending an
+    /// MLS leave or disband. Erases local history and protocol state, cancels
+    /// group work, and rejects future welcomes for the same group id. Hosts
+    /// should close the group's UI subscriptions and clear their media caches.
+    /// Returns true on the first forget, false when already forgotten.
+    pub async fn forget_group_local(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .forget_group_local(&account_ref, &group_id)
+            .await?)
+    }
+
     /// Delete this group's local app data without performing an MLS leave. The
     /// caller should cancel any active UI subscriptions for the group before
     /// invoking the wipe. The runtime removes the active transport route, then

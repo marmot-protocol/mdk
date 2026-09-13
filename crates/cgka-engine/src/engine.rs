@@ -2874,6 +2874,92 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// App surfaces use this for projections such as group profile components
     /// without reaching into OpenMLS internals.
+    /// Permanently abandon this group on this account-device, without network
+    /// traffic. Storage commits the deletion before any in-memory state changes.
+    pub fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+        let pending = self.epoch_manager.pending_refs_for_group(group_id);
+        let routes = self
+            .transport_group_id_index
+            .iter()
+            .filter(|(_, mapped)| *mapped == group_id)
+            .map(|(route, _)| route.clone())
+            .collect::<HashSet<_>>();
+        let changed = self.storage.forget_group_local(group_id)?;
+        self.epoch_manager.forget_group(group_id);
+        self.mls_group_cache.forget_group(group_id);
+        self.transport_group_id_index
+            .retain(|_, group| group != group_id);
+        self.route_backfill_pending.remove(group_id);
+        self.pending_convergence_groups.remove(group_id);
+        self.unhydrated_groups.remove(group_id);
+        self.quarantined_groups.remove(group_id);
+        self.leaving_groups.remove(group_id);
+        self.leave_requests.remove(group_id);
+        self.valid_proposal_groups.remove(group_id);
+        self.drop_self_remove_auto_commit_schedules_for_group(group_id);
+        self.invalidate_deferred_peel_candidate_cache(group_id);
+        self.deferred_peel.remove(group_id);
+        // Recompute the account byte budget lazily from the remaining durable rows.
+        self.deferred_peel_account = Default::default();
+        self.engine_metrics.forget_group(group_id);
+        self.queued_intent_by_message
+            .retain(|_, (group, _)| group != group_id);
+        self.queued_intent_by_pending
+            .retain(|_, (group, _)| group != group_id);
+        self.pending_origin_commits
+            .retain(|reference, _| !pending.contains(reference));
+        self.pending_state_changes
+            .retain(|reference, _| !pending.contains(reference));
+        self.auto_publish_buf
+            .retain(|work| !pending.contains(&work.pending));
+        self.auto_proposal_buf.retain(|message| {
+            !matches!(&message.envelope,
+            cgka_traits::TransportEnvelope::GroupMessage { transport_group_id }
+                if routes.contains(transport_group_id) || transport_group_id == group_id.as_slice())
+        });
+        self.events_buf.retain(|event| match event {
+            GroupEvent::GroupCreated { group_id: group }
+            | GroupEvent::GroupJoined {
+                group_id: group, ..
+            }
+            | GroupEvent::TransportObjectResourceRefused {
+                group_id: group, ..
+            }
+            | GroupEvent::MessageReceived {
+                group_id: group, ..
+            }
+            | GroupEvent::AppMessageInvalidated {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupStateChanged {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupHydrationQuarantined {
+                group_id: group, ..
+            }
+            | GroupEvent::EpochChanged {
+                group_id: group, ..
+            }
+            | GroupEvent::CommitRolledBack {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupStateInvalidated {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupStateRevalidated {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupUnrecoverable { group_id: group }
+            | GroupEvent::PendingCommitRecovered {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupHydrationRecovered {
+                group_id: group, ..
+            } => group != group_id,
+        });
+        Ok(changed)
+    }
+
     pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
         self.ensure_group_live(group_id)?;
         Ok(self.storage.get_group(group_id)?)

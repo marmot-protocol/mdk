@@ -4969,6 +4969,12 @@ async fn inbound_disband_candidate_blocks_local_delete_body() {
         app.delete_group_local_data("alice", &group_id_hex),
         Err(AppError::GroupDisbanding(_))
     ));
+    assert!(
+        client.forget_group_local(&group_id).await.unwrap(),
+        "local abandonment does not wait for a pending disband"
+    );
+    assert!(client.runtime.group_record(&group_id).is_err());
+    assert!(app.group("alice", &group_id_hex).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -21119,4 +21125,190 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
             1
         );
     });
+}
+
+#[tokio::test]
+async fn forget_group_local_stops_work_and_survives_reopen() {
+    use crate::client::epoch_stall::{PendingEpochBackfill, PendingEpochBackfillGroup};
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let forgotten = client.create_group("forgotten", &[]).await.unwrap();
+    let kept = client.create_group("kept", &[]).await.unwrap();
+    let group_hex = hex::encode(forgotten.as_slice());
+    let publishes = relay.published_event_ids().len();
+    client.pending_convergence_groups.insert(forgotten.clone());
+    let mut pending = PendingEpochBackfill::new();
+    pending.groups.insert(
+        forgotten.clone(),
+        PendingEpochBackfillGroup { stalled_epoch: 0 },
+    );
+    client.pending_epoch_backfill = Some(pending);
+    assert!(client.forget_group_local(&forgotten).await.unwrap());
+    assert_eq!(
+        relay.published_event_ids().len(),
+        publishes,
+        "forget must publish nothing"
+    );
+    assert!(!client.has_pending_epoch_backfill());
+    assert_eq!(installed_group_routes(&client, &forgotten), 0);
+    assert!(installed_group_routes(&client, &kept) > 0);
+    assert!(client.runtime.group_record(&forgotten).is_err());
+    assert!(app.group("alice", &group_hex).unwrap().is_none());
+    assert!(matches!(
+        client.convergence_schedule_state(&forgotten).unwrap(),
+        crate::ConvergenceScheduleState::Idle
+    ));
+    client
+        .advance_convergence_after_runtime_sync(&forgotten)
+        .await
+        .unwrap();
+    assert!(!client.forget_group_local(&forgotten).await.unwrap());
+    drop(client);
+    drop(app);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut reopened = app.client("alice").await.unwrap();
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .is_group_forgotten(&forgotten)
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .runtime
+            .live_group_ids()
+            .unwrap()
+            .contains(&forgotten)
+    );
+    assert_eq!(installed_group_routes(&reopened, &forgotten), 0);
+    assert!(!reopened.has_pending_epoch_backfill());
+    reopened.sync().await.unwrap();
+    assert!(app.group("alice", &group_hex).unwrap().is_none());
+    assert!(reopened.runtime.group_record(&kept).is_ok());
+}
+
+#[tokio::test]
+async fn forget_group_local_rejects_a_welcome_not_previously_consumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice
+        .create_group("abandoned", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let welcome = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| event.kind == transport_nostr_peeler::KIND_NIP59_GIFT_WRAP)
+        .expect("create publishes Bob's welcome")
+        .to_transport_message()
+        .unwrap();
+    assert!(bob_client.forget_group_local(&group).await.unwrap());
+    let delivery = cgka_traits::TransportDelivery {
+        account_id: MemberId::new(hex::decode(&bob.account_id_hex).unwrap()),
+        group_id_hint: None,
+        message: welcome,
+        received_at: cgka_traits::transport::Timestamp(unix_now_seconds()),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".into()),
+            plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    let effects = bob_client
+        .runtime
+        .ingest_delivery(delivery.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects.outcome,
+        cgka_traits::IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::InvalidEncoding
+        }
+    ));
+    assert!(effects.effects.events.is_empty());
+    assert!(
+        alice.runtime.group_record(&group).is_ok(),
+        "the other device is unaffected"
+    );
+    assert!(bob_client.runtime.group_record(&group).is_err());
+    drop(bob_client);
+    let mut reopened = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    let effects = reopened.runtime.ingest_delivery(delivery).await.unwrap();
+    assert!(matches!(
+        effects.outcome,
+        cgka_traits::IngestOutcome::Ignored { .. }
+    ));
+    assert!(reopened.runtime.group_record(&group).is_err());
+    assert!(
+        app.group("bob", &hex::encode(group.as_slice()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn runtime_forget_group_local_works_without_leaving() {
+    run_composed_app_runtime_test("forget-group-local", runtime_forget_group_local_body);
+}
+
+async fn runtime_forget_group_local_body() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let group = runtime
+        .create_group("alice", "abandoned", &[], None)
+        .await
+        .unwrap();
+    assert!(runtime.forget_group_local("alice", &group).await.unwrap());
+    assert!(
+        app.group("alice", &hex::encode(group.as_slice()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .is_group_forgotten(&group)
+            .unwrap()
+    );
+    assert!(!runtime.forget_group_local("alice", &group).await.unwrap());
+    runtime.shutdown().await;
 }

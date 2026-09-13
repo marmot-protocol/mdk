@@ -127,6 +127,21 @@ pub trait GroupStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()>;
     fn get_group(&self, id: &GroupId) -> StorageResult<Group>;
     fn delete_group(&self, id: &GroupId) -> StorageResult<()>;
+
+    /// Atomically erase a group's local state and retain a permanent local
+    /// rejection marker. This is not an MLS leave or a protocol tombstone.
+    /// Unsupported backends must fail without deleting anything.
+    fn forget_group_local(&self, _id: &GroupId) -> StorageResult<bool> {
+        Err(StorageError::Backend(
+            "local group forgetting is unsupported".into(),
+        ))
+    }
+
+    /// Whether this account-device explicitly abandoned this group id.
+    fn is_group_forgotten(&self, _id: &GroupId) -> StorageResult<bool> {
+        Ok(false)
+    }
+
     fn list_groups(&self) -> StorageResult<Vec<GroupId>>;
 
     /// Every stored group record in one pass. The engine's session-open seed

@@ -3919,3 +3919,114 @@ fn seen_event_prune_query_work() {
         );
     }
 }
+
+#[test]
+fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
+    use cgka_traits::storage::GroupStorage;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".into(),
+        seen_events: vec![],
+        last_transport_timestamp: None,
+        groups: vec![group("aa", "forgotten"), group("bb", "kept")],
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    insert_protocol_group_marker(&store, &[0xbb]);
+    store
+        .record_app_event(&app_event("msg-aa", "aa", 10))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO pending_push_registration_removals (
+            group_id_hex, account_label, account_id_hex, platform, token_fingerprint,
+            server_pubkey_hex, registration_created_at_ms, registration_updated_at_ms, queued_at_ms
+         ) VALUES ('aa', 'alice', 'account', 1, 'token', 'server', 0, 0, 0);",
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_forget BEFORE DELETE ON cgka_groups
+         WHEN OLD.id = x'aa' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    let id = cgka_traits::GroupId::new(vec![0xaa]);
+    assert!(store.forget_group_local(&id).is_err());
+    assert!(!store.is_group_forgotten(&id).unwrap());
+    assert!(store.list_groups().unwrap().contains(&id));
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM app_events WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_forget")
+        .unwrap();
+    assert!(store.forget_group_local(&id).unwrap());
+    assert!(!store.forget_group_local(&id).unwrap());
+    assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(
+        store
+            .pending_push_registration_removals()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.list_groups().unwrap(),
+        vec![cgka_traits::GroupId::new(vec![0xbb])]
+    );
+    assert!(store.local_group_deletion_frontier("aa").unwrap().is_none());
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_groups WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "a stale app snapshot cannot restore the chat"
+    );
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
+                []
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_groups WHERE group_id_hex = 'bb'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}

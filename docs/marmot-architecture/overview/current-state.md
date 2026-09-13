@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-12
+updated: 2026-09-13
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -30,6 +30,14 @@ Accepted disband requests keep a worker wakeup even without other group work, an
 after restart. The selected inbound convergence replay retains authenticated disband evidence before removing the
 former roster. Terminal event projection uses the retained display components and authoritative tombstone instead
 of querying deleted MLS state. Failed requests and unrecoverable groups do not acquire an idle retry loop from this scheduling.
+
+`forget_group_local` is a separate account-device operation from leaving, disbanding, and deleting chat history.
+It transactionally deletes local app and MLS state with a durable local block, then removes runtime scheduling and
+subscriptions. It needs no peer acknowledgement, works on stalled or pending-disband groups, and rejects every
+future Welcome for that same MLS group id. Ordinary `delete_group_local` still retains membership and permits fresh
+messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
+must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
+network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
