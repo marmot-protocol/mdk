@@ -4204,7 +4204,7 @@ impl MarmotApp {
                 Err(err) => {
                     tracing::warn!(
                         target: "marmot_app::key_packages",
-                        method,
+                        method = method,
                         error_kind = err.privacy_safe_kind(),
                         "skipping invalid key package event while listing account packages"
                     );
