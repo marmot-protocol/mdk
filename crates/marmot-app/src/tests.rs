@@ -19453,6 +19453,15 @@ async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
 
 #[tokio::test]
 async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
+    retained_send_recovers_after_notification_gap(true).await;
+}
+
+#[tokio::test]
+async fn notification_gap_automatically_reactivates_and_retries_the_retained_send() {
+    retained_send_recovers_after_notification_gap(false).await;
+}
+
+async fn retained_send_recovers_after_notification_gap(host_wake: bool) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("sender")
@@ -19499,13 +19508,22 @@ async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
         );
     }
 
-    runtime
-        .notify_connectivity_restored()
-        .await
-        .expect("the reconnecting worker must retain the connectivity wake");
+    if host_wake {
+        runtime
+            .notify_connectivity_restored()
+            .await
+            .expect("the reconnecting worker must retain the connectivity wake");
+    }
 
     let group_id_hex = hex::encode(group_id.as_slice());
-    tokio::time::timeout(Duration::from_millis(750), async {
+    let recovery_budget = if host_wake {
+        Duration::from_millis(750)
+    } else {
+        // Allow the production reconnect backoff and scheduled fanout retry.
+        // No host command or subscription refresh request drives this case.
+        Duration::from_secs(12)
+    };
+    tokio::time::timeout(recovery_budget, async {
         loop {
             let timeline = app
                 .timeline_messages_with_query(
@@ -19524,7 +19542,7 @@ async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
         }
     })
     .await
-    .expect("the retained connectivity wake must retry before the normal timer");
+    .expect("the retained send must publish within the recovery budget");
 
     assert_eq!(
         relay
