@@ -9,6 +9,9 @@ use tokio::sync::{Mutex, watch};
 
 use crate::error::Result;
 
+/// Retain the most recent `/new` command receipts for bounded durable replay.
+const RESET_RECEIPT_REPLAY_WINDOW: usize = 64;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
@@ -22,7 +25,7 @@ pub(crate) struct SessionRecord {
     /// started before a `/new` or `/cd` boundary.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) generation: u64,
-    /// Durable idempotency receipts for applied `/new` commands.
+    /// The bounded durable replay window for applied `/new` commands.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) reset_receipts: Vec<ResetReceipt>,
 }
@@ -102,7 +105,7 @@ enum RawRecord {
 
 impl RawRecord {
     fn into_record(self, default_cwd: &Path) -> SessionRecord {
-        match self {
+        let mut record = match self {
             Self::Bare(session_id) => SessionRecord {
                 session_id,
                 cwd: Some(default_cwd.to_path_buf()),
@@ -123,7 +126,16 @@ impl RawRecord {
                 generation,
                 reset_receipts,
             },
-        }
+        };
+        prune_reset_receipts(&mut record.reset_receipts);
+        record
+    }
+}
+
+fn prune_reset_receipts(receipts: &mut Vec<ResetReceipt>) {
+    let excess = receipts.len().saturating_sub(RESET_RECEIPT_REPLAY_WINDOW);
+    if excess > 0 {
+        receipts.drain(..excess);
     }
 }
 
@@ -245,6 +257,7 @@ impl SessionStore {
                 changed,
                 generation: record.generation,
             });
+            prune_reset_receipts(&mut record.reset_receipts);
         }
         persist(&self.path, &mut map, next).await?;
         Ok(ResetSessionOutcome {
@@ -788,7 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_replay_remains_idempotent_after_many_later_resets() {
+    async fn reset_replay_window_is_bounded_and_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let home = dir.path().to_path_buf();
@@ -816,13 +829,27 @@ mod tests {
         }
         drop(store);
 
+        // Simulate an oversized snapshot written by a pre-window version.
+        let mut snapshot: HashMap<String, SessionRecord> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let receipts = &mut snapshot.get_mut("group1").unwrap().reset_receipts;
+        receipts.insert(0, receipts[0].clone());
+        assert_eq!(receipts.len(), 65);
+        write_snapshot(&path, &snapshot).unwrap();
+
         let store = SessionStore::load(path, &home).unwrap();
-        let replay = store.reset_session("group1", "message-0").await.unwrap();
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.reset_receipts.len(), 64);
+        let expired = store.reset_session("group1", "message-0").await.unwrap();
+        assert!(expired.changed);
+        assert!(!expired.replayed);
+        let replay = store.reset_session("group1", "message-64").await.unwrap();
         assert!(replay.changed);
         assert!(replay.replayed);
         let record = store.get("group1").await.unwrap();
-        assert_eq!(record.session_id, "ses_after_64");
-        assert_eq!(record.generation, 65);
+        assert!(record.session_id.is_empty());
+        assert_eq!(record.generation, 66);
+        assert_eq!(record.reset_receipts.len(), 64);
     }
 
     #[tokio::test]

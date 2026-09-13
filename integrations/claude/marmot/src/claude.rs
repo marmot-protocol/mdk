@@ -142,6 +142,9 @@ fn parse_event_line(line: &str, expected_session_id: &str) -> Result<ParsedEvent
 }
 
 fn parse_session_event(value: &Value, expected_session_id: &str) -> Result<ParsedEvent> {
+    if has_mismatched_session_id(value, expected_session_id) {
+        return Ok(session_mismatch_event());
+    }
     validated_session_id(value, expected_session_id).map(ParsedEvent::Session)
 }
 
@@ -161,6 +164,9 @@ fn parse_assistant_event(value: &Value, expected_session_id: &str) -> Result<Par
     let text = assistant_text(message.get("content"));
     if text.trim().is_empty() {
         return Ok(ParsedEvent::Ignored);
+    }
+    if has_mismatched_session_id(value, expected_session_id) {
+        return Ok(session_mismatch_event());
     }
     validated_session_id(value, expected_session_id)?;
     Ok(ParsedEvent::Text(text))
@@ -193,7 +199,25 @@ fn validated_session_id(value: &Value, expected_session_id: &str) -> Result<Stri
     Ok(session_id)
 }
 
+fn has_mismatched_session_id(value: &Value, expected_session_id: &str) -> bool {
+    value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(normalize_session_id)
+        .is_some_and(|session_id| session_id != expected_session_id)
+}
+
+fn session_mismatch_event() -> ParsedEvent {
+    ParsedEvent::Error {
+        session_id: None,
+        summary: "session_mismatch".to_owned(),
+    }
+}
+
 fn parse_result_event(value: &Value, expected_session_id: &str) -> Result<ParsedEvent> {
+    if has_mismatched_session_id(value, expected_session_id) {
+        return Ok(session_mismatch_event());
+    }
     let session_id = validated_session_id(value, expected_session_id)?;
     let subtype = value.get("subtype").and_then(Value::as_str);
     let is_error = value
@@ -426,16 +450,27 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_missing_or_mismatched_session_identity_before_output() {
+    fn parser_rejects_missing_and_reports_mismatched_session_identity_before_output() {
         let other = "123e4567-e89b-12d3-a456-426614174000";
         for line in [
-            format!(r#"{{"type":"system","subtype":"init","session_id":"{other}"}}"#),
             r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"unbound"}]}}"#.to_owned(),
-            format!(r#"{{"type":"assistant","session_id":"{other}","parent_tool_use_id":null,"message":{{"role":"assistant","content":[{{"type":"text","text":"wrong lane"}}]}}}}"#),
             r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#.to_owned(),
-            format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"{other}"}}"#),
         ] {
             assert!(parse_event_line(&line, SESSION).is_err(), "accepted {line}");
+        }
+        for line in [
+            format!(r#"{{"type":"system","subtype":"init","session_id":"{other}"}}"#),
+            format!(
+                r#"{{"type":"assistant","session_id":"{other}","parent_tool_use_id":null,"message":{{"role":"assistant","content":[{{"type":"text","text":"wrong lane"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"{other}"}}"#
+            ),
+        ] {
+            assert_eq!(
+                parse_event_line(&line, SESSION).unwrap(),
+                session_mismatch_event()
+            );
         }
     }
 
@@ -639,6 +674,46 @@ exit 64
         assert_eq!(outcome.exit_code, Some(64));
         assert_eq!(outcome.stderr, "authentication required");
         assert_eq!(outcome.observed_session, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_session_mismatch_is_reported_without_forwarding_text() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("mismatched-claude");
+        let other = "123e4567-e89b-12d3-a456-426614174000";
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"{other}"}}'
+printf '%s\n' '{{"type":"assistant","session_id":"{other}","parent_tool_use_id":null,"message":{{"role":"assistant","content":[{{"type":"text","text":"wrong lane"}}]}}}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"session_id":"{other}"}}'
+"#
+            ),
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: Some(SESSION.to_owned()),
+                prompt: "resume".to_owned(),
+                artifact_output: None,
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.error_summary.as_deref(), Some("session_mismatch"));
+        assert!(rx.recv().await.is_none());
     }
 
     #[cfg(unix)]

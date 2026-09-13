@@ -32,6 +32,7 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/README.md": {
         "install-hermes-marmot.sh": 2,
         "install-openclaw-marmot.sh": 1,
+        "install-claude-marmot.sh": 1,
         "install-codex-marmot.sh": 2,
         "install-opencode-marmot.sh": 1,
         "install-pi-marmot.sh": 1,

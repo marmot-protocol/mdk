@@ -70,6 +70,15 @@ impl ProcessGroupGuard {
     fn disarm(&mut self) {}
 }
 
+async fn wait_for_child_and_disarm(
+    child: &mut Child,
+    process_group: &mut ProcessGroupGuard,
+) -> std::io::Result<std::process::ExitStatus> {
+    let status = child.wait().await?;
+    process_group.disarm();
+    Ok(status)
+}
+
 /// How one backend prompt reaches the child process.
 pub enum PromptTransport {
     /// Write the prompt to the child's standard input and then close it.
@@ -302,7 +311,9 @@ where
             let line = tokio::select! {
                 biased;
                 line = lines.next_line() => Some(line),
-                status = child.wait() => break Some(status.map_err(HarnessError::from)?),
+                status = wait_for_child_and_disarm(&mut child, &mut process_group) => {
+                    break Some(status.map_err(HarnessError::from)?)
+                },
                 _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
                         tx.send(RunnerEvent::LivenessUnknown)
@@ -400,7 +411,11 @@ where
                     None => None,
                 }
             };
-            let (writer, status, stderr) = tokio::join!(writer, child.wait(), &mut stderr_task);
+            let (writer, status, stderr) = tokio::join!(
+                writer,
+                wait_for_child_and_disarm(&mut child, &mut process_group),
+                &mut stderr_task,
+            );
             let status = status.map_err(HarnessError::from)?;
             let stderr = stderr.map_err(HarnessError::from)?;
             if let Some(writer) = writer {
@@ -599,5 +614,19 @@ mod tests {
         let captured = capture_bounded(input).await;
         assert_eq!(captured.len(), STDERR_CAPTURE_BYTES);
         assert!(captured.bytes().all(|byte| byte == b'x'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waiting_for_direct_child_disarms_process_group_guard() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let mut guard = ProcessGroupGuard::new(&child);
+
+        let status = wait_for_child_and_disarm(&mut child, &mut guard)
+            .await
+            .unwrap();
+
+        assert!(status.success());
+        assert!(guard.pgid.is_none());
     }
 }
