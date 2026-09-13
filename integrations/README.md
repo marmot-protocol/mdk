@@ -18,6 +18,7 @@ Choose the runtime you already use:
 | --- | --- | --- |
 | Hermes | Gateway plugin | Rich chat history, reactions, media, and live previews |
 | OpenClaw | Channel plugin | Rich gateway routing, media, and live previews |
+| Claude Code | Terminal harness | Repository and coding tasks through Claude Code |
 | Codex | Terminal harness | Repository and coding tasks through Codex |
 | OpenCode | Terminal harness | Repository and coding tasks through OpenCode |
 | Pi | Terminal harness | Repository and coding tasks through Pi |
@@ -75,6 +76,18 @@ install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256"
 ```
 
+### Claude Code
+
+Claude Code 2.1.0 or newer must already be installed, authenticated, and
+runnable as `claude`.
+
+Run this example in the same shell where `install_verified` above was defined.
+
+```sh
+install_verified "$base_url/install-claude-marmot.sh" \
+  "$base_url/install-claude-marmot.sh.sha256"
+```
+
 ### Codex
 
 Codex must already be installed, authenticated, and runnable as `codex`.
@@ -118,7 +131,7 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["npub"]); p
   "$HOME/.marmot-agents/codex/bootstrap.json"
 ```
 
-Use `hermes`, `openclaw`, `codex`, `harnesses` (OpenCode), or `pi` in that path.
+Use `hermes`, `openclaw`, `claude`, `codex`, `harnesses` (OpenCode), or `pi` in that path.
 The installers also show these values directly and render a terminal QR when
 `qrencode` is installed.
 
@@ -127,7 +140,7 @@ The installers also show these values directly and render a terminal QR when
 3. Send a test message.
 
 Hermes and OpenClaw print one final gateway restart command because the installer
-does not restart an existing gateway. Codex, OpenCode, and Pi services are
+does not restart an existing gateway. Claude Code, Codex, OpenCode, and Pi services are
 started by the default install. Their first group message can be `/<path>` to
 select a working directory under your home directory.
 
@@ -146,7 +159,7 @@ install_verified "$base_url/install-codex-marmot.sh" \
   --yes --allow-welcomer "$OWNER_NPUB"
 ```
 
-Replace `codex` in the URL with `openclaw`, `opencode`, or `pi`. Hermes keeps
+Replace `codex` in the URL with `claude`, `openclaw`, `opencode`, or `pi`. Hermes keeps
 invite acceptance and message-sender authorization explicit:
 
 Run this example in the same shell where `install_verified` above was defined.
@@ -171,11 +184,12 @@ Current integrations:
 
 - [`hermes/marmot`](hermes/marmot) - Hermes platform plugin.
 - [`openclaw/marmot`](openclaw/marmot) - OpenClaw channel plugin.
+- [`claude/marmot`](claude/marmot) - `wn-claude` Claude Code harness binary.
 - [`codex/marmot`](codex/marmot) - `wn-codex` Codex harness binary.
 - [`opencode/marmot`](opencode/marmot) - `wn-opencode` OpenCode harness binary.
 - [`pi/marmot`](pi/marmot) - `wn-pi` Pi harness binary.
 - [`terminal-harness`](terminal-harness) - shared hardened runtime for the
-  Codex, OpenCode, and Pi terminal harnesses.
+  Claude Code, Codex, OpenCode, and Pi terminal harnesses.
 
 All integrations are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
@@ -193,6 +207,7 @@ The release installers are published with the `wn-agent-v*` release family:
 
 - `scripts/install-hermes-marmot.sh`
 - `scripts/install-openclaw-marmot.sh`
+- `scripts/install-claude-marmot.sh`
 - `scripts/install-codex-marmot.sh`
 - `scripts/install-opencode-marmot.sh`
 - `scripts/install-pi-marmot.sh`
@@ -204,27 +219,28 @@ per connector:
 | --- | --- | --- |
 | Hermes | `$HOME/.marmot-agents/hermes` | `wn-agent-hermes.service` / `org.marmot.wn-agent.hermes` |
 | OpenClaw | `$HOME/.marmot-agents/openclaw` | `wn-agent-openclaw.service` / `org.marmot.wn-agent.openclaw` |
+| Claude Code harness | `$HOME/.marmot-agents/claude` | `wn-agent-claude.service` / `org.marmot.wn-agent.claude` plus `wn-claude.service` / `org.marmot.wn-claude` |
 | Codex harness | `$HOME/.marmot-agents/codex` | `wn-agent-codex.service` / `org.marmot.wn-agent.codex` plus `wn-codex.service` / `org.marmot.wn-codex` |
 | OpenCode harness | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` / `org.marmot.wn-opencode` |
 | Pi harness | `$HOME/.marmot-agents/pi` | `wn-agent-pi.service` / `org.marmot.wn-agent.pi` plus `wn-pi.service` / `org.marmot.wn-pi` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
-uses the public relay defaults shared with the phone app pilot setup. Codex,
-OpenCode, and Pi use separate connector homes and Marmot identities by default. They share
+uses the public relay defaults shared with the phone app pilot setup. Claude Code,
+Codex, OpenCode, and Pi use separate connector homes and Marmot identities by default. They share
 implementation in `integrations/terminal-harness`, but they do not share prompts,
 sessions, sockets, or services unless an operator explicitly configures a shared
 deployment.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
-gateway automatically. `wn-codex`, `wn-opencode`, and `wn-pi` each install their own harness
+gateway automatically. `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` each install their own harness
 binary and service in addition to `wn-agent`, because they are standalone
 harnesses rather than plugins loaded by an existing gateway.
 
 ## Identity Model
 
 The default topology creates or reuses one Marmot account per connector home,
-which means Hermes, OpenClaw, Codex, OpenCode, and Pi present as separate Nostr
+which means Hermes, OpenClaw, Claude Code, Codex, OpenCode, and Pi present as separate Nostr
 identities when installed with default options.
 
 Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
@@ -236,11 +252,12 @@ The installers persist the selected account into connector-specific config:
 
 - Hermes uses `MARMOT_ACCOUNT_ID_HEX` or the Marmot plugin config.
 - OpenClaw uses `channels.marmot.accountIdHex` or `MARMOT_ACCOUNT_ID_HEX`.
+- `wn-claude` uses `WN_CLAUDE_ACCOUNT_ID_HEX`.
 - `wn-codex` uses `WN_CODEX_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
 - `wn-pi` uses `WN_PI_ACCOUNT_ID_HEX`.
 
-Installing all five connectors on one machine with default options therefore
+Installing all six connectors on one machine with default options therefore
 creates distinct agent identities and distinct chat/group memberships.
 
 ## What Is Shared
@@ -269,6 +286,8 @@ Each host runtime keeps its own runtime state:
 
 - Hermes keeps Hermes gateway/plugin state under `HERMES_HOME`.
 - OpenClaw keeps OpenClaw gateway/channel state under `OPENCLAW_HOME`.
+- `wn-claude` keeps harness configuration in `$MARMOT_HOME/dev/wn-claude.env`
+  and session state under `$XDG_STATE_HOME/wn-claude` by default.
 - `wn-codex` keeps harness configuration in `$MARMOT_HOME/dev/wn-codex.env`
   and session state under `$XDG_STATE_HOME/wn-codex` by default.
 - `wn-opencode` keeps harness configuration in
@@ -284,11 +303,11 @@ Each integration also makes its own activation decision:
   they default to mention-style activation and always reply in effective DMs.
   They also support richer gateway features such as live previews, durable reply
   routing, profile onboarding, and media handling.
-- `wn-codex`, `wn-opencode`, and `wn-pi` are pure harnesses. They currently support only
+- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` are pure harnesses. They currently support only
   `always` activation for prompt messages from explicitly allowed senders, and
   have no profile onboarding or live-preview behavior. Their shared runtime
   validates and privately stages bounded ordered attachment batches. `wn-codex`
-  maps image batches to ordered Codex image inputs; `wn-opencode` and `wn-pi`
+  maps image batches to ordered Codex image inputs; `wn-claude`, `wn-opencode`, and `wn-pi`
   reject every non-empty batch, including its accompanying text, before spawning
   their backends.
 
@@ -296,7 +315,7 @@ Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the
 same account and group, every eligible integration can reply. For example, a
 direct message from an allowlisted sender could trigger Hermes/OpenClaw,
-`wn-codex`, `wn-opencode`, and `wn-pi` if all are running and configured for that account.
+`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` if all are running and configured for that account.
 
 ## Allowlist Behavior
 
@@ -319,7 +338,8 @@ allowlist to the configured set. All terminal harnesses require at least one
 allowed sender and install those senders into both the prompt allowlist and the
 `wn-agent` welcomer allowlist. Their startup mirroring is additive: removing a
 sender only from `wn-agent` is not a full harness revoke while the sender remains
-in `WN_CODEX_ALLOWED_SENDERS_HEX`, `WN_OPENCODE_ALLOWED_SENDERS_HEX`, or
+in `WN_CLAUDE_ALLOWED_SENDERS_HEX`, `WN_CODEX_ALLOWED_SENDERS_HEX`,
+`WN_OPENCODE_ALLOWED_SENDERS_HEX`, or
 `WN_PI_ALLOWED_SENDERS_HEX`.
 
 For shared-account deployments, prefer one explicit source of truth for the
@@ -372,6 +392,10 @@ just hermes-dev-e2e-connector
 just openclaw-dev-test
 just openclaw-dev-script-test
 just openclaw-dev-e2e-connector
+
+cargo test -p wn-claude
+just claude-dev-e2e-connector
+just claude-installer-test
 
 cargo test -p wn-codex
 just codex-dev-e2e-connector

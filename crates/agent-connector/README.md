@@ -11,9 +11,10 @@ Hermes is the first supported adapter. OpenClaw is the second: a TypeScript chan
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
 connector. `wn-opencode` is a pure Rust harness at
 [`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
-OpenCode. `wn-codex` and `wn-pi` are the corresponding Codex and Pi harnesses at
+OpenCode. `wn-claude`, `wn-codex`, and `wn-pi` are the corresponding Claude Code, Codex, and Pi harnesses at
+[`integrations/claude/marmot`](../../integrations/claude/marmot),
 [`integrations/codex/marmot`](../../integrations/codex/marmot) and
-[`integrations/pi/marmot`](../../integrations/pi/marmot). All three use the shared hardened runtime in
+[`integrations/pi/marmot`](../../integrations/pi/marmot). All four use the shared hardened runtime in
 [`integrations/terminal-harness`](../../integrations/terminal-harness).
 
 ## Names
@@ -125,8 +126,9 @@ in the connector. Omitting `--media-allowed-root` deliberately leaves media send
 ## Release Installs
 
 The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
-current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw, Codex,
-OpenCode, and Pi. Keep install commands there instead of duplicating them in this crate-level implementation guide.
+current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw,
+Claude Code, Codex, OpenCode, and Pi. Keep install commands there instead of duplicating them in this crate-level
+implementation guide.
 
 Connector-specific configuration, manual setup, security notes, and development workflows remain in each integration
 README under [`integrations/`](../../integrations/README.md).

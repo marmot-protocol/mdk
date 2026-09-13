@@ -159,7 +159,7 @@ every message surface, and custom kinds materialize as standalone timeline rows 
 update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token) are rejected on
 the custom send path, so apps cannot forge protocol events.
 
-The Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
+The Claude Code, Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
 `autonomous`, and `unrestricted` execution intent while retaining
 backend-specific approval and sandbox semantics. Unrestricted installs require
 explicit acknowledgement and an external OS-user, container, or VM boundary;

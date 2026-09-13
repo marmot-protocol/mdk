@@ -1,8 +1,8 @@
 # Marmot Terminal Harness
 
 `marmot-terminal-harness` is the shared Rust runtime behind
-[`wn-codex`](../codex/marmot), [`wn-opencode`](../opencode/marmot), and
-[`wn-pi`](../pi/marmot). It keeps the
+[`wn-claude`](../claude/marmot), [`wn-codex`](../codex/marmot),
+[`wn-opencode`](../opencode/marmot), and [`wn-pi`](../pi/marmot). It keeps the
 Marmot-facing behavior of pure terminal connectors consistent while leaving
 backend command construction and event parsing in each connector crate.
 
@@ -33,7 +33,7 @@ maps its strict decoder into the shared `ParsedEvent` vocabulary. The shared
 runner owns spawning, bounded stderr, stdout and total deadlines, reply-channel
 backpressure, first-session capture, and child termination and reaping.
 
-Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
+Claude Code, Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.
 
 ## Execution Profiles
@@ -49,6 +49,7 @@ the backends have equivalent permission or sandbox systems:
 
 | Backend | `inherit` | `autonomous` | `unrestricted` | Built-in OS isolation |
 | --- | --- | --- | --- | --- |
+| Claude Code | Existing permission config | `--permission-mode acceptEdits`; explicit denies remain and other unanswered asks are denied | `--dangerously-skip-permissions` | None |
 | Pi | Existing tool/config behavior | Same native approval-free invocation | Same native approval-free invocation | None |
 | OpenCode | Existing permission config | `--auto`; explicit denies remain | `--auto` plus process-local `OPENCODE_CONFIG_CONTENT={"permission":"allow"}` | None |
 | Codex | Existing approval, sandbox, and network config | `approval_policy="never"`; sandbox/network remain configured | `--dangerously-bypass-approvals-and-sandbox` | Configured for `inherit`/`autonomous`; bypassed for `unrestricted` |
@@ -161,6 +162,7 @@ and is never included in logs or diagnostics.
 The connector READMEs document their environment variables, installer topology,
 and backend contracts:
 
+- [`integrations/claude/marmot/README.md`](../claude/marmot/README.md)
 - [`integrations/codex/marmot/README.md`](../codex/marmot/README.md)
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
@@ -171,14 +173,17 @@ Run the shared suite and all connector suites after changing this crate:
 
 ```sh
 cargo test -p marmot-terminal-harness
+cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
 
+just claude-dev-e2e-connector
 just codex-dev-e2e-connector
 just opencode-dev-e2e-connector
 just pi-dev-e2e-connector
 
+just claude-installer-test
 just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
@@ -186,4 +191,4 @@ just pi-installer-test
 
 The process-level connector tests are ignored by default and use real
 `wn-agent` and connector binaries with fake backend executables. They do not
-install or authenticate the real Codex, OpenCode, or Pi CLIs.
+install or authenticate the real Claude Code, Codex, OpenCode, or Pi CLIs.

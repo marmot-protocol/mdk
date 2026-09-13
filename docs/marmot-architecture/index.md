@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-07
+updated: 2026-09-13
 tags: [marmot, architecture, index]
 ---
 
@@ -95,7 +95,7 @@ Written to be readable in 5 minutes each, shareable as a package.
     suspension rules that release WAL and root-lease file locks.
 
 - **Doc:** [`overview/terminal-harness-execution-profiles.md`](./overview/terminal-harness-execution-profiles.md)
-  - **What it covers:** Typed execution intent across Pi, OpenCode, and Codex; backend mappings, installer
+  - **What it covers:** Typed execution intent across Claude Code, Pi, OpenCode, and Codex; backend mappings, installer
     acknowledgement, and the remote-execution containment boundary.
 
 - **Doc:** [`overview/multi-step-state-changes.md`](./overview/multi-step-state-changes.md)

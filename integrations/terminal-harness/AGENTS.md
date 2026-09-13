@@ -25,6 +25,7 @@ before changing this crate.
 
 ```sh
 cargo test -p marmot-terminal-harness
+cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi

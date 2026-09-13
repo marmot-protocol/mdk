@@ -19,6 +19,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Shared profile-pseudonym helpers are now exported through UniFFI and C
   (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
   `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
+- WN Agent adds the `wn-claude` terminal harness for Claude Code 2.1.0 or newer.
+  Each Marmot group uses an explicit UUID-backed Claude session, resumes only
+  that stored UUID, sends prompts over stdin, and returns only final result
+  text. The shared harness provides workdir selection, `/new`, ordered lanes,
+  durable recovery, permission profiles, and an isolated release installer.
 
 ### Changed
 
