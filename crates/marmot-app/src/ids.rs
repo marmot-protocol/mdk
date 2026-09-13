@@ -1,4 +1,5 @@
 use cgka_traits::MemberId;
+use nostr::FromBech32;
 use nostr::ToBech32;
 use nostr::nips::nip19::Nip19Profile;
 use nostr::prelude::RelayUrl;
@@ -78,12 +79,39 @@ pub fn nprofile_for_account_id(
         .map_err(|_| AppError::InvalidPublicKey)
 }
 
-/// Normalize any public-key reference (npub bech32 or hex) into canonical
-/// hex account id. Public so embedders can resolve scanned/typed npubs.
+/// Matches the currently locked Bech32/Bech32m code-length ceiling
+/// (`bech32` 0.11.1), not a universal NIP-19 protocol limit.
+const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
+
+/// Normalize a public identity reference into a canonical hex account id.
+///
+/// Accepts hex, `npub`, `nostr:npub`, `nprofile`, and `nostr:nprofile`.
+/// Existing hex/npub/NIP-21 behavior stays on [`PublicKey::parse`]; the
+/// nprofile fallback discards relay hints and keeps the first type-0 key.
+///
+/// After one lowercase `nostr:` prefix, the fallback limits the complete
+/// encoded token to 1023 UTF-8 bytes, matching the locked Bech32 ceiling.
+/// A valid 1023-byte token therefore still decodes with that prefix. This
+/// local fallback budget does not bound the earlier `PublicKey::parse`.
+///
+/// Whitespace and `marmot://profile/...` normalization belong to FFI.
+/// Failures return [`AppError::InvalidPublicKey`] without echoing the input.
 pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
-    Ok(PublicKey::parse(reference)
-        .map_err(|_| AppError::InvalidPublicKey)?
-        .to_hex())
+    if let Ok(pubkey) = PublicKey::parse(reference) {
+        return Ok(pubkey.to_hex());
+    }
+    let profile_ref = nprofile_fallback_token(reference)?;
+    Nip19Profile::from_bech32(profile_ref)
+        .map(|profile| profile.public_key.to_hex())
+        .map_err(|_| AppError::InvalidPublicKey)
+}
+
+fn nprofile_fallback_token(reference: &str) -> Result<&str, AppError> {
+    let profile_ref = reference.strip_prefix("nostr:").unwrap_or(reference);
+    if profile_ref.len() > MAX_NPROFILE_REFERENCE_BYTES {
+        return Err(AppError::InvalidPublicKey);
+    }
+    Ok(profile_ref)
 }
 
 pub(crate) fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
@@ -92,17 +120,21 @@ pub(crate) fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{nprofile_for_account_id, npub_for_account_id};
+    use super::{
+        MAX_NPROFILE_REFERENCE_BYTES, account_id_hex_from_ref, nprofile_fallback_token,
+        nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
+    };
+    use crate::AppError;
 
-    const ACCOUNT_ID: &str = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/identity_reference_vectors.rs"
+    ));
 
     #[test]
     fn npub_and_nprofile_match_bootstrap_vectors() {
         let npub = npub_for_account_id(ACCOUNT_ID).unwrap();
-        assert_eq!(
-            npub,
-            "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
-        );
+        assert_eq!(npub, NPUB);
 
         let nprofile = nprofile_for_account_id(
             ACCOUNT_ID,
@@ -112,10 +144,81 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(nprofile, BOOTSTRAP_NPROFILE);
+
+        let no_relay = nprofile_for_account_id(ACCOUNT_ID, &[]).unwrap();
+        assert_eq!(no_relay, NO_RELAY_NPROFILE);
+        let other_relays =
+            nprofile_for_account_id(ACCOUNT_ID, &["wss://relay.example.invalid".to_owned()])
+                .unwrap();
+        assert_eq!(other_relays, OTHER_RELAY_NPROFILE);
+        assert_ne!(other_relays, BOOTSTRAP_NPROFILE);
+    }
+
+    #[test]
+    fn account_id_hex_from_ref_matches_shared_corpus() {
+        for case in cases() {
+            match case.app_account_id_hex {
+                Some(expected) => {
+                    assert_eq!(
+                        account_id_hex_from_ref(&case.reference)
+                            .unwrap_or_else(|_| panic!("case {} should decode", case.name)),
+                        expected,
+                        "case {}",
+                        case.name
+                    );
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            account_id_hex_from_ref(&case.reference),
+                            Err(AppError::InvalidPublicKey)
+                        ),
+                        "case {} should reject",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nprofile_fallback_token_rejects_oversized_tokens_before_sdk_decode() {
+        let accepted = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES);
         assert_eq!(
-            nprofile,
-            "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpremhxue69uhhyetvv9uju\
-             et49emks6t5v4hx76tnv5hxx6rpwsq3uamnwvaz7tmjv4kxz7fww4ejuamgd96x2mn0d9ek2tnrdpshggcu28s"
+            nprofile_fallback_token(&accepted).expect("1023-byte token stays eligible"),
+            accepted.as_str()
         );
+        let wrapped = format!("nostr:{accepted}");
+        assert_eq!(
+            nprofile_fallback_token(&wrapped).expect("prefix is excluded from the budget"),
+            accepted.as_str()
+        );
+
+        let oversized = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES + 1);
+        assert!(
+            matches!(
+                nprofile_fallback_token(&oversized),
+                Err(AppError::InvalidPublicKey)
+            ),
+            "1024-byte token must not reach Nip19Profile::from_bech32"
+        );
+        assert!(
+            matches!(
+                nprofile_fallback_token(&format!("nostr:{oversized}")),
+                Err(AppError::InvalidPublicKey)
+            ),
+            "prefixed oversized token must not reach Nip19Profile::from_bech32"
+        );
+    }
+
+    #[test]
+    fn parse_account_id_hex_does_not_gain_nprofile() {
+        assert_eq!(parse_account_id_hex(ACCOUNT_ID).unwrap(), ACCOUNT_ID);
+        assert_eq!(parse_account_id_hex(NPUB).unwrap(), ACCOUNT_ID);
+        assert!(matches!(
+            parse_account_id_hex(NO_RELAY_NPROFILE),
+            Err(AppError::InvalidPublicKey)
+        ));
     }
 }

@@ -808,6 +808,36 @@ mod group_roster_tests {
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
     }
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
+
+    #[test]
+    fn normalize_member_ref_ffi_matches_shared_corpus() {
+        for case in cases() {
+            match case.ffi_account_id_hex {
+                Some(expected) => {
+                    let normalized = normalize_member_ref_ffi(&case.reference)
+                        .unwrap_or_else(|_| panic!("case {} should decode", case.name));
+                    assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
+                    assert_eq!(normalized.member_ref, expected, "case {}", case.name);
+                    assert_eq!(normalized.npub, NPUB, "case {}", case.name);
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            normalize_member_ref_ffi(&case.reference),
+                            Err(MarmotKitError::InvalidIdentity { .. })
+                        ),
+                        "case {} should reject",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn member_ids_page_row_preserves_group_member_and_admin_identifiers() {
         let ffi = AppGroupMemberIdsFfi::from(AppGroupMemberIds {

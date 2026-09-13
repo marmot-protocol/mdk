@@ -13,7 +13,7 @@ use marmot_uniffi::conversions::{
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
 use super::common::MarmotMessageTag;
 use super::markdown::MarmotMarkdownDocument;
-use super::media::MarmotMediaAttachmentReference;
+use super::media::MarmotMediaAttachmentOutcome;
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, c_bool, free_c_string, optional_str, owned_c_string};
@@ -67,8 +67,9 @@ c_mirror! {
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
         opt_str media_json,
-        /// Fully-resolved media references for the previewed message.
-        vec media/media_len: MarmotMediaAttachmentReference,
+        /// Ordered per-attachment outcomes for the previewed message:
+        /// accepted references plus typed rejections at their positions.
+        vec media/media_len: MarmotMediaAttachmentOutcome,
         opt_str agent_text_stream_json,
         copy deleted: bool,
         /// Convergence invalidation reason for the previewed message.
@@ -156,9 +157,11 @@ c_mirror! {
         opt_str reply_to_message_id_hex,
         opt_rec reply_preview: MarmotTimelineReplyPreview,
         opt_str media_json,
-        /// Fully-resolved media references for this message; empty when
-        /// it has no media.
-        vec media/media_len: MarmotMediaAttachmentReference,
+        /// Ordered per-attachment outcomes for this message; empty when
+        /// it has no media. A malformed or unsupported `imeta` attachment
+        /// is a `Rejected` entry at its position with a typed reason; the
+        /// text and valid sibling attachments are unaffected.
+        vec media/media_len: MarmotMediaAttachmentOutcome,
         opt_str agent_text_stream_json,
         /// Parsed view of kind-1210 group system rows. NULL for chat,
         /// reactions, stream rows, and malformed assertions.

@@ -8,15 +8,21 @@
 //!   reference for golden V1 and V2 fixtures independently;
 //! - absent (`null`) versus present-empty (`""`) optional fields survive the
 //!   FFI conversion unchanged;
-//! - malformed, noncanonical, and unknown-version tags surface as the typed
-//!   `MarmotKitError::InvalidMediaReference` error, never a panic;
+//! - malformed, noncanonical, unknown-version, and legacy-shape tags surface as
+//!   the typed `MarmotKitError::MediaAttachmentRejected` error carrying the
+//!   fixture's stable `rejection_kind`, never a panic;
+//! - the timeline projection reports the identical outcome for the same tag
+//!   (an `Accepted` reference equal to the explicit parse, or a `Rejected`
+//!   entry with the same kind and detail), so a host can trust either surface;
 //! - converting the FFI record back to the app-layer reference and rebuilding
 //!   through the checked outbound builder reproduces the fixture tag exactly,
 //!   so the conversion drops no field.
 
-use marmot_app::{EncryptedMediaVersion, MediaAttachmentReference};
+use marmot_app::{EncryptedMediaVersion, MediaAttachmentReference, TimelineReplyPreview};
+use marmot_uniffi::conversions::TimelineReplyPreviewFfi;
 use marmot_uniffi::{
-    EncryptedMediaVersionFfi, MarmotKitError, MessageTagFfi, parse_media_imeta_tag,
+    EncryptedMediaVersionFfi, MarmotKitError, MediaAttachmentOutcomeFfi,
+    MediaAttachmentRejectionKindFfi, MessageTagFfi, parse_media_imeta_tag,
 };
 
 fn fixture_cases(file: &str) -> Vec<serde_json::Value> {
@@ -48,6 +54,45 @@ fn fixture_optional(value: &serde_json::Value, key: &str) -> Option<String> {
         serde_json::Value::String(text) => Some(text.clone()),
         other => panic!("fixture optional field {key} must be null or string, got {other}"),
     }
+}
+
+fn fixture_rejection_kind(case: &serde_json::Value) -> MediaAttachmentRejectionKindFfi {
+    match case["rejection_kind"]
+        .as_str()
+        .expect("rejection fixture names its rejection_kind")
+    {
+        "invalid_structure" => MediaAttachmentRejectionKindFfi::InvalidStructure,
+        "unsupported_format" => MediaAttachmentRejectionKindFfi::UnsupportedFormat,
+        "missing_field" => MediaAttachmentRejectionKindFfi::MissingField,
+        "duplicate_field" => MediaAttachmentRejectionKindFfi::DuplicateField,
+        "malformed_field" => MediaAttachmentRejectionKindFfi::MalformedField,
+        other => panic!("unknown fixture rejection_kind {other:?}"),
+    }
+}
+
+/// Run the fixture tag through the real timeline projection (`From` on the
+/// storage row type) so the test exercises the surface hosts consume, not a
+/// crate-private helper.
+fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcomeFfi {
+    let preview: TimelineReplyPreviewFfi = TimelineReplyPreview {
+        message_id_hex: "aa".repeat(32),
+        sender: "bb".repeat(32),
+        plaintext: "caption".to_owned(),
+        kind: 9,
+        source_epoch: Some(source_epoch),
+        media: Some(serde_json::json!({ "imeta": [tag] })),
+        agent_text_stream: None,
+        deleted: false,
+        invalidation_status: None,
+    }
+    .into();
+    let mut media = preview.media;
+    assert_eq!(
+        media.len(),
+        1,
+        "one imeta tag projects to exactly one outcome"
+    );
+    media.remove(0)
 }
 
 fn expected_version_ffi(expected: &serde_json::Value) -> EncryptedMediaVersionFfi {
@@ -154,17 +199,59 @@ fn assert_fixture_file(file: &str) {
                 .build_imeta_tag(version, &allowed, false)
                 .unwrap_or_else(|err| panic!("{file}/{name} must rebuild after FFI: {err}"));
             assert_eq!(rebuilt, tag, "{file}/{name} exact round-trip through FFI");
+            // The timeline projection accepts the same tag at index 0 with an
+            // identical reference.
+            match projected_outcome(&tag, source_epoch) {
+                MediaAttachmentOutcomeFfi::Accepted {
+                    attachment_index,
+                    reference,
+                } => {
+                    assert_eq!(attachment_index, 0, "{file}/{name} projected index");
+                    assert_eq!(
+                        MediaAttachmentReference::from(reference),
+                        app_reference,
+                        "{file}/{name} projected reference must equal the explicit parse"
+                    );
+                }
+                other => {
+                    panic!("{file}/{name} projection must accept the golden tag, got {other:?}")
+                }
+            }
         } else {
             let err = result.expect_err(&format!("{file}/{name} must be rejected over FFI"));
             let needle = case["error_contains"].as_str().expect("error_contains");
-            match &err {
-                MarmotKitError::InvalidMediaReference { details } => assert!(
-                    details.contains(needle),
-                    "{file}/{name} typed error must mention {needle:?}, got: {details}"
-                ),
+            let expected_kind = fixture_rejection_kind(&case);
+            let details = match &err {
+                MarmotKitError::MediaAttachmentRejected { kind, details } => {
+                    assert_eq!(*kind, expected_kind, "{file}/{name} stable rejection kind");
+                    assert!(
+                        details.contains(needle),
+                        "{file}/{name} typed error must mention {needle:?}, got: {details}"
+                    );
+                    details.clone()
+                }
                 other => panic!(
-                    "{file}/{name} must surface as typed InvalidMediaReference, got {other:?}"
+                    "{file}/{name} must surface as typed MediaAttachmentRejected, got {other:?}"
                 ),
+            };
+            // The timeline projection rejects the same tag at index 0 with the
+            // same kind and presentation text, so hosts can trust either surface.
+            match projected_outcome(&tag, source_epoch) {
+                MediaAttachmentOutcomeFfi::Rejected {
+                    attachment_index,
+                    rejection,
+                } => {
+                    assert_eq!(attachment_index, 0, "{file}/{name} projected index");
+                    assert_eq!(
+                        rejection.kind, expected_kind,
+                        "{file}/{name} projected kind"
+                    );
+                    assert_eq!(
+                        rejection.detail, details,
+                        "{file}/{name} projected detail must equal the explicit parser's"
+                    );
+                }
+                other => panic!("{file}/{name} projection must reject the tag, got {other:?}"),
             }
         }
     }
