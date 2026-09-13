@@ -22,7 +22,7 @@ pub(crate) struct SessionRecord {
     /// started before a `/new` or `/cd` boundary.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) generation: u64,
-    /// Bounded durable idempotency receipts for applied `/new` commands.
+    /// Durable idempotency receipts for applied `/new` commands.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) reset_receipts: Vec<ResetReceipt>,
 }
@@ -43,8 +43,6 @@ pub(crate) struct ResetReceipt {
     changed: bool,
     generation: u64,
 }
-
-const MAX_RESET_RECEIPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -242,9 +240,6 @@ impl SessionStore {
         record.session_id.clear();
         record.generation = record.generation.saturating_add(1);
         if let Some(message_ref_digest) = message_ref_digest {
-            if record.reset_receipts.len() == MAX_RESET_RECEIPTS {
-                record.reset_receipts.remove(0);
-            }
             record.reset_receipts.push(ResetReceipt {
                 message_ref_digest,
                 changed,
@@ -790,6 +785,44 @@ mod tests {
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_after_m2");
         assert_eq!(record.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn reset_replay_remains_idempotent_after_many_later_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let cwd = home.join("proj");
+        let store = SessionStore::load(path.clone(), &home).unwrap();
+        store
+            .record_session("group1", "ses_initial".to_owned(), cwd.clone())
+            .await
+            .unwrap();
+
+        for index in 0..65 {
+            let message_ref = format!("message-{index}");
+            let outcome = store.reset_session("group1", &message_ref).await.unwrap();
+            assert!(outcome.changed);
+            assert!(!outcome.replayed);
+            store
+                .record_session_if_generation(
+                    "group1",
+                    index + 1,
+                    format!("ses_after_{index}"),
+                    cwd.clone(),
+                )
+                .await
+                .unwrap();
+        }
+        drop(store);
+
+        let store = SessionStore::load(path, &home).unwrap();
+        let replay = store.reset_session("group1", "message-0").await.unwrap();
+        assert!(replay.changed);
+        assert!(replay.replayed);
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "ses_after_64");
+        assert_eq!(record.generation, 65);
     }
 
     #[tokio::test]
