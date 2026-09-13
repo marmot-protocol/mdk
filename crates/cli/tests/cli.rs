@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -15,7 +15,8 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
 };
 use nostr::nips::nip19::ToBech32;
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::builder::{PolicyResult, RelayBuilder, WritePolicy};
+use nostr_relay_builder::{LocalRelay, MockRelay};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, QuicBrokerServer};
@@ -25,12 +26,45 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
-    _relay: MockRelay,
+    _relay: TestRelayHandle,
     url: String,
+}
+
+#[allow(dead_code)]
+enum TestRelayHandle {
+    Mock(MockRelay),
+    Local(LocalRelay),
+}
+
+#[derive(Debug)]
+struct RejectKind5WritePolicy;
+
+impl WritePolicy for RejectKind5WritePolicy {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a std::net::SocketAddr,
+    ) -> nostr_relay_builder::prelude::BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind.as_u16() == 5 {
+                PolicyResult::Reject("kind-5 deletions rejected".to_owned())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
 }
 
 impl TestRelay {
     fn new() -> Self {
+        Self::from_mock()
+    }
+
+    fn rejecting_deletions() -> Self {
+        Self::from_local_builder(RelayBuilder::default().write_policy(RejectKind5WritePolicy))
+    }
+
+    fn from_mock() -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
         let mut last_error = None;
         let relay = (0..8)
@@ -47,9 +81,33 @@ impl TestRelay {
         let url = runtime.block_on(relay.url()).to_string();
         Self {
             _runtime: runtime,
-            _relay: relay,
+            _relay: TestRelayHandle::Mock(relay),
             url,
         }
+    }
+
+    fn from_local_builder(builder: RelayBuilder) -> Self {
+        let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
+        let relay = LocalRelay::new(builder);
+        let mut last_error = None;
+        for attempt in 0..8 {
+            match runtime.block_on(relay.run()) {
+                Ok(()) => {
+                    let url = runtime.block_on(relay.url()).to_string();
+                    return Self {
+                        _runtime: runtime,
+                        _relay: TestRelayHandle::Local(relay),
+                        url,
+                    };
+                }
+                Err(err) => {
+                    eprintln!("local relay startup attempt {} failed: {err}", attempt + 1);
+                    last_error = Some(err);
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+        panic!("local relay should start: {last_error:?}");
     }
 
     fn url(&self) -> &str {
@@ -57,19 +115,61 @@ impl TestRelay {
     }
 
     fn event_count(&self, kind: u16) -> usize {
+        self.fetch_events(nostr::Filter::new().kind(nostr::Kind::Custom(kind)))
+            .len()
+    }
+
+    fn fetch_events(&self, filter: nostr::Filter) -> Vec<nostr::Event> {
         self._runtime.block_on(async {
             let client = nostr_sdk::Client::default();
             client.add_relay(&self.url).await.expect("add mock relay");
             client.connect().await;
             client
-                .fetch_events(
-                    nostr::Filter::new().kind(nostr::Kind::Custom(kind)),
-                    Duration::from_secs(2),
-                )
+                .fetch_events(filter, Duration::from_secs(2))
                 .await
                 .expect("query mock relay")
-                .len()
+                .into_iter()
+                .collect()
         })
+    }
+
+    fn key_package_events(&self, author_hex: &str) -> Vec<nostr::Event> {
+        let author = nostr::PublicKey::from_hex(author_hex).expect("account pubkey");
+        self.fetch_events(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30_443))
+                .author(author),
+        )
+    }
+
+    fn send_event(&self, event: &nostr::Event) {
+        self._runtime.block_on(async {
+            let client = nostr_sdk::Client::default();
+            client.add_relay(&self.url).await.expect("add mock relay");
+            client.connect().await;
+            client
+                .send_event_to([&self.url], event)
+                .await
+                .expect("republish event to mock relay");
+        });
+    }
+
+    fn kind5_targets(&self) -> Vec<String> {
+        self.fetch_events(nostr::Filter::new().kind(nostr::Kind::EventDeletion))
+            .into_iter()
+            .flat_map(|event| {
+                event
+                    .tags
+                    .iter()
+                    .filter_map(|tag| {
+                        let slice = tag.as_slice();
+                        (slice.first().map(String::as_str) == Some("e"))
+                            .then(|| slice.get(1).cloned())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 }
 
@@ -2983,6 +3083,248 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
     );
     assert_eq!(delete_all["failed"], serde_json::json!([]));
     assert_eq!(delete_all["failed_count"], 0);
+}
+
+#[test]
+fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
+    let current = TestRelay::new();
+    let lagging = TestRelay::rejecting_deletions();
+    let home = tempfile::tempdir().expect("tempdir");
+    let account_id = create_account_with_real_relay(home.path(), current.url());
+
+    let listed = run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "list"],
+    );
+    let older_id = listed["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .find(|key| key["relay"] == true)
+        .expect("startup relay-visible key package")["key_package_event_id"]
+        .as_str()
+        .expect("older event id")
+        .to_owned();
+    let older_events = current.key_package_events(&account_id);
+    let older_event = older_events
+        .iter()
+        .find(|event| event.id.to_hex() == older_id)
+        .expect("current relay still holds the older event")
+        .clone();
+    lagging.send_event(&older_event);
+
+    run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "rotate"],
+    );
+    // Evict the superseded event from the current relay only. The lagging copy
+    // remains so delete-all can still observe both IDs while the current
+    // listing has a single winner.
+    run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "delete", &older_id],
+    );
+    run_json_with_relay(
+        home.path(),
+        current.url(),
+        &[
+            "--account",
+            &account_id,
+            "relays",
+            "add",
+            lagging.url(),
+            "--type",
+            "nip65",
+        ],
+    );
+
+    let listed = run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "list"],
+    );
+    let keys = listed["keys"].as_array().expect("keys array");
+    let relay_rows = keys
+        .iter()
+        .filter(|key| key["relay"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relay_rows.len(),
+        1,
+        "Published listing must keep one current same-slot row"
+    );
+    let newer_id = relay_rows[0]["key_package_event_id"]
+        .as_str()
+        .expect("newer event id")
+        .to_owned();
+    assert_ne!(
+        newer_id, older_id,
+        "rotate must mint a distinct current event id"
+    );
+    let local_only_ids = keys
+        .iter()
+        .filter(|key| key["relay"] != true)
+        .filter_map(|key| key["key_package_event_id"].as_str())
+        .filter(|event_id| event_id.is_empty() || (*event_id != older_id && *event_id != newer_id))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        current
+            .key_package_events(&account_id)
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([newer_id.clone()]),
+        "current relay must keep only the rotated winner after the superseded id is evicted"
+    );
+    assert_eq!(
+        lagging
+            .key_package_events(&account_id)
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([older_id.clone()]),
+        "lagging relay must keep the superseded same-slot event"
+    );
+    let history = {
+        let app = MarmotApp::with_relays(
+            home.path(),
+            vec![current.url().to_owned(), lagging.url().to_owned()],
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("history runtime");
+        runtime
+            .block_on(app.account_key_package_relay_events(
+                &account_id,
+                vec![
+                    TransportEndpoint(current.url().to_owned()),
+                    TransportEndpoint(lagging.url().to_owned()),
+                ],
+            ))
+            .expect("observe current and superseded relay history")
+    };
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.key_package_event_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([older_id.as_str(), newer_id.as_str()]),
+        "history must expose both same-slot event ids"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| event.is_current)
+            .map(|event| event.key_package_event_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([newer_id.as_str()]),
+        "only the rotated winner is current in the observed window"
+    );
+
+    let unconfirmed = run_json_error_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "delete-all"],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+    assert_eq!(unconfirmed["flag"], "--confirm");
+
+    let delete_all = run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "delete-all", "--confirm"],
+    );
+    let deleted_ids = delete_all["deleted"]
+        .as_array()
+        .expect("deleted array")
+        .iter()
+        .map(|row| {
+            row["event_id"]
+                .as_str()
+                .expect("deleted event id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let failed_ids = delete_all["failed"]
+        .as_array()
+        .expect("failed array")
+        .iter()
+        .map(|row| {
+            row["event_id"]
+                .as_str()
+                .expect("failed event id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let attempted_ids = deleted_ids
+        .iter()
+        .chain(failed_ids.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        attempted_ids,
+        BTreeSet::from([older_id.clone(), newer_id.clone()]),
+        "delete-all must attempt the current and superseded ids exactly once: {delete_all}"
+    );
+    assert_eq!(
+        deleted_ids.len() + failed_ids.len(),
+        2,
+        "each observed id must be attempted once: {delete_all}"
+    );
+    assert_eq!(delete_all["deleted_count"], deleted_ids.len());
+    assert_eq!(delete_all["failed_count"], failed_ids.len());
+    assert!(
+        deleted_ids.contains(&newer_id),
+        "the current winner must remain a successful delete-all target: {delete_all}"
+    );
+    assert!(
+        delete_all["accepted_relays"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    if failed_ids.contains(&older_id) {
+        assert_eq!(failed_ids, vec![older_id.clone()]);
+        assert_eq!(deleted_ids, vec![newer_id.clone()]);
+        assert!(
+            delete_all["failed"][0]["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "failed-event attribution must name the superseded id: {delete_all}"
+        );
+    } else {
+        assert_eq!(
+            deleted_ids.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([older_id.clone(), newer_id.clone()])
+        );
+        assert!(failed_ids.is_empty());
+    }
+    for local_only_id in &local_only_ids {
+        assert!(
+            !deleted_ids.contains(local_only_id) && !failed_ids.contains(local_only_id),
+            "local-only rows must not become delete-all targets"
+        );
+    }
+
+    let current_targets = current.kind5_targets().into_iter().collect::<BTreeSet<_>>();
+    assert!(
+        current_targets.contains(&newer_id),
+        "current relay must receive the current event's deletion"
+    );
+    let lagging_targets = lagging.kind5_targets().into_iter().collect::<BTreeSet<_>>();
+    if failed_ids.contains(&older_id) {
+        assert!(
+            lagging_targets.is_empty(),
+            "lagging relay must reject the superseded deletion"
+        );
+    } else {
+        assert!(
+            current_targets.contains(&older_id) || lagging_targets.contains(&older_id),
+            "the superseded deletion must be routed to an observed endpoint"
+        );
+    }
 }
 
 #[test]
