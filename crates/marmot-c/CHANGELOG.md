@@ -12,12 +12,46 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `marmot_forget_group_local` deletes local chat and MLS state without publishing a leave,
   stops group work, and permits a fresh authenticated invitation to rejoin. Rebuild with
   matching headers/libraries; hosts must clear their own media caches and close group views.
+- `marmot_default_profile_pseudonym` and `marmot_random_profile_pseudonym`
+  for the shared cosmetic display-name helpers. Free the owned UTF-8
+  strings with `marmot_string_free`. These functions add no status values or
+  struct layouts.
+- `MarmotMediaAttachmentOutcome` (tagged union: `Accepted { attachment_index, reference }` /
+  `Rejected { attachment_index, rejection }`), `MarmotMediaAttachmentRejection`, and
+  `MarmotMediaAttachmentRejectionKind` for per-attachment parse outcomes (#1787).
+- `MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED` (70), `MARMOT_STATUS_MEDIA_UNFETCHABLE` (71), and
+  `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` (72), appended after the existing codes.
 
 ### Changed
 
 - Account storage advances through migrations 70–71 for local group reset boundaries.
   Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in
   [the CLI changelog](../cli/CHANGELOG.md#unreleased).
+- `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
+  references and discards relay hints. Existing hex, `npub`, and
+  `marmot://profile/` forms keep their established OK-plus-NULL contract.
+  Duplicate type-0 TLV entries keep the first key. After wrapper
+  normalization, encoded tokens longer than 1023 UTF-8 bytes are
+  rejected; a valid 1023-byte token still decodes when wrapped.
+- `marmot_normalize_member_ref` documents the same nprofile spellings,
+  first-wins type-0 rule, and 1023-byte encoded-token limit.
+- **In-place ABI break, recompile required.** `MarmotTimelineMessageRecord.media` and
+  `MarmotTimelineReplyPreview.media` hold `MarmotMediaAttachmentOutcome` items rather than
+  `MarmotMediaAttachmentReference`, so the element type and array stride change; a binary built
+  against the previous header would misread the array. This is an Unreleased 0.9 change with no
+  in-place dylib swap supported: rebuild C consumers against the new `include/marmot.h` and
+  switch on the outcome tag. No `…V2` compatibility mirror is provided because no shipped C
+  consumer upgrades the library without a rebuild. A malformed or unsupported attachment now keeps
+  its position with a typed reason instead of disappearing; the parent record's deep-free releases
+  either payload.
+- `MarmotMediaRecord.attachment_index` counts the position among the message's `imeta` tags,
+  rejected siblings included, matching the timeline outcome index.
+- `marmot_download_media` returns `MARMOT_STATUS_MEDIA_UNFETCHABLE` when no locator may be
+  fetched under the current policy and `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` for transport,
+  integrity, and decryption failures. Structurally invalid host-supplied references return
+  `MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED` from every media command instead of
+  `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`, which now covers group-profile/policy mismatches
+  and unusable upload requests.
 
 ## [0.9.21] - 2026-09-10
 

@@ -30,7 +30,7 @@ use crypto::{
     media_hash_from_reference, media_nonce_from_reference, validate_sha256_hex,
 };
 pub(crate) use host_safety::parse_profile_image_fetch_url;
-use host_safety::validate_locator;
+use host_safety::{validate_blossom_fetch_url, validate_locator};
 
 pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
 #[cfg(test)]
@@ -81,24 +81,26 @@ impl Default for MediaDownloadBenchmarkTransport {
 }
 
 /// Validate and compact the latest-message encrypted-media metadata for the
-/// chat-list surface. Malformed attachments are dropped independently; raw
-/// tags and metadata never cross the app boundary.
+/// chat-list surface. Raw tags and metadata never cross the app boundary.
+///
+/// A rejected attachment still counts as an attachment and classifies as
+/// `File` (the generic glyph): the timeline renders a placeholder for it, so
+/// the list preview must not describe the same message as text-only
+/// (mdk#1787). Its media type is not trusted for classification because the
+/// tag failed validation.
 pub(crate) fn classify_chat_list_attachments(
     media_json: Option<&str>,
 ) -> (Option<ChatListAttachmentKind>, u32) {
-    let Some(imeta) = media_json
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.get("imeta").and_then(Value::as_array).cloned())
-    else {
-        return (None, 0);
-    };
-
+    // A stored container that no longer parses is corruption, not "no media":
+    // keep it as a JSON string so the shared projection reports one
+    // undecodable attachment instead of a text-only preview.
+    let media = media_json.map(|raw| {
+        serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+    });
     let mut kinds = Vec::new();
-    for raw_tag in imeta {
-        let Ok(tag) = serde_json::from_value::<Vec<String>>(raw_tag) else {
-            continue;
-        };
-        let Ok(reference) = media_attachment_from_imeta_tag(&tag, None, false) else {
+    for outcome in media_attachment_outcomes_from_media_json(media.as_ref(), None, false) {
+        let MediaAttachmentOutcome::Accepted { reference, .. } = outcome else {
+            kinds.push(ChatListAttachmentKind::File);
             continue;
         };
         let media_type = reference.media_type.to_ascii_lowercase();
@@ -279,6 +281,143 @@ pub(crate) fn normalize_profile_image_max_bytes_for_test(max_bytes: u64) -> Resu
     normalize_profile_image_max_bytes(max_bytes)
 }
 
+/// Stable category of an encrypted-media attachment rejection.
+///
+/// Hosts branch on this instead of parsing error strings. The categories are
+/// part of the binding contract: add variants, never renumber or repurpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MediaAttachmentRejectionKind {
+    /// The entry is not a decodable encrypted-media `imeta` tag: it is not an
+    /// array of strings, its first element is not `imeta`, a known field has
+    /// no value, or a `locator` lacks its `kind value` pair.
+    InvalidStructure,
+    /// The `v` field is absent or names a media format this client does not
+    /// implement. Legacy MIP-era shapes and future versions land here, so a
+    /// host can say "unsupported attachment format" rather than "corrupt".
+    UnsupportedFormat,
+    /// A required field (`locator`, `ciphertext_sha256`, `plaintext_sha256`,
+    /// `nonce`, `m`, `filename`) is absent or empty.
+    MissingField,
+    /// A single-occurrence field appears more than once. Rejected rather than
+    /// resolved first- or last-wins because `m`, `filename`, and
+    /// `plaintext_sha256` feed key derivation and the AEAD AAD.
+    DuplicateField,
+    /// A present field has an invalid value: non-hex or wrong-length hashes or
+    /// nonce, an unparseable/unsafe locator URL, a Blossom URL that does not
+    /// commit to the ciphertext hash, a non-canonical media type, an invalid
+    /// filename, or a forbidden `blurhash`.
+    MalformedField,
+}
+
+impl MediaAttachmentRejectionKind {
+    /// Stable snake_case label shared by fixtures, CLI output, and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidStructure => "invalid_structure",
+            Self::UnsupportedFormat => "unsupported_format",
+            Self::MissingField => "missing_field",
+            Self::DuplicateField => "duplicate_field",
+            Self::MalformedField => "malformed_field",
+        }
+    }
+}
+
+/// Why one `imeta` attachment was rejected by the shared strict parser.
+///
+/// `detail` is presentation text for hosts and never echoes tag content
+/// (URLs, filenames, hashes, media types). Tracing must log only `kind`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaAttachmentRejection {
+    pub kind: MediaAttachmentRejectionKind,
+    pub detail: String,
+}
+
+impl MediaAttachmentRejection {
+    fn new(kind: MediaAttachmentRejectionKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    fn structure(detail: impl Into<String>) -> Self {
+        Self::new(MediaAttachmentRejectionKind::InvalidStructure, detail)
+    }
+
+    fn unsupported(detail: impl Into<String>) -> Self {
+        Self::new(MediaAttachmentRejectionKind::UnsupportedFormat, detail)
+    }
+
+    fn missing(detail: impl Into<String>) -> Self {
+        Self::new(MediaAttachmentRejectionKind::MissingField, detail)
+    }
+
+    fn duplicate(detail: impl Into<String>) -> Self {
+        Self::new(MediaAttachmentRejectionKind::DuplicateField, detail)
+    }
+
+    fn malformed(detail: impl Into<String>) -> Self {
+        Self::new(MediaAttachmentRejectionKind::MalformedField, detail)
+    }
+
+    /// Reclassify a helper's `AppError` as a malformed-field rejection, keeping
+    /// only its privacy-safe inner message.
+    fn malformed_from(err: AppError) -> Self {
+        Self::malformed(match err {
+            AppError::InvalidAppMessagePayload(detail)
+            | AppError::InvalidEncryptedMedia(detail) => detail,
+            other => other.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for MediaAttachmentRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl From<MediaAttachmentRejection> for AppError {
+    fn from(rejection: MediaAttachmentRejection) -> Self {
+        Self::MediaAttachmentRejected(rejection)
+    }
+}
+
+/// One `imeta` attachment of a message, in tag order, either parsed or
+/// rejected. `attachment_index` is the position among the message's `imeta`
+/// tags (not among the accepted ones), so hosts can render an ordered mix of
+/// media and placeholders and correlate with `list_media` records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaAttachmentOutcome {
+    Accepted {
+        attachment_index: u32,
+        reference: MediaAttachmentReference,
+    },
+    Rejected {
+        attachment_index: u32,
+        rejection: MediaAttachmentRejection,
+    },
+}
+
+impl MediaAttachmentOutcome {
+    fn from_result(
+        index: usize,
+        result: Result<MediaAttachmentReference, MediaAttachmentRejection>,
+    ) -> Self {
+        let attachment_index = u32::try_from(index).unwrap_or(u32::MAX);
+        match result {
+            Ok(reference) => Self::Accepted {
+                attachment_index,
+                reference,
+            },
+            Err(rejection) => Self::Rejected {
+                attachment_index,
+                rejection,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaLocator {
     pub kind: String,
@@ -317,25 +456,36 @@ impl MediaAttachmentReference {
     /// `MarmotAppConfig::allow_loopback_blob_endpoints`); private, link-local,
     /// documentation, IPv6-transition, and multicast hosts are rejected
     /// regardless of its value.
-    pub(crate) fn validate(&self, allow_loopback_http: bool) -> Result<(), AppError> {
-        let version = EncryptedMediaVersion::parse(&self.version)?;
-        validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")?;
-        validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")?;
+    ///
+    /// Every failure is a typed [`MediaAttachmentRejection`]; callers that
+    /// need an [`AppError`] convert with `?` and get
+    /// [`AppError::MediaAttachmentRejected`].
+    pub(crate) fn validate(
+        &self,
+        allow_loopback_http: bool,
+    ) -> Result<(), MediaAttachmentRejection> {
+        let version = EncryptedMediaVersion::parse(&self.version)
+            .map_err(|_| MediaAttachmentRejection::unsupported("media version is not supported"))?;
+        validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")
+            .map_err(MediaAttachmentRejection::malformed_from)?;
+        validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")
+            .map_err(MediaAttachmentRejection::malformed_from)?;
         let expected_ciphertext_sha256 = self.ciphertext_sha256.to_ascii_lowercase();
         let nonce = hex::decode(&self.nonce_hex)
-            .map_err(|_| AppError::InvalidAppMessagePayload("media nonce must be hex".into()))?;
+            .map_err(|_| MediaAttachmentRejection::malformed("media nonce must be hex"))?;
         if nonce.len() != 12 {
-            return Err(AppError::InvalidAppMessagePayload(
-                "media nonce must be 12 bytes".into(),
+            return Err(MediaAttachmentRejection::malformed(
+                "media nonce must be 12 bytes",
             ));
         }
         if self.locators.is_empty() {
-            return Err(AppError::InvalidAppMessagePayload(
-                "media attachment must include at least one locator".into(),
+            return Err(MediaAttachmentRejection::missing(
+                "media attachment must include at least one locator",
             ));
         }
         for locator in &self.locators {
-            validate_locator(locator, version, allow_loopback_http)?;
+            validate_locator(locator, version, allow_loopback_http)
+                .map_err(MediaAttachmentRejection::malformed_from)?;
             // The blossom content-hash binding is Blossom-specific integrity, like
             // the host-safety check in `validate_locator`: a `blossom-v1` locator
             // URL MUST carry the ciphertext hash so the fetched blob is the one
@@ -345,21 +495,21 @@ impl MediaAttachmentReference {
             if version == EncryptedMediaVersion::V1 && locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
                 let locator_hash =
                     blossom_content_hash_from_url(&locator.value).ok_or_else(|| {
-                        AppError::InvalidAppMessagePayload(
-                            "Blossom locator URL must include the encrypted blob hash".into(),
+                        MediaAttachmentRejection::malformed(
+                            "Blossom locator URL must include the encrypted blob hash",
                         )
                     })?;
                 if locator_hash != expected_ciphertext_sha256 {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "Blossom locator hash does not match media reference".into(),
+                    return Err(MediaAttachmentRejection::malformed(
+                        "Blossom locator hash does not match media reference",
                     ));
                 }
             }
         }
         match version {
             EncryptedMediaVersion::V1 if self.file_name.trim().is_empty() => {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "media file name cannot be empty".into(),
+                return Err(MediaAttachmentRejection::malformed(
+                    "media file name cannot be empty",
                 ));
             }
             EncryptedMediaVersion::V2
@@ -367,21 +517,23 @@ impl MediaAttachmentReference {
                     || self.file_name.len() > 255
                     || self.file_name.contains('\0') =>
             {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "media file name must be 1..255 UTF-8 bytes and contain no NUL".into(),
+                return Err(MediaAttachmentRejection::malformed(
+                    "media file name must be 1..255 UTF-8 bytes and contain no NUL",
                 ));
             }
             _ => {}
         }
         match version {
             EncryptedMediaVersion::V1 => {
-                canonical_media_type_v1(&self.media_type)?;
+                canonical_media_type_v1(&self.media_type)
+                    .map_err(MediaAttachmentRejection::malformed_from)?;
             }
             EncryptedMediaVersion::V2 => {
-                let canonical = canonical_media_type_v2(&self.media_type)?;
+                let canonical = canonical_media_type_v2(&self.media_type)
+                    .map_err(MediaAttachmentRejection::malformed_from)?;
                 if canonical != self.media_type {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "media type is not canonical for encrypted-media-v2".into(),
+                    return Err(MediaAttachmentRejection::malformed(
+                        "media type is not canonical for encrypted-media-v2",
                     ));
                 }
             }
@@ -730,7 +882,8 @@ fn upload_error_summary(err: &AppError) -> String {
     match err {
         AppError::BlobStore(message)
         | AppError::InvalidEncryptedMedia(message)
-        | AppError::InvalidAppMessagePayload(message) => message.clone(),
+        | AppError::InvalidAppMessagePayload(message)
+        | AppError::UnsafeMediaFetch(message) => message.clone(),
         AppError::MediaUploadTimedOut => "request timed out".to_owned(),
         // `upload_blossom_blob` should currently surface upload failures through
         // the privacy-scrubbed variants above. Keep this fallback as a defensive
@@ -795,7 +948,8 @@ pub(crate) async fn download_encrypted_media_with_transport(
         &plaintext_hash,
         &media_type,
         &reference.file_name,
-    )?;
+    )
+    .map_err(media_download_failure)?;
     let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
     let decrypt_started = Instant::now();
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key).map_err(|_| {
@@ -805,7 +959,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
             decrypt_started,
             false,
         );
-        AppError::InvalidEncryptedMedia("invalid media key length".into())
+        AppError::MediaDownloadFailed("invalid media key length".into())
     })?;
     let mut plaintext = encrypted;
     if cipher
@@ -818,7 +972,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
             decrypt_started,
             false,
         );
-        return Err(AppError::InvalidEncryptedMedia(
+        return Err(AppError::MediaDownloadFailed(
             "media decryption failed".into(),
         ));
     }
@@ -837,7 +991,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
             plaintext_verify_started,
             false,
         );
-        return Err(AppError::InvalidEncryptedMedia(
+        return Err(AppError::MediaDownloadFailed(
             "media plaintext hash does not match reference".into(),
         ));
     }
@@ -908,20 +1062,25 @@ async fn fetch_encrypted_media_blob_with_observer(
     // reference degrades to unfetchable (not invalid): the reference may still
     // be valid and the message delivered, only the blob is unreachable here.
     if !locator_kind_allowed(BLOSSOM_LOCATOR_KIND_V1, allowed_locator_kinds) {
-        return Err(AppError::InvalidEncryptedMedia(
+        return Err(AppError::MediaUnfetchable(
             "media reference has no supported locators".into(),
         ));
     }
     let mut candidates = encrypted_media_fetch_candidates(reference, fallback_endpoints);
-    if !transport.allow_loopback_http {
-        // A loopback-HTTP candidate is valid component state but unusable in a
-        // production build: skip it rather than GETting the local host. The
-        // candidate may come from a remote-admin policy endpoint or a
-        // sender-chosen locator, so the gate applies to both.
-        candidates.retain(|candidate| !is_loopback_http_endpoint(candidate));
-    }
+    // Host safety is client destination policy, judged before any dial: a
+    // loopback-HTTP candidate is valid component state but unusable in a
+    // production build, and a private/link-local/special-use literal host is
+    // never dialed. Skip such candidates rather than GETting them. The
+    // candidate may come from a remote-admin policy endpoint or a
+    // sender-chosen locator, so the gate applies to both. What survives is
+    // fetchable under policy; anything that then fails is a download failure.
+    candidates.retain(|candidate| {
+        url::Url::parse(candidate).is_ok_and(|url| {
+            validate_blossom_fetch_url(&url, transport.allow_loopback_http).is_ok()
+        })
+    });
     if candidates.is_empty() {
-        return Err(AppError::InvalidEncryptedMedia(
+        return Err(AppError::MediaUnfetchable(
             "media reference has no supported locators".into(),
         ));
     }
@@ -934,9 +1093,15 @@ async fn fetch_encrypted_media_blob_with_observer(
         match blossom_content_hash_from_url(&candidate) {
             Some(hash) if hash == expected_hash => {}
             Some(_) => {
-                last_error = Some(AppError::InvalidEncryptedMedia(
-                    "Blossom locator hash does not match media reference".into(),
-                ));
+                // A URL that commits to a different blob cannot serve this
+                // reference: the locator is unusable, so this candidate is
+                // unfetchable rather than a failed download.
+                record_candidate_failure(
+                    &mut last_error,
+                    AppError::MediaUnfetchable(
+                        "Blossom locator hash does not match media reference".into(),
+                    ),
+                );
                 record_locator_failover_if_needed(
                     telemetry,
                     candidate_started,
@@ -946,9 +1111,12 @@ async fn fetch_encrypted_media_blob_with_observer(
                 continue;
             }
             None => {
-                last_error = Some(AppError::InvalidEncryptedMedia(
-                    "Blossom locator URL did not include encrypted blob hash".into(),
-                ));
+                record_candidate_failure(
+                    &mut last_error,
+                    AppError::MediaUnfetchable(
+                        "Blossom locator URL did not include encrypted blob hash".into(),
+                    ),
+                );
                 record_locator_failover_if_needed(
                     telemetry,
                     candidate_started,
@@ -962,7 +1130,9 @@ async fn fetch_encrypted_media_blob_with_observer(
             .saturating_duration_since(tokio::time::Instant::now())
             .is_zero()
         {
-            return Err(AppError::BlobStore("media download timed out".into()));
+            return Err(AppError::MediaDownloadFailed(
+                "media download timed out".into(),
+            ));
         }
         let fetched = blossom::fetch_blossom_blob_with_observer_until(
             &candidate,
@@ -984,15 +1154,55 @@ async fn fetch_encrypted_media_blob_with_observer(
                 if matches {
                     return Ok(bytes);
                 }
-                last_error = Some(AppError::InvalidEncryptedMedia(
-                    "encrypted blob hash does not match media reference".into(),
-                ));
+                record_candidate_failure(
+                    &mut last_error,
+                    AppError::MediaDownloadFailed(
+                        "encrypted blob hash does not match media reference".into(),
+                    ),
+                );
             }
-            Err(err) => last_error = Some(err),
+            Err(err) => record_candidate_failure(&mut last_error, media_download_failure(err)),
         }
         record_locator_failover_if_needed(telemetry, candidate_started, index, candidate_count);
     }
-    Err(last_error.unwrap_or_else(|| AppError::BlobStore("download failed".into())))
+    Err(last_error.unwrap_or_else(|| AppError::MediaDownloadFailed("download failed".into())))
+}
+
+/// Record one candidate's failure as the attachment's provisional outcome.
+///
+/// The outcome class must not depend on locator order: once a permitted server
+/// was contacted, the attachment is a (retryable) download failure, and a later
+/// unusable or policy-refused candidate must not downgrade it to "unfetchable",
+/// which the binding contract defines as "nothing was dialed".
+fn record_candidate_failure(last_error: &mut Option<AppError>, failure: AppError) {
+    if matches!(
+        (&*last_error, &failure),
+        (
+            Some(AppError::MediaDownloadFailed(_)),
+            AppError::MediaUnfetchable(_)
+        )
+    ) {
+        return;
+    }
+    *last_error = Some(failure);
+}
+
+/// Classify a failure raised for a candidate that passed the pre-dial filter.
+/// A destination-policy refusal from the shared Blossom client (the hostname
+/// resolved to a non-public address, or the URL failed the host-safety check)
+/// arrives as `UnsafeMediaFetch` and means nothing was sent: that candidate is
+/// unfetchable. Transport and integrity errors arrive as `BlobStore` /
+/// `InvalidEncryptedMedia` and mean the attachment is unavailable, never that
+/// the reference is invalid. Errors that already carry a media class pass
+/// through unchanged.
+fn media_download_failure(err: AppError) -> AppError {
+    match err {
+        AppError::UnsafeMediaFetch(detail) => AppError::MediaUnfetchable(detail),
+        AppError::BlobStore(detail) | AppError::InvalidEncryptedMedia(detail) => {
+            AppError::MediaDownloadFailed(detail)
+        }
+        other => other,
+    }
 }
 
 /// Record one reviewed media phase without dynamic labels or identifiers.
@@ -1045,18 +1255,60 @@ fn encrypted_media_fetch_candidates(
     candidates
 }
 
+/// Parse one authenticated `imeta` tag into a validated reference, or the
+/// [`AppError::MediaAttachmentRejected`] wrapper around the typed rejection.
+/// Prefer [`parse_media_attachment`] when the caller can act on the category.
 pub fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
     allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, AppError> {
+    parse_media_attachment(tag, source_epoch, allow_loopback_http).map_err(AppError::from)
+}
+
+/// The shared strict `imeta` parser: every projection, the standalone parse
+/// binding, and the CLI reach the same verdict for the same tag.
+///
+/// The version field is judged before anything else so the rejection category
+/// does not depend on field order: a tag with no `v`, or a `v` this client does
+/// not implement (including MIP-era shapes), is [`UnsupportedFormat`]
+/// regardless of what else is wrong with it. Strictness is unchanged; only the
+/// precedence among several independent defects is fixed.
+///
+/// [`UnsupportedFormat`]: MediaAttachmentRejectionKind::UnsupportedFormat
+pub fn parse_media_attachment(
+    tag: &[String],
+    source_epoch: Option<u64>,
+    allow_loopback_http: bool,
+) -> Result<MediaAttachmentReference, MediaAttachmentRejection> {
     if tag.first().map(String::as_str) != Some("imeta") {
-        return Err(AppError::InvalidAppMessagePayload(
-            "media tag must be imeta".into(),
+        return Err(MediaAttachmentRejection::structure(
+            "media tag must be imeta",
         ));
     }
-    let mut locators = Vec::new();
     let mut version = None;
+    for field in tag.iter().skip(1) {
+        if field == "v" {
+            return Err(MediaAttachmentRejection::structure(
+                "media field v is missing its value",
+            ));
+        }
+        if let Some(value) = field.strip_prefix("v ") {
+            if version.is_some() {
+                return Err(MediaAttachmentRejection::duplicate(
+                    "media tag must contain exactly one version",
+                ));
+            }
+            EncryptedMediaVersion::parse(value).map_err(|_| {
+                MediaAttachmentRejection::unsupported("media version is not supported")
+            })?;
+            version = Some(value.to_owned());
+        }
+    }
+    let Some(version) = version else {
+        return Err(MediaAttachmentRejection::unsupported("media tag missing v"));
+    };
+    let mut locators = Vec::new();
     let mut ciphertext_sha256 = None;
     let mut plaintext_sha256 = None;
     let mut nonce_hex = None;
@@ -1068,9 +1320,12 @@ pub fn media_attachment_from_imeta_tag(
     // plaintext_sha256 feed file_key derivation and the AEAD AAD, so a first-wins
     // vs last-wins decoder would derive different keys for the same tag. Reject a
     // duplicate rather than overwriting (spec/features/encrypted-media.md).
-    let set_once = |slot: &mut Option<String>, value: &str, label: &str| -> Result<(), AppError> {
+    let set_once = |slot: &mut Option<String>,
+                    value: &str,
+                    label: &str|
+     -> Result<(), MediaAttachmentRejection> {
         if slot.is_some() {
-            return Err(AppError::InvalidAppMessagePayload(format!(
+            return Err(MediaAttachmentRejection::duplicate(format!(
                 "media tag must contain exactly one {label}"
             )));
         }
@@ -1079,15 +1334,13 @@ pub fn media_attachment_from_imeta_tag(
     };
     for field in tag.iter().skip(1) {
         if field == "blurhash" || field.starts_with("blurhash ") {
-            return Err(AppError::InvalidAppMessagePayload(
-                "encrypted media uses thumbhash, not blurhash".into(),
+            return Err(MediaAttachmentRejection::malformed(
+                "encrypted media uses thumbhash, not blurhash",
             ));
         }
         if let Some(rest) = field.strip_prefix("locator ") {
             let (kind, value) = rest.split_once(' ').ok_or_else(|| {
-                AppError::InvalidAppMessagePayload(
-                    "media locator must include kind and value".into(),
-                )
+                MediaAttachmentRejection::structure("media locator must include kind and value")
             })?;
             locators.push(MediaLocator {
                 kind: kind.to_owned(),
@@ -1099,7 +1352,6 @@ pub fn media_attachment_from_imeta_tag(
             if matches!(
                 field.as_str(),
                 "locator"
-                    | "v"
                     | "ciphertext_sha256"
                     | "plaintext_sha256"
                     | "nonce"
@@ -1108,17 +1360,15 @@ pub fn media_attachment_from_imeta_tag(
                     | "dim"
                     | "thumbhash"
             ) {
-                return Err(AppError::InvalidAppMessagePayload(format!(
+                return Err(MediaAttachmentRejection::structure(format!(
                     "media field {field} is missing its value"
                 )));
             }
             continue;
         };
         match key {
-            "v" => {
-                EncryptedMediaVersion::parse(value)?;
-                set_once(&mut version, value, "version")?;
-            }
+            // Judged in the version pre-pass above.
+            "v" => {}
             "ciphertext_sha256" => set_once(&mut ciphertext_sha256, value, "ciphertext_sha256")?,
             "plaintext_sha256" => set_once(&mut plaintext_sha256, value, "plaintext_sha256")?,
             "nonce" => set_once(&mut nonce_hex, value, "nonce")?,
@@ -1132,7 +1382,7 @@ pub fn media_attachment_from_imeta_tag(
     let required = |name: &'static str, value: Option<String>| {
         value
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| AppError::InvalidAppMessagePayload(format!("media tag missing {name}")))
+            .ok_or_else(|| MediaAttachmentRejection::missing(format!("media tag missing {name}")))
     };
     let reference = MediaAttachmentReference {
         locators,
@@ -1141,13 +1391,88 @@ pub fn media_attachment_from_imeta_tag(
         nonce_hex: required("nonce", nonce_hex)?,
         file_name: required("filename", file_name)?,
         media_type: required("m", media_type)?,
-        version: required("v", version)?,
+        version,
         source_epoch: source_epoch.unwrap_or_default(),
         dim,
         thumbhash,
     };
     reference.validate(allow_loopback_http)?;
     Ok(reference)
+}
+
+/// Project a message's `imeta` tags into ordered per-attachment outcomes.
+///
+/// Only tags whose first element is `imeta` are attachments; other tags do not
+/// consume an index. Rejection is attachment-local: a malformed tag yields a
+/// [`MediaAttachmentOutcome::Rejected`] entry at its position and never hides
+/// its valid siblings or the carrying message.
+pub fn media_attachment_outcomes_from_tags(
+    tags: &[Vec<String>],
+    source_epoch: Option<u64>,
+    allow_loopback_http: bool,
+) -> Vec<MediaAttachmentOutcome> {
+    tags.iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .enumerate()
+        .map(|(index, tag)| {
+            MediaAttachmentOutcome::from_result(
+                index,
+                parse_media_attachment(tag, source_epoch, allow_loopback_http),
+            )
+        })
+        .collect()
+}
+
+/// Project a materialized timeline row's `media` metadata (`{ "imeta": [..] }`,
+/// built by the storage projection from exactly the message's `imeta` tags in
+/// order) into the same ordered outcomes as
+/// [`media_attachment_outcomes_from_tags`] yields for the raw message, so a
+/// timeline row and a `list_media` record for one message agree on every index.
+///
+/// `None`, or an object without an `imeta` list, means the message has no
+/// attachments. Anything else that is present but undecodable is preserved as
+/// a diagnostic rather than dropped: a container that is not a JSON object
+/// (storage hands a corrupt column through as a JSON string), or an `imeta`
+/// value that is not a list, cannot be indexed and is reported once as an
+/// [`InvalidStructure`] rejection at index 0; an entry that is not an array of
+/// strings is reported at its own position.
+///
+/// [`InvalidStructure`]: MediaAttachmentRejectionKind::InvalidStructure
+pub fn media_attachment_outcomes_from_media_json(
+    media: Option<&Value>,
+    source_epoch: Option<u64>,
+    allow_loopback_http: bool,
+) -> Vec<MediaAttachmentOutcome> {
+    let undecodable = || {
+        vec![MediaAttachmentOutcome::from_result(
+            0,
+            Err(MediaAttachmentRejection::structure(
+                "media metadata could not be decoded",
+            )),
+        )]
+    };
+    let Some(media) = media else {
+        return Vec::new();
+    };
+    let Some(container) = media.as_object() else {
+        return undecodable();
+    };
+    let Some(imeta) = container.get("imeta") else {
+        return Vec::new();
+    };
+    let Some(entries) = imeta.as_array() else {
+        return undecodable();
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let parsed = serde_json::from_value::<Vec<String>>(entry.clone())
+                .map_err(|_| MediaAttachmentRejection::structure("media tag could not be decoded"))
+                .and_then(|tag| parse_media_attachment(&tag, source_epoch, allow_loopback_http));
+            MediaAttachmentOutcome::from_result(index, parsed)
+        })
+        .collect()
 }
 
 /// Whether `tags` contains at least one structurally valid media reference.

@@ -20,6 +20,32 @@ same UniFFI surface, and releases publish it once.
 bindings to handle the new tag; older generated sources cannot render it.
 No generated Swift or Kotlin files are committed here.
 
+## Identity references and profile pseudonyms
+
+`accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
+`nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
+`nostr:npub`, and `marmot://profile/` links. Relay hints inside an
+nprofile are discarded and never used for routing or directory mutation.
+Duplicate type-0 TLV entries keep the first key. After FFI wrapper
+normalization, the nprofile fallback rejects encoded tokens longer than
+1023 UTF-8 bytes (the locked Bech32/Bech32m ceiling); a valid 1023-byte
+token still decodes when wrapped in `nostr:` or `marmot://profile/...`.
+The app helper strips one lowercase `nostr:` prefix itself; profile-link
+and whitespace normalization belong to FFI. The app helper's legacy NIP-21
+parser may still accept a colon-suffixed `nostr:<npub>:` form before the
+fallback runs; FFI normalization rejects that form. Decode a scanned reference
+first, then pass
+the canonical lowercase hex account id to `defaultProfilePseudonym` so
+the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
+`npub` silently produces a different name, not an error. `randomProfilePseudonym`
+replaces client-owned random-roll wordlists; it is cosmetic, may
+collide, and does not create an account.
+
+Regenerate Swift/Kotlin bindings after pulling this surface. Android
+mention/QR/edit-profile migration remains
+[whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
+MDK completion enables that follow-through but does not replace it.
+
 See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
 checksums, provenance, and generated-source synchronization rules.
 

@@ -238,6 +238,23 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_OK, "npub lookup call succeeds");
     marmot_string_free(npub);
 
+    char *account_hex = NULL;
+    const char *bootstrap_id =
+        "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    st = marmot_account_id_hex(client, bootstrap_id, &account_hex);
+    check(st == MARMOT_STATUS_OK && account_hex != NULL, "account_id_hex hex");
+    marmot_string_free(account_hex);
+
+    char *pseudonym = NULL;
+    st = marmot_default_profile_pseudonym(client, bootstrap_id, &pseudonym);
+    check(st == MARMOT_STATUS_OK && pseudonym != NULL, "default profile pseudonym");
+    marmot_string_free(pseudonym);
+
+    char *random_name = NULL;
+    st = marmot_random_profile_pseudonym(client, &random_name);
+    check(st == MARMOT_STATUS_OK && random_name != NULL, "random profile pseudonym");
+    marmot_string_free(random_name);
+
     /* ---- boundary validation ------------------------------------------ */
     /* Out-of-range enum discriminants are rejected instead of becoming
      * invalid Rust enum values. */

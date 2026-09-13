@@ -28,13 +28,36 @@ impl Marmot {
         marmot_app::npub_for_account_id(&account_id_hex).ok()
     }
 
-    /// Normalize a public-key reference (npub or hex) to canonical hex.
-    /// `None` if it isn't a valid public key. Used to resolve a scanned or
-    /// deep-linked npub back to the account id the rest of the API expects.
+    /// Normalize a public-key reference (hex, `npub`, `nostr:npub`,
+    /// `nprofile`, `nostr:nprofile`, or a `marmot://profile/` link) to
+    /// canonical hex. `None` if it isn't a valid public identity
+    /// reference. nprofile relay hints are discarded. Duplicate type-0
+    /// TLV entries keep the first key. After wrapper normalization, the
+    /// nprofile fallback rejects encoded tokens longer than 1023 UTF-8
+    /// bytes; a valid 1023-byte token still decodes when wrapped. Used
+    /// to resolve a scanned or deep-linked mention back to the account
+    /// id the rest of the API expects.
     pub fn account_id_hex(&self, reference: String) -> Option<String> {
         normalize_member_ref_ffi(&reference)
             .ok()
             .map(|normalized| normalized.account_id_hex)
+    }
+
+    /// Deterministic cosmetic display name for a canonical hex account id.
+    ///
+    /// The seed is hashed as supplied UTF-8 text and is not normalized.
+    /// Decode a scanned reference with [`Self::account_id_hex`] first.
+    /// This does not start networking or mutate a profile.
+    pub fn default_profile_pseudonym(&self, account_id_hex: String) -> String {
+        marmot_app::default_profile_pseudonym(&account_id_hex)
+    }
+
+    /// Random cosmetic display name from the shared wordlists.
+    ///
+    /// This does not generate a signing key, create an account, or
+    /// promise uniqueness or anonymity.
+    pub fn random_profile_pseudonym(&self) -> String {
+        marmot_app::random_profile_pseudonym()
     }
 
     /// Parse plaintext message content into the same Markdown AST returned on
@@ -205,6 +228,11 @@ mod tests {
     use crate::conversions::{
         MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserSearchUpdateFfi,
     };
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
 
     async fn wait_for_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -512,5 +540,46 @@ mod tests {
             SearchUpdateTriggerFfi::SearchCompleted
         ));
         assert!(subscription.next_update().await.is_none());
+    }
+
+    #[test]
+    fn account_id_hex_and_pseudonyms_are_offline_and_match_app_helpers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        for case in cases() {
+            assert_eq!(
+                kit.account_id_hex(case.reference.clone()).as_deref(),
+                case.ffi_account_id_hex,
+                "case {}",
+                case.name
+            );
+        }
+
+        assert_eq!(
+            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+            marmot_app::default_profile_pseudonym(ACCOUNT_ID)
+        );
+        assert_eq!(
+            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+            "Loyal Crane"
+        );
+        let random = kit.random_profile_pseudonym();
+        let (adjective, noun) = random.split_once(' ').expect("adjective noun");
+        assert!(!noun.contains(' '));
+        assert!(
+            adjective
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        );
+        assert!(
+            noun.chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        );
+        assert!(adjective.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
+        assert!(noun.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
     }
 }
