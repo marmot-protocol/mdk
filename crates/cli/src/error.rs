@@ -153,13 +153,6 @@ pub(crate) enum WnError {
     InvalidWelcomeId,
     #[error("initial admin {0} is not one of the invited members")]
     InitialAdminNotInvited(String),
-    #[error(
-        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
-    )]
-    MediaReferenceStaleEpoch {
-        source_epoch: u64,
-        current_epoch: u64,
-    },
     #[error("exporting private keys is disabled by White Noise CLI policy")]
     PrivateKeyExportDisabled,
     #[error("{command} requires {flag}: {reason}")]
@@ -483,18 +476,6 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "message": err.to_string(),
             "member": member,
         }),
-        WnError::MediaReferenceStaleEpoch {
-            source_epoch,
-            current_epoch,
-        } => json!({
-            "code": "media_reference_stale_epoch",
-            "message": err.to_string(),
-            "source_epoch": source_epoch,
-            "current_epoch": current_epoch,
-            "repair": {
-                "action": "wn media upload <group-hex> <file-path> [--send]",
-            },
-        }),
         WnError::InvalidMuteDuration(duration) => json!({
             "code": "invalid_mute_duration",
             "message": err.to_string(),
@@ -705,6 +686,20 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "invalid_encrypted_media",
             "message": err.to_string(),
             "reason": reason,
+        }),
+        // Raised by the CLI pre-check and, if a commit lands in between, by the
+        // account worker itself; both surface the same typed code and fields.
+        AppError::MediaReferenceStaleEpoch {
+            source_epoch,
+            current_epoch,
+        } => json!({
+            "code": "media_reference_stale_epoch",
+            "message": err.to_string(),
+            "source_epoch": source_epoch,
+            "current_epoch": current_epoch,
+            "repair": {
+                "action": "wn media upload <group-hex> <file-path> [--send]",
+            },
         }),
         AppError::InvalidAppMessagePayload(reason) => json!({
             "code": "invalid_app_message_payload",

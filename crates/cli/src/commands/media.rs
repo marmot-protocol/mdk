@@ -231,10 +231,11 @@ pub(crate) async fn media_command_with_runtime(
                 .iter()
                 .find(|reference| reference.source_epoch != current_epoch)
             {
-                return Err(WnError::MediaReferenceStaleEpoch {
+                return Err(AppError::MediaReferenceStaleEpoch {
                     source_epoch: stale.source_epoch,
                     current_epoch,
-                });
+                }
+                .into());
             }
             // The runtime re-validates every reference against the group's
             // media profile, locator policy, and version.

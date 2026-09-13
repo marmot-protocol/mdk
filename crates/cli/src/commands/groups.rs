@@ -897,12 +897,14 @@ pub(crate) async fn groups_command_with_runtime(
             let (group, mls) = group_record_and_mls(app, runtime, &account, &group_id_hex).await?;
             let mut json = disband_status_json(&group, mls.as_ref());
             insert_account_fields(&mut json, &account)?;
+            // The JSON already combines the durable record with the MLS read;
+            // the plain line must describe the same combined state.
             Ok(CommandOutput {
                 plain: format!(
                     "disband group={group_id_hex} state={} disbanding={} disbanded={}",
                     json["state"].as_str().unwrap_or("unknown"),
-                    group.disbanding,
-                    group.disbanded
+                    json["disbanding"].as_bool().unwrap_or(false),
+                    json["disbanded"].as_bool().unwrap_or(false)
                 ),
                 json,
             })

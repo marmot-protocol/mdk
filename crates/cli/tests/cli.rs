@@ -8230,26 +8230,39 @@ fn groups_disband_lifecycle_exposes_pending_and_terminal_state() {
             "--confirm",
         ],
     );
-    assert_eq!(requested["state"], "pending");
-    assert_eq!(requested["disbanded"], false);
+    // The response echoes the durable request that was recorded, while
+    // `state` is the freshest observation at return time. The runtime's
+    // post-request catch-up may already have published the terminal commit,
+    // so the request is `pending` and the state is `pending` or `disbanded`.
     assert!(
         requested["disband_request"]["pending"]["requested_at_ms"]
             .as_u64()
-            .is_some()
+            .is_some(),
+        "{requested}"
+    );
+    assert!(
+        ["pending", "disbanded"].contains(&requested["state"].as_str().unwrap_or("")),
+        "{requested}"
     );
 
-    // The durable request gates ordinary outbound work before the terminal
-    // commit lands, and the status surface distinguishes pending from terminal.
     // Every `wn` invocation is a fresh process and runtime, so this read is
-    // also the restart case: the pending request survived the process that
-    // recorded it.
-    let pending = run_json(
+    // also the restart case: the durable outcome survived the process that
+    // recorded the request. Either way the group is gated: a pending request
+    // blocks ordinary outbound work, and a terminal copy refuses it.
+    let after_request = run_json(
         home.path(),
         &["--account", &alice, "groups", "disband-status", group_id],
     );
-    assert_eq!(pending["disbanding"], true);
-    assert_eq!(pending["disbanded"], false);
-    assert_eq!(pending["state"], "pending");
+    assert!(
+        ["pending", "disbanded"].contains(&after_request["state"].as_str().unwrap_or("")),
+        "{after_request}"
+    );
+    if after_request["state"] == "pending" {
+        assert_eq!(after_request["disbanding"], true);
+        assert_eq!(after_request["disbanded"], false);
+    } else {
+        assert_eq!(after_request["disbanded"], true);
+    }
     let blocked = run_json_error(
         home.path(),
         &[

@@ -74,9 +74,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Changed
 
 - The runtime's `send_media_attachments` (MarmotKit and `wn media send`) refuses a media reference whose
-  `source_epoch` differs from the group's current epoch with `InvalidEncryptedMedia`. The `imeta` tag carries no
-  epoch, so recipients derive the media key from the delivering message's epoch; a stale reference would have
-  published fine and then failed to decrypt everywhere. Upload the file again after a commit advances the group.
+  `source_epoch` differs from the group's current epoch with the new typed `AppError::MediaReferenceStaleEpoch`
+  (`source_epoch`, `current_epoch`), which MarmotKit surfaces as `InvalidMediaReference` and `wn` as
+  `media_reference_stale_epoch` with both epochs, whether the CLI pre-check or the account worker caught it. The
+  `imeta` tag carries no epoch, so recipients derive the media key from the delivering message's epoch; a stale
+  reference would have published fine and then failed to decrypt everywhere. Upload the file again after a commit
+  advances the group.
 - `wn messages delete` help now describes what the handler does: it publishes an authenticated kind-5 delete
   tombstone to the group, which is a group-visible deletion request rather than a local-view change or secure
   erasure.

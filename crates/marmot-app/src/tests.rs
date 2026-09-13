@@ -4962,7 +4962,16 @@ async fn media_send_refuses_stale_epoch_body() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AppError::InvalidEncryptedMedia(ref reason) if reason.contains("epoch")),
+        matches!(
+            error,
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } if source_epoch == current_epoch + 1 && current_epoch == client
+                .group_mls_state(&group_id)
+                .unwrap()
+                .epoch
+        ),
         "{error:?}"
     );
     assert!(
