@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
@@ -36,18 +37,87 @@ enum TestRelayHandle {
     Local(LocalRelay),
 }
 
-#[derive(Debug)]
-struct RejectKind5WritePolicy;
+#[derive(Default)]
+struct RecordingKind5State {
+    rejected_targets: BTreeSet<String>,
+    attempts: Vec<(String, String, bool)>,
+}
 
-impl WritePolicy for RejectKind5WritePolicy {
+#[derive(Clone)]
+struct RecordingKind5WritePolicy {
+    relay: &'static str,
+    state: Arc<Mutex<RecordingKind5State>>,
+}
+
+impl RecordingKind5WritePolicy {
+    fn pair() -> (Self, Self) {
+        let state = Arc::new(Mutex::new(RecordingKind5State::default()));
+        (
+            Self {
+                relay: "current",
+                state: state.clone(),
+            },
+            Self {
+                relay: "lagging",
+                state,
+            },
+        )
+    }
+
+    fn reject_target(&self, event_id: &str) {
+        self.state
+            .lock()
+            .expect("kind5 policy")
+            .rejected_targets
+            .insert(event_id.to_owned());
+    }
+
+    fn attempt_count(&self) -> usize {
+        self.state.lock().expect("kind5 policy").attempts.len()
+    }
+
+    fn attempts_since(&self, baseline_len: usize) -> Vec<(String, String, bool)> {
+        self.state
+            .lock()
+            .expect("kind5 policy")
+            .attempts
+            .iter()
+            .skip(baseline_len)
+            .cloned()
+            .collect()
+    }
+}
+
+impl fmt::Debug for RecordingKind5WritePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordingKind5WritePolicy")
+            .field("relay", &self.relay)
+            .finish()
+    }
+}
+
+impl WritePolicy for RecordingKind5WritePolicy {
     fn admit_event<'a>(
         &'a self,
         event: &'a nostr::Event,
         _addr: &'a std::net::SocketAddr,
     ) -> nostr_relay_builder::prelude::BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if event.kind.as_u16() == 5 {
-                PolicyResult::Reject("kind-5 deletions rejected".to_owned())
+            if event.kind.as_u16() != 5 {
+                return PolicyResult::Accept;
+            }
+            let targets = kind5_event_targets(event);
+            let mut state = self.state.lock().expect("kind5 policy");
+            let reject = targets
+                .iter()
+                .any(|target| state.rejected_targets.contains(target));
+            for target in targets {
+                state
+                    .attempts
+                    .push((self.relay.to_owned(), target, !reject));
+            }
+            if reject {
+                PolicyResult::Reject("superseded kind-5 target rejected".to_owned())
             } else {
                 PolicyResult::Accept
             }
@@ -55,13 +125,26 @@ impl WritePolicy for RejectKind5WritePolicy {
     }
 }
 
+fn kind5_event_targets(event: &nostr::Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let slice = tag.as_slice();
+            (slice.first().map(String::as_str) == Some("e"))
+                .then(|| slice.get(1).cloned())
+                .flatten()
+        })
+        .collect()
+}
+
 impl TestRelay {
     fn new() -> Self {
         Self::from_mock()
     }
 
-    fn rejecting_deletions() -> Self {
-        Self::from_local_builder(RelayBuilder::default().write_policy(RejectKind5WritePolicy))
+    fn with_write_policy(policy: impl WritePolicy + 'static) -> Self {
+        Self::from_local_builder(RelayBuilder::default().write_policy(policy))
     }
 
     fn from_mock() -> Self {
@@ -157,18 +240,7 @@ impl TestRelay {
     fn kind5_targets(&self) -> Vec<String> {
         self.fetch_events(nostr::Filter::new().kind(nostr::Kind::EventDeletion))
             .into_iter()
-            .flat_map(|event| {
-                event
-                    .tags
-                    .iter()
-                    .filter_map(|tag| {
-                        let slice = tag.as_slice();
-                        (slice.first().map(String::as_str) == Some("e"))
-                            .then(|| slice.get(1).cloned())
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|event| kind5_event_targets(&event))
             .collect()
     }
 }
@@ -3087,8 +3159,9 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
 
 #[test]
 fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
-    let current = TestRelay::new();
-    let lagging = TestRelay::rejecting_deletions();
+    let (current_policy, lagging_policy) = RecordingKind5WritePolicy::pair();
+    let current = TestRelay::with_write_policy(current_policy.clone());
+    let lagging = TestRelay::with_write_policy(lagging_policy.clone());
     let home = tempfile::tempdir().expect("tempdir");
     let account_id = create_account_with_real_relay(home.path(), current.url());
 
@@ -3224,6 +3297,11 @@ fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
         "only the rotated winner is current in the observed window"
     );
 
+    // Reject the superseded id on every deletion endpoint after setup so a
+    // later current-relay ACK cannot hide the required failed-event case.
+    current_policy.reject_target(&older_id);
+    let baseline_attempts = current_policy.attempt_count();
+
     let unconfirmed = run_json_error_with_relay(
         home.path(),
         current.url(),
@@ -3231,6 +3309,11 @@ fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
     );
     assert_eq!(unconfirmed["code"], "confirmation_required");
     assert_eq!(unconfirmed["flag"], "--confirm");
+    assert_eq!(
+        current_policy.attempt_count(),
+        baseline_attempts,
+        "confirmation must fail before any delete-all publication"
+    );
 
     let delete_all = run_json_with_relay(
         home.path(),
@@ -3270,37 +3353,38 @@ fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
         "delete-all must attempt the current and superseded ids exactly once: {delete_all}"
     );
     assert_eq!(
-        deleted_ids.len() + failed_ids.len(),
-        2,
-        "each observed id must be attempted once: {delete_all}"
+        deleted_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([newer_id.clone()]),
+        "the current winner must be the only successful delete-all target: {delete_all}"
     );
-    assert_eq!(delete_all["deleted_count"], deleted_ids.len());
-    assert_eq!(delete_all["failed_count"], failed_ids.len());
+    assert_eq!(
+        failed_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([older_id.clone()]),
+        "the superseded id must be reported failed, not falsely successful: {delete_all}"
+    );
+    assert_eq!(
+        deleted_ids.len(),
+        1,
+        "exactly one deleted event: {delete_all}"
+    );
+    assert_eq!(
+        failed_ids.len(),
+        1,
+        "exactly one failed event: {delete_all}"
+    );
+    assert_eq!(delete_all["deleted_count"], 1);
+    assert_eq!(delete_all["failed_count"], 1);
     assert!(
-        deleted_ids.contains(&newer_id),
-        "the current winner must remain a successful delete-all target: {delete_all}"
+        delete_all["failed"][0]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "failed-event attribution must include a nonempty error: {delete_all}"
     );
     assert!(
         delete_all["accepted_relays"]
             .as_u64()
             .is_some_and(|count| count > 0)
     );
-    if failed_ids.contains(&older_id) {
-        assert_eq!(failed_ids, vec![older_id.clone()]);
-        assert_eq!(deleted_ids, vec![newer_id.clone()]);
-        assert!(
-            delete_all["failed"][0]["error"]
-                .as_str()
-                .is_some_and(|error| !error.is_empty()),
-            "failed-event attribution must name the superseded id: {delete_all}"
-        );
-    } else {
-        assert_eq!(
-            deleted_ids.iter().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from([older_id.clone(), newer_id.clone()])
-        );
-        assert!(failed_ids.is_empty());
-    }
     for local_only_id in &local_only_ids {
         assert!(
             !deleted_ids.contains(local_only_id) && !failed_ids.contains(local_only_id),
@@ -3308,23 +3392,37 @@ fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
         );
     }
 
-    let current_targets = current.kind5_targets().into_iter().collect::<BTreeSet<_>>();
-    assert!(
-        current_targets.contains(&newer_id),
-        "current relay must receive the current event's deletion"
+    let fresh_attempts = current_policy.attempts_since(baseline_attempts);
+    let fresh_targets = fresh_attempts
+        .iter()
+        .map(|(_, target, _)| target.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fresh_targets,
+        BTreeSet::from([older_id.clone(), newer_id.clone()]),
+        "delete-all must publish both ids after the pre-delete-all baseline"
     );
-    let lagging_targets = lagging.kind5_targets().into_iter().collect::<BTreeSet<_>>();
-    if failed_ids.contains(&older_id) {
-        assert!(
-            lagging_targets.is_empty(),
-            "lagging relay must reject the superseded deletion"
-        );
-    } else {
-        assert!(
-            current_targets.contains(&older_id) || lagging_targets.contains(&older_id),
-            "the superseded deletion must be routed to an observed endpoint"
-        );
-    }
+    assert!(
+        fresh_attempts
+            .iter()
+            .any(|(relay, target, accepted)| relay == "current"
+                && target == &newer_id
+                && *accepted),
+        "the current target must be accepted on its supplied endpoint"
+    );
+    assert!(
+        fresh_attempts
+            .iter()
+            .any(|(_, target, accepted)| target == &older_id && !*accepted),
+        "the superseded target must be rejected on a supplied deletion endpoint"
+    );
+    assert!(
+        current
+            .kind5_targets()
+            .iter()
+            .any(|target| target == &newer_id),
+        "the accepted current deletion must be stored on the current relay"
+    );
 }
 
 #[test]
