@@ -1525,7 +1525,7 @@ impl SqliteAccountStorage {
                         },
                     )
                     .storage()?;
-                if active && !terminal {
+                if active && !terminal && !forget {
                     tx.execute_cached(
                         "INSERT INTO local_group_deletion_frontiers (
                             group_id_hex, message_insert_order, prior_nostr_routes_json

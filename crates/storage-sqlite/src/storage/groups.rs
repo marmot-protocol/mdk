@@ -38,24 +38,23 @@ impl GroupStorage for SqliteAccountStorage {
     }
 
     fn complete_group_local_reset(&self, id: &GroupId) -> StorageResult<()> {
+        let conn = self.lock()?;
         // The old app-only deletion path forbids rehydrating erased media keys
         // from retained MLS state. This join has new MLS state, so that barrier
         // must not carry into the new membership (including a lower fork epoch).
-        self.lock()?
-            .execute_cached(
-                "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
+        conn.execute_cached(
+            "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
              WHERE group_id_hex = ?1 AND EXISTS (
                  SELECT 1 FROM locally_forgotten_groups
                  WHERE group_id = ?2 AND awaiting_welcome = 1)",
-                params![hex::encode(id.as_slice()), id.as_slice()],
-            )
-            .storage()?;
-        self.lock()?
-            .execute_cached(
-                "UPDATE locally_forgotten_groups SET awaiting_welcome = 0 WHERE group_id = ?1",
-                params![id.as_slice()],
-            )
-            .storage()?;
+            params![hex::encode(id.as_slice()), id.as_slice()],
+        )
+        .storage()?;
+        conn.execute_cached(
+            "UPDATE locally_forgotten_groups SET awaiting_welcome = 0 WHERE group_id = ?1",
+            params![id.as_slice()],
+        )
+        .storage()?;
         Ok(())
     }
 
