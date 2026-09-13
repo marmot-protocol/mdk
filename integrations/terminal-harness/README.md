@@ -146,7 +146,15 @@ own command through this escape.
 
 `/new` and `/reset-session` never delete backend-owned transcripts and never
 retry a failed resumed prompt automatically; the next distinct prompt starts a
-new logical backend session in the retained workdir.
+new logical backend session in the retained workdir. Reset application and its
+acknowledgement outcome are durably keyed by the inbound message reference in a
+bounded recent-replay window, so a reconnect replay resends the same
+acknowledgement without advancing the session epoch again. Observations from
+work started before that epoch boundary cannot restore the old session.
+
+On Unix, every backend invocation runs in its own process group. Timeout,
+cancellation, and failure cleanup terminate the whole group before reaping the
+direct child so backend-spawned descendants cannot outlive an interrupted turn.
 
 The stored goal is prepended to every prompt in its chat as one delimited block.
 That costs prompt tokens on every turn and, in exchange, survives session

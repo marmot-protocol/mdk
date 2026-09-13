@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_control::AgentControlMediaRef;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, watch};
 
 use crate::error::Result;
@@ -17,7 +18,33 @@ pub(crate) struct SessionRecord {
     /// Standing instruction prepended to every prompt in this chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) goal: Option<String>,
+    /// Monotonic session epoch used to reject observations from work that
+    /// started before a `/new` or `/cd` boundary.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) generation: u64,
+    /// Bounded durable idempotency receipts for applied `/new` commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reset_receipts: Vec<ResetReceipt>,
 }
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResetSessionOutcome {
+    pub(crate) changed: bool,
+    pub(crate) replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ResetReceipt {
+    message_ref_digest: String,
+    changed: bool,
+    generation: u64,
+}
+
+const MAX_RESET_RECEIPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +95,10 @@ enum RawRecord {
         cwd: Option<PathBuf>,
         #[serde(default)]
         goal: Option<String>,
+        #[serde(default)]
+        generation: u64,
+        #[serde(default)]
+        reset_receipts: Vec<ResetReceipt>,
     },
 }
 
@@ -78,15 +109,21 @@ impl RawRecord {
                 session_id,
                 cwd: Some(default_cwd.to_path_buf()),
                 goal: None,
+                generation: 0,
+                reset_receipts: Vec::new(),
             },
             Self::Full {
                 session_id,
                 cwd,
                 goal,
+                generation,
+                reset_receipts,
             } => SessionRecord {
                 session_id,
                 cwd,
                 goal,
+                generation,
+                reset_receipts,
             },
         }
     }
@@ -124,6 +161,7 @@ impl SessionStore {
     }
 
     /// Records the backend session and working directory, retaining the goal.
+    #[cfg(test)]
     pub(crate) async fn record_session(
         &self,
         group_key: &str,
@@ -137,12 +175,35 @@ impl SessionStore {
         .await
     }
 
+    /// Records a backend observation only if the session epoch that started
+    /// the backend run is still current.
+    pub(crate) async fn record_session_if_generation(
+        &self,
+        group_key: &str,
+        expected_generation: u64,
+        session_id: String,
+        cwd: PathBuf,
+    ) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        let current_generation = map.get(group_key).map_or(0, |record| record.generation);
+        if current_generation != expected_generation {
+            return Ok(false);
+        }
+        let mut next = map.clone();
+        let record = next.entry(group_key.to_owned()).or_default();
+        record.session_id = session_id;
+        record.cwd = Some(cwd);
+        persist(&self.path, &mut map, next).await?;
+        Ok(true)
+    }
+
     /// Selects the working directory and starts a new session epoch, retaining
     /// the goal.
     pub(crate) async fn set_workdir(&self, group_key: &str, cwd: PathBuf) -> Result<()> {
         self.update(group_key, |record| {
             record.session_id.clear();
             record.cwd = Some(cwd);
+            record.generation = record.generation.saturating_add(1);
         })
         .await
     }
@@ -152,22 +213,49 @@ impl SessionStore {
         self.update(group_key, |record| record.goal = goal).await
     }
 
-    pub(crate) async fn reset_session(&self, group_key: &str) -> Result<bool> {
+    pub(crate) async fn reset_session(
+        &self,
+        group_key: &str,
+        message_ref: &str,
+    ) -> Result<ResetSessionOutcome> {
         let mut map = self.map.lock().await;
-        let Some(record) = map.get(group_key) else {
-            return Ok(false);
-        };
-        if record.session_id.is_empty() {
-            return Ok(false);
+        let message_ref_digest = (!message_ref.is_empty()).then(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(message_ref.as_bytes());
+            hex::encode(hasher.finalize())
+        });
+        if let (Some(record), Some(digest)) = (map.get(group_key), message_ref_digest.as_deref())
+            && let Some(receipt) = record
+                .reset_receipts
+                .iter()
+                .find(|receipt| receipt.message_ref_digest == digest)
+        {
+            return Ok(ResetSessionOutcome {
+                changed: receipt.changed,
+                replayed: true,
+            });
         }
 
         let mut next = map.clone();
-        next.get_mut(group_key)
-            .expect("record exists in cloned session map")
-            .session_id
-            .clear();
+        let record = next.entry(group_key.to_owned()).or_default();
+        let changed = !record.session_id.is_empty();
+        record.session_id.clear();
+        record.generation = record.generation.saturating_add(1);
+        if let Some(message_ref_digest) = message_ref_digest {
+            if record.reset_receipts.len() == MAX_RESET_RECEIPTS {
+                record.reset_receipts.remove(0);
+            }
+            record.reset_receipts.push(ResetReceipt {
+                message_ref_digest,
+                changed,
+                generation: record.generation,
+            });
+        }
         persist(&self.path, &mut map, next).await?;
-        Ok(true)
+        Ok(ResetSessionOutcome {
+            changed,
+            replayed: false,
+        })
     }
 
     async fn update(&self, group_key: &str, apply: impl FnOnce(&mut SessionRecord)) -> Result<()> {
@@ -636,7 +724,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(store.reset_session("group1").await.unwrap());
+            assert!(
+                store
+                    .reset_session("group1", "reset-1")
+                    .await
+                    .unwrap()
+                    .changed
+            );
         }
 
         let store = SessionStore::load(path, &home).unwrap();
@@ -647,6 +741,84 @@ mod tests {
         assert_eq!(second.session_id, "ses_second");
         assert_eq!(second.cwd, Some(second_cwd));
         assert_eq!(second.goal.as_deref(), Some("second goal"));
+    }
+
+    #[tokio::test]
+    async fn reset_replay_is_durable_and_stale_observations_cannot_revive_old_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let cwd = home.join("proj");
+        let store = SessionStore::load(path.clone(), &home).unwrap();
+        store
+            .record_session("group1", "ses_old".to_owned(), cwd.clone())
+            .await
+            .unwrap();
+
+        let first = store.reset_session("group1", "message-1").await.unwrap();
+        assert!(first.changed);
+        assert!(!first.replayed);
+        assert_eq!(store.get("group1").await.unwrap().generation, 1);
+        assert!(
+            !store
+                .record_session_if_generation("group1", 0, "ses_stale".to_owned(), cwd.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_session_if_generation("group1", 1, "ses_after_m1".to_owned(), cwd.clone(),)
+                .await
+                .unwrap()
+        );
+        let second = store.reset_session("group1", "message-2").await.unwrap();
+        assert!(second.changed);
+        assert!(!second.replayed);
+        assert_eq!(store.get("group1").await.unwrap().generation, 2);
+        assert!(
+            store
+                .record_session_if_generation("group1", 2, "ses_after_m2".to_owned(), cwd.clone(),)
+                .await
+                .unwrap()
+        );
+        drop(store);
+
+        let store = SessionStore::load(path, &home).unwrap();
+        let replay = store.reset_session("group1", "message-1").await.unwrap();
+        assert!(replay.changed);
+        assert!(replay.replayed);
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "ses_after_m2");
+        assert_eq!(record.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn empty_reset_reference_never_collapses_distinct_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let cwd = home.join("proj");
+        let store = SessionStore::load(path, &home).unwrap();
+        store
+            .record_session("group1", "ses_first".to_owned(), cwd.clone())
+            .await
+            .unwrap();
+
+        let first = store.reset_session("group1", "").await.unwrap();
+        assert!(first.changed);
+        assert!(!first.replayed);
+        assert!(
+            store
+                .record_session_if_generation("group1", 1, "ses_second".to_owned(), cwd)
+                .await
+                .unwrap()
+        );
+        let second = store.reset_session("group1", "").await.unwrap();
+        assert!(second.changed);
+        assert!(!second.replayed);
+        let record = store.get("group1").await.unwrap();
+        assert!(record.session_id.is_empty());
+        assert_eq!(record.generation, 2);
     }
 
     #[tokio::test]
@@ -662,7 +834,7 @@ mod tests {
             .unwrap();
         std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
 
-        assert!(store.reset_session("group1").await.is_err());
+        assert!(store.reset_session("group1", "reset-1").await.is_err());
         assert!(
             store
                 .set_goal("group1", Some("g".to_owned()))
@@ -888,7 +1060,13 @@ mod tests {
             .record_session("group1", "ses_private".to_owned(), home)
             .await
             .unwrap();
-        assert!(store.reset_session("group1").await.unwrap());
+        assert!(
+            store
+                .reset_session("group1", "reset-1")
+                .await
+                .unwrap()
+                .changed
+        );
 
         let parent_mode = path
             .parent()

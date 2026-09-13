@@ -15,6 +15,61 @@ use crate::{HarnessError, Outcome, RunFailure, RunnerEvent, TRACE_TARGET};
 
 const STDERR_CAPTURE_BYTES: usize = 4096;
 
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn new(child: &Child) -> Self {
+        Self {
+            pgid: child.id().and_then(|pid| i32::try_from(pid).ok()),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let Some(pgid) = self.pgid else {
+            return;
+        };
+        // Cancellation has no later await point for normal cleanup. Kill the
+        // dedicated group, then synchronously reap its direct child.
+        // Descendants are reparented and reaped by the host.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+            let mut status = 0;
+            loop {
+                let result = libc::waitpid(pgid, &mut status, 0);
+                if result == pgid
+                    || result == -1
+                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ProcessGroupGuard;
+
+#[cfg(not(unix))]
+impl ProcessGroupGuard {
+    fn new(_child: &Child) -> Self {
+        Self
+    }
+
+    fn disarm(&mut self) {}
+}
+
 /// How one backend prompt reaches the child process.
 pub enum PromptTransport {
     /// Write the prompt to the child's standard input and then close it.
@@ -196,10 +251,17 @@ where
         }
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+
     let mut child = command.spawn().map_err(|_| RunFailure {
         error: HarnessError::BackendSpawn,
         observed_session: None,
     })?;
+    let mut process_group = ProcessGroupGuard::new(&child);
     let total_deadline = Instant::now() + total_timeout;
     let mut writer_task = match prompt {
         PromptTransport::Stdin(prompt) => match child.stdin.take() {
@@ -383,9 +445,13 @@ where
     .await;
 
     match lifecycle_result {
-        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Ok(outcome)) => {
+            process_group.disarm();
+            Ok(outcome)
+        }
         Ok(Err(error)) => {
             cleanup_failed_run(&mut child, &mut stderr_task, writer_task.as_mut()).await;
+            process_group.disarm();
             Err(RunFailure {
                 error,
                 observed_session,
@@ -393,6 +459,7 @@ where
         }
         Err(_) => {
             cleanup_failed_run(&mut child, &mut stderr_task, writer_task.as_mut()).await;
+            process_group.disarm();
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
@@ -475,6 +542,11 @@ async fn cleanup_failed_run(
 
 /// Best-effort terminates and reaps a backend child.
 async fn kill_and_reap(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pgid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: The child was spawned as the leader of its own process group.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
     let _ = child.start_kill();
     let _ = child.wait().await;
 }

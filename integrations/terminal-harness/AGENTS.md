@@ -17,6 +17,12 @@ before changing this crate.
   breaking change for anyone whose `$HOME` holds a directory of that name.
 - Keep per-group state changes on the targeted `SessionStore` mutators so a
   session, workdir, or goal write never silently discards a sibling field.
+- Keep `/new` durable and replay-safe: bind recent reset results to the inbound
+  message reference, advance a monotonic session generation once per distinct
+  command in the replay window, and reject backend observations from older
+  generations.
+- On Unix, spawn each backend in a dedicated process group and preserve the
+  cancellation guard that kills the group before the direct child is reaped.
 - Preserve privacy-safe diagnostics and never log identifiers, paths, prompts,
   model output, or transport data.
 - Changes here must be verified against every terminal harness.

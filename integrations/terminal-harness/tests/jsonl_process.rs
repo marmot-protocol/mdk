@@ -513,6 +513,129 @@ exec sleep 30
     );
 }
 
+#[tokio::test]
+async fn timeout_terminates_descendant_processes() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let pid_path = root.path().join("descendant.pid");
+    let script = executable_script(
+        root.path(),
+        "descendant-backend",
+        r#"#!/bin/sh
+sleep 30 &
+printf '%s' "$!" > "$1"
+wait
+"#,
+    );
+    let (tx, _rx) = mpsc::channel(1);
+    let mut spec = process_spec(
+        &script,
+        root.path(),
+        PromptTransport::DelimitedArgument {
+            delimiter: "--",
+            prompt: "prompt".to_owned(),
+        },
+    );
+    spec.args = vec![pid_path.to_string_lossy().into_owned()];
+    spec.total_timeout = Duration::from_secs(2);
+    spec.idle_timeout = Duration::from_secs(5);
+
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+    assert!(matches!(
+        failure.error,
+        marmot_terminal_harness::HarnessError::BackendTimedOut
+    ));
+
+    let pid = fs::read_to_string(pid_path).unwrap();
+    let exited = wait_for_process_exit(pid.trim()).await;
+    let active = !exited;
+    if active {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status();
+    }
+    assert!(!active, "descendant process {pid} survived backend cleanup");
+}
+
+#[tokio::test]
+async fn cancellation_terminates_descendant_processes() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let pid_path = root.path().join("descendant.pid");
+    let script = executable_script(
+        root.path(),
+        "cancellation-descendant-backend",
+        &format!(
+            "#!/bin/sh\nsleep 30 &\necho $! > {}\nwait\n",
+            pid_path.display()
+        ),
+    );
+    let (tx, _rx) = mpsc::channel(2);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.total_timeout = Duration::from_secs(30);
+    spec.idle_timeout = Duration::from_secs(30);
+
+    let task = tokio::spawn(async move { run_jsonl_process(spec, tx, parse_event).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pid_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("descendant pid was written");
+    task.abort();
+    let _ = task.await;
+
+    let pid = fs::read_to_string(pid_path).unwrap();
+    assert!(
+        wait_for_process_exit(pid.trim()).await,
+        "descendant process survived cancellation cleanup"
+    );
+}
+
+async fn wait_for_process_exit(pid: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while process_is_active(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn process_is_active(pid: &str) -> bool {
+    let exists = std::process::Command::new("kill")
+        .args(["-0", pid])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !exists {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+            .and_then(|rest| rest.chars().next());
+        state != Some('Z')
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", pid])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                output
+                    .stdout
+                    .into_iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+            })
+            .is_some_and(|state| state != b'Z')
+    }
+}
+
 #[test]
 fn process_debug_output_redacts_paths_arguments_prompts_and_events() {
     let spec = ProcessSpec {

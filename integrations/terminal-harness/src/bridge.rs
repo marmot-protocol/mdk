@@ -1668,15 +1668,31 @@ async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: C
 }
 
 async fn new_session_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> String {
-    match ctx.sessions.reset_session(&inbound.group_ref).await {
-        Ok(true) => format!(
-            "Session reset. The next prompt will start a new {} session in the preserved workdir.",
-            ctx.cfg.spec.display_name
-        ),
-        Ok(false) => format!(
-            "No {} session is recorded for this chat.",
-            ctx.cfg.spec.display_name
-        ),
+    match ctx
+        .sessions
+        .reset_session(&inbound.group_ref, &inbound.message_ref)
+        .await
+    {
+        Ok(outcome) => {
+            if outcome.replayed {
+                debug!(
+                    target: TRACE_TARGET,
+                    method = "session_reset_replay",
+                    "replayed durable session reset acknowledgement"
+                );
+            }
+            if outcome.changed {
+                format!(
+                    "Session reset. The next prompt will start a new {} session in the preserved workdir.",
+                    ctx.cfg.spec.display_name
+                )
+            } else {
+                format!(
+                    "No {} session is recorded for this chat.",
+                    ctx.cfg.spec.display_name
+                )
+            }
+        }
         Err(err) => {
             warn!(
                 target: TRACE_TARGET,
@@ -2169,7 +2185,17 @@ async fn persist_observed_session_if_unset(
         .as_ref()
         .is_none_or(|record| record.session_id.is_empty());
     if needs_persist && let Some(session_id) = observed_session {
-        sessions.record_session(group_ref, session_id, cwd).await?;
+        let expected_generation = known_session.map_or(0, |record| record.generation);
+        let stored = sessions
+            .record_session_if_generation(group_ref, expected_generation, session_id, cwd)
+            .await?;
+        if !stored {
+            debug!(
+                target: TRACE_TARGET,
+                method = "session_generation_fence",
+                "discarded stale backend session observation"
+            );
+        }
     }
     Ok(())
 }
@@ -4551,7 +4577,13 @@ mod tests {
             .set_goal("group1", Some("keep the workdir".to_owned()))
             .await
             .unwrap();
-        assert!(store.reset_session("group1").await.unwrap());
+        assert!(
+            store
+                .reset_session("group1", "reset-1")
+                .await
+                .unwrap()
+                .changed
+        );
 
         let reset_record = store.get("group1").await.unwrap();
         persist_observed_session_if_unset(
