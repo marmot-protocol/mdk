@@ -51,8 +51,17 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The directory a private file must be created in, or `None` when the path is
+/// a bare file name: `Path::parent` reports `Some("")` for `avatar.png`, and
+/// creating or chmod-ing `""` fails with `ENOENT` on Unix before the file is
+/// even opened.
+pub(crate) fn private_parent_dir(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
 pub(crate) fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = private_parent_dir(path) {
         create_private_dir_all(parent)?;
     }
     let mut options = std::fs::OpenOptions::new();
@@ -67,7 +76,7 @@ pub(crate) fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> std::i
 }
 
 pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = private_parent_dir(path) {
         create_private_dir_all(parent)?;
     }
     let mut options = std::fs::OpenOptions::new();
@@ -172,6 +181,13 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
 
     if matches!(cli.command, Command::Tui { .. }) {
         return tui::run_tui(cli).await;
+    }
+
+    // File inputs and output destinations mean the caller's files. A forwarded
+    // command runs inside `wnd`, whose working directory is unrelated, so pin
+    // them to the caller's directory before either execution path.
+    if let Ok(caller_dir) = std::env::current_dir() {
+        resolve_relative_paths(&mut cli, &caller_dir);
     }
 
     let home = resolve_home(cli.home.clone());
@@ -336,6 +352,46 @@ pub(crate) fn validate_materialized_secret_identity(
         return Err(WnError::SecretArgumentRejected { command });
     }
     Ok(())
+}
+
+/// Resolve every caller-relative file input and output destination in `cli`
+/// against `base`, and turn an absent download destination into `base` itself
+/// (the handlers treat a directory output as "default file name in there").
+/// Relative paths are joined, never canonicalized, so an output that does not
+/// exist yet still resolves.
+pub(crate) fn resolve_relative_paths(cli: &mut Cli, base: &Path) {
+    fn resolve(base: &Path, value: &mut String) {
+        if Path::new(value.as_str()).is_relative() {
+            *value = base.join(value.as_str()).to_string_lossy().into_owned();
+        }
+    }
+    let base_dir = || base.to_string_lossy().into_owned();
+    match &mut cli.command {
+        Command::Groups { command } => match command {
+            GroupsCommand::Create {
+                image: Some(image), ..
+            } => resolve(base, image),
+            GroupsCommand::SetImage { file_path, .. } => resolve(base, file_path),
+            GroupsCommand::DownloadImage { output, .. } => match output {
+                Some(output) => resolve(base, output),
+                None => *output = Some(base_dir()),
+            },
+            _ => {}
+        },
+        Command::Media { command } => match command {
+            MediaCommand::Upload { file_paths, .. } => {
+                for file_path in file_paths {
+                    resolve(base, file_path);
+                }
+            }
+            MediaCommand::Download { output, .. } => match output {
+                Some(output) => resolve(base, output),
+                None => *output = Some(base_dir()),
+            },
+            _ => {}
+        },
+        _ => {}
+    }
 }
 
 fn is_background_stream_watch(cli: &Cli) -> bool {
@@ -2235,6 +2291,107 @@ mod tests {
                 "text".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn private_parent_dir_skips_bare_file_names() {
+        assert_eq!(crate::private_parent_dir(Path::new("avatar.png")), None);
+        assert_eq!(
+            crate::private_parent_dir(Path::new("out/avatar.png")),
+            Some(Path::new("out"))
+        );
+        assert_eq!(
+            crate::private_parent_dir(Path::new("/tmp/avatar.png")),
+            Some(Path::new("/tmp"))
+        );
+    }
+
+    #[test]
+    fn write_private_file_accepts_a_bare_file_name_relative_path() {
+        // A bare name has an empty parent; writing must not try to create or
+        // chmod "" before opening the file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bare.bin");
+        crate::write_private_file(&path, b"ok").expect("absolute path writes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+        let nested = dir.path().join("nested").join("deep.bin");
+        crate::write_private_file(&nested, b"ok").expect("nested path creates parents");
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn relative_file_paths_resolve_against_the_caller_directory_before_forwarding() {
+        let base = Path::new("/callers/cwd");
+        let mut cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "upload",
+            "GROUP",
+            "a.png",
+            "/abs/b.png",
+            "--send",
+        ])
+        .expect("upload parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Media {
+                command: crate::MediaCommand::Upload { file_paths, .. },
+            } => assert_eq!(
+                file_paths,
+                &vec!["/callers/cwd/a.png".to_owned(), "/abs/b.png".to_owned()]
+            ),
+            other => panic!("expected media upload, got {other:?}"),
+        }
+
+        let mut cli = Cli::try_parse_from(["wn", "groups", "set-image", "GROUP", "avatar.png"])
+            .expect("set-image parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::SetImage { file_path, .. },
+            } => assert_eq!(file_path, "/callers/cwd/avatar.png"),
+            other => panic!("expected groups set-image, got {other:?}"),
+        }
+
+        let mut cli =
+            Cli::try_parse_from(["wn", "groups", "create", "pics", "--image", "founding.png"])
+                .expect("create parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::Create { image, .. },
+            } => assert_eq!(image.as_deref(), Some("/callers/cwd/founding.png")),
+            other => panic!("expected groups create, got {other:?}"),
+        }
+
+        // An absent download destination becomes the caller's directory so a
+        // forwarded download never lands in the daemon's working directory.
+        let mut cli = Cli::try_parse_from(["wn", "groups", "download-image", "GROUP"])
+            .expect("download-image parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::DownloadImage { output, .. },
+            } => assert_eq!(output.as_deref(), Some("/callers/cwd")),
+            other => panic!("expected groups download-image, got {other:?}"),
+        }
+        let mut cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "download",
+            "GROUP",
+            "aa",
+            "--output",
+            "out/file.bin",
+        ])
+        .expect("media download parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Media {
+                command: crate::MediaCommand::Download { output, .. },
+            } => assert_eq!(output.as_deref(), Some("/callers/cwd/out/file.bin")),
+            other => panic!("expected media download, got {other:?}"),
+        }
     }
 
     #[test]

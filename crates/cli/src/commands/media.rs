@@ -217,10 +217,27 @@ pub(crate) async fn media_command_with_runtime(
                 };
                 references.push(reference);
             }
+            // The wire `imeta` tag carries no epoch, so recipients derive the
+            // media secret from the epoch of the message that carries it. A
+            // reference encrypted under an earlier epoch cannot be re-sent; it
+            // has to be uploaded again. The runtime enforces the same rule
+            // atomically inside the worker; this read gives the caller a typed
+            // answer with both epochs before anything is attempted.
+            let current_epoch = runtime
+                .group_mls_state(&account.label, &group_id)
+                .await?
+                .epoch;
+            if let Some(stale) = references
+                .iter()
+                .find(|reference| reference.source_epoch != current_epoch)
+            {
+                return Err(WnError::MediaReferenceStaleEpoch {
+                    source_epoch: stale.source_epoch,
+                    current_epoch,
+                });
+            }
             // The runtime re-validates every reference against the group's
-            // media profile, locator policy, and version, and the reference
-            // keeps its original `source_epoch` so recipients derive the right
-            // media secret.
+            // media profile, locator policy, and version.
             let summary = runtime
                 .send_media_attachments(
                     &account.account_id_hex,
@@ -484,16 +501,22 @@ pub(crate) fn media_file_name(path: &Path) -> Result<String, WnError> {
         .ok_or_else(|| WnError::InvalidMediaAttachment("file name".to_owned()))
 }
 
+/// `--output` names the file to write, or an existing directory to write the
+/// attachment's own file name into. Without it the file lands in the current
+/// directory (the caller's directory when forwarded through `wnd`, because the
+/// client resolves paths before forwarding).
 fn media_output_path(output: Option<String>, file_name: &str) -> PathBuf {
-    output.map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(
-            Path::new(file_name)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("media.bin"),
-        )
-    })
+    let default_name = Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("media.bin")
+        .to_owned();
+    match output {
+        Some(output) if Path::new(&output).is_dir() => Path::new(&output).join(default_name),
+        Some(output) => PathBuf::from(output),
+        None => PathBuf::from(default_name),
+    }
 }
 
 pub(crate) fn guess_media_type(path: &Path) -> &'static str {

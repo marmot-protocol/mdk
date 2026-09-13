@@ -417,6 +417,25 @@ fn try_run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Result<V
     Ok(value["result"].clone())
 }
 
+/// Run `wn --json` with the process working directory set to `dir`, for
+/// commands whose relative file arguments must resolve against the caller.
+fn run_json_in_dir(home: &std::path::Path, dir: &std::path::Path, args: &[&str]) -> Value {
+    let output = wn(home)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("wn command should start");
+    assert!(
+        output.status.success(),
+        "wn failed\ndir={}\nargs={args:?}\n{}",
+        dir.display(),
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    value["result"].clone()
+}
+
 fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
     let output = wn_with_relay(home, relay)
         .args(args)
@@ -2133,6 +2152,59 @@ fn media_upload_and_download_round_trip_through_blossom() {
     assert_eq!(
         std::fs::read(&output_path).expect("downloaded file"),
         plaintext
+    );
+
+    // A bare `--output` file name has an empty parent directory; it must land
+    // in the caller's working directory, not fail before the file is opened.
+    let bare_dir = home.path().join("bare-output");
+    std::fs::create_dir_all(&bare_dir).expect("bare output dir");
+    let bare = run_json_in_dir(
+        home.path(),
+        &bare_dir,
+        &[
+            "--account",
+            &bob,
+            "media",
+            "download",
+            group_id,
+            &file_hash,
+            "--output",
+            "bare-note.txt",
+        ],
+    );
+    assert_eq!(
+        std::fs::read(bare_dir.join("bare-note.txt")).expect("bare download"),
+        plaintext
+    );
+    assert!(
+        bare["output_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("bare-note.txt")),
+        "{bare}"
+    );
+    // A directory `--output` receives the attachment's own file name.
+    let dir_out = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "media",
+            "download",
+            group_id,
+            &file_hash,
+            "--output",
+            bare_dir.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(
+        std::fs::read(bare_dir.join("note.txt")).expect("directory download"),
+        plaintext
+    );
+    assert!(
+        dir_out["output_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("note.txt")),
+        "{dir_out}"
     );
 }
 
@@ -5675,6 +5747,8 @@ fn daemon_executes_cli_commands_over_socket() {
         // Daemon tests drive an in-process `MockRelay` at loopback; production
         // rejects non-public relay hosts unless this dev gate is set.
         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        // The forwarded media upload below targets a loopback Blossom server.
+        .env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1")
         .spawn()
         .expect("wnd should start");
 
@@ -5729,6 +5803,76 @@ fn daemon_executes_cli_commands_over_socket() {
         assert_eq!(value["result"]["account_id"], account_id);
         assert_eq!(value["result"][key], serde_json::json!([]));
     }
+
+    // A forwarded command runs inside `wnd`, whose working directory is this
+    // test process's, not the caller's. Relative file arguments must still
+    // mean the caller's files: run the client from an unrelated directory
+    // holding `note.txt` and upload through the daemon.
+    let blossom = TestBlossom::new();
+    let created = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args([
+            "--account",
+            &account_id,
+            "groups",
+            "create",
+            "forwarded-media",
+        ])
+        .output()
+        .expect("wn should start");
+    assert!(
+        created.status.success(),
+        "group create over socket failed\n{}",
+        command_output_summary(&created)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).expect("stdout should be JSON");
+    let group_id = created["result"]["group_id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+    let caller_dir = tempfile::tempdir().expect("caller dir");
+    std::fs::write(
+        caller_dir.path().join("note.txt"),
+        b"forwarded from the caller directory",
+    )
+    .expect("write caller file");
+    let upload = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .current_dir(caller_dir.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args([
+            "--account",
+            &account_id,
+            "media",
+            "upload",
+            &group_id,
+            "note.txt",
+            "--server",
+            blossom.url(),
+        ])
+        .output()
+        .expect("wn should start");
+    assert!(
+        upload.status.success(),
+        "forwarded media upload failed\n{}",
+        command_output_summary(&upload)
+    );
+    let upload: Value = serde_json::from_slice(&upload.stdout).expect("stdout should be JSON");
+    assert_eq!(upload["ok"], true, "{upload}");
+    assert_eq!(
+        upload["result"]["attachments"][0]["media"]["file_name"],
+        "note.txt"
+    );
+    assert!(
+        std::fs::read_dir(std::env::current_dir().expect("cwd"))
+            .expect("cwd listing")
+            .filter_map(Result::ok)
+            .all(|entry| entry.file_name() != "note.txt"),
+        "the daemon must not have looked for note.txt in its own directory"
+    );
 
     stop_daemon(&socket, &mut child);
 }
@@ -8581,13 +8725,61 @@ fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoc
     assert_eq!(rows[1]["file_name"], "second.txt");
     assert_eq!(rows[1]["source_epoch"], source_epoch);
 
-    // A projected attachment can be re-sent by plaintext hash.
+    // A projected attachment can be re-sent by plaintext hash while the group
+    // is still in the epoch that encrypted it.
     let forwarded = run_json(
         home.path(),
         &["--account", &alice, "media", "send", group_id, &first_hash],
     );
     assert_eq!(forwarded["published"], 1);
     assert_eq!(forwarded["attachments"][0]["plaintext_sha256"], first_hash);
+
+    // The `imeta` tag carries no epoch: recipients derive the media key from
+    // the delivering message's epoch. Once a commit advances the group, a
+    // reference encrypted under the old epoch must be refused, not published
+    // as undecryptable ciphertext. Both input forms are covered.
+    let renamed = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "rename",
+            group_id,
+            "albums-2",
+        ],
+    );
+    assert_eq!(renamed["published"], 1);
+    let stale_by_hash = run_json_error(
+        home.path(),
+        &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(stale_by_hash["code"], "media_reference_stale_epoch");
+    assert_eq!(stale_by_hash["source_epoch"], source_epoch);
+    assert_eq!(stale_by_hash["current_epoch"], source_epoch + 1);
+    let stale_by_json = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &second_reference,
+        ],
+    );
+    assert_eq!(stale_by_json["code"], "media_reference_stale_epoch");
+    // Nothing was published for either refusal: Bob's projection still holds
+    // exactly the two media messages from before the rename.
+    let _ = try_run_json(home.path(), &["--account", &bob, "sync"]);
+    let after = run_json(home.path(), &["--account", &bob, "media", "list", group_id]);
+    let media_message_ids = after["media"]
+        .as_array()
+        .expect("media rows")
+        .iter()
+        .filter_map(|row| row["message_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(media_message_ids.len(), 2, "{after}");
 
     // Endpoint policy is signed group state: admins replace it, others cannot.
     let denied = run_json_error(

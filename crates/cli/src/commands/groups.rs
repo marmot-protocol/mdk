@@ -1148,12 +1148,21 @@ pub(crate) async fn groups_command_with_runtime(
             let bytes = runtime
                 .download_group_blossom_image(&account.label, &group_id)
                 .await?;
-            let output_path = output.map(PathBuf::from).unwrap_or_else(|| {
-                PathBuf::from(format!(
-                    "group-image.{}",
-                    group_image_extension(group.image.media_type.as_deref())
-                ))
-            });
+            // `--output` is a file path, or an existing directory that receives
+            // `group-image.<ext>`. The client resolves relative paths (and the
+            // absent default) against the caller's directory before a `wnd`
+            // forward, so the daemon never writes into its own directory.
+            let default_name = format!(
+                "group-image.{}",
+                group_image_extension(group.image.media_type.as_deref())
+            );
+            let output_path = match output {
+                Some(output) if Path::new(&output).is_dir() => {
+                    Path::new(&output).join(default_name)
+                }
+                Some(output) => PathBuf::from(output),
+                None => PathBuf::from(default_name),
+            };
             write_private_file(&output_path, &bytes)?;
             Ok(CommandOutput {
                 plain: terminal_safe_text(&output_path.display().to_string()),
@@ -1453,8 +1462,10 @@ async fn group_record_and_mls(
 
 /// One word for scripts: `not_enabled`, `enabled`, `pending` (durable local
 /// request awaiting its terminal commit), `converging` (an authenticated
-/// inbound disband is settling), `failed` (acknowledge to clear), or the
-/// terminal `disbanded`.
+/// inbound disband is settling), `failed` (acknowledge to clear), the
+/// terminal `disbanded`, or `unknown` when nothing positive was observed and
+/// the MLS state could not be read (a quarantined, terminal, or removed copy).
+/// `not_enabled` is only ever asserted from a successful MLS read.
 fn disband_state(
     group: &AppGroupRecord,
     mls: Option<&AppGroupMlsState>,
@@ -1473,7 +1484,8 @@ fn disband_state(
         Some(AppDisbandRequest::Pending { .. }) => "pending",
         None if group.disbanding || mls.is_some_and(|mls| mls.disbanding) => "converging",
         None if mls.is_some_and(|mls| mls.disbanding_enabled) => "enabled",
-        None => "not_enabled",
+        None if mls.is_some() => "not_enabled",
+        None => "unknown",
     }
 }
 
@@ -1568,7 +1580,10 @@ fn group_management_json(
             && mls.disbanding_blockers.is_empty(),
         "can_disband": is_self_admin && ordinary_actions_enabled && stable && mls.disbanding_enabled,
         "disbanding_blockers": mls.disbanding_blockers,
-        "disband_request": mls.disband_request.clone().or_else(|| group.disband_request.clone()),
+        // The durable local record is the source of intent; the MLS view is the
+        // fallback. Same order as `disband_status_json` so the two inspection
+        // commands cannot disagree about one group.
+        "disband_request": group.disband_request.clone().or_else(|| mls.disband_request.clone()),
         "member_actions": member_actions,
     })
 }

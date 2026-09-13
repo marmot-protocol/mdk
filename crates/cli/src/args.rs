@@ -462,7 +462,7 @@ pub(crate) enum MediaCommand {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Output path; defaults to the original filename"
+            help = "Output file, or an existing directory; defaults to the original filename in the current directory"
         )]
         output: Option<String>,
     },
@@ -792,7 +792,7 @@ pub(crate) enum GroupsCommand {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Output path; defaults to group-image.<ext> in the current directory"
+            help = "Output file, or an existing directory; defaults to group-image.<ext> in the current directory"
         )]
         output: Option<String>,
     },

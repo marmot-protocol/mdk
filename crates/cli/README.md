@@ -310,9 +310,11 @@ do not advertise it yet). `groups disband --confirm` durably records the irrever
 (a running `wnd`, or `messages retry <group-hex>` from a one-shot `wn`), so a returned request is never proof that the
 group has ended or that any member observed it. `groups disband-status` distinguishes `not_enabled`, `enabled`,
 `pending` (durable local request awaiting its terminal commit), `converging` (an authenticated inbound disband is
-settling), `failed` (see `disband_request.failed.reason`, then `groups acknowledge-disband-failure` to clear it), and
-the terminal `disbanded`, alongside `lifecycle_state`, `disbanding` (ordinary outbound work is gated), `disbanded`,
-`unrecoverable`, and `self_membership` (`member`, `left`, or `removed`). Ordinary sends into a disbanding group fail
+settling), `failed` (see `disband_request.failed.reason`, then `groups acknowledge-disband-failure` to clear it), the
+terminal `disbanded`, and `unknown` (no positive signal and the MLS state could not be read, as for a quarantined,
+terminal, or removed copy; `not_enabled` is only ever asserted from a successful MLS read), alongside
+`lifecycle_state`, `disbanding` (ordinary outbound work is gated), `disbanded`, `unrecoverable`, and
+`self_membership` (`member`, `left`, or `removed`). Ordinary sends into a disbanding group fail
 with `group_disbanding`. Today a removed member's copy records its own removal (`self_membership: removed`) when the
 terminal commit lands; report both fields rather than inferring the end from one. `groups management` mirrors the
 MarmotKit management state (`is_self_admin`, `can_invite`, `can_leave`, `requires_self_demote_before_leave`,
@@ -466,11 +468,20 @@ Upload JSON returns an `attachments` array with each attachment's `plaintext_sha
 `media upload` accepts several files; with `--send` they go out as one kind-9 message whose `imeta` tags keep the
 command-line order (`attachment_index` in `media list`). `media send` publishes already-uploaded references as one
 ordered message without re-uploading: each `<attachment>` is either the `media` JSON object from `media upload` /
-`media list` output, or the plaintext SHA-256 of an attachment already projected in the group (re-send/forward within
-the group). The runtime re-validates every reference against the group's media profile, locator policy, and version,
-and each reference keeps its original `source_epoch` so recipients derive the right media secret.
+`media list` output, or the plaintext SHA-256 of an attachment already projected in the group (re-send within the
+group). The runtime re-validates every reference against the group's media profile, locator policy, and version. A
+reference can only be re-sent while the group is still in the epoch that encrypted it: the wire `imeta` tag carries
+no epoch, recipients derive the media key from the delivering message's epoch, and the runtime refuses a stale
+reference before publication. The CLI reports that as `media_reference_stale_epoch` with `source_epoch` and
+`current_epoch`; upload the file again with `media upload` after a commit has advanced the group.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
-decrypts it, and writes the plaintext file.
+decrypts it, and writes the plaintext file. `--output` is a file path, or an existing directory that receives the
+attachment's own file name; without it the file lands in the caller's current directory.
+
+File arguments are the caller's files. `media upload`, `media download --output`, `groups set-image`,
+`groups create --image`, and `groups download-image --output` resolve relative paths against the directory `wn` was
+run from before the command executes, so a command forwarded to a running `wnd` (whose working directory is
+unrelated) reads and writes exactly the files the caller named.
 
 Other Whitenoise-shaped commands:
 

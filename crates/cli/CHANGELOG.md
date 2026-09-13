@@ -24,7 +24,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   clock and reports `now_ms`, totals, and a per-group `groups` array with a snake_case `status`.
 - Disband lifecycle: `wn groups enable-disbanding`, `wn groups disband --confirm`, `wn groups disband-status`,
   and `wn groups acknowledge-disband-failure`. `disband-status` reports a one-word `state` (`not_enabled`,
-  `enabled`, `pending`, `converging`, `failed`, `disbanded`) alongside `lifecycle_state`, `disbanding`,
+  `enabled`, `pending`, `converging`, `failed`, `disbanded`, or `unknown` when the MLS state could not be read and
+  nothing positive was observed) alongside `lifecycle_state`, `disbanding`,
   `disbanded`, `disband_request`, `disbanding_blockers`, `unrecoverable`, and `self_membership`. A returned disband
   request is durable local intent; the terminal commit is prepared by the runtime convergence pass (a running `wnd`
   or `messages retry <group-hex>`). `wn groups management <group-hex>` mirrors the MarmotKit management state.
@@ -44,8 +45,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `wn media upload` accepts several files and `--send` publishes them as one ordered kind-9 message.
   `wn media send <group-hex> <attachment> [...]` sends already-uploaded references (the `media` JSON object from
   upload/list output, or the plaintext SHA-256 of a projected attachment) through `send_media_attachments`,
-  preserving order and each reference's `source_epoch`. `wn media set-endpoints <group-hex> <url> [...]` replaces
-  the group's encrypted-media default blob endpoints through `replace_encrypted_media_blob_endpoints`.
+  preserving order. A reference from an earlier epoch is refused with `media_reference_stale_epoch`
+  (`source_epoch`, `current_epoch`) instead of publishing ciphertext recipients could not decrypt.
+  `wn media set-endpoints <group-hex> <url> [...]` replaces the group's encrypted-media default blob endpoints
+  through `replace_encrypted_media_blob_endpoints`.
+- `wn media download --output` and `wn groups download-image --output` accept an existing directory as well as a
+  file path. Relative file arguments to `media upload`, `media download --output`, `groups set-image`,
+  `groups create --image`, and `groups download-image --output` resolve against the caller's working directory
+  before execution, so commands forwarded to a running `wnd` read and write the caller's files rather than the
+  daemon's. A bare output file name (empty parent directory) now writes correctly instead of failing on Unix.
 - `wn groups update <group-hex> [--name] [--description]` is the canonical plural spelling of the legacy
   `wn group update`; both now require at least one field at parse time. `wn tui` `/chat describe` and
   `/chat rename` use it.
@@ -60,6 +68,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- The runtime's `send_media_attachments` (MarmotKit and `wn media send`) refuses a media reference whose
+  `source_epoch` differs from the group's current epoch with `InvalidEncryptedMedia`. The `imeta` tag carries no
+  epoch, so recipients derive the media key from the delivering message's epoch; a stale reference would have
+  published fine and then failed to decrypt everywhere. Upload the file again after a commit advances the group.
 - `wn messages delete` help now describes what the handler does: it publishes an authenticated kind-5 delete
   tombstone to the group, which is a group-visible deletion request rather than a local-view change or secure
   erasure.

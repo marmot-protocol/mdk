@@ -78,7 +78,8 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
   daemon-configured relay defaults. Keep `wn daemon start` and direct `wnd` setup flags aligned, including
   `--data-dir`, `--logs-dir`, `--discovery-relays`, and `--default-account-relays`.
 - Normal commands may forward to `wnd` when a socket exists for the selected home. Daemon control commands and TUI
-  startup handle daemon access directly.
+  startup handle daemon access directly. Resolve caller-relative file inputs and output destinations in the client
+  (`resolve_relative_paths`) before forwarding: the daemon's working directory is unrelated to the caller's.
 - Runtime subscriptions should keep local signing accounts current; explicit catch-up remains a diagnostic/repair path.
 - Keep daemon status JSON useful for the TUI: running state, pid, socket, log path, last runtime activity summary,
   relay health, and background stream watch summaries.

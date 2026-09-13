@@ -153,6 +153,13 @@ pub(crate) enum WnError {
     InvalidWelcomeId,
     #[error("initial admin {0} is not one of the invited members")]
     InitialAdminNotInvited(String),
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+    )]
+    MediaReferenceStaleEpoch {
+        source_epoch: u64,
+        current_epoch: u64,
+    },
     #[error("exporting private keys is disabled by White Noise CLI policy")]
     PrivateKeyExportDisabled,
     #[error("{command} requires {flag}: {reason}")]
@@ -475,6 +482,18 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "initial_admin_not_invited",
             "message": err.to_string(),
             "member": member,
+        }),
+        WnError::MediaReferenceStaleEpoch {
+            source_epoch,
+            current_epoch,
+        } => json!({
+            "code": "media_reference_stale_epoch",
+            "message": err.to_string(),
+            "source_epoch": source_epoch,
+            "current_epoch": current_epoch,
+            "repair": {
+                "action": "wn media upload <group-hex> <file-path> [--send]",
+            },
         }),
         WnError::InvalidMuteDuration(duration) => json!({
             "code": "invalid_mute_duration",

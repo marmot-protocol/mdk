@@ -3944,6 +3944,21 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
+        // The `imeta` tag carries no epoch: a recipient derives the media
+        // secret from the epoch of the message that delivers the tag. A
+        // reference whose ciphertext was produced under an earlier epoch would
+        // publish successfully and then fail to decrypt for every recipient,
+        // so refuse it here, before publication, and ask for a fresh upload.
+        let (sending_epoch, _) = self.encrypted_media_secret(group_id)?;
+        if let Some(stale) = attachments
+            .iter()
+            .find(|attachment| attachment.source_epoch != sending_epoch)
+        {
+            return Err(AppError::InvalidEncryptedMedia(format!(
+                "media reference was encrypted at epoch {} but the group is at epoch {}; upload it again",
+                stale.source_epoch, sending_epoch
+            )));
+        }
         // Validate every outbound attachment against the group's exact,
         // profile-selected media version and locator policy.
         let policy = self.encrypted_media_policy_for_group(group_id)?;

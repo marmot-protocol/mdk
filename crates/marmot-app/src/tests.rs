@@ -4919,6 +4919,56 @@ fn locally_queued_send_survives_runtime_restart_and_failed_reactivation() {
 }
 
 #[test]
+fn media_send_refuses_references_encrypted_under_another_epoch() {
+    run_composed_app_runtime_test(
+        "media-send-stale-epoch",
+        media_send_refuses_stale_epoch_body,
+    );
+}
+
+async fn media_send_refuses_stale_epoch_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("media", &[]).await.unwrap();
+    let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+
+    // The tag has no epoch field, so a recipient would derive the key for the
+    // sending epoch and fail to decrypt ciphertext produced one epoch earlier.
+    let stale = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x33_u8; 32]),
+        plaintext_sha256: hex::encode([0x11_u8; 32]),
+        nonce_hex: hex::encode([0x22_u8; 12]),
+        file_name: "a.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: current_epoch + 1,
+        dim: None,
+        thumbhash: None,
+    };
+    let error = client
+        .send_media_attachments(&group_id, vec![stale], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::InvalidEncryptedMedia(ref reason) if reason.contains("epoch")),
+        "{error:?}"
+    );
+    assert!(
+        app.messages("alice").unwrap().is_empty(),
+        "a refused stale reference must publish nothing"
+    );
+}
+
+#[test]
 fn pending_disband_is_projected_and_blocks_optimistic_application_messages() {
     run_composed_app_runtime_test(
         "pending-disband-composer-gate",
