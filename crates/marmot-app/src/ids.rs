@@ -85,28 +85,17 @@ const MAX_NPROFILE_REFERENCE_BYTES: usize = 1023;
 
 /// Normalize a public identity reference into a canonical hex account id.
 ///
-/// Accepts hex, `npub`, one lowercase `nostr:npub` prefix, bare `nprofile`,
-/// and one lowercase `nostr:nprofile` prefix. Existing hex/npub/NIP-21
-/// behavior stays on [`PublicKey::parse`]; nprofile is a fallback that
-/// returns only `profile.public_key` hex and discards every relay hint.
-/// Duplicate type-0 TLV entries keep the first 32-byte key (SDK first-wins).
+/// Accepts hex, `npub`, `nostr:npub`, `nprofile`, and `nostr:nprofile`.
+/// Existing hex/npub/NIP-21 behavior stays on [`PublicKey::parse`]; the
+/// nprofile fallback discards relay hints and keeps the first type-0 key.
 ///
-/// The fallback runs only after `PublicKey::parse` fails. It strips at most
-/// one exact lowercase `nostr:` prefix and then rejects encoded tokens
-/// longer than 1023 UTF-8 bytes, counting the
-/// HRP, separator, and checksum but excluding that one prefix. Decorated
-/// wrappers such as `marmot://profile/...` are not stripped here; FFI
-/// canonicalizes those before calling this helper. A valid 1023-byte token
-/// wrapped in `nostr:` therefore still decodes even though the complete
-/// wrapper is longer.
+/// After one lowercase `nostr:` prefix, the fallback limits the complete
+/// encoded token to 1023 UTF-8 bytes, matching the locked Bech32 ceiling.
+/// A valid 1023-byte token therefore still decodes with that prefix. This
+/// local fallback budget does not bound the earlier `PublicKey::parse`.
 ///
-/// The fallback borrows the token without trimming whitespace or normalizing
-/// case; successful decoding allocates the returned hex string. The
-/// legacy NIP-21 parser may still accept a colon-suffixed `nostr:<npub>:`
-/// form before the fallback runs. Failures map to
-/// [`AppError::InvalidPublicKey`] without echoing the input. The local
-/// token limit makes the fallback budget explicit; it does not bound
-/// `PublicKey::parse`, FFI allocation, or C NUL scanning.
+/// Whitespace and `marmot://profile/...` normalization belong to FFI.
+/// Failures return [`AppError::InvalidPublicKey`] without echoing the input.
 pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
     if let Ok(pubkey) = PublicKey::parse(reference) {
         return Ok(pubkey.to_hex());

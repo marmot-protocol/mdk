@@ -152,6 +152,7 @@ fn damaged_checksum(token: &str) -> String {
     let mut damaged = token.to_owned();
     let last = damaged.len() - 1;
     damaged.replace_range(last.., "x");
+    assert_ne!(damaged, token, "checksum mutation must change the input");
     damaged
 }
 

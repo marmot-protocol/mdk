@@ -69,7 +69,8 @@ helper's legacy NIP-21 parser may still accept a colon-suffixed
 `nostr:<npub>:` form, but C/UniFFI wrapper normalization rejects it.
 `marmot_default_profile_pseudonym`
 hashes the supplied canonical hex account-id text; decode a scanned
-reference first. `marmot_random_profile_pseudonym` is a cosmetic
+reference first. Passing uppercase hex or an undecoded `npub` silently
+produces a different name, not an error. `marmot_random_profile_pseudonym` is a cosmetic
 random roll from the same wordlists. Free those strings with
 `marmot_string_free` and normalized records with
 `marmot_member_ref_free`. Regenerate `marmot.h` after pulling this

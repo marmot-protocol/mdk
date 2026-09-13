@@ -1206,7 +1206,10 @@ pub unsafe extern "C" fn marmot_default_profile_pseudonym(
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_id_hex = try_arg!(unsafe { required_str(account_id_hex) });
-        deliver_plain_string(client.marmot.default_profile_pseudonym(account_id_hex), out)
+        deliver_plain_opt_string(
+            Some(client.marmot.default_profile_pseudonym(account_id_hex)),
+            out,
+        )
     })
 }
 
@@ -1224,19 +1227,8 @@ pub unsafe extern "C" fn marmot_random_profile_pseudonym(
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
-        deliver_plain_string(client.marmot.random_profile_pseudonym(), out)
+        deliver_plain_opt_string(Some(client.marmot.random_profile_pseudonym()), out)
     })
-}
-
-fn deliver_plain_string(value: String, out: *mut *mut c_char) -> MarmotStatus {
-    let ptr = crate::memory::owned_c_string(value);
-    match unsafe { write_out(out, ptr) } {
-        Ok(()) => MarmotStatus::Ok,
-        Err(status) => {
-            unsafe { crate::memory::free_c_string(ptr) };
-            status
-        }
-    }
 }
 
 fn deliver_plain_opt_string(value: Option<String>, out: *mut *mut c_char) -> MarmotStatus {
@@ -2817,14 +2809,14 @@ mod identity_pointer_tests {
     }
 
     #[test]
-    fn deliver_plain_string_balances_owned_output() {
+    fn deliver_plain_opt_string_balances_owned_output() {
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
 
         let mut out = std::ptr::null_mut();
         assert_eq!(
-            super::deliver_plain_string("Loyal Crane".to_owned(), &raw mut out),
+            super::deliver_plain_opt_string(Some("Loyal Crane".to_owned()), &raw mut out),
             MarmotStatus::Ok
         );
         assert!(!out.is_null());

@@ -36,7 +36,8 @@ parser may still accept a colon-suffixed `nostr:<npub>:` form before the
 fallback runs; FFI normalization rejects that form. Decode a scanned reference
 first, then pass
 the canonical lowercase hex account id to `defaultProfilePseudonym` so
-the shared text-hash seed is preserved. `randomProfilePseudonym`
+the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
+`npub` silently produces a different name, not an error. `randomProfilePseudonym`
 replaces client-owned random-roll wordlists; it is cosmetic, may
 collide, and does not create an account.
 

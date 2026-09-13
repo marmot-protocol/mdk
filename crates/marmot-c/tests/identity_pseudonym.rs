@@ -17,6 +17,7 @@ use marmot_c::{
     marmot_client_shutdown, marmot_string_free,
 };
 
+// Test-only fixtures shared within this unpublished workspace, without a direct marmot-app dependency.
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../marmot-app/tests/support/identity_reference_vectors.rs"
