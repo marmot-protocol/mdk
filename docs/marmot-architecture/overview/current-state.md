@@ -32,10 +32,19 @@ former roster. Terminal event projection uses the retained display components an
 of querying deleted MLS state. Failed requests and unrecoverable groups do not acquire an idle retry loop from this scheduling.
 
 `forget_group_local` is a separate account-device operation from leaving, disbanding, and deleting chat history.
-It transactionally deletes local app and MLS state with a durable local block, then removes runtime scheduling and
-subscriptions. It needs no peer acknowledgement, works on stalled or pending-disband groups, and rejects every
-future Welcome for that same MLS group id. Ordinary `delete_group_local` still retains membership and permits fresh
-messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
+It transactionally deletes local app and MLS state with a durable reset cutoff, then removes runtime scheduling and
+subscriptions. It needs no peer acknowledgement and works on stalled or pending-disband groups. While awaiting a
+new Welcome it cannot resume group work. A fully validated Welcome for the same MLS group id may join with clean
+state only when its sender-authenticated inner creation time is strictly newer than the cutoff and its author
+matches the MLS inviter. Missing timestamps and equal-second/older invitations are rejected, even when received
+later or rewrapped. Normal invitation confirmation policy still applies. The cutoff survives the new join and
+restart: older transport traffic is discarded before it can schedule deferred recovery. The new Welcome establishes
+the MLS join-epoch floor; previous chat history and rewind anchors remain erased. Repeated forgetting while awaiting
+a Welcome preserves the cutoff; forgetting after a successful join establishes a new one. Clock skew can cause a
+legitimate invitation to fall before the boundary; generate another invitation after the sender clock crosses it.
+Timestamp filtering is replay policy, not proof against an authorized inviter deliberately redating old content.
+Legacy permanent markers migrate to a cutoff at migration time. Ordinary `delete_group_local` still retains
+membership and permits fresh messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
 must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
 network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
 

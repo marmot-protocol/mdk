@@ -4683,6 +4683,7 @@ mod candidate_branch_peel_halt_tests {
                 group_id: None,
                 sender: None,
                 content: PeeledContent::Welcome {
+                    created_at: None,
                     bytes: msg.payload.clone(),
                 },
                 origin: msg.clone(),

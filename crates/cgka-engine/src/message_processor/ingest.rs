@@ -357,6 +357,21 @@ impl<S: StorageProvider> Engine<S> {
         let reported = |outcome| Ok(GroupMessageIngestOutcome::Outcome(outcome));
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
+        // A reset's replay cutoff survives the fresh join. Drop old transport
+        // traffic before hydration/deferred-peel retention can schedule recovery
+        // of the discarded state. This timestamp is a replay filter, not proof
+        // that newer traffic is valid; newer input still passes normal crypto
+        // validation and the new join epoch's membership bound.
+        if self
+            .storage
+            .group_local_reset_cutoff(&group_id)?
+            .is_some_and(|cutoff| msg.timestamp <= cutoff)
+        {
+            return reported(IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup,
+            });
+        }
+
         // Authenticated terminal evidence is permanent. Drop late traffic
         // before the missing-OpenMLS fallback can retain it as retryable
         // unknown-group input.

@@ -2608,7 +2608,8 @@ impl AppClient {
     }
 
     /// Forget a group on this account-device without publishing a leave.
-    /// This also rejects future welcomes for the same MLS group id.
+    /// Old Welcomes stay rejected; a valid invitation created strictly after
+    /// this reset can join the same MLS group id with fresh state.
     pub async fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         let changed = self.runtime.forget_group_local(group_id)?;
         let group_hex = hex::encode(group_id.as_slice());

@@ -2870,11 +2870,7 @@ impl<S: StorageProvider> Engine<S> {
         self.pending_origin_commits.remove(&pending)
     }
 
-    /// Return the Marmot group metadata mirrored from signed MLS group state.
-    ///
-    /// App surfaces use this for projections such as group profile components
-    /// without reaching into OpenMLS internals.
-    /// Permanently abandon this group on this account-device, without network
+    /// Reset this group on this account-device, without network
     /// traffic. Storage commits the deletion before any in-memory state changes.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
         let pending = self.epoch_manager.pending_refs_for_group(group_id);
@@ -2884,7 +2880,9 @@ impl<S: StorageProvider> Engine<S> {
             .filter(|(_, mapped)| *mapped == group_id)
             .map(|(route, _)| route.clone())
             .collect::<HashSet<_>>();
-        let changed = self.storage.forget_group_local(group_id)?;
+        let changed = self
+            .storage
+            .forget_group_local(group_id, self.wall_clock.now())?;
         self.epoch_manager.forget_group(group_id);
         self.mls_group_cache.forget_group(group_id);
         self.transport_group_id_index
@@ -2960,6 +2958,10 @@ impl<S: StorageProvider> Engine<S> {
         Ok(changed)
     }
 
+    /// Return the Marmot group metadata mirrored from signed MLS group state.
+    ///
+    /// App surfaces use this for projections such as group profile components
+    /// without reaching into OpenMLS internals.
     pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
         self.ensure_group_live(group_id)?;
         Ok(self.storage.get_group(group_id)?)

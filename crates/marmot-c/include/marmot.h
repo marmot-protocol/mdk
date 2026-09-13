@@ -4856,8 +4856,8 @@ MarmotStatus marmot_delete_group_local(const struct MarmotClient *client,
                                        bool *out);
 
 /**
- * Permanently forget this group on this account-device without publishing.
- * Deletes local app and MLS state and rejects future welcomes for this id.
+ * Reset this group on this account-device without publishing.
+ * Deletes local app and MLS state; only a valid Welcome created after the reset can rejoin.
  * Close group UI subscriptions and clear host-owned media caches first.
  * Writes true for a new forget, false if already forgotten.
  *

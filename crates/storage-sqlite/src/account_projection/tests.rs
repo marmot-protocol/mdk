@@ -3957,7 +3957,11 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         )
         .unwrap();
     let id = cgka_traits::GroupId::new(vec![0xaa]);
-    assert!(store.forget_group_local(&id).is_err());
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .is_err()
+    );
     assert!(!store.is_group_forgotten(&id).unwrap());
     assert!(store.list_groups().unwrap().contains(&id));
     assert_eq!(
@@ -3977,8 +3981,16 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         .unwrap()
         .execute_batch("DROP TRIGGER fail_forget")
         .unwrap();
-    assert!(store.forget_group_local(&id).unwrap());
-    assert!(!store.forget_group_local(&id).unwrap());
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
     assert!(store.is_group_forgotten(&id).unwrap());
     assert!(
         store
@@ -4028,5 +4040,83 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             )
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
+    use cgka_traits::storage::{GroupStorage, StorageProvider};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let id = cgka_traits::GroupId::new(vec![0xaa]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![group("aa", "old membership")],
+                ..Default::default()
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .forget_group_local(&id, cgka_traits::Timestamp(200))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
+    assert!(
+        !store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    let failed: Result<(), StorageError> = store.with_transaction(|storage| {
+        storage.complete_group_local_reset(&id)?;
+        insert_protocol_group_marker(storage, id.as_slice());
+        Err(StorageError::Backend("injected join failure".into()))
+    });
+    assert!(failed.is_err());
+    assert!(
+        !store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(store.list_groups().unwrap().is_empty());
+    store
+        .with_transaction::<_, StorageError, _>(|storage| {
+            storage.complete_group_local_reset(&id)?;
+            insert_protocol_group_marker(storage, id.as_slice());
+            Ok(())
+        })
+        .unwrap();
+    assert!(!store.is_group_forgotten(&id).unwrap());
+    assert!(
+        store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
+    assert!(store.list_groups().unwrap().contains(&id));
+    // A second reset cannot move the boundary backward if the local clock regresses.
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(90))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
     );
 }

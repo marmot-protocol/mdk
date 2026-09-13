@@ -476,6 +476,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: self.welcome_sender.clone(),
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),

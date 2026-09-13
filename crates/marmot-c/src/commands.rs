@@ -656,8 +656,8 @@ c_cmd! {
     /// intact; a future fresh delivery can recreate a chat row. Writes
     /// true if any local rows or a live route were removed.
     async fn marmot_delete_group_local(account_ref: str, group_id_hex: str) -> scalar(bool) = delete_group_local;
-    /// Permanently forget this group on this account-device without publishing.
-    /// Deletes local app and MLS state and rejects future welcomes for this id.
+    /// Reset this group on this account-device without publishing.
+    /// Deletes local app and MLS state; only a valid Welcome created after the reset can rejoin.
     /// Close group UI subscriptions and clear host-owned media caches first.
     /// Writes true for a new forget, false if already forgotten.
     async fn marmot_forget_group_local(account_ref: str, group_id_hex: str) -> scalar(bool) = forget_group_local;

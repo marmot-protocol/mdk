@@ -21196,85 +21196,264 @@ async fn forget_group_local_stops_work_and_survives_reopen() {
 }
 
 #[tokio::test]
-async fn forget_group_local_rejects_a_welcome_not_previously_consumed() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let bob = home.create_account("bob").unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
-    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
-    let plane = MarmotRelayPlane::new(None, relay.clone());
-    let mut alice = app
-        .client_with_relay_plane("alice", &plane, None)
-        .await
-        .unwrap();
-    let mut bob_client = app
-        .client_with_relay_plane("bob", &plane, None)
-        .await
-        .unwrap();
-    bob_client.sync().await.unwrap();
-    let group = alice
-        .create_group("abandoned", &[bob.account_id_hex.as_str()])
-        .await
-        .unwrap();
-    let welcome = relay
-        .published_events
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|event| event.kind == transport_nostr_peeler::KIND_NIP59_GIFT_WRAP)
-        .expect("create publishes Bob's welcome")
-        .to_transport_message()
-        .unwrap();
-    assert!(bob_client.forget_group_local(&group).await.unwrap());
-    let delivery = cgka_traits::TransportDelivery {
-        account_id: MemberId::new(hex::decode(&bob.account_id_hex).unwrap()),
-        group_id_hint: None,
-        message: welcome,
-        received_at: cgka_traits::transport::Timestamp(unix_now_seconds()),
-        source: cgka_traits::TransportDeliverySource {
-            transport: cgka_traits::transport::TransportSource("nostr".into()),
-            plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
-            endpoint: None,
-            subscription_id: None,
-            wire: None,
-        },
-    };
-    let effects = bob_client
-        .runtime
-        .ingest_delivery(delivery.clone())
-        .await
-        .unwrap();
-    assert!(matches!(
-        effects.outcome,
-        cgka_traits::IngestOutcome::Ignored {
-            category: cgka_traits::ingest::InputRejectionCategory::InvalidEncoding
-        }
-    ));
-    assert!(effects.effects.events.is_empty());
-    assert!(
-        alice.runtime.group_record(&group).is_ok(),
-        "the other device is unaffected"
-    );
-    assert!(bob_client.runtime.group_record(&group).is_err());
-    drop(bob_client);
-    let mut reopened = app
-        .client_with_relay_plane("bob", &plane, None)
-        .await
-        .unwrap();
-    let effects = reopened.runtime.ingest_delivery(delivery).await.unwrap();
-    assert!(matches!(
-        effects.outcome,
-        cgka_traits::IngestOutcome::Ignored { .. }
-    ));
-    assert!(reopened.runtime.group_record(&group).is_err());
-    assert!(
-        app.group("bob", &hex::encode(group.as_slice()))
+async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitation() {
+    for initially_joined in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let plane = MarmotRelayPlane::new(None, relay.clone());
+        let mut alice = app
+            .client_with_relay_plane("alice", &plane, None)
+            .await
+            .unwrap();
+        let mut bob_client = app
+            .client_with_relay_plane("bob", &plane, None)
+            .await
+            .unwrap();
+        bob_client.sync().await.unwrap();
+        let group = alice
+            .create_group("abandoned", &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let welcome = relay
+            .published_events
+            .lock()
             .unwrap()
-            .is_none()
-    );
+            .iter()
+            .find(|event| event.kind == transport_nostr_peeler::KIND_NIP59_GIFT_WRAP)
+            .expect("create publishes Bob's welcome")
+            .to_transport_message()
+            .unwrap();
+        if initially_joined {
+            assert!(
+                bob_client
+                    .sync()
+                    .await
+                    .unwrap()
+                    .joined_groups
+                    .contains(&group)
+            );
+        }
+        alice.send(&group, b"history before reset").await.unwrap();
+        if initially_joined {
+            bob_client.sync().await.unwrap();
+            assert!(!app.messages("bob").unwrap().is_empty());
+        }
+        assert!(bob_client.forget_group_local(&group).await.unwrap());
+        let mut delivery = cgka_traits::TransportDelivery {
+            account_id: MemberId::new(hex::decode(&bob.account_id_hex).unwrap()),
+            group_id_hint: None,
+            message: welcome,
+            received_at: cgka_traits::transport::Timestamp(unix_now_seconds()),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".into()),
+                plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        };
+        use cgka_traits::storage::GroupStorage;
+        let storage = app.account_storage("bob").unwrap();
+        let cutoff = storage.group_local_reset_cutoff(&group).unwrap().unwrap();
+        if !initially_joined {
+            // Pin the equal-second boundary with an authentic, never-consumed
+            // invitation. Receiving or wrapping it later must not make it fresh.
+            let bob_keys = home.load_signing_keys("bob").unwrap();
+            let alice_keys = home.load_signing_keys("alice").unwrap();
+            let event = NostrTransportEvent::from_transport_message(&delivery.message)
+                .unwrap()
+                .to_verified_nostr_event()
+                .unwrap();
+            let inner = nostr::nips::nip59::extract_rumor(&bob_keys, &event)
+                .await
+                .unwrap()
+                .rumor;
+            let rumor = EventBuilder::new(inner.kind, inner.content)
+                .tags(inner.tags)
+                .custom_created_at(NostrTimestamp::from_secs(cutoff.0))
+                .build(alice_keys.public_key());
+            let wrapper = EventBuilder::gift_wrap(&alice_keys, &bob_keys.public_key(), rumor, [])
+                .await
+                .unwrap();
+            delivery.message = NostrTransportEvent::from_nostr_event(&wrapper)
+                .unwrap()
+                .to_transport_message()
+                .unwrap();
+        }
+        delivery.message.timestamp = cgka_traits::Timestamp(cutoff.0 + 3600);
+        delivery.received_at = cgka_traits::Timestamp(cutoff.0 + 3600);
+        let effects = bob_client
+            .runtime
+            .ingest_delivery(delivery.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            effects.outcome,
+            cgka_traits::IngestOutcome::Ignored { .. }
+        ));
+        assert!(effects.effects.events.is_empty());
+        assert!(
+            alice.runtime.group_record(&group).is_ok(),
+            "the other device is unaffected"
+        );
+        assert!(bob_client.runtime.group_record(&group).is_err());
+        drop(bob_client);
+        let mut reopened = app
+            .client_with_relay_plane("bob", &plane, None)
+            .await
+            .unwrap();
+        let effects = reopened
+            .runtime
+            .ingest_delivery(delivery.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            effects.outcome,
+            cgka_traits::IngestOutcome::Ignored { .. }
+        ));
+        assert!(reopened.runtime.group_record(&group).is_err());
+        assert!(
+            app.group("bob", &hex::encode(group.as_slice()))
+                .unwrap()
+                .is_none()
+        );
+
+        // Forgetting is local: the inviter still needs to remove the old membership
+        // and generate a real new Add/Welcome, not redeliver the original bytes.
+        alice
+            .remove_members(&group, &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        reopened.rotate_key_package().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(unix_now_seconds() > cutoff.0);
+        alice
+            .invite_members(&group, &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let fresh = relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| event.kind == transport_nostr_peeler::KIND_NIP59_GIFT_WRAP)
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+        assert_ne!(fresh.id, delivery.message.id);
+        let mut fresh_delivery = delivery.clone();
+        fresh_delivery.message = fresh;
+        fresh_delivery.message.timestamp = cgka_traits::Timestamp(0);
+        let joined = reopened
+            .ingest_received_delivery(fresh_delivery)
+            .await
+            .unwrap();
+        assert!(joined.joined_groups.contains(&group));
+        assert!(!storage.is_group_forgotten(&group).unwrap());
+        assert_eq!(
+            storage.group_local_reset_cutoff(&group).unwrap(),
+            Some(cutoff)
+        );
+        assert!(reopened.runtime.group_record(&group).is_ok());
+        assert!(installed_group_routes(&reopened, &group) > 0);
+        assert!(
+            app.group("bob", &hex::encode(group.as_slice()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            app.messages("bob").unwrap().is_empty(),
+            "old chat history stays erased"
+        );
+
+        // Old traffic remains excluded even though a live route exists again.
+        let old_group_event = relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE
+                    && event.created_at <= cutoff.0
+            })
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+        let mut old_delivery = delivery.clone();
+        old_delivery.message = old_group_event;
+        let ignored = reopened
+            .runtime
+            .ingest_delivery(old_delivery)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ignored.outcome,
+            cgka_traits::IngestOutcome::Ignored { .. }
+        ));
+        assert!(ignored.effects.events.is_empty());
+        let old = reopened.runtime.ingest_delivery(delivery).await.unwrap();
+        assert!(matches!(
+            old.outcome,
+            cgka_traits::IngestOutcome::Ignored { .. }
+        ));
+
+        drop(reopened);
+        let mut reopened = app
+            .client_with_relay_plane("bob", &plane, None)
+            .await
+            .unwrap();
+        assert!(reopened.runtime.group_record(&group).is_ok());
+        assert!(!storage.is_group_forgotten(&group).unwrap());
+        assert_eq!(
+            storage.group_local_reset_cutoff(&group).unwrap(),
+            Some(cutoff)
+        );
+        let sent = reopened
+            .send(&group, b"message after fresh join")
+            .await
+            .unwrap();
+        assert_eq!(
+            sent.accept_disposition,
+            cgka_traits::SendAcceptDisposition::Published
+        );
+        let fresh_message = relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+        let received = alice
+            .ingest_received_delivery(cgka_traits::TransportDelivery {
+                account_id: alice.runtime.session().self_id(),
+                group_id_hint: Some(group.clone()),
+                message: fresh_message,
+                received_at: cgka_traits::Timestamp(unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(!received.messages.is_empty());
+        // A later explicit reset establishes a new boundary for this membership.
+        assert!(reopened.forget_group_local(&group).await.unwrap());
+        assert!(storage.group_local_reset_cutoff(&group).unwrap().unwrap() > cutoff);
+    }
 }
 
 #[test]

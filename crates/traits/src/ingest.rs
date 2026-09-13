@@ -227,5 +227,13 @@ pub enum PeeledContent {
     /// decides how to apply.
     MlsMessage { bytes: Vec<u8> },
     /// Welcome payload (MLS welcome bytes).
-    Welcome { bytes: Vec<u8> },
+    Welcome {
+        bytes: Vec<u8>,
+        /// Sender-authenticated inner invitation creation time, in Unix seconds.
+        /// Never substitute transport receipt time or an outer privacy wrapper's
+        /// timestamp. Absent on transports that cannot establish this value;
+        /// those Welcomes cannot cross a local group reset boundary.
+        #[serde(default)]
+        created_at: Option<crate::transport::Timestamp>,
+    },
 }

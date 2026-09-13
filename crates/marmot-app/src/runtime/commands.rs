@@ -902,7 +902,7 @@ impl AccountManager {
             let changed = self
                 .app
                 .account_storage(&account.label)?
-                .forget_group_local(group_id)?;
+                .forget_group_local(group_id, cgka_traits::Timestamp(crate::unix_now_seconds()))?;
             if changed {
                 publish_app_runtime_group_state_updated(
                     &self.events,

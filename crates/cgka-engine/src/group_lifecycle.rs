@@ -110,7 +110,7 @@ pub(crate) fn welcome_content_dedup_id(
     peeled: &cgka_traits::ingest::PeeledMessage,
 ) -> Result<cgka_traits::types::MessageId, EngineError> {
     match &peeled.content {
-        cgka_traits::ingest::PeeledContent::Welcome { bytes } => {
+        cgka_traits::ingest::PeeledContent::Welcome { bytes, .. } => {
             Ok(crate::message_processor::content_dedup_id(bytes))
         }
         _ => Err(EngineError::Peeler(
@@ -1054,8 +1054,10 @@ impl<S: StorageProvider> Engine<S> {
         consent: Option<(&GroupId, &[u8])>,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
-        let welcome_bytes = match peeled.content {
-            cgka_traits::ingest::PeeledContent::Welcome { bytes } => bytes,
+        let (welcome_bytes, welcome_created_at) = match peeled.content {
+            cgka_traits::ingest::PeeledContent::Welcome { bytes, created_at } => {
+                (bytes, created_at)
+            }
             _ => {
                 return Err(EngineError::Peeler(
                     cgka_traits::error::PeelerError::Malformed(
@@ -1154,8 +1156,13 @@ impl<S: StorageProvider> Engine<S> {
             // GroupInfo is still unverified here. Every tentative replacement
             // write is rolled back unless OpenMLS and Marmot checks succeed
             // and the local state permits this join.
-            if storage.disband_tombstone(&group_id)?.is_some()
-                || storage.is_group_forgotten(&group_id)?
+            if storage.disband_tombstone(&group_id)?.is_some() {
+                return Err(EngineError::InvalidWelcome);
+            }
+
+            let reset_cutoff = storage.group_local_reset_cutoff(&group_id)?;
+            if let Some(cutoff) = reset_cutoff
+                && welcome_created_at.is_none_or(|created_at| created_at <= cutoff)
             {
                 return Err(EngineError::InvalidWelcome);
             }
@@ -1239,6 +1246,12 @@ impl<S: StorageProvider> Engine<S> {
                 .welcome_sender()
                 .map_err(|_| EngineError::InvalidWelcome)?;
             let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+            // Bind the timestamp's authenticated author to the MLS inviter;
+            // an unrelated sender rewrapping old Welcome bytes cannot make
+            // those bytes a fresh invitation across a reset boundary.
+            if reset_cutoff.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
+                return Err(EngineError::InvalidWelcome);
+            }
             let mls_group = staged
                 .into_group(&provider)
                 .map_err(classify_openmls_welcome_error)?;
@@ -1352,6 +1365,9 @@ impl<S: StorageProvider> Engine<S> {
                 },
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
+            if reset_cutoff.is_some() {
+                storage.complete_group_local_reset(&group_id)?;
+            }
             storage.put_group(&group_record)?;
             if local_state_is_stale {
                 if consent.is_some() {
