@@ -782,7 +782,12 @@ impl AppClient {
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
         let rebuild_since = self.subscription_rebuild_since();
-        self.sync_runtime_groups_since(rebuild_since).await
+        self.pending_runtime_group_subscription_refresh = true;
+        let result = self.sync_runtime_groups_since(rebuild_since).await;
+        if result.is_ok() {
+            self.pending_runtime_group_subscription_refresh = false;
+        }
+        result
     }
 
     async fn sync_runtime_groups_since(
@@ -1030,6 +1035,8 @@ impl AppClient {
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<(), (SyncFailureStage, AppError)> {
+        // Failed/cancelled activation must retain a retry intent for scheduled work.
+        self.pending_runtime_group_subscription_refresh = true;
         // Before any subscription goes out: auth-gated relays (NIP-42)
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
@@ -4022,8 +4029,8 @@ impl AppClient {
         if self.is_group_forgotten(group_id)? {
             return Ok(SyncSummary::default());
         }
-        // The account worker refreshes transport groups once for the scheduled
-        // convergence batch before calling this per-group path.
+        // The worker retries dirty subscription state before this pass. An
+        // unchanged group set requires no account-wide refresh per group.
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.finish_scheduled_convergence_effects(group_id, &effects)
             .await

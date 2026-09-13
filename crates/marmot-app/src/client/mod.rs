@@ -2654,8 +2654,7 @@ impl AppClient {
         self.queued_epoch_backfills
             .retain(|pending| !pending.groups.is_empty());
         self.encrypted_media_not_required_epochs.remove(&group_hex);
-        // Hand the worker an Idle state to cancel any existing wakeup.
-        self.pending_convergence_groups.insert(group_id.clone());
+        self.pending_convergence_groups.remove(group_id);
         for summary in [
             &mut self.pending_applied_sync_summary,
             &mut self.pending_failed_sync_summary,
