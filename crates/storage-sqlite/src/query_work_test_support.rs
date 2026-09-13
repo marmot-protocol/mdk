@@ -61,6 +61,7 @@ pub(crate) fn measured<T>(
 ) -> T {
     let started = Instant::now();
     let (result, steps) = measure(store, action);
+    eprintln!("QUERY_WORK {label}: steps={steps} limit={max_steps}");
     assert!(
         steps < max_steps,
         "{label}: {steps} >= {max_steps}, elapsed={:?}",

@@ -1,6 +1,6 @@
 //! Account-local navigation over the four chat lists. Runtime windows own live reconciliation.
 //!
-//! Migration 0070 maintains disposable query keys on `chat_list_rows` from account membership,
+//! Migration 0072 maintains disposable query keys on `chat_list_rows` from account membership,
 //! archive/invitation state, row read intent, pin order and engine operation/tombstone tables.
 //! Left takes precedence over archive, including durable leave and active disband intent.
 //! Engine records remain authoritative: the returned leaving/disbanding state is read through

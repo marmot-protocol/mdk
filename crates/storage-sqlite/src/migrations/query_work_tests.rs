@@ -208,7 +208,7 @@ fn replay_query_work() {
                 .all(|package| package.value.as_slice() == [0])
         );
 
-        measured(&store, "proposal queue cleanup", 120, || {
+        measured(&store, "proposal queue cleanup", 90, || {
             store.openmls.clear_proposal_queue::<openmls::group::GroupId,
                 openmls::ciphersuite::hash_ref::ProposalRef>(&openmls::group::GroupId::from_slice(&[0xaa])).unwrap();
         });
@@ -434,7 +434,7 @@ fn media_reference_query_work() {
         ];
         let message = format!("{count:064x}");
         for label in ["first reference", "replayed reference"] {
-            measured(&store, &format!("{label} rows={count}"), 400, || {
+            measured(&store, &format!("{label} rows={count}"), 350, || {
                 let mut conn = store.lock().unwrap();
                 let before = conn.total_changes();
                 let tx = conn.transaction().unwrap();

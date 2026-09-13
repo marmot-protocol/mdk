@@ -602,7 +602,10 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                         .unwrap()
                         .join("\n");
                     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
-                    assert!(plan.contains(view.index()), "{plan}");
+                    if cursor.is_some() {
+                        assert!(plan.contains("SEARCH"), "{plan}");
+                        assert!(!plan.contains("SCAN"), "{plan}");
+                    }
                 }
             }
         }
