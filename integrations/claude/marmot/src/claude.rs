@@ -130,6 +130,7 @@ fn parse_event_line(line: &str) -> Result<ParsedEvent> {
         Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
             parse_session_event(&value)
         }
+        Some("assistant") => parse_assistant_event(&value),
         Some("result") => parse_result_event(&value),
         _ => Ok(ParsedEvent::Ignored),
     }
@@ -142,6 +143,41 @@ fn parse_session_event(value: &Value) -> Result<ParsedEvent> {
     normalize_session_id(session_id)
         .map(ParsedEvent::Session)
         .ok_or(HarnessError::Json)
+}
+
+fn parse_assistant_event(value: &Value) -> Result<ParsedEvent> {
+    if value
+        .get("parent_tool_use_id")
+        .is_some_and(|parent| !parent.is_null())
+    {
+        return Ok(ParsedEvent::Ignored);
+    }
+    let Some(message) = value.get("message") else {
+        return Ok(ParsedEvent::Ignored);
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Ok(ParsedEvent::Ignored);
+    }
+    let text = assistant_text(message.get("content"));
+    if text.trim().is_empty() {
+        return Ok(ParsedEvent::Ignored);
+    }
+    Ok(ParsedEvent::Text(text))
+}
+
+fn assistant_text(content: Option<&Value>) -> String {
+    let Some(Value::Array(parts)) = content else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn parse_result_event(value: &Value) -> Result<ParsedEvent> {
@@ -160,12 +196,7 @@ fn parse_result_event(value: &Value) -> Result<ParsedEvent> {
             summary: result_error_summary(subtype).to_owned(),
         });
     }
-    Ok(value
-        .get("result")
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .map(|text| ParsedEvent::Text(text.to_owned()))
-        .unwrap_or(ParsedEvent::Ignored))
+    Ok(ParsedEvent::Ignored)
 }
 
 fn result_error_summary(subtype: Option<&str>) -> &'static str {
@@ -281,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_emits_init_session_and_final_result_only() {
+    fn parser_emits_main_assistant_text_without_result_duplication() {
         assert_eq!(
             parse_event_line(&format!(
                 r#"{{"type":"system","subtype":"init","session_id":"{SESSION}"}}"#
@@ -294,11 +325,19 @@ mod tests {
                 r#"{{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"{SESSION}"}}"#
             ))
             .unwrap(),
-            ParsedEvent::Text("done".to_owned())
+            ParsedEvent::Ignored
+        );
+        assert_eq!(
+            parse_event_line(
+                r#"{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"checking "},{"type":"tool_use","name":"Read"},{"type":"text","text":"done"}]}}"#
+            )
+            .unwrap(),
+            ParsedEvent::Text("checking done".to_owned())
         );
         for line in [
             r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"secret"}]}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","input":"secret"}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"tool-1","message":{"role":"assistant","content":[{"type":"text","text":"subagent text"}]}}"#,
             r#"{"type":"user","message":{"content":"prompt"}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta"}}"#,
         ] {
@@ -367,7 +406,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runner_pipes_prompt_and_returns_only_final_result() {
+    async fn runner_pipes_prompt_and_returns_completed_assistant_messages() {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("fake-claude");
         write_executable(
@@ -382,7 +421,8 @@ test "$5" = "--session-id"
 session="$6"
 prompt="$(cat)"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"'"$session"'"}'
-printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"intermediate"}]}}'
+printf '%s\n' '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"intermediate"},{"type":"thinking","thinking":"secret"},{"type":"tool_use","name":"Read"}]}}'
+printf '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"reply: %s"}]}}\n' "$prompt"
 printf '{"type":"result","subtype":"success","is_error":false,"result":"reply: %s","session_id":"%s"}\n' "$prompt" "$session"
 "#,
         );
@@ -405,6 +445,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"reply: %
 
         assert!(outcome.observed_session.is_some());
         assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("intermediate".to_owned()))
+        );
         assert_eq!(
             rx.recv().await,
             Some(RunnerEvent::Text("reply: --stdin-only".to_owned()))

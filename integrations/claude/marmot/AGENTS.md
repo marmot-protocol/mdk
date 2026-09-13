@@ -11,9 +11,10 @@ socket. Read `README.md`, `../../AGENTS.md`, and
   Claude Code and parses its `stream-json` event stream.
 - Every message from an allowed sender is a prompt. Do not add gateway,
   mention-activation, profile, QUIC-preview, or protocol behavior here.
-- Send prompts over stdin and emit only the completed final `result` text.
-  Never expose assistant intermediate messages, reasoning, tool calls/output,
-  user echoes, partial events, or raw backend errors.
+- Send prompts over stdin and emit completed text blocks from main-conversation
+  assistant messages, including assistant messages between tool calls. Never
+  expose reasoning, tool calls/output, user echoes, subagent messages, partial
+  events, duplicate terminal `result` text, or raw backend errors.
 - Preserve the shared workdir/session-lane rules. A fresh lane uses an explicit
   adapter-generated UUID; later prompts resume only that stored UUID.
 

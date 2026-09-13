@@ -9,9 +9,10 @@ The adapter uses Claude Code's documented non-interactive contract. It sends
 prompts over stdin with `claude -p --output-format stream-json --verbose`,
 creates fresh conversations with an adapter-generated UUID passed to
 `--session-id`, and resumes only the stored UUID with `--resume`. It forwards
-only the completed final `result` text; intermediate assistant messages,
-reasoning, tool calls and output, user echoes, and partial stream events are
-ignored.
+completed main-conversation assistant text messages, including assistant text
+emitted between tool calls. Reasoning, tool calls and output, user echoes,
+subagent messages, partial stream events, and the duplicate terminal `result`
+text are ignored.
 
 For the current guided install, runtime chooser, and White Noise setup, use the
 canonical [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
@@ -152,8 +153,9 @@ The CLI contract and event schema were checked against Claude Code 2.1.270.
 - Claude Code print mode skips its interactive workspace-trust dialog. Select
   only a working directory you already trust.
 - Prompts travel over stdin and never appear in process arguments.
-- Only the final `result` text is returned to Marmot; raw errors and all
-  intermediate events are excluded.
+- Completed main-conversation assistant text is returned to Marmot. Raw errors,
+  reasoning, tool events, user echoes, subagent messages, partial events, and
+  the duplicate terminal `result` text are excluded.
 - Non-empty attachment batches are rejected before Claude Code starts. The
   accompanying text is not forwarded.
 - Connector state is owner-only, and logs exclude identifiers, paths, prompts,
