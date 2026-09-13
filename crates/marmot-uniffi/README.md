@@ -41,6 +41,14 @@ the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
 replaces client-owned random-roll wordlists; it is cosmetic, may
 collide, and does not create an account.
 
+`accountKeyPackages` lists the current KeyPackage winner per addressable slot
+plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
+history for that same fetch window: current and superseded kind-30443 events,
+with `isCurrent` set only among those observed valid events. Hosts can pass a
+superseded `eventIdHex` and its `sourceRelays` to the existing delete API.
+This does not change the Published-list filter (`relay == true`) and does not
+replace Android history UI work.
+
 Regenerate Swift/Kotlin bindings after pulling this surface. Android
 mention/QR/edit-profile migration remains
 [whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);

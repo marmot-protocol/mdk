@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `account_key_package_relay_events` / Swift and Kotlin `accountKeyPackageRelayEvents` /
+  `marmot_account_key_package_relay_events` return observed kind-30443 relay history for
+  one account, including superseded same-slot events, so hosts can delete a specific
+  event without targeting the current winner.
 - Runtime `forget_group_local` and Swift/Kotlin `forgetGroupLocal` for recovery from an
   unusable local group copy: erase chat history and MLS state, cancel group work, and
   wait for a fresh authenticated Welcome. Invitations must be created strictly after
@@ -22,6 +26,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Account KeyPackage listing now exposes one current relay event per addressable
+  slot. `wn keys list` follows that current-slot inventory; `wn keys delete-all
+  --confirm` still publishes deletions for every observed relay event, including
+  superseded same-slot members. Sign-out and wipe use the same all-event cleanup.
 - Account storage advances through migrations 70–71. Back up before upgrading;
   downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
   Keep native libraries and generated bindings on matching versions.

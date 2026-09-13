@@ -161,9 +161,11 @@ already pending. Routine replacement does not publish a kind-5 deletion; `keys d
 explicit teardown/legacy-cleanup tools. `keys maintenance-status` shows the persisted slot, lifetime, refresh,
 replacement, retry, and retained-private-material state.
 
-KeyPackage publish/fetch/check/list use the current relay-directory path. `keys list` returns the relay event id for
-each known KeyPackage record. `keys delete` publishes a Nostr deletion for one event id, and `keys delete-all
---confirm` publishes deletions for every relay-published KeyPackage record found for the selected account.
+KeyPackage publish/fetch/check/list use the current relay-directory path. `keys list` returns the current
+winner per addressable slot (plus local-only rows). `keys delete` publishes a Nostr deletion for one event
+id, and `keys delete-all --confirm` publishes deletions for every observed relay KeyPackage event in the
+validated fetch window, including superseded same-slot events. Pass a superseded event id from history to
+`keys delete` to retire that event without deleting the current slot winner.
 
 Chat projection commands:
 

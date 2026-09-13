@@ -77,6 +77,14 @@ random roll from the same wordlists. Free those strings with
 surface. Android mention/QR migration remains a separate consumer
 issue.
 
+`marmot_account_key_packages` returns the current KeyPackage winner per
+addressable slot plus local-only rows. `marmot_account_key_package_relay_events`
+returns observed relay history from the same validated fetch window, including
+superseded events. Free that list with
+`marmot_account_key_package_relay_event_list_free`. Existing
+`MarmotAccountKeyPackage` layout and `marmot_account_key_package_list_free`
+are unchanged.
+
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it

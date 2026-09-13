@@ -1227,6 +1227,29 @@ typedef struct MarmotAccountKeyPackageList {
 } MarmotAccountKeyPackageList;
 
 /**
+ * One observed relay KeyPackage event, including superseded slot members.
+ */
+typedef struct MarmotAccountKeyPackageRelayEvent {
+  char *account_id_hex;
+  char *key_package_id;
+  char *key_package_ref_hex;
+  char *event_id_hex;
+  uint64_t created_at;
+  uint64_t key_package_bytes;
+  char **source_relays;
+  uintptr_t source_relays_len;
+  bool is_current;
+} MarmotAccountKeyPackageRelayEvent;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAccountKeyPackageRelayEventList {
+  struct MarmotAccountKeyPackageRelayEvent *items;
+  uintptr_t len;
+} MarmotAccountKeyPackageRelayEventList;
+
+/**
  * One published relay list (`kind` is the Nostr event kind).
  */
 typedef struct MarmotRelayList {
@@ -4659,8 +4682,8 @@ MarmotStatus marmot_account_inbox_relays(const struct MarmotClient *client,
                                          struct MarmotStringList **out);
 
 /**
- * Local + relay-published KeyPackages for the account. Free with
- * `marmot_account_key_package_list_free`.
+ * Local + current-slot relay-published KeyPackages for the account. Free
+ * with `marmot_account_key_package_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4673,6 +4696,22 @@ MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
                                          const char *const *bootstrap_relays,
                                          uintptr_t bootstrap_relays_len,
                                          struct MarmotAccountKeyPackageList **out);
+
+/**
+ * Observed relay KeyPackage history, including superseded events. Free
+ * with `marmot_account_key_package_relay_event_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_key_package_relay_events(const struct MarmotClient *client,
+                                                     const char *account_ref,
+                                                     const char *const *bootstrap_relays,
+                                                     uintptr_t bootstrap_relays_len,
+                                                     struct MarmotAccountKeyPackageRelayEventList **out);
 
 /**
  * Publish a fresh KeyPackage. Writes the accepting-relay count.
@@ -8263,6 +8302,15 @@ void marmot_send_summary_free(struct MarmotSendSummary *ptr);
  * library.
  */
 void marmot_account_key_package_list_free(struct MarmotAccountKeyPackageList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_account_key_package_relay_event_list_free(struct MarmotAccountKeyPackageRelayEventList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -2898,6 +2898,42 @@ fn keys_list_reports_published_key_package() {
 }
 
 #[test]
+fn keys_list_after_rotate_keeps_one_current_row() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let account_id = create_account(home.path());
+    run_json(home.path(), &["--account", &account_id, "keys", "publish"]);
+    run_json(home.path(), &["--account", &account_id, "keys", "rotate"]);
+
+    let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
+    let keys = listed["keys"].as_array().expect("keys array");
+    let relay_rows = keys
+        .iter()
+        .filter(|key| key["relay"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relay_rows.len(),
+        1,
+        "rotate must keep one current relay inventory row"
+    );
+    assert!(
+        relay_rows[0]["key_package_event_id"]
+            .as_str()
+            .is_some_and(|event_id| !event_id.is_empty())
+    );
+
+    let delete_all = run_json(
+        home.path(),
+        &["--account", &account_id, "keys", "delete-all", "--confirm"],
+    );
+    assert!(
+        delete_all["deleted_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_eq!(delete_all["failed_count"], 0);
+}
+
+#[test]
 fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = TestRelay::new();

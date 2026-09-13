@@ -37,24 +37,25 @@ use crate::{
     ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
-    AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread,
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster, AppMessageQuery,
-    AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup, AuditLogDeleteOutcome,
-    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
-    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
-    KeyPackageDeletionResult, KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp,
-    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, MessageDraft, MessageDraftAttachment,
-    MessageDraftSummary, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
-    TimelineMessageRecord, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountRelayListBootstrap,
+    AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
+    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
+    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
+    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
+    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
+    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
+    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
+    unix_now_seconds,
 };
 
 pub(crate) mod account_worker;
@@ -3322,6 +3323,16 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn account_key_package_relay_events(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRelayEvent>, AppError> {
+        self.accounts
+            .account_key_package_relay_events(account_ref, bootstrap_relays)
+            .await
+    }
+
     pub async fn delete_key_package(
         &self,
         account_ref: &str,
@@ -3356,14 +3367,15 @@ impl MarmotAppRuntime {
     async fn delete_relay_key_packages(
         &self,
         account_label: &str,
-        packages: Vec<AccountKeyPackageRecord>,
+        events: Vec<AccountKeyPackageRelayEvent>,
     ) -> (u32, Vec<RelayFailure>) {
-        let targets = packages
+        let mut seen = std::collections::HashSet::new();
+        let targets = events
             .into_iter()
-            .filter(|package| package.relay)
-            .map(|package| KeyPackageDeletionTarget {
-                event_id_hex: package.key_package_event_id,
-                source_relays: package
+            .filter(|event| seen.insert(event.key_package_event_id.clone()))
+            .map(|event| KeyPackageDeletionTarget {
+                event_id_hex: event.key_package_event_id,
+                source_relays: event
                     .source_relays
                     .into_iter()
                     .map(TransportEndpoint)
@@ -3486,11 +3498,13 @@ impl MarmotAppRuntime {
         // recorded as a single failure (no event id) and must not abort the
         // sign-out. This mirrors stage 2 of `sign_out_and_wipe`.
         if options.delete_key_packages {
-            match self.account_key_packages(account_ref, Vec::new()).await {
-                Ok(packages) => {
-                    let (deleted, failures) = self
-                        .delete_relay_key_packages(&account.label, packages)
-                        .await;
+            match self
+                .account_key_package_relay_events(account_ref, Vec::new())
+                .await
+            {
+                Ok(events) => {
+                    let (deleted, failures) =
+                        self.delete_relay_key_packages(&account.label, events).await;
                     outcome.key_packages_deleted += deleted;
                     outcome.key_package_failures.extend(failures);
                 }
@@ -3636,11 +3650,13 @@ impl MarmotAppRuntime {
         // Stage 2: delete every relay-published KeyPackage. Discovery itself is
         // network-bound; a discovery failure is recorded as a single failure
         // (no event id) and must not abort the wipe.
-        match self.account_key_packages(account_ref, Vec::new()).await {
-            Ok(packages) => {
-                let (deleted, failures) = self
-                    .delete_relay_key_packages(&account.label, packages)
-                    .await;
+        match self
+            .account_key_package_relay_events(account_ref, Vec::new())
+            .await
+        {
+            Ok(events) => {
+                let (deleted, failures) =
+                    self.delete_relay_key_packages(&account.label, events).await;
                 outcome.key_packages_deleted += deleted;
                 outcome.key_package_failures.extend(failures);
             }
@@ -6037,6 +6053,21 @@ impl AccountManager {
         .map_err(cgka_session::SessionError::from)?;
         self.app
             .account_key_package_records(&account.label, bootstrap_relays, owned)
+            .await
+    }
+
+    pub async fn account_key_package_relay_events(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRelayEvent>, AppError> {
+        let account = self.resolve(account_ref)?;
+        if account.can_sign() && !account.signed_out {
+            self.wait_for_account_network_startup_to_settle(&account.label)
+                .await?;
+        }
+        self.app
+            .account_key_package_relay_events(&account.label, bootstrap_relays)
             .await
     }
 

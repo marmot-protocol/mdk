@@ -298,9 +298,9 @@ use directory::records::display_name_for_profile;
 use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
 use key_package_records::{
-    account_key_package_record_from_fetched, key_package_from_hex_with_optional_source,
-    key_package_from_record, merge_key_package_records, parse_key_package_event_id_hex,
-    publish_endpoints_from_bootstrap,
+    account_key_package_record_from_fetched, account_key_package_relay_events_from_records,
+    key_package_from_hex_with_optional_source, key_package_from_record, merge_key_package_records,
+    parse_key_package_event_id_hex, publish_endpoints_from_bootstrap,
 };
 #[cfg(test)]
 use key_package_records::{
@@ -1047,6 +1047,27 @@ pub struct AccountKeyPackageRecord {
     pub local: bool,
     /// True when this exact event id was discovered from a relay.
     pub relay: bool,
+}
+
+/// Observed relay history for an account's kind-30443 KeyPackage events.
+///
+/// This is the validated, event-ID-deduplicated window returned by a single
+/// fetch — current and superseded events together. `is_current` is the winner
+/// only among those observed valid events, not a global relay guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageRelayEvent {
+    pub account_id_hex: String,
+    /// Exact validated `d` tag / addressable slot.
+    pub key_package_id: String,
+    pub key_package_ref_hex: String,
+    pub key_package_event_id: String,
+    /// Relay event timestamp. Never a local overlay time.
+    pub created_at: u64,
+    pub key_package_bytes: usize,
+    /// Normalized observations for this exact event.
+    pub source_relays: Vec<String>,
+    /// Winner only within this returned validated window.
+    pub is_current: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4118,15 +4139,14 @@ impl MarmotApp {
         Ok(records)
     }
 
-    pub async fn account_key_package_records(
+    async fn fetch_validated_account_key_package_records(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
-        owned_key_packages: Vec<KeyPackage>,
+        method: &'static str,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
-        let mut packages = self.local_key_package_records(label, owned_key_packages)?;
 
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
         let mut relay_lists = if has_explicit_bootstrap_relays {
@@ -4175,6 +4195,7 @@ impl MarmotApp {
             .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
             .await?;
         sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
         for record in relay_records {
             match key_package_from_record(record) {
                 Ok(fetched) => {
@@ -4183,15 +4204,47 @@ impl MarmotApp {
                 Err(err) => {
                     tracing::warn!(
                         target: "marmot_app::key_packages",
-                        method = "account_key_package_records",
+                        method,
                         error_kind = err.privacy_safe_kind(),
                         "skipping invalid key package event while listing account packages"
                     );
                 }
             }
         }
+        Ok(packages)
+    }
 
+    pub async fn account_key_package_records(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        owned_key_packages: Vec<KeyPackage>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let mut packages = self.local_key_package_records(label, owned_key_packages)?;
+        packages.extend(
+            self.fetch_validated_account_key_package_records(
+                label,
+                bootstrap_relays,
+                "account_key_package_records",
+            )
+            .await?,
+        );
         Ok(merge_key_package_records(packages))
+    }
+
+    pub async fn account_key_package_relay_events(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRelayEvent>, AppError> {
+        let packages = self
+            .fetch_validated_account_key_package_records(
+                label,
+                bootstrap_relays,
+                "account_key_package_relay_events",
+            )
+            .await?;
+        Ok(account_key_package_relay_events_from_records(packages))
     }
 
     pub async fn delete_key_package_event(
