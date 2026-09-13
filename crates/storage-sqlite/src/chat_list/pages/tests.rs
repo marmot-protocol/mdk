@@ -551,6 +551,20 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
             let tail = store
                 .chat_list_page(query(view, 10, ChatListPageDirection::Backward, None))
                 .unwrap();
+            let (_, anchor_steps) = measure(&store, || {
+                store
+                    .chat_list_page_from_anchor(
+                        view,
+                        &tail.rows.last().unwrap().group_id_hex,
+                        10,
+                        ChatListPageDirection::Backward,
+                    )
+                    .unwrap()
+            });
+            assert!(
+                anchor_steps < 2400,
+                "{count} pins={pin_cap} {view:?}: anchor used {anchor_steps} VM steps"
+            );
             for limit in [10, 100] {
                 for (direction, cursor) in [
                     (ChatListPageDirection::Forward, None),
@@ -689,7 +703,33 @@ fn missing_projected_pin_and_row_recreation_keep_authoritative_global_pin_ranks(
 }
 
 #[test]
+fn stable_anchor_accepts_normalized_ids_for_mixed_case_rows() {
+    for id in ["ABCD", "aBcD"] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, id, false, "member", 1, false);
+        for direction in [
+            ChatListPageDirection::Forward,
+            ChatListPageDirection::Backward,
+        ] {
+            let anchored = store
+                .chat_list_page_from_anchor(ChatListView::Chats, "abcd", 10, direction)
+                .unwrap();
+            assert_eq!(ids(&anchored), [id]);
+            assert!(matches!(
+                store.chat_list_page_from_anchor(ChatListView::Archived, "abcd", 10, direction),
+                Err(ChatListPageError::AnchorUnavailable)
+            ));
+        }
+    }
+}
+
+#[test]
 fn legacy_disband_record_without_status_retains_pending_semantics() {
+    assert_eq!(
+        serde_json::to_value(DisbandRequestStatus::Pending).unwrap(),
+        serde_json::json!("pending"),
+        "migration 0070 freezes this durable status literal in trigger DDL"
+    );
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "01", false, "member", 0, false);
     let group = engine_group(&store, "01");

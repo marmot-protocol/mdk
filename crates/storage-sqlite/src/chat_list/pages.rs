@@ -229,7 +229,7 @@ impl SqliteAccountStorage {
             let key = tx
                 .query_row_cached(
                     &format!(
-                        "SELECT {KEY_COLUMNS} FROM chat_list_rows WHERE group_id_hex = ?1 AND {}",
+                        "SELECT {KEY_COLUMNS} FROM chat_list_rows WHERE lower(group_id_hex) = lower(?1) AND {}",
                         query.view.predicate()
                     ),
                     [group],

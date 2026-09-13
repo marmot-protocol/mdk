@@ -846,7 +846,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
             std::time::Instant::now() < deadline,
             "queued outbound work did not publish within the convergence deadline"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         advanced = carol.advance_convergence(&created.group_id).await.unwrap();
     }
 
