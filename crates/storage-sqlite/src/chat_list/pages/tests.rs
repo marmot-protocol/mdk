@@ -728,7 +728,7 @@ fn legacy_disband_record_without_status_retains_pending_semantics() {
     assert_eq!(
         serde_json::to_value(DisbandRequestStatus::Pending).unwrap(),
         serde_json::json!("pending"),
-        "migration 0070 freezes this durable status literal in trigger DDL"
+        "migration 0072 freezes this durable status literal in trigger DDL"
     );
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "01", false, "member", 0, false);

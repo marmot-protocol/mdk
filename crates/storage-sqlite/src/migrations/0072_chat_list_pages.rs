@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn populated_upgrade_classifies_mixed_case_engine_ids() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..69]).unwrap();
+        run(&mut conn, &MIGRATIONS[..71]).unwrap();
         conn.execute_batch(
             "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('aBcD','',0);
             INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES ('aBcD',0);
@@ -229,7 +229,7 @@ mod tests {
     fn populated_upgrade_backfills_navigation_and_rolls_back_failed_migration() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-        run(&mut conn, &MIGRATIONS[..69]).unwrap();
+        run(&mut conn, &MIGRATIONS[..71]).unwrap();
         conn.execute_batch("INSERT INTO account_groups(group_id_hex, endpoint, updated_at, archived, self_membership) VALUES
                 ('01','',0,0,'member'), ('02','',0,1,'member'), ('03','',0,1,'removed'), ('04','',0,0,'member');
             INSERT INTO chat_list_rows(group_id_hex, updated_at, unread_count, manually_marked_unread)
