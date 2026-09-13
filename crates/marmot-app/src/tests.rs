@@ -8039,7 +8039,7 @@ async fn fresh_key_package_for_account(
 }
 
 /// Seed the explicit kind-10050 state normally established by account setup.
-fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, relay: &str) {
+pub(crate) fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, relay: &str) {
     let mut relay_lists = AccountRelayListStatus::empty();
     relay_lists.inbox.created_at = 1;
     relay_lists.inbox.relays = vec![relay.to_owned()];
@@ -21373,7 +21373,9 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             "old chat history stays erased"
         );
 
-        // Old traffic remains excluded even though a live route exists again.
+        // Old ciphertext cannot restore the discarded MLS state or history.
+        // Opaque traffic follows the ordinary bounded deferred-peel policy;
+        // outer timestamps must not reject valid post-join traffic.
         let old_group_event = relay
             .published_events
             .lock()
@@ -21393,11 +21395,12 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             .ingest_delivery(old_delivery)
             .await
             .unwrap();
-        assert!(matches!(
+        assert!(!matches!(
             ignored.outcome,
-            cgka_traits::IngestOutcome::Ignored { .. }
+            cgka_traits::IngestOutcome::Processed
         ));
         assert!(ignored.effects.events.is_empty());
+        assert!(app.messages("bob").unwrap().is_empty());
         let old = reopened.runtime.ingest_delivery(delivery).await.unwrap();
         assert!(matches!(
             old.outcome,
@@ -21450,6 +21453,58 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             .await
             .unwrap();
         assert!(!received.messages.is_empty());
+        alice
+            .send(&group, b"reply with a slow outer clock")
+            .await
+            .unwrap();
+        let event = relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+        // Re-sign the actual outer event with a skewed creation time, not just
+        // an altered transport hint. Its ciphertext is valid in the new MLS epoch.
+        let skewed = EventBuilder::new(event.kind, event.content.clone())
+            .tags(event.tags.clone())
+            .custom_created_at(NostrTimestamp::from_secs(0))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reply = reopened
+            .ingest_received_delivery(cgka_traits::TransportDelivery {
+                account_id: MemberId::new(hex::decode(&bob.account_id_hex).unwrap()),
+                group_id_hint: Some(group.clone()),
+                message: NostrTransportEvent::from_nostr_event(&skewed)
+                    .unwrap()
+                    .to_transport_message()
+                    .unwrap(),
+                received_at: cgka_traits::Timestamp(unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.messages.len(),
+            1,
+            "a reset must not mute valid traffic from a slow clock"
+        );
+        assert!(
+            app.messages("bob")
+                .unwrap()
+                .iter()
+                .any(|message| message.plaintext == "reply with a slow outer clock")
+        );
+
         // A later explicit reset establishes a new boundary for this membership.
         assert!(reopened.forget_group_local(&group).await.unwrap());
         assert!(storage.group_local_reset_cutoff(&group).unwrap().unwrap() > cutoff);

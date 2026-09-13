@@ -357,16 +357,10 @@ impl<S: StorageProvider> Engine<S> {
         let reported = |outcome| Ok(GroupMessageIngestOutcome::Outcome(outcome));
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
-        // A reset's replay cutoff survives the fresh join. Drop old transport
-        // traffic before hydration/deferred-peel retention can schedule recovery
-        // of the discarded state. This timestamp is a replay filter, not proof
-        // that newer traffic is valid; newer input still passes normal crypto
-        // validation and the new join epoch's membership bound.
-        if self
-            .storage
-            .group_local_reset_cutoff(&group_id)?
-            .is_some_and(|cutoff| msg.timestamp <= cutoff)
-        {
+        // Before a fresh Welcome, no group message may restart abandoned work.
+        // After joining, use MLS validation and its join-epoch bound: outer
+        // transport timestamps cannot safely reject traffic from skewed clocks.
+        if self.storage.is_group_forgotten(&group_id)? {
             return reported(IngestOutcome::Ignored {
                 category: InputRejectionCategory::UnknownGroup,
             });
