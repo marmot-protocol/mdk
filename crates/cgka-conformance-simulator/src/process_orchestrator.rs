@@ -1076,42 +1076,62 @@ impl ProcessOrchestrator {
                     unreachable!("predicate rejected by process capability preflight")
                 };
                 let labels = vec![client.clone()];
-                for iteration in 0..=max_iterations {
-                    let observations = self.observe(&labels, action_id).await?;
+                let wait = crate::assertion_wait::AssertionWait::new(
+                    max_iterations,
+                    matches!(assertion, crate::ScenarioAssertionV2::Eventually { .. }),
+                );
+                let mut iteration = 0;
+                let mut samples = 0;
+                let mut last_actual = serde_json::Value::Null;
+                let (passed, final_actual) = loop {
+                    let Some(observations) = wait.run(self.observe(&labels, action_id)).await?
+                    else {
+                        break (false, last_actual);
+                    };
+                    samples += 1;
                     let actual = &observations[0].protocol;
                     let passed = epoch.is_none_or(|expected| actual.epoch == expected)
-                        && member_count.is_none_or(|expected| actual.member_count == expected);
-                    if passed || iteration == max_iterations {
-                        report
-                            .assertion_observations
-                            .push(crate::ScenarioAssertionObservationV2 {
-                                step_index: action.schedule.source_step_index,
-                                assertion: assertion.clone(),
-                                passed,
-                                samples: iteration + 1,
-                                elapsed_virtual_ms: 0,
-                                final_actual: serde_json::json!({
-                                    "client": client,
-                                    "epoch": actual.epoch,
-                                    "member_count": actual.member_count,
-                                }),
-                            });
-                        if passed {
-                            return Ok((labels, ProcessActionStatusV1::Completed));
-                        }
-                        return Err((Some(client.clone()), NodeErrorV1 {
-                            code: "scenario_assertion_failed".into(),
-                            category: SubjectFailureCategory::Protocol,
-                            retryable: false,
-                            message: "public client state did not match within the declared assertion budget".into(),
-                        }));
+                        && member_count.is_none_or(|expected| actual.member_count == expected)
+                        && !wait.expired();
+                    let final_actual = serde_json::json!({
+                        "client": client,
+                        "epoch": actual.epoch,
+                        "member_count": actual.member_count,
+                    });
+                    if passed || iteration == max_iterations || wait.expired() {
+                        break (passed, final_actual);
                     }
-                    // Match the shared Eventually driver: each round wakes every
-                    // running scenario participant, including peers needed for repair.
+                    // Wake all running peers needed for repair, with the same
+                    // pacing/deadline as the public AppRuntimeHarness driver.
                     let running = self.running_labels();
-                    self.catch_up(&running, action_id, false).await?;
+                    if !wait.tick(self.catch_up(&running, action_id, false)).await? {
+                        break (false, final_actual);
+                    }
+                    last_actual = final_actual;
+                    iteration += 1;
+                };
+                report
+                    .assertion_observations
+                    .push(crate::ScenarioAssertionObservationV2 {
+                        step_index: action.schedule.source_step_index,
+                        assertion: assertion.clone(),
+                        passed,
+                        samples,
+                        elapsed_virtual_ms: 0,
+                        wall_timeout_ms: wait.timeout_ms(),
+                        elapsed_wall_ms: wait.elapsed_ms(),
+                        final_actual,
+                    });
+                if passed {
+                    Ok((labels, ProcessActionStatusV1::Completed))
+                } else {
+                    Err((Some(client.clone()), NodeErrorV1 {
+                        code: "scenario_assertion_failed".into(),
+                        category: SubjectFailureCategory::Protocol,
+                        retryable: false,
+                        message: "public client state did not match within the declared assertion budget".into(),
+                    }))
                 }
-                unreachable!("bounded assertion always returns its final sample")
             }
             ScenarioStep::SyncRelayHistory { clients, sync } => {
                 let clients = clients

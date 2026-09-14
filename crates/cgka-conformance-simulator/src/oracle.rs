@@ -1120,6 +1120,8 @@ mod tests {
             passed,
             samples: 1,
             elapsed_virtual_ms: 0,
+            wall_timeout_ms: None,
+            elapsed_wall_ms: None,
             final_actual: serde_json::json!(if passed { 1 } else { 0 }),
         }
     }
@@ -1145,6 +1147,8 @@ mod tests {
                         passed: true,
                         samples: 1,
                         elapsed_virtual_ms: 0,
+                        wall_timeout_ms: None,
+                        elapsed_wall_ms: None,
                         final_actual: serde_json::json!(1),
                     }
                 })

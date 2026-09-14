@@ -24,3 +24,11 @@ Local map for simulator source modules. Read `../AGENTS.md` for the agent workfl
 - Default app acceptance uses one process per participant and a separate relay process. Keep `new_in_process_stress`
   explicit for shared-runtime diagnostics. Build and freeze matching node/coordinator feature modes before a campaign;
   preserve the existing protocol, cleanup and execution-layout checks when adding a command.
+
+## Assertion timing
+
+`assertion_wait.rs` shares real-app eventual-assertion pacing and deadlines between `scenario.rs`
+and `process_orchestrator.rs`. Keep the first sample immediate, later rounds at least one second,
+and the total allowance `(max_iterations + 1)` seconds. Record elapsed/allowed wall time separately
+from virtual time. Engine subjects retain deterministic unpaced ticks. Test fast/slow polling,
+never-recovering and stalled subjects with paused Tokio time; do not relax predicate expectations.

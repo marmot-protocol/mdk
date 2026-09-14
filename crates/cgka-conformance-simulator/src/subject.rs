@@ -364,6 +364,12 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    /// Real app adapters pace eventual assertions against wall time. Engine
+    /// subjects keep deterministic tick-count semantics by default.
+    fn uses_wall_clock_assertions(&self) -> bool {
+        false
+    }
+
     /// Select controlled virtual-time behavior without advancing either clock
     /// domain. This makes the clock-mode transition explicit for adapters.
     fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {

@@ -1295,6 +1295,10 @@ impl AppRuntimeHarness {
 
 #[async_trait]
 impl ConvergenceSubject for AppRuntimeHarness {
+    fn uses_wall_clock_assertions(&self) -> bool {
+        true
+    }
+
     fn execution_layout(&self) -> Option<serde_json::Value> {
         Some(self.process_layout())
     }

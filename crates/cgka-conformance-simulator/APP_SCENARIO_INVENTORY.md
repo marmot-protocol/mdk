@@ -108,6 +108,18 @@ builds and freezes that helper, records its hash, and supplies its absolute path
 Never let a later feature/compatibility build silently replace a running campaign's executable.
 Use fresh evidence roots and the saved generated input for reproduction.
 
+## CI placement
+
+PR CI runs `just simulator-smoke` (ordinary simulator tests and four selected process regressions)
+and the Python campaign-contract tests. It does **not** execute the full 72-case app catalog.
+The nightly workflow runs the broader simulator lane and two separate production-policy
+1,024-message app recovery journeys. The weekly hardening lane runs broader engine/container
+campaigns. Neither scheduled workflow currently invokes the full app-stack catalog.
+
+Keep the full 72-case app run in an explicit or scheduled assurance lane, rather than adding it to
+PR smoke. Weekly is the intended starting cadence; wiring that catalog into a scheduled job remains
+separate work. Focused saved-input regressions and harness tests are the PR gate for timing fixes.
+
 ## Recorded validation and remaining gates
 
 The 13 September 2026 local campaign completed all six large-group variants at seeds 42, 7 and
@@ -132,8 +144,15 @@ builds: 43 passes precede the historical-sender correction and 29 use that corre
 independent completion verification remain in `target/app-full-eight-seed7-20260914-4`.
 These results do not establish 72 passes on one final build or replace the earlier failure records.
 
-Before PR readiness, rerun all 72 seed-7 selections on the final rebased build. Separate remaining
-gates include the two explicit 1,024-message slow tests and the separately classified strict race
-diagnostic. Measure structural diversity when widening seeds. Keep completed-case ledgers so
+A later frozen-head run at `788bac21` attempted all 72 seed-7 selections: 70 passed and backlog
+cases 2 and 5 exhausted 120 polling rounds before background recovery completed. Saved-input
+probes recovered during an extra wait; a serial-catch-up control passed case 2. These failed
+verdicts remain preserved in `target/app-full-eight-seed7-pr-20260914-1`. Real-app eventual assertions
+now pace rounds and record their wall-clock watchdog; focused replay establishes that fix separately.
+
+Full-catalog acceptance on a final build remains a separate assurance result, not an automatic
+requirement to rerun every case for each PR edit. Other gates include the two explicit
+1,024-message slow tests and the separately classified strict race diagnostic. Measure structural
+diversity when widening seeds. Keep completed-case ledgers so
 broadening does not repeat prior passes; a deliberate regression campaign uses a fresh ledger. A fresh-stack campaign establishes repeated execution coverage; continuous longevity
 requires repeated activity and recovery in the same long-lived participant processes and databases.

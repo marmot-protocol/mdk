@@ -1491,6 +1491,12 @@ async fn process_client_state_assertion_exhaustion_stops_before_next_action() {
     assert_eq!(report.assertion_observations[0].samples, 1);
     assert!(!report.assertion_observations[1].passed);
     assert_eq!(report.assertion_observations[1].samples, 3);
+    assert_eq!(report.assertion_observations[0].wall_timeout_ms, None);
+    assert_eq!(
+        report.assertion_observations[1].wall_timeout_ms,
+        Some(3_000)
+    );
+    assert!(report.assertion_observations[1].elapsed_wall_ms.unwrap() >= 2_000);
     assert_eq!(report.failure_capsules.len(), 1);
     let capsule: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&report.failure_capsules[0]).unwrap()).unwrap();

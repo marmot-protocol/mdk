@@ -111,7 +111,7 @@ adapter and is not used as evidence of offline recovery.
 `assert` actions are executable and write samples to the common report/capsule schema:
 
 - `exactly` samples once at the current action boundary;
-- `eventually` samples now and after at most `max_iterations` deterministic participant tick rounds;
+- `eventually` samples now and after at most `max_iterations` participant tick rounds (deterministic for engine subjects; paced against wall time for real app subjects);
 - `within` samples now, then advances virtual time and ticks participants until the predicate matches or the deadline;
 - `never` requires the predicate to remain false at every sample through the virtual-time window; and
 - `resource` compares a structural-progress metric to an exact, upper, or lower bound.
@@ -124,6 +124,14 @@ are watchdogs rather than a redefinition of success. Predicate samples are non-d
 does not drain the event window that a later `observe` action records. Predicates that require exact canonical state add
 the exact-observation capability during compilation, so a semantic-only adapter rejects the complete schedule before
 action zero.
+
+For real app subjects, each unsuccessful `eventually` round includes catch-up and lasts at least one
+second. A total wall-clock watchdog of `(max_iterations + 1)` seconds includes the initial sample;
+slow remote operations consume that same budget. This keeps parallel catch-up from spending all
+polls before production convergence timers can fire. A matching initial sample still returns
+immediately, predicates remain unchanged, and exceeding either budget fails the assertion. Reports
+include `wall_timeout_ms` and `elapsed_wall_ms`; older reports deserialize without these optional
+fields. Deterministic engine subjects keep unpaced tick counts and omit wall-clock evidence.
 
 The process adapter supports `exactly` and `eventually` with `client_state` through the narrow
 `client_state_assertion` capability. It reads the public epoch/member count, samples once before ticking,

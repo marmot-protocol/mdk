@@ -1233,6 +1233,8 @@ async fn execute_assertion(
     let mut samples = 0_usize;
     let mut elapsed_virtual_ms = 0_u64;
     let mut final_actual = serde_json::Value::Null;
+    let mut wall_timeout_ms = None;
+    let mut elapsed_wall_ms = None;
     let passed = match assertion {
         ScenarioAssertionV2::Exactly { predicate } => {
             let observation = subject.evaluate_predicate(predicate)?;
@@ -1244,19 +1246,28 @@ async fn execute_assertion(
             predicate,
             max_iterations,
         } => {
+            let wait = crate::assertion_wait::AssertionWait::new(
+                *max_iterations,
+                subject.uses_wall_clock_assertions(),
+            );
             let mut matched = false;
             for iteration in 0..=*max_iterations {
                 let observation = subject.evaluate_predicate(predicate)?;
                 samples += 1;
                 final_actual = observation.actual;
-                if observation.matched {
+                if observation.matched && !wait.expired() {
                     matched = true;
                     break;
                 }
-                if iteration < *max_iterations {
-                    subject.tick(clients).await?;
+                if wait.expired()
+                    || iteration == *max_iterations
+                    || !wait.tick(subject.tick(clients)).await?
+                {
+                    break;
                 }
             }
+            wall_timeout_ms = wait.timeout_ms();
+            elapsed_wall_ms = wait.elapsed_ms();
             matched
         }
         ScenarioAssertionV2::Within {
@@ -1329,6 +1340,8 @@ async fn execute_assertion(
         passed,
         samples,
         elapsed_virtual_ms,
+        wall_timeout_ms,
+        elapsed_wall_ms,
         final_actual,
     })
 }
@@ -1719,6 +1732,131 @@ mod tests {
             scenario_initial_admins(&spec, 0, &["bob".into(), "carol".into()]),
             vec!["bob", "carol"]
         );
+    }
+
+    struct AssertionTimingSubject {
+        started: tokio::time::Instant,
+        ready_after: Option<std::time::Duration>,
+        tick_delay: std::time::Duration,
+        wall_clock: bool,
+        ticks: usize,
+    }
+
+    #[async_trait]
+    impl ConvergenceSubject for AssertionTimingSubject {
+        fn descriptor(&self) -> SubjectDescriptor {
+            SubjectDescriptor {
+                adapter: "assertion-timing-test".into(),
+                adapter_version: "1".into(),
+                storage_backend: "none".into(),
+                capabilities: BTreeSet::new(),
+            }
+        }
+
+        fn uses_wall_clock_assertions(&self) -> bool {
+            self.wall_clock
+        }
+
+        async fn tick(&mut self, _clients: &[String]) -> Result<(), SubjectError> {
+            self.ticks += 1;
+            tokio::time::sleep(self.tick_delay).await;
+            Ok(())
+        }
+
+        fn evaluate_predicate(
+            &mut self,
+            _predicate: &crate::ScenarioPredicateV2,
+        ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
+            let elapsed = self.started.elapsed();
+            Ok(crate::ScenarioPredicateObservationV2 {
+                matched: self.ready_after.is_some_and(|ready| elapsed >= ready),
+                actual: serde_json::json!({"elapsed_ms": elapsed.as_millis()}),
+            })
+        }
+    }
+
+    async fn timed_assertion(
+        tick_ms: u64,
+        ready_ms: Option<u64>,
+        iterations: usize,
+        wall_clock: bool,
+    ) -> (crate::ScenarioAssertionObservationV2, usize) {
+        let mut subject = AssertionTimingSubject {
+            started: tokio::time::Instant::now(),
+            ready_after: ready_ms.map(std::time::Duration::from_millis),
+            tick_delay: std::time::Duration::from_millis(tick_ms),
+            wall_clock,
+            ticks: 0,
+        };
+        let observation = execute_assertion(
+            &crate::ScenarioAssertionV2::Eventually {
+                predicate: crate::ScenarioPredicateV2::ClientState {
+                    client: "alice".into(),
+                    epoch: Some(2),
+                    member_count: None,
+                },
+                max_iterations: iterations,
+            },
+            &mut subject,
+            &["alice".into()],
+            0,
+        )
+        .await
+        .unwrap();
+        (observation, subject.ticks)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_parallel_polling_keeps_the_same_recovery_window() {
+        // Simulate fast parallel and slower serial catch-up. Recovery needs
+        // more time than four unpaced polls provide in the fast case.
+        for tick_ms in [10, 800] {
+            let (observation, ticks) = timed_assertion(tick_ms, Some(2_500), 4, true).await;
+            assert!(observation.passed);
+            assert_eq!(ticks, 3);
+            assert_eq!(observation.samples, 4);
+            assert_eq!(observation.elapsed_wall_ms, Some(3_000));
+            assert_eq!(observation.wall_timeout_ms, Some(5_000));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_still_fails_when_recovery_never_happens() {
+        let (observation, ticks) = timed_assertion(10, None, 3, true).await;
+        assert!(!observation.passed);
+        assert_eq!(ticks, 3);
+        assert_eq!(observation.samples, 4);
+        assert_eq!(observation.elapsed_wall_ms, Some(3_000));
+        assert_eq!(observation.final_actual["elapsed_ms"], 3_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_deadline_bounds_a_stalled_tick_and_rejects_late_success() {
+        let (observation, ticks) = timed_assertion(60_000, Some(5_000), 3, true).await;
+        assert!(!observation.passed);
+        assert_eq!(ticks, 1);
+        assert_eq!(observation.samples, 1);
+        assert_eq!(observation.elapsed_wall_ms, Some(4_000));
+        assert_eq!(observation.wall_timeout_ms, Some(4_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_engine_rounds_remain_unpaced() {
+        let (observation, ticks) = timed_assertion(10, Some(15), 2, false).await;
+        assert!(observation.passed);
+        assert_eq!(ticks, 2);
+        assert_eq!(observation.final_actual["elapsed_ms"], 20);
+        assert_eq!(observation.wall_timeout_ms, None);
+        assert_eq!(observation.elapsed_wall_ms, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_ready_state_does_not_wait() {
+        let (observation, ticks) = timed_assertion(10, Some(0), 3, true).await;
+        assert!(observation.passed);
+        assert_eq!(ticks, 0);
+        assert_eq!(observation.samples, 1);
+        assert_eq!(observation.elapsed_wall_ms, Some(0));
     }
 
     struct RecordingSubject {

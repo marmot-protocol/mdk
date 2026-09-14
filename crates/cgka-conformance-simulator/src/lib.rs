@@ -21,6 +21,7 @@
 //! See [`tests/`](../../tests/) in this crate for canonical scenarios.
 
 pub mod app_runtime;
+mod assertion_wait;
 mod audit_capture;
 pub mod bus;
 mod campaign_metrics;
