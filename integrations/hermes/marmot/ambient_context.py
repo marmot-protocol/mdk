@@ -138,14 +138,16 @@ class AmbientContextStore:
             fd = self._open_private_file(self.path)
             os.close(fd)
             db = sqlite3.connect(self.path, timeout=5, isolation_level="IMMEDIATE", check_same_thread=False)
+            # Own the connection before any setup can fail, so close() also
+            # covers corrupt/read-only databases rejected by the first PRAGMA.
+            self._db = db
+            self._lock_fd = lock_fd
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
             db.execute("PRAGMA wal_autocheckpoint=1")
             db.execute("PRAGMA journal_size_limit=32768")
             db.execute("PRAGMA busy_timeout=5000")
-            self._db = db
-            self._lock_fd = lock_fd
             self._initialize_schema()
             page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
             # The configured budget counts logical rows. Reserve physical room

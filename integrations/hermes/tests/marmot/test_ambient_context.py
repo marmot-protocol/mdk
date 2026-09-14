@@ -453,6 +453,42 @@ os._exit(0)
             )
             migrated.close()
 
+    def test_pragma_failure_closes_connection_before_returning(self):
+        real_connect = sqlite3.connect
+        for statement in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL",
+                          "PRAGMA wal_autocheckpoint=1", "PRAGMA journal_size_limit=32768",
+                          "PRAGMA busy_timeout=5000"):
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as directory:
+                connections = []
+                class FailingConnection(sqlite3.Connection):
+                    closed = False
+                    def execute(self, sql, *args, **kwargs):
+                        if sql == statement:
+                            raise sqlite3.OperationalError("synthetic PRAGMA failure")
+                        return super().execute(sql, *args, **kwargs)
+                    def close(self):
+                        self.closed = True
+                        return super().close()
+                def connect(*args, **kwargs):
+                    db = real_connect(*args, **kwargs, factory=FailingConnection)
+                    connections.append(db)
+                    return db
+                path = Path(directory).resolve() / "ambient.sqlite3"
+                store = AmbientContextStore(path)
+                try:
+                    with mock.patch.object(sqlite3, "connect", side_effect=connect):
+                        with self.assertRaises(AmbientContextError):
+                            store.open()
+                    self.assertTrue(connections[0].closed)
+                    self.assertFalse(store.is_open)
+                    replacement = AmbientContextStore(path)
+                    replacement.open()
+                    replacement.close()
+                finally:
+                    for db in connections:
+                        db.close()
+                    store.close()
+
     def test_malformed_store_fails_closed_and_releases_owner_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve() / "private"

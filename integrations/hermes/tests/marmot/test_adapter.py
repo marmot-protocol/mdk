@@ -4522,7 +4522,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_mutation_kind_is_dropped_without_touching_store(self):
         adapter = self._adapter(object())
         adapter._ambient_context.record = unittest.mock.Mock()
-        await adapter._handle_mutation(
+        await adapter._handle_control_event(
             {
                 "type": "future_mutation_kind",
                 "group_id_hex": "22" * 32,
@@ -4530,6 +4530,27 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         adapter._ambient_context.record.assert_not_called()
+
+    async def test_mutations_without_identity_do_not_enter_durable_dedupe(self):
+        adapter = self._adapter(object())
+        group = "22" * 32
+        try:
+            for identity in (None, "", "   "):
+                for kind in ("message_deleted", "message_edited", "reaction_added", "reaction_removed"):
+                    event = {"type": kind, "group_id_hex": group}
+                    if identity is not None:
+                        event["event_id_hex"] = identity
+                    await adapter._handle_control_event(event)
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual(facts, [])
+            for index, kind in enumerate(("message_deleted", "message_edited")):
+                await adapter._handle_control_event({"type": kind, "group_id_hex": group,
+                                                    "event_id_hex": f"{index + 1:064x}"})
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual([fact.kind for fact in facts], ["message_deleted", "message_edited"])
+            self.assertEqual(adapter.events, [])
+        finally:
+            await adapter.disconnect()
 
     async def test_overlapping_dispatches_attach_one_ambient_claim_at_most_once(self):
         adapter = self._adapter(object())

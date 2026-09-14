@@ -3519,16 +3519,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Privacy-safe log: no ids, actors, emoji, or plaintext.
         logger.debug("Marmot inbound mutation observed")
         kind = str(event.get("type") or "")
-        if kind not in {
-            "message_edited",
-            "message_deleted",
-            "reaction_added",
-            "reaction_removed",
-        }:
-            logger.debug("Ignoring unsupported Marmot mutation kind")
-            return
         group_id_hex = str(event.get("group_id_hex") or "")
-        event_id_hex = str(event.get("event_id_hex") or "")
+        event_id_hex = str(event.get("event_id_hex") or "").strip()
+        if not event_id_hex:
+            logger.debug("Ignoring Marmot mutation without occurrence identity")
+            return
         context_key = f"marmot:mutation:{group_id_hex}:{event_id_hex}"
         await self._surface_ambient_context(event, kind, context_key, live_text=_mutation_channel_context(event))
 

@@ -118,27 +118,18 @@ but before either write succeeds, acceptance cannot be recovered and context may
 replay. The acceptance boundary is Hermes's normal `handle_message` return;
 it does not prove that an agent response completed or reached a recipient.
 
-The separate ambient database is deliberate failure isolation: optional context
-can become unavailable without preventing the real inbound journal from opening
-or changing its schema and recovery rules. A second table with per-operation
-exception handling would isolate statement errors, but would still share
-file-level corruption, disk/page capacity, WAL recovery, and schema-open failure
-with the journal whose availability gates real-message delivery. This duplicates some file-safety and
-SQLite lifecycle code; consolidating that infrastructure is a later refactor.
-Unlike the real-message spool, which needs plaintext to replay a message, the
-ambient store deliberately avoids retaining additional mutation/rename content.
-A coarse restart fact is only a hint that group history changed; it cannot
-identify a deleted message or establish a rename target. Consumers should refresh
-history when detail matters, rather than infer a target. The automatic history
-fetch is best-effort and returns at most 20 messages before the triggering
-message's cursor. It cannot establish that no older message changed, and it may
-fail entirely. A retained change hint can prompt a targeted/older history lookup
-instead of treating that limited window as proof that prior context is current.
-It is redundant when the changed item is already represented in the fetched
-window. Collapsing all kinds to one per-group dirty marker would reduce precision
-and still require durable ownership, acceptance, recovery, bounds, and dedupe;
-this implementation keeps those guarantees and the coarse change kinds. Earlier
-branch-install schemas remain readable to preserve any existing operator data.
+Optional ambient storage can fail independently of the required real-message
+journal. A coarse restart fact is only a history-change hint: it cannot identify
+a deleted message or establish a rename target. Fetch targeted or older history
+when detail matters. Automatic history is best-effort and returns at most 20
+messages before the triggering message's cursor; a missing or limited page does
+not prove that older context is current. Earlier branch-install ambient schemas
+remain readable.
+
+Ambient acknowledgement consumes optional context at host acceptance even while
+the real-message journal remains `unresolved`. That journal does not automatically
+replay unknown outcomes. Any later external retry does not restore context whose
+ambient claim has already been retired.
 
 The byte setting is a logical row budget. The physical database page ceiling
 adds 64 KiB for schema pages and eight times the logical budget for indexes,
