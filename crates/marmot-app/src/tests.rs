@@ -1300,7 +1300,6 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             .unwrap()
             .expect("local group projection");
 
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.start().await.unwrap();
         // This command is deferred behind startup catch-up, so its response is
@@ -1320,6 +1319,11 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
         )
         .await
         .expect("explicit catch-up must park its complete floored activation");
+
+        // Leave startup EOSE incomplete so explicit catch-up must register
+        // again instead of reusing settled subscriptions. Complete EOSE only
+        // after the command owns the live client and its REQs are blocked.
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
         let above_floor = cursor;
         for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
