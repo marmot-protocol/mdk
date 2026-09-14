@@ -2019,6 +2019,70 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
     );
 }
 
+// The past-peel rewind is the third shape: the deferred-peel sweep rewinds the
+// live group onto a retained anchor to derive the exporter context that reads a
+// late message. A crash inside that window strands the anchor image as live
+// state, so hydration must restore the pre-rewind tip instead of adopting the
+// rewound epoch as this device's own.
+#[tokio::test]
+async fn hydration_recovers_interrupted_past_peel_rewind() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+    let (live_message, live_queued) = seed_probe_work_rows(&storage, &group_id, 3);
+
+    let mut historical_group = live_group.clone();
+    historical_group.name = "historical anchor".into();
+    historical_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&historical_group)
+        .expect("plant historical group record");
+    storage
+        .create_group_state_snapshot(&group_id, "test-historical-anchor")
+        .expect("capture historical anchor");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_state_snapshot(&group_id, "peel-restore-test-crash")
+        .expect("capture pre-rewind live state");
+    storage
+        .rollback_group_state_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate committed past-peel rewind");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate recovers orphaned past-peel rewind");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-rewind live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    let events = reopened.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::PendingCommitRecovered { .. })),
+        "a recovered rewind must not be mistaken for a crashed publish; got {events:?}"
+    );
+    assert_probe_work_rows(&storage, &live_message, &live_queued);
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("peel-restore-")),
+        "recovered rewind snapshot must be released"
+    );
+}
+
 // Two interrupted rewind probes mean two candidate live states and no way to
 // tell which is newer, so hydration must refuse the group rather than guess.
 // The two rewinds must therefore be distinguishable on disk: were they to share
@@ -2051,6 +2115,117 @@ async fn hydration_fails_closed_on_two_interrupted_rewind_probes_of_different_ki
             [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
         ),
         "an ambiguous pair of interrupted probes must quarantine the group"
+    );
+}
+
+// A replay guard's window lives entirely inside the sweep guard's, so the pair
+// is not ambiguous: the outer snapshot is the only one holding live state, and
+// the inner one is an image of state the outer already captured. Recovery must
+// restore the outer and drop the inner rather than refuse the group.
+#[tokio::test]
+async fn hydration_recovers_the_outermost_of_two_nested_interrupted_guards() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    let mut historical_group = live_group.clone();
+    historical_group.name = "historical anchor".into();
+    storage
+        .put_group(&historical_group)
+        .expect("plant historical group record");
+    storage
+        .create_group_state_snapshot(&group_id, "test-historical-anchor")
+        .expect("capture historical anchor");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_state_snapshot(&group_id, "openmls-branch-probe-test-crash")
+        .expect("capture pre-sweep live state");
+    storage
+        .rollback_group_state_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate committed sweep rewind");
+    storage
+        .create_group_state_snapshot(&group_id, "openmls-probe-test-crash")
+        .expect("capture pre-replay state inside the sweep window");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate recovers nested guards");
+
+    assert!(
+        reopened.quarantined_groups().is_empty(),
+        "nested guard windows are not an ambiguous pair"
+    );
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the outermost guard's live state"
+    );
+    assert!(
+        storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .all(|name| !name.starts_with("openmls-branch-probe-")
+                && !name.starts_with("openmls-probe-")),
+        "both interrupted guard snapshots must be released"
+    );
+}
+
+// Candidate replay also runs on its own, outside any pass or sweep window. A
+// lone replay snapshot is therefore the outermost window that was interrupted,
+// and holds the only copy of the pre-replay live state.
+#[tokio::test]
+async fn hydration_recovers_a_standalone_interrupted_replay() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+    let (live_message, live_queued) = seed_probe_work_rows(&storage, &group_id, 4);
+
+    let mut replayed_group = live_group.clone();
+    replayed_group.name = "mid-replay".into();
+    storage
+        .put_group(&replayed_group)
+        .expect("plant mid-replay group record");
+    storage
+        .create_group_state_snapshot(&group_id, "test-mid-replay")
+        .expect("capture mid-replay state");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_state_snapshot(&group_id, "openmls-probe-test-crash")
+        .expect("capture pre-replay live state");
+    storage
+        .rollback_group_state_to_snapshot(&group_id, "test-mid-replay")
+        .expect("simulate a replay that mutated live state");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydrate recovers a standalone replay");
+
+    assert!(
+        reopened.quarantined_groups().is_empty(),
+        "a lone replay snapshot is not an ambiguous pair"
+    );
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-replay live state"
+    );
+    assert_probe_work_rows(&storage, &live_message, &live_queued);
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-probe-")),
+        "recovered replay snapshot must be released"
     );
 }
 

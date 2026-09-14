@@ -112,7 +112,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 
 - **Module:** `snapshot_guard.rs`
   - **Owns:** RAII guard that rolls back + releases a snapshot on Drop; used by snapshot-probing call sites so panics or
-    async cancellation don't leave storage in mid-mutation state
+    async cancellation don't leave storage in mid-mutation state. Also owns `RewindSite`, the closed set of guard sites
+    that names every guard snapshot and drives `openmls_projection::recover_interrupted_rewind_guard`, so a site cannot
+    exist that open-time recovery cannot classify
 
 - **Module:** `pending_commit_guard.rs`
   - **Owns:** `PendingCommitCleanupGuard` — RAII cleanup that clears an orphaned OpenMLS pending commit if a
