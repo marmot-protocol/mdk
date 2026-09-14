@@ -1855,6 +1855,7 @@ async fn queued_output_preserves_background_recovery_allowance() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload,
+                expected_epoch: None,
             })
             .await
             .unwrap();

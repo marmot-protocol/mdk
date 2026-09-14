@@ -5364,6 +5364,7 @@ mod tests {
                 .send(cgka_traits::engine::SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload: payload.clone(),
+                    expected_epoch: None,
                 })
                 .await
                 .unwrap();

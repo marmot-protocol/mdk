@@ -1,6 +1,7 @@
 //! `messages` command namespace handlers (incl. the `timeline` subgroup) and message output helpers.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::{
     GroupId,
@@ -8,13 +9,15 @@ use cgka_traits::{
         GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
         GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
         GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-        GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_EDIT,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     },
 };
 use marmot_account::AccountHome;
 use marmot_app::{
-    AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppRuntime, TimelineMessageQuery,
-    TimelineMessageRecord, TimelinePage, TimelinePagination, group_system_event_from_message,
+    AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppRuntime, RetentionSweepReport,
+    RetentionSweepStatus, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    TimelinePagination, group_system_event_from_message,
 };
 use serde_json::{Value, json};
 
@@ -170,6 +173,45 @@ pub(crate) async fn message_command_with_runtime(
                 }),
             })
         }
+        MessageCommand::Edit {
+            group_id,
+            message_id,
+            text,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group_id)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let content = text.join(" ");
+            if content.trim().is_empty() {
+                return Err(WnError::EmptyMessage);
+            }
+            // Recipients only honour an edit whose authenticated author matches
+            // the target's author, so publishing a foreign edit would waste a
+            // group event that every client then ignores. Check the local
+            // projection first and fail loudly instead.
+            ensure_local_message_author(app, &account, &group_id_hex, &message_id)?;
+            let summary = runtime
+                .edit_message(&account.label, &group_id, &message_id, &content)
+                .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "edited message {message_id} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group_id": group_id_hex,
+                    "target_message_id": message_id,
+                    "kind": MARMOT_APP_EVENT_KIND_EDIT,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
+                }),
+            })
+        }
         MessageCommand::Delete {
             group_id,
             message_id,
@@ -202,12 +244,16 @@ pub(crate) async fn message_command_with_runtime(
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            // The runtime retry is group-scoped: it republishes durable
+            // pending work for the whole group and never re-encrypts fresh
+            // plaintext. The optional event id is echoed for scripts only.
             let summary = runtime
                 .retry_group_convergence(&account.label, &group_id)
                 .await?;
             Ok(CommandOutput {
                 plain: format!(
-                    "retried group convergence for {event_id} published={}",
+                    "retried group convergence for {} published={}",
+                    hex::encode(group_id.as_slice()),
                     summary.published
                 ),
                 json: json!({
@@ -373,8 +419,97 @@ pub(crate) async fn message_command_with_runtime(
                 }),
             })
         }
+        MessageCommand::SweepExpired => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            // Production clock semantics: the engine applies its own skew
+            // tolerance, unread deferral, and scan bounds to this wall-clock
+            // value. There is deliberately no flag to supply an arbitrary time.
+            let now_ms = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| std::io::Error::other("system clock is before the Unix epoch"))?
+                    .as_millis(),
+            )
+            .map_err(|_| std::io::Error::other("system clock overflowed"))?;
+            let report = runtime
+                .sweep_expired_retention(&account.label, now_ms)
+                .await?;
+            let pruned_messages: u64 = report
+                .groups
+                .iter()
+                .map(|group| group.pruned_messages)
+                .sum();
+            let secrets_deleted: u64 = report
+                .groups
+                .iter()
+                .map(|group| group.secrets_deleted)
+                .sum();
+            Ok(CommandOutput {
+                plain: format!(
+                    "retention sweep groups={} pruned_messages={pruned_messages} secrets_deleted={secrets_deleted}",
+                    report.groups.len()
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "now_ms": now_ms,
+                    "pruned_messages": pruned_messages,
+                    "secrets_deleted": secrets_deleted,
+                    "groups": retention_sweep_report_json(&report),
+                }),
+            })
+        }
         MessageCommand::Subscribe { .. } => Err(WnError::MessagesSubscribeRequiresDaemon),
     }
+}
+
+/// Require the edit target to be a locally projected message authored by the
+/// selected account. Senders are recorded as account id hex on every device.
+fn ensure_local_message_author(
+    app: &MarmotApp,
+    account: &marmot_account::AccountSummary,
+    group_id_hex: &str,
+    message_id: &str,
+) -> Result<(), WnError> {
+    let target = app
+        .message_by_id(&account.label, group_id_hex, message_id)?
+        .ok_or_else(|| WnError::UnknownMessage(message_id.to_owned()))?;
+    if target.sender != account.account_id_hex {
+        return Err(WnError::NotMessageAuthor {
+            message_id: message_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn retention_sweep_status_name(status: RetentionSweepStatus) -> &'static str {
+    match status {
+        RetentionSweepStatus::NoExpiredMessages => "no_expired_messages",
+        RetentionSweepStatus::Pruned => "pruned",
+        RetentionSweepStatus::DeferredClockSkew => "deferred_clock_skew",
+        RetentionSweepStatus::DeferredUnread => "deferred_unread",
+        RetentionSweepStatus::DeferredScanExhausted => "deferred_scan_exhausted",
+        RetentionSweepStatus::Failed => "failed",
+    }
+}
+
+fn retention_sweep_report_json(report: &RetentionSweepReport) -> Vec<Value> {
+    report
+        .groups
+        .iter()
+        .map(|group| {
+            json!({
+                "group_id": group.group_id_hex,
+                "status": retention_sweep_status_name(group.status),
+                "pruned_messages": group.pruned_messages,
+                "secrets_deleted": group.secrets_deleted,
+                "media_ciphertext_sha256": group.media_ciphertext_sha256,
+                "failure_kind": group.failure_kind,
+            })
+        })
+        .collect()
 }
 
 /// Parse one `--tag` value: a JSON array of strings with at least the tag
@@ -693,6 +828,8 @@ pub(crate) fn timeline_message_record_json(
         "reactions": message.reactions,
         "deleted": message.deleted,
         "deleted_by_message_id": message.deleted_by_message_id_hex,
+        "retention_seconds": message.retention_seconds,
+        "retention_expires_at": message.retention_expires_at,
     })
 }
 
@@ -864,6 +1001,10 @@ pub(crate) fn message_record_json(
         "tags": message.tags,
         "recorded_at": message.recorded_at,
         "received_at": message.received_at,
+        // Durable source-epoch retention decision; `null` for legacy rows and
+        // rows delivered under no policy. Never re-derived from the current
+        // group component.
+        "retention": message.retention,
     });
     if let Some(agent_text_stream) = agent_text_stream {
         value["agent_text_stream"] = agent_text_stream;

@@ -7726,6 +7726,9 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
+    // A reference is only sendable in the epoch that encrypted it; the
+    // synthetic references below claim the group's live epoch.
+    let media_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
     bob.send_media_attachments(
         &group_id,
         vec![
@@ -7740,7 +7743,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
                 version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
+                source_epoch: media_epoch,
                 dim: Some("800x600".to_owned()),
                 thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
             },
@@ -7755,7 +7758,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "audio.ogg".to_owned(),
                 media_type: "audio/ogg".to_owned(),
                 version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
+                source_epoch: media_epoch,
                 dim: None,
                 thumbhash: None,
             },

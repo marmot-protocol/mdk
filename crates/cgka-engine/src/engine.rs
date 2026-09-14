@@ -1063,7 +1063,11 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
     ) -> Result<SendResult, EngineError> {
         self.accept_send_with_audit_context(
-            SendIntent::AppMessage { group_id, payload },
+            SendIntent::AppMessage {
+                group_id,
+                payload,
+                expected_epoch: None,
+            },
             context,
             SendAcceptance::QueueAppMessage,
         )
@@ -1093,7 +1097,10 @@ impl<S: StorageProvider> Engine<S> {
         let result = match acceptance {
             SendAcceptance::Prepare => self.do_send(intent).await,
             SendAcceptance::QueueAppMessage => {
-                let SendIntent::AppMessage { group_id, payload } = intent else {
+                let SendIntent::AppMessage {
+                    group_id, payload, ..
+                } = intent
+                else {
                     unreachable!("queue app-message acceptance constructs an AppMessage intent")
                 };
                 self.do_queue_app_message(group_id, payload)

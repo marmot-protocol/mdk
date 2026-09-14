@@ -653,6 +653,20 @@ impl<S: StorageProvider> Engine<S> {
             .should_queue_outbound_intent(&group_id, &intent)
             .await?
         {
+            // Retention re-encrypts the payload under the drain-time epoch.
+            // A payload pinned to one epoch (an encrypted-media reference,
+            // whose key the recipient derives from the delivering message's
+            // epoch) would then ship unreadable, so refuse it here with a
+            // typed answer instead of parking a doomed message.
+            if let SendIntent::AppMessage {
+                expected_epoch: Some(expected),
+                ..
+            } = &intent
+            {
+                return Err(EngineError::AppMessageEpochUnsettled {
+                    expected: *expected,
+                });
+            }
             return self.queue_outbound_intent(group_id, intent, 0);
         }
 
@@ -676,6 +690,7 @@ impl<S: StorageProvider> Engine<S> {
         let intent = SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         };
         self.validate_send_acceptance(&intent)?;
         // Same retention boundary as `send`: a publication this client staged

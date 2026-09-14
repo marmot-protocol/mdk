@@ -222,6 +222,7 @@ mod tests {
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload: payload.to_vec(),
+                    expected_epoch: None,
                 })
                 .await
                 .map(|_| ())

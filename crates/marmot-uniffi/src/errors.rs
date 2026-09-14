@@ -350,6 +350,14 @@ impl From<AppError> for MarmotKitError {
             // errors; map them to the typed variant so send/upload/download
             // agree with build/parse even when a call site uses `?`/`From`.
             AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
+            stale @ AppError::MediaReferenceStaleEpoch { .. } => Self::InvalidMediaReference {
+                details: stale.to_string(),
+            },
+            unsettled @ AppError::MediaReferenceEpochUnsettled { .. } => {
+                Self::InvalidMediaReference {
+                    details: unsettled.to_string(),
+                }
+            }
             AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
                 kind: rejection.kind.into(),
                 details: rejection.detail,

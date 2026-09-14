@@ -1857,12 +1857,159 @@ async fn app_message_is_retained_while_a_publish_is_pending() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .expect("a temporary non-stable state must retain an app message, not reject it");
     assert!(
         matches!(queued, SendResult::Queued { .. }),
         "expected durable retention, got {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publish_is_pending() {
+    // Retention re-encrypts at drain time. An encrypted-media `imeta`
+    // reference is bound to the epoch that produced its ciphertext (recipients
+    // derive the media key from the delivering message's epoch), so retaining
+    // it would ship an attachment nobody can decrypt. A pinned send must be
+    // refused with a typed answer and leave nothing behind.
+    let mut alice = build(b"alice");
+    let mut bob = build(b"bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    let pinned_epoch = alice.epoch(&group_id).unwrap();
+
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+
+    let payload = app_payload_for(&alice, "media bound to the pre-commit epoch");
+    let refused = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(pinned_epoch),
+        })
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AppMessageEpochUnsettled { expected }) if expected == pinned_epoch
+        ),
+        "a pinned message must be refused while the epoch is unsettled, got {refused:?}"
+    );
+
+    // Nothing was retained: once the publish resolves and the group advances,
+    // the drain has nothing to regenerate.
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap().0, pinned_epoch.0 + 1);
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        drained.is_empty(),
+        "a refused pinned message must not be retained, got {drained:?}"
+    );
+
+    // The refusal left the group usable: a message pinned to the settled
+    // epoch encrypts under exactly that epoch.
+    let settled_epoch = alice.epoch(&group_id).unwrap();
+    let payload = app_payload_for(&alice, "re-derived for the new epoch");
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(settled_epoch),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            sent,
+            SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == settled_epoch
+        ),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_commit() {
+    // The other way the epoch moves under a send: `send` settles retained peer
+    // commits before preparing the message. An unpinned message simply
+    // encrypts under the new epoch — that is the point of folding. A pinned
+    // one must be refused at encryption time, after the fold, naming both
+    // epochs, and must leave the group intact for the next send.
+    let bob_clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build(b"alice");
+    let mut bob = build_with_clock(b"bob", bob_clock.clone());
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    let pinned_epoch = bob.epoch(&group_id).unwrap();
+
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update stages a group evolution")
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    // Bob holds the commit but has not applied it: it waits out the
+    // settlement window as retained convergence input.
+    bob.ingest(commit).await.unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), pinned_epoch);
+    bob_clock.advance_ms(1_000);
+
+    let payload = app_payload_for(&bob, "media bound to the epoch bob still sees");
+    let refused = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(pinned_epoch),
+        })
+        .await;
+    let folded_epoch = bob.epoch(&group_id).unwrap();
+    assert_eq!(
+        folded_epoch.0,
+        pinned_epoch.0 + 1,
+        "the send must have folded the retained commit before preparing"
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AppMessageEpochMismatch { expected, current })
+                if expected == pinned_epoch && current == folded_epoch
+        ),
+        "expected an epoch mismatch naming both epochs, got {refused:?}"
+    );
+
+    // The early return handed the MLS state back untouched: an unpinned
+    // message goes out under the folded epoch.
+    let payload = app_payload_for(&bob, "ordinary message after the fold");
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            sent,
+            SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == folded_epoch
+        ),
+        "{sent:?}"
     );
 }
 
@@ -1899,6 +2046,7 @@ async fn retained_app_message_encrypts_under_the_drain_time_epoch() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload,
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1976,6 +2124,7 @@ async fn resolving_a_publish_schedules_the_drain_for_retained_app_messages() {
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload,
+                    expected_epoch: None,
                 })
                 .await
                 .unwrap(),
@@ -2046,6 +2195,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload,
+                    expected_epoch: None,
                 })
                 .await
                 .unwrap(),
@@ -2123,6 +2273,7 @@ async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, "retained across a locked pass-close read"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -2196,6 +2347,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload,
+                expected_epoch: None,
             })
             .await
             .unwrap_or_else(|error| panic!("send {i} below the cap must be retained: {error:?}"));
@@ -2211,6 +2363,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .expect_err("a send past the retention cap must be refused, not silently retained");
@@ -2286,6 +2439,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .expect("a recovered group must accept sends again");

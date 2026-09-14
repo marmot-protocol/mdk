@@ -167,6 +167,28 @@ pub enum AppError {
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
+    /// A media reference was encrypted under `source_epoch`, but the message
+    /// that would carry it is sent at `current_epoch`. The `imeta` tag has no
+    /// epoch field, so recipients would derive the wrong media secret; the
+    /// attachment has to be uploaded again.
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+    )]
+    MediaReferenceStaleEpoch {
+        source_epoch: u64,
+        current_epoch: u64,
+    },
+    /// The group's epoch is unsettled — a commit this device staged still
+    /// awaits its publish outcome, or retained peer commits are not yet
+    /// applied — so a media reference encrypted at `source_epoch` cannot be
+    /// sent right now. Ordinary messages are retained and encrypted when the
+    /// group settles; a media reference cannot be, because the delivering
+    /// message's epoch is the recipient's media key. Nothing was published.
+    /// Sync and send again, or upload again if the epoch moved.
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group epoch is unsettled; sync and retry, or upload it again if the epoch advanced"
+    )]
+    MediaReferenceEpochUnsettled { source_epoch: u64 },
     /// An inbound or host-supplied encrypted-media `imeta` reference failed the
     /// shared strict parser. Carries the stable rejection category plus
     /// privacy-safe presentation text so bindings can surface a typed reason
@@ -340,6 +362,8 @@ impl AppError {
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
+            Self::MediaReferenceStaleEpoch { .. } => "media_reference_stale_epoch",
+            Self::MediaReferenceEpochUnsettled { .. } => "media_reference_epoch_unsettled",
             Self::MediaAttachmentRejected(_) => "media_attachment_rejected",
             Self::MediaUnfetchable(_) => "media_unfetchable",
             Self::MediaDownloadFailed(_) => "media_download_failed",
