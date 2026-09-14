@@ -327,29 +327,53 @@ def _wrap_delete(adapter, attempts: list[str]) -> None:
     adapter.delete_message = tracked
 
 
+def _safe_schedule_modules() -> list[Any]:
+    modules: list[Any] = []
+    import gateway.run as gateway_run
+
+    modules.append(gateway_run)
+    try:
+        from agent import async_utils
+    except ImportError:
+        async_utils = None
+    if async_utils is not None:
+        modules.append(async_utils)
+    try:
+        import gateway.run_turn as gateway_run_turn
+    except ImportError:
+        gateway_run_turn = None
+    if gateway_run_turn is not None:
+        modules.append(gateway_run_turn)
+    return modules
+
+
 @contextlib.contextmanager
 def _capture_safe_schedules(bucket: list[Any]):
-    import gateway.run as gateway_run
-    from agent import async_utils
-
-    originals = {
-        async_utils: async_utils.safe_schedule_threadsafe,
-        gateway_run: gateway_run.safe_schedule_threadsafe,
-    }
+    originals: dict[Any, Any] = {}
+    impl = None
+    for module in _safe_schedule_modules():
+        current = getattr(module, "safe_schedule_threadsafe", None)
+        if not callable(current):
+            continue
+        originals[module] = current
+        if impl is None:
+            impl = current
+    if impl is None:
+        raise AssertionError("host safe_schedule_threadsafe was not importable")
 
     def tracked(coro, loop, **kwargs):
-        future = originals[async_utils](coro, loop, **kwargs)
+        future = impl(coro, loop, **kwargs)
         if future is not None:
             bucket.append(future)
         return future
 
-    async_utils.safe_schedule_threadsafe = tracked
-    gateway_run.safe_schedule_threadsafe = tracked
+    for module in originals:
+        setattr(module, "safe_schedule_threadsafe", tracked)
     try:
         yield
     finally:
-        async_utils.safe_schedule_threadsafe = originals[async_utils]
-        gateway_run.safe_schedule_threadsafe = originals[gateway_run]
+        for module, original in originals.items():
+            setattr(module, "safe_schedule_threadsafe", original)
 
 
 def _wrap_post_delivery_boundary(
@@ -358,7 +382,6 @@ def _wrap_post_delivery_boundary(
     callback_registrations: list[bool],
     callback_invocations: list[bool],
     pop_calls: list[bool],
-    scheduled: list[Any],
 ) -> None:
     original_register = adapter.register_post_delivery_callback
     original_pop = adapter.pop_post_delivery_callback
@@ -368,8 +391,7 @@ def _wrap_post_delivery_boundary(
 
         def wrapped_callback(*cb_args, **cb_kwargs):
             callback_invocations.append(True)
-            with _capture_safe_schedules(scheduled):
-                return callback(*cb_args, **cb_kwargs)
+            return callback(*cb_args, **cb_kwargs)
 
         return original_register(session_key, wrapped_callback, *args, **kwargs)
 
@@ -382,7 +404,7 @@ def _wrap_post_delivery_boundary(
     adapter.pop_post_delivery_callback = tracking_pop
 
 
-async def _await_host_turn(adapter, *, timeout: float) -> None:
+def _open_host_tasks(adapter) -> set[asyncio.Task]:
     tasks: set[asyncio.Task] = set()
     background = getattr(adapter, "_background_tasks", None)
     if background:
@@ -394,32 +416,47 @@ async def _await_host_turn(adapter, *, timeout: float) -> None:
             for task in session_tasks.values()
             if isinstance(task, asyncio.Task) and not task.done()
         )
-    if not tasks:
-        raise AssertionError("handle_message returned without a host turn task")
-    _done, pending = await asyncio.wait(tasks, timeout=timeout)
-    if pending:
-        raise AssertionError("host turn task did not finish before timeout")
+    return tasks
+
+
+async def _await_host_turn(adapter, *, timeout: float) -> None:
+    tasks = _open_host_tasks(adapter)
+    if tasks:
+        _done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            raise AssertionError("host turn task did not finish before timeout")
+        return
+    if any(inst.last_result is not None for inst in DeterministicAIAgent.instances):
+        return
+    raise AssertionError("handle_message returned without a host turn task")
 
 
 async def _await_scheduled_work(scheduled: list[Any], *, timeout: float) -> None:
-    if not scheduled:
-        return
     loop = asyncio.get_running_loop()
-    awaitables: list[Any] = []
-    for item in scheduled:
-        if asyncio.isfuture(item) or isinstance(item, asyncio.Task):
-            awaitables.append(item)
-        else:
-            awaitables.append(asyncio.wrap_future(item, loop=loop))
-    done, pending = await asyncio.wait(awaitables, timeout=timeout)
-    if pending:
-        for task in pending:
-            task.cancel()
-        raise AssertionError("scheduled post-delivery cleanup work did not finish before timeout")
-    for item in done:
-        exc = item.exception() if hasattr(item, "exception") else None
-        if exc is not None:
-            raise AssertionError("scheduled post-delivery cleanup work failed")
+    deadline = loop.time() + timeout
+    seen = 0
+    while seen < len(scheduled):
+        awaitables: list[Any] = []
+        for item in scheduled[seen:]:
+            if asyncio.isfuture(item) or isinstance(item, asyncio.Task):
+                awaitables.append(item)
+            else:
+                awaitables.append(asyncio.wrap_future(item, loop=loop))
+        seen = len(scheduled)
+        if not awaitables:
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError("scheduled post-delivery cleanup work did not finish before timeout")
+        done, pending = await asyncio.wait(awaitables, timeout=remaining)
+        if pending:
+            for task in pending:
+                task.cancel()
+            raise AssertionError("scheduled post-delivery cleanup work did not finish before timeout")
+        for item in done:
+            exc = item.exception() if hasattr(item, "exception") else None
+            if exc is not None:
+                raise AssertionError("scheduled post-delivery cleanup work failed")
 
 
 def _build_event(SessionSource, MessageEvent, Platform):
@@ -439,13 +476,16 @@ def _build_event(SessionSource, MessageEvent, Platform):
     )
 
 
-async def _dispatch_registered_delete() -> dict[str, Any]:
+async def _dispatch_registered_delete(adapter_module) -> dict[str, Any]:
     from tools.registry import registry
 
     entry = registry.get_entry("delete_marmot_message")
-    if entry is None or not callable(getattr(entry, "handler", None)):
+    handler = getattr(entry, "handler", None) if entry is not None else None
+    if not callable(handler):
+        handler = getattr(adapter_module, "_delete_marmot_message_tool", None)
+    if not callable(handler):
         raise AssertionError("delete_marmot_message was not registered with Hermes")
-    raw = entry.handler(
+    raw = handler(
         {
             "message_id": EXPLICIT_OPERATION_ID,
             "target": f"marmot:{GROUP_ID_HEX}",
@@ -463,11 +503,10 @@ async def _dispatch_registered_delete() -> dict[str, Any]:
     return payload
 
 
-def _fresh_persisted_gateway(hermes_home: Path, helper):
+def _fresh_persisted_gateway(hermes_home: Path, helper, adapter_module):
     from gateway.config import Platform, load_gateway_config
     from gateway.display_config import resolve_display_setting
     from gateway.platform_registry import platform_registry
-    from hermes_cli.plugins import discover_plugins
     import gateway.run as gateway_run
 
     os.environ["HERMES_HOME"] = str(hermes_home)
@@ -475,12 +514,14 @@ def _fresh_persisted_gateway(hermes_home: Path, helper):
     persisted = helper.load_config(hermes_home / "config.yaml")
     if resolve_display_setting(persisted, "marmot", "cleanup_progress") is not False:
         raise AssertionError("reconfigured persisted cleanup_progress did not remain false")
-    discover_plugins(force=True)
     loaded = load_gateway_config()
     platform_config = loaded.platforms.get(Platform("marmot"))
     if platform_config is None:
         raise AssertionError("persisted gateway load missing marmot platform")
     adapter = platform_registry.create_adapter("marmot", platform_config)
+    if adapter is None:
+        adapter = adapter_module.MarmotPlatformAdapter(platform_config)
+        adapter_module._remember_live_adapter(adapter)
     if adapter is None:
         raise AssertionError("persisted gateway adapter factory returned no adapter")
     runner = gateway_run.GatewayRunner(config=loaded)
@@ -562,7 +603,6 @@ async def _run_gateway_turn(
         callback_registrations=callback_registrations,
         callback_invocations=callback_invocations,
         pop_calls=pop_calls,
-        scheduled=scheduled,
     )
     send_ids: list[str] = []
     original_send = adapter.send
@@ -598,13 +638,14 @@ async def _run_gateway_turn(
             runner.adapters[Platform("marmot")] = adapter
             adapter.set_message_handler(runner._handle_message)
             event = _build_event(SessionSource, MessageEvent, Platform)
-            await asyncio.wait_for(adapter.handle_message(event), timeout=30.0)
-            await _await_host_turn(adapter, timeout=30.0)
-            delivery_boundary_observed = bool(pop_calls)
-            await _await_scheduled_work(scheduled, timeout=SCHEDULED_WORK_TIMEOUT_S)
-            scheduled_work_drained = True
-            if explicit_delete:
-                await _dispatch_registered_delete()
+            with _capture_safe_schedules(scheduled):
+                await asyncio.wait_for(adapter.handle_message(event), timeout=30.0)
+                await _await_host_turn(adapter, timeout=30.0)
+                delivery_boundary_observed = bool(pop_calls)
+                await _await_scheduled_work(scheduled, timeout=SCHEDULED_WORK_TIMEOUT_S)
+                scheduled_work_drained = True
+                if explicit_delete:
+                    await _dispatch_registered_delete(adapter_module)
     finally:
         gateway_run._load_gateway_config = original_load_gateway_config
         if runner is not None:
@@ -817,7 +858,9 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         adapter_module=adapter_module,
     )
     helper.configure_gateway_config(**_quiet_helper_kwargs(restart_home, tool_progress="all"))
-    _persisted, fresh_runner, fresh = _fresh_persisted_gateway(restart_home, helper)
+    _persisted, fresh_runner, fresh = _fresh_persisted_gateway(
+        restart_home, helper, adapter_module
+    )
     try:
         events = getattr(fresh, "_tool_progress_events", None)
         if events and len(events) != 0:

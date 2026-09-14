@@ -208,7 +208,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   a successful turn. Automatic progress cleanup is unsupported; explicit `delete_marmot_message` is
   unchanged. Covered by helper/CLI configuration tests and a pinned-Hermes turn-boundary probe that
   fails closed if installed cleanup is re-enabled, if injected delivery failures are skipped, or if
-  scheduled post-delivery cleanup work is not drained.
+  scheduled post-delivery cleanup work is not drained, including on candidate hosts that bind the
+  cleanup scheduler before the delivery callback.
 
 - `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
   directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran
