@@ -4600,6 +4600,7 @@ mod checkpoint_prefix_tests {
                 unrecoverable: false,
                 disbanded: None,
                 join_epoch: EpochId(0),
+                local_copy_install_epoch: EpochId(0),
             })
             .unwrap();
         storage

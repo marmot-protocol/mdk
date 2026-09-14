@@ -17,8 +17,8 @@ use cgka_traits::ingest::{IngestOutcome, LocalIngestState, PeeledContent, Peeled
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, MessageStorage,
-    OutboundIntentStorage, StorageProvider,
+    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, LeaveRequestStorage,
+    MessageStorage, OutboundIntentStorage, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -4229,5 +4229,312 @@ async fn realizing_the_removal_writes_no_ledger_row_for_the_realizing_message() 
         rows_before,
         "the message that realized the removal must leave no durable trace, so \
          redelivery after a re-add Welcome is not answered as a duplicate"
+    );
+}
+
+/// A commit from an epoch below this copy's own history stays out of
+/// convergence even while a pass is open.
+///
+/// The admission gate reads an open pass as licence to admit any in-horizon
+/// past-epoch commit, which is right for a rival of a branch this copy could
+/// rewind onto. Below the epoch the copy was installed at there is no such
+/// branch: retained anchors only ever cover the rewind horizon below the
+/// current copy's own tip and never reach beneath its first join, so admitting
+/// one hands the pass a candidate whose state it cannot reconstruct. The
+/// ordinary past-epoch arm is the whole answer. No re-join here — the plain
+/// first-join shape carries the same floor.
+#[tokio::test]
+async fn commit_below_this_copys_install_epoch_is_refused_while_a_pass_is_open() {
+    let mut alice = build_client(b"below-install-alice");
+    let mut bob = build_client(b"below-install-bob");
+    let (mut carol, carol_storage) = build_with_storage(b"below-install-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "below-install".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, mut welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    // An in-horizon epoch that exists BEFORE carol is ever invited.
+    let below_install = route_group_commit(
+        commit_and_confirm(
+            &mut alice,
+            SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            },
+        )
+        .await,
+        &group_id,
+    );
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (carol_welcome, invite_pending) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(invite_pending).await.unwrap();
+    carol.join_welcome(carol_welcome).await.unwrap();
+    carol.drain_events();
+
+    let install_epoch = carol.epoch(&group_id).unwrap();
+    let record = carol_storage.get_group(&group_id).unwrap();
+    assert_eq!(record.local_copy_install_epoch, install_epoch);
+    assert_eq!(record.join_epoch, install_epoch);
+
+    // Open a pass the ordinary way: one commit at carol's own tip, buffered
+    // by ingest and deliberately left unconverged.
+    let at_the_tip = route_group_commit(
+        commit_and_confirm(
+            &mut alice,
+            SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            },
+        )
+        .await,
+        &group_id,
+    );
+    assert!(
+        matches!(
+            carol.ingest(at_the_tip).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ),
+        "a commit at the tip opens the pass this test needs"
+    );
+    let open_pass = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("a pass is open");
+    assert!(open_pass.is_active(), "got {:?}", open_pass.phase);
+
+    let outcome = carol.ingest(below_install.clone()).await.unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::AlreadyAtEpoch { .. }
+            }
+        ),
+        "a commit from below the install epoch takes the ordinary past-epoch \
+         arm, not convergence admission; got {outcome:?}"
+    );
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "refusing a commit this copy never had state for must not halt the group"
+    );
+    let events = carol.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupUnrecoverable { .. }
+        )),
+        "got {events:?}"
+    );
+    let live: Vec<_> = carol_storage
+        .list_messages_in_states(
+            &group_id,
+            &[
+                MessageState::Created,
+                MessageState::Retryable,
+                MessageState::PeelDeferred,
+                MessageState::ConvergenceDeferred,
+            ],
+            cgka_traits::EpochId(0),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.id == content_id(&below_install))
+        .map(|record| (record.epoch, record.state))
+        .collect();
+    assert!(
+        live.is_empty(),
+        "it must not be left a live canonicalization input steering later \
+         passes; got {live:?}"
+    );
+    let pass_after = carol_storage
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("the open pass survives");
+    assert_eq!(pass_after.generation, open_pass.generation);
+    assert!(pass_after.is_active(), "got {:?}", pass_after.phase);
+}
+
+/// Stage one group evolution and confirm it published, returning its commit.
+async fn commit_and_confirm(
+    engine: &mut Engine<SqliteAccountStorage>,
+    intent: SendIntent,
+) -> TransportMessage {
+    let (msg, pending) = match engine.send(intent).await.unwrap() {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    engine.confirm_published(pending).await.unwrap();
+    msg
+}
+
+fn route_group_commit(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
+    TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    }
+}
+
+/// A commit from below this local copy's install epoch is not a rival.
+///
+/// After a re-add, commits the group published during the eviction era are
+/// still in flight. They fork from epochs this copy never held, so no rewind
+/// target for them exists or ever could — the same fact that lets a
+/// replacement Welcome retire the retained commits below its own epoch. The
+/// convergence admission gate's missing-anchor alarm is for a gap in the
+/// copy's OWN history, and the only thing that used to keep eviction-era
+/// commits out of it was `join_epoch` — which a replacement Welcome
+/// deliberately records as 0 so prior-interval application messages stay
+/// decryptable. So ordinary relay redelivery after a re-add admitted them as
+/// rivals of a branch this device can never reconstruct: the pass errors on
+/// unavailable candidate state and parks one of them `ConvergenceDeferred`,
+/// where it stays a live canonicalization input steering every later pass's
+/// rewind target.
+#[tokio::test]
+async fn eviction_era_commits_redelivered_after_a_rejoin_are_not_rivals() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-era-redelivery").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+
+    // The group keeps committing while bob is gone. Both land inside the
+    // rewind horizon of the epoch he is about to re-join at.
+    let mut eviction_era = Vec::new();
+    for _ in 0..2 {
+        let (msg, pending) = match alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+        eviction_era.push(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        });
+    }
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (rejoin_welcome, invite_pending) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(invite_pending).await.unwrap();
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    bob.drain_events();
+
+    // The relay finally redelivers the eviction-era commits.
+    let mut outcomes = Vec::new();
+    for msg in &eviction_era {
+        outcomes.push(bob.ingest(msg.clone()).await.unwrap());
+    }
+    let pass = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+
+    assert!(
+        !bob_storage.get_group(&group_id).unwrap().unrecoverable,
+        "redelivered eviction-era traffic must not halt the group the Welcome repaired"
+    );
+    let events = bob.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupUnrecoverable { .. }
+        )),
+        "got {events:?}"
+    );
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap(),
+        "bob stays converged with the group he was re-added to"
+    );
+    assert!(
+        outcomes.iter().all(|outcome| matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::AlreadyAtEpoch { .. }
+            }
+        )),
+        "an eviction-era commit falls through to the ordinary past-epoch arm — \
+         terminally stale, not a rival awaiting adjudication; got {outcomes:?}"
+    );
+    assert!(
+        pass.errors.is_empty(),
+        "no pass should be asked to reconstruct a branch this copy never held; \
+         got {:?}",
+        pass.errors
+    );
+    let live: Vec<_> = bob_storage
+        .list_messages_in_states(
+            &group_id,
+            &[
+                MessageState::Created,
+                MessageState::Retryable,
+                MessageState::PeelDeferred,
+                MessageState::ConvergenceDeferred,
+            ],
+            cgka_traits::EpochId(0),
+        )
+        .unwrap()
+        .iter()
+        .map(|record| (record.epoch, record.state))
+        .collect();
+    assert!(
+        live.is_empty(),
+        "an eviction-era commit must not be left a live canonicalization input \
+         steering later passes; got {live:?}"
     );
 }

@@ -1855,6 +1855,7 @@ fn dummy_group(group_id: GroupId) -> Group {
         unrecoverable: false,
         disbanded: None,
         join_epoch: EpochId(0),
+        local_copy_install_epoch: EpochId(0),
     }
 }
 

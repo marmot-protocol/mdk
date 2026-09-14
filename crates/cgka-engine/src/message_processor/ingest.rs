@@ -1068,8 +1068,10 @@ impl<S: StorageProvider> Engine<S> {
         // advance retains a source-epoch anchor and pruning runs only
         // beyond the horizon — so the WrongEpoch arm below must fail
         // closed loudly instead of silently classifying the rival stale.
-        // Commits forking from before this device's join epoch are the
-        // one legitimate in-horizon absence and keep the stale fallback.
+        // Commits forking from below this copy's own history — before the
+        // device's join epoch, or before the current copy was installed — are
+        // the legitimate in-horizon absences and keep the stale fallback; see
+        // `commit_is_below_this_copys_history`.
         //
         // One rule for every member: an in-horizon rival commit enters
         // distributed convergence whether or not this device is itself
@@ -1092,11 +1094,20 @@ impl<S: StorageProvider> Engine<S> {
                     .convergence_pass(&group_id)?
                     .is_some_and(|pass| pass.is_active());
                 let has_source_anchor = self.has_retained_anchor_snapshot(&group_id, msg_epoch)?;
+                // Below this copy's own history the commit is not a rival at
+                // all: neither an admission (any anchor at that epoch belongs
+                // to a discarded copy and rewinding onto it is what produces
+                // `CandidateStateUnavailable`) nor the missing-anchor alarm,
+                // which is reserved for a gap in history this copy really had.
+                let below_this_copys_history =
+                    self.commit_is_below_this_copys_history(&group_id, msg_epoch);
                 convergence_refused_for_missing_anchor = within_rewind_horizon
                     && !active_pass
                     && !has_source_anchor
-                    && !self.msg_is_pre_membership(&group_id, msg_epoch);
-                within_rewind_horizon && (active_pass || has_source_anchor)
+                    && !below_this_copys_history;
+                !below_this_copys_history
+                    && within_rewind_horizon
+                    && (active_pass || has_source_anchor)
             }
         } else {
             false
@@ -2352,6 +2363,38 @@ impl<S: StorageProvider> Engine<S> {
         self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
         self.seen_message_ids.insert(msg_id.clone());
         Ok(IngestOutcome::Ignored { category })
+    }
+
+    /// Whether a commit at `msg_epoch` sits below every epoch this local copy
+    /// could ever rewind to, so it is not a rival of anything and the
+    /// missing-anchor alarm must not fire for it.
+    ///
+    /// Two independent floors, evaluated from one record load:
+    ///
+    /// - `join_epoch`: epochs before this device's first membership were never
+    ///   decryptable here by design (mdk#339).
+    /// - `local_copy_install_epoch`: epochs before the CURRENT copy was
+    ///   installed. A replacement Welcome deliberately resets `join_epoch` to
+    ///   zero so prior-interval application messages stay decryptable, which
+    ///   leaves the commits published during an eviction era with no floor at
+    ///   all: in-horizon, anchor-less, and so indistinguishable from a rival
+    ///   whose anchor this device lost. They are not rivals — this copy holds
+    ///   no state at those epochs and never will, the same fact
+    ///   `openmls_projection::retire_commits_superseded_by_replacement_welcome`
+    ///   uses to terminalize the retained ones.
+    ///
+    /// Genuine anchor loss on the copy's OWN history — at or above the install
+    /// epoch — is untouched and still fails closed loudly through
+    /// `unadjudicable_fork_rival_without_anchor`.
+    ///
+    /// Best-effort in the same way as the fields themselves: `EpochId(0)`
+    /// means "unknown" and applies no floor.
+    fn commit_is_below_this_copys_history(&self, group_id: &GroupId, msg_epoch: EpochId) -> bool {
+        let Ok(group) = self.storage.get_group(group_id) else {
+            return false;
+        };
+        let below = |floor: EpochId| floor.0 > 0 && msg_epoch < floor;
+        below(group.join_epoch) || below(group.local_copy_install_epoch)
     }
 
     /// Whether `msg_epoch` predates this device's membership in `group_id`

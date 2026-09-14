@@ -537,6 +537,7 @@ impl<S: StorageProvider> Engine<S> {
             unrecoverable: false,
             disbanded: None,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
+            local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         if self.new_protocol_profile == ProtocolProfile::Legacy {
             self.storage.put_group(&group_record)?;
@@ -1363,6 +1364,9 @@ impl<S: StorageProvider> Engine<S> {
                 } else {
                     EpochId(mls_group.epoch().as_u64())
                 },
+                // Unconditional, unlike `join_epoch`: a first join and a
+                // replacement join both install a copy that starts here.
+                local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
             if reset_cutoff.is_some() {

@@ -43,6 +43,7 @@ pub(crate) fn sample_group(id: GroupId, epoch: u64, members: usize) -> Group {
         unrecoverable: false,
         disbanded: None,
         join_epoch: EpochId(0),
+        local_copy_install_epoch: EpochId(0),
     }
 }
 
