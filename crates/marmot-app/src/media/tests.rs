@@ -1963,12 +1963,10 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
     assert_eq!(downloaded, body);
 }
 
-/// Multiple stalled locators consume one shared transfer deadline instead of
-/// receiving a fresh end-to-end budget for every candidate.
+/// Stalled locators reserve time for the remaining fallback candidates.
 #[tokio::test]
 async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
-    const EARLY_COMPLETION_TOLERANCE: Duration = Duration::from_millis(30);
 
     let body = b"healthy ciphertext";
     let (first_url, first_server) = spawn_stalled_http_server().await;
@@ -1984,18 +1982,15 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     let started = Instant::now();
 
-    let error = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
-        .await
-        .expect_err("candidate failover must not renew the transfer deadline");
+    let downloaded =
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect("stalled candidates must leave time for the healthy locator");
     first_server.abort();
     second_server.abort();
 
-    assert!(error.to_string().contains("timed out"));
+    assert_eq!(downloaded, body);
     let elapsed = started.elapsed();
-    assert!(
-        elapsed >= TRANSFER_DEADLINE - EARLY_COMPLETION_TOLERANCE,
-        "the shared end-to-end deadline must be consumed before timing out"
-    );
     assert!(
         elapsed < Duration::from_secs(2),
         "two stalled candidates must share the configured end-to-end deadline"
@@ -2036,6 +2031,78 @@ async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
     assert_eq!(response_headers.attempts, 2);
     assert_eq!(response_headers.successes, 0);
     assert_eq!(response_headers.failures, 2);
+}
+
+#[tokio::test]
+async fn transient_get_retries_once() {
+    for first_status in [502, 503] {
+        let server = spawn_http_responses(vec![
+            http_status_response(first_status, "Unavailable"),
+            http_ok_response(b"hello"),
+        ]);
+        let transport = BlossomHttpTransport::new(true);
+        let started = Instant::now();
+        let body = fetch_blossom_blob_with_transport(
+            &format!("{server}/{}.bin", valid_hash()),
+            &transport,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, b"hello");
+        assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+    let server = spawn_http_responses(vec![
+        http_status_response(503, "Unavailable"),
+        http_status_response(503, "Unavailable"),
+    ]);
+    let error = fetch_blossom_blob_with_transport(
+        &format!("{server}/{}.bin", valid_hash()),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("HTTP 503"));
+}
+
+#[tokio::test]
+async fn trickle_yields_to_fallback() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nx")
+            .await
+            .unwrap();
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if stream.write_all(b"x").await.is_err() {
+                return;
+            }
+        }
+    });
+    let body = b"healthy ciphertext";
+    let healthy = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[url, healthy]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_millis(600),
+    );
+    let downloaded = fetch_encrypted_media_blob_with_transport(
+        &reference,
+        &[],
+        &[BLOSSOM_LOCATOR_KIND_V1.to_owned()],
+        &transport,
+    )
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(downloaded, body);
 }
 
 #[tokio::test]
