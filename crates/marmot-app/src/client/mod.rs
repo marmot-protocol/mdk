@@ -4302,7 +4302,6 @@ impl AppClient {
         reference: MediaAttachmentReference,
     ) -> Result<EncryptedMediaDownloadHttp, AppError> {
         self.ensure_group(group_id)?;
-        self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         // The current group policy governs fetch endpoints, but the retained
         // attachment's own version governs KDF/AAD and which versioned cache
