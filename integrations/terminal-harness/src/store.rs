@@ -23,6 +23,9 @@ pub(crate) struct SessionRecord {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) generation: u64,
     /// The non-evicting durable journal for applied `/new` commands.
+    /// The control protocol supplies no replay horizon or durable low-water
+    /// mark. Accept linear growth until it does: eviction would let an old
+    /// command reset a newer session after restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) reset_receipts: Vec<ResetReceipt>,
 }

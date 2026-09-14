@@ -221,7 +221,7 @@ fn parse_result_event(value: &Value, expected_session_id: &str) -> Result<Parsed
     let is_error = value
         .get("is_error")
         .and_then(Value::as_bool)
-        .unwrap_or(subtype != Some("success"));
+        .unwrap_or(false);
     if is_error || subtype != Some("success") {
         return Ok(ParsedEvent::Error {
             session_id: Some(session_id),

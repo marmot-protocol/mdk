@@ -497,6 +497,57 @@ exit 0
 }
 
 #[tokio::test]
+async fn escaped_pipe_holders_do_not_stall_completed_turns() {
+    let _permit = process_test_permit().await;
+    for retain_stdout in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let script = executable_script(
+            root.path(),
+            "escaped-pipe-backend",
+            &format!(
+                r#"#!/usr/bin/env python3
+import os, time
+read_fd, write_fd = os.pipe()
+if os.fork() == 0:
+    os.close(read_fd)
+    os.setsid()
+    if not {retain_stdout}:
+        os.close(1)
+    with open('escaped.pid', 'w') as pid_file:
+        pid_file.write(str(os.getpid()))
+    os.write(write_fd, b'ready')
+    os.close(write_fd)
+    time.sleep(30)
+    os._exit(0)
+os.close(write_fd)
+os.read(read_fd, 5)
+os.close(read_fd)
+print('{{"type":"text","text":"completed"}}', flush=True)
+os._exit(0)
+"#,
+                retain_stdout = if retain_stdout { "True" } else { "False" }
+            ),
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+        spec.total_timeout = Duration::from_secs(5);
+        let result = run_jsonl_process(spec, tx, parse_event).await;
+        // This fixture deliberately leaves the owned group. The test owns and
+        // cleans that separate process regardless of the assertion outcome.
+        let pid = fs::read_to_string(root.path().join("escaped.pid")).unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status();
+        assert!(wait_for_process_exit(pid.trim()).await);
+        assert_eq!(result.unwrap().exit_code, Some(0));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("completed".to_owned()))
+        );
+    }
+}
+
+#[tokio::test]
 async fn early_stdin_closure_preserves_exit_and_bounded_sanitized_stderr() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();

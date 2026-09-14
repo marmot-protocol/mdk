@@ -158,6 +158,8 @@ direct child so backend-spawned descendants cannot outlive an interrupted turn.
 Normal and nonzero leader exits also terminate remaining group members before
 reaping the leader. Exit observation retains the unreaped leader until this
 cleanup completes, preventing PID reuse from redirecting a later group signal.
+After leader exit, pipe draining has a separate two-second grace period so a
+helper that escaped the group cannot stall the lane by retaining stdout/stderr.
 
 The stored goal is prepended to every prompt in its chat as one delimited block.
 That costs prompt tokens on every turn and, in exchange, survives session

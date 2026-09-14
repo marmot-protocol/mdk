@@ -14,6 +14,7 @@ use tracing::debug;
 use crate::{HarnessError, Outcome, RunFailure, RunnerEvent, TRACE_TARGET};
 
 const STDERR_CAPTURE_BYTES: usize = 4096;
+const POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 struct ProcessGroupGuard {
@@ -102,8 +103,10 @@ async fn wait_for_child_and_cleanup(
 ) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     {
+        let mut delay = Duration::from_millis(10);
         while !process_group.has_exited()? {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_millis(250));
         }
         process_group.terminate();
     }
@@ -341,12 +344,15 @@ where
     let lifecycle_result = timeout_at(total_deadline, async {
         let mut lines = BufReader::new(stdout).lines();
         let mut child_status = None;
+        let mut post_exit_deadline = None;
         loop {
             let line = tokio::select! {
                 biased;
+                _ = sleep_until(post_exit_deadline.unwrap_or(total_deadline)), if post_exit_deadline.is_some() => break,
                 line = lines.next_line() => Some(line),
                 status = wait_for_child_and_cleanup(&mut child, &mut process_group), if child_status.is_none() => {
                     child_status = Some(status.map_err(HarnessError::from)?);
+                    post_exit_deadline = Some(Instant::now() + POST_EXIT_DRAIN_TIMEOUT);
                     // The pipe can still contain final events even when its readiness
                     // notification loses the race to exit observation. Drain to EOF.
                     continue;
@@ -424,20 +430,37 @@ where
         };
 
         let completion = async {
-            let writer = async {
-                match writer_task.as_mut() {
-                    Some(task) => Some(task.await),
-                    None => None,
+            let status = match child_status {
+                Some(status) => status,
+                None => wait_for_child_and_cleanup(&mut child, &mut process_group)
+                    .await.map_err(HarnessError::from)?,
+            };
+            let drain_deadline = post_exit_deadline
+                .unwrap_or_else(|| Instant::now() + POST_EXIT_DRAIN_TIMEOUT);
+            let drain = timeout_at(drain_deadline, async {
+                let writer = async {
+                    match writer_task.as_mut() {
+                        Some(task) => Some(task.await),
+                        None => None,
+                    }
+                };
+                tokio::join!(writer, &mut stderr_task)
+            }).await;
+            let (writer, stderr) = match drain {
+                Ok(drained) => drained,
+                Err(_) => {
+                    // Escaped descendants may retain pipe handles after their
+                    // leader and owned process group are gone. Preserve the
+                    // leader's outcome instead of holding its lane indefinitely.
+                    if let Some(task) = writer_task.as_mut() {
+                        task.abort();
+                        if !task.is_finished() { let _ = task.await; }
+                    }
+                    stderr_task.abort();
+                    if !stderr_task.is_finished() { let _ = (&mut stderr_task).await; }
+                    return Ok((status, stderr_snapshot.lock().await.clone()));
                 }
             };
-            let status = async {
-                match child_status {
-                    Some(status) => Ok(status),
-                    None => wait_for_child_and_cleanup(&mut child, &mut process_group).await,
-                }
-            };
-            let (writer, status, stderr) = tokio::join!(writer, status, &mut stderr_task);
-            let status = status.map_err(HarnessError::from)?;
             let stderr = stderr.map_err(HarnessError::from)?;
             if let Some(writer) = writer {
                 match writer.map_err(HarnessError::from)? {
@@ -481,10 +504,7 @@ where
     .await;
 
     match lifecycle_result {
-        Ok(Ok(outcome)) => {
-            process_group.disarm();
-            Ok(outcome)
-        }
+        Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(error)) => {
             cleanup_failed_run(
                 &mut child,
@@ -493,7 +513,6 @@ where
                 writer_task.as_mut(),
             )
             .await;
-            process_group.disarm();
             Err(RunFailure {
                 error,
                 observed_session,
@@ -507,7 +526,6 @@ where
                 writer_task.as_mut(),
             )
             .await;
-            process_group.disarm();
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
                 observed_session,
