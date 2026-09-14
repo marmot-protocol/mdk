@@ -445,6 +445,17 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
+    fn waits_for_media(&self, media_http: &MediaHttpContext) -> bool {
+        media_http.permits.available_permits() == 0
+            && matches!(
+                self,
+                Self::UploadPreparedGroupImage { .. }
+                    | Self::DownloadGroupImage { .. }
+                    | Self::UploadMedia { .. }
+                    | Self::DownloadMedia { .. }
+            )
+    }
+
     fn may_change_push_registration_work(&self) -> bool {
         matches!(
             self,
@@ -965,6 +976,10 @@ async fn run_app_runtime_account_worker(
     // one FIFO. Live commands received during fanout append behind it, so a
     // later read cannot bypass an earlier deferred mutation.
     while let Some(command) = pending.pop_front() {
+        if command.waits_for_media(&media_http) {
+            pending.push_front(command);
+            break;
+        }
         match command {
             AccountWorkerCommand::CatchUp { respond } => {
                 handle_account_worker_catch_up(
@@ -1092,6 +1107,12 @@ async fn run_app_runtime_account_worker(
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
             command = async {
+                if pending.front().is_some_and(|command| command.waits_for_media(&media_http)) {
+                    // Keep polling completions below: they release the permits.
+                    // Stop consuming the bounded command channel while full.
+                    let permit = media_http.permits.acquire().await.ok()?;
+                    drop(permit);
+                }
                 match pending.pop_front() {
                     Some(command) => Some(command),
                     None => commands.recv().await,
@@ -2755,6 +2776,10 @@ async fn handle_account_worker_command(
     command: AccountWorkerCommand,
     context: AccountWorkerCommandContext<'_>,
 ) {
+    if command.waits_for_media(context.media_http) {
+        context.pending.push_back(command);
+        return;
+    }
     let events = context.events;
     let account_id_hex = context.account_id_hex;
     let account_label = context.account_label;
@@ -5779,6 +5804,53 @@ mod tests {
 
         drop(completion);
         assert!(reserve_media_http(&media_http).is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_media_capacity_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let (media_http, _completions) = media_http_context(4);
+        let permits = (0..4)
+            .map(|_| reserve_media_http(&media_http).unwrap())
+            .collect::<Vec<_>>();
+        let (respond, mut response) = oneshot::channel();
+        let (mut commands, mut pending) = unused_account_worker_command_io();
+        let (events, _) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+        handle_account_worker_command(
+            &mut client,
+            AccountWorkerCommand::DownloadGroupImage {
+                group_id: GroupId::new(vec![1; 16]),
+                respond,
+            },
+            AccountWorkerCommandContext {
+                commands: &mut commands,
+                pending: &mut pending,
+                app: &app,
+                events: &events,
+                account_id_hex: "",
+                account_label: "alice",
+                shared: &shared,
+                media_http: &media_http,
+                scheduled_convergence: &mut scheduled,
+            },
+        )
+        .await;
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.front().unwrap().waits_for_media(&media_http));
+        drop(permits);
+        assert!(!pending.front().unwrap().waits_for_media(&media_http));
     }
 
     #[tokio::test]
