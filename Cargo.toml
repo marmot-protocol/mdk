@@ -97,7 +97,7 @@ zeroize = "1"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 # Already in the graph through quinn's platform-verifier feature; direct dep so
 # the broker can build ALPN-carrying rustls client configs with platform trust.
 rustls-platform-verifier = "0.6"
