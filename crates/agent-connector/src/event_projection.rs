@@ -447,6 +447,7 @@ fn project_durable_record(
         return Ok(Some(AgentControlEvent::GroupStateChanged {
             account_id_hex: account_id_hex.to_owned(),
             group_id_hex: record.group_id_hex,
+            event_id_hex: Some(record.message_id_hex),
             change: change.to_owned(),
             detail,
         }));
@@ -715,7 +716,11 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
                 }))
             }
             GroupEvent::GroupStateChanged {
-                group_id, change, ..
+                group_id,
+                epoch,
+                actor,
+                change,
+                ..
             } => {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 if !inbound_filter_matches(
@@ -729,6 +734,8 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
                 // Map to a coarse change kind. Privacy: the subject member's
                 // pubkey is NEVER surfaced; only a rename carries a detail (the
                 // new group display name, which is operationally visible).
+                let event_id_hex =
+                    group_state_change_replay_id(&group_id, epoch.0, actor.as_ref(), &change);
                 let (change, detail) = match change {
                     GroupStateChange::MemberAdded { .. } => ("member_added", None),
                     GroupStateChange::MemberRemoved { .. } => ("member_removed", None),
@@ -745,6 +752,7 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
                 Ok(Some(AgentControlEvent::GroupStateChanged {
                     account_id_hex: group_event.account_id_hex,
                     group_id_hex,
+                    event_id_hex,
                     change: change.to_owned(),
                     detail,
                 }))

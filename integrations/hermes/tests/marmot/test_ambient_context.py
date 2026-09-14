@@ -74,6 +74,45 @@ os._exit(0)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
+    def test_live_details_never_persist_and_restart_falls_back_to_kind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
+            store = AmbientContextStore(path)
+            secret = "private rename and message plaintext"
+            self.assertTrue(store.record("group", "event", "message_edited", live_text=secret))
+            self.assertEqual(store.pending("group")[0].live_text, secret)
+            for artifact in path.parent.iterdir():
+                self.assertNotIn(secret.encode(), artifact.read_bytes())
+            store.close()
+            restarted = AmbientContextStore(path)
+            fact = restarted.claim("group").facts[0]
+            self.assertEqual(fact.kind, "message_edited")
+            self.assertIsNone(fact.live_text)
+            restarted.close()
+
+    def test_live_detail_byte_limit_preserves_coarse_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(Path(directory).resolve() / "ambient.sqlite3")
+            self.assertTrue(store.record("group", "event", "message_edited",
+                                         live_text="é" * store.max_state_bytes))
+            fact = store.claim("group").facts[0]
+            self.assertEqual(fact.kind, "message_edited")
+            self.assertIsNone(fact.live_text)
+            store.close()
+
+    def test_graceful_reconnect_preserves_acceptance_when_both_writes_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(Path(directory).resolve() / "ambient.sqlite3")
+            store.record("group", "accepted", "message_deleted")
+            claim = store.claim("group")
+            store.remember_accepted(claim.token)
+            # Neither commit nor acknowledge succeeded before shutdown.
+            store.disable_generation()
+            store.enable_generation()
+            self.assertEqual(store.claim("group").facts, ())
+            self.assertFalse(store.record("group", "accepted", "message_deleted"))
+            store.close()
+
     def test_acknowledged_event_stays_deduped_across_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / "private" / "ambient.sqlite3"

@@ -66,46 +66,51 @@ Payloads and identifiers are never logged.
 
 ### Quiet ambient continuity
 
-`message_deleted`, edit/reaction mutations, and coarse `group_state_changed`
-facts never invoke `handle_message` and never trigger an agent turn. The adapter
-persists them in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
-`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches an explicitly marked untrusted,
-identifier-free representation only to the next real inbound message that
-passes activation. Admission rejection leaves the facts pending. A dispatch
-exception or cancellation also leaves them pending; a normal
-`handle_message` return acknowledges exactly the snapshot attached to that
-accepted turn, without deleting facts observed concurrently. Per-group claims
-prevent overlapping dispatch producers from attaching one snapshot twice. An
-ambient-store failure is logged privately and never rejects or reclassifies an
-otherwise accepted real inbound turn.
+`message_deleted`, edit/reaction mutations, and `group_state_changed` facts
+never invoke `handle_message` or trigger an agent turn. The adapter records
+coarse facts in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
+`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches explicitly marked untrusted context
+to the next real inbound message that passes activation. Within the same live
+adapter, a bounded memory cache retains useful mutation targets, replacement
+text, reaction content, and rename details. After restart, context falls back
+to the allowlisted fact kind. These details never enter the ambient database.
 
-The durable rows contain only SHA-256 routing/dedupe keys, an allowlisted fact
-kind, ordering, and expiry metadata. They contain no message text, rename text,
-account/group/message identifiers, pubkeys, relay URLs, tokens, or stream
-capabilities. Acknowledged event hashes remain only as bounded replay-dedupe
-tombstones. The private parent and database/lock/WAL files are checked and
-kept private; symlink files are refused. The file-mode fallback opens the
-already-validated regular file with `O_NOFOLLOW` and applies mode through the
-descriptor. Pending facts and replay tombstones share one per-group window and
-deterministic aggregate group, event-count, logical-byte, and age bounds;
-oldest observed entries (and then oldest groups) are evicted first. A
-live claim may temporarily add at most one already-bounded snapshot to the
-persisted limits; it is never evicted before the host outcome, and
-acknowledgement or release immediately restores the configured aggregate
-limits.
+Admission rejection preserves pending facts. A host exception or cancellation
+releases its claimed snapshot; a normal `handle_message` return accepts that
+snapshot. Commit and acknowledgement are attempted independently, and the
+existing retry loop retries failed retirement or release operations. Claims
+prevent overlapping dispatches from attaching the same facts. Retirement only
+touches the accepted snapshot, preserving concurrent observations when capacity
+allows. Ambient database work runs on the journal worker, outside the host event
+loop. A storage failure never reclassifies an accepted real inbound turn.
 
-A connector reconnect in the same process and a clean adapter disconnect leave
-unacknowledged facts on disk. WAL recovery preserves committed facts after
-abrupt process death. Replayed ambient events collapse through their persisted
-hashed event key even after acknowledgement; later non-duplicate facts retain
-observation order. A non-blocking exclusive store lock proves one process
-generation owns claims. On a new adapter/gateway generation, acquiring that
-lock recovers claims abandoned by an abruptly dead owner; clean disconnect
-releases live claims before closing. Reconnect without process replacement
-keeps the same owner. A host call that is cancelled, rejects, or raises is not
-an accepted turn; its attached claim is released for the next attempt. The
-acceptance boundary is the normal return from Hermes's `handle_message`,
-followed by conversion of only that exact claim into replay tombstones.
+Durable rows contain SHA-256 routing/dedupe keys, allowlisted fact kinds,
+ordering/expiry metadata, and local claim ownership tokens. They contain no
+message or rename text, raw account/group/message identifiers, pubkeys, relay
+URLs, authentication tokens, or stream capabilities. Database, lock, and WAL
+files are private; symlink paths are refused. Acknowledged hashes remain as
+bounded replay tombstones. Pending facts, active claims, and tombstones share
+hard per-group and aggregate group, event-count, logical-byte, and age limits.
+Unclaimed entries are evicted deterministically; active claims are protected.
+If protected claims fill a limit, a new observation can be refused. There is
+no extra snapshot allowance. The live detail cache has its own byte ceiling
+equal to the configured state-byte limit; dropping detail retains the coarse
+fact.
+
+Modern connectors supply an opaque `event_id_hex` for each group-change
+occurrence, identical in live delivery and durable replay. Its hash deduplicates
+replays, including after acknowledgement, while distinct changes of the same
+kind remain separate. Older connectors omit this optional field; each such
+observation is retained independently because change kind alone cannot identify
+an occurrence. Legacy replay can therefore repeat coarse context.
+
+An exclusive lock ensures one process owns the store. Restart recovers abandoned
+unaccepted claims and retires durably committed accepted claims. A graceful
+reconnect of the same adapter also preserves acceptance remembered in memory
+when both retirement writes failed. If the process dies after host acceptance
+but before either write succeeds, acceptance cannot be recovered and context may
+replay. The acceptance boundary is Hermes's normal `handle_message` return;
+it does not prove that an agent response completed or reached a recipient.
 
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message

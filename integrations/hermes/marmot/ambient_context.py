@@ -46,6 +46,7 @@ class AmbientContextError(RuntimeError):
 class AmbientFact:
     seq: int
     kind: str
+    live_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,10 @@ class AmbientContextStore:
         self._db: sqlite3.Connection | None = None
         self._lock_fd: int | None = None
         self._generation_enabled = True
+        # Detailed context is process-local only. The database remains coarse;
+        # after restart consumers render the allowlisted kind instead.
+        self._live_details: dict[int, str] = {}
+        self._accepted_tokens: set[str] = set()
 
     def __del__(self) -> None:
         try:
@@ -118,7 +123,7 @@ class AmbientContextStore:
                 raise AmbientContextError("ambient context store is already owned") from exc
             fd = self._open_private_file(self.path)
             os.close(fd)
-            db = sqlite3.connect(self.path, timeout=5, isolation_level="IMMEDIATE")
+            db = sqlite3.connect(self.path, timeout=5, isolation_level="IMMEDIATE", check_same_thread=False)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
@@ -134,6 +139,12 @@ class AmbientContextStore:
             if result is None or result[0] != "ok":
                 raise AmbientContextError("ambient context integrity check failed")
             with db:
+                # A graceful reconnect of this same object may follow failed
+                # commit AND acknowledgement writes. Preserve its in-memory
+                # acceptance knowledge before normal abandoned-claim recovery.
+                for token in self._accepted_tokens:
+                    db.execute("UPDATE facts SET committed=1 WHERE claim_token=? AND claim_owner=?",
+                               (token, self.owner_id))
                 # A committed claim crossed the durable host-handoff boundary.
                 # Retire it before reclaiming ordinary claims abandoned by the
                 # previous process generation, so a crash after host acceptance
@@ -145,6 +156,7 @@ class AmbientContextStore:
                 )
                 self._gc(time.time())
                 self._enforce_all_bounds()
+            self._accepted_tokens.clear()
             self._checkpoint()
         except Exception as exc:
             lock_was_attached = self._lock_fd is not None
@@ -165,8 +177,10 @@ class AmbientContextStore:
                         with db:
                             db.execute(
                                 "UPDATE facts SET claim_owner=NULL,claim_token=NULL,claimed_at=NULL "
-                                "WHERE claim_owner=? AND committed=0",
-                                (self.owner_id,),
+                                "WHERE claim_owner=? AND committed=0 "
+                                + (f"AND claim_token NOT IN ({','.join('?' for _ in self._accepted_tokens)})"
+                                   if self._accepted_tokens else ""),
+                                (self.owner_id, *self._accepted_tokens),
                             )
                             self._gc(time.time())
                             self._enforce_all_bounds()
@@ -183,6 +197,7 @@ class AmbientContextStore:
         finally:
             self._db = None
             self._lock_fd = None
+            self._live_details.clear()
             if lock_fd is not None:
                 self._close_lock(lock_fd)
 
@@ -193,6 +208,11 @@ class AmbientContextStore:
         self.close()
         self._generation_enabled = False
 
+    def remember_accepted(self, token: str) -> None:
+        """Keep acceptance known across storage faults and graceful reconnects."""
+        if token:
+            self._accepted_tokens.add(token)
+
     def record(
         self,
         group_id: str,
@@ -200,6 +220,7 @@ class AmbientContextStore:
         kind: str,
         *,
         observed_at: float | None = None,
+        live_text: str | None = None,
     ) -> bool:
         if kind not in _ALLOWED_KINDS:
             raise ValueError("unsupported ambient fact kind")
@@ -224,10 +245,13 @@ class AmbientContextStore:
                 )
                 self._enforce_all_bounds()
                 retained = db.execute(
-                    "SELECT 1 FROM facts WHERE event_key=?", (dedupe_key,)
-                ).fetchone() is not None
+                    "SELECT seq FROM facts WHERE event_key=?", (dedupe_key,)
+                ).fetchone()
             self._checkpoint()
-            return retained
+            if retained is not None and live_text:
+                self._live_details[int(retained[0])] = live_text
+                self._trim_live_details()
+            return retained is not None
         except AmbientContextError:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -247,7 +271,7 @@ class AmbientContextStore:
                     (group_key,),
                 ).fetchall()
             self._checkpoint()
-            return [AmbientFact(int(row["seq"]), str(row["kind"])) for row in rows]
+            return [self._fact_from_row(row) for row in rows]
         except AmbientContextError:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -279,7 +303,7 @@ class AmbientContextStore:
             self._checkpoint()
             return AmbientClaim(
                 token,
-                tuple(AmbientFact(int(row["seq"]), str(row["kind"])) for row in rows),
+                tuple(self._fact_from_row(row) for row in rows),
             )
         except AmbientContextError:
             raise
@@ -312,6 +336,7 @@ class AmbientContextStore:
                 self._gc(time.time())
                 self._enforce_all_bounds()
             self._checkpoint()
+            self._accepted_tokens.discard(token)
             return int(changed)
         except AmbientContextError:
             raise
@@ -321,9 +346,9 @@ class AmbientContextStore:
     def commit(self, group_id: str, token: str) -> int:
         """Persist that this claim crossed the host-handoff boundary.
 
-        A normal exception or cancellation rolls this state back with
-        ``release``. An abrupt process death leaves it committed, so the next
-        exclusive owner retires it instead of replaying accepted context.
+        Call only after normal host acceptance. An abrupt process death leaves
+        it committed, so the next exclusive owner retires it instead of
+        replaying accepted context.
         """
         if not token:
             return 0
@@ -450,6 +475,23 @@ class AmbientContextStore:
         while self._logical_bytes() > self.max_state_bytes:
             if not self._delete_oldest_any(1):
                 break
+        self._trim_live_details()
+
+    def _fact_from_row(self, row: sqlite3.Row) -> AmbientFact:
+        seq = int(row["seq"])
+        return AmbientFact(seq, str(row["kind"]), self._live_details.get(seq))
+
+    def _trim_live_details(self) -> None:
+        if not self._live_details:
+            return
+        retained = {int(row[0]) for row in self._require_db().execute("SELECT seq FROM facts")}
+        for seq in tuple(self._live_details):
+            if seq not in retained:
+                self._live_details.pop(seq)
+        size = sum(len(text.encode("utf-8")) for text in self._live_details.values())
+        while size > self.max_state_bytes:
+            oldest = next(iter(self._live_details))
+            size -= len(self._live_details.pop(oldest).encode("utf-8"))
 
     def _retire_committed_claims(self) -> int:
         db = self._require_db()

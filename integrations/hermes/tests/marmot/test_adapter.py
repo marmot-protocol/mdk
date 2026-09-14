@@ -4279,11 +4279,13 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"type":"message_edited"', triggered.channel_context)
         self.assertIn('"type":"reaction_added"', triggered.channel_context)
         self.assertIn('"type":"reaction_removed"', triggered.channel_context)
-        self.assertIn(
-            'Marmot ambient context (untrusted): {"type":"group_state_changed","change":"group_renamed"}',
-            triggered.channel_context,
-        )
-        self.assertNotIn("Crew", triggered.channel_context)
+        self.assertIn('The group was renamed to "Crew".', triggered.channel_context)
+        mutations = [json.loads(line.split(": ", 1)[1])
+                     for line in triggered.channel_context.splitlines()
+                     if line.startswith("Marmot conversation event (untrusted): ")]
+        self.assertTrue(any(item.get("target_message_id") == "33" * 32 for item in mutations))
+        self.assertTrue(any(item.get("replacement_text") == "edited" for item in mutations))
+        self.assertTrue(any(item.get("emoji") == "👍" for item in mutations))
         # Buffer was drained: a second message in the group carries no stale context.
         self.assertEqual(adapter._ambient_context.pending("22" * 32), [])
 
@@ -6998,6 +7000,133 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.config_cls(extra=merged), client=client if client is not None else object()
         )
 
+    async def test_cancelled_worker_claim_is_released_after_sqlite_finishes(self):
+        import threading
+        adapter = self.make_adapter()
+        store = adapter._ambient_context
+        call = adapter._ambient_context_call
+        await call(store.record, "22" * 32, "event", "message_deleted")
+        started = asyncio.Event()
+        finish = threading.Event()
+        loop = asyncio.get_running_loop()
+        original = store.claim
+        def blocked_claim(group):
+            loop.call_soon_threadsafe(started.set)
+            if not finish.wait(timeout=5):
+                raise RuntimeError("test worker timed out")
+            return original(group)
+        store.claim = blocked_claim
+        task = asyncio.create_task(adapter._claim_ambient_context("22" * 32))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            store.claim = original
+            self.assertEqual(len((await call(store.claim, "22" * 32)).facts), 1)
+        finally:
+            finish.set()
+            await adapter.disconnect()
+
+    async def test_ambient_acknowledges_even_when_acceptance_commit_fails(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        store = adapter._ambient_context
+        call = adapter._ambient_context_call
+        group = "22" * 32
+        await call(store.record, group, "ambient-event", "message_deleted")
+        try:
+            with unittest.mock.patch.object(store, "commit", side_effect=OSError("unavailable")):
+                await adapter._handle_control_event(self.make_event())
+                await adapter._inbound_queue.join()
+            self.assertEqual(len(adapter.events), 1)
+            self.assertEqual(await call(store.pending, group), [])
+            self.assertEqual(adapter._ambient_outcomes, {})
+            await call(store.close)
+            self.assertFalse(await call(store.record, group, "ambient-event", "message_deleted"))
+        finally:
+            await adapter.disconnect()
+
+    async def test_failed_ambient_retirement_retries_without_deleting_new_facts(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        store = adapter._ambient_context
+        call = adapter._ambient_context_call
+        group = "22" * 32
+        await call(store.record, group, "accepted", "message_deleted")
+        try:
+            with unittest.mock.patch.object(store, "commit", side_effect=OSError("unavailable")), \
+                 unittest.mock.patch.object(store, "acknowledge", side_effect=OSError("unavailable")):
+                await adapter._handle_control_event(self.make_event())
+                await adapter._inbound_queue.join()
+                self.assertEqual(len(adapter._ambient_outcomes), 1)
+                self.assertEqual((await call(store.claim, group)).facts, ())
+                await call(store.record, group, "new-fact", "message_edited")
+            await adapter._retry_ambient_outcomes()
+            self.assertEqual(adapter._ambient_outcomes, {})
+            self.assertEqual([fact.kind for fact in await call(store.pending, group)], ["message_edited"])
+            self.assertFalse(await call(store.record, group, "accepted", "message_deleted"))
+        finally:
+            await adapter.disconnect()
+
+    async def test_retry_loop_recovers_failed_ambient_release_and_retirement(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                adapter = self.make_adapter(extra={"group_activation": "always"})
+                store = adapter._ambient_context
+                call = adapter._ambient_context_call
+                group = "22" * 32
+                await call(store.record, group, "event", "message_deleted")
+                if not accepted:
+                    adapter.handle_message = unittest.mock.AsyncMock(side_effect=RuntimeError("rejected"))
+                operation = "acknowledge" if accepted else "release"
+                try:
+                    with unittest.mock.patch.object(store, operation, side_effect=OSError("unavailable")):
+                        await adapter._handle_control_event(self.make_event())
+                        await adapter._inbound_queue.join()
+                    self.assertEqual(len(adapter._ambient_outcomes), 1)
+                    settled = asyncio.Event()
+                    original_retry = adapter._retry_ambient_outcomes
+                    async def observe_retry():
+                        await original_retry()
+                        if not adapter._ambient_outcomes:
+                            settled.set()
+                    adapter._retry_ambient_outcomes = observe_retry
+                    adapter._inbound_spool_retry_task = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+                    adapter._inbound_spool_wakeup.set()
+                    await asyncio.wait_for(settled.wait(), timeout=5)
+                    claim = await call(store.claim, group)
+                    self.assertEqual(len(claim.facts), 0 if accepted else 1)
+                finally:
+                    await adapter.disconnect()
+
+    async def test_group_occurrence_ids_dedupe_replay_but_preserve_later_same_kind(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        group = "22" * 32
+        def change(occurrence=None):
+            event = {"type": "group_state_changed", "account_id_hex": "11" * 32,
+                     "group_id_hex": group, "change": "group_renamed", "detail": "Crew"}
+            if occurrence is not None:
+                event["event_id_hex"] = occurrence
+            return wire_event(event)
+        try:
+            await adapter._handle_control_event(change("aa" * 32))
+            self.assertEqual(adapter.events, [])
+            await adapter._handle_control_event(self.make_event())
+            await adapter._inbound_queue.join()
+            await adapter._ambient_context_call(adapter._ambient_context.close)
+            await adapter._handle_control_event(change("aa" * 32))
+            await adapter._handle_control_event(change("bb" * 32))
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual(len(facts), 1)
+            # Older connectors have no occurrence identity. Preserve each
+            # observation instead of suppressing this kind for the full TTL.
+            await adapter._handle_control_event(change())
+            await adapter._handle_control_event(change())
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual(len(facts), 3)
+        finally:
+            await adapter.disconnect()
+
     async def test_journal_commit_precedes_queue_admission(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
         message_id = "33" * 32
@@ -7143,11 +7272,16 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                         raise self.adapter_module.sqlite3.OperationalError("synthetic terminal storage failure")
                     return original(message_id, state, disposition)
 
+                await adapter._ambient_context_call(
+                    adapter._ambient_context.record, "22" * 32, "ambient", "message_deleted"
+                )
                 store.transition = fault
                 try:
                     await adapter._handle_control_event(self.make_event())
                     await adapter._inbound_queue.join()
                     self.assertEqual(["durable"], [message.text for message in adapter.events])
+                    self.assertEqual(await adapter._ambient_context_call(
+                        adapter._ambient_context.pending, "22" * 32), [])
                     unavailable = False
                     await adapter._retry_inbound_dispatch_dispositions()
                     await adapter._admit_due_spooled()
