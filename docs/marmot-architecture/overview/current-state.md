@@ -19,13 +19,20 @@ status: overview
 
 # Current State — Implementations & Spec
 
+C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
+snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
+return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
+[bounded conversation opening](../further-context/conversation-opening.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
 archive; successful rejoin restores departed conversations. Independent live account attention reuses the Unread
 eligibility keys, reports unavailable accounts explicitly, and refreshes affected accounts without opening lists.
-Native bindings remain C4 M4. See [bounded live chat-list windows](../further-context/chat-list-windows.md)
-and [independent account attention](../further-context/account-attention.md).
+C4 M4 adds UniFFI/C handles, typed window errors and native ownership/parity checks;
+release and client adoption remain separate. See the [native handoff](../further-context/chat-projections-native.md),
+[bounded live chat-list windows](../further-context/chat-list-windows.md) and
+[independent account attention](../further-context/account-attention.md).
 
 Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
 it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined

@@ -112,7 +112,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 
 - **Module:** `snapshot_guard.rs`
   - **Owns:** RAII guard that rolls back + releases a snapshot on Drop; used by snapshot-probing call sites so panics or
-    async cancellation don't leave storage in mid-mutation state
+    async cancellation don't leave storage in mid-mutation state. Also owns `RewindSite`, the closed set of guard sites
+    that names every guard snapshot and drives `openmls_projection::recover_interrupted_rewind_guard`, so a site cannot
+    exist that open-time recovery cannot classify
 
 - **Module:** `pending_commit_guard.rs`
   - **Owns:** `PendingCommitCleanupGuard` — RAII cleanup that clears an orphaned OpenMLS pending commit if a
@@ -388,8 +390,9 @@ immediate drain behavior; application routing still depends on captured branch c
 500-ms budget across its reprocessing loop. Explicit-time engine entry points keep the row allowance without an
 elapsed wall deadline; queued outbound foreground preflight keeps its existing budget. Return pending at complete operation boundaries; do not cancel a
 snapshot guard or advance a partially tried generation. Foreground send budgets retain their separate semantics.
-Historical anchor peel contexts are materialized lazily once per bounded sweep and dropped with it; they preserve
-snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
+Historical anchor peel contexts are materialized lazily once per candidate generation — they derive only from an
+immutable retained anchor, so they outlive a bounded slice and are dropped with the generation that owns them; they
+preserve snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
 when canonical/candidate context is invalidated; never persist this secret-bearing cache or extend epoch retention.
 Tests: `tests/deferred_peel_lifecycle.rs` covers host budget yield, explicit-time row determinism, restart and eventual
 completion. Readiness queries all deferred rows using the storage state filter; never hide unattempted rows by

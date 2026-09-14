@@ -478,7 +478,8 @@ async fn encrypted_replay_graph_fixture_with_apps(
         let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
             &alice_store,
             group_id.clone(),
-            "measurement-branch".into(),
+            crate::snapshot_guard::RewindSite::CandidateBranchSweep,
+            "measurement-branch",
         )
         .unwrap();
         for _ in 0..depth {

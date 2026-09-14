@@ -113,6 +113,16 @@ int main(int argc, char **argv) {
     marmot_string_free(NULL);
     marmot_account_summary_list_free(NULL);
     marmot_markdown_document_free(NULL);
+    marmot_chat_list_window_snapshot_free(NULL);
+    marmot_account_attention_snapshot_free(NULL);
+    marmot_chat_list_window_subscription_free(NULL);
+    marmot_account_attention_subscription_free(NULL);
+    check(marmot_open_chat_list_window(NULL, NULL, 0, NULL, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "window open preflights output");
+    check(marmot_chat_list_window_subscription_page(NULL, 0, 0, 1, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "window page preflights output");
+    check(marmot_account_attention_subscription_next(NULL, 5000, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "attention next preflights output");
     marmot_presented_chat_row_free(NULL);
     marmot_presented_chat_list_snapshot_free(NULL);
     marmot_presented_chat_list_update_free(NULL);
@@ -229,6 +239,22 @@ int main(int argc, char **argv) {
     }
     check(accounts->len == 0, "fresh home has no accounts");
     marmot_account_summary_list_free(accounts);
+
+    MarmotAccountAttentionSubscription *attention = NULL;
+    st = marmot_subscribe_account_attention(client, &attention);
+    check(st == MARMOT_STATUS_OK && attention != NULL, "independent attention opens");
+    if (attention != NULL) {
+        MarmotAccountAttentionSnapshot *snapshot = NULL;
+        st = marmot_account_attention_subscription_snapshot(attention, &snapshot);
+        check(st == MARMOT_STATUS_OK && snapshot != NULL, "attention initial snapshot");
+        if (snapshot != NULL) {
+            check(snapshot->accounts_len == 0 && snapshot->sequence == 0, "empty account set");
+            marmot_account_attention_snapshot_free(snapshot);
+        }
+        st = marmot_account_attention_subscription_next(attention, 5, &snapshot);
+        check(st == MARMOT_STATUS_TIMEOUT && snapshot == NULL, "attention timeout preserves ownership");
+        marmot_account_attention_subscription_free(attention);
+    }
 
     /* Directory lookups for an unknown id resolve to absent (NULL out). */
     char *npub = NULL;

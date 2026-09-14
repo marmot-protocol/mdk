@@ -21,11 +21,95 @@
 //! callers explicitly call [`SnapshotRollbackGuard::commit`] which runs
 //! the rollback + release once and disarms the `Drop` so it doesn't
 //! repeat the work.
+//!
+//! Process termination runs neither. The surviving snapshot is then the
+//! only copy of the live state, so it must be recognizable at the next
+//! open: [`RewindSite`] is the closed set of guard sites that both names
+//! the snapshots and drives that recovery
+//! (`openmls_projection::recover_interrupted_rewind_guard`).
 
 use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
 use cgka_traits::types::GroupId;
 
 const TRACE_TARGET: &str = "cgka_engine::snapshot_guard";
+
+/// Every engine site that mutates live group state behind a
+/// [`SnapshotRollbackGuard`].
+///
+/// A guard's snapshot name is built only from this closed set, and open-time
+/// recovery classifies orphaned snapshots through the same set
+/// ([`RewindSite::classify`]). A site therefore cannot exist without being
+/// recoverable: the pair that used to drift — six naming sites, two recognized
+/// by recovery — is now one enumeration.
+///
+/// The prefixes are durable. A snapshot row written by an earlier build must
+/// still classify after upgrade, because that is what restores the live state
+/// of a device whose process died inside a rewind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RewindSite {
+    /// Ingest rewinds onto a retained anchor to derive the exporter context
+    /// that reads a message from a past epoch.
+    PastPeelContext,
+    /// Ingest rewinds onto a retained anchor to read the retention policy that
+    /// was authenticated at a delayed message's source epoch.
+    RetentionSource,
+    /// Hydration processes a stored proposal to decide whether it is a
+    /// deferred SelfRemove.
+    HydrateSelfRemove,
+    /// A candidate path is replayed forward onto the current state to observe
+    /// its tip.
+    Replay,
+    /// The convergence pass rewinds onto the retained anchor before replaying
+    /// the stored graph.
+    RetainedAnchorPass,
+    /// The deferred-peel sweep rewinds onto the retained anchor to enumerate
+    /// candidate branches.
+    CandidateBranchSweep,
+}
+
+impl RewindSite {
+    const ALL: [Self; 6] = [
+        Self::PastPeelContext,
+        Self::RetentionSource,
+        Self::HydrateSelfRemove,
+        Self::Replay,
+        Self::RetainedAnchorPass,
+        Self::CandidateBranchSweep,
+    ];
+
+    /// Durable snapshot-name prefix. No prefix is a prefix of another, so
+    /// classification is unambiguous.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::PastPeelContext => "peel-restore-",
+            Self::RetentionSource => "retention-restore-",
+            Self::HydrateSelfRemove => "hydrate-selfremove-probe-",
+            Self::Replay => "openmls-probe-",
+            Self::RetainedAnchorPass => "openmls-retained-probe-",
+            Self::CandidateBranchSweep => "openmls-branch-probe-",
+        }
+    }
+
+    /// The site that wrote `name`, or `None` for a snapshot no guard created
+    /// (retained anchors, convergence-apply snapshots, test fixtures).
+    pub(crate) fn classify(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|site| name.starts_with(site.prefix()))
+    }
+
+    /// Whether this site's guard window can open inside another site's.
+    ///
+    /// Only the forward replay of a candidate path can: the convergence pass
+    /// and the deferred-peel sweep each replay candidates while rewound onto a
+    /// retained anchor, and it also runs on its own. Recovery needs the
+    /// distinction because a crash inside a nested window strands two
+    /// snapshots: only the outer one holds live state, so the inner one is
+    /// released rather than restored.
+    pub(crate) const fn may_nest_inside_another_guard(self) -> bool {
+        matches!(self, Self::Replay)
+    }
+}
 
 /// Owns a freshly-created canonical-group-state snapshot. Drop rolls back to
 /// the snapshot and releases it. Call [`Self::commit`] on the happy path to
@@ -39,15 +123,21 @@ pub(crate) struct SnapshotRollbackGuard<'a, S: StorageProvider> {
 }
 
 impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
-    /// Create a canonical-group-state snapshot named `name` for `group_id` and
-    /// return a guard. The message ledger and outbound queue are deliberately
-    /// excluded: callers use this guard only around temporary canonical-state
-    /// mutations and must leave live input/work collections untouched.
+    /// Create a canonical-group-state snapshot for `group_id` and return a
+    /// guard. The message ledger and outbound queue are deliberately excluded:
+    /// callers use this guard only around temporary canonical-state mutations
+    /// and must leave live input/work collections untouched.
+    ///
+    /// The name is composed from `site` and a caller-chosen `suffix` that
+    /// separates concurrent windows of the same site, so every guard snapshot
+    /// is classifiable by open-time recovery.
     pub(crate) fn create_group_state(
         storage: &'a S,
         group_id: GroupId,
-        name: String,
+        site: RewindSite,
+        suffix: &str,
     ) -> StorageResult<Self> {
+        let name = format!("{}{suffix}", site.prefix());
         storage.create_group_state_snapshot(&group_id, &name)?;
         Ok(Self {
             storage,
@@ -85,6 +175,18 @@ impl<'a, S: StorageProvider> Drop for SnapshotRollbackGuard<'a, S> {
         // rollback fails the database is in mid-mutation state, but
         // there is nothing more we can do from Drop. Surface a
         // privacy-safe trace so the failure is visible.
+        //
+        // Release the snapshot even then. Keeping it looks safer — a failed
+        // rollback means live state was not restored — but the guard cannot
+        // tell whether this window mutated anything at all. At most sites the
+        // first step inside the window is itself a rollback onto a retained
+        // anchor, which can fail before changing a byte; the early return then
+        // drops an armed guard over untouched live state. A snapshot kept
+        // there is stale the moment the group advances, and open-time recovery
+        // restores a surviving guard snapshot unconditionally — so it would be
+        // written over newer live state at the next open, which is the durable
+        // self-rollback this recovery exists to prevent. Keeping the snapshot
+        // becomes correct only once the guard knows the window mutated.
         if let Err(_e) = self
             .storage
             .rollback_group_state_to_snapshot(&self.group_id, &self.name)
@@ -110,7 +212,7 @@ impl<'a, S: StorageProvider> Drop for SnapshotRollbackGuard<'a, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::SnapshotRollbackGuard;
+    use super::{RewindSite, SnapshotRollbackGuard};
     use cgka_traits::capabilities::GroupCapabilities;
     use cgka_traits::engine::SendIntent;
     use cgka_traits::group::{Group, ProtocolProfile};
@@ -163,6 +265,68 @@ mod tests {
     }
 
     #[test]
+    fn every_guard_snapshot_is_classified_by_the_recovery_set() {
+        let storage = SqliteAccountStorage::in_memory().expect("storage");
+        let group_id = GroupId::new(vec![9; 16]);
+        storage
+            .put_group(&group(&group_id, 4, "live"))
+            .expect("put live group");
+
+        for site in RewindSite::ALL {
+            let guard = SnapshotRollbackGuard::create_group_state(
+                &storage,
+                group_id.clone(),
+                site,
+                "0011223344556677",
+            )
+            .expect("capture live state");
+            let classified = storage
+                .list_group_snapshots(&group_id)
+                .expect("list snapshots")
+                .iter()
+                .filter_map(|name| RewindSite::classify(name))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                classified,
+                vec![site],
+                "a guard must leave exactly one snapshot that open-time recovery classifies"
+            );
+            guard.commit().expect("release guard snapshot");
+        }
+    }
+
+    /// A device that died inside a rewind is healed by the FIRST open after
+    /// upgrade, which requires the prefixes an earlier build wrote to still
+    /// classify. These literals are therefore durable, not internal.
+    #[test]
+    fn snapshot_names_written_by_earlier_builds_stay_classifiable() {
+        for (name, site) in [
+            ("peel-restore-a1b2c3d4e5f60718", RewindSite::PastPeelContext),
+            (
+                "retention-restore-81-a1b2c3d4e5f60718",
+                RewindSite::RetentionSource,
+            ),
+            (
+                "hydrate-selfremove-probe-a1b2c3d4e5f60718",
+                RewindSite::HydrateSelfRemove,
+            ),
+            ("openmls-probe-a1b2c3d4e5f60718", RewindSite::Replay),
+            (
+                "openmls-retained-probe-a1b2c3d4e5f60718",
+                RewindSite::RetainedAnchorPass,
+            ),
+            (
+                "openmls-branch-probe-a1b2c3d4e5f60718",
+                RewindSite::CandidateBranchSweep,
+            ),
+        ] {
+            assert_eq!(RewindSite::classify(name), Some(site), "name: {name}");
+        }
+        assert_eq!(RewindSite::classify("openmls-retained-anchor-81"), None);
+        assert_eq!(RewindSite::classify("openmls-apply-a1b2c3d4"), None);
+    }
+
+    #[test]
     fn group_state_guard_does_not_rewrite_live_message_or_queue_rows() {
         let storage = SqliteAccountStorage::in_memory().expect("storage");
         let group_id = GroupId::new(vec![7; 16]);
@@ -180,7 +344,8 @@ mod tests {
         let guard = SnapshotRollbackGuard::create_group_state(
             &storage,
             group_id.clone(),
-            "temporary-probe".into(),
+            RewindSite::Replay,
+            "temporary-probe",
         )
         .expect("capture live state");
 

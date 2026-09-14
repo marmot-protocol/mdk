@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
+  commands and independent live account-attention summaries across Swift/Kotlin and C.
+  Existing list/read APIs and C record layouts remain; new typed window errors append
+  status codes 73–77. Regenerate bindings and use matching libraries.
+
 - `MarmotAccountKeyPackageRelayEvent`, `MarmotAccountKeyPackageRelayEventList`,
   `marmot_account_key_package_relay_events`, and
   `marmot_account_key_package_relay_event_list_free` for observed KeyPackage

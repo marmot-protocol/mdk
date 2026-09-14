@@ -96,7 +96,7 @@ atomically restores membership and archive eligibility and updates the account
 worker's in-memory intent. Consented rejoin restores once; replay cannot undo a
 subsequent explicit archive. Existing membership push-share side effects remain.
 
-M3 owns independent account attention summaries; M4 owns native binding contracts
-and consumer handoff. Full-dataset search and custom folders keep their existing
+M3 owns independent account attention summaries; M4 provides the
+[native binding contracts and consumer handoff](chat-projections-native.md). Full-dataset search and custom folders keep their existing
 APIs until separately migrated. These row-count and SQL-work tests do not establish
 native rendering speed or a byte-size bound for arbitrary preview payloads.

@@ -396,3 +396,9 @@ an unread, pin, archive or mute update can have the same presentation revision. 
 accounts; cancellation preserves a pending refresh, and shutdown ends the stream. Account-store replacement requires
 opening a new handle. Do not log rows or avatar material, including generated host-language record stringification.
 Existing chat-list APIs remain available during client migration. Android/iOS adoption is a separate delivery step.
+
+## Bounded chat screens
+
+C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
+See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
+for paging, sequence handling, cancellation, C ownership, and compatibility.

@@ -315,6 +315,23 @@ impl FailedStateWriteFault {
     }
 }
 
+/// Counts rollbacks onto a retained epoch anchor. One per anchor per candidate
+/// generation is the cached shape; one per anchor per bounded slice is not.
+#[derive(Clone, Default)]
+struct RetainedAnchorRewindCounter(Arc<AtomicUsize>);
+
+impl RetainedAnchorRewindCounter {
+    fn note(&self, name: &str) {
+        if name.starts_with("openmls-retained-anchor-") {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
 /// selected record/cache writes. Every other call delegates unchanged.
 struct FaultStorage {
@@ -325,6 +342,7 @@ struct FaultStorage {
     intent_write_fault: LeaveWriteFault,
     failed_state_fault: FailedStateWriteFault,
     preparation_delay: PreparationDelay,
+    retained_anchor_rewinds: RetainedAnchorRewindCounter,
 }
 
 impl GroupStorage for FaultStorage {
@@ -451,6 +469,7 @@ impl MessageStorage for FaultStorage {
         self.inner.list_group_snapshots(group_id)
     }
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.retained_anchor_rewinds.note(name);
         self.inner.rollback_group_to_snapshot(group_id, name)
     }
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
@@ -802,6 +821,7 @@ fn build_fault_selfremove_client(
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -827,6 +847,7 @@ fn build_capability_fault_client(
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -853,6 +874,7 @@ fn build_leave_write_fault_client(
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(identity))
@@ -1666,6 +1688,7 @@ async fn slow_preparation_case(
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: delay.clone(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"slow-preparation"))
@@ -1711,6 +1734,130 @@ async fn slow_preparation_case(
         ids.push(message.id);
     }
     (bob, storage, group_id, ids, delay)
+}
+
+/// A backlog of opaque rows over a group that has left `anchors` epochs
+/// behind, so every swept row is offered each retained anchor's peel context.
+async fn past_peel_backlog_case(
+    anchors: usize,
+    backlog: usize,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Vec<MessageId>,
+    RetainedAnchorRewindCounter,
+) {
+    let rewinds = RetainedAnchorRewindCounter::default();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let handle = storage.clone();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner: storage,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: rewinds.clone(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"past-peel-backlog"))
+    .account_identity_proof_signer(proof_signer(b"past-peel-backlog"))
+    .peeler(Box::new(OpaquePeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = bob
+        .create_group(CreateGroupRequest {
+            name: "past peel backlog".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("group creation");
+    };
+    bob.confirm_published(pending).await.unwrap();
+
+    // Each advance retains the epoch it leaves behind, so the sweep has
+    // `anchors` historical peel contexts to offer every row.
+    for epoch in 0..anchors {
+        let SendResult::GroupEvolution { pending, .. } = bob
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("past peel backlog {epoch}")),
+                description: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("group data update");
+        };
+        bob.confirm_published(pending).await.unwrap();
+    }
+
+    let mut ids = Vec::new();
+    for index in 0..backlog {
+        let message = TransportMessage {
+            id: MessageId::new(format!("past-peel-{index}").into_bytes()),
+            payload: vec![42; 32],
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        };
+        assert!(matches!(
+            bob.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        ids.push(message.id);
+    }
+    (bob, handle, group_id, ids, rewinds)
+}
+
+/// A historical peel context is derived from an immutable retained anchor, so
+/// it stays valid for the whole candidate generation. Re-deriving it per
+/// bounded slice made a long backlog pay one rewind of live state per anchor
+/// per slice.
+#[tokio::test]
+async fn a_past_peel_context_is_derived_once_per_generation_not_once_per_slice() {
+    const ANCHORS: usize = 3;
+    // Deeper than two explicit-time row slices, so the generation is still
+    // open after the second one and no completion convergence rewinds on its
+    // own account.
+    let (mut bob, storage, group_id, ids, rewinds) = past_peel_backlog_case(ANCHORS, 200).await;
+    // Live ingest deliberately keeps no cross-message context cache; measure
+    // only what the sweeps add.
+    let before_sweeps = rewinds.count();
+
+    bob.converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let first_slice_rewinds = rewinds.count() - before_sweeps;
+    let attempts_after_first_slice = deferred_attempts(&storage, &ids);
+    assert_eq!(
+        first_slice_rewinds, ANCHORS,
+        "the first slice must derive each historical peel context exactly once"
+    );
+
+    bob.converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .unwrap();
+    assert!(
+        deferred_attempts(&storage, &ids) > attempts_after_first_slice,
+        "the second slice must offer those contexts to further rows"
+    );
+    assert_eq!(
+        rewinds.count() - before_sweeps,
+        first_slice_rewinds,
+        "a later slice of the same generation must reuse those contexts"
+    );
 }
 
 fn deferred_attempts(storage: &SqliteAccountStorage, ids: &[MessageId]) -> u32 {
@@ -1970,6 +2117,7 @@ async fn setup_own_intent_fault_case(
         intent_write_fault: fault,
         failed_state_fault: FailedStateWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"own-intent-fault"))
@@ -2177,6 +2325,7 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: failed_state_fault.clone(),
         preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"carol-retire-atomic"))

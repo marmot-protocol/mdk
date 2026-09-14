@@ -37,6 +37,12 @@ memory and must never be logged or persisted. No schema migration or durable cou
 This lets resumable reconstruction distinguish actual state changes from unrelated writes through another app
 connection. The older `mls_write_generation` contract remains unchanged for cached `MlsGroup` objects.
 
+## Conversation opening
+
+`conversation_open` composes a bounded canonical timeline page with retained read state in one read-only snapshot.
+It supports first-unread/latest opening and scoped anchor recovery; dirty projections return `ReadStateNotReady`
+for the existing owner to refresh. See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
+
 ## Migrations
 
 Account/session schema changes go through Rust migrations. The runner and ordered registry live in

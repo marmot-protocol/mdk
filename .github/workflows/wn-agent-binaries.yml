@@ -209,6 +209,7 @@ jobs:
           cp integrations/hermes/marmot/__init__.py "$bundle_dir/"
           cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
           cp integrations/hermes/marmot/agent_control.py "$bundle_dir/"
+          cp integrations/hermes/marmot/ambient_context.py "$bundle_dir/"
           cp integrations/hermes/marmot/inbound_spool.py "$bundle_dir/"
           cp integrations/hermes/marmot/README.md "$bundle_dir/"
           cp scripts/hermes_marmot_configure_gateway.py "$bundle_dir/configure_gateway.py"
@@ -225,6 +226,7 @@ jobs:
               "__init__.py",
               "adapter.py",
               "agent_control.py",
+              "ambient_context.py",
               "inbound_spool.py",
               "configure_gateway.py",
               "README.md",
@@ -237,6 +239,7 @@ jobs:
             cd "$stage_parent"
             tar -czf "$asset" "hermes-marmot-plugin"
           )
+          python3 integrations/hermes/tests/marmot/verify_packaged_plugin.py "$asset"
           shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
           mkdir -p dist/hermes-marmot-plugin
           cp "$asset" "$asset.sha256" dist/hermes-marmot-plugin/

@@ -24,7 +24,7 @@ use cgka_engine::openmls_projection::{
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -53,6 +53,7 @@ const READY_PREFIX: &str = "MDK_CGKA_TEST_CRASH_READY:";
 const H5_POINT: &str = "historical-apply-before-commit";
 const H6_POINT: &str = "retained-anchor-after-rewind";
 const CANDIDATE_BRANCH_POINT: &str = "candidate-branch-after-rewind";
+const PAST_PEEL_POINT: &str = "past-peel-after-rewind";
 const DURABLE_TRANSITION_POINTS: &[&str] = &[
     "convergence-pass-collecting-durable",
     "convergence-pass-frozen-durable",
@@ -130,6 +131,42 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+/// Models the production shape the retained-anchor fallback exists for: traffic
+/// sealed under a past epoch's exporter secret, which the live context cannot
+/// read.
+struct UnreadablePeeler;
+
+#[async_trait]
+impl TransportPeeler for UnreadablePeeler {
+    async fn peel_group_message(
+        &self,
+        _msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Err(PeelerError::DecryptFailed)
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 #[test]
 fn h5_kill_before_historical_apply_commit_preserves_live_inputs() {
     run_parent_case(H5_POINT, EpochId(2), "openmls-apply-");
@@ -143,6 +180,16 @@ fn h6_kill_after_retained_anchor_rewind_recovers_live_snapshot() {
 #[test]
 fn candidate_branch_kill_after_rewind_recovers_live_state_and_work_rows() {
     run_parent_case(CANDIDATE_BRANCH_POINT, EpochId(1), "openmls-branch-probe-");
+}
+
+// The deferred-peel sweep rewinds live state onto a retained anchor once per
+// anchor to derive the exporter context that reads a late message. A kill
+// inside that window leaves the anchor's epoch as this device's durable state
+// while the guard snapshot holds the real tip, so reopening must restore the
+// tip instead of accepting the rollback as its own.
+#[test]
+fn past_peel_kill_after_rewind_recovers_the_committed_tip() {
+    run_parent_case(PAST_PEEL_POINT, EpochId(1), "peel-restore-");
 }
 
 #[test]
@@ -259,7 +306,7 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
     let group_id = group_ids[0].clone();
     let stranded_group = storage.get_group(&group_id).expect("stranded group");
     assert_eq!(stranded_group.epoch, stranded_epoch);
-    if matches!(point, H6_POINT | CANDIDATE_BRANCH_POINT) {
+    if matches!(point, H6_POINT | CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT) {
         assert!(
             !stranded_group
                 .members
@@ -276,7 +323,7 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
             .any(|name| name.starts_with(snapshot_prefix)),
         "expected stranded snapshot prefix {snapshot_prefix}"
     );
-    if matches!(point, H5_POINT | CANDIDATE_BRANCH_POINT) {
+    if matches!(point, H5_POINT | CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT) {
         assert_eq!(
             storage
                 .list_queued_outbound_intents(&group_id)
@@ -303,6 +350,13 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
     assert_eq!(
         reopened.epoch(&group_id).expect("recovered epoch"),
         EpochId(2)
+    );
+    let events = reopened.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::PendingCommitRecovered { .. })),
+        "a recovered rewind must not be mistaken for a crashed publish; got {events:?}"
     );
     let recovered_group = storage.get_group(&group_id).expect("recovered group");
     assert_eq!(recovered_group.name, "crash-recovery");
@@ -697,7 +751,8 @@ async fn run_child_case(database: &Path) {
             policy.convergence.max_rewind_commits,
         )
         .expect("historical apply reaches selected crash point");
-    } else if crash_point.as_deref() == Some(CANDIDATE_BRANCH_POINT) {
+    } else if let Some(point @ (CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT)) = crash_point.as_deref()
+    {
         let deferred = TransportMessage {
             id: MessageId::new(b"candidate-branch-deferred".to_vec()),
             payload: b"opaque candidate-branch traffic".to_vec(),
@@ -720,6 +775,19 @@ async fn run_child_case(database: &Path) {
                 deferred_peel: None,
             })
             .expect("persist deferred crash input");
+        // The past-peel rewind is only reached by a row the LIVE context cannot
+        // read, which is the production shape of post-fork traffic. Reopen the
+        // same database behind a peeler that models it.
+        if point == PAST_PEEL_POINT {
+            carol = build_client_with_peeler(
+                CAROL_SEED,
+                carol_storage.clone(),
+                Box::new(UnreadablePeeler),
+            );
+            carol
+                .hydrate_all_stored_groups()
+                .expect("hydrate before the past-peel sweep");
+        }
         carol
             .retry_deferred_peels(&group_id)
             .await
@@ -727,7 +795,7 @@ async fn run_child_case(database: &Path) {
         carol
             .retry_deferred_peels(&group_id)
             .await
-            .expect("candidate branch probe reaches selected crash point");
+            .expect("deferred-peel sweep reaches selected crash point");
     } else {
         carol
             .converge_stored_openmls_messages_at(&group_id, 3_000_000)
@@ -744,6 +812,14 @@ fn build_memory_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAcco
 fn build_client_with_storage(
     seed: &[u8],
     storage: SqliteAccountStorage,
+) -> Engine<SqliteAccountStorage> {
+    build_client_with_peeler(seed, storage, Box::new(MockPeeler))
+}
+
+fn build_client_with_peeler(
+    seed: &[u8],
+    storage: SqliteAccountStorage,
+    peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
     let builder = EngineBuilder::new(storage);
     #[cfg(feature = "test-policy-overrides")]
@@ -762,7 +838,7 @@ fn build_client_with_storage(
         .identity(identity(seed))
         .account_identity_proof_signer(proof_signer(seed))
         .feature_registry(self_remove_registry())
-        .peeler(Box::new(MockPeeler))
+        .peeler(peeler)
         .build()
         .expect("build crash-test engine")
 }

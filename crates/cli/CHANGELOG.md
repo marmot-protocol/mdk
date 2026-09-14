@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
+  commands and independent live account-attention summaries across Swift/Kotlin and C.
+  Existing list/read APIs and C record layouts remain; new typed window errors append
+  status codes 73–77. Regenerate bindings and use matching libraries.
+
 - `wn messages edit <group-hex> <message-id> <text>` publishes a kind-1009 edit through the runtime's
   `edit_message`. The target must be a locally projected message authored by the selected account; a foreign target
   fails with `not_message_author` and an unknown id with `unknown_message` before anything is published. The JSON

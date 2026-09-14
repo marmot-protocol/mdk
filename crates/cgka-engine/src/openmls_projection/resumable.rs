@@ -308,15 +308,16 @@ fn with_anchor<S: StorageProvider, T>(
     if epoch >= source.graph.current_epoch {
         return f().map(Some);
     }
-    let name = if peel {
-        candidate_branch_probe_snapshot_name(group, epoch)
+    let site = if peel {
+        RewindSite::CandidateBranchSweep
     } else {
-        retained_anchor_probe_snapshot_name(group, epoch)
+        RewindSite::RetainedAnchorPass
     };
     let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
         storage,
         group.clone(),
-        name,
+        site,
+        &rewind_probe_snapshot_suffix(group, epoch),
     )?;
     let result = match storage
         .rollback_group_state_to_snapshot(group, &retained_anchor_snapshot_name(epoch))

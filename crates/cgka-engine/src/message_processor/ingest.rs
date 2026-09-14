@@ -17,7 +17,7 @@ use crate::openmls_projection::{
 };
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
-use crate::snapshot_guard::SnapshotRollbackGuard;
+use crate::snapshot_guard::{RewindSite, SnapshotRollbackGuard};
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::{AutoPublish, GroupEvent, GroupStateChange};
 use cgka_traits::error::{EngineError, PeelerError};
@@ -67,9 +67,11 @@ pub(crate) struct DeferredPeelSweep<'a> {
     past_contexts: Option<&'a PastPeelContextCache>,
 }
 
-/// Secret-bearing, single-group cache owned by one bounded sweep, never persisted.
-/// The caller stops the sweep if canonical context changes. Inactive snapshots
-/// are cached as None; failures are not cached and can be retried normally.
+/// Secret-bearing, single-group cache owned by one deferred-peel candidate
+/// generation, never persisted. Each entry derives from one immutable retained
+/// anchor, so it outlives a bounded slice; the owning generation is dropped
+/// whenever canonical context changes. Inactive snapshots are cached as None;
+/// failures are not cached and can be retried normally.
 #[derive(Default)]
 pub(super) struct PastPeelContextCache {
     contexts: Mutex<HashMap<String, Option<Arc<PastPeelContext>>>>,
@@ -2671,11 +2673,11 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(b"cgka-engine-peel-restore/v2");
         hasher.update(group_id.as_slice());
         hasher.update(snapshot_name.as_bytes());
-        let restore_snapshot = format!("peel-restore-{}", hex::encode(&hasher.finalize()[..8]));
         let guard = SnapshotRollbackGuard::create_group_state(
             &self.storage,
             group_id.clone(),
-            restore_snapshot,
+            RewindSite::PastPeelContext,
+            &hex::encode(&hasher.finalize()[..8]),
         )?;
         let context = self.context_from_group_snapshot(group_id, snapshot_name);
         guard.commit()?;
@@ -2734,15 +2736,15 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(group_id.as_slice());
         hasher.update(source_epoch.0.to_be_bytes());
         hasher.update(current_epoch.0.to_be_bytes());
-        let restore_name = format!(
-            "retention-restore-{}-{}",
-            current_epoch.0,
-            hex::encode(&hasher.finalize()[..8])
-        );
         let guard = SnapshotRollbackGuard::create_group_state(
             &self.storage,
             group_id.clone(),
-            restore_name,
+            RewindSite::RetentionSource,
+            &format!(
+                "{}-{}",
+                current_epoch.0,
+                hex::encode(&hasher.finalize()[..8])
+            ),
         )?;
         let resolved = match self
             .storage
@@ -2814,6 +2816,7 @@ impl<S: StorageProvider> Engine<S> {
     > {
         self.storage
             .rollback_group_state_to_snapshot(group_id, snapshot_name)?;
+        crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mls_group = MlsGroup::load(

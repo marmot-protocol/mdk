@@ -11,7 +11,7 @@ C4 M3 in [#1777](https://github.com/marmot-protocol/mdk/issues/1777) adds
 `MarmotAppRuntime::subscribe_account_attention()`. An account switcher can receive
 current badges without opening a chat list or starting that account's worker.
 This reuses the durable chat counters and M1 eligibility keys; it adds no migration
-or second counter store. Native bindings follow in M4.
+or second counter store. [Native bindings and handoff](chat-projections-native.md) are provided by M4.
 
 ## Snapshot contract
 

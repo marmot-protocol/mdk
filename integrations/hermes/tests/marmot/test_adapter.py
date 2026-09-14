@@ -115,14 +115,15 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         gateway_restart_notification: bool = True
         extra: dict = field(default_factory=dict)
         _inbound_spool_test_path: str = field(init=False, repr=False)
+        _ambient_context_test_path: str = field(init=False, repr=False)
 
         def __post_init__(self):
             # Unit adapters directly invoke inbound hooks without connect(). Give
-            # each instance a private spool so tests exercise the real durability
-            # boundary without touching the operator's default Marmot home.
-            self._inbound_spool_test_path = str(
-                Path(tempfile.mkdtemp(dir=TEST_SPOOL_ROOT.name)) / "inbound.sqlite3"
-            )
+            # each instance private stores so tests exercise real durability
+            # boundaries without touching the operator's default Marmot home.
+            store_root = Path(tempfile.mkdtemp(dir=TEST_SPOOL_ROOT.name)).resolve()
+            self._inbound_spool_test_path = str(store_root / "inbound.sqlite3")
+            self._ambient_context_test_path = str(store_root / "ambient.sqlite3")
 
     class BasePlatformAdapter:
         def __init__(self, config, platform):
@@ -1440,6 +1441,134 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await adapter.disconnect()
                 self.assertIsNone(adapter._listener_task)
+
+    async def test_failed_old_listener_cannot_bypass_connect_failure_cleanup(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}), client=object()
+        )
+        await adapter._ensure_inbound_spool_open()
+        await adapter._ambient_context_call(adapter._ambient_context.open)
+        async def failed_listener():
+            raise RuntimeError("old transport failure")
+        adapter._listener_task = asyncio.create_task(failed_listener())
+        await asyncio.sleep(0)
+        adapter._ensure_account_id = unittest.mock.AsyncMock(side_effect=OSError("connect failed"))
+        adapter._set_fatal_error = unittest.mock.Mock()
+        try:
+            self.assertFalse(await adapter.connect(is_reconnect=True))
+            self.assertIsNone(adapter._listener_task)
+            self.assertIsNone(adapter._inbound_spool_retry_task)
+            self.assertFalse(adapter._ambient_context.is_open)
+            self.assertFalse(adapter._inbound_spool.is_open)
+            adapter._set_fatal_error.assert_called_once_with("marmot_connect_failed", "connect failed", retryable=True)
+            # Closed connection also relinquished the exclusive ambient lock.
+            other = self.adapter_module.AmbientContextStore(adapter._ambient_context.path)
+            other.open()
+            other.close()
+        finally:
+            await adapter.disconnect()
+
+    async def test_connect_failure_survives_each_cleanup_error_and_stops_worker(self):
+        for operation in ("tasks", "ambient", "spool"):
+            with self.subTest(operation=operation):
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}), client=object()
+                )
+                await adapter._ensure_inbound_spool_open()
+                await adapter._ambient_context_call(adapter._ambient_context.open)
+                executor = adapter._inbound_spool_executor
+                adapter._ensure_account_id = unittest.mock.AsyncMock(side_effect=OSError("original connection failure"))
+                adapter._set_fatal_error = unittest.mock.Mock()
+                if operation == "tasks":
+                    target, name = adapter, "_stop_inbound_tasks"
+                    fault = unittest.mock.AsyncMock(side_effect=RuntimeError("task cleanup failure"))
+                else:
+                    target, name = ((adapter._ambient_context, "_close_lock") if operation == "ambient"
+                                    else (adapter._inbound_spool, "close"))
+                    original = getattr(target, name)
+                    def fault(*args, **kwargs):
+                        original(*args, **kwargs)
+                        raise OSError("close cleanup failure")
+                try:
+                    with unittest.mock.patch.object(target, name, fault):
+                        self.assertFalse(await adapter.connect(is_reconnect=True))
+                    adapter._set_fatal_error.assert_called_once_with(
+                        "marmot_connect_failed", "original connection failure", retryable=True)
+                    self.assertFalse(adapter._inbound_spool.is_open)
+                    self.assertFalse(adapter._ambient_context.is_open)
+                    self.assertFalse(adapter._ambient_context._generation_enabled)
+                    self.assertIsNone(adapter._inbound_spool_executor)
+                    self.assertTrue(all(not thread.is_alive() for thread in executor._threads))
+                finally:
+                    await adapter.disconnect()
+
+    async def test_early_connect_failure_does_not_create_journal_worker(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}), client=object()
+        )
+        adapter._ensure_account_id = unittest.mock.AsyncMock(side_effect=OSError("unavailable"))
+        adapter._set_fatal_error = unittest.mock.Mock()
+        with unittest.mock.patch.object(self.adapter_module, "ThreadPoolExecutor") as executor:
+            self.assertFalse(await adapter.connect())
+            executor.assert_not_called()
+        self.assertIsNone(adapter._inbound_spool_executor)
+        self.assertFalse(adapter._ambient_context._generation_enabled)
+        adapter._set_fatal_error.assert_called_once_with("marmot_connect_failed", "unavailable", retryable=True)
+
+    async def test_ambient_open_failure_degrades_without_blocking_real_inbound(self):
+        inbound = wire_event(
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "still delivered",
+                "mentions_self": True,
+            }
+        )
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                yield inbound
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=FakeClient(),
+        )
+        adapter._ambient_context.open = unittest.mock.Mock(
+            side_effect=RuntimeError("ambient open failed")
+        )
+
+        self.assertTrue(await adapter.connect())
+        for _ in range(100):
+            if adapter.events:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual([event.text for event in adapter.events], ["still delivered"])
+        await adapter.disconnect()
+        self.assertFalse(adapter._inbound_spool.is_open)
+        self.assertFalse(adapter._ambient_context.is_open)
+        self.assertIsNone(adapter._listener_task)
+        self.assertIsNone(adapter._inbound_spool_retry_task)
+
+    async def test_disconnect_prevents_store_reopen_from_delayed_work(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=object(),
+        )
+        adapter._inbound_spool.open()
+        adapter._ambient_context.open()
+
+        await adapter.disconnect()
+
+        with self.assertRaises(self.adapter_module.InboundSpoolError):
+            await adapter._ensure_inbound_spool_open()
+        with self.assertRaisesRegex(Exception, "generation is closed"):
+            adapter._ambient_context.record("22" * 32, "late", "message_deleted")
+        self.assertFalse(adapter._inbound_spool.is_open)
+        self.assertFalse(adapter._ambient_context.is_open)
 
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
@@ -4223,11 +4352,15 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"type":"message_edited"', triggered.channel_context)
         self.assertIn('"type":"reaction_added"', triggered.channel_context)
         self.assertIn('"type":"reaction_removed"', triggered.channel_context)
-        self.assertTrue(
-            triggered.channel_context.endswith('The group was renamed to "Crew".')
-        )
+        self.assertIn('The group was renamed to "Crew".', triggered.channel_context)
+        mutations = [json.loads(line.split(": ", 1)[1])
+                     for line in triggered.channel_context.splitlines()
+                     if line.startswith("Marmot conversation event (untrusted): ")]
+        self.assertTrue(any(item.get("target_message_id") == "33" * 32 for item in mutations))
+        self.assertTrue(any(item.get("replacement_text") == "edited" for item in mutations))
+        self.assertTrue(any(item.get("emoji") == "👍" for item in mutations))
         # Buffer was drained: a second message in the group carries no stale context.
-        self.assertEqual(adapter._take_pending_ambient_context("22" * 32), None)
+        self.assertEqual(adapter._ambient_context.pending("22" * 32), [])
 
     async def test_ambient_event_never_invokes_message_handler(self):
         # Regression guard for the adversarial finding: an ambient event must not
@@ -4265,9 +4398,243 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handler_calls, [], "ambient event must not invoke handle_message")
         # The fact is buffered for a later real message rather than dropped.
-        context = adapter._take_pending_ambient_context("22" * 32)
-        self.assertIn('"type":"message_deleted"', context)
-        self.assertNotIn("plaintext", context)
+        pending = adapter._ambient_context.pending("22" * 32)
+        self.assertEqual([fact.kind for fact in pending], ["message_deleted"])
+        self.assertNotIn("plaintext", Path(adapter._ambient_context.path).read_bytes().decode("latin1"))
+
+    async def test_ambient_context_survives_restart_rejection_and_cancellation(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"is_direct": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory).resolve() / "private" / "ambient.sqlite3")
+            group_id = "22" * 32
+            first = self._adapter(FakeClient(), {"ambient_context_path": path})
+            await first._handle_mutation(
+                {
+                    "type": "message_deleted",
+                    "group_id_hex": group_id,
+                    "event_id_hex": "91" * 32,
+                }
+            )
+            first._ambient_context.close()  # clean adapter/gateway restart boundary
+
+            restarted = self._adapter(FakeClient(), {"ambient_context_path": path})
+            rejected = self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": "a1" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "not activated",
+                        "mentions_self": False,
+                    }
+                )
+            )
+            await restarted._dispatch_inbound_message(rejected)
+            self.assertEqual(
+                [fact.kind for fact in restarted._ambient_context.pending(group_id)],
+                ["message_deleted"],
+            )
+
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def cancelled_turn(event):
+                started.set()
+                await release.wait()
+
+            restarted.handle_message = cancelled_turn  # type: ignore[assignment]
+            eligible = self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": "a2" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "activated",
+                        "mentions_self": True,
+                    }
+                )
+            )
+            task = asyncio.create_task(restarted._dispatch_inbound_message(eligible))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(
+                [fact.kind for fact in restarted._ambient_context.pending(group_id)],
+                ["message_deleted"],
+            )
+
+            accepted_context = []
+
+            async def accepted_turn(event):
+                accepted_context.append(event.channel_context)
+
+            restarted.handle_message = accepted_turn  # type: ignore[assignment]
+            await restarted._dispatch_inbound_message(eligible)
+            self.assertIn('"type":"message_deleted"', accepted_context[0])
+            self.assertEqual(restarted._ambient_context.pending(group_id), [])
+            restarted._ambient_context.close()
+
+    async def test_ambient_store_failures_do_not_break_event_ingestion_or_real_turns(self):
+        class FakeClient:
+            pass
+
+        adapter = self._adapter(FakeClient())
+        adapter._ambient_context.record = unittest.mock.Mock(side_effect=RuntimeError("record failed"))
+        await adapter._handle_mutation(
+            {
+                "type": "message_deleted",
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "33" * 32,
+            }
+        )
+
+        delivered = []
+        adapter._ambient_context.claim = unittest.mock.Mock(side_effect=RuntimeError("open failed"))
+
+        async def handle_message(event):
+            delivered.append(event.text)
+
+        adapter.handle_message = handle_message
+        event = self.adapter_module._normalize_inbound_message_event(
+            wire_event(
+                {
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "44" * 32,
+                    "sender_account_id_hex": "55" * 32,
+                    "text": "still delivered",
+                    "mentions_self": True,
+                }
+            )
+        )
+        await adapter._dispatch_inbound_message(event)
+        self.assertEqual(delivered, ["still delivered"])
+
+    async def test_unknown_mutation_kind_is_dropped_without_touching_store(self):
+        adapter = self._adapter(object())
+        adapter._ambient_context.record = unittest.mock.Mock()
+        await adapter._handle_control_event(
+            {
+                "type": "future_mutation_kind",
+                "group_id_hex": "22" * 32,
+                "event_id_hex": "33" * 32,
+            }
+        )
+        adapter._ambient_context.record.assert_not_called()
+
+    async def test_mutations_without_identity_do_not_enter_durable_dedupe(self):
+        adapter = self._adapter(object())
+        group = "22" * 32
+        try:
+            for identity in (None, "", "   "):
+                for kind in ("message_deleted", "message_edited", "reaction_added", "reaction_removed"):
+                    event = {"type": kind, "group_id_hex": group}
+                    if identity is not None:
+                        event["event_id_hex"] = identity
+                    await adapter._handle_control_event(event)
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual(facts, [])
+            for index, kind in enumerate(("message_deleted", "message_edited")):
+                await adapter._handle_control_event({"type": kind, "group_id_hex": group,
+                                                    "event_id_hex": f"{index + 1:064x}"})
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual([fact.kind for fact in facts], ["message_deleted", "message_edited"])
+            self.assertEqual(adapter.events, [])
+        finally:
+            await adapter.disconnect()
+
+    async def test_overlapping_dispatches_attach_one_ambient_claim_at_most_once(self):
+        adapter = self._adapter(object())
+        group_id = "22" * 32
+        adapter._ambient_context.record(group_id, "event", "message_deleted")
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        contexts = []
+
+        async def handle_message(event):
+            contexts.append(event.channel_context)
+            if event.text == "first":
+                first_started.set()
+                await release_first.wait()
+
+        adapter.handle_message = handle_message
+
+        def inbound(message_id, text):
+            return self.adapter_module._normalize_inbound_message_event(
+                wire_event(
+                    {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": group_id,
+                        "message_id_hex": message_id,
+                        "sender_account_id_hex": "55" * 32,
+                        "text": text,
+                        "mentions_self": True,
+                    }
+                )
+            )
+
+        first = asyncio.create_task(adapter._dispatch_inbound_message(inbound("41" * 32, "first")))
+        await first_started.wait()
+        second = asyncio.create_task(adapter._dispatch_inbound_message(inbound("42" * 32, "second")))
+        await second
+        release_first.set()
+        await first
+
+        attached = [value for value in contexts if value and '"type":"message_deleted"' in value]
+        self.assertEqual(len(attached), 1)
+        adapter._ambient_context.close()
+
+    async def test_acknowledgement_failure_after_host_acceptance_does_not_reclassify_spool(self):
+        adapter = self._adapter(object())
+        group_id = "22" * 32
+        message_id = "44" * 32
+        event = self.adapter_module._normalize_inbound_message_event(
+            wire_event(
+                {
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": group_id,
+                    "message_id_hex": message_id,
+                    "sender_account_id_hex": "55" * 32,
+                    "text": "accepted",
+                    "mentions_self": True,
+                }
+            )
+        )
+        adapter._inbound_spool.open()
+        adapter._inbound_spool.record(event)
+        adapter._inbound_spool.claim(message_id)
+        adapter._ambient_context.record(group_id, "event", "message_deleted")
+
+        accepted = []
+
+        async def handle_message(message):
+            accepted.append(message.text)
+
+        adapter.handle_message = handle_message
+        adapter._ambient_context.acknowledge = unittest.mock.Mock(side_effect=RuntimeError("ack failed"))
+        await adapter._dispatch_inbound_message(event, spool_message_id=message_id)
+
+        self.assertEqual(accepted, ["accepted"])
+        self.assertEqual(adapter._inbound_spool.get(message_id).state, "unresolved")
+        ambient_path = adapter._ambient_context.path
+        adapter._ambient_context.close()
+        adapter._inbound_spool.close()
+
+        restarted = self.adapter_module.AmbientContextStore(ambient_path)
+        self.assertEqual(restarted.pending(group_id), [])
+        self.assertFalse(restarted.record(group_id, "event", "message_deleted"))
+        restarted.close()
 
     async def test_ambient_context_is_bounded_and_survives_failed_turn(self):
         class FakeClient:
@@ -4276,17 +4643,18 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         adapter = self._adapter(FakeClient())
         group_id = "22" * 32
         for index in range(20):
-            adapter._append_pending_ambient_context(group_id, f"fact-{index}")
+            adapter._ambient_context.record(
+                group_id, f"ambient-{index}", "message_deleted"
+            )
 
-        pending_facts = list(adapter._pending_ambient_context[group_id])
-        pending = "\n".join(pending_facts)
+        pending_facts = adapter._ambient_context.pending(group_id)
         self.assertEqual(len(pending_facts), 16)
-        self.assertNotIn("fact-3\n", pending)
-        self.assertTrue(pending.startswith("fact-4\n"))
-        self.assertTrue(pending.endswith("fact-19"))
+        self.assertEqual([fact.seq for fact in pending_facts], sorted(fact.seq for fact in pending_facts))
 
         async def fail_turn(event):
-            adapter._append_pending_ambient_context(group_id, "fact-new-on-failure")
+            adapter._ambient_context.record(
+                group_id, "new-on-failure", "reaction_added"
+            )
             raise RuntimeError("synthetic turn failure")
 
         adapter.handle_message = fail_turn  # type: ignore[assignment]
@@ -4305,19 +4673,17 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        retained = adapter._pending_ambient_context[group_id]
+        retained = adapter._ambient_context.pending(group_id)
         self.assertEqual(len(retained), 16)
-        self.assertNotIn("fact-4", retained)
-        self.assertEqual(retained[-1], "fact-new-on-failure")
+        self.assertTrue(all(fact.kind == "message_deleted" for fact in retained))
 
-        adapter._pending_ambient_context[group_id] = [
-            f"success-fact-{index}" for index in range(16)
-        ]
         delivered_context = []
 
         async def successful_turn(event):
             delivered_context.append(event.channel_context)
-            adapter._append_pending_ambient_context(group_id, "fact-new-on-success")
+            adapter._ambient_context.record(
+                group_id, "new-on-success", "reaction_removed"
+            )
 
         adapter.handle_message = successful_turn  # type: ignore[assignment]
         await adapter._dispatch_inbound_message(
@@ -4335,20 +4701,9 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        self.assertIn("success-fact-0", delivered_context[0])
-        self.assertEqual(
-            adapter._pending_ambient_context[group_id],
-            ["fact-new-on-success"],
-        )
-
-        for index in range(257):
-            adapter._append_pending_ambient_context(
-                f"{index:064x}",
-                f"group-fact-{index}",
-            )
-        self.assertEqual(len(adapter._pending_ambient_context), 256)
-        self.assertNotIn(f"{0:064x}", adapter._pending_ambient_context)
-        self.assertIn(f"{256:064x}", adapter._pending_ambient_context)
+        self.assertIn('"type":"message_deleted"', delivered_context[0])
+        remaining = adapter._ambient_context.pending(group_id)
+        self.assertEqual(remaining, [])
 
     # --- Behavior 6: optional debounce coalescing preserves mentions+media ----
     async def test_debounce_coalesces_and_preserves_mentions_and_media(self):
@@ -6739,6 +7094,166 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.config_cls(extra=merged), client=client if client is not None else object()
         )
 
+    async def test_cancelled_worker_claim_is_released_after_sqlite_finishes(self):
+        import threading
+        adapter = self.make_adapter()
+        store = adapter._ambient_context
+        call = adapter._ambient_context_call
+        await call(store.record, "22" * 32, "event", "message_deleted")
+        started = asyncio.Event()
+        finish = threading.Event()
+        loop = asyncio.get_running_loop()
+        original = store.claim
+        def blocked_claim(group):
+            loop.call_soon_threadsafe(started.set)
+            if not finish.wait(timeout=5):
+                raise RuntimeError("test worker timed out")
+            return original(group)
+        store.claim = blocked_claim
+        task = asyncio.create_task(adapter._claim_ambient_context("22" * 32))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            store.claim = original
+            self.assertEqual(len((await call(store.claim, "22" * 32)).facts), 1)
+        finally:
+            finish.set()
+            await adapter.disconnect()
+
+    async def test_ambient_acknowledges_even_when_acceptance_commit_fails(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        store = adapter._ambient_context
+        call = adapter._ambient_context_call
+        group = "22" * 32
+        await call(store.record, group, "ambient-event", "message_deleted")
+        try:
+            with unittest.mock.patch.object(store, "commit", side_effect=OSError("unavailable")):
+                await adapter._handle_control_event(self.make_event())
+                await adapter._inbound_queue.join()
+            self.assertEqual(len(adapter.events), 1)
+            self.assertEqual(await call(store.pending, group), [])
+            self.assertEqual(adapter._ambient_outcomes, {})
+            await call(store.close)
+            self.assertFalse(await call(store.record, group, "ambient-event", "message_deleted"))
+        finally:
+            await adapter.disconnect()
+
+    async def test_failed_ambient_retirement_retries_without_deleting_new_facts(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        store = adapter._ambient_context
+        call = adapter._ambient_context_call
+        group = "22" * 32
+        await call(store.record, group, "accepted", "message_deleted")
+        try:
+            with unittest.mock.patch.object(store, "commit", side_effect=OSError("unavailable")), \
+                 unittest.mock.patch.object(store, "acknowledge", side_effect=OSError("unavailable")):
+                await adapter._handle_control_event(self.make_event())
+                await adapter._inbound_queue.join()
+                self.assertEqual(len(adapter._ambient_outcomes), 1)
+                self.assertEqual((await call(store.claim, group)).facts, ())
+                await call(store.record, group, "new-fact", "message_edited")
+            await adapter._retry_ambient_outcomes()
+            self.assertEqual(adapter._ambient_outcomes, {})
+            self.assertEqual([fact.kind for fact in await call(store.pending, group)], ["message_edited"])
+            self.assertFalse(await call(store.record, group, "accepted", "message_deleted"))
+        finally:
+            await adapter.disconnect()
+
+    async def test_retry_loop_recovers_failed_ambient_release_and_retirement(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                adapter = self.make_adapter(extra={"group_activation": "always"})
+                store = adapter._ambient_context
+                call = adapter._ambient_context_call
+                group = "22" * 32
+                await call(store.record, group, "event", "message_deleted")
+                if not accepted:
+                    adapter.handle_message = unittest.mock.AsyncMock(side_effect=RuntimeError("rejected"))
+                operation = "acknowledge" if accepted else "release"
+                try:
+                    with unittest.mock.patch.object(store, operation, side_effect=OSError("unavailable")):
+                        await adapter._handle_control_event(self.make_event())
+                        await adapter._inbound_queue.join()
+                    self.assertEqual(len(adapter._ambient_outcomes), 1)
+                    settled = asyncio.Event()
+                    original_retry = adapter._retry_ambient_outcomes
+                    async def observe_retry():
+                        await original_retry()
+                        if not adapter._ambient_outcomes:
+                            settled.set()
+                    adapter._retry_ambient_outcomes = observe_retry
+                    adapter._inbound_spool_retry_task = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+                    adapter._inbound_spool_wakeup.set()
+                    await asyncio.wait_for(settled.wait(), timeout=5)
+                    claim = await call(store.claim, group)
+                    self.assertEqual(len(claim.facts), 0 if accepted else 1)
+                finally:
+                    await adapter.disconnect()
+
+    async def test_group_occurrence_ids_dedupe_replay_but_preserve_later_same_kind(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        group = "22" * 32
+        def change(occurrence=None):
+            event = {"type": "group_state_changed", "account_id_hex": "11" * 32,
+                     "group_id_hex": group, "change": "group_renamed", "detail": "Crew"}
+            if occurrence is not None:
+                event["event_id_hex"] = occurrence
+            return wire_event(event)
+        try:
+            await adapter._handle_control_event(change("aa" * 32))
+            self.assertEqual(adapter.events, [])
+            await adapter._handle_control_event(self.make_event())
+            await adapter._inbound_queue.join()
+            await adapter._ambient_context_call(adapter._ambient_context.close)
+            await adapter._handle_control_event(change("aa" * 32))
+            await adapter._handle_control_event(change("bb" * 32))
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual(len(facts), 1)
+            # Legacy frames use bounded process-local suppression; modern
+            # occurrences above remain distinct by their canonical ids.
+            await adapter._handle_control_event(change())
+            await adapter._handle_control_event(change())
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual(len(facts), 2)
+        finally:
+            await adapter.disconnect()
+
+    async def test_legacy_replay_burst_does_not_evict_distinct_ambient_facts(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        group = "22" * 32
+        try:
+            await adapter._ambient_context_call(adapter._ambient_context.record,
+                                                group, "distinct-deletion", "message_deleted")
+            event = {"type": "group_state_changed", "account_id_hex": "11" * 32,
+                     "group_id_hex": group, "change": "group_renamed", "detail": "Crew"}
+            for _ in range(64):
+                await adapter._handle_control_event(event)
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual([fact.kind for fact in facts], ["message_deleted", "group_state:group_renamed"])
+            self.assertEqual(adapter.events, [])
+        finally:
+            await adapter.disconnect()
+
+    async def test_restart_hint_survives_failed_automatic_history_lookup(self):
+        client = unittest.mock.Mock()
+        client.timeline_list = unittest.mock.AsyncMock(side_effect=OSError("history unavailable"))
+        adapter = self.make_adapter(extra={"group_activation": "always"}, client=client)
+        try:
+            await adapter._ambient_context_call(adapter._ambient_context.record,
+                                                "22" * 32, "deletion", "message_deleted")
+            await adapter._ambient_context_call(adapter._ambient_context.close)
+            await adapter._handle_control_event(self.make_event())
+            await adapter._inbound_queue.join()
+            self.assertEqual(len(adapter.events), 1)
+            self.assertIn('"type":"message_deleted"', adapter.events[0].channel_context)
+            client.timeline_list.assert_awaited_once()
+            self.assertEqual(client.timeline_list.call_args.kwargs["limit"], 20)
+        finally:
+            await adapter.disconnect()
+
     async def test_journal_commit_precedes_queue_admission(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
         message_id = "33" * 32
@@ -6884,11 +7399,16 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                         raise self.adapter_module.sqlite3.OperationalError("synthetic terminal storage failure")
                     return original(message_id, state, disposition)
 
+                await adapter._ambient_context_call(
+                    adapter._ambient_context.record, "22" * 32, "ambient", "message_deleted"
+                )
                 store.transition = fault
                 try:
                     await adapter._handle_control_event(self.make_event())
                     await adapter._inbound_queue.join()
                     self.assertEqual(["durable"], [message.text for message in adapter.events])
+                    self.assertEqual(await adapter._ambient_context_call(
+                        adapter._ambient_context.pending, "22" * 32), [])
                     unavailable = False
                     await adapter._retry_inbound_dispatch_dispositions()
                     await adapter._admit_due_spooled()
@@ -7183,6 +7703,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(adapter._inbound_spool.is_open)
 
         adapter._inbound_spool.release_debounce = original_release
+        adapter._enable_store_generation()
         await adapter._ensure_inbound_spool_open()
         adapter._inbound_spool_admission_enabled = True
         recovered = adapter._inbound_spool.get("33" * 32)
@@ -7477,6 +7998,12 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         original_due = adapter._inbound_spool.due
         failed_once = asyncio.Event()
         loop = asyncio.get_running_loop()
+        handed_off = asyncio.Event()
+        original_handle = adapter.handle_message
+        async def observed_handle(message):
+            await original_handle(message)
+            handed_off.set()
+        adapter.handle_message = observed_handle
 
         def flaky_due(*, now=None):
             if not failed_once.is_set():
@@ -7490,19 +8017,20 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
         try:
             adapter._inbound_spool_wakeup.set()
-            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            await asyncio.wait_for(failed_once.wait(), timeout=5)
             self.assertFalse(retry.done())
             adapter._inbound_spool_wakeup.set()
-            for _ in range(150):
-                if adapter.events:
-                    break
-                await asyncio.sleep(0.01)
+            # Recovery intentionally sleeps one second after the injected
+            # fault, then performs durable admission and ambient lookup. Wait
+            # for the actual handoff instead of a 1.5-second polling budget.
+            await asyncio.wait_for(handed_off.wait(), timeout=5)
+            await adapter._inbound_queue.join()
             self.assertEqual([item.text for item in adapter.events], ["durable"])
             self.assertFalse(retry.done())
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+            await adapter.disconnect()
 
     async def test_cancel_after_handoff_preserves_cancellation_and_recovers_unresolved(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
