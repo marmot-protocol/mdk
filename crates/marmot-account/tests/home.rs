@@ -982,3 +982,69 @@ impl AccountSecretStore for MemorySecretStore {
         Ok(())
     }
 }
+
+#[test]
+fn onboarding_latest_evidence_and_recovery_journal_are_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+    home.set_account_signed_out(&account.label, true).unwrap();
+    let first = br#"{"approved":true,"signed":"uncertain"}"#;
+    home.set_account_onboarding(&account.label, first).unwrap();
+    home.archive_account_onboarding(&account.label).unwrap();
+    assert_eq!(
+        home.cancelled_account_onboarding(&account.label)
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    let latest = b"latest cancellation";
+    home.set_account_onboarding(&account.label, latest).unwrap();
+    home.archive_account_onboarding(&account.label).unwrap();
+    home.archive_account_onboarding(&account.label).unwrap();
+    assert_eq!(
+        home.cancelled_account_onboarding(&account.label)
+            .unwrap()
+            .unwrap(),
+        latest
+    );
+    let opaque = b"opaque recovery journal";
+    assert!(
+        home.finish_recovered_account_onboarding(&account.label, b"tombstone")
+            .is_err()
+    );
+    home.set_account_onboarding_recovery(&account.label, opaque)
+        .unwrap();
+    home.finish_recovered_account_onboarding(&account.label, b"tombstone")
+        .unwrap();
+    assert_eq!(
+        home.account_onboarding_recovery(&account.label)
+            .unwrap()
+            .unwrap(),
+        opaque
+    );
+    assert_eq!(
+        home.cancelled_account_onboarding(&account.label)
+            .unwrap()
+            .unwrap(),
+        b"tombstone"
+    );
+    let directory = home.account_dir(&account.label);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in ["onboarding-cancelled.json", "onboarding-recovery.json"] {
+            assert_eq!(
+                std::fs::metadata(directory.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+}

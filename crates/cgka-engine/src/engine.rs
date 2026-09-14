@@ -304,12 +304,10 @@ pub struct Engine<S: StorageProvider> {
     /// commit-apply site therefore calls [`Self::reindex_transport_group_id`],
     /// which additively inserts the new id while leaving the prior id in place
     /// for the rotation overlap window (this map is intentionally many-to-one).
-    /// The engine has no group-deletion path today (`StorageProvider::delete_group`
-    /// is never called from engine code; a left group's record is retained), so an
-    /// entry cannot outlive its group — and even a hypothetical stale entry is
-    /// self-correcting, since the resolved `GroupId` is loaded by the caller and a
-    /// missing group is dropped as unknown. If engine-side group deletion is ever
-    /// added, that site MUST remove the corresponding index entries.
+    /// Leaving retains the group record. Local forgetting deletes it and removes
+    /// every corresponding index entry in `forget_group_local`. A stale entry
+    /// is also self-correcting: callers load the resolved group and drop missing
+    /// groups as unknown rather than retaining their traffic.
     pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
 
     /// #636: cached hex-encoded snapshot of `seen_message_ids` for the
@@ -1065,7 +1063,11 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
     ) -> Result<SendResult, EngineError> {
         self.accept_send_with_audit_context(
-            SendIntent::AppMessage { group_id, payload },
+            SendIntent::AppMessage {
+                group_id,
+                payload,
+                expected_epoch: None,
+            },
             context,
             SendAcceptance::QueueAppMessage,
         )
@@ -1095,7 +1097,10 @@ impl<S: StorageProvider> Engine<S> {
         let result = match acceptance {
             SendAcceptance::Prepare => self.do_send(intent).await,
             SendAcceptance::QueueAppMessage => {
-                let SendIntent::AppMessage { group_id, payload } = intent else {
+                let SendIntent::AppMessage {
+                    group_id, payload, ..
+                } = intent
+                else {
                     unreachable!("queue app-message acceptance constructs an AppMessage intent")
                 };
                 self.do_queue_app_message(group_id, payload)
@@ -2109,10 +2114,18 @@ impl<S: StorageProvider> Engine<S> {
                 &stored_message_records,
             )
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        // An accepted disband may have no commit or ordinary queued intent
+        // yet. Recreate its scheduling edge from the durable request on open.
+        let has_pending_disband = !group.is_terminal()
+            && !group.unrecoverable
+            && self
+                .disband_request_pending(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         if has_queued_intents
             || has_convergence_inputs
             || has_deferred_peels
             || restored_self_remove_work
+            || has_pending_disband
         {
             self.schedule_pending_convergence_group(group_id);
         }
@@ -2488,6 +2501,11 @@ impl<S: StorageProvider> Engine<S> {
             .collect()
     }
 
+    /// Number of currently quarantined groups without cloning their identities.
+    pub fn quarantined_group_count(&self) -> usize {
+        self.quarantined_groups.len()
+    }
+
     /// Quarantine lookup for the live data-path gates.
     pub(crate) fn quarantined_reason(
         &self,
@@ -2855,6 +2873,94 @@ impl<S: StorageProvider> Engine<S> {
         pending: PendingStateRef,
     ) -> Option<MessageId> {
         self.pending_origin_commits.remove(&pending)
+    }
+
+    /// Reset this group on this account-device, without network
+    /// traffic. Storage commits the deletion before any in-memory state changes.
+    pub fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+        let pending = self.epoch_manager.pending_refs_for_group(group_id);
+        let routes = self
+            .transport_group_id_index
+            .iter()
+            .filter(|(_, mapped)| *mapped == group_id)
+            .map(|(route, _)| route.clone())
+            .collect::<HashSet<_>>();
+        let changed = self
+            .storage
+            .forget_group_local(group_id, self.wall_clock.now())?;
+        self.epoch_manager.forget_group(group_id);
+        self.mls_group_cache.forget_group(group_id);
+        self.transport_group_id_index
+            .retain(|_, group| group != group_id);
+        self.route_backfill_pending.remove(group_id);
+        self.pending_convergence_groups.remove(group_id);
+        self.unhydrated_groups.remove(group_id);
+        self.quarantined_groups.remove(group_id);
+        self.leaving_groups.remove(group_id);
+        self.leave_requests.remove(group_id);
+        self.valid_proposal_groups.remove(group_id);
+        self.drop_self_remove_auto_commit_schedules_for_group(group_id);
+        self.invalidate_deferred_peel_candidate_cache(group_id);
+        self.deferred_peel.remove(group_id);
+        // Recompute the account byte budget lazily from the remaining durable rows.
+        self.deferred_peel_account = Default::default();
+        self.engine_metrics.forget_group(group_id);
+        self.queued_intent_by_message
+            .retain(|_, (group, _)| group != group_id);
+        self.queued_intent_by_pending
+            .retain(|_, (group, _)| group != group_id);
+        self.pending_origin_commits
+            .retain(|reference, _| !pending.contains(reference));
+        self.pending_state_changes
+            .retain(|reference, _| !pending.contains(reference));
+        self.auto_publish_buf
+            .retain(|work| !pending.contains(&work.pending));
+        self.auto_proposal_buf.retain(|message| {
+            !matches!(&message.envelope,
+            cgka_traits::TransportEnvelope::GroupMessage { transport_group_id }
+                if routes.contains(transport_group_id) || transport_group_id == group_id.as_slice())
+        });
+        self.events_buf.retain(|event| match event {
+            GroupEvent::GroupCreated { group_id: group }
+            | GroupEvent::GroupJoined {
+                group_id: group, ..
+            }
+            | GroupEvent::TransportObjectResourceRefused {
+                group_id: group, ..
+            }
+            | GroupEvent::MessageReceived {
+                group_id: group, ..
+            }
+            | GroupEvent::AppMessageInvalidated {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupStateChanged {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupHydrationQuarantined {
+                group_id: group, ..
+            }
+            | GroupEvent::EpochChanged {
+                group_id: group, ..
+            }
+            | GroupEvent::CommitRolledBack {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupStateInvalidated {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupStateRevalidated {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupUnrecoverable { group_id: group }
+            | GroupEvent::PendingCommitRecovered {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupHydrationRecovered {
+                group_id: group, ..
+            } => group != group_id,
+        });
+        Ok(changed)
     }
 
     /// Return the Marmot group metadata mirrored from signed MLS group state.

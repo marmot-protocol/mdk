@@ -232,15 +232,28 @@ impl AgentConnector {
             None
         };
 
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Agent,
+            "final_message",
+            marmot_app::ProductUnit::Action,
+        );
         let summary = if let Some(target_message_id) = reply_to_message_id_hex {
             self.runtime
                 .reply_to_message(&account.label, &group_id, &target_message_id, &text)
-                .await?
+                .await
         } else {
             self.runtime
                 .send_message(&account.label, &group_id, text.into_bytes())
-                .await?
+                .await
         };
+        if let Some(observation) = observation {
+            observation.finish(if summary.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        let summary = summary?;
         // Record only after a successful send so a failed send remains retryable.
         // A key already bound to a different fingerprint is left untouched (first
         // write wins), so this send simply proceeds without caching.

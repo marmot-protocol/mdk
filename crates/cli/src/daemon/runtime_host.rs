@@ -177,6 +177,9 @@ async fn dispatch_hosted_runtime_command(
     };
 
     let output = match cli.command.clone() {
+        crate::Command::UsageDiagnostics { command } => {
+            crate::usage_diagnostics_command(runtime, command)
+        }
         crate::Command::Group { command } => {
             crate::commands::groups::group_command_with_runtime(
                 &account_home,
@@ -300,6 +303,7 @@ async fn dispatch_hosted_runtime_command(
 
 pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
     match &cli.command {
+        crate::Command::UsageDiagnostics { .. } => true,
         crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
         crate::Command::Chats { command } => !matches!(
             command,
@@ -564,13 +568,16 @@ pub(crate) fn open_app_runtime(
     let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
     let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
     let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-    let app = crate::app_for(
+    let app = crate::app_for_role(
         defaults.home.clone(),
         defaults.relay.clone(),
         defaults.discovery_relays.clone(),
         account_home,
+        false,
     )?;
-    Ok(app.runtime())
+    let runtime = app.runtime();
+    marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
+    Ok(runtime)
 }
 
 pub(crate) fn spawn_app_runtime_bridge(

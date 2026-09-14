@@ -10,11 +10,31 @@ struct Migration {
     apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_shared_store",
-    apply: version_1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_shared_store",
+        apply: version_1,
+    },
+    Migration {
+        version: 2,
+        name: "0002_usage_diagnostics",
+        apply: version_2,
+    },
+    Migration {
+        version: 3,
+        name: "0003_directory_presentation",
+        apply: |tx| {
+            tx.execute_batch(include_str!("v3.sql"))
+                .map_err(sqlite_error)
+        },
+    },
+];
+
+fn version_2(tx: &Transaction<'_>) -> StorageResult<()> {
+    tx.execute_batch(include_str!("v2.sql"))
+        .map_err(sqlite_error)
+}
 const VERSION_1_SQL: &str = include_str!("v1.sql");
 const LEGACY_SQL: &str = include_str!("legacy.sql");
 const LEDGER: &str = "shared_schema_migrations";

@@ -15,6 +15,7 @@
 //! Commands with struct/byte inputs are written by hand below the macro
 //! block.
 
+use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
 
 use marmot_uniffi::MarmotKitError;
@@ -23,14 +24,16 @@ use crate::MarmotStatus;
 use crate::memory::{CFree, boxed, owned_c_string, required_str, str_array};
 use crate::status::status_from_error;
 use crate::types::account::{
-    MarmotAccountKeyPackageList, MarmotAccountSetupReadiness, MarmotAccountSummary,
-    MarmotAccountSummaryList, MarmotAccountUnreadList, MarmotIdentityCreationResult,
-    MarmotSendSummary, MarmotSignOutOutcome, MarmotUserProfileMetadata, MarmotWipeOutcome,
+    MarmotAccountKeyPackageList, MarmotAccountKeyPackageRelayEventList,
+    MarmotAccountSetupReadiness, MarmotAccountSummary, MarmotAccountSummaryList,
+    MarmotAccountUnreadList, MarmotIdentityCreationResult, MarmotSendSummary, MarmotSignOutOutcome,
+    MarmotUserProfileMetadata, MarmotWipeOutcome,
 };
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
     MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
-    MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerUpdateResult, MarmotAuditLogUploadResult,
+    MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
+    MarmotAuditLogUploadResult,
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
@@ -38,6 +41,7 @@ use crate::types::chat_list::{
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
 use crate::types::directory::MarmotCachedIdentityProjectionList;
+use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
 use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
@@ -45,9 +49,9 @@ use crate::types::group::{
     MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
     MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest,
     MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
-    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRoster,
-    MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef,
-    MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
+    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
+    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
 use crate::types::maintenance::{
     MarmotGroupMaintenanceStatus, MarmotKeyPackageMaintenanceStatus, MarmotMaintenanceRunSummary,
@@ -531,11 +535,22 @@ c_cmd! {
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
     /// Retry onboarding against explicitly selected discovery relays.
+    /// Query whether unreadable/exhausted checkpoints require explicit recovery.
+    sync fn marmot_onboarding_recovery_required(account_ref: str) -> scalar(bool) = onboarding_recovery_required;
+    /// Retain opaque evidence, retire the old attempt, and return a new epoch.
+    /// Requires explicit acknowledgment of latest-only evidence retention.
+    /// Hosts invalidate old UI callbacks first, then explicitly begin again.
+    async fn marmot_recover_onboarding(account_ref: str, acknowledge_latest_only_evidence: flag) -> string = recover_onboarding;
+    /// Approve using the epoch and revision from the same displayed snapshot.
+    async fn marmot_approve_onboarding_repair_in_epoch(account_ref: str, revision: val u64, recovery_epoch: str) -> rec(MarmotOnboardingSnapshot) = approve_onboarding_repair_in_epoch;
+    /// Acknowledge the displayed device notice in a recovered attempt.
+    async fn marmot_acknowledge_onboarding_single_device_in_epoch(account_ref: str, revision: val u64, recovery_epoch: str) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device_in_epoch;
     async fn marmot_set_onboarding_discovery_relays(account_ref: str, discovery_relays/discovery_relays_len: str_arr) -> rec(MarmotOnboardingSnapshot) = set_onboarding_discovery_relays;
     /// Acknowledge the displayed one-device notice and resume setup.
     async fn marmot_acknowledge_onboarding_single_device(account_ref: str, revision: val u64) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device;
     /// Cancel unfinished onboarding, retaining the signed-out identity and private state.
-    /// An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+    /// Cancellation is valid at every interactive step, including approved or ready
+    /// attempts. It performs no relay deletion.
     async fn marmot_cancel_onboarding(account_ref: str) -> unit = cancel_onboarding;
 
     /// Create a brand-new Nostr identity, store its secret in the account
@@ -563,9 +578,13 @@ c_cmd! {
     /// `marmot_string_list_free`.
     sync fn marmot_account_inbox_relays(account_ref: str) -> rec(MarmotStringList) = account_inbox_relays;
 
-    /// Local + relay-published KeyPackages for the account. Free with
-    /// `marmot_account_key_package_list_free`.
+    /// Local + current-slot relay-published KeyPackages for the account. Free
+    /// with `marmot_account_key_package_list_free`.
     async fn marmot_account_key_packages(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageList) = account_key_packages;
+
+    /// Observed relay KeyPackage history, including superseded events. Free
+    /// with `marmot_account_key_package_relay_event_list_free`.
+    async fn marmot_account_key_package_relay_events(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageRelayEventList) = account_key_package_relay_events;
 
     /// Publish a fresh KeyPackage. Writes the accepting-relay count.
     async fn marmot_publish_new_key_package(account_ref: str) -> scalar(u64) = publish_new_key_package;
@@ -609,7 +628,12 @@ c_cmd! {
     async fn marmot_create_group(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> string = create_group;
 
     /// Normalize a member reference (hex, `npub`, `nostr:npub...`,
-    /// `marmot://profile/...`). Free with `marmot_member_ref_free`.
+    /// `nprofile`, `nostr:nprofile...`, and `marmot://profile/...`).
+    /// nprofile relay hints are discarded. Duplicate type-0 TLV entries
+    /// keep the first key. After wrapper normalization, encoded tokens
+    /// longer than 1023 UTF-8 bytes are rejected; a valid 1023-byte
+    /// token still decodes when wrapped. Free with
+    /// `marmot_member_ref_free`.
     sync fn marmot_normalize_member_ref(member_ref: str) -> rec(MarmotMemberRef) = normalize_member_ref;
 
     /// Membership roster for `group_id_hex`. Free with
@@ -642,11 +666,26 @@ c_cmd! {
     /// intact; a future fresh delivery can recreate a chat row. Writes
     /// true if any local rows or a live route were removed.
     async fn marmot_delete_group_local(account_ref: str, group_id_hex: str) -> scalar(bool) = delete_group_local;
+    /// Reset this group on this account-device without publishing.
+    /// Deletes local app and MLS state; only a valid Welcome created after the reset can rejoin.
+    /// Close group UI subscriptions and clear host-owned media caches first.
+    /// Writes true for a new forget, false if already forgotten.
+    async fn marmot_forget_group_local(account_ref: str, group_id_hex: str) -> scalar(bool) = forget_group_local;
 
     /// Set the per-group disappearing-message retention.
     /// `disappearing_message_secs` of `0` disables expiry. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_update_message_retention(account_ref: str, group_id_hex: str, disappearing_message_secs: val u64) -> rec(MarmotSendSummary) = update_message_retention;
+
+    /// Query advisory membership health and pending rejoin offers.
+    /// Free with `marmot_group_recovery_status_free`.
+    async fn marmot_group_recovery_status(account_ref: str, group_id_hex: str) -> rec(MarmotGroupRecoveryStatus) = group_recovery_status;
+
+    /// Only after explicit recipient consent. Free with marmot_group_recovery_status_free.
+    async fn marmot_confirm_group_rejoin(account_ref: str, welcome_id_hex: str, local_state_token: str) -> rec(MarmotGroupRecoveryStatus) = confirm_group_rejoin;
+
+    /// Decline the selected replacement offer without changing active group state.
+    async fn marmot_decline_group_rejoin(account_ref: str, welcome_id_hex: str) -> unit = decline_group_rejoin;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.
@@ -824,6 +863,10 @@ c_cmd! {
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
     sync fn marmot_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotChatListRowList) = chat_list;
+    /// Complete local rows with selected title/avatar. Free with marmot_presented_chat_list_snapshot_free.
+    async fn marmot_presented_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotPresentedChatListSnapshot) = presented_chat_list;
+    /// Keyed complete row; missing groups return NULL. Free with marmot_presented_chat_row_free.
+    async fn marmot_presented_chat_list_row(account_ref: str, group_id_hex: str) -> opt_rec(MarmotPresentedChatRow) = presented_chat_list_row;
 
     /// Initialize read state for a conversation being opened; writes the
     /// refreshed row, or NULL with `MARMOT_STATUS_OK` when the group has
@@ -985,6 +1028,11 @@ c_cmd! {
     /// `marmot_existing_direct_conversation_free`.
     async fn marmot_existing_direct_conversation(account_ref: str, peer_account_id: str) -> opt_rec(MarmotExistingDirectConversation) = existing_direct_conversation;
 
+    /// Search public identities cached through any connected account. Follow
+    /// flags refer to the selected account. Call off the UI thread and free with
+    /// `marmot_user_directory_search_result_list_free`.
+    sync fn marmot_search_cached_users(account_id_hex: str, query: str, limit: val u32) -> rec(MarmotUserDirectorySearchResultList) = search_cached_users;
+
     /// What the local directory cache holds for each requested id, one
     /// row per request in order. Free with
     /// `marmot_cached_identity_projection_list_free`.
@@ -1126,9 +1174,14 @@ pub unsafe extern "C" fn marmot_npub(
     })
 }
 
-/// Hex account id for an `npub`/hex reference; NULL with
-/// `MARMOT_STATUS_OK` when the input does not decode. Free with
-/// `marmot_string_free`.
+/// Hex account id for an `npub`/hex/`nprofile` reference; NULL with
+/// `MARMOT_STATUS_OK` when the input does not decode. Accepts hex,
+/// `npub`, `nostr:npub`, `nprofile`, `nostr:nprofile`, and
+/// `marmot://profile/` links. nprofile relay hints are discarded.
+/// Duplicate type-0 TLV entries keep the first key. After wrapper
+/// normalization, encoded tokens longer than 1023 UTF-8 bytes are
+/// rejected; a valid 1023-byte token still decodes when wrapped. Free
+/// with `marmot_string_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; `reference` a valid string; `out`
@@ -1144,6 +1197,47 @@ pub unsafe extern "C" fn marmot_account_id_hex(
         let client = try_arg!(unsafe { client_ref(client) });
         let reference = try_arg!(unsafe { required_str(reference) });
         deliver_plain_opt_string(client.marmot.account_id_hex(reference), out)
+    })
+}
+
+/// Deterministic cosmetic display name for a canonical hex account id.
+/// Free with `marmot_string_free`. Decode a scanned reference with
+/// `marmot_account_id_hex` first; the seed is hashed as supplied text.
+///
+/// # Safety
+/// Same as `marmot_account_id_hex`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_default_profile_pseudonym(
+    client: *const MarmotClient,
+    account_id_hex: *const c_char,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_id_hex = try_arg!(unsafe { required_str(account_id_hex) });
+        deliver_plain_opt_string(
+            Some(client.marmot.default_profile_pseudonym(account_id_hex)),
+            out,
+        )
+    })
+}
+
+/// Random cosmetic display name from the shared wordlists. Free with
+/// `marmot_string_free`. This does not create an account or generate a
+/// signing key.
+///
+/// # Safety
+/// `client` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_random_profile_pseudonym(
+    client: *const MarmotClient,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        deliver_plain_opt_string(Some(client.marmot.random_profile_pseudonym()), out)
     })
 }
 
@@ -1175,7 +1269,9 @@ pub unsafe extern "C" fn marmot_relay_health(
     })
 }
 
-/// Replace the relay-telemetry export settings. Free the result with
+/// Deprecated consent control: use `marmot_set_usage_diagnostics_consent`.
+/// Enable requires a combined grant; disable revokes both exporters. The
+/// telemetry interval remains configurable. Free the result with
 /// `marmot_relay_telemetry_settings_free`.
 ///
 /// # Safety
@@ -1258,6 +1354,27 @@ pub unsafe extern "C" fn marmot_set_audit_log_tracker_config(
     client: *const MarmotClient,
     config: *const MarmotAuditLogTrackerConfig,
     out: *mut *mut MarmotAuditLogTrackerConfig,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let config = try_arg!(unsafe { borrowed(config) });
+        let config = try_arg!(unsafe { config.to_ffi() });
+        unsafe { deliver(client.marmot.set_audit_log_tracker_config(config), out) }
+    })
+}
+
+/// Replace the audit-log tracker endpoint config. Free the result with
+/// `marmot_audit_log_tracker_config_v4_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `config` a valid borrowed struct;
+/// `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_audit_log_tracker_config_v4(
+    client: *const MarmotClient,
+    config: *const MarmotAuditLogTrackerConfigV4,
+    out: *mut *mut MarmotAuditLogTrackerConfigV4,
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
@@ -2543,4 +2660,199 @@ pub unsafe extern "C" fn marmot_cancel_onboarding_repair(
             )
         }
     })
+}
+
+use crate::types::product_analytics::*;
+c_cmd! {
+ sync fn marmot_usage_diagnostics_settings() -> rec(MarmotUsageDiagnosticsSettings) = usage_diagnostics_settings;
+ sync fn marmot_set_usage_diagnostics_consent(enabled: flag) -> rec(MarmotUsageDiagnosticsSettings) = set_usage_diagnostics_consent;
+ sync fn marmot_usage_diagnostics_status() -> rec(MarmotUsageDiagnosticsStatus) = usage_diagnostics_status;
+
+ async fn marmot_flush_product_analytics() -> unit = flush_product_analytics;
+}
+/// Forward a validated product analytics input.
+/// # Safety
+/// Client and borrowed input must be valid; output, when present, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_product_analytics_runtime_config(
+    client: *const MarmotClient,
+    input: *const MarmotProductAnalyticsRuntimeConfig,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let input = try_arg!(unsafe { borrowed(input) });
+        let input = try_arg!(unsafe { input.to_ffi() });
+        deliver_unit(client.marmot.set_product_analytics_runtime_config(input))
+    })
+}
+/// Forward a validated product analytics input.
+/// # Safety
+/// Client and borrowed input must be valid; output, when present, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_record_product_event(
+    client: *const MarmotClient,
+    input: *const MarmotProductEvent,
+    out: *mut MarmotProductRecordResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::check_out(out) });
+        unsafe {
+            *out = MarmotProductRecordResult::IgnoredDisabled;
+        }
+        let client = try_arg!(unsafe { client_ref(client) });
+        let input = try_arg!(unsafe { borrowed(input) });
+        let input = try_arg!(unsafe { input.to_ffi() });
+        unsafe { deliver_enum(client.marmot.record_product_event(input), out) }
+    })
+}
+
+/// Record an app-defined timing through the consent-gated product exporter.
+/// Register `name` with `elapsed: DurationBucket` and `outcome: Enum` choices
+/// `success`/`failure`. Milliseconds are bucketed before recording.
+/// # Safety
+/// Client and borrowed name must be valid; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_record_host_timing(
+    client: *const MarmotClient,
+    name: *const c_char,
+    duration_ms: u64,
+    outcome: u32,
+    out: *mut MarmotProductRecordResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::check_out(out) });
+        unsafe {
+            *out = MarmotProductRecordResult::IgnoredDisabled;
+        }
+        let client = try_arg!(unsafe { client_ref(client) });
+        let name = try_arg!(unsafe { required_str(name) });
+        let outcome = try_arg!(MarmotHostPerformanceOutcome::from_c(outcome));
+        unsafe {
+            deliver_enum(
+                client
+                    .marmot
+                    .record_host_timing(name, duration_ms, outcome.into()),
+                out,
+            )
+        }
+    })
+}
+
+/// Signal host activity. Discriminants are validated before conversion.
+/// # Safety
+/// Client must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_product_analytics_activity(
+    client: *const MarmotClient,
+    activity: u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let activity = try_arg!(MarmotProductAnalyticsActivity::from_c(activity));
+        deliver_unit(
+            client.block_on(
+                client
+                    .marmot
+                    .set_product_analytics_activity(activity.into()),
+            ),
+        )
+    })
+}
+
+#[cfg(test)]
+mod identity_pointer_tests {
+    use super::{
+        marmot_account_id_hex, marmot_account_key_package_relay_events,
+        marmot_default_profile_pseudonym, marmot_random_profile_pseudonym,
+    };
+    use crate::MarmotStatus;
+    use std::ffi::CString;
+    use std::ptr;
+
+    #[test]
+    fn account_key_package_relay_events_rejects_null_out_before_work() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                marmot_account_key_package_relay_events(
+                    ptr::null(),
+                    account.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            MarmotStatus::NullPointer
+        );
+    }
+
+    #[test]
+    fn identity_wrappers_reject_null_out_before_work() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        assert_eq!(
+            unsafe { marmot_account_id_hex(ptr::null(), account.as_ptr(), ptr::null_mut()) },
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe {
+                marmot_default_profile_pseudonym(ptr::null(), account.as_ptr(), ptr::null_mut())
+            },
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe { marmot_random_profile_pseudonym(ptr::null(), ptr::null_mut()) },
+            MarmotStatus::NullPointer
+        );
+    }
+
+    #[test]
+    fn identity_wrappers_clear_out_when_client_or_input_is_null() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        let mut out = 0x10 as *mut std::ffi::c_char;
+        assert_eq!(
+            unsafe { marmot_account_id_hex(ptr::null(), account.as_ptr(), &raw mut out) },
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+
+        out = 0x10 as *mut std::ffi::c_char;
+        assert_eq!(
+            unsafe {
+                marmot_default_profile_pseudonym(ptr::null(), account.as_ptr(), &raw mut out)
+            },
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+
+        out = 0x10 as *mut std::ffi::c_char;
+        assert_eq!(
+            unsafe { marmot_random_profile_pseudonym(ptr::null(), &raw mut out) },
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn deliver_plain_opt_string_balances_owned_output() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            super::deliver_plain_opt_string(Some("Loyal Crane".to_owned()), &raw mut out),
+            MarmotStatus::Ok
+        );
+        assert!(!out.is_null());
+        unsafe { crate::memory::free_c_string(out) };
+
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
 }

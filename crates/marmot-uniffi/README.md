@@ -15,11 +15,68 @@ package that shared surface:
 The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
 same UniFFI surface, and releases publish it once.
 
+`MarkdownBlockFfi` now includes an additive `Details` variant for bounded
+`<details>` / `<summary>` display blocks. Hosts must regenerate Swift/Kotlin
+bindings to handle the new tag; older generated sources cannot render it.
+No generated Swift or Kotlin files are committed here.
+
+## Identity references and profile pseudonyms
+
+`accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
+`nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
+`nostr:npub`, and `marmot://profile/` links. Relay hints inside an
+nprofile are discarded and never used for routing or directory mutation.
+Duplicate type-0 TLV entries keep the first key. After FFI wrapper
+normalization, the nprofile fallback rejects encoded tokens longer than
+1023 UTF-8 bytes (the locked Bech32/Bech32m ceiling); a valid 1023-byte
+token still decodes when wrapped in `nostr:` or `marmot://profile/...`.
+The app helper strips one lowercase `nostr:` prefix itself; profile-link
+and whitespace normalization belong to FFI. The app helper's legacy NIP-21
+parser may still accept a colon-suffixed `nostr:<npub>:` form before the
+fallback runs; FFI normalization rejects that form. Decode a scanned reference
+first, then pass
+the canonical lowercase hex account id to `defaultProfilePseudonym` so
+the shared text-hash seed is preserved. Passing uppercase hex or an undecoded
+`npub` silently produces a different name, not an error. `randomProfilePseudonym`
+replaces client-owned random-roll wordlists; it is cosmetic, may
+collide, and does not create an account.
+
+`accountKeyPackages` lists the current KeyPackage winner per addressable slot
+plus local-only rows. `accountKeyPackageRelayEvents` is the additive observed
+history for that same fetch window: current and superseded kind-30443 events,
+with `isCurrent` set only among those observed valid events. Hosts can pass a
+superseded `eventIdHex` and its `sourceRelays` to the existing delete API.
+This does not change the Published-list filter (`relay == true`) and does not
+replace Android history UI work.
+
+Regenerate Swift/Kotlin bindings after pulling this surface. Android
+mention/QR/edit-profile migration remains
+[whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
+MDK completion enables that follow-through but does not replace it.
+
 See [`DISTRIBUTION.md`](DISTRIBUTION.md) for immutable Apple and Android artifacts, exact release and snapshot URLs,
 checksums, provenance, and generated-source synchronization rules.
 
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
+
+## Audit v4 adoption
+
+Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
+App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
+root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
+key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
+call is needed.
+Regenerate Swift/Kotlin bindings and use `AuditLogTrackerConfigV4Ffi` with
+`AuditLogUploadSourceV4Ffi.hardwareModel` in place of the old source record and its `deviceLabel`.
+The versioned config type changes the setter ABI checksum so old generated bindings cannot silently
+reinterpret a device label as a hardware model.
+Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
+hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
+Deploy a v4-compatible Goggles endpoint before expecting successful uploads from these bindings.
+Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
+`MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
+These regenerate host bindings and execute DTO round trips; platform package builds remain separate.
 
 ## Exclusive Root Ownership
 
@@ -147,6 +204,48 @@ Imported identities can use the durable preflight API instead of `login`:
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
 
+#### Explicit recovery and checkpoint compatibility
+
+When `begin_*_onboarding` or cancellation returns `OnboardingActionUnavailable`,
+query `onboarding_recovery_required(account_ref)`. A true result means an
+unreadable/unsupported checkpoint, an exhausted revision counter, or an
+interrupted recovery needs attention. Invalidate the old UI attempt and obtain
+the user's acknowledgment of latest-only evidence retention, then call
+`recover_onboarding(account_ref, true)`. It supports local and external-signer
+accounts and does not wait for the signer or publish any repair.
+
+Recovery durably records the exact opaque active/cancelled bytes in the private
+`onboarding-recovery.json` before replacing their gates. It preserves identity,
+credentials, setup journals/context and unrelated account data, signs out,
+reaps the worker and establishes a random 256-bit approval epoch. Unknown
+counters are never interpreted as zero within their old epoch. A later explicit
+begin starts with fresh checks and no inherited proposal, approval, or signed
+repair. The new epoch is returned by recovery and included in future snapshots;
+use the epoch-aware approval and device-acknowledgment methods described below.
+
+An interrupted recovery remains gated and resumes through retry or reconcile;
+dropping its caller cannot detach a removed worker. The latest recovery journal
+is readable through `AccountHome::account_onboarding_recovery`; an unreadable
+previous recovery journal is retained as opaque evidence there. A subsequent
+explicit recovery may replace older evidence. Keep any evidence needing longer
+retention outside this latest-only workflow before acknowledging recovery.
+
+Ordinary checkpoints remain version 3, with supported version 1/2 upgrades.
+Version 3 is a semantic barrier: old version 2 code rejects approved cancellation
+and cannot safely restart it. Recovery checkpoints use version 4 because a
+version 3 reader cannot validate epoch-scoped approvals. Completed recovery
+leaves a version 4 cancellation tombstone even before a new begin, so older
+readers fail closed. Downgrading during recovery is unsupported; finish recovery
+with an epoch-aware build. Do not relabel versions or delete checkpoints to
+force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
+unsupported evidence with this API.
+
+Persisted generation/pending state supplies durable admission checks after
+restart; the retirement watch only supplies prompt wake-up for this runtime.
+They are not interchangeable, so this change does not introduce watch-only
+caching or prune retirement senders. Test holds remain test-only and retain
+explicit interleaving coverage.
+
 The `SingleDevice` step always pauses before initial KeyPackage publication.
 Display a general notice that White Noise does not yet support synchronized
 multi-device use and recommends one device. The snapshot's `single_device_notice`
@@ -156,16 +255,33 @@ one installation and conversations will not automatically appear on both.
 Reinstallation or cleared local state can produce the same evidence; do not
 claim to have identified a physical device or a particular app.
 
-Offer **Cancel** and **Continue anyway**. For Cancel, call
-`cancel_onboarding(account_ref)`: it signs the identity out, retains local data and
-completed repairs, and archives the checkpoint to remove the active gate. A later
-sign-in can use either the legacy or interactive entry point. The registered
-external-signer callback remains attached for explicit sign-in within this runtime;
-a process restart still requires the host to register it again. Cancellation is
-idempotent; if interrupted with `cancellation_pending`, call it again to finish.
-Normal onboarding mutations are blocked during that interval. Cancellation is
-not offered while an approved repair is unfinished and cannot discard that repair.
+Offer **Cancel** and **Continue anyway**. For Cancel, invalidate the current UI
+attempt first, then await `cancel_onboarding(account_ref)` before any new
+`begin_*_onboarding`. Cancellation is legal at every interactive step, including
+an approved but unconfirmed repair and a ready checkpoint that the host has not
+yet opened with Open Chats. Success signs the identity out, reaps its worker,
+delivers a terminal non-ready snapshot, and closes that subscription. It retains
+local data, credentials, setup journals, and the latest cancellation checkpoint,
+including its signed publication evidence. A subsequent cancellation replaces
+`onboarding-cancelled.json` even if the earlier publication is still uncertain.
+This is a latest-only retention limit, not proof of remote reconciliation.
+Previously written content-addressed archives are left untouched; new
+cancellations do not create them. It does not delete, replace, or prove non-publication of
+events that may already be on relays. A later explicit interactive begin starts
+a new attempt with the supplied options and no old proposal, approval, or
+signed repair; observing a previously published record is not replay permission.
+Legacy `login` remains available and does not consume archived onboarding
+choices. Reconcile, runtime start, signer attachment, and connectivity
+restoration are not explicit sign-in. If the call returns
+`AccountWorkerResponseTimedOut`, the pending fence remains and the host should
+retry the same cancel; dropping the waiter does not abort cleanup. Do not treat
+`ready` as an Open Chats command — the host still owns that transition.
 For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
+If `snapshot.recovery_epoch` is present, use
+`acknowledge_onboarding_single_device_in_epoch(account_ref, snapshot.revision, epoch)`
+and `approve_onboarding_repair_in_epoch(account_ref, snapshot.revision, epoch)`
+for approvals. Pass the epoch from the same displayed snapshot. The original
+revision-only methods reject recovered attempts, even when the number matches.
 MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
 The acknowledgment survives KeyPackage publication failure, task interruption,
 and restart. Rechecking an earlier prerequisite, changing discovery sources,
@@ -262,3 +378,21 @@ edited Markdown message per update. Results include source cloning, conversion,
 and UniFFI serialization: p50/p95 over 100 samples after 10 warm-up iterations,
 plus serialized byte counts. They exclude storage, runtime window application,
 FFI scheduling, and Swift/Kotlin decoding and rendering.
+
+## Selected chat-list presentation
+
+`openPresentedChatList(accountRef, includeArchived)` returns an account-bound subscription.
+Take `snapshot()` once (generation plus sequence zero), then consume `next()` as complete replacement snapshots.
+Each row contains the existing chat-list fields and MDK's selected title/avatar; hosts render the typed fallback text
+with their own localization and load the selected avatar descriptor without a roster/profile lookup.
+`presentedChatList` and `presentedChatListRow` provide the same local contract for one-shot and creation/rebind paths.
+
+First use can await bounded local preparation. `ChatPresentationNotReady` means preparation did not advance and may be
+retried after maintenance; it is not an empty list or missing group. Storage errors remain errors. Ready reads do no
+network fetching or repair writes. Selected values survive offline reopen; avatar bytes still use the existing loaders.
+
+Order updates by the handle's generation and sequence. `presentationVersion` only versions selected presentation:
+an unread, pin, archive or mute update can have the same presentation revision. Drop the old handle when changing
+accounts; cancellation preserves a pending refresh, and shutdown ends the stream. Account-store replacement requires
+opening a new handle. Do not log rows or avatar material, including generated host-language record stringification.
+Existing chat-list APIs remain available during client migration. Android/iOS adoption is a separate delivery step.

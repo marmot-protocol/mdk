@@ -9,6 +9,311 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `wn messages edit <group-hex> <message-id> <text>` publishes a kind-1009 edit through the runtime's
+  `edit_message`. The target must be a locally projected message authored by the selected account; a foreign target
+  fails with `not_message_author` and an unknown id with `unknown_message` before anything is published. The JSON
+  response is a send result plus `target_message_id` and `kind`. Kind 1009 stays reserved on `messages send-event`.
+- `wn groups retention <group-hex> [--set <duration>]` shows or sets the disappearing-message policy through
+  `update_message_retention` (`0`/`off` disables explicitly; bare seconds or `s`/`m`/`h`/`d`/`w` suffixes), and
+  `wn groups create --retention <duration>` makes the policy part of the founding commit via
+  `create_group_with_options`. `messages list` rows carry an additive `retention` object and timeline rows carry
+  `retention_seconds` / `retention_expires_at` so the delivering epoch's policy stays visible per message.
+- `wn messages sweep-expired` runs the engine-owned retention sweep for the selected account on the current wall
+  clock and reports `now_ms`, totals, and a per-group `groups` array with a snake_case `status`.
+- Disband lifecycle: `wn groups enable-disbanding`, `wn groups disband --confirm`, `wn groups disband-status`,
+  and `wn groups acknowledge-disband-failure`. `disband-status` reports a one-word `state` (`not_enabled`,
+  `enabled`, `pending`, `converging`, `failed`, `disbanded`, or `unknown` when the MLS state could not be read and
+  nothing positive was observed) alongside `lifecycle_state`, `disbanding`,
+  `disbanded`, `disband_request`, `disbanding_blockers`, `unrecoverable`, and `self_membership`. A returned disband
+  request is durable local intent; the terminal commit is prepared by the runtime convergence pass (a running `wnd`
+  or `messages retry <group-hex>`). `wn groups management <group-hex>` mirrors the MarmotKit management state.
+- Recovery: `wn groups recovery-status`, `wn groups confirm-rejoin <welcome-id> --local-state-token <hex>
+  --confirm`, `wn groups decline-rejoin`, `wn groups quarantined`, and `wn groups retry-hydrate`. Rejoin consent
+  is bound to the exact reviewed offer id and token; ordinary invite acceptance never stands in for it.
+- `wn groups delete-local <group-hex> --confirm` deletes only this device's local group data through
+  `delete_group_local`, distinct from leaving, disbanding, and archiving.
+- Encrypted group images: `wn groups set-image`, `wn groups clear-image`, `wn groups download-image`, and
+  `wn groups create --image <path> [--image-media-type <mime>]`. Their JSON reports a redacted `image` summary
+  (`present`, `image_hash_hex`, `media_type`) and never the image key, upload secret, or key-bearing `data_hex`.
+- `wn groups add-members ... --admin <member>` (and legacy `wn group invite --admin`) grants admin to an invitee in
+  the same invite commit via `invite_members_with_initial_admins`; a non-invitee admin fails with
+  `initial_admin_not_invited`. Invite results carry an additive `initial_admins` list.
+- `wn groups pending-welcomes` lists undelivered Welcomes from `pending_welcome_deliveries` and
+  `wn groups redeliver-welcome <message-id>` re-publishes one without re-committing.
+- `wn media upload` accepts several files and `--send` publishes them as one ordered kind-9 message.
+  `wn media send <group-hex> <attachment> [...]` sends already-uploaded references (the `media` JSON object from
+  upload/list output, or the plaintext SHA-256 of a projected attachment) through `send_media_attachments`,
+  preserving order. A reference from an earlier epoch is refused with `media_reference_stale_epoch`
+  (`source_epoch`, `current_epoch`) instead of publishing ciphertext recipients could not decrypt. A plaintext hash
+  resolves to the newest projected reference carrying it (`media send` and `media download`), so after the same file
+  is uploaded and sent again under the new epoch, the hash form sends that copy instead of re-binding the stale one.
+  The pre-check is the early answer; the binding one is an epoch pin the runtime puts on the send, which the engine
+  enforces at encryption time (see Changed).
+  `wn media set-endpoints <group-hex> <url> [...]` replaces the group's encrypted-media default blob endpoints
+  through `replace_encrypted_media_blob_endpoints`.
+- `wn media download --output` and `wn groups download-image --output` accept an existing directory as well as a
+  file path. Relative file arguments to `media upload`, `media download --output`, `groups set-image`,
+  `groups create --image`, and `groups download-image --output` resolve against the caller's working directory
+  before execution, so commands forwarded to a running `wnd` read and write the caller's files rather than the
+  daemon's. A bare output file name (empty parent directory) now writes correctly instead of failing on Unix.
+- `wn groups update <group-hex> [--name] [--description]` is the canonical plural spelling of the legacy
+  `wn group update`; both now require at least one field at parse time. `wn tui` `/chat describe` and
+  `/chat rename` use it.
+- Typed JSON error codes for the new surface: `group_disbanding`, `disbanding_not_enabled`,
+  `disbanding_unsupported_members`, `leave_already_requested`, `group_invite_not_pending`,
+  `invalid_encrypted_media`, `invalid_app_message_payload`, `invalid_retention_duration`, `unknown_message`,
+  `not_message_author`, `empty_group_image`, `group_image_absent`, `invalid_rejoin_token`, `invalid_welcome_id`,
+  and `initial_admin_not_invited`.
+- `account_key_package_relay_events` / Swift and Kotlin `accountKeyPackageRelayEvents` /
+  `marmot_account_key_package_relay_events` return observed kind-30443 relay history for
+  one account, including superseded same-slot events, so hosts can delete a specific
+  event without targeting the current winner.
+- Runtime `forget_group_local` and Swift/Kotlin `forgetGroupLocal` for recovery from an
+  unusable local group copy: erase chat history and MLS state, cancel group work, and
+  wait for a fresh authenticated Welcome. Invitations must be created strictly after
+  the reset's Unix-second cutoff; equal-second invitations are rejected. Hosts retain
+  responsibility for their own media caches and active group views.
+- Shared profile-pseudonym helpers are now exported through UniFFI and C
+  (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
+  `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
+
+### Changed
+
+- The runtime's `send_media_attachments` (MarmotKit and `wn media send`) refuses a media reference whose
+  `source_epoch` differs from the group's current epoch with the new typed `AppError::MediaReferenceStaleEpoch`
+  (`source_epoch`, `current_epoch`), which MarmotKit surfaces as `InvalidMediaReference` and `wn` as
+  `media_reference_stale_epoch` with both epochs, whether the CLI pre-check or the account worker caught it. The
+  `imeta` tag carries no epoch, so recipients derive the media key from the delivering message's epoch; a stale
+  reference would have published fine and then failed to decrypt everywhere. Upload the file again after a commit
+  advances the group.
+- Media sends are pinned to the reference's epoch all the way into the engine: `SendIntent::AppMessage` gained an
+  optional `expected_epoch`, which the engine checks against the loaded MLS state immediately before encryption —
+  after any retained peer commits the send folded first — and which keeps the message out of the durable retention
+  queue while the group's epoch is unsettled (a staged local publish awaiting its outcome, or convergence input not
+  yet applied). Previously the epoch comparison ran once at the runtime boundary, and the engine could then
+  legitimately advance the epoch or park the message and encrypt the unchanged `imeta` payload at a later epoch,
+  publishing an attachment no recipient could decrypt. A fold reports `media_reference_stale_epoch` with both epochs;
+  an unsettled epoch reports the new `media_reference_epoch_unsettled` (`source_epoch`; sync and retry, or upload
+  again if the epoch advanced). Both surface as `InvalidMediaReference` in MarmotKit. The pin also covers
+  `wn media upload --send`, whose upload and send straddle an HTTP round-trip. Unpinned messages keep today's
+  retention and drain-time re-encryption. Persisted intents without the field deserialize as unpinned.
+- `wn messages delete` help now describes what the handler does: it publishes an authenticated kind-5 delete
+  tombstone to the group, which is a group-visible deletion request rather than a local-view change or secure
+  erasure.
+- `wn messages retry <group-hex> [event-id]` documents its real contract: it retries durable pending work for the
+  whole group through `retry_group_convergence` and never re-encrypts fresh plaintext. The event id is now optional
+  and only echoed as `target_event_id` (`null` when omitted); `retry_scope` stays `group_convergence`.
+- Group JSON (`groups show`, `groups list`, `chats` rows, and the `groups subscribe-state` feed) gains additive
+  `message_retention`, `disbanding`, `disbanded`, `disband_request`, `unrecoverable`, `self_membership`
+  (`member`/`left`/`removed`), and `leave_requested_at_ms` keys. The `mls` object gains additive `protocol_profile`,
+  `lifecycle_state`, `unrecoverable`, `disbanding_enabled`, `disbanding`, `disbanding_blockers`, and
+  `disband_request` keys. Other existing keys are unchanged.
+- **Breaking (JSON):** the `image` object in group JSON (`groups show`/`list`, `group(s) create`, `chats` rows, and
+  the daemon `group_state` feed) is now the redacted summary `{component_id, component, present, image_hash_hex,
+  media_type}`. It no longer carries `image_key_hex`, `image_nonce_hex`, `image_upload_key_hex`, or the key-bearing
+  `data_hex`, because `wn` can now populate those capability keys through `groups set-image` and
+  `groups create --image` (mdk#1253). No `wn`, `wn tui`, or `wnd` consumer read them; use `groups download-image`
+  for the decrypted image.
+- The README documents canonical MLS group ids versus 32-byte Nostr routing ids, and relay publication versus
+  durable completion, for the group and message surfaces.
+- Account KeyPackage listing now exposes one current relay event per addressable
+  slot. `wn keys list` follows that current-slot inventory; `wn keys delete-all
+  --confirm` still publishes deletions for every observed relay event, including
+  superseded same-slot members. Sign-out and wipe use the same all-event cleanup.
+- Account storage advances through migrations 70–71. Back up before upgrading;
+  downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
+  Keep native libraries and generated bindings on matching versions.
+- Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
+  addition to hex, `npub`, and existing URI forms. nprofile relay hints are
+  discarded. Duplicate type-0 TLV entries keep the first key. After one
+  lowercase `nostr:` prefix, the nprofile fallback rejects encoded tokens
+  longer than 1023 UTF-8 bytes; a valid 1023-byte token still decodes when
+  wrapped. FFI wrapper normalization is unchanged.
+
+- MarmotKit timeline rows and reply previews expose `media` as an ordered list of
+  `MediaAttachmentOutcome` values, `Accepted { attachment_index, reference }` or
+  `Rejected { attachment_index, rejection }`, instead of a list of accepted references only.
+  A malformed or unsupported `imeta` attachment keeps its position and carries a stable
+  `MediaAttachmentRejectionKind` (`InvalidStructure`, `UnsupportedFormat`, `MissingField`,
+  `DuplicateField`, `MalformedField`) plus privacy-safe detail text, so hosts can render an
+  unsupported/invalid attachment placeholder instead of an empty attachment list (#1787).
+  Swift/Kotlin consumers of `TimelineMessageRecord.media` and `TimelineReplyPreview.media`
+  switch on the outcome; the message text and valid sibling attachments are unaffected.
+- `list_media` numbers `attachment_index` by position among the message's `imeta` tags,
+  rejected siblings included, so it matches the timeline outcome index. Only accepted
+  attachments are returned; rejections are visible on the timeline row.
+- `parse_media_imeta_tag`, `build_media_imeta_tag`, `send_media_attachments`,
+  `send_media_reference`, `upload_media`, and `download_media` report a structurally invalid
+  reference as `MarmotKitError.MediaAttachmentRejected { kind, details }` with the same kind
+  and text the timeline projection reports for that tag. `InvalidMediaReference` now covers
+  group-profile and locator-policy mismatches and unusable upload requests.
+- `download_media` distinguishes `MediaUnfetchable` (valid reference, but no locator may be
+  fetched under the group's `allowed_locator_kinds` or this client's host-safety policy;
+  nothing was dialed) from `MediaDownloadFailed` (transport, timeout, hash mismatch, or
+  decryption failure after a locator was selected). Both previously surfaced as
+  `InvalidMediaReference` or the untyped `Runtime` error.
+- Download classification does not depend on locator order: a candidate the destination
+  policy refuses before dialing (a private-IP literal, or a hostname whose DNS answer is a
+  non-public address) is unfetchable, and once any permitted server was contacted the
+  attachment reports `MediaDownloadFailed` even if later locators were unusable, including
+  when a permitted server redirects to a target the policy then refuses. Blossom
+  dial-safety refusals now carry the `UnsafeMediaFetch` class internally, so an upload or
+  group-image fetch to an unsafe endpoint surfaces as `InvalidMediaReference` rather than the
+  untyped `Runtime` error.
+- A stored timeline media container that no longer decodes (on-disk corruption) is preserved
+  as one `InvalidStructure` rejection on the row and its reply previews instead of failing the
+  page or reply query; a present non-object `media` value projects the same way.
+- The shared `imeta` parser judges the version field before other fields, so a tag with an
+  absent or unknown `v`, including the legacy MIP-era `url`/`x`/`n` shape Amethyst once
+  emitted, is always classified `UnsupportedFormat` regardless of field order. Strictness,
+  duplicate-field, and cryptographic checks are unchanged.
+- The chat-list latest-message attachment preview counts a rejected `imeta` attachment as a
+  generic `File` (and toward the attachment count) instead of ignoring it, so a message whose
+  only attachment was rejected no longer previews as text-only while its timeline row shows a
+  placeholder. Its declared media type is not trusted for classification.
+- The shared encrypted-media fixtures (`fixtures/encrypted-media/`) carry a `rejection_kind`
+  for every rejection case plus new legacy-shape, field-without-value, and missing-locator
+  cases; marmot-app, MarmotKit, and `wn` assert against them.
+
+### Fixed
+
+- `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
+  directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran
+  the wn-home directory helper against that directory and chmod-ed it to `0700`, removing other users' access to a
+  shared `0755` directory (or failing outright in a directory owned by someone else, such as `/tmp`). Downloads now
+  leave existing directories exactly as found, create only missing directories privately, and still write the
+  plaintext file `0600`. Covered by a unit test on the writer and the CLI end-to-end default, bare, and directory
+  output downloads, which assert the parent's mode is unchanged.
+- Foreground recovery services commands between group passes without starving due
+  convergence under a busy command queue; unchanged group subscriptions stay in place.
+- Unchanged push registrations retain their gossip progress.
+- Accepted disbands remain scheduled across restart and project completion after MLS
+  state deletion, including completion through inbound convergence.
+
+## [0.9.21] - 2026-09-10
+
+### Release notes
+
+- Host-driven agent stream publishing is available through the runtime,
+  Swift/Kotlin, and C bindings.
+- Audit uploads use the v4 schema and hardware model metadata. Hosts must
+  adopt the v4 tracker config and regenerate bindings; startup removes
+  recognized legacy v1-v3 forensic files while preserving v4 and key-reveal logs.
+- Account storage advances through migrations 68–69 for bounded media-retention
+  and chat-readiness queries. Back up before upgrading; downgrade is unsupported.
+  Re-upgrade or restore a pre-upgrade database/export. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before 0.9.15 also cross migration 47: keep at least 3.25 times
+  the account database size free for its history-table rebuild.
+- Epoch-gap backfill intents are discarded for groups this device has left or
+  been removed from. Chat-list and media-retention database work is bounded.
+- Update generated source and native libraries together. C consumers must
+  rebuild against the matching header because record layouts changed.
+
+### Added
+
+- App-message Markdown now emits a structured `Details` block for structural
+  `<details>` / `<summary>` lines, including UniFFI and C display trees. Hosts
+  must regenerate bindings to render the new variant.
+
+### Fixed
+
+- Failed `<details>` candidates now keep a completed `<summary>` in the display
+  tree, restore ordinary block structure and source gaps on fallback, preserve
+  hard breaks and cross-line code spans in multiline summaries, and keep
+  summary recognition linear for many short continuation lines. An open
+  summary code span now also keeps interior `</summary>` / `</details>` lines
+  literal until the matching backticks close.
+
+### Changed
+
+- Group creation, invites, and composition prewarming fetch current KeyPackages from relays, including for local
+  sibling accounts; unavailable relay material no longer falls back to cached packages. MarmotKit's prewarm
+  `reusedMembers` remains present but always returns zero. Prewarm caches only discovery routes.
+- Create and Invite reject packages advertising RFC 9420 default capabilities. Recipients with older affected
+  packages automatically regenerate on account activation after upgrading. A durable per-account-device generator
+  revision advances only after a relay acknowledges the replacement, with retries across restarts. Older pending
+  publications are superseded in the same slot with a newer timestamp while preserving their private bundles.
+  Previous unused private bundles remain available until expiry; historical Welcome processing is unchanged.
+  **Compatibility:** inviting a peer still advertising an affected package fails with `InvalidKeyPackageCapabilities`
+  until that peer generates and publishes a conforming package. An upgraded sender cannot repair a recipient that
+  has not upgraded; automatic regeneration requires the recipient to upgrade, activate, and obtain a relay ACK.
+  This is a deliberate stricter admission policy to keep nonconforming signed leaves out of new membership state.
+  The engine reports `InvalidKeyPackageCapabilities` with the affected member for typed callers, while diagnostic
+  text omits identities and classifies the error as a deliberate protocol refusal.
+
+- User search includes cached public identities from every connected account and delivers Vertex matches without
+  waiting for graph traversal. Swift/Kotlin and C expose a cache-only search and explicit selected-account follow
+  labels. Streaming consumers must apply `updated_results` as keyed replacements; CLI search merges them into one
+  result per person. Radius windows filter known distances only; consumers must deduplicate off-graph identities
+  across pages. Search-discovered public profiles are searchable across accounts but remain outside live directory
+  subscriptions. Local cache materialization is capped at 10,000 distinct identities per account cache, and cache result
+  batches at 10,000 people.
+- `wn stream send` (direct and `--broker`) now applies the shared public-address gate to explicit `--connect`
+  destinations. Unflagged loopback, private, link-local, CGNAT, and other non-public targets return
+  `unsafe_quic_endpoint`. `--insecure-local` still opens loopback only; a pinned certificate is TLS trust, not address
+  authorization.
+
+### Fixed
+
+- Direct QUIC stream clients bind the unspecified address of the destination family so IPv6 and normally routed
+  off-host receivers are reachable. The wildcard source bind does not authorize the remote destination.
+
+## [0.9.20] - 2026-09-08
+
+### Added
+
+- Durable chat names and avatars, background presentation maintenance, and
+  complete presented chat-list reads and subscriptions across the runtime,
+  Swift/Kotlin, and C bindings.
+- First-class Hermes plugin packaging and media dispatch.
+- Added `usage-diagnostics show|enable|disable` with JSON output and live daemon
+  routing. One explicit local consent controls OTLP and stock Aptabase exports;
+  prior telemetry users reconfirm. Standalone commands and TUI children are silent
+  collectors. Aptabase configuration and app keys do not grant consent.
+
+### Changed
+
+- Account databases advance through migrations 65–67 for durable chat
+  presentation, background maintenance checkpoints, and invitation recovery.
+  Shared storage advances through versions 2–3 for diagnostics consent and
+  profile-change tracking. Back up before upgrading; downgrade is unsupported.
+  Re-upgrade or restore a pre-upgrade database/export instead of removing
+  migration rows. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before `0.9.15` also cross migration 47: keep at least 3.25
+  times the account database size free for its history-table rebuild and
+  gradual post-readiness promotion. The 2,048-row release check measured a
+  4.01-times peak footprint (3.01 times additional space), a 6,159 ms migration,
+  4,916 ms promotion, and 146 ms slowest 32-row batch.
+- Interactive onboarding cancellation now ends approved, interrupted, or ready
+  sign-in attempts, keeps the account signed out, and retains uncertain
+  publication evidence for a later explicit restart. Late publication or signer
+  responses cannot revive a cancelled attempt, and a fresh explicit begin no
+  longer waits for the retired operation. Existing pre-generation checkpoints
+  keep working after upgrade, cancelled ready-state cleanup no longer deletes
+  retained setup journals, and a dropped cancellation waiter still observes a
+  finished worker reap. Cancellation evidence is now latest-only, including
+  uncertain publications. Explicit recovery retains opaque historical bytes
+  and starts a fresh approval epoch; Swift/Kotlin/C hosts use the epoch-aware
+  approval APIs for recovered attempts.
+- Simulator engine-subject group-action refusals now stay on the existing
+  report, fixture, and portable capsule path instead of panicking. Failed
+  create, invite, profile, remove, and self-update steps use fixed
+  privacy-safe engine messages, release unused scenario-input reservations,
+  and leave successful current and legacy create forms unchanged.
+
+### Fixed
+
+- Invitations superseded by convergence recover through durable reinvite and
+  rejoin state, including after restart.
+- Transport receipt synchronization uses one account-owned boundary, and
+  message-latency measurements cover recovery gating.
+- Audit uploads stop retrying files rejected with a bare HTTP 413 response.
+- Directory caches bound retained unknown profile metadata.
+
 ## [0.9.19] - 2026-09-07
 
 ### Added
@@ -2074,7 +2379,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.20...HEAD
+[0.9.20]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...v0.9.19
 [0.9.18]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...v0.9.17

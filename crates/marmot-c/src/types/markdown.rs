@@ -16,7 +16,8 @@ use marmot_uniffi::{
 
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{
-    CFree, free_c_string, free_vec, owned_c_string, owned_opt_c_string, owned_vec,
+    CFree, boxed, free_boxed, free_c_string, free_vec, owned_c_string, owned_opt_c_string,
+    owned_vec,
 };
 
 c_enum! {
@@ -414,6 +415,22 @@ pub enum MarmotMarkdownBlock {
     MathBlock {
         content: *mut c_char,
     },
+    Details {
+        details: *mut MarmotMarkdownDetails,
+    },
+}
+
+/// Owned payload for [`MarmotMarkdownBlock::Details`]. Indirection keeps the
+/// existing tagged-union size and discriminants unchanged.
+#[repr(C)]
+pub struct MarmotMarkdownDetails {
+    pub summary: *mut MarmotMarkdownInline,
+    pub summary_len: usize,
+    pub open: bool,
+    pub body: *mut MarmotMarkdownBlock,
+    pub body_len: usize,
+    pub blank_lines_before: *mut u8,
+    pub blank_lines_before_len: usize,
 }
 
 fn block_vec(blocks: Vec<MarkdownBlockFfi>) -> (*mut MarmotMarkdownBlock, usize) {
@@ -491,6 +508,27 @@ impl From<MarkdownBlockFfi> for MarmotMarkdownBlock {
             MarkdownBlockFfi::MathBlock { content } => Self::MathBlock {
                 content: owned_c_string(content),
             },
+            MarkdownBlockFfi::Details {
+                summary,
+                open,
+                body,
+                blank_lines_before,
+            } => {
+                let (summary, summary_len) = inline_vec(summary);
+                let (body, body_len) = block_vec(body);
+                let (blank_lines_before, blank_lines_before_len) = owned_vec(blank_lines_before);
+                Self::Details {
+                    details: boxed(MarmotMarkdownDetails {
+                        summary,
+                        summary_len,
+                        open,
+                        body,
+                        body_len,
+                        blank_lines_before,
+                        blank_lines_before_len,
+                    }),
+                }
+            }
         }
     }
 }
@@ -544,7 +582,18 @@ impl CFree for MarmotMarkdownBlock {
                     free_vec(*rows, *rows_len);
                 }
                 Self::MathBlock { content } => free_c_string(*content),
+                Self::Details { details } => free_boxed(*details),
             }
+        }
+    }
+}
+
+impl CFree for MarmotMarkdownDetails {
+    unsafe fn free_in_place(&mut self) {
+        unsafe {
+            free_vec(self.summary, self.summary_len);
+            free_vec(self.body, self.body_len);
+            free_vec(self.blank_lines_before, self.blank_lines_before_len);
         }
     }
 }
@@ -632,6 +681,82 @@ mod tests {
 
         let mirror: MarmotMarkdownDocument = doc.into();
         assert_eq!(mirror.blocks_len, 3);
+        let root = boxed(mirror);
+        unsafe { marmot_markdown_document_free(root) };
+
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn details_payload_is_indirect_and_existing_tags_stay_stable() {
+        assert_eq!(std::mem::size_of::<MarmotMarkdownBlock>(), 56);
+        assert_eq!(std::mem::align_of::<MarmotMarkdownBlock>(), 8);
+        let paragraph = MarmotMarkdownBlock::Paragraph {
+            inlines: std::ptr::null_mut(),
+            inlines_len: 0,
+        };
+        let heading = MarmotMarkdownBlock::Heading {
+            level: 1,
+            inlines: std::ptr::null_mut(),
+            inlines_len: 0,
+        };
+        let math = MarmotMarkdownBlock::MathBlock {
+            content: std::ptr::null_mut(),
+        };
+        assert_eq!(block_tag(&paragraph), 0);
+        assert_eq!(block_tag(&heading), 1);
+        assert_eq!(block_tag(&MarmotMarkdownBlock::ThematicBreak), 2);
+        assert_eq!(block_tag(&math), 7);
+        let details = MarmotMarkdownBlock::Details {
+            details: std::ptr::null_mut(),
+        };
+        assert_eq!(block_tag(&details), 8);
+        assert_eq!(
+            std::mem::size_of_val(&[paragraph, heading, math, details]),
+            56 * 4
+        );
+    }
+
+    fn block_tag(block: &MarmotMarkdownBlock) -> u32 {
+        unsafe { *(block as *const MarmotMarkdownBlock as *const u32) }
+    }
+
+    #[test]
+    fn details_nested_empty_roundtrip_returns_to_baseline() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let doc = MarkdownDocumentFfi {
+            blocks: vec![MarkdownBlockFfi::Details {
+                summary: vec![],
+                open: true,
+                body: vec![MarkdownBlockFfi::Details {
+                    summary: vec![MarkdownInlineFfi::Text {
+                        content: "inner".into(),
+                    }],
+                    open: false,
+                    body: vec![],
+                    blank_lines_before: vec![],
+                }],
+                blank_lines_before: vec![0],
+            }],
+            truncated: false,
+            blank_lines_before: vec![0],
+        };
+        let mirror: MarmotMarkdownDocument = doc.into();
+        assert_eq!(mirror.blocks_len, 1);
+        unsafe {
+            match &*mirror.blocks {
+                MarmotMarkdownBlock::Details { details } => {
+                    assert!(!details.is_null());
+                    assert!((**details).open);
+                    assert_eq!((**details).body_len, 1);
+                }
+                other => panic!("expected details, got tag {}", block_tag(other)),
+            }
+        }
         let root = boxed(mirror);
         unsafe { marmot_markdown_document_free(root) };
 

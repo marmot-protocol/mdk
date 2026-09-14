@@ -119,6 +119,9 @@ pub enum InboundResourceLimit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalIngestState {
+    /// A validated replacement Welcome is durable and awaits explicit local
+    /// consent. It has not changed MLS state and is not convergence work.
+    RejoinConfirmationRequired,
     /// Authenticated MLS state records this account-device's removal. The
     /// engine has already performed the realizing-removal side effects.
     Removed,
@@ -224,5 +227,13 @@ pub enum PeeledContent {
     /// decides how to apply.
     MlsMessage { bytes: Vec<u8> },
     /// Welcome payload (MLS welcome bytes).
-    Welcome { bytes: Vec<u8> },
+    Welcome {
+        bytes: Vec<u8>,
+        /// Sender-authenticated inner invitation creation time, in Unix seconds.
+        /// Never substitute transport receipt time or an outer privacy wrapper's
+        /// timestamp. Absent on transports that cannot establish this value;
+        /// those Welcomes cannot cross a local group reset boundary.
+        #[serde(default)]
+        created_at: Option<crate::transport::Timestamp>,
+    },
 }

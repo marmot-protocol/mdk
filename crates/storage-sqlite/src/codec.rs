@@ -233,7 +233,13 @@ pub(crate) fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
     if is_busy_error(&error) {
         StorageError::Busy(error.to_string())
     } else {
-        StorageError::Backend(error.to_string())
+        match error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseCorrupt) => {
+                StorageError::Corruption(error.to_string())
+            }
+            Some(rusqlite::ErrorCode::DiskFull) => StorageError::Capacity(error.to_string()),
+            _ => StorageError::Backend(error.to_string()),
+        }
     }
 }
 
@@ -438,11 +444,21 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_corruption_and_capacity_keep_typed_failure_classes() {
+        let corruption = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT));
+        assert!(matches!(corruption, StorageError::Corruption(_)));
+        assert!(!corruption.is_transient());
+        let capacity = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_FULL));
+        assert!(matches!(capacity, StorageError::Capacity(_)));
+        assert!(!capacity.is_transient());
+    }
+
+    #[test]
     fn map_sqlite_error_routes_other_errors_to_backend() {
-        let mapped = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT));
+        let mapped = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_NOTADB));
         assert!(
             matches!(mapped, StorageError::Backend(_)),
-            "non-busy errors must map to StorageError::Backend, got {mapped:?}"
+            "an unrecognized/encrypted database is not proof of corruption: {mapped:?}"
         );
         assert!(!mapped.is_transient());
     }

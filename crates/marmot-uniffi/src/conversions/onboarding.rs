@@ -259,6 +259,7 @@ impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OnboardingSnapshotFfi {
     pub account_id_hex: String,
+    pub recovery_epoch: Option<String>,
     pub revision: u64,
     pub ready: bool,
     pub steps: Vec<OnboardingStepStateFfi>,
@@ -270,6 +271,7 @@ impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
     fn from(value: marmot_app::OnboardingSnapshot) -> Self {
         Self {
             account_id_hex: value.account_id_hex,
+            recovery_epoch: value.recovery_epoch,
             revision: value.revision,
             ready: value.ready,
             steps: value.steps.into_iter().map(Into::into).collect(),

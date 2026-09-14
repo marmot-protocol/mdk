@@ -47,11 +47,19 @@ pub(crate) enum AppPerformanceOperation {
     AccountSetupKeyPackageLocal,
     AccountSetupLocalReadyHandoff,
     AccountSetupNetworkReady,
+    InboundDeliveryProjection,
     OutboundMessageSend,
+    OutboundMessageQueueWait,
+    OutboundMessageLocalProjection,
+    OutboundMessageLocalAccept,
+    OutboundMessagePublish,
+    OutboundMessageResponse,
+    HostOutboundMessageVisible,
+    HostInboundMessageVisible,
+
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
     GroupMemberKeyPackagePrewarm,
-    GroupCreateKeyPackageCacheReuse,
     GroupCreateKeyPackageNetworkResolution,
     GroupCreateImagePreprocess,
     GroupCreateImageUpload,
@@ -105,6 +113,10 @@ pub(crate) enum AppPerformanceOperation {
 pub enum HostPerformanceOperation {
     SplashReady,
     ForegroundLocalReady,
+    /// From the user send action until the first local bubble is rendered.
+    OutboundMessageVisible,
+    /// From the host receiving a message update until it is rendered.
+    InboundMessageVisible,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +166,9 @@ pub enum SyncErrorClass {
     Protocol,
     Crypto,
     Storage,
+    StorageBusy,
+    StorageCorruption,
+    StorageCapacity,
     Cancelled,
     Unknown,
 }
@@ -167,6 +182,9 @@ impl SyncErrorClass {
             Self::Protocol => "protocol",
             Self::Crypto => "crypto",
             Self::Storage => "storage",
+            Self::StorageBusy => "storage_busy",
+            Self::StorageCorruption => "storage_corruption",
+            Self::StorageCapacity => "storage_capacity",
             Self::Cancelled => "cancelled",
             Self::Unknown => "unknown",
         }
@@ -274,13 +292,31 @@ pub struct AppPerformanceSnapshot {
     /// passphrase KDF derivation (mdk#1439).
     #[serde(default)]
     pub sqlcipher_migration_probe_skips: u64,
+    #[serde(default)]
+    pub inbound_delivery_projection: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_queue_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_local_projection: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_local_accept: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_response: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_outbound_message_visible: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_inbound_message_visible: AppPerformanceOperationSnapshot,
+
     #[serde(default)]
     pub group_create_queue_wait: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_key_package_lookup: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_member_key_package_prewarm: AppPerformanceOperationSnapshot,
+    /// Retired counter retained for export/API compatibility; no new samples.
     #[serde(default)]
     pub group_create_key_package_cache_reuse: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -369,6 +405,7 @@ pub struct AppPerformanceSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct AppPerformanceTelemetry {
+    product: Option<crate::ProductAnalytics>,
     inner: Arc<Mutex<AppPerformanceTelemetryInner>>,
 }
 
@@ -398,7 +435,16 @@ struct AppPerformanceTelemetryInner {
     account_setup_key_package_local: AppPerformanceOperationTelemetry,
     account_setup_local_ready_handoff: AppPerformanceOperationTelemetry,
     account_setup_network_ready: AppPerformanceOperationTelemetry,
+    inbound_delivery_projection: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
+    outbound_message_queue_wait: AppPerformanceOperationTelemetry,
+    outbound_message_local_projection: AppPerformanceOperationTelemetry,
+    outbound_message_local_accept: AppPerformanceOperationTelemetry,
+    outbound_message_publish: AppPerformanceOperationTelemetry,
+    outbound_message_response: AppPerformanceOperationTelemetry,
+    host_outbound_message_visible: AppPerformanceOperationTelemetry,
+    host_inbound_message_visible: AppPerformanceOperationTelemetry,
+
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
     group_member_key_package_prewarm: AppPerformanceOperationTelemetry,
@@ -548,9 +594,94 @@ impl AppPerformanceOperationTelemetry {
 }
 
 impl AppPerformanceTelemetry {
+    pub(crate) fn with_product_analytics(product: crate::ProductAnalytics) -> Self {
+        Self {
+            product: Some(product),
+            ..Self::default()
+        }
+    }
+    fn record_product(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        success: bool,
+    ) {
+        use crate::{ProductFamily as F, ProductUnit as U};
+        use AppPerformanceOperation::*;
+        let Some(product) = &self.product else {
+            return;
+        };
+        let (family, op) = match operation {
+            AppStart => (F::Runtime, "startup"),
+            AccountOpen => (F::Storage, "open"),
+            // The complete local-ready phase owns product reporting; this is only its handoff.
+            AccountSetupNetworkReady => (F::Account, "network_ready"),
+            AccountSetupKeyPackageLocal => (F::KeyPackage, "generate"),
+            AccountDefaultProfilePublish => (F::Account, "profile_update"),
+            AccountSync => (F::Sync, "background"),
+            AccountCatchUp => (F::Sync, "foreground"),
+            // The canonical member resolver owns lookup observations.
+            GroupCreateTotalCallerLatency => (F::Group, "create"),
+            GroupInviteMembers => (F::Group, "invite"),
+            GroupAcceptInvite => (F::Group, "accept_invite"),
+            GroupPromoteAdmin => (F::Group, "promote_admin"),
+            MediaUpload => (F::Media, "upload"),
+            MediaDownload => (F::Media, "download"),
+            GroupCreateImageUpload => (F::Media, "group_image"),
+            AccountWorkerReadiness | HostForegroundLocalReady => (F::Runtime, "readiness"),
+            AccountTransportActivation => (F::Connectivity, "connect"),
+            AccountGroupHydration => (F::Recovery, "hydration"),
+            GroupCreateWelcomePublish | GroupInviteWelcomePublish => (F::Welcome, "publish"),
+            MediaDownloadLocatorFailover => (F::Media, "failover"),
+            MediaDownloadCiphertextVerify | MediaDownloadPlaintextVerify if !success => {
+                (F::Media, "integrity")
+            }
+            MediaDownloadDecrypt if !success => (F::Media, "decrypt"),
+            _ => return,
+        };
+        product.observe(
+            family,
+            op,
+            if success { "success" } else { "failure" },
+            U::Attempt,
+            Some(duration),
+        );
+    }
+
     /// Record one closed, reviewed operation as a process-wide count and
     /// fixed-bucket duration sample without accepting dynamic attributes.
     pub(crate) fn record(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        success: bool,
+    ) {
+        self.record_product(operation, duration, success);
+        self.record_without_product(operation, duration, success);
+    }
+
+    pub(crate) fn record_media(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        success: bool,
+        media_type: &str,
+    ) {
+        if let Some(product) = &self.product {
+            let name = match operation {
+                AppPerformanceOperation::MediaUpload => Some("upload"),
+                AppPerformanceOperation::MediaDownload => Some("download"),
+                AppPerformanceOperation::GroupCreateImageUpload => Some("group_image"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                product.observe_media(name, duration, success, media_type);
+            }
+        }
+        self.record_without_product(operation, duration, success);
+    }
+
+    fn record_without_product(
         &self,
         operation: AppPerformanceOperation,
         duration: Duration,
@@ -636,6 +767,36 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::AccountSetupNetworkReady => {
                 inner.account_setup_network_ready.record(duration, success)
             }
+            AppPerformanceOperation::OutboundMessageQueueWait => {
+                inner.outbound_message_queue_wait.record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageLocalProjection => {
+                inner
+                    .outbound_message_local_projection
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageLocalAccept => {
+                inner
+                    .outbound_message_local_accept
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessagePublish => {
+                inner.outbound_message_publish.record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageResponse => {
+                inner.outbound_message_response.record(duration, success);
+            }
+            AppPerformanceOperation::HostOutboundMessageVisible => {
+                inner
+                    .host_outbound_message_visible
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::HostInboundMessageVisible => {
+                inner.host_inbound_message_visible.record(duration, success);
+            }
+            AppPerformanceOperation::InboundDeliveryProjection => {
+                inner.inbound_delivery_projection.record(duration, success);
+            }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
             }
@@ -650,11 +811,6 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm => {
                 inner
                     .group_member_key_package_prewarm
-                    .record(duration, success);
-            }
-            AppPerformanceOperation::GroupCreateKeyPackageCacheReuse => {
-                inner
-                    .group_create_key_package_cache_reuse
                     .record(duration, success);
             }
             AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution => {
@@ -828,6 +984,17 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         failure: Option<SyncFailureClassification>,
     ) {
+        if let Some(product) = &self.product {
+            product.observe_sync(
+                if operation == AppPerformanceOperation::AccountCatchUp {
+                    "foreground"
+                } else {
+                    "background"
+                },
+                duration,
+                failure,
+            );
+        }
         debug_assert!(matches!(
             operation,
             AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp
@@ -853,6 +1020,12 @@ impl AppPerformanceTelemetry {
         outcome: HostPerformanceOutcome,
     ) {
         let operation = match operation {
+            HostPerformanceOperation::OutboundMessageVisible => {
+                AppPerformanceOperation::HostOutboundMessageVisible
+            }
+            HostPerformanceOperation::InboundMessageVisible => {
+                AppPerformanceOperation::HostInboundMessageVisible
+            }
             HostPerformanceOperation::SplashReady => AppPerformanceOperation::HostSplashReady,
             HostPerformanceOperation::ForegroundLocalReady => {
                 AppPerformanceOperation::HostForegroundLocalReady
@@ -905,7 +1078,16 @@ impl AppPerformanceTelemetry {
             account_setup_network_ready: inner.account_setup_network_ready.snapshot(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
+            inbound_delivery_projection: inner.inbound_delivery_projection.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
+            outbound_message_queue_wait: inner.outbound_message_queue_wait.snapshot(),
+            outbound_message_local_projection: inner.outbound_message_local_projection.snapshot(),
+            outbound_message_local_accept: inner.outbound_message_local_accept.snapshot(),
+            outbound_message_publish: inner.outbound_message_publish.snapshot(),
+            outbound_message_response: inner.outbound_message_response.snapshot(),
+            host_outbound_message_visible: inner.host_outbound_message_visible.snapshot(),
+            host_inbound_message_visible: inner.host_inbound_message_visible.snapshot(),
+
             group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
             group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
             group_member_key_package_prewarm: inner.group_member_key_package_prewarm.snapshot(),
@@ -1315,7 +1497,6 @@ mod tests {
             AppPerformanceOperation::GroupCreateQueueWait,
             AppPerformanceOperation::GroupCreateKeyPackageLookup,
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
-            AppPerformanceOperation::GroupCreateKeyPackageCacheReuse,
             AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
             AppPerformanceOperation::GroupCreateImagePreprocess,
             AppPerformanceOperation::GroupCreateImageUpload,
@@ -1333,11 +1514,11 @@ mod tests {
         }
 
         let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.group_create_key_package_cache_reuse.attempts, 0);
         for stage in [
             snapshot.group_create_queue_wait,
             snapshot.group_create_key_package_lookup,
             snapshot.group_member_key_package_prewarm,
-            snapshot.group_create_key_package_cache_reuse,
             snapshot.group_create_key_package_network_resolution,
             snapshot.group_create_image_preprocess,
             snapshot.group_create_image_upload,

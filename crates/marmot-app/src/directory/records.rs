@@ -139,6 +139,9 @@ pub struct UserDirectorySearch {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UserDirectorySearchResult {
+    /// Direct follow of the selected searcher, never inferred from radius or another account.
+    #[serde(default)]
+    pub is_followed_by_searcher: bool,
     pub account_id_hex: String,
     pub npub: String,
     pub radius: u8,
@@ -703,6 +706,7 @@ mod tests {
     #[test]
     fn search_result_serializes_match_attribution_as_snake_case_strings() {
         let result = UserDirectorySearchResult {
+            is_followed_by_searcher: false,
             account_id_hex: "aa".repeat(32),
             npub: "npub1example".to_owned(),
             radius: 1,

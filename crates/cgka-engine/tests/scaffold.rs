@@ -156,6 +156,7 @@ async fn empty_engine_methods_return_typed_results() {
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: cgka_traits::GroupId::new(vec![0; 4]),
             payload: vec![],
+            expected_epoch: None,
         })
         .await;
     assert!(res.is_err());

@@ -3790,7 +3790,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
             authorization_bearer_token: Some("goggles_runtime_secret".to_owned()),
             source: AuditLogUploadSource {
-                device_label: Some("Alice iPhone".to_owned()),
+                hardware_model: Some("iPhone17,3".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
             },
@@ -4069,6 +4069,20 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
          tracker even though the arming traffic produced no visible activity",
     );
 
+    assert!(
+        !runtime
+            .group_recovery_status("bob", &group_id)
+            .await
+            .unwrap()
+            .automatic_recovery_failed,
+        "an undecryptable burst and initial backfill arm must not claim recovery failed"
+    );
+    assert!(
+        app.group("bob", &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .pending_confirmation
+    );
     server.abort();
     runtime.shutdown().await;
 }
@@ -4333,6 +4347,14 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let carol = create_network_ready_identity(&runtime, setup).await;
+    let mut bob_chats = runtime
+        .subscribe_chats(&bob.account.account_id_hex, false)
+        .await
+        .unwrap();
+    let mut carol_chats = runtime
+        .subscribe_chats(&carol.account.account_id_hex, false)
+        .await
+        .unwrap();
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -4345,6 +4367,12 @@ async fn removed_member_triggers_local_push_token_cleanup() {
         )
         .await
         .unwrap();
+    // Group creation schedules recipient catch-up in the background. Wait for
+    // both recipients to join before registering tokens, otherwise a share can
+    // succeed with no joined groups and leave this cleanup test racing setup.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
+    wait_for_chat_update(&mut carol_chats, |chat| chat.group_id_hex == group_id_hex).await;
     let server_pubkey = nostr::Keys::generate().public_key().to_hex();
 
     for member in [&bob, &carol] {
@@ -4358,10 +4386,12 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             Some(url.clone()),
         )
         .unwrap();
-        runtime
+        let share = runtime
             .share_push_registration(&member.account.account_id_hex)
             .await
             .unwrap();
+        assert_eq!(share.failed_groups, 0);
+        assert_eq!(share.pending_groups, 0);
     }
     runtime.catch_up_accounts().await.unwrap();
 
@@ -6178,9 +6208,9 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 /// his own send — not a receive — applied it.
 ///
 /// This regression uses explicit test-policy overrides to create the precise
-/// post-cutoff/pre-scheduler state. `update_group_profile` completes its
-/// cross-account catch-up before returning, proving bob has ingested the
-/// rename. The test then lets the 100ms engine cutoff elapse while holding the
+/// post-cutoff/pre-scheduler state. Cross-account catch-up is best-effort, so
+/// the test witnesses the rename's commit edge in bob's durable active
+/// pass before allowing its engine cutoff to elapse while holding the
 /// scheduled worker for 60s. The send is therefore the only operation that can
 /// move bob's durable row from the old name to the new one, and the
 /// subscription must update within 5s, well before scheduled convergence can
@@ -6236,17 +6266,18 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         .await
         .unwrap();
 
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
     let renamed = "renamed during retained send".to_owned();
-    runtime
+    let rename_summary = runtime
         .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
         .await
         .unwrap();
-    assert_ne!(
-        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
-        Some(renamed.as_str()),
-        "bob's completed catch-up must retain the rename without applying it"
-    );
-    sleep(Duration::from_millis(250)).await;
+    assert!(rename_summary.published > 0, "the rename must be published");
+    wait_for_retained_commit_cutoff(&app, &bob.account.label, &group_id, source_epoch).await;
     assert_ne!(
         row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
         Some(renamed.as_str()),
@@ -6343,17 +6374,18 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         .await
         .unwrap();
 
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
     let renamed = "renamed during rejected send".to_owned();
-    runtime
+    let rename_summary = runtime
         .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
         .await
         .unwrap();
-    assert_ne!(
-        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
-        Some(renamed.as_str()),
-        "bob's completed catch-up must retain the rename without applying it"
-    );
-    sleep(Duration::from_millis(250)).await;
+    assert!(rename_summary.published > 0, "the rename must be published");
+    wait_for_retained_commit_cutoff(&app, &bob.account.label, &group_id, source_epoch).await;
     assert_ne!(
         row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
         Some(renamed.as_str()),
@@ -6589,6 +6621,48 @@ where
     .expect("runtime chat update")
 }
 
+/// Witness a rename admitted at the receiver's current epoch before waiting
+/// out its cutoff. A completed best-effort catch-up and an unchanged title do
+/// not prove delivery. Passive reads leave the send as the only settling seam.
+#[cfg(feature = "test-policy-overrides")]
+async fn wait_for_retained_commit_cutoff(
+    app: &MarmotApp,
+    label: &str,
+    group_id: &GroupId,
+    source_epoch: u64,
+) {
+    use cgka_traits::convergence_pass::{ConvergencePassMemberRole, ConvergencePassPhase};
+
+    let pass = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pass) = app.convergence_pass_for_test(label, group_id).unwrap()
+                && matches!(
+                    pass.phase,
+                    ConvergencePassPhase::Collecting | ConvergencePassPhase::Frozen
+                )
+                && pass.base_epoch.0 == source_epoch
+                && pass.members.iter().any(|member| {
+                    member.role == ConvergencePassMemberRole::CommitEdge
+                        && member.source_epoch == source_epoch
+                })
+            {
+                break pass;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receiver must retain the rename in its active pass");
+    // Wait a full observed pass window using a monotonic timer, avoiding any
+    // assumption about how long publication/catch-up took or wall-clock phase.
+    sleep(Duration::from_millis(
+        pass.cutoff_monotonic_ms()
+            .saturating_sub(pass.opened_monotonic_ms)
+            .saturating_add(1),
+    ))
+    .await;
+}
+
 /// Current chat-list row title for one group, read fresh from the projection
 /// (rebuilt on read after any state save). Used as the durable witness that a
 /// group-state commit has been applied locally.
@@ -6597,6 +6671,79 @@ fn row_title(app: &MarmotApp, label: &str, group_id_hex: &str) -> Option<String>
     app.chat_list_row(label, group_id_hex)
         .unwrap()
         .map(|row| row.title)
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn accepted_disband_finishes_for_both_members_without_followup_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(100),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(&alice_id, "closure", std::slice::from_ref(&bob_id), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob_id && joined == &group_id)
+    })
+    .await;
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut alice_state = runtime
+        .subscribe_group_state(&alice_id, &group_id_hex)
+        .await
+        .unwrap();
+    let mut bob_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
+        .unwrap();
+
+    let request = runtime.disband_group(&alice_id, &group_id).await.unwrap();
+    assert!(matches!(
+        request,
+        marmot_app::AppDisbandRequest::Pending { .. }
+    ));
+    // Only observe: no sends, explicit catch-up or manual convergence calls
+    // may rescue the accepted request's autonomous scheduling.
+    async fn observe_closure(
+        state: &mut marmot_app::RuntimeGroupStateSubscription,
+        role: &str,
+    ) -> bool {
+        let mut last = state.snapshot.clone();
+        let completed = timeout(Duration::from_secs(20), async {
+            while !last.disbanded {
+                last = state.recv().await.expect("group state stream stays open");
+            }
+        })
+        .await;
+        assert!(completed.is_ok(), "{role} did not observe terminal disband");
+        last.disbanded
+    }
+    let (alice_group, bob_group) = tokio::join!(
+        observe_closure(&mut alice_state, "admin"),
+        observe_closure(&mut bob_state, "member"),
+    );
+    assert!(alice_group && bob_group);
+    runtime.shutdown().await;
 }
 
 async fn wait_for_group_state_update<F>(
@@ -7566,6 +7713,9 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
+    // A reference is only sendable in the epoch that encrypted it; the
+    // synthetic references below claim the group's live epoch.
+    let media_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
     bob.send_media_attachments(
         &group_id,
         vec![
@@ -7580,7 +7730,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
                 version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
+                source_epoch: media_epoch,
                 dim: Some("800x600".to_owned()),
                 thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
             },
@@ -7595,7 +7745,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "audio.ogg".to_owned(),
                 media_type: "audio/ogg".to_owned(),
                 version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
+                source_epoch: media_epoch,
                 dim: None,
                 thumbhash: None,
             },
@@ -11494,6 +11644,10 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
         .await
         .expect("reactivation must resolve kind 10050 from the advertised outbox");
 
+    // Moving the advertised outbox requires publishing the public package
+    // there as well. Invitation resolution must not rely on the local cache.
+    runtime.publish_key_package(&carol_id).await.unwrap();
+
     let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
@@ -13813,16 +13967,22 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
         )
         .await
         .unwrap();
-    for member in [&bob_id, &carol_id] {
-        wait_for_event(&mut events, |event| {
+    // Either recipient can join first; do not discard the other recipient's event.
+    let mut awaiting = std::collections::HashSet::from([bob_id.clone(), carol_id.clone()]);
+    while !awaiting.is_empty() {
+        let event = wait_for_event(&mut events, |event| {
             matches!(
                 event,
                 MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
-                    if account_id_hex == member && joined == &group_id
+                    if awaiting.contains(account_id_hex) && joined == &group_id
             )
         })
         .await;
-        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+        let MarmotAppEvent::GroupJoined { account_id_hex, .. } = event else {
+            unreachable!("wait_for_event matched GroupJoined");
+        };
+        awaiting.remove(&account_id_hex);
+        accept_group_invite_retrying_busy(&runtime, &account_id_hex, &group_id)
             .await
             .unwrap();
     }

@@ -2,13 +2,30 @@
 
 use std::time::Duration;
 
-use crate::Marmot;
 use crate::conversions::{
     AppPerformanceSnapshotFfi, HostPerformanceOperationFfi, HostPerformanceOutcomeFfi,
+    ProductRecordResultFfi,
 };
+use crate::{Marmot, MarmotKitError};
 
 #[uniffi::export]
 impl Marmot {
+    /// Record an app-defined timing in the consent-gated product event pipeline.
+    /// Register `name` with `elapsed: DurationBucket` and `outcome: Enum` choices
+    /// `success`/`failure` in the product analytics config. Milliseconds are
+    /// bucketed before recording; this does not add an OTLP performance metric.
+    pub fn record_host_timing(
+        &self,
+        name: String,
+        duration_ms: u64,
+        outcome: HostPerformanceOutcomeFfi,
+    ) -> Result<ProductRecordResultFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .record_host_timing(name, Duration::from_millis(duration_ms), outcome.into())?
+            .into())
+    }
+
     /// Record one approved host-app milestone.
     ///
     /// The operation is a closed enum and the exported metrics carry no
@@ -62,6 +79,16 @@ mod tests {
                     );
                     let runtime = app.runtime();
                     let kit = Marmot { app, runtime };
+
+                    assert_eq!(
+                        kit.record_host_timing(
+                            "app_inbox_layout".into(),
+                            250,
+                            HostPerformanceOutcomeFfi::Success,
+                        )
+                        .unwrap(),
+                        ProductRecordResultFfi::IgnoredDisabled,
+                    );
 
                     kit.record_host_performance(
                         HostPerformanceOperationFfi::SplashReady,

@@ -442,3 +442,40 @@ impl AgentStreamSubscription {
         inner.recv().await.map(Into::into)
     }
 }
+
+/// Snapshot and ordered whole-list updates. Drop to cancel; read errors are retryable
+/// according to their typed error, and do not consume the pending refresh.
+#[derive(uniffi::Object)]
+pub struct PresentedChatListSubscription {
+    snapshot: StdMutex<Option<crate::conversions::PresentedChatListUpdateFfi>>,
+    inner: Mutex<marmot_app::RuntimePresentedChatListSubscription>,
+}
+impl PresentedChatListSubscription {
+    pub(crate) fn new(mut inner: marmot_app::RuntimePresentedChatListSubscription) -> Arc<Self> {
+        let snapshot = crate::conversions::PresentedChatListUpdateFfi {
+            subscription_generation: inner.subscription_generation.clone(),
+            sequence: 0,
+            snapshot: marmot_app::PresentedChatListSnapshot {
+                rows: std::mem::take(&mut inner.snapshot.rows),
+                presentation_version: inner.snapshot.presentation_version.clone(),
+            }
+            .into(),
+        };
+        Arc::new(Self {
+            snapshot: StdMutex::new(Some(snapshot)),
+            inner: Mutex::new(inner),
+        })
+    }
+}
+#[uniffi::export(async_runtime = "tokio")]
+impl PresentedChatListSubscription {
+    /// Take the initial snapshot once, with generation and sequence zero.
+    pub fn snapshot(&self) -> Option<crate::conversions::PresentedChatListUpdateFfi> {
+        take_snapshot(&self.snapshot)
+    }
+    pub async fn next(
+        &self,
+    ) -> Result<Option<crate::conversions::PresentedChatListUpdateFfi>, MarmotKitError> {
+        Ok(self.inner.lock().await.recv().await?.map(Into::into))
+    }
+}

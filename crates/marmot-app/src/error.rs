@@ -35,6 +35,8 @@ impl std::fmt::Display for AccountCatchUpFailure {
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    ProductAnalytics(#[from] crate::ProductAnalyticsError),
+    #[error(transparent)]
     Account(#[from] marmot_account::AccountError),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
@@ -77,6 +79,8 @@ pub enum AppError {
     /// account hydration/reconciliation completes; do not treat this as a miss.
     #[error("direct conversation index is not ready; retry after account hydration")]
     DirectConversationIndexNotReady,
+    #[error("chat presentation preparation is incomplete; retry after local maintenance")]
+    ChatPresentationNotReady,
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
     #[error("invalid chat pin: {0}")]
@@ -97,6 +101,16 @@ pub enum AppError {
     InvalidMessageDraft(String),
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
+    #[error("agent publisher: {0}")]
+    AgentStreamPublisher(String),
+    /// The finish expectation disagrees with the sealed transcript. Retrying
+    /// with the same inputs cannot succeed.
+    #[error("stream finalize does not match the sealed transcript")]
+    AgentStreamFinishMismatch,
+    /// The durable final send failed after sealing. The sealed transcript is
+    /// retained, so the same finish request may be retried.
+    #[error("agent stream durable send failed: {0}")]
+    AgentStreamSendFailed(#[source] Box<AppError>),
     #[error("agent text stream start has no confirmed message id yet")]
     AgentStreamStartNotConfirmed,
     #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
@@ -153,6 +167,46 @@ pub enum AppError {
     InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
+    /// A media reference was encrypted under `source_epoch`, but the message
+    /// that would carry it is sent at `current_epoch`. The `imeta` tag has no
+    /// epoch field, so recipients would derive the wrong media secret; the
+    /// attachment has to be uploaded again.
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+    )]
+    MediaReferenceStaleEpoch {
+        source_epoch: u64,
+        current_epoch: u64,
+    },
+    /// The group's epoch is unsettled — a commit this device staged still
+    /// awaits its publish outcome, or retained peer commits are not yet
+    /// applied — so a media reference encrypted at `source_epoch` cannot be
+    /// sent right now. Ordinary messages are retained and encrypted when the
+    /// group settles; a media reference cannot be, because the delivering
+    /// message's epoch is the recipient's media key. Nothing was published.
+    /// Sync and send again, or upload again if the epoch moved.
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group epoch is unsettled; sync and retry, or upload it again if the epoch advanced"
+    )]
+    MediaReferenceEpochUnsettled { source_epoch: u64 },
+    /// An inbound or host-supplied encrypted-media `imeta` reference failed the
+    /// shared strict parser. Carries the stable rejection category plus
+    /// privacy-safe presentation text so bindings can surface a typed reason
+    /// instead of a Rust error string (mdk#1787). Attachment-local: the
+    /// carrying message and its valid sibling attachments are unaffected.
+    #[error("invalid encrypted media reference: {0}")]
+    MediaAttachmentRejected(crate::MediaAttachmentRejection),
+    /// A structurally valid reference has no locator this client may fetch
+    /// under the group's `allowed_locator_kinds` or its own host-safety policy.
+    /// Distinct from [`AppError::MediaAttachmentRejected`] (the reference is
+    /// fine) and from [`AppError::MediaDownloadFailed`] (nothing was dialed).
+    #[error("encrypted media is unfetchable: {0}")]
+    MediaUnfetchable(String),
+    /// Fetching, verifying, or decrypting an encrypted-media blob failed after
+    /// the reference validated and a locator was selected: transport errors,
+    /// timeouts, ciphertext/plaintext hash mismatches, and AEAD failures.
+    #[error("encrypted media download failed: {0}")]
+    MediaDownloadFailed(String),
     #[error("blob store request failed: {0}")]
     BlobStore(String),
     /// A Blossom upload exhausted its bounded transfer/response budget before
@@ -250,6 +304,7 @@ impl AppError {
 
     pub(crate) fn privacy_safe_kind(&self) -> &'static str {
         match self {
+            Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),
             Self::AccountHome(error) => account_home_error_kind(error),
             Self::Session(error) => session_error_kind(error),
@@ -257,7 +312,14 @@ impl AppError {
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
             Self::Json(_) => "json",
-            Self::Sqlite(_) => "sqlite",
+            Self::Sqlite(error) => match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    "storage_busy"
+                }
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => "storage_corruption",
+                Some(rusqlite::ErrorCode::DiskFull) => "storage_capacity",
+                _ => "sqlite",
+            },
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
@@ -265,6 +327,7 @@ impl AppError {
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
+            Self::ChatPresentationNotReady => "chat_presentation_not_ready",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
@@ -272,6 +335,9 @@ impl AppError {
             Self::GroupRemoved(_) => "group_removed",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
+            Self::AgentStreamPublisher(_) => "agent_stream_publisher",
+            Self::AgentStreamFinishMismatch => "agent_stream_finish_mismatch",
+            Self::AgentStreamSendFailed(_) => "agent_stream_send_failed",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
             Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",
             Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",
@@ -296,6 +362,11 @@ impl AppError {
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
+            Self::MediaReferenceStaleEpoch { .. } => "media_reference_stale_epoch",
+            Self::MediaReferenceEpochUnsettled { .. } => "media_reference_epoch_unsettled",
+            Self::MediaAttachmentRejected(_) => "media_attachment_rejected",
+            Self::MediaUnfetchable(_) => "media_unfetchable",
+            Self::MediaDownloadFailed(_) => "media_download_failed",
             Self::BlobStore(_) => "blob_store",
             Self::MediaUploadTimedOut => "media_upload_timed_out",
             Self::UnsafeMediaFetch(_) => "unsafe_media_fetch",
@@ -330,7 +401,16 @@ impl AppError {
     /// Broad, bounded cause derived only from typed variants.
     pub(crate) fn sync_error_class(&self) -> SyncErrorClass {
         match self {
-            Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) => SyncErrorClass::Storage,
+            Self::Storage(error) => storage_error_class(error),
+            Self::Sqlite(error) => match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    SyncErrorClass::StorageBusy
+                }
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => SyncErrorClass::StorageCorruption,
+                Some(rusqlite::ErrorCode::DiskFull) => SyncErrorClass::StorageCapacity,
+                _ => SyncErrorClass::Storage,
+            },
+            Self::Io(_) => SyncErrorClass::Storage,
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
@@ -384,7 +464,7 @@ fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
 
 fn session_error_class(error: &cgka_session::SessionError) -> SyncErrorClass {
     match error {
-        cgka_session::SessionError::Storage(_) => SyncErrorClass::Storage,
+        cgka_session::SessionError::Storage(error) => storage_error_class(error),
         cgka_session::SessionError::Engine(error) => engine_error_class(error),
     }
 }
@@ -393,7 +473,7 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
     use cgka_traits::error::{EngineError, PeelerError};
 
     match error {
-        EngineError::Storage(_) => SyncErrorClass::Storage,
+        EngineError::Storage(error) => storage_error_class(error),
         EngineError::Peeler(
             PeelerError::DecryptFailed
             | PeelerError::MissingContext { .. }
@@ -404,6 +484,7 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
         | EngineError::InvalidAppMessagePayload(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
+        | EngineError::InvalidKeyPackageCapabilities { .. }
         | EngineError::InvalidWelcome
         | EngineError::Serialize(_)
         | EngineError::ForkedEpoch { .. }
@@ -481,6 +562,15 @@ fn session_error_kind(error: &cgka_session::SessionError) -> &'static str {
     }
 }
 
+fn storage_error_class(error: &StorageError) -> SyncErrorClass {
+    match error {
+        StorageError::Busy(_) => SyncErrorClass::StorageBusy,
+        StorageError::Corruption(_) => SyncErrorClass::StorageCorruption,
+        StorageError::Capacity(_) => SyncErrorClass::StorageCapacity,
+        _ => SyncErrorClass::Storage,
+    }
+}
+
 fn storage_error_kind(error: &StorageError) -> &'static str {
     match error {
         StorageError::NotFound => "storage_not_found",
@@ -488,6 +578,8 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
         StorageError::TimelineCursorExpired => "storage_timeline_cursor_expired",
         StorageError::Busy(_) => "storage_busy",
+        StorageError::Corruption(_) => "storage_corruption",
+        StorageError::Capacity(_) => "storage_capacity",
         StorageError::Closed(_) => "storage_closed",
         StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
         StorageError::Backend(_) => "storage_backend",
@@ -501,6 +593,24 @@ mod tests {
     use crate::SyncFailureClassification;
     use cgka_traits::error::EngineError;
     use cgka_traits::types::{EpochId, GroupId};
+
+    #[test]
+    fn invalid_key_package_capabilities_preserve_member_and_protocol_classification() {
+        let member = cgka_traits::MemberId::new(vec![0xBB; 32]);
+        let error = AppError::Session(cgka_session::SessionError::Engine(
+            EngineError::InvalidKeyPackageCapabilities {
+                member: member.clone(),
+            },
+        ));
+        assert_eq!(
+            error.privacy_safe_kind(),
+            "invalid_key_package_capabilities"
+        );
+        assert_eq!(error.sync_error_class(), crate::SyncErrorClass::Protocol);
+        assert!(matches!(error.as_engine_error(),
+            Some(EngineError::InvalidKeyPackageCapabilities { member: rejected }) if rejected == &member));
+        assert!(!error.to_string().contains(&hex::encode(member.as_slice())));
+    }
 
     // Kind strings leave the runtime: `account_error_message` interpolates
     // them into messages the CLI daemon persists and host apps log. Pin the

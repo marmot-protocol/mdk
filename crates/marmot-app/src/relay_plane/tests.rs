@@ -371,6 +371,16 @@ async fn notification_recovery_closes_account_delivery_and_signals_directory_reb
         .expect("inbound recovery must not take the outbound publisher down");
 }
 
+#[async_trait::async_trait]
+impl DirectoryRelayFetcher for RecordingRelayClient {
+    async fn fetch_directory_events(
+        &self,
+        _request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        Ok(Vec::new())
+    }
+}
+
 #[tokio::test]
 async fn managed_account_worker_reopens_transport_after_notification_recovery() {
     let dir = tempfile::tempdir().unwrap();

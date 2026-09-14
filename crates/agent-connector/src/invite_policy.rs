@@ -361,6 +361,26 @@ impl AgentConnector {
         group_id: &GroupId,
         welcomer: Option<MemberId>,
     ) -> Result<(), ConnectorError> {
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Agent,
+            "invite_policy",
+            marmot_app::ProductUnit::Attempt,
+        );
+        let result = self
+            .apply_invite_policy_unobserved(account_id_hex, group_id, welcomer)
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    async fn apply_invite_policy_unobserved(
+        &self,
+        account_id_hex: &str,
+        group_id: &GroupId,
+        welcomer: Option<MemberId>,
+    ) -> Result<(), ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let policy = if self.dev_allow_any_invites {
             AgentControlInvitePolicy::AnyAuthenticated

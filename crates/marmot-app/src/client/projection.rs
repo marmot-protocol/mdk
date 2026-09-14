@@ -467,7 +467,25 @@ impl AppClient {
             .map(|group| group.group_id_hex.clone())
             .collect::<std::collections::HashSet<_>>();
         let live_group_ids = self.runtime.live_group_ids()?;
-        let mut changed = false;
+        let quarantined: std::collections::HashSet<_> = self
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(id, _)| hex::encode(id.as_slice()))
+            .collect();
+        let mut cleared = Vec::new();
+        for group in &mut self.state.groups {
+            if quarantined.contains(&group.group_id_hex)
+                && group.presentation_member_ids_hex.is_some()
+            {
+                group.presentation_member_ids_hex = None;
+                cleared.push(group.group_id_hex.clone());
+            }
+        }
+        let mut changed = !cleared.is_empty();
+        for id in cleared {
+            self.mark_group_projection_dirty_hex(id);
+        }
         for group_id in live_group_ids {
             let group_id_hex = hex::encode(group_id.as_slice());
             if !projected.contains(group_id_hex.as_str()) {
@@ -500,8 +518,11 @@ impl AppClient {
                     dirty = true;
                 }
                 let previous_direct_members = projected_group.direct_member_ids_hex.clone();
+                let previous_presentation_members =
+                    projected_group.presentation_member_ids_hex.clone();
                 projected_group.set_direct_member_ids_from_roster(&group.members);
-                dirty |= projected_group.direct_member_ids_hex != previous_direct_members;
+                dirty |= projected_group.direct_member_ids_hex != previous_direct_members
+                    || projected_group.presentation_member_ids_hex != previous_presentation_members;
             }
             if dirty {
                 self.mark_group_projection_dirty_hex(group_id_hex);
@@ -582,6 +603,35 @@ impl AppClient {
         group_id: &GroupId,
         group_metadata: Option<&'a cgka_traits::group::Group>,
     ) -> Result<EventGroupProjection<'a>, AppError> {
+        if group_metadata.is_some_and(|group| group.disbanded.is_some()) {
+            // Terminal settlement deletes live MLS state before emitting its
+            // effects. Preserve the last display components and project the
+            // authoritative tombstone instead of querying deleted MLS state.
+            let previous = match self.state_group_record(group_id) {
+                Some(previous) => previous,
+                None => self
+                    .app
+                    .group(&self.state.label, &hex::encode(group_id.as_slice()))?
+                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            };
+            return Ok(EventGroupProjection {
+                group_metadata,
+                nostr_routing: previous.nostr_routing,
+                profile: previous.profile,
+                admin_policy: previous.admin_policy,
+                message_retention: previous.message_retention,
+                agent_text_stream: previous.agent_text_stream,
+                avatar_url: previous.avatar_url,
+                encrypted_media: previous.encrypted_media,
+                image: AppGroupImageInput {
+                    image_hash_hex: previous.image.image_hash_hex,
+                    image_key_hex: previous.image.image_key_hex,
+                    image_nonce_hex: previous.image.image_nonce_hex,
+                    image_upload_key_hex: previous.image.image_upload_key_hex,
+                    media_type: previous.image.media_type,
+                },
+            });
+        }
         let protocol_profile = protocol_profile_of(group_metadata);
         let media_component_id = Self::encrypted_media_component_id(protocol_profile);
         let component_ids = [
@@ -1092,6 +1142,7 @@ fn build_group_system_projection(
 
 fn read_marker_error_code(error: &AppError) -> &'static str {
     match error {
+        AppError::ProductAnalytics(_) => "read_marker_failed:usage_diagnostics",
         AppError::Account(_) => "read_marker_failed:account",
         AppError::AccountHome(_) => "read_marker_failed:account_home",
         AppError::Session(_) => "read_marker_failed:session",
@@ -1111,6 +1162,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidGroupMembershipPage(_) => {
             "read_marker_failed:invalid_group_membership_page"
         }
+        AppError::ChatPresentationNotReady => "read_marker_failed:chat_presentation_not_ready",
         AppError::DirectConversationIndexNotReady => {
             "read_marker_failed:direct_conversation_index_not_ready"
         }
@@ -1119,6 +1171,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
+        AppError::AgentStreamPublisher(_) => "read_marker_failed:agent_stream_publisher",
+        AppError::AgentStreamFinishMismatch => "read_marker_failed:agent_stream_finish_mismatch",
+        AppError::AgentStreamSendFailed(_) => "read_marker_failed:agent_stream_send_failed",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {
             "read_marker_failed:agent_stream_start_not_confirmed"
@@ -1154,6 +1209,15 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:invalid_agent_text_stream_policy"
         }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
+        AppError::MediaReferenceStaleEpoch { .. } => {
+            "read_marker_failed:media_reference_stale_epoch"
+        }
+        AppError::MediaReferenceEpochUnsettled { .. } => {
+            "read_marker_failed:media_reference_epoch_unsettled"
+        }
+        AppError::MediaAttachmentRejected(_) => "read_marker_failed:media_attachment_rejected",
+        AppError::MediaUnfetchable(_) => "read_marker_failed:media_unfetchable",
+        AppError::MediaDownloadFailed(_) => "read_marker_failed:media_download_failed",
         AppError::BlobStore(_) => "read_marker_failed:blob_store",
         AppError::MediaUploadTimedOut => "read_marker_failed:media_upload_timed_out",
         AppError::UnsafeMediaFetch(_) => "read_marker_failed:unsafe_media_fetch",

@@ -88,6 +88,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -599,6 +600,7 @@ async fn run_child_case(database: &Path) {
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, b"queued across crash"),
+                expected_epoch: None,
             },
             created_at_ms: 2_100,
             reissue_attempts: 0,

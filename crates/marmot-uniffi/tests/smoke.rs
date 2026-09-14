@@ -12,8 +12,8 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi, CursorPersistenceFfi,
-    Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
+    AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi, AuditLogUploadSourceV4Ffi,
+    CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
     MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayEndpointPolicyFfi,
     RelayTelemetrySettingsFfi, TimelineMessageQueryFfi, parse_media_imeta_tag,
@@ -21,6 +21,11 @@ use marmot_uniffi::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../marmot-app/tests/support/identity_reference_vectors.rs"
+));
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
 /// targets (iOS/macOS) is always present but in headless CI (Linux Secret
@@ -43,7 +48,7 @@ struct CapturedAuditUpload {
     path: String,
     authorization: Option<String>,
     content_type: Option<String>,
-    device_label: Option<String>,
+    hardware_model: Option<String>,
     platform: Option<String>,
     app_version: Option<String>,
     body: Vec<u8>,
@@ -102,7 +107,7 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
         let path = parts.next().unwrap_or_default().to_owned();
         let authorization = header_value(&headers, "authorization");
         let content_type = header_value(&headers, "content-type");
-        let device_label = header_value(&headers, "x-goggles-device-label");
+        let hardware_model = header_value(&headers, "x-goggles-hardware-model");
         let platform = header_value(&headers, "x-goggles-platform");
         let app_version = header_value(&headers, "x-goggles-app-version");
         let body = buf[header_end..header_end + content_length].to_vec();
@@ -116,7 +121,7 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
             path,
             authorization,
             content_type,
-            device_label,
+            hardware_model,
             platform,
             app_version,
             body,
@@ -304,33 +309,49 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
         vec!["wss://relay.invalid.test".to_string()],
     )
     .expect("open marmot kit");
-    let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-    let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
-
-    for reference in [
-        account_id.to_string(),
-        npub.to_string(),
-        format!("nostr:{npub}"),
-        format!("marmot://profile/{npub}?from=qr"),
-    ] {
-        let normalized = kit
-            .normalize_member_ref(reference.clone())
-            .expect("normalize member ref");
-        assert_eq!(normalized.member_ref, account_id);
-        assert_eq!(normalized.account_id_hex, account_id);
-        assert_eq!(normalized.npub, npub);
-        assert_eq!(
-            kit.account_id_hex(reference),
-            Some(account_id.to_string()),
-            "legacy account_id_hex should accept the same references"
-        );
+    for case in cases() {
+        match case.ffi_account_id_hex {
+            Some(expected) => {
+                let normalized = kit
+                    .normalize_member_ref(case.reference.clone())
+                    .unwrap_or_else(|_| panic!("case {} should normalize", case.name));
+                assert_eq!(normalized.member_ref, expected, "case {}", case.name);
+                assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
+                assert_eq!(normalized.npub, NPUB, "case {}", case.name);
+                assert_eq!(
+                    kit.account_id_hex(case.reference).as_deref(),
+                    Some(expected),
+                    "case {}",
+                    case.name
+                );
+            }
+            None => {
+                assert!(
+                    matches!(
+                        kit.normalize_member_ref(case.reference.clone()),
+                        Err(MarmotKitError::InvalidIdentity { .. })
+                    ),
+                    "case {} should reject",
+                    case.name
+                );
+                assert_eq!(
+                    kit.account_id_hex(case.reference),
+                    None,
+                    "case {}",
+                    case.name
+                );
+            }
+        }
     }
-
-    assert!(matches!(
-        kit.normalize_member_ref("not-a-member-ref".into())
-            .expect_err("invalid member ref should fail"),
-        MarmotKitError::InvalidIdentity { .. }
-    ));
+    assert_eq!(
+        kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+        "Loyal Crane"
+    );
+    let random = kit.random_profile_pseudonym();
+    assert!(
+        random.split_once(' ').is_some(),
+        "random pseudonym should be two words"
+    );
 }
 
 #[tokio::test]
@@ -604,7 +625,10 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     let invalid = parse_media_imeta_tag(v2, 8).expect_err("noncanonical V2 type must fail");
     assert!(matches!(
         invalid,
-        MarmotKitError::InvalidMediaReference { .. }
+        MarmotKitError::MediaAttachmentRejected {
+            kind: marmot_uniffi::MediaAttachmentRejectionKindFfi::MalformedField,
+            ..
+        }
     ));
 }
 
@@ -757,6 +781,21 @@ async fn relay_telemetry_settings_binding_round_trips() {
     assert!(!settings.export_enabled);
     assert_eq!(settings.export_interval_seconds, 60);
 
+    assert!(matches!(
+        kit.set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
+            export_enabled: true,
+            export_interval_seconds: 30
+        })
+        .await,
+        Err(MarmotKitError::ConsentRequired)
+    ));
+    let receipt = kit
+        .set_usage_diagnostics_consent(true)
+        .expect("accept combined permission");
+    assert_eq!(
+        receipt.decision,
+        marmot_uniffi::UsageDiagnosticsDecisionFfi::Granted
+    );
     let stored = kit
         .set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
             export_enabled: true,
@@ -832,7 +871,7 @@ fn audit_log_binding_lists_local_jsonl_logs() {
         .expect("reopen account home")
         .account_dir(&account.label)
         .join("audit-binding.jsonl");
-    std::fs::write(&audit_path, b"{\"seq\":1}\n").expect("write audit log");
+    std::fs::write(&audit_path, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n").expect("write audit log");
 
     let files = kit.audit_log_files().expect("list audit logs");
 
@@ -855,7 +894,7 @@ async fn audit_log_binding_posts_jsonl_file() {
         .expect("open account home")
         .create_nostr_account()
         .expect("create local account");
-    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     let audit_path = AccountHome::open_with_default_keychain(tmp.path())
         .expect("reopen account home")
         .account_dir(&account.label)
@@ -906,7 +945,7 @@ async fn audit_log_binding_posts_tracker_update() {
         .expect("open account home")
         .create_nostr_account()
         .expect("create local account");
-    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     let audit_path = AccountHome::open_with_default_keychain(tmp.path())
         .expect("reopen account home")
         .account_dir(&account.label)
@@ -921,11 +960,11 @@ async fn audit_log_binding_posts_tracker_update() {
     kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
         .await
         .expect("enable audit logs");
-    kit.set_audit_log_tracker_config(AuditLogTrackerConfigFfi {
+    kit.set_audit_log_tracker_config(AuditLogTrackerConfigV4Ffi {
         endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
         authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
-        source: AuditLogUploadSourceFfi {
-            device_label: Some("Alice iPhone".to_owned()),
+        source: AuditLogUploadSourceV4Ffi {
+            hardware_model: Some("iPhone17,3".to_owned()),
             platform: Some("ios".to_owned()),
             app_version: Some("2026.6.8".to_owned()),
         },
@@ -953,7 +992,7 @@ async fn audit_log_binding_posts_tracker_update() {
         captured.content_type.as_deref(),
         Some("application/x-ndjson")
     );
-    assert_eq!(captured.device_label.as_deref(), Some("Alice iPhone"));
+    assert_eq!(captured.hardware_model.as_deref(), Some("iPhone17,3"));
     assert_eq!(captured.platform.as_deref(), Some("ios"));
     assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
     assert_eq!(captured.body, audit_body);

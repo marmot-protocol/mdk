@@ -113,6 +113,10 @@ simulator_library_sha="$(shasum -a 256 "$XCFRAMEWORK/${simulator_artifact#Marmot
 
 cp "$SWIFT_BINDING" "$DIST_DIR/$swift_name"
 
+analytics_features='["otlp-export"]'
+if [[ "${PRODUCT_ANALYTICS_EXPORT:-}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
+  analytics_features='["otlp-export", "product-analytics-export"]'
+fi
 cat > "$DIST_DIR/$manifest_name" <<EOF
 {
   "schema_version": 1,
@@ -125,7 +129,7 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
   "cargo_lock_sha256": "$lock_sha",
   "rustc": "$rust_version",
   "cargo": "$cargo_version",
-  "features": ["otlp-export"],
+  "features": $analytics_features,
   "ios_targets": ["aarch64-apple-ios", "aarch64-apple-ios-sim"],
   "ios_deployment_target": "$deployment_target",
   "rust_release_profile": {

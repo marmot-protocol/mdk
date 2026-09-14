@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, TableCell};
+use crate::details::{self, SummaryContinue, SummaryLine};
 use crate::scanner;
 
 pub(crate) const MAX_CONTAINER_DEPTH: usize = 96;
@@ -29,9 +30,10 @@ pub(crate) struct LinkRef {
 }
 
 pub(crate) fn parse_blocks(input: &str) -> (Vec<Block>, Vec<u8>, HashMap<String, LinkRef>) {
-    let mut p = BlockParser::new();
-    for line in scanner::lines(input) {
-        p.feed(line);
+    details::Work::reset();
+    let mut p = BlockParser::new(details::recognition_window(input));
+    for (line, start) in scanner::lines_with_offsets(input) {
+        p.feed(line, start);
     }
     p.finish();
     (p.root, p.root_blank_lines_before, p.refs)
@@ -59,6 +61,49 @@ enum Container {
         children: Vec<Block>,
         blank_lines_before: Vec<u8>,
         indent: usize,
+    },
+    Details {
+        open: bool,
+        opener_raw: String,
+        children: Vec<Block>,
+        blank_lines_before: Vec<u8>,
+        leading_blank_lines: u8,
+        summary_inner: Option<String>,
+        /// Original summary source lines with tags, retained until commit so
+        /// fallback can restore ordinary block semantics.
+        summary_raw_lines: Vec<String>,
+        summary_replayed: bool,
+        pre_summary_gap: u8,
+        summary_state: SummaryState,
+        failed: bool,
+    },
+}
+
+#[derive(Debug)]
+enum SummaryState {
+    AwaitingFirstNonblank,
+    Collecting {
+        collector: Box<details::SummaryCollector>,
+        raw_lines: Vec<String>,
+    },
+    Done,
+}
+
+enum SummaryAction {
+    MarkDone,
+    Complete {
+        inner: String,
+        raw_lines: Vec<String>,
+        leftover: Vec<String>,
+    },
+    Hold {
+        collector: details::SummaryCollector,
+        raw_lines: Vec<String>,
+    },
+    FailAndContinue,
+    FailReplay {
+        raw_lines: Vec<String>,
+        consume: bool,
     },
 }
 
@@ -110,6 +155,10 @@ struct BlockParser {
     /// (slot `index + 1`). Each slot saturates independently so blank markers
     /// belonging to a nested quote cannot consume an ancestor's count budget.
     pending_source_gaps: [u8; MAX_CONTAINER_DEPTH + 1],
+    /// UTF-8-safe source prefix in which complete details candidates may match.
+    details_window: usize,
+    container_depth_limit: usize,
+    line_start: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +174,7 @@ struct ContainerMatch {
 }
 
 impl BlockParser {
-    fn new() -> Self {
+    fn new(details_window: usize) -> Self {
         Self {
             refs: HashMap::new(),
             root: Vec::new(),
@@ -134,12 +183,16 @@ impl BlockParser {
             leaf: None,
             leaf_blank_lines_before: 0,
             pending_source_gaps: [0; MAX_CONTAINER_DEPTH + 1],
+            details_window,
+            container_depth_limit: MAX_CONTAINER_DEPTH,
+            line_start: 0,
         }
     }
 
     // -------- top-level line dispatch --------
 
-    fn feed(&mut self, line: &str) {
+    fn feed(&mut self, line: &str, line_start: usize) {
+        self.line_start = line_start;
         let bytes = line.as_bytes();
         let ContainerMatch {
             cursor,
@@ -190,6 +243,7 @@ impl BlockParser {
                 _ => self.close_leaf(),
             }
             if mark_blank {
+                self.flush_held_summary_on_blank();
                 self.record_source_blank(scanner::is_blank(bytes), &blank_owners);
                 self.mark_list_blank_at_depth(matched_depth);
             }
@@ -247,6 +301,16 @@ impl BlockParser {
 
                 // Leaf-block starters that beat container openers.
                 if !rest.is_empty() {
+                    let rest_str = std::str::from_utf8(rest).unwrap_or("");
+                    if self.try_close_details(rest_str, probe_off) {
+                        return;
+                    }
+                    if self.try_accept_summary_line(rest_str, probe_off) {
+                        return;
+                    }
+                    if self.try_open_details(rest_str, probe_off) {
+                        return;
+                    }
                     if let Some((level, text)) = parse_atx_heading(rest) {
                         self.close_leaf();
                         self.push_new_block(Block::Heading {
@@ -331,7 +395,7 @@ impl BlockParser {
                     if rest[0] == b'>'
                         && let Some((nc, no)) = try_open_blockquote(bytes, probe_col, probe_off)
                     {
-                        if self.containers.len() >= MAX_CONTAINER_DEPTH {
+                        if self.containers.len() >= self.container_depth_limit {
                             self.append_paragraph_from(line, probe_off);
                             return;
                         }
@@ -358,7 +422,7 @@ impl BlockParser {
                         probe_off,
                         matches!(self.leaf, Some(Leaf::Paragraph(_))),
                     ) {
-                        if self.containers.len() + 2 > MAX_CONTAINER_DEPTH {
+                        if self.containers.len() + 2 > self.container_depth_limit {
                             self.append_paragraph_from(line, probe_off);
                             return;
                         }
@@ -386,6 +450,11 @@ impl BlockParser {
             // continuation. If a paragraph is open, this is lazy paragraph
             // continuation (handled below as a paragraph append).
             if sub_col >= 4 && !matches!(self.leaf, Some(Leaf::Paragraph(_))) {
+                let rest = std::str::from_utf8(&bytes[off..]).unwrap_or("");
+                if self.details_is_collecting_summary() && self.try_accept_summary_line(rest, off) {
+                    return;
+                }
+                self.end_summary_eligibility();
                 // Append to existing indented code or open a new one.
                 let stripped = indented_strip(line, off);
                 if let Some(Leaf::IndentedCode {
@@ -500,9 +569,9 @@ impl BlockParser {
                     }
                     blank_owners[i + 1] = scanner::is_blank(&bytes[off..]);
                 }
-                Container::List { .. } => {
-                    // Lists themselves consume nothing; their open ListItem
-                    // (if any) handles indent matching.
+                Container::List { .. } | Container::Details { .. } => {
+                    // Lists and details consume nothing; list items handle
+                    // indent matching, and details close on an explicit tag.
                 }
                 Container::ListItem { indent, .. } => {
                     let needed = *indent;
@@ -723,11 +792,28 @@ impl BlockParser {
         blank_owners: &[bool; MAX_CONTAINER_DEPTH + 1],
     ) {
         if physically_blank {
-            Self::increment_gap(&mut pending_source_gaps[0]);
+            // Blanks inside an open details stay in that disclosure; they must
+            // not become a sibling gap on an ancestor after the closer.
+            let inner_from = containers
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, container)| {
+                    matches!(container, Container::Details { .. }).then_some(index + 1)
+                })
+                .unwrap_or(0);
+            if inner_from == 0 {
+                Self::increment_gap(&mut pending_source_gaps[0]);
+            }
             for (index, container) in containers.iter().enumerate() {
+                if index + 1 < inner_from {
+                    continue;
+                }
                 if matches!(
                     container,
-                    Container::BlockQuote { .. } | Container::ListItem { .. }
+                    Container::BlockQuote { .. }
+                        | Container::ListItem { .. }
+                        | Container::Details { .. }
                 ) {
                     Self::increment_gap(&mut pending_source_gaps[index + 1]);
                 }
@@ -768,9 +854,11 @@ impl BlockParser {
         self.close_dangling_lists();
         let slot = match self.containers.last() {
             None => 0,
-            Some(Container::BlockQuote { .. } | Container::ListItem { .. }) => {
-                self.containers.len()
-            }
+            Some(
+                Container::BlockQuote { .. }
+                | Container::ListItem { .. }
+                | Container::Details { .. },
+            ) => self.containers.len(),
             Some(Container::List { .. }) => unreachable!("dangling lists were just closed"),
         };
         let count = self.pending_source_gaps[slot];
@@ -805,6 +893,11 @@ impl BlockParser {
                 ..
             })
             | Some(Container::ListItem {
+                children,
+                blank_lines_before: child_gaps,
+                ..
+            })
+            | Some(Container::Details {
                 children,
                 blank_lines_before: child_gaps,
                 ..
@@ -863,6 +956,7 @@ impl BlockParser {
                 let block = Block::List { kind, tight, items };
                 self.push_block(block, leading_blank_lines);
             }
+            Container::Details { .. } => self.finish_details(c, None),
         }
     }
 
@@ -917,6 +1011,518 @@ impl BlockParser {
                 *tight = false;
                 *last_blank = false;
             }
+        }
+    }
+
+    fn details_is_current_parent(&self) -> bool {
+        match self.containers.last() {
+            Some(Container::Details { .. }) => true,
+            Some(Container::List { .. }) => self
+                .containers
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| matches!(c, Container::Details { .. })),
+            _ => false,
+        }
+    }
+
+    fn try_close_details(&mut self, rest: &str, probe_off: usize) -> bool {
+        let Some(close) = details::parse_details_closer_line(rest) else {
+            return false;
+        };
+        if !self.details_is_current_parent() {
+            return false;
+        }
+        if self.summary_blocks_details_close() {
+            return false;
+        }
+        if let Some((inner, leftover)) = self.finalize_collecting_summary() {
+            let raw_lines = self.take_collecting_raw_lines();
+            self.apply_summary_action(SummaryAction::Complete {
+                inner,
+                raw_lines,
+                leftover,
+            });
+        }
+        self.close_leaf();
+        self.close_dangling_lists();
+        let closer_end = self.line_start + probe_off + close.tag_end;
+        let closer_raw = rest.trim_matches([' ', '\t']).to_string();
+        if let Some(Container::Details { .. }) = self.containers.last() {
+            let c = self.containers.pop().unwrap();
+            self.finish_details(c, Some((closer_raw, closer_end)));
+            return true;
+        }
+        false
+    }
+
+    fn summary_blocks_details_close(&self) -> bool {
+        matches!(
+            self.containers.last(),
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { collector, .. },
+                ..
+            }) if collector.has_unmatched_openers()
+        )
+    }
+
+    fn finalize_collecting_summary(&self) -> Option<(String, Vec<String>)> {
+        match self.containers.last() {
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { collector, .. },
+                ..
+            }) => collector.finalize(),
+            _ => None,
+        }
+    }
+
+    fn take_collecting_raw_lines(&mut self) -> Vec<String> {
+        match self.containers.last_mut() {
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { raw_lines, .. },
+                ..
+            }) => std::mem::take(raw_lines),
+            _ => Vec::new(),
+        }
+    }
+
+    fn try_open_details(&mut self, rest: &str, probe_off: usize) -> bool {
+        let tag_start_abs = self.line_start + probe_off;
+        if tag_start_abs >= self.details_window {
+            return false;
+        }
+        let Some(open) = details::parse_details_opener_line(rest) else {
+            return false;
+        };
+        let tag_end_abs = tag_start_abs + open.tag_end;
+        if tag_end_abs > self.details_window {
+            return false;
+        }
+        if self.containers.len() >= self.container_depth_limit {
+            return false;
+        }
+        self.close_leaf();
+        let opener_raw = rest.trim_matches([' ', '\t']).to_string();
+        let leading_blank_lines = self.take_pending_source_gap();
+        self.containers.push(Container::Details {
+            open: open.open,
+            opener_raw,
+            children: Vec::new(),
+            blank_lines_before: Vec::new(),
+            leading_blank_lines,
+            summary_inner: None,
+            summary_raw_lines: Vec::new(),
+            summary_replayed: false,
+            pre_summary_gap: 0,
+            summary_state: SummaryState::AwaitingFirstNonblank,
+            failed: false,
+        });
+        true
+    }
+
+    fn details_is_collecting_summary(&self) -> bool {
+        matches!(
+            self.containers.last(),
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { .. },
+                ..
+            })
+        )
+    }
+
+    fn end_summary_eligibility(&mut self) {
+        if let Some(Container::Details {
+            summary_state: state @ SummaryState::AwaitingFirstNonblank,
+            ..
+        }) = self.containers.last_mut()
+        {
+            *state = SummaryState::Done;
+        }
+    }
+
+    fn summary_scan_budget(&self, probe_off: usize) -> usize {
+        self.details_window
+            .saturating_sub(self.line_start.saturating_add(probe_off))
+    }
+
+    fn line_extends_past_window(&self, probe_off: usize, rest: &str) -> bool {
+        self.line_start
+            .saturating_add(probe_off)
+            .saturating_add(rest.len())
+            > self.details_window
+    }
+
+    fn try_accept_summary_line(&mut self, rest: &str, probe_off: usize) -> bool {
+        let budget = self.summary_scan_budget(probe_off);
+        let extends_past = self.line_extends_past_window(probe_off, rest);
+        if budget == 0 {
+            return match self.containers.last() {
+                Some(Container::Details {
+                    summary_state: SummaryState::AwaitingFirstNonblank,
+                    ..
+                }) => {
+                    self.end_summary_eligibility();
+                    false
+                }
+                Some(Container::Details {
+                    summary_state: SummaryState::Collecting { .. },
+                    ..
+                }) => {
+                    let raw = self.take_collecting_raw_lines();
+                    self.apply_summary_action(SummaryAction::FailReplay {
+                        raw_lines: raw,
+                        consume: false,
+                    })
+                }
+                _ => false,
+            };
+        }
+        let action = match self.containers.last() {
+            Some(Container::Details {
+                summary_state: SummaryState::Done,
+                ..
+            }) => return false,
+            Some(Container::Details {
+                summary_state: SummaryState::AwaitingFirstNonblank,
+                ..
+            }) => match details::parse_summary_line_bounded(rest, budget) {
+                SummaryLine::NotSummary => SummaryAction::MarkDone,
+                SummaryLine::Complete { inner } => SummaryAction::Complete {
+                    inner,
+                    raw_lines: vec![rest.to_string()],
+                    leftover: Vec::new(),
+                },
+                SummaryLine::OpenOnly { after_open } => {
+                    if extends_past {
+                        SummaryAction::FailAndContinue
+                    } else {
+                        SummaryAction::Hold {
+                            collector: details::SummaryCollector::from_after_open(&after_open),
+                            raw_lines: vec![rest.to_string()],
+                        }
+                    }
+                }
+                SummaryLine::Malformed => SummaryAction::FailAndContinue,
+            },
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { .. },
+                ..
+            }) => {
+                if extends_past {
+                    let raw = self.take_collecting_raw_lines();
+                    return self.apply_summary_action(SummaryAction::FailReplay {
+                        raw_lines: raw,
+                        consume: false,
+                    });
+                }
+                return self.continue_collecting_summary(rest, budget);
+            }
+            _ => return false,
+        };
+        self.apply_summary_action(action)
+    }
+
+    fn continue_collecting_summary(&mut self, rest: &str, budget: usize) -> bool {
+        let outcome = match self.containers.last_mut() {
+            Some(Container::Details {
+                summary_state:
+                    SummaryState::Collecting {
+                        collector,
+                        raw_lines,
+                    },
+                ..
+            }) => {
+                let continue_result = collector.push_line(rest, budget);
+                match continue_result {
+                    SummaryContinue::Complete { inner } => {
+                        raw_lines.push(rest.to_string());
+                        Some(SummaryAction::Complete {
+                            inner,
+                            raw_lines: std::mem::take(raw_lines),
+                            leftover: Vec::new(),
+                        })
+                    }
+                    SummaryContinue::StillOpen => {
+                        raw_lines.push(rest.to_string());
+                        None
+                    }
+                    SummaryContinue::Malformed => {
+                        raw_lines.push(rest.to_string());
+                        Some(SummaryAction::FailReplay {
+                            raw_lines: std::mem::take(raw_lines),
+                            consume: true,
+                        })
+                    }
+                }
+            }
+            _ => return false,
+        };
+        match outcome {
+            Some(action) => self.apply_summary_action(action),
+            None => true,
+        }
+    }
+
+    fn apply_summary_action(&mut self, action: SummaryAction) -> bool {
+        match action {
+            SummaryAction::MarkDone => {
+                if let Some(Container::Details { summary_state, .. }) = self.containers.last_mut() {
+                    *summary_state = SummaryState::Done;
+                }
+                false
+            }
+            SummaryAction::Complete {
+                inner,
+                raw_lines,
+                leftover,
+            } => {
+                let leftover_n = leftover.len();
+                let (summary_lines, leftover_raw) =
+                    if leftover_n > 0 && leftover_n <= raw_lines.len() {
+                        let split_at = raw_lines.len() - leftover_n;
+                        let leftover_raw = raw_lines[split_at..].to_vec();
+                        (raw_lines[..split_at].to_vec(), leftover_raw)
+                    } else {
+                        (raw_lines, leftover)
+                    };
+                let gap = self.current_details_gap();
+                if let Some(Container::Details {
+                    summary_state,
+                    summary_inner,
+                    summary_raw_lines,
+                    pre_summary_gap,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *summary_inner = if details::summary_inner_is_empty(&inner) {
+                        None
+                    } else {
+                        Some(inner)
+                    };
+                    *summary_raw_lines = summary_lines;
+                    *pre_summary_gap = gap;
+                    *summary_state = SummaryState::Done;
+                }
+                self.clear_current_details_gap();
+                if !leftover_raw.is_empty() {
+                    self.replay_ordinary_lines(leftover_raw, 0);
+                }
+                true
+            }
+            SummaryAction::Hold {
+                collector,
+                raw_lines,
+            } => {
+                let gap = self.current_details_gap();
+                if let Some(Container::Details {
+                    summary_state,
+                    pre_summary_gap,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *pre_summary_gap = gap;
+                    *summary_state = SummaryState::Collecting {
+                        collector: Box::new(collector),
+                        raw_lines,
+                    };
+                }
+                self.clear_current_details_gap();
+                true
+            }
+            SummaryAction::FailAndContinue => {
+                if let Some(Container::Details {
+                    summary_state,
+                    failed,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *failed = true;
+                    *summary_state = SummaryState::Done;
+                }
+                false
+            }
+            SummaryAction::FailReplay { raw_lines, consume } => {
+                let gap = self.current_details_pre_gap();
+                if let Some(Container::Details {
+                    summary_state,
+                    failed,
+                    summary_replayed,
+                    ..
+                }) = self.containers.last_mut()
+                {
+                    *failed = true;
+                    *summary_state = SummaryState::Done;
+                    *summary_replayed = true;
+                }
+                self.replay_ordinary_lines(raw_lines, gap);
+                consume
+            }
+        }
+    }
+
+    fn current_details_gap(&self) -> u8 {
+        if matches!(self.containers.last(), Some(Container::Details { .. })) {
+            self.pending_source_gaps[self.containers.len()]
+        } else {
+            0
+        }
+    }
+
+    fn current_details_pre_gap(&self) -> u8 {
+        match self.containers.last() {
+            Some(Container::Details {
+                pre_summary_gap, ..
+            }) if *pre_summary_gap > 0 => *pre_summary_gap,
+            Some(Container::Details { .. }) => self.current_details_gap(),
+            _ => 0,
+        }
+    }
+
+    fn flush_held_summary_on_blank(&mut self) {
+        if let Some((inner, leftover)) = self.finalize_collecting_summary() {
+            let raw_lines = self.take_collecting_raw_lines();
+            self.apply_summary_action(SummaryAction::Complete {
+                inner,
+                raw_lines,
+                leftover,
+            });
+            return;
+        }
+        let held = match self.containers.last() {
+            Some(Container::Details {
+                summary_state: SummaryState::Collecting { raw_lines, .. },
+                ..
+            }) => raw_lines.clone(),
+            _ => return,
+        };
+        self.apply_summary_action(SummaryAction::FailReplay {
+            raw_lines: held,
+            consume: true,
+        });
+    }
+
+    fn clear_current_details_gap(&mut self) {
+        if let Some(Container::Details { .. }) = self.containers.last() {
+            self.pending_source_gaps[self.containers.len()] = 0;
+        }
+    }
+
+    fn finish_details(&mut self, c: Container, closer: Option<(String, usize)>) {
+        let Container::Details {
+            open,
+            opener_raw,
+            mut children,
+            mut blank_lines_before,
+            leading_blank_lines,
+            summary_inner,
+            summary_raw_lines,
+            summary_replayed,
+            pre_summary_gap,
+            summary_state,
+            failed,
+        } = c
+        else {
+            unreachable!("finish_details requires Details");
+        };
+
+        let (still_collecting, collecting_raw) = match summary_state {
+            SummaryState::Collecting { raw_lines, .. } => (true, raw_lines),
+            _ => (false, summary_raw_lines),
+        };
+
+        let matched = !failed
+            && !still_collecting
+            && closer
+                .as_ref()
+                .is_some_and(|(_, end)| *end <= self.details_window);
+        if !matched {
+            if !summary_replayed && !collecting_raw.is_empty() {
+                let (mut restored, mut restored_gaps) =
+                    self.parse_ordinary_line_blocks(collecting_raw, pre_summary_gap);
+                restored.append(&mut children);
+                restored_gaps.append(&mut blank_lines_before);
+                children = restored;
+                blank_lines_before = restored_gaps;
+            }
+            return self.fallback_details(
+                opener_raw,
+                children,
+                blank_lines_before,
+                leading_blank_lines,
+                closer.map(|(raw, _)| raw),
+            );
+        }
+
+        let summary = match summary_inner {
+            Some(raw) => vec![Inline::Text(raw)],
+            None => Vec::new(),
+        };
+        self.push_block(
+            Block::Details {
+                summary,
+                open,
+                body: children,
+                blank_lines_before,
+            },
+            leading_blank_lines,
+        );
+    }
+
+    fn parse_ordinary_line_blocks(
+        &mut self,
+        lines: Vec<String>,
+        first_gap: u8,
+    ) -> (Vec<Block>, Vec<u8>) {
+        // Replay the bounded held source through the ordinary block parser so
+        // setext headings, verbatim leaves, tables, and container continuations
+        // have the same semantics as non-disclosure Markdown. A zero window
+        // prevents disclosure recognition (and recursive fallback) on replay.
+        let mut replay = Self::new(0);
+        replay.container_depth_limit = self
+            .container_depth_limit
+            .saturating_sub(self.containers.len());
+        replay.refs = std::mem::take(&mut self.refs);
+        replay.pending_source_gaps[0] = first_gap;
+        for line in lines {
+            replay.feed(&line, 0);
+        }
+        replay.finish();
+        self.refs = replay.refs;
+        (replay.root, replay.root_blank_lines_before)
+    }
+
+    fn replay_ordinary_lines(&mut self, lines: Vec<String>, first_gap: u8) {
+        let (blocks, gaps) = self.parse_ordinary_line_blocks(lines, first_gap);
+        for (block, gap) in blocks.into_iter().zip(gaps) {
+            self.push_block(block, gap);
+        }
+    }
+
+    fn fallback_details(
+        &mut self,
+        opener_raw: String,
+        children: Vec<Block>,
+        child_gaps: Vec<u8>,
+        leading_blank_lines: u8,
+        closer_raw: Option<String>,
+    ) {
+        self.push_block(
+            Block::Paragraph {
+                inlines: vec![Inline::Text(opener_raw)],
+            },
+            leading_blank_lines,
+        );
+        for (block, gap) in children.into_iter().zip(child_gaps) {
+            self.push_block(block, gap);
+        }
+        if let Some(closer_raw) = closer_raw {
+            self.push_block(
+                Block::Paragraph {
+                    inlines: vec![Inline::Text(closer_raw)],
+                },
+                0,
+            );
         }
     }
 }
@@ -1343,6 +1949,12 @@ impl BlockParser {
             return false;
         }
         if try_open_list_marker(bytes, cursor.col, cursor.off, true).is_some() {
+            return false;
+        }
+        let rest_str = std::str::from_utf8(rest).unwrap_or("");
+        if details::parse_details_opener_line(rest_str).is_some()
+            || details::parse_details_closer_line(rest_str).is_some()
+        {
             return false;
         }
         if let Some(open) = try_open_list_marker(bytes, probe_col, probe_off, false)

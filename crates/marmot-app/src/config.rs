@@ -53,6 +53,8 @@ pub enum CursorPersistence {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
+    /// Disable exporters for short-lived command processes. Frozen cursors always disable them.
+    pub usage_diagnostics_silent: bool,
     pub directory_max_future_skew: Duration,
     /// Host-configured WebSocket relays used for Nostr directory reads such as
     /// relay-list and KeyPackage discovery.
@@ -207,6 +209,7 @@ pub struct MarmotAppConfig {
 /// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarmotServiceEndpoints {
+    pub product_analytics_events_endpoint: Option<String>,
     pub relay_telemetry_otlp_endpoint: Option<String>,
     pub audit_log_tracker_endpoint: Option<String>,
     pub encrypted_media_blob_endpoints: Vec<String>,
@@ -225,6 +228,7 @@ pub struct MarmotServiceEndpoints {
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
+            usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
             service_endpoints: MarmotServiceEndpoints::compiled(),
@@ -444,6 +448,10 @@ impl MarmotAppConfig {
 impl MarmotServiceEndpoints {
     pub fn compiled() -> Self {
         Self {
+            product_analytics_events_endpoint: option_env!(
+                "MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT"
+            )
+            .map(str::to_owned),
             relay_telemetry_otlp_endpoint: COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT
                 .map(str::to_owned),
             audit_log_tracker_endpoint: COMPILED_AUDIT_LOG_TRACKER_ENDPOINT.map(str::to_owned),
@@ -460,6 +468,8 @@ impl MarmotServiceEndpoints {
     }
 
     pub fn normalize(mut self) -> Self {
+        self.product_analytics_events_endpoint =
+            trim_optional(self.product_analytics_events_endpoint);
         self.relay_telemetry_otlp_endpoint = trim_optional(self.relay_telemetry_otlp_endpoint);
         self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
         self.encrypted_media_blob_endpoints =
@@ -523,7 +533,8 @@ impl std::fmt::Debug for RelayTelemetryRuntimeConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditLogUploadSource {
-    pub device_label: Option<String>,
+    /// System model identifier; never a user-assigned device name, hostname, or serial number.
+    pub hardware_model: Option<String>,
     pub platform: Option<String>,
     pub app_version: Option<String>,
 }
@@ -569,7 +580,7 @@ impl RelayTelemetryResource {
 
     fn normalize(mut self) -> Result<Self, String> {
         self.service_version = trim_required("service.version", self.service_version)?;
-        self.service_instance_id = trim_required("service.instance.id", self.service_instance_id)?;
+        self.service_instance_id = self.service_instance_id.trim().to_owned();
         self.deployment_environment =
             trim_required("deployment.environment.name", self.deployment_environment)?;
         self.tenant = trim_required("tenant", self.tenant)?;
@@ -606,7 +617,7 @@ impl RelayTelemetryRuntimeConfig {
 
 impl AuditLogUploadSource {
     fn normalize(mut self) -> Self {
-        self.device_label = trim_optional(self.device_label);
+        self.hardware_model = trim_optional(self.hardware_model);
         self.platform = trim_optional(self.platform);
         self.app_version = trim_optional(self.app_version);
         self

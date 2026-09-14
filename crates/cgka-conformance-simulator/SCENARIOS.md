@@ -871,6 +871,19 @@ exercises the retained-join pending-work condition. Generator tests compile the 
 executing the expensive large/xlarge cases. Run 32/64-member blocks in nightly isolated workers and keep
 128/200-member execution scheduled or manual until measured budgets justify wider promotion.
 
+A refused engine create, including the large-Welcome wrap refusal on case `8001/30` (`large-anchor-64` bulk
+application fanout), is a serializable subject-step failure. Default regressions inject that refusal through a
+test-only peeler wrapper in `subject::tests`. The real 64-member report/campaign boundary is ignored by default:
+
+```sh
+cargo test -p cgka-conformance-simulator --locked --bin cgka-conformance-campaign -- \
+  --ignored --exact tests::large_group_pressure_8001_30_reports_create_refusal
+```
+
+That fixture persists `GeneratedScenarioInputV1` first, then replays it with the campaign worker
+(`--worker --input FILE --storage file --out NEW_DIR`) and checks the report, fixture candidate, and portable
+`synthetic_shareable` capsule. Do not commit generated replay artifacts or checkpoints.
+
 ### `convergence-chaos/v1`
 
 - Generator: `generate_convergence_chaos_family` (generator version `6`).
@@ -1117,8 +1130,11 @@ command's return value), fresh traffic flows in every direction, history survive
 within three minutes. Journey 08 is strict by default: a profile edit the runtime reported as saved reaches the settled
 state when the winner left its field untouched; a same-field race is reported to the host as a conflict (#1734). The
 strict 30-second leave regression also runs ordinarily after the SelfRemove deadline scheduling correction (#1736).
-The strict form of journey 09 remains ignored for the stranded-invitee gap (#1735): an invitee excluded by the canonical
-branch must hold no projection, and a losing invite needs recovery beyond the current re-invitation report.
+The opt-in strict form of journey 09 chooses the losing inviter identity and requires automatic fresh-material recovery,
+recipient-confirmed rejoin, and matching public membership/name plus fresh bidirectional messages. The rejoin offer
+survives reopen before consent, and its accepted projection survives reopen after consent (#1735). Real-socket scheduling
+cannot guarantee both mutations use the same epoch; a missed race is inconclusive evidence, so the strict diagnostic
+is excluded from required CI. The deterministic engine recovery regression remains required.
 The manual self-update journey runs with zeroed maintenance windows when built with `test-policy-overrides`
 (`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter
 run on real time.

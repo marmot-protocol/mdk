@@ -664,6 +664,7 @@ impl AccountHome {
 
     /// Retain the last cancelled checkpoint while removing its active gate.
     /// The caller must first durably sign out and retain any setup journal.
+    /// A later cancellation replaces this evidence even if publication is uncertain.
     pub fn archive_account_onboarding(&self, account_ref: &str) -> AccountHomeResult<()> {
         let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         let account = self.account(account_ref)?;
@@ -682,6 +683,59 @@ impl AccountHome {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Private opaque recovery journal. The app owns its schema and retains the
+    /// interrupted checkpoints here before clearing their active gates.
+    pub fn set_account_onboarding_recovery(
+        &self,
+        account_ref: &str,
+        bytes: &[u8],
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        write_secret_bytes(
+            self.account_dir(&account.label)
+                .join("onboarding-recovery.json"),
+            bytes,
+        )
+    }
+
+    pub fn account_onboarding_recovery(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(
+            self.account_dir(&account.label)
+                .join("onboarding-recovery.json"),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace old gates with an app-supplied recovery tombstone. Write the
+    /// active gate before atomically renaming it over the cancelled gate, so
+    /// older readers always encounter a checkpoint they must validate.
+    pub fn finish_recovered_account_onboarding(
+        &self,
+        account_ref: &str,
+        tombstone: &[u8],
+    ) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.signed_out || self.account_onboarding_recovery(&account.label)?.is_none() {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let directory = self.account_dir(&account.label);
+        write_secret_bytes(directory.join("onboarding.json"), tombstone)?;
+        fs::rename(
+            directory.join("onboarding.json"),
+            directory.join("onboarding-cancelled.json"),
+        )?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
     }
 
     /// Read the retained cancellation record for an explicit onboarding restart.

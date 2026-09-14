@@ -623,6 +623,11 @@ impl AccountDeviceSession {
         Ok(self.engine.put_periodic_maintenance_policy(policy)?)
     }
 
+    /// Abandon a group locally without sending a leave or disband.
+    pub fn forget_group_local(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.forget_group_local(group_id)?)
+    }
+
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
         Ok(self.engine.group_record(group_id)?)
     }
@@ -668,6 +673,11 @@ impl AccountDeviceSession {
     /// Backs the application's per-group recovery surface (mdk#426).
     pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
         self.engine.quarantined_groups()
+    }
+
+    /// Number of currently quarantined groups without cloning their identities.
+    pub fn quarantined_group_count(&self) -> usize {
+        self.engine.quarantined_group_count()
     }
 
     /// Re-attempt hydration of a single quarantined group. Returns `Ok(true)`
@@ -1082,6 +1092,57 @@ impl AccountDeviceSession {
         &mut self,
     ) -> SessionResult<Vec<SupersededIntentReport>> {
         Ok(self.engine.reissue_superseded_own_commits_from_state()?)
+    }
+
+    pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
+        Ok(self.engine.retry_rejoins_after_trusted_removal().await?)
+    }
+
+    pub fn pending_group_rejoins_for(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
+        Ok(self.engine.pending_group_rejoins_for(Some(group_id))?)
+    }
+
+    pub async fn confirm_group_rejoin(
+        &mut self,
+        welcome_id: &MessageId,
+        token: &[u8],
+    ) -> SessionResult<GroupId> {
+        Ok(self.engine.confirm_group_rejoin(welcome_id, token).await?)
+    }
+
+    pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.decline_group_rejoin(welcome_id)?)
+    }
+
+    pub fn reinvite_recovery_records(
+        &self,
+    ) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        Ok(self.engine.reinvite_recovery_records()?)
+    }
+
+    pub fn pending_reinvites(&self) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        Ok(self.engine.pending_reinvites()?)
+    }
+
+    pub fn reserve_reinvite_lookup(
+        &mut self,
+        commit_id: &MessageId,
+        now_ms: u64,
+    ) -> SessionResult<bool> {
+        Ok(self.engine.reserve_reinvite_lookup(commit_id, now_ms)?)
+    }
+
+    pub fn reissue_invite_with_key_packages(
+        &mut self,
+        commit_id: &MessageId,
+        packages: Vec<KeyPackage>,
+    ) -> SessionResult<Option<SupersededIntentReport>> {
+        Ok(self
+            .engine
+            .reissue_invite_with_key_packages(commit_id, packages)?)
     }
 
     /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.

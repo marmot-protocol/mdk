@@ -408,6 +408,15 @@ jobs:
         if: matrix.partition == 1
         run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
 
+      - name: Test consent and both diagnostic exporters
+        if: matrix.partition == 1
+        run: |
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --test relay_telemetry_otlp --locked
+          cargo test -p marmot-c --features otlp-export,product-analytics-export,alloc-audit product_analytics --locked
+          cargo test -p agent-connector --features otlp-export,product-analytics-export usage_diagnostics:: --locked
+
   cli-e2e:
     name: CLI e2e (mock relay)
     needs: changes

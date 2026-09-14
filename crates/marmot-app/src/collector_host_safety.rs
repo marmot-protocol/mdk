@@ -10,20 +10,20 @@ use std::{
 use cgka_traits::app_components::{is_loopback_ip, reject_non_public_ip};
 use url::{Host, Url};
 
-use super::RelayExportError;
 use crate::config::{endpoint_host_is_loopback, parse_relay_telemetry_endpoint};
+use crate::relay_telemetry_export::RelayExportError;
 
-pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Deliberately no Debug: the configured URL and DNS answers are private.
-pub(super) struct PinnedCollector {
-    pub(super) url: Url,
+pub(crate) struct PinnedCollector {
+    pub(crate) url: Url,
     addrs: Vec<SocketAddr>,
 }
 
 impl PinnedCollector {
-    pub(super) fn build_client(&self) -> Result<reqwest::Client, RelayExportError> {
+    pub(crate) fn build_client(&self) -> Result<reqwest::Client, RelayExportError> {
         self.build_client_from(reqwest::Client::builder())
     }
 
@@ -49,13 +49,13 @@ impl PinnedCollector {
     }
 }
 
-pub(super) async fn system_resolve(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
+pub(crate) async fn system_resolve(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
     tokio::net::lookup_host((host.as_str(), port))
         .await
         .map(|addrs| addrs.map(|addr| addr.ip()).collect())
 }
 
-pub(super) async fn resolve_with<F, Fut>(
+pub(crate) async fn resolve_with<F, Fut>(
     endpoint: &str,
     resolver: F,
 ) -> Result<PinnedCollector, RelayExportError>

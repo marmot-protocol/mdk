@@ -57,6 +57,19 @@ impl EpochManager {
         Self::default()
     }
 
+    pub(crate) fn pending_refs_for_group(&self, group_id: &GroupId) -> Vec<PendingStateRef> {
+        self.pending
+            .iter()
+            .filter(|(_, meta)| &meta.group_id == group_id)
+            .map(|(reference, _)| *reference)
+            .collect()
+    }
+
+    pub(crate) fn forget_group(&mut self, group_id: &GroupId) {
+        self.states.remove(group_id);
+        self.pending.retain(|_, meta| &meta.group_id != group_id);
+    }
+
     // ── Read-only queries ──────────────────────────────────────────────────
 
     pub(crate) fn state(&self, group_id: &GroupId) -> Option<&EpochState> {

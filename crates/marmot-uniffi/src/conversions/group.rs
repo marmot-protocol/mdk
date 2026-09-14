@@ -808,6 +808,36 @@ mod group_roster_tests {
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
     }
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
+
+    #[test]
+    fn normalize_member_ref_ffi_matches_shared_corpus() {
+        for case in cases() {
+            match case.ffi_account_id_hex {
+                Some(expected) => {
+                    let normalized = normalize_member_ref_ffi(&case.reference)
+                        .unwrap_or_else(|_| panic!("case {} should decode", case.name));
+                    assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
+                    assert_eq!(normalized.member_ref, expected, "case {}", case.name);
+                    assert_eq!(normalized.npub, NPUB, "case {}", case.name);
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            normalize_member_ref_ffi(&case.reference),
+                            Err(MarmotKitError::InvalidIdentity { .. })
+                        ),
+                        "case {} should reject",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn member_ids_page_row_preserves_group_member_and_admin_identifiers() {
         let ffi = AppGroupMemberIdsFfi::from(AppGroupMemberIds {
@@ -818,5 +848,46 @@ mod group_roster_tests {
         assert_eq!(ffi.group_id_hex, "01".repeat(16));
         assert_eq!(ffi.member_ids_hex, vec!["02".repeat(32), "03".repeat(32)]);
         assert_eq!(ffi.admin_ids_hex, vec!["02".repeat(32)]);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupRejoinInvitationFfi {
+    pub welcome_id_hex: String,
+    pub welcomer_account_id_hex: String,
+    pub epoch: u64,
+    pub local_state_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupRecoveryStatusFfi {
+    pub group_id_hex: String,
+    /// Repeated completed replays failed to restore synchronization; not membership evidence.
+    pub automatic_recovery_failed: bool,
+    /// Lost invitations awaiting fresh material on this inviter device.
+    pub pending_reinvites: u32,
+    /// Exhausted recovery attempts requiring a new user-initiated invitation.
+    pub failed_reinvites: u32,
+    pub rejoin_invitations: Vec<GroupRejoinInvitationFfi>,
+}
+
+impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
+    fn from(value: marmot_app::GroupRecoveryStatus) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            automatic_recovery_failed: value.automatic_recovery_failed,
+            pending_reinvites: value.pending_reinvites,
+            failed_reinvites: value.failed_reinvites,
+            rejoin_invitations: value
+                .rejoin_invitations
+                .into_iter()
+                .map(|offer| GroupRejoinInvitationFfi {
+                    welcome_id_hex: offer.welcome_id_hex,
+                    welcomer_account_id_hex: offer.welcomer_account_id_hex,
+                    epoch: offer.epoch,
+                    local_state_token: offer.local_state_token,
+                })
+                .collect(),
+        }
     }
 }

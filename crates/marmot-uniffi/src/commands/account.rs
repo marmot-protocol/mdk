@@ -365,7 +365,8 @@ impl Marmot {
     }
 
     /// List the local and relay-discovered Marmot KeyPackage publications for
-    /// `account_ref`.
+    /// `account_ref`. Relay-backed rows are the current winner per addressable
+    /// slot in the validated fetch window.
     pub async fn account_key_packages(
         &self,
         account_ref: String,
@@ -374,6 +375,23 @@ impl Marmot {
         Ok(self
             .runtime
             .account_key_packages(&account_ref, endpoints(&bootstrap_relays))
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Observed relay history for `account_ref`: current and superseded
+    /// kind-30443 events from one validated fetch window. Clients can pass a
+    /// superseded event id and its source relays to the existing deletion API.
+    pub async fn account_key_package_relay_events(
+        &self,
+        account_ref: String,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<Vec<conversions::AccountKeyPackageRelayEventFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_key_package_relay_events(&account_ref, endpoints(&bootstrap_relays))
             .await?
             .into_iter()
             .map(Into::into)

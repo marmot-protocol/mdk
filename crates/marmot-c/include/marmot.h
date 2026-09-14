@@ -130,6 +130,25 @@ enum MarmotStatus
   MARMOT_STATUS_GROUP_REMOVED = 63,
   MARMOT_STATUS_ONBOARDING_ACTION_UNAVAILABLE = 64,
   MARMOT_STATUS_ONBOARDING_REQUIRED = 65,
+  MARMOT_STATUS_CONSENT_REQUIRED = 66,
+  MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67,
+  MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68,
+  MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY = 69,
+  /**
+   * An `imeta` reference failed the shared strict parser (mdk#1787).
+   * The detail string carries the stable rejection kind label and the
+   * presentation text.
+   */
+  MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED = 70,
+  /**
+   * The reference is valid but no locator may be fetched under the
+   * current policy; nothing was dialed.
+   */
+  MARMOT_STATUS_MEDIA_UNFETCHABLE = 71,
+  /**
+   * Fetch, integrity, or decryption failed after a locator was selected.
+   */
+  MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED = 72,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -413,6 +432,20 @@ typedef enum MarmotChatConversationKind {
   MARMOT_CHAT_CONVERSATION_KIND_GROUP,
 } MarmotChatConversationKind;
 
+typedef enum MarmotPresentationSource {
+  MARMOT_PRESENTATION_SOURCE_GROUP,
+  MARMOT_PRESENTATION_SOURCE_PEER_PROFILE,
+  MARMOT_PRESENTATION_SOURCE_PEER_FALLBACK,
+  MARMOT_PRESENTATION_SOURCE_GROUP_FALLBACK,
+  MARMOT_PRESENTATION_SOURCE_UNKNOWN_FALLBACK,
+} MarmotPresentationSource;
+
+typedef enum MarmotPresentationResolution {
+  MARMOT_PRESENTATION_RESOLUTION_CACHED,
+  MARMOT_PRESENTATION_RESOLUTION_LAST_KNOWN,
+  MARMOT_PRESENTATION_RESOLUTION_FALLBACK,
+} MarmotPresentationResolution;
+
 /**
  * How far an account's setup has progressed.
  */
@@ -428,6 +461,27 @@ typedef enum MarmotAccountSetupReadiness {
    */
   MARMOT_ACCOUNT_SETUP_READINESS_RECOVERY_REQUIRED,
 } MarmotAccountSetupReadiness;
+
+/**
+ * Which profile field the query matched.
+ */
+typedef enum MarmotMatchedField {
+  MARMOT_MATCHED_FIELD_NAME,
+  MARMOT_MATCHED_FIELD_NIP05,
+  MARMOT_MATCHED_FIELD_DISPLAY_NAME,
+  MARMOT_MATCHED_FIELD_ABOUT,
+  MARMOT_MATCHED_FIELD_NPUB,
+  MARMOT_MATCHED_FIELD_PUBKEY,
+} MarmotMatchedField;
+
+/**
+ * How closely a result matched the query.
+ */
+typedef enum MarmotMatchQuality {
+  MARMOT_MATCH_QUALITY_EXACT,
+  MARMOT_MATCH_QUALITY_PREFIX,
+  MARMOT_MATCH_QUALITY_CONTAINS,
+} MarmotMatchQuality;
 
 /**
  * Where a prepared group image sits in the upload lifecycle.
@@ -511,6 +565,34 @@ typedef enum MarmotRetentionSweepStatus {
 } MarmotRetentionSweepStatus;
 
 /**
+ * Stable category of a rejected encrypted-media attachment (mdk#1787).
+ * Branch on this rather than on `detail`; the set only grows.
+ */
+typedef enum MarmotMediaAttachmentRejectionKind {
+  /**
+   * Not a decodable encrypted-media `imeta` tag.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_INVALID_STRUCTURE,
+  /**
+   * The `v` field is absent or names a format this build does not
+   * implement (legacy MIP-era and future shapes).
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_UNSUPPORTED_FORMAT,
+  /**
+   * A required field is absent or empty.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MISSING_FIELD,
+  /**
+   * A single-occurrence field appears more than once.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_DUPLICATE_FIELD,
+  /**
+   * A present field has an invalid value.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MALFORMED_FIELD,
+} MarmotMediaAttachmentRejectionKind;
+
+/**
  * Outcome class of a background collection.
  */
 typedef enum MarmotNotificationCollectionStatus {
@@ -556,6 +638,14 @@ typedef enum MarmotRelayEndpointPolicy {
    */
   MARMOT_RELAY_ENDPOINT_POLICY_UNSAFE,
 } MarmotRelayEndpointPolicy;
+
+typedef enum MarmotProductRecordResult {
+  MARMOT_PRODUCT_RECORD_RESULT_RECORDED,
+  MARMOT_PRODUCT_RECORD_RESULT_IGNORED_DISABLED,
+  MARMOT_PRODUCT_RECORD_RESULT_IGNORED_UNCONFIGURED,
+  MARMOT_PRODUCT_RECORD_RESULT_IGNORED_DUPLICATE,
+  MARMOT_PRODUCT_RECORD_RESULT_DROPPED_CAPACITY,
+} MarmotProductRecordResult;
 
 /**
  * Why a timeline delta fired.
@@ -609,25 +699,66 @@ typedef enum MarmotChatListUpdateTrigger {
 } MarmotChatListUpdateTrigger;
 
 /**
- * Which profile field the query matched.
+ * Relay endpoint policy used by `marmot_client_new_with_options`.
  */
-typedef enum MarmotMatchedField {
-  MARMOT_MATCHED_FIELD_NAME,
-  MARMOT_MATCHED_FIELD_NIP05,
-  MARMOT_MATCHED_FIELD_DISPLAY_NAME,
-  MARMOT_MATCHED_FIELD_ABOUT,
-  MARMOT_MATCHED_FIELD_NPUB,
-  MARMOT_MATCHED_FIELD_PUBKEY,
-} MarmotMatchedField;
+enum MarmotRelayPolicy
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  MARMOT_RELAY_POLICY_PUBLIC_ONLY = 0,
+  MARMOT_RELAY_POLICY_ALLOW_LOOPBACK = 1,
+  /**
+   * Also permit loopback blob endpoints for local media fixtures.
+   */
+  MARMOT_RELAY_POLICY_ALLOW_LOOPBACK_RELAYS_AND_BLOBS = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotRelayPolicy MarmotRelayPolicy;
+#else
+typedef uint32_t MarmotRelayPolicy;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
- * How closely a result matched the query.
+ * Transcript record type. Pass the discriminant as uint32_t.
  */
-typedef enum MarmotMatchQuality {
-  MARMOT_MATCH_QUALITY_EXACT,
-  MARMOT_MATCH_QUALITY_PREFIX,
-  MARMOT_MATCH_QUALITY_CONTAINS,
-} MarmotMatchQuality;
+enum MarmotPublisherRecord
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  MARMOT_PUBLISHER_RECORD_TEXT = 0,
+  MARMOT_PUBLISHER_RECORD_STATUS = 1,
+  MARMOT_PUBLISHER_RECORD_PROGRESS = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotPublisherRecord MarmotPublisherRecord;
+#else
+typedef uint32_t MarmotPublisherRecord;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Broker trust policy. AllowLoopback is an explicit local-test opt-in.
+ */
+enum MarmotPublisherTrust
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  MARMOT_PUBLISHER_TRUST_PUBLIC_ONLY = 0,
+  MARMOT_PUBLISHER_TRUST_ALLOW_LOOPBACK = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MarmotPublisherTrust MarmotPublisherTrust;
+#else
+typedef uint32_t MarmotPublisherTrust;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * What woke the background collection.
@@ -692,6 +823,8 @@ typedef enum MarmotSecretStoreStatus {
 typedef enum MarmotHostPerformanceOperation {
   MARMOT_HOST_PERFORMANCE_OPERATION_SPLASH_READY,
   MARMOT_HOST_PERFORMANCE_OPERATION_FOREGROUND_LOCAL_READY,
+  MARMOT_HOST_PERFORMANCE_OPERATION_OUTBOUND_MESSAGE_VISIBLE,
+  MARMOT_HOST_PERFORMANCE_OPERATION_INBOUND_MESSAGE_VISIBLE,
 } MarmotHostPerformanceOperation;
 
 /**
@@ -701,6 +834,12 @@ typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_SUCCESS,
   MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE,
 } MarmotHostPerformanceOutcome;
+
+/**
+ * Single live stream. Free before its creating `MarmotClient`; never free
+ * concurrently with an in-flight call on this handle.
+ */
+typedef struct MarmotAgentPublisher MarmotAgentPublisher;
 
 /**
  * Opaque handle to a live agent-text-stream watch: incremental
@@ -759,6 +898,12 @@ typedef struct MarmotNotificationsSubscription MarmotNotificationsSubscription;
  * A current onboarding snapshot followed by durable progress updates.
  */
 typedef struct MarmotOnboardingSubscription MarmotOnboardingSubscription;
+
+/**
+ * Account-bound complete chat-list snapshots. Free before the parent client.
+ * This fallible stream uses blocking next so storage errors retain their typed status.
+ */
+typedef struct MarmotPresentedChatListSubscription MarmotPresentedChatListSubscription;
 
 /**
  * Opaque handle to one conversation's materialized timeline window.
@@ -1043,6 +1188,7 @@ typedef struct MarmotOnboardingSingleDeviceNotice {
 
 typedef struct MarmotOnboardingSnapshot {
   char *account_id_hex;
+  char *recovery_epoch;
   uint64_t revision;
   bool ready;
   struct MarmotOnboardingStepState *steps;
@@ -1079,6 +1225,29 @@ typedef struct MarmotAccountKeyPackageList {
   struct MarmotAccountKeyPackage *items;
   uintptr_t len;
 } MarmotAccountKeyPackageList;
+
+/**
+ * One observed relay KeyPackage event, including superseded slot members.
+ */
+typedef struct MarmotAccountKeyPackageRelayEvent {
+  char *account_id_hex;
+  char *key_package_id;
+  char *key_package_ref_hex;
+  char *event_id_hex;
+  uint64_t created_at;
+  uint64_t key_package_bytes;
+  char **source_relays;
+  uintptr_t source_relays_len;
+  bool is_current;
+} MarmotAccountKeyPackageRelayEvent;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAccountKeyPackageRelayEventList {
+  struct MarmotAccountKeyPackageRelayEvent *items;
+  uintptr_t len;
+} MarmotAccountKeyPackageRelayEventList;
 
 /**
  * One published relay list (`kind` is the Nostr event kind).
@@ -1366,6 +1535,28 @@ typedef struct MarmotSendSummary {
   enum MarmotSendAcceptDisposition accept_disposition;
   enum MarmotSendMaintenanceDisposition maintenance_disposition;
 } MarmotSendSummary;
+
+/**
+ * Embedded replacement offer; show the authenticated inviter before confirmation.
+ */
+typedef struct MarmotGroupRejoinInvitation {
+  char *welcome_id_hex;
+  char *welcomer_account_id_hex;
+  uint64_t epoch;
+  char *local_state_token;
+} MarmotGroupRejoinInvitation;
+
+/**
+ * Durable advisory membership health and explicit rejoin offers.
+ */
+typedef struct MarmotGroupRecoveryStatus {
+  char *group_id_hex;
+  bool automatic_recovery_failed;
+  uint32_t pending_reinvites;
+  uint32_t failed_reinvites;
+  struct MarmotGroupRejoinInvitation *rejoin_invitations;
+  uintptr_t rejoin_invitations_len;
+} MarmotGroupRecoveryStatus;
 
 /**
  * The updated group record plus the decline publish summary.
@@ -1764,6 +1955,20 @@ typedef struct MarmotMarkdownTableRow {
 } MarmotMarkdownTableRow;
 
 /**
+ * Owned payload for [`MarmotMarkdownBlock::Details`]. Indirection keeps the
+ * existing tagged-union size and discriminants unchanged.
+ */
+typedef struct MarmotMarkdownDetails {
+  struct MarmotMarkdownInline *summary;
+  uintptr_t summary_len;
+  bool open;
+  struct MarmotMarkdownBlock *body;
+  uintptr_t body_len;
+  uint8_t *blank_lines_before;
+  uintptr_t blank_lines_before_len;
+} MarmotMarkdownDetails;
+
+/**
  * One block-level Markdown node.
  */
 typedef enum MarmotMarkdownBlock_Tag {
@@ -1775,6 +1980,7 @@ typedef enum MarmotMarkdownBlock_Tag {
   MARMOT_MARKDOWN_BLOCK_LIST_BLOCK,
   MARMOT_MARKDOWN_BLOCK_TABLE,
   MARMOT_MARKDOWN_BLOCK_MATH_BLOCK,
+  MARMOT_MARKDOWN_BLOCK_DETAILS,
 } MarmotMarkdownBlock_Tag;
 
 typedef struct MarmotMarkdownBlock_Paragraph_Body {
@@ -1824,6 +2030,10 @@ typedef struct MarmotMarkdownBlock_MathBlock_Body {
   char *content;
 } MarmotMarkdownBlock_MathBlock_Body;
 
+typedef struct MarmotMarkdownBlock_Details_Body {
+  struct MarmotMarkdownDetails *details;
+} MarmotMarkdownBlock_Details_Body;
+
 typedef struct MarmotMarkdownBlock {
   MarmotMarkdownBlock_Tag tag;
   union {
@@ -1834,6 +2044,7 @@ typedef struct MarmotMarkdownBlock {
     MarmotMarkdownBlock_ListBlock_Body LIST_BLOCK;
     MarmotMarkdownBlock_Table_Body TABLE;
     MarmotMarkdownBlock_MathBlock_Body MATH_BLOCK;
+    MarmotMarkdownBlock_Details_Body DETAILS;
   };
 } MarmotMarkdownBlock;
 
@@ -1959,6 +2170,91 @@ typedef struct MarmotChatListRowList {
   struct MarmotChatListRow *items;
   uintptr_t len;
 } MarmotChatListRowList;
+
+/**
+ * Typed text; hosts localize the fallback cases.
+ */
+typedef enum MarmotPresentationText_Tag {
+  MARMOT_PRESENTATION_TEXT_LITERAL,
+  MARMOT_PRESENTATION_TEXT_UNNAMED_GROUP,
+  MARMOT_PRESENTATION_TEXT_UNAVAILABLE_CONVERSATION,
+} MarmotPresentationText_Tag;
+
+typedef struct MarmotPresentationText_Literal_Body {
+  char *text;
+} MarmotPresentationText_Literal_Body;
+
+typedef struct MarmotPresentationText_UnnamedGroup_Body {
+  bool has_member_count;
+  uint64_t member_count;
+} MarmotPresentationText_UnnamedGroup_Body;
+
+typedef struct MarmotPresentationText {
+  MarmotPresentationText_Tag tag;
+  union {
+    MarmotPresentationText_Literal_Body LITERAL;
+    MarmotPresentationText_UnnamedGroup_Body UNNAMED_GROUP;
+  };
+} MarmotPresentationText;
+
+/**
+ * Descriptor only. Group image material remains owned by the containing result.
+ */
+typedef enum MarmotSelectedAvatar_Tag {
+  MARMOT_SELECTED_AVATAR_REMOTE_IMAGE,
+  MARMOT_SELECTED_AVATAR_ENCRYPTED_GROUP_IMAGE,
+  MARMOT_SELECTED_AVATAR_PLACEHOLDER,
+} MarmotSelectedAvatar_Tag;
+
+typedef struct MarmotSelectedAvatar_RemoteImage_Body {
+  char *url;
+  char *cache_key;
+} MarmotSelectedAvatar_RemoteImage_Body;
+
+typedef struct MarmotSelectedAvatar_EncryptedGroupImage_Body {
+  struct MarmotChatListAvatar image;
+  char *cache_key;
+} MarmotSelectedAvatar_EncryptedGroupImage_Body;
+
+typedef struct MarmotSelectedAvatar_Placeholder_Body {
+  char *stable_seed;
+  enum MarmotPresentationSource source;
+} MarmotSelectedAvatar_Placeholder_Body;
+
+typedef struct MarmotSelectedAvatar {
+  MarmotSelectedAvatar_Tag tag;
+  union {
+    MarmotSelectedAvatar_RemoteImage_Body REMOTE_IMAGE;
+    MarmotSelectedAvatar_EncryptedGroupImage_Body ENCRYPTED_GROUP_IMAGE;
+    MarmotSelectedAvatar_Placeholder_Body PLACEHOLDER;
+  };
+} MarmotSelectedAvatar;
+
+typedef struct MarmotConversationPresentation {
+  struct MarmotPresentationText title;
+  struct MarmotSelectedAvatar avatar;
+  enum MarmotPresentationSource title_source;
+  enum MarmotPresentationSource avatar_source;
+  char *peer_id;
+  enum MarmotPresentationResolution resolution;
+} MarmotConversationPresentation;
+
+typedef struct MarmotPresentedChatRow {
+  struct MarmotChatListRow row;
+  struct MarmotConversationPresentation presentation;
+} MarmotPresentedChatRow;
+
+typedef struct MarmotPresentationVersion {
+  uint8_t *account_store_epoch;
+  uintptr_t account_store_epoch_len;
+  uint64_t revision;
+} MarmotPresentationVersion;
+
+typedef struct MarmotPresentedChatListSnapshot {
+  struct MarmotPresentedChatRow *rows;
+  uintptr_t rows_len;
+  struct MarmotPresentationVersion presentation_version;
+} MarmotPresentedChatListSnapshot;
 
 /**
  * The account's pinned chats, in display order.
@@ -2087,6 +2383,10 @@ typedef struct MarmotMediaAttachmentReference {
  */
 typedef struct MarmotMediaRecord {
   char *message_id_hex;
+  /**
+   * Position among the source message's `imeta` tags, rejected
+   * siblings included, matching the timeline row's outcome index.
+   */
   uint32_t attachment_index;
   char *direction;
   char *group_id_hex;
@@ -2131,6 +2431,35 @@ typedef struct MarmotExistingDirectConversation {
   bool archived;
   uint64_t activity_sort_at;
 } MarmotExistingDirectConversation;
+
+/**
+ * One search hit, with typed attribution for why it matched.
+ */
+typedef struct MarmotUserDirectorySearchResult {
+  char *account_id_hex;
+  char *npub;
+  /**
+   * Social distance from the searching account.
+   */
+  uint8_t radius;
+  bool is_followed_by_searcher;
+  enum MarmotMatchedField matched_field;
+  enum MarmotMatchQuality match_quality;
+  bool has_provider_rank;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  double provider_rank;
+  struct MarmotUserProfileMetadata *profile;
+} MarmotUserDirectorySearchResult;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotUserDirectorySearchResultList {
+  struct MarmotUserDirectorySearchResult *items;
+  uintptr_t len;
+} MarmotUserDirectorySearchResultList;
 
 /**
  * What the local directory cache knows about one requested id.
@@ -2540,8 +2869,8 @@ typedef struct MarmotRelayTelemetryRuntimeConfig {
 } MarmotRelayTelemetryRuntimeConfig;
 
 /**
- * Optional device/app provenance attached to tracker uploads.
- * Borrowed input inside `MarmotAuditLogTrackerConfig`.
+ * Legacy ABI input. `device_label` is ignored and always returned NULL.
+ * Use the v4 config entry point to supply a system hardware model.
  */
 typedef struct MarmotAuditLogUploadSource {
   char *device_label;
@@ -2558,6 +2887,24 @@ typedef struct MarmotAuditLogTrackerConfig {
   char *authorization_bearer_token;
   struct MarmotAuditLogUploadSource source;
 } MarmotAuditLogTrackerConfig;
+
+/**
+ * V4 provenance. Hardware model must be system-sourced, never a device name.
+ */
+typedef struct MarmotAuditLogUploadSourceV4 {
+  char *hardware_model;
+  char *platform;
+  char *app_version;
+} MarmotAuditLogUploadSourceV4;
+
+/**
+ * V4 tracker input/output. Credentials are redacted from returned values.
+ */
+typedef struct MarmotAuditLogTrackerConfigV4 {
+  char *endpoint;
+  char *authorization_bearer_token;
+  struct MarmotAuditLogUploadSourceV4 source;
+} MarmotAuditLogTrackerConfigV4;
 
 /**
  * One attachment to encrypt and upload. Borrowed input only: the
@@ -2668,6 +3015,48 @@ typedef struct MarmotTimelineMessageQuery {
 } MarmotTimelineMessageQuery;
 
 /**
+ * Why one attachment was rejected. `detail` is privacy-safe
+ * presentation text from the shared parser; it never echoes tag
+ * content.
+ */
+typedef struct MarmotMediaAttachmentRejection {
+  enum MarmotMediaAttachmentRejectionKind kind;
+  char *detail;
+} MarmotMediaAttachmentRejection;
+
+/**
+ * One `imeta` attachment of a message, in tag order. `attachment_index`
+ * is the position among the message's `imeta` tags, rejected siblings
+ * included, so a host can render media and placeholders in order and
+ * correlate a timeline row with `MarmotMediaRecord` entries for the same
+ * message. Pass an `Accepted` reference to `marmot_download_media`;
+ * render `Rejected` as an unsupported/invalid attachment placeholder
+ * using `rejection.kind`.
+ */
+typedef enum MarmotMediaAttachmentOutcome_Tag {
+  MARMOT_MEDIA_ATTACHMENT_OUTCOME_ACCEPTED,
+  MARMOT_MEDIA_ATTACHMENT_OUTCOME_REJECTED,
+} MarmotMediaAttachmentOutcome_Tag;
+
+typedef struct MarmotMediaAttachmentOutcome_Accepted_Body {
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentReference reference;
+} MarmotMediaAttachmentOutcome_Accepted_Body;
+
+typedef struct MarmotMediaAttachmentOutcome_Rejected_Body {
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentRejection rejection;
+} MarmotMediaAttachmentOutcome_Rejected_Body;
+
+typedef struct MarmotMediaAttachmentOutcome {
+  MarmotMediaAttachmentOutcome_Tag tag;
+  union {
+    MarmotMediaAttachmentOutcome_Accepted_Body ACCEPTED;
+    MarmotMediaAttachmentOutcome_Rejected_Body REJECTED;
+  };
+} MarmotMediaAttachmentOutcome;
+
+/**
  * Preview of the message a timeline row replies to.
  */
 typedef struct MarmotTimelineReplyPreview {
@@ -2678,9 +3067,10 @@ typedef struct MarmotTimelineReplyPreview {
   uint64_t kind;
   char *media_json;
   /**
-   * Fully-resolved media references for the previewed message.
+   * Ordered per-attachment outcomes for the previewed message:
+   * accepted references plus typed rejections at their positions.
    */
-  struct MarmotMediaAttachmentReference *media;
+  struct MarmotMediaAttachmentOutcome *media;
   uintptr_t media_len;
   char *agent_text_stream_json;
   bool deleted;
@@ -2813,10 +3203,12 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotTimelineReplyPreview *reply_preview;
   char *media_json;
   /**
-   * Fully-resolved media references for this message; empty when
-   * it has no media.
+   * Ordered per-attachment outcomes for this message; empty when
+   * it has no media. A malformed or unsupported `imeta` attachment
+   * is a `Rejected` entry at its position with a typed reason; the
+   * text and valid sibling attachments are unaffected.
    */
-  struct MarmotMediaAttachmentReference *media;
+  struct MarmotMediaAttachmentOutcome *media;
   uintptr_t media_len;
   char *agent_text_stream_json;
   /**
@@ -3084,7 +3476,15 @@ typedef struct MarmotAppPerformanceSnapshot {
    * verdict since process start.
    */
   uint64_t sqlcipher_migration_probe_skips;
+  struct MarmotAppPerformanceOperationSnapshot inbound_delivery_projection;
   struct MarmotAppPerformanceOperationSnapshot outbound_message_send;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_queue_wait;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_local_projection;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_local_accept;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_publish;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_response;
+  struct MarmotAppPerformanceOperationSnapshot host_outbound_message_visible;
+  struct MarmotAppPerformanceOperationSnapshot host_inbound_message_visible;
   struct MarmotAppPerformanceOperationSnapshot group_create_queue_wait;
   struct MarmotAppPerformanceOperationSnapshot group_create_key_package_lookup;
   struct MarmotAppPerformanceOperationSnapshot group_member_key_package_prewarm;
@@ -3132,6 +3532,101 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot host_splash_ready;
   struct MarmotAppPerformanceOperationSnapshot host_foreground_local_ready;
 } MarmotAppPerformanceSnapshot;
+
+typedef struct MarmotUsageDiagnosticsSettings {
+  uint32_t decision;
+  char *policy_revision;
+  char *registry_revision;
+  int64_t updated_at_ms;
+  uint8_t previously_enabled;
+} MarmotUsageDiagnosticsSettings;
+
+typedef struct MarmotUsageDiagnosticsStatus {
+  uint32_t consent;
+  uint32_t telemetry;
+  uint32_t product_analytics;
+  uint64_t queued_events;
+  uint64_t dropped_events;
+  uint64_t accepted_batches;
+  uint64_t failed_batches;
+} MarmotUsageDiagnosticsStatus;
+
+typedef struct MarmotProductAnalyticsMetadata {
+  char *app_version;
+  char *os_family;
+  char *os_major_version;
+  char *device_class;
+  char *host_surface;
+  char *environment;
+  uint8_t is_debug;
+} MarmotProductAnalyticsMetadata;
+
+typedef struct MarmotProductPropertySchema {
+  char *name;
+  uint32_t kind;
+  char **choices;
+  uintptr_t choices_len;
+} MarmotProductPropertySchema;
+
+typedef struct MarmotProductEventSchema {
+  char *name;
+  uint32_t mode;
+  struct MarmotProductPropertySchema *properties;
+  uintptr_t properties_len;
+} MarmotProductEventSchema;
+
+typedef struct MarmotProductAnalyticsRuntimeConfig {
+  char *events_endpoint;
+  char *app_key;
+  struct MarmotProductAnalyticsMetadata metadata;
+  struct MarmotProductEventSchema *registry;
+  uintptr_t registry_len;
+  uint8_t allow_loopback;
+  char *operator_;
+} MarmotProductAnalyticsRuntimeConfig;
+
+typedef struct MarmotProductEventProperty {
+  char *name;
+  char *value;
+} MarmotProductEventProperty;
+
+typedef struct MarmotProductEvent {
+  char *name;
+  struct MarmotProductEventProperty *properties;
+  uintptr_t properties_len;
+} MarmotProductEvent;
+
+/**
+ * Stable stream and start-message identifiers.
+ */
+typedef struct MarmotPublisherInfo {
+  char *stream_id_hex;
+  char *start_message_id_hex;
+} MarmotPublisherInfo;
+
+/**
+ * Accepted record receipt. A live preview error does not discard the
+ * transcript; finish still produces the durable final.
+ */
+typedef struct MarmotPublisherAck {
+  uint64_t chunk_count;
+  /**
+   * NULL when no preview error occurred; otherwise an error string.
+   * Either is possible after a successful append; check before dereferencing.
+   */
+  char *live_error;
+} MarmotPublisherAck;
+
+/**
+ * Borrowed broker options. NULL certificate with zero length selects
+ * platform trust. `trust` is a `MarmotPublisherTrust` discriminant.
+ */
+typedef struct MarmotPublisherOptions {
+  const char *candidate;
+  const uint8_t *server_cert_der;
+  uintptr_t server_cert_der_len;
+  uint32_t trust;
+} MarmotPublisherOptions;
 
 /**
  * One live-received message.
@@ -3693,6 +4188,7 @@ typedef enum MarmotSearchUpdateTrigger_Tag {
    */
   MARMOT_SEARCH_UPDATE_TRIGGER_SEARCH_COMPLETED,
   MARMOT_SEARCH_UPDATE_TRIGGER_ERROR,
+  MARMOT_SEARCH_UPDATE_TRIGGER_CACHED_RESULTS_FOUND,
 } MarmotSearchUpdateTrigger_Tag;
 
 typedef struct MarmotSearchUpdateTrigger_RadiusStarted_Body {
@@ -3732,26 +4228,6 @@ typedef struct MarmotSearchUpdateTrigger {
 } MarmotSearchUpdateTrigger;
 
 /**
- * One search hit, with typed attribution for why it matched.
- */
-typedef struct MarmotUserDirectorySearchResult {
-  char *account_id_hex;
-  char *npub;
-  /**
-   * Social distance from the searching account.
-   */
-  uint8_t radius;
-  enum MarmotMatchedField matched_field;
-  enum MarmotMatchQuality match_quality;
-  bool has_provider_rank;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  double provider_rank;
-  struct MarmotUserProfileMetadata *profile;
-} MarmotUserDirectorySearchResult;
-
-/**
  * One step of a running user search. Free with
  * `marmot_user_search_update_free`.
  */
@@ -3762,6 +4238,8 @@ typedef struct MarmotUserSearchUpdate {
    */
   struct MarmotUserDirectorySearchResult *new_results;
   uintptr_t new_results_len;
+  struct MarmotUserDirectorySearchResult *updated_results;
+  uintptr_t updated_results_len;
   uint32_t total_result_count;
 } MarmotUserSearchUpdate;
 
@@ -3779,9 +4257,34 @@ typedef void (*MarmotUserSearchUpdateCallback)(const struct MarmotUserSearchUpda
 typedef void (*MarmotOnboardingCallback)(const struct MarmotOnboardingSnapshot *item,
                                          void *user_data);
 
+typedef struct MarmotPresentedChatListUpdate {
+  char *subscription_generation;
+  uint64_t sequence;
+  struct MarmotPresentedChatListSnapshot snapshot;
+} MarmotPresentedChatListUpdate;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Create a client with an explicit relay policy and optional host secret store.
+ * `store == NULL` selects the platform keychain. Loopback opt-in does not
+ * permit private/link-local relays or plaintext public endpoints.
+ * Ownership of the store transfers only on success, as with
+ * `marmot_client_new_with_secret_store`.
+ *
+ * # Safety
+ * Strings and arrays must be valid for the call; `store` must be NULL or a
+ * valid vtable; `out_client` must be writable. Pass a `MarmotRelayPolicy`
+ * discriminant as `relay_policy`; unknown values are rejected.
+ */
+MarmotStatus marmot_client_new_with_options(const char *root_path,
+                                            const char *const *relay_urls,
+                                            uintptr_t relay_urls_len,
+                                            uint32_t relay_policy,
+                                            const struct MarmotSecretStore *store,
+                                            struct MarmotClient **out_client);
 
 /**
  * Create a Marmot client rooted at `root_path`, connected to
@@ -3984,6 +4487,65 @@ MarmotStatus marmot_sign_out(const struct MarmotClient *client,
 
 /**
  * Retry onboarding against explicitly selected discovery relays.
+ * Query whether unreadable/exhausted checkpoints require explicit recovery.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_onboarding_recovery_required(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 bool *out);
+
+/**
+ * Retain opaque evidence, retire the old attempt, and return a new epoch.
+ * Requires explicit acknowledgment of latest-only evidence retention.
+ * Hosts invalidate old UI callbacks first, then explicitly begin again.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_recover_onboarding(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       uint8_t acknowledge_latest_only_evidence,
+                                       char **out);
+
+/**
+ * Approve using the epoch and revision from the same displayed snapshot.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_approve_onboarding_repair_in_epoch(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       uint64_t revision,
+                                                       const char *recovery_epoch,
+                                                       struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Acknowledge the displayed device notice in a recovered attempt.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_onboarding_single_device_in_epoch(const struct MarmotClient *client,
+                                                                  const char *account_ref,
+                                                                  uint64_t revision,
+                                                                  const char *recovery_epoch,
+                                                                  struct MarmotOnboardingSnapshot **out);
+
+/**
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4013,7 +4575,8 @@ MarmotStatus marmot_acknowledge_onboarding_single_device(const struct MarmotClie
 
 /**
  * Cancel unfinished onboarding, retaining the signed-out identity and private state.
- * An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+ * Cancellation is valid at every interactive step, including approved or ready
+ * attempts. It performs no relay deletion.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4119,8 +4682,8 @@ MarmotStatus marmot_account_inbox_relays(const struct MarmotClient *client,
                                          struct MarmotStringList **out);
 
 /**
- * Local + relay-published KeyPackages for the account. Free with
- * `marmot_account_key_package_list_free`.
+ * Local + current-slot relay-published KeyPackages for the account. Free
+ * with `marmot_account_key_package_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4133,6 +4696,22 @@ MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
                                          const char *const *bootstrap_relays,
                                          uintptr_t bootstrap_relays_len,
                                          struct MarmotAccountKeyPackageList **out);
+
+/**
+ * Observed relay KeyPackage history, including superseded events. Free
+ * with `marmot_account_key_package_relay_event_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_key_package_relay_events(const struct MarmotClient *client,
+                                                     const char *account_ref,
+                                                     const char *const *bootstrap_relays,
+                                                     uintptr_t bootstrap_relays_len,
+                                                     struct MarmotAccountKeyPackageRelayEventList **out);
 
 /**
  * Publish a fresh KeyPackage. Writes the accepting-relay count.
@@ -4283,7 +4862,12 @@ MarmotStatus marmot_create_group(const struct MarmotClient *client,
 
 /**
  * Normalize a member reference (hex, `npub`, `nostr:npub...`,
- * `marmot://profile/...`). Free with `marmot_member_ref_free`.
+ * `nprofile`, `nostr:nprofile...`, and `marmot://profile/...`).
+ * nprofile relay hints are discarded. Duplicate type-0 TLV entries
+ * keep the first key. After wrapper normalization, encoded tokens
+ * longer than 1023 UTF-8 bytes are rejected; a valid 1023-byte
+ * token still decodes when wrapped. Free with
+ * `marmot_member_ref_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4408,6 +4992,23 @@ MarmotStatus marmot_delete_group_local(const struct MarmotClient *client,
                                        bool *out);
 
 /**
+ * Reset this group on this account-device without publishing.
+ * Deletes local app and MLS state; only a valid Welcome created after the reset can rejoin.
+ * Close group UI subscriptions and clear host-owned media caches first.
+ * Writes true for a new forget, false if already forgotten.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_forget_group_local(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       bool *out);
+
+/**
  * Set the per-group disappearing-message retention.
  * `disappearing_message_secs` of `0` disables expiry. Free with
  * `marmot_send_summary_free`.
@@ -4423,6 +5024,49 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
                                              const char *group_id_hex,
                                              uint64_t disappearing_message_secs,
                                              struct MarmotSendSummary **out);
+
+/**
+ * Query advisory membership health and pending rejoin offers.
+ * Free with `marmot_group_recovery_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_recovery_status(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          struct MarmotGroupRecoveryStatus **out);
+
+/**
+ * Only after explicit recipient consent. Free with marmot_group_recovery_status_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_confirm_group_rejoin(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *welcome_id_hex,
+                                         const char *local_state_token,
+                                         struct MarmotGroupRecoveryStatus **out);
+
+/**
+ * Decline the selected replacement offer without changing active group state.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_decline_group_rejoin(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *welcome_id_hex);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group
@@ -5065,6 +5709,34 @@ MarmotStatus marmot_chat_list(const struct MarmotClient *client,
                               struct MarmotChatListRowList **out);
 
 /**
+ * Complete local rows with selected title/avatar. Free with marmot_presented_chat_list_snapshot_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_presented_chat_list(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        uint8_t include_archived,
+                                        struct MarmotPresentedChatListSnapshot **out);
+
+/**
+ * Keyed complete row; missing groups return NULL. Free with marmot_presented_chat_row_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_presented_chat_list_row(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            struct MarmotPresentedChatRow **out);
+
+/**
  * Initialize read state for a conversation being opened; writes the
  * refreshed row, or NULL with `MARMOT_STATUS_OK` when the group has
  * no row. Free with `marmot_chat_list_row_free`.
@@ -5644,6 +6316,23 @@ MarmotStatus marmot_existing_direct_conversation(const struct MarmotClient *clie
                                                  struct MarmotExistingDirectConversation **out);
 
 /**
+ * Search public identities cached through any connected account. Follow
+ * flags refer to the selected account. Call off the UI thread and free with
+ * `marmot_user_directory_search_result_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_search_cached_users(const struct MarmotClient *client,
+                                        const char *account_id_hex,
+                                        const char *query,
+                                        uint32_t limit,
+                                        struct MarmotUserDirectorySearchResultList **out);
+
+/**
  * What the local directory cache holds for each requested id, one
  * row per request in order. Free with
  * `marmot_cached_identity_projection_list_free`.
@@ -5944,9 +6633,14 @@ MarmotStatus marmot_display_name(const struct MarmotClient *client,
 MarmotStatus marmot_npub(const struct MarmotClient *client, const char *account_id_hex, char **out);
 
 /**
- * Hex account id for an `npub`/hex reference; NULL with
- * `MARMOT_STATUS_OK` when the input does not decode. Free with
- * `marmot_string_free`.
+ * Hex account id for an `npub`/hex/`nprofile` reference; NULL with
+ * `MARMOT_STATUS_OK` when the input does not decode. Accepts hex,
+ * `npub`, `nostr:npub`, `nprofile`, `nostr:nprofile`, and
+ * `marmot://profile/` links. nprofile relay hints are discarded.
+ * Duplicate type-0 TLV entries keep the first key. After wrapper
+ * normalization, encoded tokens longer than 1023 UTF-8 bytes are
+ * rejected; a valid 1023-byte token still decodes when wrapped. Free
+ * with `marmot_string_free`.
  *
  * # Safety
  * `client` must be a live handle; `reference` a valid string; `out`
@@ -5957,6 +6651,28 @@ MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
                                    char **out);
 
 /**
+ * Deterministic cosmetic display name for a canonical hex account id.
+ * Free with `marmot_string_free`. Decode a scanned reference with
+ * `marmot_account_id_hex` first; the seed is hashed as supplied text.
+ *
+ * # Safety
+ * Same as `marmot_account_id_hex`.
+ */
+MarmotStatus marmot_default_profile_pseudonym(const struct MarmotClient *client,
+                                              const char *account_id_hex,
+                                              char **out);
+
+/**
+ * Random cosmetic display name from the shared wordlists. Free with
+ * `marmot_string_free`. This does not create an account or generate a
+ * signing key.
+ *
+ * # Safety
+ * `client` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_random_profile_pseudonym(const struct MarmotClient *client, char **out);
+
+/**
  * Aggregate relay-pool health. Free with `marmot_relay_health_free`.
  *
  * # Safety
@@ -5965,7 +6681,9 @@ MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
 MarmotStatus marmot_relay_health(const struct MarmotClient *client, struct MarmotRelayHealth **out);
 
 /**
- * Replace the relay-telemetry export settings. Free the result with
+ * Deprecated consent control: use `marmot_set_usage_diagnostics_consent`.
+ * Enable requires a combined grant; disable revokes both exporters. The
+ * telemetry interval remains configurable. Free the result with
  * `marmot_relay_telemetry_settings_free`.
  *
  * # Safety
@@ -6008,6 +6726,18 @@ MarmotStatus marmot_set_audit_log_settings(const struct MarmotClient *client,
 MarmotStatus marmot_set_audit_log_tracker_config(const struct MarmotClient *client,
                                                  const struct MarmotAuditLogTrackerConfig *config,
                                                  struct MarmotAuditLogTrackerConfig **out);
+
+/**
+ * Replace the audit-log tracker endpoint config. Free the result with
+ * `marmot_audit_log_tracker_config_v4_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `config` a valid borrowed struct;
+ * `out` valid.
+ */
+MarmotStatus marmot_set_audit_log_tracker_config_v4(const struct MarmotClient *client,
+                                                    const struct MarmotAuditLogTrackerConfigV4 *config,
+                                                    struct MarmotAuditLogTrackerConfigV4 **out);
 
 /**
  * Publish the account's kind:0 profile metadata. The returned profile is
@@ -6561,6 +7291,172 @@ MarmotStatus marmot_approve_onboarding_repair(const struct MarmotClient *client,
 MarmotStatus marmot_cancel_onboarding_repair(const struct MarmotClient *client,
                                              const char *account_ref,
                                              struct MarmotOnboardingSnapshot **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_usage_diagnostics_settings(const struct MarmotClient *client,
+                                               struct MarmotUsageDiagnosticsSettings **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_usage_diagnostics_consent(const struct MarmotClient *client,
+                                                  uint8_t enabled,
+                                                  struct MarmotUsageDiagnosticsSettings **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_usage_diagnostics_status(const struct MarmotClient *client,
+                                             struct MarmotUsageDiagnosticsStatus **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_flush_product_analytics(const struct MarmotClient *client);
+
+/**
+ * Forward a validated product analytics input.
+ * # Safety
+ * Client and borrowed input must be valid; output, when present, must be writable.
+ */
+MarmotStatus marmot_set_product_analytics_runtime_config(const struct MarmotClient *client,
+                                                         const struct MarmotProductAnalyticsRuntimeConfig *input);
+
+/**
+ * Forward a validated product analytics input.
+ * # Safety
+ * Client and borrowed input must be valid; output, when present, must be writable.
+ */
+MarmotStatus marmot_record_product_event(const struct MarmotClient *client,
+                                         const struct MarmotProductEvent *input,
+                                         enum MarmotProductRecordResult *out);
+
+/**
+ * Record an app-defined timing through the consent-gated product exporter.
+ * Register `name` with `elapsed: DurationBucket` and `outcome: Enum` choices
+ * `success`/`failure`. Milliseconds are bucketed before recording.
+ * # Safety
+ * Client and borrowed name must be valid; out must be writable.
+ */
+MarmotStatus marmot_record_host_timing(const struct MarmotClient *client,
+                                       const char *name,
+                                       uint64_t duration_ms,
+                                       uint32_t outcome,
+                                       enum MarmotProductRecordResult *out);
+
+/**
+ * Signal host activity. Discriminants are validated before conversion.
+ * # Safety
+ * Client must be a live handle.
+ */
+MarmotStatus marmot_set_product_analytics_activity(const struct MarmotClient *client,
+                                                   uint32_t activity);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_publisher_info_free(struct MarmotPublisherInfo *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_publisher_ack_free(struct MarmotPublisherAck *ptr);
+
+/**
+ * Anchor a new stream and return its publisher. Broker connection happens
+ * in the background. Invalid inputs/out-pointers fail before anchoring.
+ *
+ * # Safety
+ * `client` is live; required strings and options are valid for this call;
+ * certificate is NULL with zero length or references that many bytes;
+ * `out` is writable. Input memory is neither retained nor freed.
+ */
+MarmotStatus marmot_agent_publisher_new(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const struct MarmotPublisherOptions *options,
+                                        struct MarmotAgentPublisher **out);
+
+/**
+ * Read stream identifiers. Free with `marmot_publisher_info_free`.
+ *
+ * # Safety
+ * `publisher` is live and `out` is writable.
+ */
+MarmotStatus marmot_agent_publisher_info(const struct MarmotAgentPublisher *publisher,
+                                         struct MarmotPublisherInfo **out);
+
+/**
+ * Append one text/status/progress record; free the receipt with
+ * `marmot_publisher_ack_free`. Unknown record types fail before appending.
+ *
+ * # Safety
+ * `publisher` is live, `text` is valid UTF-8/NUL-terminated, `out` writable.
+ */
+MarmotStatus marmot_agent_publisher_append(const struct MarmotAgentPublisher *publisher,
+                                           uint32_t kind,
+                                           const char *text,
+                                           struct MarmotPublisherAck **out);
+
+/**
+ * Seal and send the final transcript. Failed sends retain the sealed
+ * request for retry; a successful repeated call returns the original receipt.
+ * Free with `marmot_send_summary_free`. Inspect its delivery disposition.
+ *
+ * # Safety
+ * `publisher` is live and `out` is writable.
+ */
+MarmotStatus marmot_agent_publisher_finish(const struct MarmotAgentPublisher *publisher,
+                                           struct MarmotSendSummary **out);
+
+/**
+ * Cancel the preview. Does not retract a final already being published.
+ *
+ * # Safety
+ * `publisher` is a live handle.
+ */
+MarmotStatus marmot_agent_publisher_cancel(const struct MarmotAgentPublisher *publisher);
+
+/**
+ * Release a publisher, requesting preview cancellation. NULL is a no-op.
+ *
+ * # Safety
+ * `publisher` is NULL or a live root returned by this library, with no
+ * concurrent call using it. Free before the creating client.
+ */
+void marmot_agent_publisher_free(struct MarmotAgentPublisher *publisher);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
@@ -7323,6 +8219,44 @@ MarmotStatus marmot_onboarding_subscription_snapshot(const struct MarmotOnboardi
                                                      struct MarmotOnboardingSnapshot **out);
 
 /**
+ * Open a complete chat list with both invalidation sources already attached.
+ * Take the initial snapshot once, then call next. Free with marmot_presented_chat_list_subscription_free.
+ * # Safety
+ * Client and string must be valid; out_sub must be writable.
+ */
+MarmotStatus marmot_open_presented_chat_list(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             uint8_t include_archived,
+                                             struct MarmotPresentedChatListSubscription **out_sub);
+
+/**
+ * Take the initial snapshot with sequence zero. A second call returns CLOSED and NULL.
+ * Free the result with marmot_presented_chat_list_update_free.
+ * # Safety
+ * sub must be live; out must be writable.
+ */
+MarmotStatus marmot_presented_chat_list_subscription_snapshot(const struct MarmotPresentedChatListSubscription *sub,
+                                                              struct MarmotPresentedChatListUpdate **out);
+
+/**
+ * Read a whole replacement. timeout_ms zero waits indefinitely. Timeout/closed/error leave
+ * out NULL; timeout or a storage error does not discard the pending refresh. Retry according
+ * to the typed status. Free results with marmot_presented_chat_list_update_free.
+ * # Safety
+ * sub must be live; out must be writable.
+ */
+MarmotStatus marmot_presented_chat_list_subscription_next(const struct MarmotPresentedChatListSubscription *sub,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotPresentedChatListUpdate **out);
+
+/**
+ * Cancel and free a presented-list handle. NULL is a no-op.
+ * # Safety
+ * sub must be NULL or a live library-owned handle not in use by another call.
+ */
+void marmot_presented_chat_list_subscription_free(struct MarmotPresentedChatListSubscription *sub);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -7368,6 +8302,15 @@ void marmot_send_summary_free(struct MarmotSendSummary *ptr);
  * library.
  */
 void marmot_account_key_package_list_free(struct MarmotAccountKeyPackageList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_account_key_package_relay_event_list_free(struct MarmotAccountKeyPackageRelayEventList *list);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -7436,6 +8379,16 @@ void marmot_agent_stream_update_free(struct MarmotAgentStreamUpdate *update);
  * this library.
  */
 void marmot_audit_log_settings_free(struct MarmotAuditLogSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_audit_log_tracker_config_v4_free(struct MarmotAuditLogTrackerConfigV4 *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -7589,6 +8542,15 @@ void marmot_cached_identity_projection_free(struct MarmotCachedIdentityProjectio
  * library.
  */
 void marmot_cached_identity_projection_list_free(struct MarmotCachedIdentityProjectionList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_user_directory_search_result_list_free(struct MarmotUserDirectorySearchResultList *list);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -7820,6 +8782,16 @@ void marmot_prepared_group_image_upload_free(struct MarmotPreparedGroupImageUplo
  * library.
  */
 void marmot_prepared_group_image_upload_list_free(struct MarmotPreparedGroupImageUploadList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -8114,6 +9086,56 @@ void marmot_timeline_subscription_update_free(struct MarmotTimelineSubscriptionU
  * this library.
  */
 void marmot_onboarding_snapshot_free(struct MarmotOnboardingSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_usage_diagnostics_settings_free(struct MarmotUsageDiagnosticsSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_usage_diagnostics_status_free(struct MarmotUsageDiagnosticsStatus *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_presented_chat_row_free(struct MarmotPresentedChatRow *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_presented_chat_list_snapshot_free(struct MarmotPresentedChatListSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_presented_chat_list_update_free(struct MarmotPresentedChatListUpdate *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

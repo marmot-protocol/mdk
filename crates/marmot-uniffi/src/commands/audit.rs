@@ -2,7 +2,7 @@
 
 use crate::Marmot;
 use crate::conversions::{
-    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
+    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
     AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi,
 };
 use crate::errors::MarmotKitError;
@@ -33,16 +33,16 @@ impl Marmot {
     }
 
     /// Supply non-persisted audit tracker upload metadata: optional Goggles
-    /// upload URL override, bearer token from the host app, and optional human
-    /// source labels.
+    /// upload URL override, bearer token from the host app, and optional system
+    /// hardware model, platform, and app version.
     ///
     /// The returned config confirms what was stored but never echoes the
     /// bearer token back across FFI: secrets flow in, not out.
     pub fn set_audit_log_tracker_config(
         &self,
-        config: AuditLogTrackerConfigFfi,
-    ) -> Result<AuditLogTrackerConfigFfi, MarmotKitError> {
-        Ok(AuditLogTrackerConfigFfi::redacted(
+        config: AuditLogTrackerConfigV4Ffi,
+    ) -> Result<AuditLogTrackerConfigV4Ffi, MarmotKitError> {
+        Ok(AuditLogTrackerConfigV4Ffi::redacted(
             self.runtime.set_audit_log_tracker_config(config.into())?,
         ))
     }

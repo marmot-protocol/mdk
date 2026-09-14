@@ -524,7 +524,10 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   (event path: the account layer's `GroupStateInvalidated` reconciler; derived path: `run_due_maintenance`) decides
   from the record, never from the losing branch's bytes: re-queue an edit only when the canonical value of every field
   the intent changed still equals the baseline, report `Conflict` otherwise; re-queue a removal for targets still on
-  the roster; an invite is `ReinviteRequired` (mdk#1735 owns the invitee); at most `MAX_OWN_COMMIT_REISSUE_ATTEMPTS`
+  the roster; an invite retains a durable `ReinviteRequired` record until the host supplies fresh KeyPackages
+  (never replay consumed material). Active recipients receive bounded durable offers and require explicit branch-bound
+  consent through `confirm_group_rejoin`; local history remains, discarded-branch anchors do not.
+  At most `MAX_OWN_COMMIT_REISSUE_ATTEMPTS`
   re-issues, then `Abandoned`. The decision is returned as a `SupersededIntentReport` so the runtime can announce it
   (mdk#1734). Tests: `tests/distributed_convergence.rs::superseded_profile_edit_*`.
 - **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`

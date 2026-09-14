@@ -127,6 +127,10 @@ pre-releases.
 
 Prerequisites:
 
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors. The former `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES`
+  setting is ignored; the connector now chunks live previews itself.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
@@ -172,7 +176,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
 ```
@@ -189,7 +193,7 @@ repeated or given a comma-separated list to authorize multiple senders:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -205,7 +209,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -235,7 +239,7 @@ To accept Marmot messages from any sender (explicit opt-in):
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users
@@ -630,7 +634,8 @@ not a disk-streaming or low-memory-mobile transfer mode.
   the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
-- Status records are included in the stream transcript hash and chunk count.
+- `stream_finish` sends the acknowledged final text. The shared Rust publisher
+  owns chunking and transcript hashing, including status and progress records.
 
 Run the shim tests with:
 

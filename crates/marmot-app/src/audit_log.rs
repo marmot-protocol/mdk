@@ -2,8 +2,8 @@
 //! file enumeration, HTTP upload, and audit-log path validation.
 //!
 //! The audit log is an opt-in, privacy-safe forensic measure recorded per
-//! account-device at `<account_dir>/audit-<engine_id>-v3.jsonl`. This module owns
-//! the audit DTOs, the stable salted-hash identity derivation, the upload
+//! account-device at `<account_dir>/audit-<engine_id>-v4.jsonl`. This module owns
+//! the audit DTOs, the stable domain-separated hash identity derivation, the upload
 //! client, and the `MarmotApp` methods that drive recording, enumeration,
 //! validation, and upload.
 
@@ -26,6 +26,9 @@ use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_
 use crate::error::AppError;
 use crate::{MarmotApp, config};
 
+mod legacy_cleanup;
+pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
+
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// Always-on, append-only per-account key-reveal audit log (mdk#543).
@@ -42,6 +45,13 @@ pub(crate) const AUDIT_ID_BYTES: usize = 16;
 pub(crate) const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    let schema = serde_json::from_str(include_str!(
+        "../../marmot-forensics/schema/audit-log-event.v4.schema.json"
+    ))
+    .expect("bundled audit schema must be valid JSON");
+    jsonschema::validator_for(&schema).expect("bundled audit schema must compile offline")
+});
 static AUDIT_LOG_UPLOAD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
@@ -84,6 +94,10 @@ pub(crate) struct AuditUploadReceipt {
 
 pub(crate) enum AuditUploadAttempt {
     Uploaded(AuditUploadReceipt),
+    Ineligible {
+        observed_bytes: u64,
+        modified_at_ms: Option<u64>,
+    },
     Deferred,
     FileFailure(AppError),
     Rejected {
@@ -94,6 +108,8 @@ pub(crate) enum AuditUploadAttempt {
 
 /// Retry-After accepts either delta seconds or an HTTP date. Bound untrusted
 /// deadlines to five minutes so one response cannot silence incident evidence for a day.
+/// `None` means the header was absent. A header we cannot parse is still a
+/// request to retry, so it yields a zero minimum instead of disappearing.
 fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
     let value = value?.trim();
     let delay = value
@@ -104,7 +120,8 @@ fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
             httpdate::parse_http_date(value)
                 .ok()
                 .map(|date| date.duration_since(now).unwrap_or_default())
-        })?;
+        })
+        .unwrap_or_default();
     Some(delay.min(Duration::from_secs(5 * 60)))
 }
 
@@ -142,6 +159,40 @@ impl AuditUploadSnapshot {
             modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
         })
     }
+
+    /// Validate the exact immutable bytes that will be sent. No legacy migration
+    /// or redaction: a single invalid complete row rejects the whole snapshot.
+    fn validate(&self) -> Result<(), AppError> {
+        let mut has_record = false;
+        for line in self.body.split(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            // Strict typed decoding also rejects duplicate and unknown fields
+            // before serde_json::Value could collapse duplicate object keys.
+            let event = serde_json::from_slice::<marmot_forensics::AuditEvent>(line)
+                .map_err(|_| invalid_audit_upload())?;
+            if event.schema_version != marmot_forensics::AUDIT_LOG_SCHEMA_VERSION {
+                return Err(invalid_audit_upload());
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(line).map_err(|_| invalid_audit_upload())?;
+            if !AUDIT_UPLOAD_SCHEMA.is_valid(&value) {
+                return Err(invalid_audit_upload());
+            }
+            has_record = true;
+        }
+        if has_record {
+            Ok(())
+        } else {
+            Err(invalid_audit_upload())
+        }
+    }
+}
+
+fn invalid_audit_upload() -> AppError {
+    // Never expose schema validation errors: they can contain the rejected data.
+    AppError::InvalidAuditLogFile("only valid v4 forensic audit records may be uploaded".into())
 }
 
 /// What the tracker already did with one audit file.
@@ -150,10 +201,17 @@ impl AuditUploadSnapshot {
 pub(crate) enum AuditUploadOutcome {
     /// The endpoint accepted the file's whole content.
     Uploaded,
-    /// The file is larger than the endpoint's per-request ceiling, so no
-    /// automatic upload can ever accept it. Recorded so the tracker reports it
-    /// once instead of re-attempting on every trigger.
+    /// The tracker will not re-post this file's content: it is over the local
+    /// `AUDIT_LOG_UPLOAD_MAX_BYTES` ceiling, or the endpoint answered `413`
+    /// without `Retry-After` (RFC 9110 15.5.14 has a server send that header
+    /// when the refusal is temporary). Recorded so the tracker reports it once
+    /// instead of re-attempting on every trigger. Like every checkpoint entry
+    /// it is keyed on the file's size and mtime, so deleting the sidecar clears
+    /// it, and a manual per-file upload never consults it. A `413` that
+    /// carries `Retry-After` is a cooldown, not this outcome.
     TooLargeToUpload,
+    /// Contains legacy, malformed, or schema-ineligible records. Never sent.
+    IneligibleSchema,
 }
 
 /// One acknowledged audit file, identified by the size and mtime it had when
@@ -199,7 +257,7 @@ impl AuditUploadCheckpoint {
             .map(|entry| entry.outcome)
     }
 
-    /// Record the observed oversized-file verdict or an accepted complete snapshot.
+    /// Record an oversized/ineligible-file verdict or an accepted complete snapshot.
     /// Successful uploads are checked against enumeration before checkpointing.
     pub(crate) fn acknowledge(
         &mut self,
@@ -247,7 +305,7 @@ pub struct AuditLogSettings {
 }
 
 /// One always-on key-reveal audit record (mdk#543). Privacy-safe: it
-/// carries only a salted-hash account ref, never key material, the nsec, the
+/// carries only a deterministic account hash, never key material, the nsec, the
 /// raw pubkey, or the npub.
 ///
 /// `caller_context` identifies the surface that initiated the reveal (issue
@@ -417,23 +475,12 @@ impl MarmotApp {
 
     fn audit_source_context_for_recorder(
         &self,
-        label: &str,
-        account_id: &MemberId,
         device_id_hex: &str,
     ) -> marmot_forensics::AuditSourceContext {
-        let account_id_hex = hex::encode(account_id.as_slice());
-        let account_label = self
-            .display_name_for_account_id(&account_id_hex)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| label.to_owned());
         let upload_source = self.audit_log_tracker_config().source;
-        let device_label = upload_source.device_label.clone();
         marmot_forensics::AuditSourceContext {
-            account_label: Some(account_label),
-            device_label: device_label.clone(),
             device_id: Some(device_id_hex.to_owned()),
-            device_name: device_label,
+            hardware_model: upload_source.hardware_model,
             platform: upload_source.platform,
             app_version: upload_source.app_version,
             ..Default::default()
@@ -538,6 +585,7 @@ impl MarmotApp {
                 "audit snapshot has no complete lines".into(),
             )),
             AuditUploadAttempt::FileFailure(error) => Err(error),
+            AuditUploadAttempt::Ineligible { .. } => Err(invalid_audit_upload()),
             AuditUploadAttempt::Rejected { status, .. } => Err(AppError::AuditLogUpload(format!(
                 "upload returned HTTP {status}"
             ))),
@@ -579,6 +627,20 @@ impl MarmotApp {
         if snapshot.body.is_empty() {
             return Ok(AuditUploadAttempt::Deferred);
         }
+        // Validation of a bounded but potentially large file is CPU work. Keep
+        // it off runtime workers; cancellation still prevents the later POST.
+        let (snapshot, eligible) = tokio::task::spawn_blocking(move || {
+            let eligible = snapshot.validate().is_ok();
+            (snapshot, eligible)
+        })
+        .await
+        .map_err(|_| AppError::AuditLogUpload("audit validation worker failed".into()))?;
+        if !eligible {
+            return Ok(AuditUploadAttempt::Ineligible {
+                observed_bytes: snapshot.observed_bytes,
+                modified_at_ms: snapshot.modified_at_ms,
+            });
+        }
         let bytes_sent = snapshot.body.len() as u64;
         let mut request = AUDIT_LOG_UPLOAD_CLIENT
             .post(endpoint)
@@ -588,8 +650,8 @@ impl MarmotApp {
         if let Some(token) = config.authorization_bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
-        if let Some(value) = config.source.device_label.as_deref() {
-            request = request.header("X-Goggles-Device-Label", value);
+        if let Some(value) = config.source.hardware_model.as_deref() {
+            request = request.header("X-Goggles-Hardware-Model", value);
         }
         if let Some(value) = config.source.platform.as_deref() {
             request = request.header("X-Goggles-Platform", value);
@@ -606,7 +668,7 @@ impl MarmotApp {
                     response
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok()),
+                        .map(|value| value.to_str().unwrap_or_default()),
                     SystemTime::now(),
                 ),
             });
@@ -657,10 +719,9 @@ impl MarmotApp {
         // live-recorder match fail, so a delete would remove the visible file
         // while the recorder kept appending to the orphaned inode.
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
-        // Version the filename so existing v1/v2 files remain untouched and a
-        // new recorder never appends safe-only v3 rows to an older schema file.
-        // The `audit-*.jsonl` glob still enumerates every version.
-        let audit_path = account_dir.join(format!("audit-{engine_id_hex}-v3.jsonl"));
+        // Start a distinct v4 file. Exclusive-root startup retires legacy files;
+        // any that survive cleanup still fail the upload gate.
+        let audit_path = marmot_forensics::default_jsonl_path(&account_dir, &engine_id_hex);
         match marmot_forensics::JsonlRecorder::open_with_account_ref(
             &audit_path,
             engine_id_hex,
@@ -670,8 +731,7 @@ impl MarmotApp {
                 // Emit a source_context row identifying the producing account and
                 // the host-supplied device/client metadata from tracker config.
                 use marmot_forensics::ForensicRecorder as _;
-                let source =
-                    self.audit_source_context_for_recorder(label, account_id, &device_id_hex);
+                let source = self.audit_source_context_for_recorder(&device_id_hex);
                 recorder.record(marmot_forensics::AuditRecord::new(
                     None,
                     marmot_forensics::AuditEventKind::SourceContext { source },
@@ -854,7 +914,7 @@ impl MarmotApp {
     /// Append an always-on, privacy-safe reveal record to the per-account
     /// `audit-key-reveal.jsonl` file (mdk#543).
     ///
-    /// The record carries only a salted-hash account ref (matching the
+    /// The record carries only a deterministic account hash (matching the
     /// forensic audit log's derivation), the reveal action/format, and the
     /// caller-context surface label; it never contains key material, the nsec,
     /// the raw pubkey, or the npub.
@@ -911,8 +971,13 @@ mod tests {
             audit_retry_after(Some("18446744073709551615"), now),
             Some(Duration::from_secs(300))
         );
-        for value in [None, Some("nonsense"), Some("-1")] {
-            assert_eq!(audit_retry_after(value, now), None);
+        assert_eq!(audit_retry_after(None, now), None);
+        for malformed in ["nonsense", "-1", ""] {
+            assert_eq!(
+                audit_retry_after(Some(malformed), now),
+                Some(Duration::ZERO),
+                "a malformed Retry-After is still a request to retry"
+            );
         }
     }
 
@@ -1114,14 +1179,14 @@ mod tests {
     }
 
     #[test]
-    fn audit_recorder_source_context_includes_tracker_config_and_account_label() {
+    fn audit_recorder_source_context_excludes_names_and_keeps_system_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         app.set_audit_log_tracker_config(AuditLogTrackerConfig {
             source: AuditLogUploadSource {
-                device_label: Some("Jeff iPhone".to_owned()),
+                hardware_model: Some("iPhone17,3".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
             },
@@ -1142,9 +1207,10 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(&first_line).unwrap();
         assert_eq!(event["kind"]["type"], "source_context");
         let source = &event["kind"]["source"];
-        assert_eq!(source["account_label"], "alice");
-        assert_eq!(source["device_label"], "Jeff iPhone");
-        assert_eq!(source["device_name"], "Jeff iPhone");
+        assert!(source.get("account_label").is_none());
+        assert!(source.get("device_label").is_none());
+        assert!(source.get("device_name").is_none());
+        assert_eq!(source["hardware_model"], "iPhone17,3");
         assert_eq!(source["platform"], "ios");
         assert_eq!(source["app_version"], "2026.6.8");
         assert!(
@@ -1227,28 +1293,34 @@ mod tests {
     }
 
     #[test]
-    fn audit_recorder_writes_a_new_v3_file_and_leaves_legacy_files_untouched() {
+    fn audit_recorder_writes_a_new_v4_file_and_leaves_legacy_files_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
-        // Open the live recorder; the backing file is a versioned v3 file.
+        // Open the live recorder; the backing file is a versioned v4 file.
         let recorder = app.build_audit_recorder("alice", true);
-        let v3_path = recorder
+        let v4_path = recorder
             .audit_log_path()
             .expect("file-backed recorder when enabled");
-        let v3_name = v3_path.file_name().unwrap().to_string_lossy().into_owned();
+        let v4_name = v4_path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            v3_name.ends_with("-v3.jsonl"),
-            "v3 recorder must use a versioned filename, got {v3_name}"
+            v4_name.ends_with("-v4.jsonl"),
+            "v4 recorder must use a versioned filename, got {v4_name}"
         );
 
         // Earlier schema files are distinct and never read, migrated, or appended to.
-        let v1_path = v3_path.with_file_name(v3_name.replace("-v3.jsonl", ".jsonl"));
-        let v2_path = v3_path.with_file_name(v3_name.replace("-v3.jsonl", "-v2.jsonl"));
-        assert_ne!(v1_path, v3_path);
-        assert_ne!(v2_path, v3_path);
+        let v1_path = v4_path.with_file_name(v4_name.replace("-v4.jsonl", ".jsonl"));
+        let v2_path = v4_path.with_file_name(v4_name.replace("-v4.jsonl", "-v2.jsonl"));
+        let v3_path = v4_path.with_file_name(v4_name.replace("-v4.jsonl", "-v3.jsonl"));
+        std::fs::write(
+            &v3_path,
+            b"{\"schema_version\":\"marmot-forensics-audit/v3\"}\n",
+        )
+        .unwrap();
+        assert_ne!(v1_path, v4_path);
+        assert_ne!(v2_path, v4_path);
         std::fs::write(
             &v1_path,
             b"{\"schema_version\":\"marmot-forensics-audit/v1\"}\n",
@@ -1260,11 +1332,11 @@ mod tests {
         )
         .unwrap();
 
-        // Reopening appends only to v3; legacy bytes are left exactly as they were.
+        // Reopening appends only to v4; legacy bytes are left exactly as they were.
         let reopened = app.build_audit_recorder("alice", true);
         assert_eq!(
             reopened.audit_log_path().as_deref(),
-            Some(v3_path.as_path())
+            Some(v4_path.as_path())
         );
         assert_eq!(
             std::fs::read_to_string(&v1_path).unwrap(),
@@ -1275,6 +1347,11 @@ mod tests {
             "{\"schema_version\":\"marmot-forensics-audit/v2\"}\n"
         );
 
+        assert_eq!(
+            std::fs::read_to_string(&v3_path).unwrap(),
+            "{\"schema_version\":\"marmot-forensics-audit/v3\"}\n"
+        );
+
         // All generations coexist and are enumerable via the `audit-*.jsonl` glob.
         let listed: Vec<String> = app
             .audit_log_files()
@@ -1282,7 +1359,7 @@ mod tests {
             .into_iter()
             .map(|file| file.file_name)
             .collect();
-        assert!(listed.iter().any(|name| name == &v3_name));
+        assert!(listed.iter().any(|name| name == &v4_name));
         assert!(
             listed
                 .iter()

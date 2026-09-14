@@ -789,6 +789,7 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -1496,6 +1497,7 @@ async fn send_waits_for_slow_relay() {
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload,
+                    expected_epoch: None,
                 })
                 .await
                 .unwrap();
@@ -1508,6 +1510,7 @@ async fn send_waits_for_slow_relay() {
         let send = runtime.send(SendIntent::AppMessage {
             group_id,
             payload: app_payload_for(&sender, b"latency probe"),
+            expected_epoch: None,
         });
         tokio::pin!(send);
 

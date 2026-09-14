@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-08-15
+updated: 2026-09-08
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -51,6 +51,13 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | `AgentStreamWatchManager.watches` | 256 (`AGENT_STREAM_WATCH_RETAIN_LIMIT`), including `running` watches | Enforced on both start and finish. Finished watches evict oldest-first; when running watches alone exceed the cap (a finish that never arrives), the oldest running watches evict too (mdk#343). |
 | `recent_updates` replay ring | 256 (`AGENT_STREAM_UPDATE_REPLAY_LIMIT`) | Oldest popped on publish. |
+
+### Presented chat-list subscriptions (`marmot-app/src/runtime/presented_chat_list.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Initial and current complete snapshots | Existing account-list cardinality; no history retained | Current snapshot is replaced, never appended. UniFFI transfers the initial snapshot once. Dropping the handle releases both and closes the underlying list consumer; shutdown terminates reads. C4 owns future bounded paging. |
+| Invalidation receivers | Existing bounded chat-list queue plus the shared 64-entry presentation broadcast | Lag rebuilds current local state. No per-subscriber presentation timer or durable event log. |
 
 ### `marmot-app` (`src/sqlcipher.rs`)
 

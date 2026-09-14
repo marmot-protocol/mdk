@@ -322,7 +322,21 @@ impl MarmotApp {
                 if !marker_path.exists() && sqlcipher_v2_verdict_cached(db_path, &salt) {
                     SQLCIPHER_MIGRATION_PROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    finish_interrupted_sqlcipher_migration(label, keys, db_path, kind, &salt)?;
+                    let observation = self.product_analytics.begin(
+                        crate::ProductFamily::Storage,
+                        "recovery",
+                        crate::ProductUnit::Attempt,
+                    );
+                    let recovery =
+                        finish_interrupted_sqlcipher_migration(label, keys, db_path, kind, &salt);
+                    if let Some(observation) = observation {
+                        observation.finish(match &recovery {
+                            Ok(true) => "performed",
+                            Ok(false) => "no_work_due",
+                            Err(_) => "failure",
+                        });
+                    }
+                    recovery?;
                     // Success means the database was just observed opening
                     // under the v2 key (the probe) or was just rekeyed to it.
                     sqlcipher_v2_verdict_record(db_path, &salt);
@@ -351,7 +365,20 @@ impl MarmotApp {
             let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
             let new_key =
                 SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, &salt, kind)?)?;
-            if let Err(err) = rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key) {
+            let observation = self.product_analytics.begin(
+                crate::ProductFamily::Storage,
+                "recovery",
+                crate::ProductUnit::Attempt,
+            );
+            let rekey = rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key);
+            if let Some(observation) = observation {
+                observation.finish(if rekey.is_ok() {
+                    "performed"
+                } else {
+                    "failure"
+                });
+            }
+            if let Err(err) = rekey {
                 // `PRAGMA rekey` is transactional and rolls back on error, so
                 // the database is still legacy-keyed. Roll back our sidecars so
                 // the next open retries cleanly from the legacy key.
@@ -485,11 +512,11 @@ fn finish_interrupted_sqlcipher_migration(
     db_path: &Path,
     kind: SqlcipherDatabaseKind,
     salt: &[u8; SQLCIPHER_SALT_LEN],
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     if !db_path.exists() {
         // No database to migrate (e.g. interrupted before the fresh-DB path even
         // created a file). The durable salt is authoritative for the next open.
-        return Ok(());
+        return Ok(false);
     }
 
     let new_key = SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, salt, kind)?)?;
@@ -503,14 +530,14 @@ fn finish_interrupted_sqlcipher_migration(
     #[cfg(test)]
     record_probe_attempt_for_test(db_path);
     if open_hardened_sqlcipher(&conn, &new_key, SqlCipherHardening::cipher_only()).is_ok() {
-        return Ok(());
+        return Ok(false);
     }
     drop(conn);
 
     // Still legacy-keyed: re-run the rekey. `PRAGMA rekey` is transactional, so
     // a crash here simply leaves the marker in place for the next attempt.
     let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
-    rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key)
+    rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key).map(|()| true)
 }
 
 fn derive_sqlcipher_key_material(
@@ -767,6 +794,13 @@ mod tests {
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        #[cfg(feature = "product-analytics-export")]
+        let app = {
+            let mut configured = app;
+            configured.product_analytics = crate::product_analytics::test_product_collector();
+            configured.set_usage_diagnostics_consent(true).unwrap();
+            configured
+        };
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let projection_path = app.legacy_account_projection_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
@@ -815,6 +849,17 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "kept");
+        #[cfg(feature = "product-analytics-export")]
+        {
+            let rows = app.product_analytics.test_payloads();
+            assert!(
+                rows.iter()
+                    .any(|row| row["eventName"] == "mdk_storage_summary"
+                        && row["props"]["operation"] == "recovery"
+                        && row["props"]["outcome"] == "performed")
+            );
+            assert!(!serde_json::to_string(&rows).unwrap().contains("alice"));
+        }
     }
 
     #[test]

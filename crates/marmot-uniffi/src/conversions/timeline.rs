@@ -10,7 +10,7 @@ use marmot_app::{
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
-use super::media::{MediaAttachmentReferenceFfi, timeline_media_references_ffi};
+use super::media::{MediaAttachmentOutcomeFfi, timeline_media_outcomes_ffi};
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -91,11 +91,13 @@ pub struct TimelineReplyPreviewFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub media_json: Option<String>,
-    /// Fully-resolved, downloadable media references for the previewed message,
-    /// built from its `imeta` tags + its own `source_epoch` using the same
-    /// resolution and validation as `list_media`. Empty when the previewed
-    /// message has no media or its `imeta` is malformed.
-    pub media: Vec<MediaAttachmentReferenceFfi>,
+    /// Ordered per-attachment outcomes for the previewed message, built from
+    /// its `imeta` tags + its own `source_epoch` with the same parser and error
+    /// mapping as `list_media` and `parse_media_imeta_tag`. An `Accepted`
+    /// entry is downloadable; a `Rejected` entry keeps its position and carries
+    /// a typed reason so the preview can show a placeholder. Empty when the
+    /// previewed message has no media.
+    pub media: Vec<MediaAttachmentOutcomeFfi>,
     pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
     /// Convergence invalidation reason for the previewed message. The content
@@ -106,7 +108,7 @@ pub struct TimelineReplyPreviewFfi {
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
-        let media = timeline_media_references_ffi(&value.media, value.source_epoch);
+        let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -192,13 +194,15 @@ pub struct TimelineMessageRecordFfi {
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
     pub media_json: Option<String>,
-    /// Fully-resolved, downloadable media references for this message, built
-    /// from its `imeta` tags + its own `source_epoch` using the same resolution
-    /// and validation as `list_media` (a `list_media` record and this row's
-    /// `media` resolve identically for the same message). Empty when the message
-    /// has no media; a malformed `imeta` attachment is dropped while the message
-    /// still appears as text.
-    pub media: Vec<MediaAttachmentReferenceFfi>,
+    /// Ordered per-attachment outcomes for this message, built from its `imeta`
+    /// tags + its own `source_epoch` with the same parser and error mapping as
+    /// `list_media` and `parse_media_imeta_tag` (a `list_media` record and an
+    /// `Accepted` outcome here share their `attachment_index` and resolve
+    /// identically). Empty when the message has no media. A malformed or
+    /// unsupported `imeta` attachment is a `Rejected` outcome at its position
+    /// with a typed `rejection.kind` (mdk#1787): render a placeholder for it;
+    /// the message text and its valid sibling attachments are unaffected.
+    pub media: Vec<MediaAttachmentOutcomeFfi>,
     pub agent_text_stream_json: Option<String>,
     /// Parsed view of kind-1210 group system rows. `None` for chat, reactions,
     /// stream rows, and malformed/free-text kind-1210 assertions.
@@ -217,7 +221,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = group_system_event_from_message(value.kind, &value.plaintext);
-        let media = timeline_media_references_ffi(&value.media, value.source_epoch);
+        let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -594,6 +598,18 @@ mod tests {
         serde_json::json!({ "imeta": tags })
     }
 
+    fn accepted(
+        outcome: &MediaAttachmentOutcomeFfi,
+    ) -> (u32, &super::super::MediaAttachmentReferenceFfi) {
+        match outcome {
+            MediaAttachmentOutcomeFfi::Accepted {
+                attachment_index,
+                reference,
+            } => (*attachment_index, reference),
+            other => panic!("expected an accepted attachment, got {other:?}"),
+        }
+    }
+
     fn record_with_media(
         source_epoch: Option<u64>,
         media: Option<serde_json::Value>,
@@ -630,20 +646,68 @@ mod tests {
         let record: TimelineMessageRecordFfi = record_with_media(Some(7), Some(media), None).into();
 
         assert_eq!(record.media.len(), 1);
-        assert_eq!(record.media[0].file_name, "diagram.png");
-        assert_eq!(record.media[0].source_epoch, 7);
+        let (index, reference) = accepted(&record.media[0]);
+        assert_eq!(index, 0);
+        assert_eq!(reference.file_name, "diagram.png");
+        assert_eq!(reference.source_epoch, 7);
         // Additive: the raw imeta JSON is still exposed during migration.
         assert!(record.media_json.is_some());
     }
 
     #[test]
-    fn timeline_message_record_ffi_keeps_text_when_imeta_malformed() {
+    fn timeline_message_record_ffi_keeps_text_and_surfaces_malformed_imeta() {
+        // Issue #1787: a rejected attachment must stay visible with a typed
+        // reason at its position instead of leaving an empty media list that
+        // looks like a text-only message.
         let malformed = vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()];
-        let media = imeta_metadata(&[malformed]);
+        let media = imeta_metadata(&[imeta_tag(0x11, "image/png", "ok.png"), malformed]);
         let record: TimelineMessageRecordFfi = record_with_media(Some(7), Some(media), None).into();
 
-        assert!(record.media.is_empty());
         assert_eq!(record.plaintext, "see attached");
+        assert_eq!(record.media.len(), 2);
+        let (index, reference) = accepted(&record.media[0]);
+        assert_eq!((index, reference.file_name.as_str()), (0, "ok.png"));
+        match &record.media[1] {
+            MediaAttachmentOutcomeFfi::Rejected {
+                attachment_index,
+                rejection,
+            } => {
+                assert_eq!(*attachment_index, 1);
+                assert_eq!(
+                    rejection.kind,
+                    super::super::MediaAttachmentRejectionKindFfi::MissingField
+                );
+                assert!(!rejection.detail.is_empty());
+            }
+            other => panic!("malformed attachment must be a Rejected outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_reports_an_undecodable_media_container() {
+        // Storage hands a media column that no longer parses through as a JSON
+        // string so the page query survives; the projection must show one
+        // rejected attachment rather than a text-only row.
+        let corrupt = serde_json::Value::String("{not-json".to_owned());
+        let record: TimelineMessageRecordFfi =
+            record_with_media(Some(7), Some(corrupt), None).into();
+
+        assert_eq!(record.plaintext, "see attached");
+        assert_eq!(record.media.len(), 1);
+        match &record.media[0] {
+            MediaAttachmentOutcomeFfi::Rejected {
+                attachment_index,
+                rejection,
+            } => {
+                assert_eq!(*attachment_index, 0);
+                assert_eq!(
+                    rejection.kind,
+                    super::super::MediaAttachmentRejectionKindFfi::InvalidStructure
+                );
+            }
+            other => panic!("corrupt container must be a Rejected outcome, got {other:?}"),
+        }
+        assert_eq!(record.media_json.as_deref(), Some("\"{not-json\""));
     }
 
     #[test]
@@ -694,8 +758,10 @@ mod tests {
 
         let reply = record.reply_preview.expect("reply preview");
         assert_eq!(reply.media.len(), 1);
-        assert_eq!(reply.media[0].file_name, "clip.mp4");
-        assert_eq!(reply.media[0].source_epoch, 3);
+        let (index, reference) = accepted(&reply.media[0]);
+        assert_eq!(index, 0);
+        assert_eq!(reference.file_name, "clip.mp4");
+        assert_eq!(reference.source_epoch, 3);
         assert_eq!(reply.invalidation_status.as_deref(), Some("LosingBranch"));
     }
 }

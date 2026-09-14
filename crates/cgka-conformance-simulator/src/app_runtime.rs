@@ -489,6 +489,54 @@ impl AppRuntimeHarness {
         }
     }
 
+    /// Public account identity, for reproducible ordering of concurrent authors.
+    pub fn account_identity(&self, client: &str) -> Result<&str, SubjectError> {
+        Ok(&self.participant(client)?.account_id)
+    }
+
+    /// Read the supported app recovery snapshot for the active scenario group.
+    pub async fn group_recovery_status(
+        &self,
+        client: &str,
+    ) -> Result<marmot_app::GroupRecoveryStatus, SubjectError> {
+        let participant = self.participant(client)?;
+        participant
+            .runtime()?
+            .group_recovery_status(&participant.account_id, &self.active_group()?)
+            .await
+            .map_err(app_error)
+    }
+
+    /// Models the recipient's explicit acceptance of one reviewed offer.
+    pub async fn confirm_group_rejoin(
+        &self,
+        client: &str,
+        offer: &marmot_app::GroupRejoinInvitation,
+    ) -> Result<(), SubjectError> {
+        let participant = self.participant(client)?;
+        let id = cgka_traits::MessageId::new(
+            hex::decode(&offer.welcome_id_hex).map_err(|error| app_error(error.into()))?,
+        );
+        let token =
+            hex::decode(&offer.local_state_token).map_err(|error| app_error(error.into()))?;
+        // A busy response guarantees the decision did not start. Reuse the
+        // exact consent token; never refresh it silently after a branch change.
+        for _ in 0..500 {
+            match participant
+                .runtime()?
+                .confirm_group_rejoin(&participant.account_id, &id, &token)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(AppError::AccountWorkerBusy) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(app_error(error)),
+            }
+        }
+        Err(app_error(AppError::AccountWorkerBusy))
+    }
+
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
         let relay_url = self.relay_url.clone();
         let settlement_quiescence_ms = self.settlement_quiescence_ms;
@@ -1900,6 +1948,7 @@ fn app_error_kind(error: &AppError) -> &'static str {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
+        AppError::ChatPresentationNotReady => "chat_presentation_not_ready",
         AppError::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
@@ -1927,6 +1976,7 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
             | AppError::AccountWorkerBusy
             | AppError::RuntimeBusy
             | AppError::TransportClosed
+            | AppError::ChatPresentationNotReady
             | AppError::DirectConversationIndexNotReady
     ) {
         participant.retryable_failures = participant.retryable_failures.saturating_add(1);
@@ -1951,6 +2001,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
         | AppError::AccountWorkerResponseTimedOut
+        | AppError::ChatPresentationNotReady
         | AppError::DirectConversationIndexNotReady
         | AppError::RuntimeStopping
         | AppError::TransportClosed
@@ -1958,11 +2009,14 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RelayDirectory(_)
         | AppError::Publish(_)
         | AppError::BlobStore(_)
+        | AppError::AgentStreamSendFailed(_)
         | AppError::MediaUploadTimedOut
+        | AppError::MediaDownloadFailed(_)
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
         | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,
-        AppError::Json(_)
+        AppError::ProductAnalytics(_)
+        | AppError::Json(_)
         | AppError::Hex(_)
         | AppError::InvalidChatPin(_)
         | AppError::InvalidGroupMembershipPage(_)
@@ -1978,6 +2032,10 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)
         | AppError::InvalidEncryptedMedia(_)
+        | AppError::MediaReferenceStaleEpoch { .. }
+        | AppError::MediaReferenceEpochUnsettled { .. }
+        | AppError::MediaAttachmentRejected(_)
+        | AppError::MediaUnfetchable(_)
         | AppError::UnsafeMediaFetch(_)
         | AppError::InvalidAppMessagePayload(_)
         | AppError::InvalidPushToken(_)
@@ -1992,6 +2050,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupInviteNotPending
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
+        | AppError::AgentStreamPublisher(_)
+        | AppError::AgentStreamFinishMismatch
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
         | AppError::AgentStreamUnsupportedRoute
@@ -2211,6 +2271,8 @@ mod tests {
         for failure in [
             AppError::RuntimeBusy,
             AppError::AccountWorkerResponseTimedOut,
+            AppError::ChatPresentationNotReady,
+            AppError::AgentStreamSendFailed(Box::new(AppError::Publish(marker.into()))),
         ] {
             let resource = app_error(failure);
             assert_eq!(resource.category, SubjectFailureCategory::Resource);

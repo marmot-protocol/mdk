@@ -7,6 +7,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo ./.cargo
 COPY crates ./crates
 COPY integrations ./integrations
+COPY docs/marmot-architecture/product-event-catalogue.json ./docs/marmot-architecture/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \

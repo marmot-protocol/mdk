@@ -52,6 +52,13 @@ pub enum StorageError {
     /// it as a transient (not fatal) error.
     #[error("backend busy: {0}")]
     Busy(String),
+    /// The backend reported a verified corruption code. A wrong encryption key
+    /// or an unrecognized database format is not sufficient to classify this.
+    #[error("backend corruption: {0}")]
+    Corruption(String),
+    /// The backend cannot persist because its storage capacity is exhausted.
+    #[error("backend capacity exhausted: {0}")]
+    Capacity(String),
     /// The backend has been closed and will not serve further operations.
     ///
     /// Distinct from [`StorageError::Backend`] because it is an *expected*
@@ -120,6 +127,36 @@ pub trait GroupStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()>;
     fn get_group(&self, id: &GroupId) -> StorageResult<Group>;
     fn delete_group(&self, id: &GroupId) -> StorageResult<()>;
+
+    /// Atomically erase a group's local state and retain a reset cutoff.
+    /// Repeated calls while awaiting a Welcome preserve the original cutoff.
+    /// This is not an MLS leave or a protocol tombstone.
+    /// Unsupported backends must fail without deleting anything.
+    fn forget_group_local(&self, _id: &GroupId, _at: crate::Timestamp) -> StorageResult<bool> {
+        Err(StorageError::Backend(
+            "local group forgetting is unsupported".into(),
+        ))
+    }
+
+    /// Whether this account-device is awaiting a fresh Welcome after a reset.
+    fn is_group_forgotten(&self, _id: &GroupId) -> StorageResult<bool> {
+        Ok(false)
+    }
+
+    /// Durable reset cutoff, retained even after a fresh join to reject old replay.
+    fn group_local_reset_cutoff(&self, _id: &GroupId) -> StorageResult<Option<crate::Timestamp>> {
+        Ok(None)
+    }
+
+    /// Permit group insertion after a fully validated fresh Welcome. The caller
+    /// must include this write in the same transaction as the MLS join. The
+    /// cutoff remains intact; failed joins must roll back this transition.
+    fn complete_group_local_reset(&self, _id: &GroupId) -> StorageResult<()> {
+        Err(StorageError::Backend(
+            "local group reset is unsupported".into(),
+        ))
+    }
+
     fn list_groups(&self) -> StorageResult<Vec<GroupId>>;
 
     /// Every stored group record in one pass. The engine's session-open seed
@@ -420,6 +457,14 @@ pub enum OwnCommitBaseline {
     AppComponents { components: Vec<AppComponentData> },
 }
 
+/// Durable fresh-KeyPackage lookup state for an invitation withdrawn by convergence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReinviteRetry {
+    pub next_attempt_at_ms: u64,
+    pub lookup_attempts: u32,
+    pub abandoned: bool,
+}
+
 /// The intent behind a commit this device staged. A confirmed commit can still
 /// be parked by convergence for as long as it sits inside the group's rewind
 /// horizon, so the record outlives publication: it is removed when the publish
@@ -436,6 +481,8 @@ pub struct OwnCommitIntent {
     pub source_epoch: EpochId,
     pub intent: SendIntent,
     pub baseline: OwnCommitBaseline,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reinvite: Option<ReinviteRetry>,
     #[serde(default)]
     pub reissue_attempts: u32,
     pub created_at_ms: u64,

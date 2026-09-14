@@ -66,6 +66,9 @@ Prerequisites:
   host and never installs or upgrades OpenClaw.
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors.
 
 ```sh
 install_verified() (
@@ -89,7 +92,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256"
 ```
@@ -109,7 +112,7 @@ an `npub` or raw hex public key:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -123,7 +126,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes \
@@ -334,8 +337,8 @@ for any plugin or tenant that is not in the same trust boundary.
   retries. Every retry of one logical mutation reuses its original idempotency
   key and payload. `wn-agent` therefore applies a mutation at most once even
   when it committed the record but its Ack was lost, while the plugin advances
-  its local transcript only after an Ack; the client and server transcript
-  hashes remain aligned for `stream_finalize`.
+  its append-only text only after an Ack. `stream_finish` checks this text;
+  the shared Rust publisher owns transcript hashing and chunk counts.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call

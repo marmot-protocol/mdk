@@ -120,7 +120,27 @@ impl Hash for KeyPackage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendIntent {
     /// Encrypt + send an application-layer payload to the group.
-    AppMessage { group_id: GroupId, payload: Vec<u8> },
+    AppMessage {
+        group_id: GroupId,
+        payload: Vec<u8>,
+        /// The MLS epoch this payload must be encrypted under, for payloads
+        /// that bind key material to an epoch the wire format does not carry.
+        /// An encrypted-media `imeta` reference is the case today: recipients
+        /// derive the media key from the epoch of the message that delivers
+        /// the tag, so ciphertext produced at epoch N is unreadable when the
+        /// tag ships at N+1.
+        ///
+        /// `None` (the default, and every ordinary message) lets the engine
+        /// retain the intent while the group's epoch is unsettled and encrypt
+        /// it under whatever epoch the group lands on. A pinned message has
+        /// no such freedom: the engine refuses it with
+        /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
+        /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
+        /// time if convergence moved the epoch during the send. Nothing is
+        /// persisted or published in either case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_epoch: Option<EpochId>,
+    },
     /// Invite new members via their KeyPackages.
     Invite {
         group_id: GroupId,
@@ -512,6 +532,9 @@ pub enum GroupEvent {
         /// MLS-authenticated Welcome author derived from the GroupInfo signer
         /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
+        /// Local recipient explicitly authorized replacement of an active branch.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        explicitly_confirmed: bool,
     },
     /// A raw transport object was released solely because a local durable
     /// resource budget expired. This is not a protocol validity verdict and

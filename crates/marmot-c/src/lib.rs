@@ -25,6 +25,7 @@ use marmot_uniffi::Marmot;
 pub mod commands;
 pub(crate) mod macros;
 pub mod memory;
+pub mod publisher;
 pub mod secret_store;
 pub mod status;
 pub mod subscriptions;
@@ -36,6 +37,72 @@ use memory::{owned_c_string, required_str, str_array};
 use secret_store::{CSecretStore, MarmotSecretStore};
 use status::set_last_error;
 use types::notification::MarmotCursorPersistence;
+
+/// Relay endpoint policy used by `marmot_client_new_with_options`.
+#[repr(u32)]
+pub enum MarmotRelayPolicy {
+    PublicOnly = 0,
+    AllowLoopback = 1,
+    /// Also permit loopback blob endpoints for local media fixtures.
+    AllowLoopbackRelaysAndBlobs = 2,
+}
+
+/// Create a client with an explicit relay policy and optional host secret store.
+/// `store == NULL` selects the platform keychain. Loopback opt-in does not
+/// permit private/link-local relays or plaintext public endpoints.
+/// Ownership of the store transfers only on success, as with
+/// `marmot_client_new_with_secret_store`.
+///
+/// # Safety
+/// Strings and arrays must be valid for the call; `store` must be NULL or a
+/// valid vtable; `out_client` must be writable. Pass a `MarmotRelayPolicy`
+/// discriminant as `relay_policy`; unknown values are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_options(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    relay_policy: u32,
+    store: *const MarmotSecretStore,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
+        let policy = match relay_policy {
+            0 => marmot_uniffi::RelayPolicyFfi::PublicOnly,
+            1 => marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            2 => marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
+            _ => {
+                set_last_error("invalid relay policy");
+                return MarmotStatus::InvalidArgument;
+            }
+        };
+        let store = if store.is_null() {
+            None
+        } else {
+            match unsafe { CSecretStore::from_c(store) } {
+                Ok(store) => Some(Arc::new(store)),
+                Err(status) => return status,
+            }
+        };
+        let status = unsafe {
+            open_client(root_path, relay_urls, relay_urls_len, out_client, {
+                let store = store
+                    .as_ref()
+                    .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
+                move |root, relays| Marmot::new_with_options(root, relays, policy, store)
+            })
+        };
+        if status == MarmotStatus::Ok
+            && let Some(store) = store
+        {
+            store.arm();
+        }
+        status
+    })
+}
 
 /// Opaque handle to a running Marmot client: the app runtime plus the
 /// tokio runtime that drives it. Create with `marmot_client_new`, destroy

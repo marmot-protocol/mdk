@@ -19,7 +19,7 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 - Keep audit logging opt-in and explicit. The sole supported event model is privacy-safe: hashed/truncated identifiers,
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.
-- Keep the schema (`schema/audit-log-event.v3.schema.json`) and the Rust kind catalog in lockstep. Two tests enforce
+- Keep the schema (`schema/audit-log-event.v4.schema.json`) and the Rust kind catalog in lockstep. Two tests enforce
   two different halves of that, and both are load-bearing: `audit_log_event_schema_tracks_kind_catalog` compares the
   set of `type` tags, so it catches an added or removed *event kind* — it does not look at properties and passes
   cleanly with a property missing. `sample_events_serialize_within_schema_property_names` walks every sample kind's

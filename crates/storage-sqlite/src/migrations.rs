@@ -126,6 +126,22 @@ mod migration_0062_chat_list_preview_indexes;
 mod migration_0063_query_indexes;
 #[path = "migrations/0064_own_commit_intents.rs"]
 mod migration_0064_own_commit_intents;
+#[path = "migrations/0065_chat_presentation.rs"]
+mod migration_0065_chat_presentation;
+#[path = "migrations/0066_chat_presentation_maintenance.rs"]
+mod migration_0066_chat_presentation_maintenance;
+#[path = "migrations/0067_invitation_recovery.rs"]
+mod migration_0067_invitation_recovery;
+#[path = "migrations/0068_media_epoch_index.rs"]
+mod migration_0068_media_epoch_index;
+#[path = "migrations/0069_chat_readiness_index.rs"]
+mod migration_0069_chat_readiness_index;
+#[path = "migrations/0070_forgotten_groups.rs"]
+mod migration_0070_forgotten_groups;
+#[path = "migrations/0071_group_reset_cutoff.rs"]
+mod migration_0071_group_reset_cutoff;
+#[path = "migrations/0072_chat_list_pages.rs"]
+mod migration_0072_chat_list_pages;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -464,18 +480,64 @@ const MIGRATIONS: &[Migration] = &[
         name: "0064_own_commit_intents",
         apply: migration_0064_own_commit_intents::apply,
     },
+    Migration {
+        version: 65,
+        name: "0065_chat_presentation",
+        apply: migration_0065_chat_presentation::apply,
+    },
+    Migration {
+        version: 66,
+        name: "0066_chat_presentation_maintenance",
+        apply: migration_0066_chat_presentation_maintenance::apply,
+    },
+    Migration {
+        version: 67,
+        name: "0067_invitation_recovery",
+        apply: migration_0067_invitation_recovery::apply,
+    },
+    Migration {
+        version: 68,
+        name: "0068_media_epoch_index",
+        apply: migration_0068_media_epoch_index::apply,
+    },
+    Migration {
+        version: 69,
+        name: "0069_chat_readiness_index",
+        apply: migration_0069_chat_readiness_index::apply,
+    },
+    Migration {
+        version: 70,
+        name: "0070_forgotten_groups",
+        apply: migration_0070_forgotten_groups::apply,
+    },
+    Migration {
+        version: 71,
+        name: "0071_group_reset_cutoff",
+        apply: migration_0071_group_reset_cutoff::apply,
+    },
+    Migration {
+        version: 72,
+        name: "0072_chat_list_pages",
+        apply: migration_0072_chat_list_pages::apply,
+    },
 ];
 
-pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
-    run(connection, MIGRATIONS)
+pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
+    run_with_summary(connection, MIGRATIONS)
 }
 
+#[cfg(test)]
 pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<()> {
+    run_with_summary(connection, migrations).map(|_| ())
+}
+
+fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
     ensure_migration_table(connection)?;
     ensure_ordered(migrations)?;
     reconcile_legacy_migration_names(connection, migrations)?;
     reject_unknown_future_migrations(connection, migrations)?;
 
+    let mut applied = 0;
     for migration in migrations {
         match applied_name(connection, migration.version)? {
             Some(name) if name == migration.name => continue,
@@ -485,11 +547,14 @@ pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> Stor
                     migration.version, migration.name
                 )));
             }
-            None => apply_migration(connection, migration)?,
+            None => {
+                apply_migration(connection, migration)?;
+                applied += 1;
+            }
         }
     }
 
-    Ok(())
+    Ok(applied)
 }
 
 fn ensure_migration_table(connection: &Connection) -> StorageResult<()> {
@@ -690,6 +755,54 @@ mod tests {
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
 
     #[test]
+    fn presentation_upgrade_adds_durable_storage_without_rewriting_group_names() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..64]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at)
+                            VALUES ('aa', 'fixture', 'Deliberately chosen name', 7);
+             INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at) VALUES ('aa', 19, 7);
+             INSERT INTO direct_conversation_members VALUES ('aa', 'bb'), ('aa', 'cc');",
+        )
+        .unwrap();
+        // Simulate interruption after the DDL/data work but before commit.
+        {
+            let tx = conn.transaction().unwrap();
+            super::migration_0065_chat_presentation::apply(&tx).unwrap();
+            tx.rollback().unwrap();
+        }
+        let columns: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('chat_list_rows') WHERE name = 'presentation_json'", [], |r| r.get(0)).unwrap();
+        assert_eq!(columns, 0);
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_list_rows') WHERE name = 'presentation_json')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            present,
+            "chat rows must persist selected presentation in the account database"
+        );
+        let name: String = conn
+            .query_row(
+                "SELECT profile_name FROM account_groups WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Deliberately chosen name");
+        let preserved: (i64, i64, bool) = conn.query_row("SELECT activity_sort_at, length(presentation_row_epoch), presentation_json IS NULL FROM chat_list_rows WHERE group_id_hex = 'aa'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(preserved, (19, 16, true));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chat_presentation_members", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn preview_indexes_are_repeatable() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mut conn = store.lock().unwrap();
@@ -765,6 +878,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(intent, [0xbb]);
+    }
+
+    #[test]
+    fn invitation_recovery_upgrade_preserves_existing_data_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invitation-recovery.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..66]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 1, x'00');
+            INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
+            VALUES (x'01', x'aa', 1, x'bb');",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "UPDATE chat_presentation_checkpoint SET generation=7, state=x'cafe' WHERE id=1;",
+        )
+        .unwrap();
+        run_all(&mut conn).unwrap();
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            applied_name(&conn, 67).unwrap().as_deref(),
+            Some("0067_invitation_recovery")
+        );
+        let intent: Vec<u8> = conn
+            .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent, [0xbb]);
+        let checkpoint: (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT generation, state FROM chat_presentation_checkpoint WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, (7, vec![0xca, 0xfe]));
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM app_group_recovery_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "upgrading must not invent recovery failures");
     }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
@@ -1129,7 +1290,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 64,
+                found: 72,
                 latest_supported: 46,
             }
         ));
@@ -1185,7 +1346,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 64,
+                found: 72,
                 latest_supported: 46,
             }
         ));
@@ -1489,7 +1650,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 64,
+                found: 72,
                 latest_supported: 46,
             }
         ));
@@ -2880,5 +3041,46 @@ mod tests {
         stmt.query_map([], |row| row.get::<_, String>("name"))
             .unwrap()
             .any(|name| name.as_deref() == Ok(index))
+    }
+}
+
+#[cfg(test)]
+mod group_reset_tests {
+    use super::*;
+
+    #[test]
+    fn permanent_forget_marker_migrates_to_awaiting_fresh_welcome() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..70]).unwrap();
+        conn.execute(
+            "INSERT INTO locally_forgotten_groups(group_id) VALUES (x'aa')",
+            [],
+        )
+        .unwrap();
+        let before = crate::codec::unix_now_seconds_i64();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let (cutoff, awaiting): (i64, bool) = conn.query_row(
+            "SELECT forgotten_at, awaiting_welcome FROM locally_forgotten_groups WHERE group_id = x'aa'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(cutoff >= before && cutoff <= crate::codec::unix_now_seconds_i64());
+        assert!(awaiting);
+        assert!(
+            conn.execute(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
+                []
+            )
+            .is_err()
+        );
+        // Upgrading/reopening again must not advance the user's reset boundary.
+        run(&mut conn, MIGRATIONS).unwrap();
+        let unchanged: i64 = conn
+            .query_row(
+                "SELECT forgotten_at FROM locally_forgotten_groups WHERE group_id = x'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, cutoff);
     }
 }

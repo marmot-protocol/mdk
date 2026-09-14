@@ -14,6 +14,7 @@ mod store;
 
 pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
+pub(crate) use store::fail_deferred_peel_rows_in_terminal_group;
 #[cfg(feature = "test-conformance-snapshot")]
 pub(crate) use store::normalized_deferred_peel_lifecycle;
 pub(crate) use store::transition_staged_invite_welcomes;
@@ -621,7 +622,15 @@ impl<S: StorageProvider> Engine<S> {
         // seen-cache insertion is also what it reports to callers holding a
         // dedup index of their own.
         self.last_ingest_left_object_unpersisted = retryable_unpersisted;
-        if !retryable_unpersisted && self.should_remember_ingested_message(&msg.id)? {
+        if !retryable_unpersisted
+            && !matches!(
+                outcome,
+                IngestOutcome::LocalState {
+                    state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
+                }
+            )
+            && self.should_remember_ingested_message(&msg.id)?
+        {
             // Successful group-message peel seams persist exact wrapper ids
             // with their canonical content admission before reaching this
             // epilogue. Keep only the bounded hot-process fallback here: doing
@@ -644,6 +653,20 @@ impl<S: StorageProvider> Engine<S> {
             .should_queue_outbound_intent(&group_id, &intent)
             .await?
         {
+            // Retention re-encrypts the payload under the drain-time epoch.
+            // A payload pinned to one epoch (an encrypted-media reference,
+            // whose key the recipient derives from the delivering message's
+            // epoch) would then ship unreadable, so refuse it here with a
+            // typed answer instead of parking a doomed message.
+            if let SendIntent::AppMessage {
+                expected_epoch: Some(expected),
+                ..
+            } = &intent
+            {
+                return Err(EngineError::AppMessageEpochUnsettled {
+                    expected: *expected,
+                });
+            }
             return self.queue_outbound_intent(group_id, intent, 0);
         }
 
@@ -667,6 +690,7 @@ impl<S: StorageProvider> Engine<S> {
         let intent = SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         };
         self.validate_send_acceptance(&intent)?;
         // Same retention boundary as `send`: a publication this client staged
@@ -744,7 +768,8 @@ impl<S: StorageProvider> Engine<S> {
         // Terminal gate before queueing: a local copy marked removed (realized
         // self-eviction) must never accept or queue outbound work. Checked
         // again in `do_send_ready` so queued-intent drains for a copy removed
-        // after queueing hit the same deterministic error.
+        // after queueing hit the same deterministic error. Disband reaches the
+        // tombstone gate above first, so the message below stays accurate.
         if group.as_ref().is_some_and(|group| group.removed) {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
@@ -957,14 +982,19 @@ impl<S: StorageProvider> Engine<S> {
         if self.sync_unrecoverable_halt_from_record(group_id, group.as_ref()) {
             return Ok(false);
         }
-        // Terminal: a removed copy must never publish, and the removed-copy
+        // Terminal: a terminal copy must never publish, and the terminal-copy
         // gate in `do_send_ready` would turn every queued record into a
         // permanent drain error that the app retries forever. Discard the
-        // queue and report nothing to drain. This is the defense-in-depth
-        // side; the marker sites (realization, commit-apply seam, convergence
-        // reorg) also purge at the moment the copy becomes removed.
-        if group.is_some_and(|group| group.removed) {
+        // queue, retire the deferred-peel backlog, and report nothing to
+        // drain. This gate is also what keeps the sweep away from a *removed*
+        // copy, which stays `Stable` — so it owes the retirement itself, and
+        // it is the only recovery if a crash lands between a marker site's
+        // record write and its own purge. The marker sites (realization,
+        // commit-apply seam, convergence reorg, disband settle) purge both at
+        // the moment the copy becomes terminal.
+        if group.is_some_and(|group| group.is_terminal()) {
             self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+            self.retire_deferred_peel_rows_for_terminal_group(group_id)?;
             return Ok(false);
         }
         if let Some(state) = self.epoch_manager.state(group_id)
@@ -1647,7 +1677,7 @@ impl<S: StorageProvider> Engine<S> {
         if delay.is_some()
             && self
                 .stored_group_record(group_id)?
-                .is_none_or(|group| group.removed)
+                .is_none_or(|group| group.is_terminal())
         {
             // Input-only convergence can realize our eviction while fanout
             // blocks the outbound drain. Removed copies exit that drain before
@@ -2913,10 +2943,21 @@ impl<S: StorageProvider> Engine<S> {
     /// cap-rejection audit re-arms so a fresh cap-full episode is recorded
     /// once more.
     pub(crate) fn note_peel_deferred_row_retired(&mut self, record: &MessageRecord) {
+        self.note_peel_deferred_row_retired_by_id(&record.group_id, &record.id);
+    }
+
+    /// [`Self::note_peel_deferred_row_retired`] keyed by the only two fields
+    /// it reads, for callers holding metadata rather than a whole record (the
+    /// payload bytes come from `deferred_payload_bytes_by_id`, not the row).
+    pub(crate) fn note_peel_deferred_row_retired_by_id(
+        &mut self,
+        group_id: &GroupId,
+        id: &MessageId,
+    ) {
         let account_was_full = self.deferred_peel_account.counted
             && self.deferred_peel_account.bytes >= self.deferred_peel_account_byte_limit;
-        let local_reopened = if let Some(state) = self.deferred_peel.get_mut(&record.group_id) {
-            let Some(payload_bytes) = state.deferred_payload_bytes_by_id.remove(&record.id) else {
+        let local_reopened = if let Some(state) = self.deferred_peel.get_mut(group_id) {
+            let Some(payload_bytes) = state.deferred_payload_bytes_by_id.remove(id) else {
                 return;
             };
             state.deferred_rows = state.deferred_rows.saturating_sub(1);
@@ -2942,7 +2983,7 @@ impl<S: StorageProvider> Engine<S> {
             for state in self.deferred_peel.values_mut() {
                 state.cap_rejection_audited = false;
             }
-        } else if local_reopened && let Some(state) = self.deferred_peel.get_mut(&record.group_id) {
+        } else if local_reopened && let Some(state) = self.deferred_peel.get_mut(group_id) {
             state.cap_rejection_audited = false;
         }
     }

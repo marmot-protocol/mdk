@@ -272,6 +272,29 @@ impl<S: StorageProvider> Engine<S> {
                     category: InputRejectionCategory::Duplicate,
                 })
             }
+            Err(EngineError::InvalidTransition(error)) => {
+                // The offer may have arrived under another transport wrapper.
+                // It owns the content but must remain eligible for ordinary
+                // trusted-removal reentry as well as explicit confirmation.
+                let peeled = self
+                    .peeler
+                    .peel_welcome(msg)
+                    .await
+                    .map_err(EngineError::Peeler)?;
+                let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+                if self.storage.list_welcomes()?.iter().any(|candidate| {
+                    candidate
+                        .rejoin
+                        .as_ref()
+                        .is_some_and(|rejoin| rejoin.content_id == content_id)
+                }) {
+                    Ok(IngestOutcome::LocalState {
+                        state: LocalIngestState::RejoinConfirmationRequired,
+                    })
+                } else {
+                    Err(EngineError::InvalidTransition(error))
+                }
+            }
             Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
                 Ok(IngestOutcome::Ignored {
@@ -333,6 +356,15 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<GroupMessageIngestOutcome, EngineError> {
         let reported = |outcome| Ok(GroupMessageIngestOutcome::Outcome(outcome));
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
+
+        // Before a fresh Welcome, no group message may restart abandoned work.
+        // After joining, use MLS validation and its join-epoch bound: outer
+        // transport timestamps cannot safely reject traffic from skewed clocks.
+        if self.storage.is_group_forgotten(&group_id)? {
+            return reported(IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup,
+            });
+        }
 
         // Authenticated terminal evidence is permanent. Drop late traffic
         // before the missing-OpenMLS fallback can retain it as retryable
@@ -1576,6 +1608,13 @@ impl<S: StorageProvider> Engine<S> {
                     // intents so later drains do not re-fail them forever
                     // against the removed-copy send gate.
                     self.discard_queued_outbound_intents_for_removed_group(&group_id)?;
+                    // And retire the deferred-peel backlog (see
+                    // `retire_deferred_peel_rows_for_terminal_group`). This
+                    // seam owns that here rather than deferring to
+                    // `realize_self_eviction`: the transaction above already
+                    // wrote `removed`, so a later realization early-returns
+                    // without ever reaching it.
+                    self.retire_deferred_peel_rows_for_terminal_group(&group_id)?;
                 } else if after_ids.contains(self.identity.self_id()) {
                     if self.load_leave_request_state(&group_id)?.is_some() {
                         // A SelfRemove proposal is valid only in its
@@ -2223,6 +2262,10 @@ impl<S: StorageProvider> Engine<S> {
         // leaving them to re-fail through the removed-copy send gate on every
         // later drain.
         self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+        // Same for retained inbound work: see
+        // `retire_deferred_peel_rows_for_terminal_group` for why no later
+        // sweep can reach these rows.
+        self.retire_deferred_peel_rows_for_terminal_group(group_id)?;
         // Deliberately LAST, after the marker write — not before it like the
         // convergence path (which has no attribution read). The notification
         // is already enqueued above, so a failure here cannot lose it; it only

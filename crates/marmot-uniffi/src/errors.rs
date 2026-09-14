@@ -4,6 +4,12 @@ use marmot_app::AppError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
+    #[error("usage and diagnostics consent required")]
+    ConsentRequired,
+    #[error("invalid product analytics configuration")]
+    InvalidProductAnalyticsConfiguration,
+    #[error("unregistered or invalid product observation")]
+    InvalidProductObservation,
     #[error("identity already exists: {account}")]
     DuplicateIdentity { account: String },
     #[error("unknown account: {account_ref}")]
@@ -35,15 +41,44 @@ pub enum MarmotKitError {
     /// direct conversation.
     #[error("direct conversation index is not ready; retry after account hydration")]
     DirectConversationIndexNotReady,
+    #[error("chat presentation preparation is incomplete; retry after local maintenance")]
+    ChatPresentationNotReady,
     #[error("invalid chat pin: {details}")]
     InvalidChatPin { details: String },
     /// Host-supplied draft attachment metadata is malformed.
     #[error("invalid message draft: {details}")]
     InvalidMessageDraft { details: String },
-    /// Host-supplied encrypted-media metadata is malformed or does not match
-    /// the target group's selected media profile.
+    /// Host-supplied encrypted-media metadata does not match the target
+    /// group's selected media profile or locator policy, or an upload request
+    /// is unusable (empty batch, oversized, no endpoint).
     #[error("invalid media reference: {details}")]
     InvalidMediaReference { details: String },
+    /// An encrypted-media `imeta` reference failed MDK's shared strict parser
+    /// (mdk#1787): `parse_media_imeta_tag` on an inbound tag, or a host-built
+    /// reference passed to build/send/upload/download whose fields are
+    /// structurally invalid. `kind` is the stable category the timeline's
+    /// `Rejected` outcomes also report, so explicit parsing and projection
+    /// agree without string matching; `details` is privacy-safe presentation
+    /// text. Attachment-local: never a reason to hide the carrying message.
+    #[error("invalid media attachment [{kind}]: {details}")]
+    MediaAttachmentRejected {
+        kind: crate::conversions::MediaAttachmentRejectionKindFfi,
+        details: String,
+    },
+    /// The reference is valid but has no locator this client may fetch under
+    /// the group's current `allowed_locator_kinds` or its own host-safety
+    /// policy; nothing was dialed. Not retryable until the policy, the client,
+    /// or the sender's locators change. Distinct from
+    /// [`MarmotKitError::MediaAttachmentRejected`] (the reference is fine) and
+    /// [`MarmotKitError::MediaDownloadFailed`] (a fetch was attempted).
+    #[error("media is unfetchable under the current locator policy: {details}")]
+    MediaUnfetchable { details: String },
+    /// Fetching, verifying, or decrypting the blob failed after a fetchable
+    /// locator was selected: transport errors and timeouts (retryable),
+    /// ciphertext/plaintext hash mismatches, and AEAD failures (the served
+    /// bytes or the epoch secret do not match the reference).
+    #[error("media download failed: {details}")]
+    MediaDownloadFailed { details: String },
     #[error("invalid hex: {details}")]
     InvalidHex { details: String },
     #[error("invalid nostr identity: {details}")]
@@ -246,6 +281,15 @@ impl From<AppError> for MarmotKitError {
             return Self::from_engine_error(err);
         }
         match value {
+            AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
+                Self::ConsentRequired
+            }
+            AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::InvalidConfiguration) => {
+                Self::InvalidProductAnalyticsConfiguration
+            }
+            AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::InvalidEvent) => {
+                Self::InvalidProductObservation
+            }
             AppError::AccountHome(AccountHomeError::UnknownAccount(account_ref)) => {
                 Self::UnknownAccount { account_ref }
             }
@@ -293,6 +337,7 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
                 max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
             },
+            AppError::ChatPresentationNotReady => Self::ChatPresentationNotReady,
             AppError::DirectConversationIndexNotReady => Self::DirectConversationIndexNotReady,
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
@@ -305,6 +350,20 @@ impl From<AppError> for MarmotKitError {
             // errors; map them to the typed variant so send/upload/download
             // agree with build/parse even when a call site uses `?`/`From`.
             AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
+            stale @ AppError::MediaReferenceStaleEpoch { .. } => Self::InvalidMediaReference {
+                details: stale.to_string(),
+            },
+            unsettled @ AppError::MediaReferenceEpochUnsettled { .. } => {
+                Self::InvalidMediaReference {
+                    details: unsettled.to_string(),
+                }
+            }
+            AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
+                kind: rejection.kind.into(),
+                details: rejection.detail,
+            },
+            AppError::MediaUnfetchable(details) => Self::MediaUnfetchable { details },
+            AppError::MediaDownloadFailed(details) => Self::MediaDownloadFailed { details },
             AppError::UnsafeMediaFetch(details) => Self::InvalidMediaReference { details },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),

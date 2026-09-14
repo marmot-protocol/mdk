@@ -165,6 +165,16 @@ Run `cargo test -p cgka-conformance-simulator --test large_group_family --locked
 application and retained-join canaries. Prefer the isolated file-backed campaign runner for broader execution;
 generator tests already compile all 54 shapes without running the expensive large/xlarge blocks.
 
+The 64-member Welcome-refusal boundary (`seed=8001`, `case_index=30`) is an explicit opt-in:
+
+```sh
+cargo test -p cgka-conformance-simulator --locked --bin cgka-conformance-campaign -- \
+  --ignored --exact tests::large_group_pressure_8001_30_reports_create_refusal
+```
+
+Use a fresh `--out` directory. The worker must exit 1 with a report, fixture candidate, and portable capsule; a
+panic exit 101 means the refusal was not converted into a failed scenario step.
+
 For `offline-catchup-pressure/v1`, six consecutive cases form one volume block: 24, 96, 384, then 1,024 application
 messages, interleaved with 4, 8, 12, then 16 commit rounds. Each block covers natural full history, reverse history,
 reverse history with three copies, natural two-copy incremental followed by full repair, reverse two-copy restart after

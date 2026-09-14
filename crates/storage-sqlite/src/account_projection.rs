@@ -186,6 +186,8 @@ pub struct StoredAccountGroup {
     /// peer without scanning every unnamed two-member chat. `None` when the
     /// group is not currently classified as Direct.
     pub direct_member_ids_hex: Option<Vec<String>>,
+    /// Current authoritative two-member roster, including explicitly named groups.
+    pub presentation_member_ids_hex: Option<Vec<String>>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
     pub nostr_routing_last_epoch: u64,
@@ -227,7 +229,7 @@ impl fmt::Debug for StoredAccountGroup {
             .field("prior_nostr_routes", &self.prior_nostr_routes)
             .field("self_membership", &self.self_membership)
             .field("components", &self.components)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -557,6 +559,35 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Retire these groups' recovery intents whatever epoch they were armed at.
+    ///
+    /// A group this device is terminal in keeps no intent at any epoch, so the
+    /// stored epoch is not part of the key here. Use
+    /// [`Self::clear_epoch_backfill_intents`] instead when a replay completed
+    /// and a concurrent newer arm must survive.
+    pub fn clear_epoch_backfill_intents_for_groups(
+        &self,
+        group_ids_hex: &[String],
+    ) -> StorageResult<()> {
+        if group_ids_hex.is_empty() {
+            return Ok(());
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for group_id_hex in group_ids_hex {
+                let group_id = hex::decode(group_id_hex).map_err(|error| {
+                    StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
+                })?;
+                conn.execute_cached(
+                    "DELETE FROM app_epoch_backfill_intents WHERE group_id = ?1",
+                    params![group_id],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn account_delivery_recovery(
         &self,
         label: &str,
@@ -682,13 +713,11 @@ impl SqliteAccountStorage {
 
     /// Every group's frozen-epoch evidence, for account-open restore.
     ///
-    /// Rows are written when evidence is gathered, never when it is voided:
-    /// nothing persists the resets, because they happen on the delivery hot
-    /// path and a group that recovers has no further reason to touch storage.
-    /// A recovered group therefore leaves its last row behind. That is bounded
-    /// and inert by construction — one row per group, cascading with the
-    /// protocol group — and the restore path discards it on the first
-    /// observation at any other epoch.
+    /// Epoch movement alone need not persist a reset: restore discards stale
+    /// per-epoch evidence on the first observation at another epoch. The app
+    /// explicitly clears this row alongside a recovery-failure warning when
+    /// authenticated peer activity or a join resolves that recovery run, so a
+    /// same-epoch restart cannot resurrect evidence already cleared by a peer.
     pub fn epoch_stall_evidence(&self) -> StorageResult<Vec<StoredEpochStallEvidence>> {
         let conn = self.lock()?;
         let mut statement = conn
@@ -848,6 +877,7 @@ impl SqliteAccountStorage {
 
         let mut components_by_group = all_account_group_components(&conn)?;
         let mut members_by_group = load_direct_conversation_members(&conn)?;
+        let mut presentation_members = load_presentation_members(&conn)?;
         let mut groups = Vec::with_capacity(raw_groups.len());
         for raw in raw_groups {
             let prior_nostr_routes = serde_json::from_str(&raw.prior_nostr_routes_json)
@@ -856,6 +886,7 @@ impl SqliteAccountStorage {
                 .remove(&raw.group_id_hex)
                 .unwrap_or_default();
             let direct_member_ids_hex = members_by_group.remove(&raw.group_id_hex);
+            let presentation_member_ids_hex = presentation_members.remove(&raw.group_id_hex);
             groups.push(StoredAccountGroup {
                 group_id_hex: raw.group_id_hex,
                 endpoint: raw.endpoint,
@@ -871,6 +902,7 @@ impl SqliteAccountStorage {
                 pending_confirmation: raw.pending_confirmation,
                 member_count: raw.member_count.and_then(|value| value.try_into().ok()),
                 direct_member_ids_hex,
+                presentation_member_ids_hex,
                 welcomer_account_id_hex: raw.welcomer_account_id_hex,
                 via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
                 nostr_routing_last_epoch: raw
@@ -1101,7 +1133,7 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
 
-            let locally_deleted_group_ids = if state.groups.is_empty() {
+            let mut locally_deleted_group_ids = if state.groups.is_empty() {
                 std::collections::HashSet::new()
             } else {
                 let mut statement = conn
@@ -1113,6 +1145,19 @@ impl SqliteAccountStorage {
                     .collect::<Result<std::collections::HashSet<_>, _>>()
                     .storage()?
             };
+            // Probe only groups in this write, not the lifetime collection of
+            // forgotten ids. Ordinary delta checkpoints usually contain one.
+            if !state.groups.is_empty() {
+                let mut forgotten = conn.prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM locally_forgotten_groups WHERE group_id = ?1 AND awaiting_welcome = 1)"
+                ).storage()?;
+                for group in &state.groups {
+                    if let Ok(id) = hex::decode(&group.group_id_hex)
+                        && forgotten.query_row(params![id], |row| row.get::<_, bool>(0)).storage()? {
+                        locally_deleted_group_ids.insert(group.group_id_hex.clone());
+                    }
+                }
+            }
             let retained_group_ids = state
                 .groups
                 .iter()
@@ -1263,6 +1308,8 @@ impl SqliteAccountStorage {
                     group.direct_member_ids_hex.as_deref(),
                     persist_direct_conversation_members(group),
                 )?;
+                crate::chat_presentation::replace_members_tx(&conn, &group.group_id_hex,
+                    group.presentation_member_ids_hex.as_deref().unwrap_or(&[]))?;
             }
             for message_id in application_event_ids_to_ack {
                 conn.execute_cached(
@@ -1375,6 +1422,30 @@ impl SqliteAccountStorage {
         &self,
         group_id_hex: &str,
     ) -> StorageResult<DeleteLocalGroupDataResult> {
+        self.delete_local_group_data_inner(group_id_hex, None)
+    }
+
+    pub(crate) fn forget_group_local_data(
+        &self,
+        group_id_hex: &str,
+        at: cgka_traits::Timestamp,
+    ) -> StorageResult<bool> {
+        use cgka_traits::storage::GroupStorage;
+        let id = cgka_traits::GroupId::new(
+            hex::decode(group_id_hex)
+                .map_err(|_| StorageError::Serialization("invalid local group id".into()))?,
+        );
+        let already_forgotten = self.is_group_forgotten(&id)?;
+        self.delete_local_group_data_inner(group_id_hex, Some(at))?;
+        Ok(!already_forgotten)
+    }
+
+    fn delete_local_group_data_inner(
+        &self,
+        group_id_hex: &str,
+        forgotten_at: Option<cgka_traits::Timestamp>,
+    ) -> StorageResult<DeleteLocalGroupDataResult> {
+        let forget = forgotten_at.is_some();
         if group_id_hex.trim().is_empty() {
             return Err(StorageError::Backend(
                 "local group delete id must not be empty".to_owned(),
@@ -1454,7 +1525,7 @@ impl SqliteAccountStorage {
                         },
                     )
                     .storage()?;
-                if active && !terminal {
+                if active && !terminal && !forget {
                     tx.execute_cached(
                         "INSERT INTO local_group_deletion_frontiers (
                             group_id_hex, message_insert_order, prior_nostr_routes_json
@@ -1477,7 +1548,7 @@ impl SqliteAccountStorage {
                     )
                     .storage()?;
                 }
-                if terminal {
+                if terminal && !forget {
                     tx.execute_cached(
                         "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
                         params![hex::encode(&group_id)],
@@ -1490,6 +1561,41 @@ impl SqliteAccountStorage {
                         )
                         .storage()?,
                     );
+                }
+                if let Some(at) = forgotten_at {
+                    deleted += tx.execute_cached(
+                        "INSERT INTO locally_forgotten_groups(group_id, forgotten_at, awaiting_welcome)
+                         VALUES (?1, ?2, 1) ON CONFLICT(group_id) DO UPDATE SET
+                         forgotten_at = MAX(locally_forgotten_groups.forgotten_at, excluded.forgotten_at),
+                         awaiting_welcome = 1 WHERE locally_forgotten_groups.awaiting_welcome = 0",
+                        params![&group_id, u64_to_i64(at.0)?],
+                    ).storage()?;
+                    crate::storage::groups::delete_group_tx(
+                        &tx,
+                        &cgka_traits::GroupId::new(group_id.clone()),
+                    )?;
+                    for table in ["cgka_welcomes", "cgka_disband_tombstones"] {
+                        tx.execute_cached(
+                            &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                            params![&group_id],
+                        )
+                        .storage()?;
+                    }
+                    for table in [
+                        "local_group_deletion_frontiers",
+                        "app_pending_welcome_delivery",
+                        "pending_push_registration_removals",
+                        "app_prepared_group_image_upload",
+                        "message_drafts",
+                        "chat_pin_positions",
+                    ] {
+                        tx.execute_cached(
+                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
+                            params![group_id_hex],
+                        )
+                        .storage()?;
+                    }
+                    self.connection.note_openmls_write();
                 }
                 if deleted > 0 {
                     merge_local_group_delete_intent_tx(&tx, group_id_hex, deleted)?;
@@ -1750,6 +1856,29 @@ impl SqliteAccountStorage {
             )
             .storage()?
             > 0)
+    }
+
+    /// Apply an authoritative self-arrival. A departed conversation returns to Chats
+    /// even if it was archived before leaving. Ordinary member activity preserves archive.
+    /// Returns whether this transitioned an existing departed projection back to Member.
+    pub fn restore_group_self_membership(&self, group_id_hex: &str) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let departed = matches!(
+                self.group_self_membership(group_id_hex)?,
+                Some(SelfMembership::Left | SelfMembership::Removed)
+            );
+            if departed {
+                self.lock()?
+                    .execute_cached(
+                        "UPDATE account_groups SET archived=0 WHERE group_id_hex=?1",
+                        [group_id_hex],
+                    )
+                    .storage()?;
+            }
+            // Preserve push-share admission and every existing membership side effect.
+            self.set_group_self_membership(group_id_hex, SelfMembership::Member)?;
+            Ok(departed)
+        })
     }
 
     /// Record the local account's own membership in `group_id_hex` so the
@@ -2340,6 +2469,19 @@ impl SqliteAccountStorage {
     ) -> StorageResult<AccountStoredPushRegistration> {
         self.connection.with_transaction(|| {
             let existing = self.push_registration(&registration.account_label)?;
+            // Hosts re-register on foreground. Keep an unchanged registration's
+            // revision and partial gossip progress instead of requeueing every
+            // joined group each time the app resumes.
+            if let Some(existing) = &existing
+                && existing.registration.account_id_hex == registration.account_id_hex
+                && existing.registration.platform == registration.platform
+                && existing.registration.token_fingerprint == registration.token_fingerprint
+                && existing.registration.server_pubkey_hex == registration.server_pubkey_hex
+                && existing.registration.relay_hint == registration.relay_hint
+                && existing.token_bytes == token_bytes
+            {
+                return Ok(existing.clone());
+            }
             let created_at_ms = existing
                 .as_ref()
                 .map(|existing| existing.registration.created_at_ms)
@@ -3779,6 +3921,29 @@ fn load_direct_conversation_members(
         .prepare_cached(
             "SELECT group_id_hex, member_id_hex
              FROM direct_conversation_members
+             ORDER BY group_id_hex, member_id_hex",
+        )
+        .storage()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .storage()?;
+    let mut members_by_group = HashMap::new();
+    for row in rows {
+        let (group_id_hex, member_id_hex) = row.storage()?;
+        members_by_group
+            .entry(group_id_hex)
+            .or_insert_with(Vec::new)
+            .push(member_id_hex);
+    }
+    Ok(members_by_group)
+}
+fn load_presentation_members(conn: &Connection) -> StorageResult<HashMap<String, Vec<String>>> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT group_id_hex, member_id_hex
+             FROM chat_presentation_members
              ORDER BY group_id_hex, member_id_hex",
         )
         .storage()?;

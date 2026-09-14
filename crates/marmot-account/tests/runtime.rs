@@ -176,6 +176,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -317,22 +318,24 @@ async fn welcome_for_key_package(
         })
         .await
         .unwrap();
-    match &created.effects.publish[0] {
+    let welcomes = match &created.effects.publish[0] {
         PublishWork::GroupCreated { welcomes, pending } => {
             inviter.confirm_published(*pending).await.unwrap();
             welcomes
-                .iter()
-                .find(|message| {
-                    matches!(
-                        &message.envelope,
-                        TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
-                    )
-                })
-                .expect("welcome addressed to key package owner")
-                .clone()
         }
-        other => panic!("expected GroupCreated publish work, got {other:?}"),
-    }
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes,
+        _ => panic!("expected group creation publish work"),
+    };
+    welcomes
+        .iter()
+        .find(|message| {
+            matches!(
+                &message.envelope,
+                TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
+            )
+        })
+        .expect("welcome addressed to key package owner")
+        .clone()
 }
 
 /// MIP-03 self-remove feature registration, mirroring the cgka-session
@@ -669,6 +672,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 }
 
 include!("runtime/frozen_fanout.rs");
+include!("runtime/key_package_generation_upgrade.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
@@ -1014,6 +1018,17 @@ async fn automatic_maintenance_publication_preserves_private_material_ownership(
 
     runtime.run_due_maintenance().await.unwrap();
 
+    let activity = runtime.take_maintenance_activity();
+    assert_eq!(activity.key_package_attempts, 1);
+    assert_eq!(activity.attempt_durations.len(), 1);
+    assert!(activity.attempt_durations[0].key_package);
+    assert!(!activity.attempt_durations[0].failed);
+    assert!(
+        runtime
+            .take_maintenance_activity()
+            .attempt_durations
+            .is_empty()
+    );
     let published = publisher.publications();
     assert_eq!(published.len(), 1);
     assert_eq!(
@@ -2271,6 +2286,7 @@ async fn post_join_rotation_does_not_block_application_send_and_returns_disposit
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice_hex, b"send while rotation is pending"),
+            expected_epoch: None,
         })
         .await
         .expect("post-join maintenance must not block application sends");
@@ -3818,6 +3834,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -4554,7 +4571,18 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
     );
 
     let publishes_before = adapter.publishes().len();
-    runtime.run_due_maintenance().await.unwrap();
+    for _ in 0..60 {
+        runtime.run_due_maintenance().await.unwrap();
+    }
+    let activity = runtime.take_maintenance_activity();
+    assert_eq!(
+        activity.failed_transitions, 0,
+        "restored failure is state, not sixty new edges"
+    );
+    assert_eq!(
+        activity.self_update_attempts, 0,
+        "terminal obligations do not execute"
+    );
 
     assert_eq!(
         sole_evolution(&runtime, &group_id).phase,
