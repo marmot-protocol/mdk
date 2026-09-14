@@ -154,7 +154,13 @@ not yet definitively tested under the current peel-context fingerprint a bounded
 uses the earlier of 250 ms of local monotonic deferred-phase time or four row attempts. Required authenticated
 convergence is completed first and does not consume that deferred-phase time budget. If work remains when either bound
 is reached, the engine MUST durably retain the original outbound intent and return `AcceptedPending`; it MUST NOT
-prepare wire bytes. Current-fingerprint deferred work remains safety-critical ahead of every queued outbound intent.
+prepare wire bytes. The one exception is an application message whose intent pins an `expected_epoch`: retention
+would encrypt it under the drain-time epoch, and the payload binds key material to the pinned one (an
+encrypted-media `imeta` reference, whose media key recipients derive from the delivering message's epoch). The
+engine MUST refuse such a message with `AppMessageEpochUnsettled` instead of retaining it, and MUST compare the loaded
+MLS epoch against the pin immediately before encryption, refusing with `AppMessageEpochMismatch` when convergence
+folded into the send moved the epoch; neither refusal persists or publishes anything. Current-fingerprint deferred
+work remains safety-critical ahead of every queued outbound intent.
 Rows already definitively tested under that fingerprint are historical-only maintenance and MUST NOT keep a new or
 queued outbound intent waiting. The durable per-row fingerprint, rather than a process-local numeric cursor,
 determines which row is next after restart.
@@ -209,6 +215,18 @@ group. Auto-publish and explicit `send` paths now share the same publish-before-
 
 If a group has unresolved convergence input, `send(intent)` MUST store the intent durably and return
 `SendResult::Queued`.
+
+### Superseded own commits
+
+A confirmed group evolution can still lose a same-epoch race inside the rewind horizon. The engine MUST retain the
+intent behind every own `Invite`, `RemoveMembers`, `UpdateGroupData`, and `UpdateAppComponents` commit, with the
+authoring baseline of the fields it changed, until the group has advanced more than `max_rewind_commits` epochs past
+the commit's source epoch. When branch selection withdraws such a commit, the engine MUST decide the intent's fate
+from that record rather than replay the losing bytes: a profile or component edit is re-queued as an ordinary outbound
+intent only when the canonical state still holds the baseline for every field the edit changed, and is otherwise
+reported as a conflict; a removal is re-queued for targets that are still members; an invite is reported as requiring
+a fresh invitation. Re-issue is bounded (two attempts), and every decision is reported to the host so a change the
+caller was told had saved is never silently lost.
 
 `PendingPublish` and `Merging` are the two steps of resolving a publication this client staged, and neither exit is
 something the sender controls — a transport outcome, then the local merge that outcome authorizes. An
@@ -537,6 +555,10 @@ A conforming engine MUST pass scenario tests for:
 - duplicate commit, proposal, and app message reported as `AlreadySeen`,
 - outbound app and commit intents queued while syncing,
 - app message retained across a pending publish and regenerated under the epoch the publish established,
+- epoch-pinned app message refused rather than retained while a publish is pending, and refused at encryption when
+  the send folds a retained commit
+  (`epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publish_is_pending`,
+  `epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_commit`),
 - queued commit regenerated after settled convergence,
 - restart reproducing the same canonicalization result from persisted storage,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients.

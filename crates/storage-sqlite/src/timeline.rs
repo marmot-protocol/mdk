@@ -1137,12 +1137,17 @@ impl SqliteAccountStorage {
                     .storage()?;
                 Ok(rows)
             };
+        // Start with origin-linked rows; ordinary chat history has no origin.
+        // Decode the text id to use the existing binary id index. Keep the
+        // original comparison so noncanonical hex still does not match.
         let to_withdraw = collect(
             "SELECT DISTINCT app_events.origin_commit_id
              FROM app_events
-             JOIN cgka_messages
-               ON lower(hex(cgka_messages.id)) = app_events.origin_commit_id
-             WHERE cgka_messages.state = ?1
+             CROSS JOIN cgka_messages
+               ON cgka_messages.id = unhex(app_events.origin_commit_id)
+              AND lower(hex(cgka_messages.id)) = app_events.origin_commit_id
+             WHERE app_events.origin_commit_id IS NOT NULL
+               AND cgka_messages.state = ?1
                AND app_events.invalidated = 0
              ORDER BY app_events.origin_commit_id",
             vec![deferred.into()],
@@ -1150,9 +1155,11 @@ impl SqliteAccountStorage {
         let to_revive = collect(
             "SELECT DISTINCT app_events.origin_commit_id
              FROM app_events
-             JOIN cgka_messages
-               ON lower(hex(cgka_messages.id)) = app_events.origin_commit_id
-             WHERE cgka_messages.state = ?1
+             CROSS JOIN cgka_messages
+               ON cgka_messages.id = unhex(app_events.origin_commit_id)
+              AND lower(hex(cgka_messages.id)) = app_events.origin_commit_id
+             WHERE app_events.origin_commit_id IS NOT NULL
+               AND cgka_messages.state = ?1
                AND app_events.invalidated = 1
                AND app_events.invalidation_reason = ?2
              ORDER BY app_events.origin_commit_id",
@@ -1716,7 +1723,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
 ) -> StorageResult<()> {
     let activity_filter = crate::chat_list::chat_list_activity_filter_sql("preview.");
     let preview_order = crate::chat_list::chat_list_preview_order_desc("preview.");
-    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.");
+    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.", "?1");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
                 preview.kind, preview.timeline_at, preview.deleted,
@@ -1727,7 +1734,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                     WHEN preview.source_message_id_hex IS NULL THEN 'pending'
                     ELSE 'delivered'
                 END
-         FROM message_timeline AS preview
+         FROM message_timeline AS preview NOT INDEXED
          WHERE preview.group_id_hex = ?1
            AND {activity_filter}
            AND {preview_eligibility}
@@ -2131,6 +2138,8 @@ fn app_events_targeting_message_tx(
     // .any(|t| t == target)` relationship (one edge per "e" tag value), so the
     // indexed join is equivalent to the former JSON `LIKE` scan plus Rust-side
     // re-filter, without either. Ordering is preserved byte-for-byte.
+    // Keep the target index outermost; scanning history to avoid a small
+    // modifier sort makes even a message with no modifiers cost O(history).
     let mut stmt = tx
         .prepare_cached(
             "SELECT app_events.group_id_hex, app_events.message_id_hex, app_events.source_message_id_hex,
@@ -2140,7 +2149,7 @@ fn app_events_targeting_message_tx(
                     app_events.invalidated, app_events.invalidation_reason,
                     app_events.moderation_grant
              FROM message_modifier_edges AS edges
-             JOIN app_events
+             CROSS JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
               AND app_events.message_id_hex = edges.modifier_message_id_hex
              WHERE edges.group_id_hex = ?1
@@ -3588,13 +3597,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
         reply_to_message_id_hex: row.get(13)?,
         reply_preview: None,
-        media: optional_value_from_json(row.get::<_, Option<String>>(14)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                14,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
+        media: media_value_from_json(row.get::<_, Option<String>>(14)?),
         agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(15)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -3699,9 +3702,7 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         sender: row.get(1)?,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        media: optional_value_from_json(row.get::<_, Option<String>>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        media: media_value_from_json(row.get::<_, Option<String>>(4)?),
         agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -3733,6 +3734,16 @@ fn optional_value_json(value: &Option<Value>) -> StorageResult<Option<String>> {
 
 fn optional_value_from_json(value: Option<String>) -> Result<Option<Value>, serde_json::Error> {
     value.map(|value| serde_json::from_str(&value)).transpose()
+}
+
+/// Decode a stored media container leniently. The projection only ever writes
+/// valid JSON here, so a column that no longer parses is corruption; instead of
+/// failing the whole page or reply query, preserve the raw text as a JSON
+/// string so the app-layer attachment projection reports one undecodable
+/// attachment while the message text and every other row stay readable
+/// (mdk#1787).
+fn media_value_from_json(value: Option<String>) -> Option<Value> {
+    value.map(|text| serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
 fn reaction_summary_json(summary: &TimelineReactionSummary) -> StorageResult<String> {

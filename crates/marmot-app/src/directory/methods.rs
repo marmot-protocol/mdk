@@ -36,7 +36,8 @@ use crate::ids::{
 };
 use crate::key_package_records::{
     fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
-    latest_fresh_key_package_from_records, publish_endpoints_from_bootstrap, relay_list_queries,
+    latest_fresh_key_package_from_records, merge_relay_list_status,
+    publish_endpoints_from_bootstrap, relay_list_queries,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
@@ -98,34 +99,16 @@ impl MarmotApp {
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
-        let observed_nip65 = records.iter().any(|record| {
-            record.event.pubkey == account_id_hex
-                && record.event.kind == KIND_NIP65_RELAY_LIST
-                && freshness.accepts(record)
-        });
-        let observed_inbox = records.iter().any(|record| {
-            record.event.pubkey == account_id_hex
-                && record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST
-                && freshness.accepts(record)
-        });
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
-        let mut status = selection.value;
-        if !observed_nip65 || !observed_inbox {
+        let cached = {
             let app = self.clone();
             let account_id = account_id_hex.clone();
-            let cached = blocking_app_task(move || {
-                app.account_relay_list_status_for_account_id(&account_id)
-            })
-            .await?;
-            if !observed_nip65 {
-                status.nip65 = cached.nip65;
-            }
-            if !observed_inbox {
-                status.inbox = cached.inbox;
-            }
-            push_unique_strings(&mut status.bootstrap_relays, cached.bootstrap_relays);
-            status.refresh();
-        }
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
+        };
+        // The one-hop diagnostic and target-aware resolver share the same
+        // per-kind anti-clobber rule; observing an older record is not freshness.
+        let mut status = merge_relay_list_status(cached, selection.value);
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = bootstrap_relays
                 .iter()
@@ -142,12 +125,148 @@ impl MarmotApp {
         Ok(status)
     }
 
+    /// Resolve an account's relay metadata through its advertised NIP-65
+    /// write relays before treating a kind-10050 inbox list as absent.
+    ///
+    /// The explicit fetch API above intentionally remains a one-hop diagnostic
+    /// primitive. Production account setup uses this target-aware wrapper so a
+    /// discovery relay (`D`) can point at an outbox (`W`) that owns the current
+    /// inbox declaration. If the second hop fails, already-observed positive
+    /// inbox metadata remains usable; an empty first hop is not promoted into
+    /// authoritative absence.
+    pub(crate) async fn resolve_account_relay_list_status_for_account_id(
+        &self,
+        account_id_hex: &str,
+        discovery_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let discovery_relays = self.directory_source_relays(&discovery_relays);
+        let freshness = self.directory_freshness();
+        let cached = {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
+        };
+        let first = self
+            .relay_plane
+            .fetch_directory_events_with_completion(
+                discovery_relays.clone(),
+                relay_list_queries(account_id_hex.clone()),
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let mut records = first.records;
+        let first_observed =
+            fresh_relay_list_status_from_records(&account_id_hex, records.clone(), freshness).value;
+        let first_hop = merge_relay_list_status(cached.clone(), first_observed);
+        let outbox_relays = self.retain_safe_discovered_endpoints(
+            first_hop
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "account inbox outbox discovery",
+        );
+        let mut complete = first.complete;
+        if !outbox_relays.is_empty() {
+            match self
+                .relay_plane
+                .fetch_directory_events_with_completion(
+                    outbox_relays,
+                    relay_list_queries(account_id_hex.clone()),
+                )
+                .await
+            {
+                Ok(second) => {
+                    complete &= second.complete;
+                    records.extend(second.records);
+                }
+                Err(_) => complete = false,
+            }
+        }
+
+        let observed = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
+        // A rejected future-dated declaration is not evidence of absence.
+        complete &= !observed.rejected_future;
+        let mut status = merge_relay_list_status(cached, observed.value);
+        // Persist signed observations (including explicit-empty lists) and
+        // valid cached metadata even when discovery was incomplete. Do not
+        // durably turn the caller's discovery fallback into claimed account
+        // metadata merely because a lookup failed.
+        if status.nip65.created_at > 0 || status.inbox.created_at > 0 {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = status.clone();
+            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
+                .await?;
+        }
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = discovery_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
+
+        let explicit_empty = (status.nip65.created_at > 0 && status.nip65.relays.is_empty())
+            || (status.inbox.created_at > 0 && status.inbox.relays.is_empty());
+        let uncertain_absence =
+            !complete && (status.nip65.relays.is_empty() || status.inbox.relays.is_empty());
+        if uncertain_absence {
+            return Err(AppError::RelayDirectory(
+                "relay-list absence was not authoritatively established".to_owned(),
+            ));
+        }
+        if explicit_empty {
+            return Err(AppError::MissingRelayLists(status.missing.clone()));
+        }
+        Ok(status)
+    }
+
     pub async fn fetch_current_account_relay_list_status_for_account_id(
         &self,
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
         required_list_kind: Option<&str>,
     ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "relay_list",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_current_account_relay_list_status_for_account_id_unobserved(
+                account_id_hex,
+                bootstrap_relays,
+                required_list_kind,
+            )
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok((Some(_), _)) => "success",
+                    Ok((None, _)) => "empty",
+                    Err(_) => "failure",
+                },
+                // Failed fetches have no result provenance; classify the network attempt.
+                result.as_ref().map_or("network", |(_, source)| *source),
+                1,
+            );
+            observation.discard();
+        }
+        result.map(|(status, _)| status)
+    }
+
+    async fn fetch_current_account_relay_list_status_for_account_id_unobserved(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        required_list_kind: Option<&str>,
+    ) -> Result<(Option<AccountRelayListStatus>, &'static str), AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
@@ -188,7 +307,7 @@ impl MarmotApp {
             None => observed_nip65 || observed_inbox,
         };
         if !has_required_list {
-            return Ok(None);
+            return Ok((None, "network"));
         }
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
@@ -197,6 +316,17 @@ impl MarmotApp {
             let account_id = account_id_hex.clone();
             blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
                 .await?
+        };
+        let source = if (!observed_nip65 && cached.nip65.created_at > 0)
+            || (!observed_inbox && cached.inbox.created_at > 0)
+            || cached
+                .bootstrap_relays
+                .iter()
+                .any(|relay| !status.bootstrap_relays.contains(relay))
+        {
+            "mixed"
+        } else {
+            "network"
         };
         if !observed_nip65 {
             status.nip65 = cached.nip65;
@@ -219,7 +349,7 @@ impl MarmotApp {
             blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
                 .await?;
         }
-        Ok(Some(status))
+        Ok((Some(status), source))
     }
 
     /// Fetch the account's own current published kind:0 profile metadata from
@@ -235,6 +365,34 @@ impl MarmotApp {
     /// remote state instead of publishing a partial replacement. The fetched
     /// profile is cached in the local directory on success.
     pub async fn fetch_current_user_profile_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<UserProfileMetadata>, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "profile",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_current_user_profile_for_account_id_unobserved(account_id_hex, bootstrap_relays)
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(Some(_)) => "success",
+                    Ok(None) => "empty",
+                    Err(_) => "failure",
+                },
+                "network",
+                1,
+            );
+            observation.discard();
+        }
+        result
+    }
+
+    async fn fetch_current_user_profile_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
@@ -272,6 +430,36 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<FetchedKeyPackage, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "key_package",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_latest_key_package_for_account_id_unobserved(account_id_hex, bootstrap_relays)
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(_) => "success",
+                    Err(AppError::MissingKeyPackage(_)) => "empty",
+                    Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
+                    Err(_) => "failure",
+                },
+                // Failed fetches have no result provenance; classify the network attempt.
+                result.as_ref().map_or("network", |(_, source)| *source),
+                1,
+            );
+            observation.discard();
+        }
+        result.map(|(fetched, _)| fetched)
+    }
+
+    async fn fetch_latest_key_package_for_account_id_unobserved(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<(FetchedKeyPackage, &'static str), AppError> {
         // Normalize the identifier to canonical hex up front. The relay *queries*
         // below re-parse internally, but the KeyPackage record filter compares
         // `event.pubkey` (always hex) against this string verbatim — so an npub
@@ -334,22 +522,22 @@ impl MarmotApp {
             let account_id = account_id_hex.to_owned();
             blocking_app_task(move || app.directory_entry_for_account_id(&account_id)).await?
         };
-        let mut fetched = fresh_or_cached_key_package(
+        let selection = latest_fresh_key_package_from_records(
             account_id_hex,
-            latest_fresh_key_package_from_records(
-                account_id_hex,
-                records,
-                self.directory_freshness(),
-            )?,
-            cached_entry,
+            records,
+            self.directory_freshness(),
         )?;
+        let from_cache = selection.value.is_none();
+        let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;
+        // Without a fresh selection, only a successful cache fallback reaches this point.
+        let source = if from_cache { "cache" } else { "network" };
         fetched.relay_lists = relay_lists;
         {
             let app = self.clone();
             let remembered = fetched.clone();
             blocking_app_task(move || app.remember_directory_key_package(&remembered)).await?;
         }
-        Ok(fetched)
+        Ok((fetched, source))
     }
 
     pub async fn refresh_directory_entry_for_account_id(
@@ -503,6 +691,26 @@ impl MarmotApp {
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "publish",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .publish_user_profile_to_endpoints_unobserved(label, profile, endpoints)
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    async fn publish_user_profile_to_endpoints_unobserved(
+        &self,
+        label: &str,
+        profile: UserProfileMetadata,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Result<(), AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let content = serde_json::to_string(&profile_content_json(&profile))?;
@@ -629,6 +837,8 @@ impl MarmotApp {
             return Ok(Vec::new());
         }
 
+        let follows =
+            self.cached_search_follows(&parse_account_id_hex(&search.searcher_account_id_hex)?)?;
         let mut results = Vec::new();
         for (record, radius) in records {
             if radius < search.radius_start || radius > search.radius_end {
@@ -638,6 +848,7 @@ impl MarmotApp {
                 continue;
             };
             results.push(UserDirectorySearchResult {
+                is_followed_by_searcher: follows.contains(&record.account_id_hex),
                 account_id_hex: record.account_id_hex.clone(),
                 npub: record.npub.clone(),
                 radius,
@@ -732,6 +943,34 @@ impl MarmotApp {
     }
 
     pub async fn fetch_current_follow_list_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "follows",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_current_follow_list_for_account_id_unobserved(account_id_hex, source_relays)
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(Some(_)) => "success",
+                    Ok(None) => "empty",
+                    Err(_) => "failure",
+                },
+                "network",
+                1,
+            );
+            observation.discard();
+        }
+        result
+    }
+
+    async fn fetch_current_follow_list_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
@@ -937,11 +1176,16 @@ impl MarmotApp {
                     continue;
                 }
 
-                let Some(record) =
+                let Some(mut record) =
                     Self::directory_search_record_from_caches(&caches, &account_id, now)?
                 else {
                     continue;
                 };
+                if radius == 0 {
+                    record.follows = self
+                        .cached_search_follow_list(&account_id)?
+                        .unwrap_or_default();
+                }
                 if radius < radius_end {
                     for follow in &record.follows {
                         if next.len() >= USER_DIRECTORY_SEARCH_MAX_FRONTIER {
@@ -1011,7 +1255,7 @@ impl MarmotApp {
             .directory_entry_for_account_id(account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
         entry.account_id_hex = account_id_hex.to_owned();
-        entry.relay_lists = relay_lists.clone();
+        entry.relay_lists = merge_relay_list_status(entry.relay_lists, relay_lists.clone());
         self.save_directory_entry(&entry)
     }
 
@@ -1023,7 +1267,7 @@ impl MarmotApp {
             .directory_entry_for_account_id(&fetched.account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(&fetched.account_id_hex));
         entry.account_id_hex = fetched.account_id_hex.clone();
-        entry.relay_lists = fetched.relay_lists.clone();
+        entry.relay_lists = merge_relay_list_status(entry.relay_lists, fetched.relay_lists.clone());
         entry.key_package = Some(DirectoryKeyPackage {
             key_package_id: fetched.key_package_id.clone(),
             key_package_ref_hex: fetched.key_package_ref_hex.clone(),
@@ -1069,6 +1313,9 @@ impl MarmotApp {
         entry.follows = follow_list.follows.clone();
         entry.follow_source_relays = follow_list.source_relays.clone();
         self.save_directory_entry(&entry)?;
+        // A fetched empty kind-3 is authoritative, unlike a profile-only
+        // promotion whose empty follow vec means "not loaded".
+        self.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
         for follow in &follow_list.follows {
             self.remember_directory_user(follow)?;
         }
@@ -1265,6 +1512,11 @@ impl MarmotApp {
             return Ok(());
         }
         shared_storage.put_public_directory_user(&public_entry)?;
+        let _ = self
+            .presentation_signals
+            .profile_updates
+            .send(entry.account_id_hex.clone());
+        self.presentation_signals.wake();
         for cache in caches {
             cache.put_with_reason(&entry, reason)?;
         }
@@ -1402,6 +1654,12 @@ impl MarmotApp {
         let shared_storage = self.shared_storage()?;
         for entry in &entries {
             shared_storage.put_public_directory_user(&public_directory_user_record(entry)?)?;
+            // Each row commits independently; a later import error must not hide this work.
+            let _ = self
+                .presentation_signals
+                .profile_updates
+                .send(entry.account_id_hex.clone());
+            self.presentation_signals.wake();
         }
         for cache in caches {
             for entry in &entries {

@@ -14,7 +14,8 @@ struct CapturedRequest {
     path: String,
     authorization: Option<String>,
     content_type: Option<String>,
-    device_label: Option<String>,
+    hardware_model: Option<String>,
+    legacy_device_label: Option<String>,
     platform: Option<String>,
     app_version: Option<String>,
     body: Vec<u8>,
@@ -102,7 +103,8 @@ async fn read_captured_request(stream: &mut TcpStream) -> Option<CapturedRequest
         let path = parts.next().unwrap_or_default().to_owned();
         let authorization = header_value(&headers, "authorization");
         let content_type = header_value(&headers, "content-type");
-        let device_label = header_value(&headers, "x-goggles-device-label");
+        let hardware_model = header_value(&headers, "x-goggles-hardware-model");
+        let legacy_device_label = header_value(&headers, "x-goggles-device-label");
         let platform = header_value(&headers, "x-goggles-platform");
         let app_version = header_value(&headers, "x-goggles-app-version");
         let body = buf[header_end..header_end + content_length].to_vec();
@@ -112,7 +114,8 @@ async fn read_captured_request(stream: &mut TcpStream) -> Option<CapturedRequest
             path,
             authorization,
             content_type,
-            device_label,
+            hardware_model,
+            legacy_device_label,
             platform,
             app_version,
             body,
@@ -135,7 +138,7 @@ async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     let audit_path = home
         .account_dir(&account.label)
         .join("audit-tracker-update.jsonl");
@@ -155,7 +158,7 @@ async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
             authorization_bearer_token: Some("goggles_dev_secret".to_owned()),
             source: AuditLogUploadSource {
-                device_label: Some("Alice iPhone".to_owned()),
+                hardware_model: Some("iPhone17,3".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
             },
@@ -181,7 +184,8 @@ async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
         captured.content_type.as_deref(),
         Some("application/x-ndjson")
     );
-    assert_eq!(captured.device_label.as_deref(), Some("Alice iPhone"));
+    assert_eq!(captured.hardware_model.as_deref(), Some("iPhone17,3"));
+    assert!(captured.legacy_device_label.is_none());
     assert_eq!(captured.platform.as_deref(), Some("ios"));
     assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
     assert_eq!(captured.body, audit_body);
@@ -193,7 +197,7 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let audit_body = b"{\"seq\":1}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
     let audit_path = home
         .account_dir(&account.label)
         .join("audit-default-endpoint.jsonl");
@@ -220,7 +224,7 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
             endpoint: None,
             authorization_bearer_token: Some("goggles_client_secret".to_owned()),
             source: AuditLogUploadSource {
-                device_label: Some("Alice iPhone".to_owned()),
+                hardware_model: Some("iPhone17,3".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
             },
@@ -251,8 +255,8 @@ async fn post_audit_log_tracker_update_continues_after_file_upload_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let failed_body = b"{\"seq\":1}\n";
-    let successful_body = b"{\"seq\":2}\n";
+    let failed_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
+    let successful_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     std::fs::write(
         home.account_dir(&account.label)
             .join("audit-0001-fails.jsonl"),
@@ -306,7 +310,7 @@ async fn post_audit_log_tracker_update_skips_when_disabled_or_unconfigured() {
     std::fs::write(
         home.account_dir(&account.label)
             .join("audit-tracker-skip.jsonl"),
-        b"{\"seq\":1}\n",
+        b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n",
     )
     .unwrap();
 
@@ -374,7 +378,7 @@ async fn post_audit_log_file_posts_jsonl_body() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
     let audit_path = home
         .account_dir(&account.label)
         .join("audit-feedface.jsonl");
@@ -416,7 +420,7 @@ async fn post_audit_log_file_rejects_remote_endpoint_without_token() {
     let audit_path = home
         .account_dir(&account.label)
         .join("audit-unauthenticated-remote.jsonl");
-    std::fs::write(&audit_path, b"{\"seq\":1}\n").unwrap();
+    std::fs::write(&audit_path, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n").unwrap();
 
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
     let err = app
@@ -607,10 +611,12 @@ struct CaptureSink {
     addr: std::net::SocketAddr,
     requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
     statuses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u16>>>,
-    /// Milliseconds a handler holds a request open before answering, so a test
+    /// Hold handlers until explicitly released, so a test
     /// can schedule more triggers while an upload is genuinely in flight.
-    hold_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    default_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    started: std::sync::Arc<tokio::sync::Notify>,
+    finished: std::sync::Arc<tokio::sync::Notify>,
     in_flight: std::sync::Arc<std::sync::Mutex<(usize, usize)>>,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -624,15 +630,19 @@ impl CaptureSink {
         let statuses = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::<u16>::new(),
         ));
-        let hold_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let default_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204));
+        let hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
         let in_flight = std::sync::Arc::new(std::sync::Mutex::new((0_usize, 0_usize)));
         let handle = tokio::spawn({
             use std::sync::atomic::Ordering;
             let requests = requests.clone();
             let statuses = statuses.clone();
-            let hold_ms = hold_ms.clone();
-            let default_status = default_status.clone();
+            let hold = hold.clone();
+            let permits = permits.clone();
+            let started = started.clone();
+            let finished = finished.clone();
             let in_flight = in_flight.clone();
             async move {
                 loop {
@@ -641,8 +651,10 @@ impl CaptureSink {
                     };
                     let requests = requests.clone();
                     let statuses = statuses.clone();
-                    let hold_ms = hold_ms.clone();
-                    let default_status = default_status.clone();
+                    let hold = hold.clone();
+                    let permits = permits.clone();
+                    let started = started.clone();
+                    let finished = finished.clone();
                     let in_flight = in_flight.clone();
                     // One task per connection so overlapping uploads are
                     // observable instead of serialized behind `accept`.
@@ -655,15 +667,11 @@ impl CaptureSink {
                             counts.0 += 1;
                             counts.1 = counts.1.max(counts.0);
                         }
-                        let hold = hold_ms.load(Ordering::Relaxed);
-                        if hold > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+                        started.notify_one();
+                        if hold.load(Ordering::Relaxed) {
+                            permits.acquire().await.unwrap().forget();
                         }
-                        let status = statuses
-                            .lock()
-                            .unwrap()
-                            .pop_front()
-                            .unwrap_or_else(|| default_status.load(Ordering::Relaxed));
+                        let status = statuses.lock().unwrap().pop_front().unwrap_or(204);
                         // Record the body before answering, after the hold: once the
                         // response is written the client may fire its next request,
                         // and the order-asserting tests need bodies pushed in serve
@@ -674,6 +682,7 @@ impl CaptureSink {
                         write_http_response(&mut stream, status).await;
                         let _ = stream.shutdown().await;
                         in_flight.lock().unwrap().0 -= 1;
+                        finished.notify_one();
                     });
                 }
             }
@@ -682,8 +691,10 @@ impl CaptureSink {
             addr,
             requests,
             statuses,
-            hold_ms,
-            default_status,
+            hold,
+            permits,
+            started,
+            finished,
             in_flight,
             handle,
         }
@@ -697,14 +708,22 @@ impl CaptureSink {
         *self.statuses.lock().unwrap() = statuses.iter().copied().collect();
     }
 
-    fn hold_each_request_for(&self, millis: u64) {
-        self.hold_ms
-            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    fn hold_requests(&self) {
+        self.hold.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    async fn wait_started(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.started.notified())
+            .await
+            .unwrap();
+    }
+    async fn wait_finished(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.finished.notified())
+            .await
+            .unwrap();
     }
 
-    fn always_answer(&self, status: u16) {
-        self.default_status
-            .store(status, std::sync::atomic::Ordering::Relaxed);
+    fn release_one(&self) {
+        self.permits.add_permits(1);
     }
 
     fn max_concurrent_requests(&self) -> usize {
@@ -749,10 +768,10 @@ async fn acknowledged_audit_files_are_not_re_posted_without_new_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let sealed = b"{\"seq\":1}\n{\"seq\":2}\n{\"seq\":3}\n";
+    let sealed = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":3}\n";
     std::fs::write(
         home.account_dir(&account.label)
-            .join("audit-engine-v3-seg000001.jsonl"),
+            .join("audit-engine-v4-seg000001.jsonl"),
         sealed,
     )
     .unwrap();
@@ -780,9 +799,9 @@ async fn appending_a_suffix_transfers_only_the_changed_file() {
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
     let dir = home.account_dir(&account.label);
-    let sealed = b"{\"seq\":1}\n";
-    std::fs::write(dir.join("audit-engine-v3-seg000001.jsonl"), sealed).unwrap();
-    std::fs::write(dir.join("audit-engine-v3.jsonl"), b"{\"seq\":2}\n").unwrap();
+    let sealed = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
+    std::fs::write(dir.join("audit-engine-v4-seg000001.jsonl"), sealed).unwrap();
+    std::fs::write(dir.join("audit-engine-v4.jsonl"), b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n").unwrap();
 
     let sink = CaptureSink::start().await;
     let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
@@ -792,19 +811,19 @@ async fn appending_a_suffix_transfers_only_the_changed_file() {
 
     // A new immutable segment plus growth of the active file.
     std::fs::write(
-        dir.join("audit-engine-v3-seg000002.jsonl"),
-        b"{\"seq\":3}\n",
+        dir.join("audit-engine-v4-seg000002.jsonl"),
+        b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":3}\n",
     )
     .unwrap();
-    let active = b"{\"seq\":2}\n{\"seq\":4}\n";
-    std::fs::write(dir.join("audit-engine-v3.jsonl"), active).unwrap();
+    let active = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":4}\n";
+    std::fs::write(dir.join("audit-engine-v4.jsonl"), active).unwrap();
 
     runtime.post_audit_log_tracker_update().await.unwrap();
 
     let bodies = sink.take_bodies();
     assert_eq!(
         bodies,
-        vec![b"{\"seq\":3}\n".to_vec(), active.to_vec()],
+        vec![b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":3}\n".to_vec(), active.to_vec()],
         "only the new segment and the grown active file should transfer"
     );
 }
@@ -814,10 +833,10 @@ async fn acknowledgement_survives_restart_and_a_lost_checkpoint_costs_one_repeat
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let sealed = b"{\"seq\":1}\n";
+    let sealed = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
     std::fs::write(
         home.account_dir(&account.label)
-            .join("audit-engine-v3-seg000001.jsonl"),
+            .join("audit-engine-v4-seg000001.jsonl"),
         sealed,
     )
     .unwrap();
@@ -854,10 +873,10 @@ async fn failed_uploads_retry_while_acknowledged_files_do_not() {
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
     let dir = home.account_dir(&account.label);
-    let failing = b"{\"seq\":1}\n";
-    let succeeding = b"{\"seq\":2}\n";
-    std::fs::write(dir.join("audit-engine-v3-seg000001.jsonl"), failing).unwrap();
-    std::fs::write(dir.join("audit-engine-v3-seg000002.jsonl"), succeeding).unwrap();
+    let failing = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
+    let succeeding = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
+    std::fs::write(dir.join("audit-engine-v4-seg000001.jsonl"), failing).unwrap();
+    std::fs::write(dir.join("audit-engine-v4-seg000002.jsonl"), succeeding).unwrap();
 
     let sink = CaptureSink::start().await;
     sink.script(&[500, 204]);
@@ -888,10 +907,10 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
     // Upgrade path: an active file grown past the request ceiling by a build
     // without segment rotation. It sorts first, so it also proves the oversized
     // file does not block the files behind it.
-    let huge = std::fs::File::create(dir.join("audit-engine-v3-seg000001.jsonl")).unwrap();
+    let huge = std::fs::File::create(dir.join("audit-engine-v4-seg000001.jsonl")).unwrap();
     huge.set_len(64 * 1024 * 1024 + 1).unwrap();
-    let normal = b"{\"seq\":1}\n";
-    std::fs::write(dir.join("audit-engine-v3.jsonl"), normal).unwrap();
+    let normal = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
+    std::fs::write(dir.join("audit-engine-v4.jsonl"), normal).unwrap();
 
     let sink = CaptureSink::start().await;
     let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
@@ -901,7 +920,7 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
     assert_eq!(sink.take_bodies(), vec![normal.to_vec()]);
     // Never deleted or truncated: retention is mdk#1014's contract.
     assert_eq!(
-        std::fs::metadata(dir.join("audit-engine-v3-seg000001.jsonl"))
+        std::fs::metadata(dir.join("audit-engine-v4-seg000001.jsonl"))
             .unwrap()
             .len(),
         64 * 1024 * 1024 + 1
@@ -915,11 +934,11 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
         .expect("checkpoint written");
     let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
     assert_eq!(
-        checkpoint["files"]["audit-engine-v3-seg000001.jsonl"]["outcome"],
+        checkpoint["files"]["audit-engine-v4-seg000001.jsonl"]["outcome"],
         serde_json::json!("too_large_to_upload")
     );
     assert_eq!(
-        checkpoint["files"]["audit-engine-v3.jsonl"]["outcome"],
+        checkpoint["files"]["audit-engine-v4.jsonl"]["outcome"],
         serde_json::json!("uploaded")
     );
 
@@ -930,13 +949,65 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
 }
 
 #[tokio::test]
+async fn endpoint_too_large_verdict_is_recorded_once_and_never_re_posted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let dir = home.account_dir(&account.label);
+    // Under the local ceiling, so only the endpoint can refuse it. A 413
+    // without Retry-After is a permanent verdict on this entity (RFC 9110
+    // 15.5.14), not a cooldown.
+    let refused = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
+    let accepted = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
+    std::fs::write(dir.join("audit-engine-v4-seg000001.jsonl"), refused).unwrap();
+    std::fs::write(dir.join("audit-engine-v4-seg000002.jsonl"), accepted).unwrap();
+
+    let sink = CaptureSink::start().await;
+    sink.script(&[413, 204]);
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(
+        sink.take_bodies(),
+        vec![refused.to_vec(), accepted.to_vec()],
+        "the refusal must not wedge the file behind it"
+    );
+
+    // The sidecar pins which verdict was recorded; the second pass below pins
+    // that it holds.
+    let checkpoint = std::fs::read_to_string(checkpoint_path(&home, &account.label))
+        .expect("checkpoint written");
+    let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+    assert_eq!(
+        checkpoint["files"]["audit-engine-v4-seg000001.jsonl"]["outcome"],
+        serde_json::json!("too_large_to_upload")
+    );
+    assert_eq!(
+        checkpoint["files"]["audit-engine-v4-seg000002.jsonl"]["outcome"],
+        serde_json::json!("uploaded")
+    );
+
+    // A second run neither retries the refused file nor re-posts the one it
+    // already acknowledged.
+    runtime.post_audit_log_tracker_update().await.unwrap();
+    assert!(sink.take_bodies().is_empty());
+
+    // Never deleted or truncated: retention is mdk#1014's contract.
+    assert_eq!(
+        std::fs::read(dir.join("audit-engine-v4-seg000001.jsonl")).unwrap(),
+        refused.to_vec()
+    );
+}
+
+#[tokio::test]
 async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
     let path = home
         .account_dir(&account.label)
-        .join("audit-00112233445566778899aabbccddeeff-v3.jsonl");
+        .join("audit-00112233445566778899aabbccddeeff-v4.jsonl");
     let recorder = marmot_forensics::JsonlRecorder::open(&path, "0011".repeat(8)).unwrap();
     {
         use marmot_forensics::ForensicRecorder as _;
@@ -962,7 +1033,11 @@ async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling()
     runtime.post_audit_log_tracker_update().await.unwrap();
 
     let bodies = sink.take_bodies();
-    assert_eq!(bodies.len(), 3, "two sealed segments plus the active file");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "two sealed segments; empty active file is not uploaded"
+    );
     for body in &bodies {
         assert!(
             (body.len() as u64) < 64 * 1024 * 1024,
@@ -976,41 +1051,365 @@ async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling()
     assert!(sink.take_bodies().is_empty());
 }
 
-#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
-async fn trigger_bursts_coalesce_into_one_follow_up_run() {
+async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
+    use std::io::Write;
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let dir = home.account_dir(&account.label);
-    std::fs::write(dir.join("audit-engine-v3.jsonl"), b"{\"seq\":1}\n").unwrap();
-
+    let path = home.account_dir(&account.label).join("audit-active.jsonl");
+    std::fs::write(&path, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2").unwrap();
     let sink = CaptureSink::start().await;
-    // Hold each upload open so the burst lands while a run is in flight, which
-    // is the case the coalescing contract is about, and refuse every upload so
-    // nothing is ever acknowledged — then each run posts, and the request count
-    // measures runs rather than changed content.
-    sink.hold_each_request_for(400);
-    sink.always_answer(500);
     let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(sink.take_bodies(), vec![b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n".to_vec()]);
+    let checkpoint: Value = serde_json::from_slice(
+        &std::fs::read(checkpoint_path(&home, &account.label)).unwrap_or_else(|_| b"{}".to_vec()),
+    )
+    .unwrap();
+    assert!(checkpoint["files"]["audit-active.jsonl"].is_null());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"}\n")
+        .unwrap();
+    let next = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(next.uploaded.len(), 1);
+    let bodies = sink.take_bodies();
+    assert_eq!(bodies, vec![b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n".to_vec()]);
+    for line in std::str::from_utf8(&bodies[0]).unwrap().lines() {
+        serde_json::from_str::<Value>(line).unwrap();
+    }
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+}
 
-    runtime.schedule_audit_log_tracker_update_for_test("burst");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+#[tokio::test]
+async fn unfinished_first_row_is_deferred_until_complete() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let path = home.account_dir(&account.label).join("audit-active.jsonl");
+    std::fs::write(&path, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}").unwrap();
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    for _ in 0..2 {
+        assert!(
+            runtime
+                .post_audit_log_tracker_update()
+                .await
+                .unwrap()
+                .uploaded
+                .is_empty()
+        );
+    }
+    assert!(sink.take_bodies().is_empty());
+    assert!(!checkpoint_path(&home, &account.label).exists());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    assert_eq!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .len(),
+        1
+    );
+    assert_eq!(sink.take_bodies(), vec![b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n".to_vec()]);
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+    assert!(sink.take_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn custom_json_acknowledgment_is_checkpointed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    std::fs::write(
+        home.account_dir(&account.label).join("audit-active.jsonl"),
+        b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/ingest", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let body = r#"{"ok":true}"#;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_captured_request(&mut stream).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let runtime = tracker_runtime(tmp.path(), &endpoint);
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+    server.await.unwrap();
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn automatic_upload_burst_coalesces_over_real_http_without_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    let first = home.account_dir("alice").join("audit-a.jsonl");
+    std::fs::write(&first, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n").unwrap();
+    std::fs::write(
+        home.account_dir("alice").join("audit-b.jsonl"),
+        b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n",
+    )
+    .unwrap();
+    let sink = CaptureSink::start().await;
+    sink.hold_requests();
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    runtime.set_audit_log_batch_window_for_test(std::time::Duration::ZERO);
+    runtime.schedule_audit_log_tracker_update_for_test("first");
+    sink.wait_started().await;
+    // Grow the opened file while its immutable snapshot is held by the sink.
+    let grown = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":3}\n";
+    std::fs::write(&first, grown).unwrap();
     for _ in 0..50 {
         runtime.schedule_audit_log_tracker_update_for_test("burst");
     }
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    for _ in 0..2 {
+        sink.release_one();
+        sink.wait_finished().await;
+        sink.wait_started().await;
+    }
+    sink.release_one();
+    sink.wait_finished().await;
+    runtime.shutdown().await;
+    assert_eq!(sink.max_concurrent_requests(), 1);
+    assert_eq!(
+        sink.take_bodies(),
+        vec![
+            b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n".to_vec(),
+            b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n".to_vec(),
+            grown.to_vec()
+        ]
+    );
+}
 
-    // 50 triggers arriving during a run collapse into exactly one follow-up,
-    // and no two uploads are ever in flight at once.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn file_growing_past_limit_does_not_stop_other_files_or_accounts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    for account in ["alice", "bob"] {
+        home.create_account(account).unwrap();
+    }
+    let alice_body = jsonl_row(&v4_source_row());
+    let mut bob_row = v4_source_row();
+    bob_row["engine_id"] = "bob-engine".into();
+    let bob_body = jsonl_row(&bob_row);
+    for name in ["audit-a.jsonl", "audit-b.jsonl", "audit-c.jsonl"] {
+        std::fs::write(home.account_dir("alice").join(name), &alice_body).unwrap();
+    }
+    std::fs::write(home.account_dir("bob").join("audit-a.jsonl"), &bob_body).unwrap();
+    let sink = CaptureSink::start().await;
+    sink.hold_requests();
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    runtime.set_audit_log_batch_window_for_test(std::time::Duration::ZERO);
+    runtime.schedule_audit_log_tracker_update_for_test("growth");
+    sink.wait_started().await;
+    // Enumeration has finished, but the second file has not been opened yet.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(home.account_dir("alice").join("audit-b.jsonl"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    for _ in 0..2 {
+        sink.release_one();
+        sink.wait_finished().await;
+        sink.wait_started().await;
+    }
+    sink.release_one();
+    sink.wait_finished().await;
+    runtime.shutdown().await;
     assert_eq!(
-        sink.take_bodies().len(),
-        2,
-        "a burst during an in-flight run must produce one follow-up, not one run per trigger"
+        sink.take_bodies(),
+        vec![alice_body.clone(), alice_body.clone(), bob_body.clone()]
     );
-    assert_eq!(
-        sink.max_concurrent_requests(),
-        1,
-        "tracker updates must never upload concurrently"
+}
+
+fn v4_source_row() -> Value {
+    serde_json::json!({
+        "schema_version": "marmot-forensics-audit/v4", "seq": 0,
+        "wall_time_ms": 0, "engine_id": "test-engine",
+        "kind": {"type": "source_context", "source": {
+            "platform": "linux", "app_version": "test", "hardware_model": "TestModel"
+        }}
+    })
+}
+
+fn jsonl_row(value: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[tokio::test]
+async fn manual_upload_rejects_legacy_mixed_unknown_and_removed_fields_before_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    // Deliberately use a v4 filename: only the actual content is authoritative.
+    let path = home.account_dir("alice").join("audit-renamed-v4.jsonl");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/v1/audit-logs/",
+        listener.local_addr().unwrap()
     );
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let mut rejected = Vec::new();
+    for version in ["v1", "v2", "v3", "v5"] {
+        let mut row = v4_source_row();
+        row["schema_version"] = format!("marmot-forensics-audit/{version}").into();
+        rejected.push(jsonl_row(&row));
+        rejected.push([jsonl_row(&v4_source_row()), jsonl_row(&row)].concat());
+    }
+    for field in [
+        "account_label",
+        "device_label",
+        "device_name",
+        "unknown_field",
+    ] {
+        let mut row = v4_source_row();
+        row["kind"]["source"][field] = "PRIVATE_SENTINEL".into();
+        rejected.push(jsonl_row(&row));
+        let mut row = v4_source_row();
+        row["context"] = serde_json::json!({"source": {field: "PRIVATE_SENTINEL"}});
+        rejected.push(jsonl_row(&row));
+    }
+    let mut row = v4_source_row();
+    row["account_ref"] = "not-a-hash".into();
+    rejected.push(jsonl_row(&row));
+    let duplicate = String::from_utf8(jsonl_row(&v4_source_row()))
+        .unwrap()
+        .replace(
+            "\"source\":",
+            "\"source\":{\"account_label\":\"PRIVATE_SENTINEL\"},\"source\":",
+        );
+    rejected.push(duplicate.into_bytes());
+    rejected.push(b"{invalid PRIVATE_SENTINEL}\n".to_vec());
+    rejected.push(b"\xff\n".to_vec());
+    rejected.push(b" \n\n".to_vec());
+    rejected.push(b"{\"schema_version\":\"marmot-key-reveal-audit/v1\"}\n".to_vec());
+    for bytes in rejected {
+        std::fs::write(&path, &bytes).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.post_audit_log_file(path.to_str().unwrap(), &endpoint),
+        )
+        .await
+        .unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("only valid v4"), "{error}");
+        assert!(!error.contains("PRIVATE_SENTINEL"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "rejection preserves local bytes"
+        );
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn tracker_skips_legacy_files_without_retry_and_uploads_later_v4_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    let dir = home.account_dir("alice");
+    let mut legacy_names = Vec::new();
+    for version in ["v1", "v2", "v3"] {
+        let name = format!("audit-000-{version}.jsonl");
+        let mut row = v4_source_row();
+        row["schema_version"] = format!("marmot-forensics-audit/{version}").into();
+        row["kind"]["source"]["account_label"] = "PRIVATE_SENTINEL".into();
+        std::fs::write(dir.join(&name), jsonl_row(&row)).unwrap();
+        legacy_names.push(name);
+    }
+    let valid = jsonl_row(&v4_source_row());
+    std::fs::write(dir.join("audit-zzz-v4.jsonl"), &valid).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/v1/audit-logs/",
+        listener.local_addr().unwrap()
+    );
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(capture_one_request(listener, tx));
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(endpoint),
+            authorization_bearer_token: Some("test".into()),
+            source: AuditLogUploadSource::default(),
+        })
+        .unwrap();
+    let result = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(result.uploaded.len(), 1);
+    assert_eq!(rx.await.unwrap().body, valid);
+    server.await.unwrap();
+    // The sink is gone: a repeated pass must make no request, including to v4.
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+    let checkpoint: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("audit-upload-checkpoint.json")).unwrap())
+            .unwrap();
+    for name in legacy_names {
+        assert_eq!(checkpoint["files"][&name]["outcome"], "ineligible_schema");
+        assert!(
+            std::fs::read_to_string(dir.join(name))
+                .unwrap()
+                .contains("PRIVATE_SENTINEL")
+        );
+    }
 }

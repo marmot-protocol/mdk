@@ -48,11 +48,13 @@ c_enum! {
 
 c_mirror! {
     /// One search hit, with typed attribution for why it matched.
-    MarmotUserDirectorySearchResult from UserDirectorySearchResultFfi {
+    MarmotUserDirectorySearchResult from UserDirectorySearchResultFfi,
+    list(MarmotUserDirectorySearchResultList, marmot_user_directory_search_result_list_free) {
         str account_id_hex,
         str npub,
         /// Social distance from the searching account.
         copy radius: u8,
+        copy is_followed_by_searcher: bool,
         copy matched_field: MarmotMatchedField,
         copy match_quality: MarmotMatchQuality,
         opt_copy has_provider_rank/provider_rank: f64,
@@ -84,6 +86,7 @@ pub enum MarmotSearchUpdateTrigger {
     Error {
         message: *mut ::std::ffi::c_char,
     },
+    CachedResultsFound,
 }
 
 impl From<SearchUpdateTriggerFfi> for MarmotSearchUpdateTrigger {
@@ -92,6 +95,7 @@ impl From<SearchUpdateTriggerFfi> for MarmotSearchUpdateTrigger {
             SearchUpdateTriggerFfi::RadiusStarted { radius } => Self::RadiusStarted { radius },
             SearchUpdateTriggerFfi::ResultsFound { radius } => Self::ResultsFound { radius },
             SearchUpdateTriggerFfi::DiscoveryResultsFound => Self::DiscoveryResultsFound,
+            SearchUpdateTriggerFfi::CachedResultsFound => Self::CachedResultsFound,
             SearchUpdateTriggerFfi::RadiusCompleted { radius } => Self::RadiusCompleted { radius },
             SearchUpdateTriggerFfi::RadiusTimeout { radius } => Self::RadiusTimeout { radius },
             SearchUpdateTriggerFfi::RadiusTruncated { radius } => Self::RadiusTruncated { radius },
@@ -119,6 +123,46 @@ c_mirror! {
         rec trigger: MarmotSearchUpdateTrigger,
         /// Hits discovered since the previous update, not the full set.
         vec new_results/new_results_len: MarmotUserDirectorySearchResult,
+        vec updated_results/updated_results_len: MarmotUserDirectorySearchResult,
         copy total_result_count: u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_replacements_preserve_follow_attribution_and_free_all_rows() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let result = UserDirectorySearchResultFfi {
+            account_id_hex: "11".repeat(32),
+            npub: "npub1test".into(),
+            radius: 1,
+            is_followed_by_searcher: true,
+            matched_field: MatchedFieldFfi::Name,
+            match_quality: MatchQualityFfi::Exact,
+            provider_rank: None,
+            profile: Some(marmot_uniffi::conversions::UserProfileMetadataFfi {
+                name: Some("needle".into()),
+                ..Default::default()
+            }),
+        };
+        let mut update = MarmotUserSearchUpdate::from(UserSearchUpdateFfi {
+            trigger: SearchUpdateTriggerFfi::CachedResultsFound,
+            new_results: vec![result.clone()],
+            updated_results: vec![result],
+            total_result_count: 1,
+        });
+        assert_eq!(update.new_results_len, 1);
+        assert_eq!(update.updated_results_len, 1);
+        unsafe {
+            assert!((*update.updated_results).is_followed_by_searcher);
+            update.free_in_place();
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
     }
 }

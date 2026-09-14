@@ -35,6 +35,39 @@ destination or link text when policy keeps it inert.
 - No CGKA engine, storage, transport, or runtime state.
 - No UniFFI surface of its own (bindings expose parsed output through `marmot-app` / `marmot-uniffi` as needed).
 
+## Bounded details/summary disclosures
+
+The parser recognizes structural `<details>` / `<summary>` lines as `Block::Details`.
+This is a block-oriented extension, not a general HTML parser:
+
+- The opening `<details ...>` and closing `</details>` each occupy their own
+  logical line after quote/list prefixes and at most three columns of local
+  indent. Surrounding horizontal whitespace is allowed. Compact one-line HTML
+  such as `<details><summary>x</summary>y</details>` stays literal text.
+- An optional first nonblank `<summary ...>...</summary>` child is inline-parsed
+  (formatting, entities, links, and Nostr mentions). Missing or empty summaries
+  yield `summary: []`; clients may supply a localized fallback label. A later
+  summary is ordinary body text. A malformed initial summary falls back to
+  ordinary Markdown instead of dropping text.
+- The `open` attribute means expanded even when written `open="false"`. Other
+  attributes are ignored and never tokenized as destinations. Styles, scripts,
+  event handlers, and URLs are not rendering instructions.
+- Recognition uses original source before entity decoding. Escaped
+  (`\<details>`, `&lt;details&gt;`), inline-code, fenced/indented code, and math
+  forms stay literal. Failed or unclosed candidates keep their tags as ordinary
+  Markdown and do not swallow following siblings.
+- Recognition is limited to a 65536-byte original-source prefix and a 4096-byte
+  structural tag cap (inclusive of `<` through `>`). Each details block consumes
+  one existing container-depth slot. Recognition work is linear in that capped
+  prefix: each continuation line is scanned once with carried code-span state,
+  and unmatched backtick runs are never rescanned. An open summary code span
+  keeps interior `</summary>` and `</details>` lines as content until a
+  matching run closes it. Failed candidates restore ordinary block structure
+  and source gaps instead of collapsing to one paragraph.
+- Body blank-line counts align with `body` and saturate at
+  `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
+  the closer stay inside the disclosure.
+
 Golden fixtures under `tests/golden/` lock parser output for regression coverage.
 
 ## Run the tests

@@ -139,6 +139,10 @@ pub fn conformance_constant_snapshot() -> ConformanceConstantSnapshot {
         "E12.max_foreground_deferred_rows".into(),
         crate::message_processor::MAX_FOREGROUND_DEFERRED_ROWS as u64,
     );
+    values.insert(
+        "E13.background_convergence_budget_ms".into(),
+        crate::message_processor::BACKGROUND_CONVERGENCE_BUDGET_MS,
+    );
     ConformanceConstantSnapshot {
         schema_version: "1".into(),
         values,
@@ -289,6 +293,10 @@ pub struct ConformanceStructuralProgressSnapshot {
     pub current_monotonic_ms: u64,
     pub lifecycle: GroupLifecycleState,
     pub pending_work: ConformancePendingWorkSnapshot,
+    /// Completed distinct-context attempts on retained raw rows. A bounded
+    /// sweep can make durable progress without changing the retained row count.
+    #[serde(default)]
+    pub deferred_peel_completed_context_attempts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -764,6 +772,12 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
         current_monotonic_ms: now.monotonic_ms,
         lifecycle,
         pending_work,
+        deferred_peel_completed_context_attempts: messages
+            .iter()
+            .filter(|record| record.state == MessageState::PeelDeferred)
+            .filter_map(|record| record.deferred_peel.as_ref())
+            .map(|lifecycle| u64::from(lifecycle.distinct_context_attempts))
+            .sum(),
         pass_generation: pass.as_ref().map(|pass| pass.generation),
         pass_phase: pass.as_ref().map(|pass| pass.phase),
         earliest_next_wake_monotonic_ms: next_wake,
@@ -841,7 +855,7 @@ mod tests {
     fn constant_snapshot_pins_every_engine_owned_reliability_constant() {
         let snapshot = conformance_constant_snapshot();
         assert_eq!(snapshot.schema_version, "1");
-        assert_eq!(snapshot.values.len(), 25);
+        assert_eq!(snapshot.values.len(), 26);
         for key in [
             "P1.max_rewind_commits",
             "P2.app_message_past_epoch_limit",
@@ -868,6 +882,7 @@ mod tests {
             "E10.max_candidate_branch_peel_contexts",
             "E11.foreground_deferred_peel_budget_ms",
             "E12.max_foreground_deferred_rows",
+            "E13.background_convergence_budget_ms",
         ] {
             assert!(snapshot.values.contains_key(key), "missing {key}");
         }

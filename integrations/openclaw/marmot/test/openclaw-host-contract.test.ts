@@ -367,6 +367,104 @@ describe("installed OpenClaw inbound host contract", () => {
     expect(actions?.supportsAction?.({ action: "delete" })).toBe(true);
   });
 
+  it("releases the stable debounce lane when the group queue adopts a batch", async () => {
+    vi.useFakeTimers();
+    const groupIdHex = HEX32("cc");
+    const senderA = HEX32("bb");
+    const senderB = HEX32("bc");
+    const messageIdA1 = HEX32("d1");
+    const messageIdA2 = HEX32("d2");
+    const messageIdB1 = HEX32("d3");
+    const inbound = (messageIdHex: string, senderAccountIdHex: string): AgentControlEvent => ({
+      type: "inbound_message",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: groupIdHex,
+      message: {
+        message_id_hex: messageIdHex,
+        sender: { account_id_hex: senderAccountIdHex, display_name: null, is_self: false },
+        text: messageIdHex,
+        recorded_at: 123,
+        media: [],
+      },
+    });
+    let emitA2!: () => void;
+    let emitB1!: () => void;
+    const waitForA2 = new Promise<void>((resolve) => {
+      emitA2 = resolve;
+    });
+    const waitForB1 = new Promise<void>((resolve) => {
+      emitB1 = resolve;
+    });
+    const client = {
+      accountList: async () => ({
+        type: "account_list" as const,
+        accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+      }),
+      async *subscribeInbound(
+        _filter?: unknown,
+        signal?: AbortSignal,
+        hooks?: { onReady?: () => void },
+      ): AsyncGenerator<AgentControlEvent> {
+        hooks?.onReady?.();
+        yield inbound(messageIdA1, senderA);
+        await waitForA2;
+        yield inbound(messageIdA2, senderA);
+        await waitForB1;
+        yield inbound(messageIdB1, senderB);
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+          } else {
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+          }
+        });
+      },
+    } as unknown as MarmotAgentControlClient;
+    const started: string[] = [];
+    const completions = new Map<string, () => void>();
+    const stop = startMarmotInbound(
+      {
+        config: {
+          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false } },
+        },
+        logger: { info: () => undefined, warn: () => undefined },
+      },
+      async (message) => {
+        started.push(message.messageIdHex);
+        await new Promise<void>((resolve) => completions.set(message.messageIdHex, resolve));
+      },
+      { clientFactory: () => client },
+    );
+
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(started).toEqual([messageIdA1]);
+
+      emitA2();
+      await vi.advanceTimersByTimeAsync(1);
+      emitB1();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(started).toEqual([messageIdA1]);
+
+      completions.get(messageIdA1)?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(started).toEqual([messageIdA1, messageIdA2]);
+
+      completions.get(messageIdA2)?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(started).toEqual([messageIdA1, messageIdA2, messageIdB1]);
+      completions.get(messageIdB1)?.();
+    } finally {
+      emitA2();
+      emitB1();
+      for (const resolve of completions.values()) {
+        resolve();
+      }
+      stop();
+      vi.useRealTimers();
+    }
+  });
+
   const betaContract = process.env.OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR === "1" ? it : it.skip;
   betaContract("dispatches a debounced batch through beta's lifecycle contract", async () => {
     const events: AgentControlEvent[] = ["first", "second"].map((text, index) => ({
@@ -418,6 +516,77 @@ describe("installed OpenClaw inbound host contract", () => {
       await vi.waitFor(() => expect(dispatched).toHaveBeenCalledOnce());
       expect(dispatched.mock.calls[0]?.[0]).toMatchObject({ text: "first\nsecond" });
     } finally {
+      stop();
+    }
+  });
+
+  betaContract("releases a debounce key when the group queue adopts the batch", async () => {
+    const events: AgentControlEvent[] = Array.from({ length: 33 }, (_, index) => ({
+      type: "inbound_message",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      message: {
+        message_id_hex: (index + 1).toString(16).padStart(64, "0"),
+        sender: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+        text: `message-${index}`,
+        recorded_at: 123 + index,
+        media: [],
+      },
+    }));
+    const client = {
+      accountList: async () => ({
+        type: "account_list" as const,
+        accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+      }),
+      async *subscribeInbound(
+        _filter?: unknown,
+        _signal?: AbortSignal,
+        hooks?: { onReady?: () => void },
+      ): AsyncGenerator<AgentControlEvent> {
+        hooks?.onReady?.();
+        for (const event of events) {
+          yield event;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        await new Promise<void>((resolve) => {
+          if (_signal?.aborted) {
+            resolve();
+          } else {
+            _signal?.addEventListener("abort", () => resolve(), { once: true });
+          }
+        });
+      },
+    } as unknown as MarmotAgentControlClient;
+    let releaseFirst!: () => void;
+    const firstCompletion = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const dispatched = vi.fn(async (_message: MarmotInboundMessage) => {
+      if (dispatched.mock.calls.length === 1) {
+        await firstCompletion;
+      }
+    });
+    const warnings: string[] = [];
+    const stop = startMarmotInbound(
+      {
+        config: {
+          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false } },
+        },
+        logger: { info: () => undefined, warn: (message) => warnings.push(message) },
+      },
+      dispatched,
+      { clientFactory: () => client },
+    );
+
+    try {
+      await vi.waitFor(() =>
+        expect(warnings).toContain(
+          "marmot: inbound queue overloaded (reason=per_group_depth, active_groups=1, max_depth_per_group=32, max_tracked_groups=256)",
+        ),
+      );
+      expect(warnings.join(" ")).not.toContain("inbound debounce overloaded");
+    } finally {
+      releaseFirst();
       stop();
     }
   });

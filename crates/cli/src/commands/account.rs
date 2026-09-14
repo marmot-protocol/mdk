@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use crate::{
     AccountCommand, CliRuntimeInfo, CommandOutput, ImportNsec, SecretStoreKind, WnError,
     account_selector_or_default, npub_for_account_id, parse_public_key, profile_display_name,
-    relay_endpoints, relay_lists_json, resolve_account, validate_materialized_secret_identity,
+    relay_endpoints, relay_lists_json, resolve_account, terminal_safe_json_display,
+    terminal_safe_text, validate_materialized_secret_identity,
 };
 
 pub(crate) async fn identity_create_command(
@@ -83,8 +84,10 @@ pub(crate) fn whoami_command(
             )?
         };
         return Ok(CommandOutput {
-            plain: serde_json::to_string_pretty(&status)
-                .expect("JSON response serialization cannot fail"),
+            plain: terminal_safe_json_display(
+                &serde_json::to_string_pretty(&status)
+                    .expect("JSON response serialization cannot fail"),
+            ),
             json: status,
         });
     }
@@ -325,16 +328,20 @@ pub(crate) async fn account_command(
                     app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
                 let json = public_account_status_json(&account, relay_lists)?;
                 return Ok(CommandOutput {
-                    plain: serde_json::to_string_pretty(&json)
-                        .expect("JSON response serialization cannot fail"),
+                    plain: terminal_safe_json_display(
+                        &serde_json::to_string_pretty(&json)
+                            .expect("JSON response serialization cannot fail"),
+                    ),
                     json,
                 });
             }
             let status = app.status(&account.label)?;
             let json = wn_status_json(status, &runtime_info)?;
             Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&json)
-                    .expect("JSON response serialization cannot fail"),
+                plain: terminal_safe_json_display(
+                    &serde_json::to_string_pretty(&json)
+                        .expect("JSON response serialization cannot fail"),
+                ),
                 json,
             })
         }
@@ -410,13 +417,19 @@ fn account_summary_json(
     }))
 }
 
-fn account_display_name_or_npub(account: &Value) -> &str {
+fn account_display_name_or_npub(account: &Value) -> String {
     account
         .get("display_name")
         .and_then(Value::as_str)
+        .map(terminal_safe_text)
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| account.get("npub").and_then(Value::as_str))
-        .unwrap_or("")
+        .or_else(|| {
+            account
+                .get("npub")
+                .and_then(Value::as_str)
+                .map(terminal_safe_text)
+        })
+        .unwrap_or_default()
 }
 
 fn wn_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Result<Value, WnError> {
@@ -489,4 +502,38 @@ pub(crate) fn apply_global_relay_defaults(
         applied.bootstrap_relays = true;
     }
     applied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn account_display_name_falls_back_when_sanitized_label_is_blank() {
+        let named = json!({
+            "display_name": "ali\u{1b}]0;pwn\u{7}ce",
+            "npub": "npub1example"
+        });
+        assert_eq!(account_display_name_or_npub(&named), "ali]0;pwnce");
+
+        let controls_only = json!({
+            "display_name": "\u{1b}\u{7}\u{202e}",
+            "npub": "npub1fallback"
+        });
+        assert_eq!(
+            account_display_name_or_npub(&controls_only),
+            "npub1fallback"
+        );
+    }
+
+    #[test]
+    fn account_pretty_json_plain_dump_uses_terminal_safe_json_display() {
+        let value = json!({"display_name": "a\u{1b}b"});
+        let serialized =
+            serde_json::to_string_pretty(&value).expect("pretty JSON serialization cannot fail");
+        let displayed = terminal_safe_json_display(&serialized);
+        assert_eq!(displayed, serialized);
+        assert!(!displayed.contains('\u{1b}'));
+    }
 }

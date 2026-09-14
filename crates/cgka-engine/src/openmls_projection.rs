@@ -6,7 +6,7 @@
 //! snapshot-and-replay messages for candidate materialization or apply a
 //! selected canonical branch to retained storage.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_event::AppMessageRetentionDecision;
@@ -39,6 +39,10 @@ use crate::canonicalization::{
     MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
 };
 use crate::convergence::BranchCandidate;
+
+#[cfg(test)]
+#[path = "openmls_projection/tests.rs"]
+mod graph_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMlsContentKind {
@@ -242,7 +246,7 @@ pub(crate) struct ReplayProfilePolicy {
 #[derive(Clone, Debug)]
 pub(crate) struct StoredCanonicalizationOptions<'a> {
     pub(crate) replay_profile: ReplayProfilePolicy,
-    pub(crate) admitted_message_ids: Option<&'a HashSet<MessageId>>,
+    pub(crate) admitted_message_ids: Option<&'a [MessageId]>,
     pub(crate) admit_app_witnesses: bool,
     pub(crate) replay_probe_budget_override: Option<u64>,
     /// Engine-path seen-id snapshot, shared instead of copied into
@@ -1193,15 +1197,38 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
-    admitted_message_ids: Option<&HashSet<MessageId>>,
+    admitted_message_ids: Option<&[MessageId]>,
 ) -> Result<StoredOpenMlsGraphInputs, OpenMlsProjectionError> {
-    let current_epoch = storage
-        .get_group(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-        .epoch
-        .0;
-    let records = storage
-        .list_messages(group_id, EpochId(0))
+    // Keep the group epoch and message records in the same read snapshot.
+    let (current_epoch, records) = storage
+        .with_transaction(|storage| {
+            let current_epoch = storage.get_group(group_id)?.epoch.0;
+            if let Some(ids) = admitted_message_ids {
+                // Frozen membership already names the complete batch. Do not
+                // load unrelated history just to intersect it with these ids.
+                let records = ids
+                    .iter()
+                    .map(|id| storage.get_message(id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok((current_epoch, records));
+            }
+            let mut records = Vec::new();
+            for state in OPENMLS_GRAPH_INPUT_STATES {
+                // Processed rows only witness the retained window. Unresolved
+                // rows below it must still receive their stale-commit verdict.
+                let floor = if state == MessageState::Processed {
+                    retained_anchor_epoch
+                } else {
+                    0
+                };
+                records.extend(storage.list_messages_in_states(
+                    group_id,
+                    &[state],
+                    EpochId(floor),
+                )?);
+            }
+            Ok::<_, StorageError>((current_epoch, records))
+        })
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     let mut commit_messages = Vec::new();
     let mut pending_messages = Vec::new();
@@ -1210,7 +1237,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     let mut own_commits = PrevalidatedOwnCommits::default();
 
     for record in records {
-        if admitted_message_ids.is_some_and(|admitted| !admitted.contains(&record.id)) {
+        if record.group_id != *group_id {
             continue;
         }
         if !record_state_can_contribute_to_openmls_graph(record.state) {
@@ -3669,6 +3696,25 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     source_epoch,
                     proposal_ref,
                 });
+                if let Some(max_retained_anchor_rewind) = retain_replayed_anchors {
+                    // A rival at this epoch may consume this proposal *by
+                    // reference* — the SelfRemove auto-commit shape, where
+                    // every peer that sees one `Leave` commits the same
+                    // `ProposalRef`. Once the commit this device adopts
+                    // merges, the proposal record is `Processed` and the
+                    // seeder stops re-supplying it, so the epoch's retained
+                    // anchor becomes the only surviving record of the pending
+                    // proposal. Refresh it now, while the store still holds
+                    // the proposal: a rewind to this epoch must land on the
+                    // state as the device *left* it, or the rival's
+                    // `ProposalRef` resolves against nothing and OpenMLS
+                    // rejects it as `MissingProposal`.
+                    retain_current_group_epoch_snapshot(
+                        storage,
+                        group_id,
+                        max_retained_anchor_rewind,
+                    )?;
+                }
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 if reject_legacy_group_additions && staged.add_proposals().next().is_some() {
@@ -3778,6 +3824,32 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         reason: format!("current-profile resulting state: {err}"),
                         rejection_category: None,
                     });
+                }
+                if retain_replayed_anchors.is_some()
+                    && crate::app_components::staged_commit_disbands(&mls_group, &staged)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                {
+                    // Ordinary inbound commits enter convergence before the
+                    // direct-ingest disband detector. Preserve the authenticated
+                    // terminal evidence while applying the selected branch,
+                    // before merge removes the former roster. Candidate probes
+                    // must not persist it; this write shares the apply transaction.
+                    storage.put_disband_candidate(&cgka_traits::storage::DisbandCandidate {
+                        group_id: group_id.clone(),
+                        source_epoch: EpochId(source_epoch),
+                        commit_id: message.id.clone(),
+                        content_commit_id: crate::message_processor::content_dedup_id(
+                            &message.payload,
+                        ),
+                        commit_digest: projection.message_digest,
+                        actor: sender_id
+                            .clone()
+                            .expect("authenticated sender checked above"),
+                        local_was_committer_leaf: committer_index == mls_group.own_leaf_index(),
+                        former_members: crate::disband::deduplicated_roster(&marmot_members(
+                            &mls_group,
+                        )),
+                    })?;
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
@@ -4611,6 +4683,7 @@ mod candidate_branch_peel_halt_tests {
                 group_id: None,
                 sender: None,
                 content: PeeledContent::Welcome {
+                    created_at: None,
                     bytes: msg.payload.clone(),
                 },
                 origin: msg.clone(),
@@ -4694,6 +4767,37 @@ mod candidate_branch_peel_halt_tests {
             joiner.join_welcome(welcome).await.unwrap();
         }
         group_id
+    }
+
+    #[tokio::test]
+    async fn graph_seed_keeps_stale_commits() {
+        let (mut alice, storage) = build_client(b"graph-seed");
+        let (mut bob, _) = build_client(b"graph-seed-peer");
+        let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+        let epoch = storage.get_group(&group_id).unwrap().epoch.0;
+        let commit = rival_commit(&storage, &alice.self_id(), &group_id);
+        admit_rival(&storage, &group_id, &commit, epoch);
+
+        let retained =
+            super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch, None).unwrap();
+        assert!(
+            retained
+                .commit_messages
+                .iter()
+                .any(|row| row.message.id == commit.id)
+        );
+        let stale =
+            super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch + 1, None).unwrap();
+        assert!(stale.commit_messages.is_empty());
+        assert!(stale.stale_commit_drops.iter().any(|row| {
+            row.message_id == hex::encode(commit.id.as_slice())
+                && row.reason == super::DroppedMessageReason::BeyondAnchor
+        }));
+        // Seeding classifies; only canonical apply may persist the verdict.
+        assert_eq!(
+            storage.get_message(&commit.id).unwrap().state,
+            MessageState::ConvergenceDeferred
+        );
     }
 
     // --- Graph fixtures ------------------------------------------------------

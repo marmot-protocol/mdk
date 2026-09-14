@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,37 @@ def wait_for(path: Path, timeout: float = 5.0):
 
 
 class InboundSpoolTests(unittest.TestCase):
+    def test_schema_one_migration_preserves_obligations_and_separates_retry_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "private" / "spool.sqlite3"
+            store = spool.InboundSpool(path)
+            store.open()
+            store.record(event(1))
+            message_id = event(1)["message_id_hex"]
+            store.claim(message_id)
+            store.defer(message_id, delay_s=0.01, reason="queue_full")
+            store.close()
+            # Recreate the previous version's events table and version marker.
+            with sqlite3.connect(path) as db:
+                db.execute("ALTER TABLE events DROP COLUMN dispatch_attempts")
+                db.execute("PRAGMA user_version=1")
+            store.open()
+            try:
+                record = store.get(message_id)
+                self.assertEqual("pending", record.state)
+                self.assertEqual(event(1), record.event)
+                self.assertEqual(1, record.attempts)
+                self.assertEqual(0, record.dispatch_attempts)
+                store.claim(message_id, ignore_backoff=True)
+                store.defer(message_id, delay_s=0.01, reason="dispatch_failed_before_handoff", dispatch_failure=True)
+                store.close()
+                store.open()
+                record = store.get(message_id)
+                self.assertEqual(2, record.attempts)
+                self.assertEqual(1, record.dispatch_attempts)
+            finally:
+                store.close()
+
     def test_record_reopen_and_private_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "private" / "spool.sqlite3"
@@ -206,6 +238,102 @@ class InboundSpoolTests(unittest.TestCase):
             self.assertEqual("pending", store.get(event(1)["message_id_hex"]).state)
             store.close()
 
+    def test_expired_terminal_pages_are_reused_for_repeated_refill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(
+                Path(tmp) / "spool.sqlite3",
+                max_bytes=1024 * 1024,
+                terminal_retention_s=0,
+            )
+            store.open()
+            payload = "x" * (600 * 1024)
+
+            def seed_expired_terminal(item):
+                serialized = json.dumps(item, separators=(",", ":"), sort_keys=True)
+                now = time.time()
+                db = store._require_db()
+                with db:
+                    db.execute("DELETE FROM events")
+                    db.execute(
+                        "INSERT INTO events(account_id,group_id,message_id,state,event_json,"
+                        "source_ids_json,reply_anchor,attempts,next_attempt_at,disposition,"
+                        "created_at,changed_at) VALUES(?,?,?,'failed',?,'[]',NULL,0,0,'',?,?)",
+                        (
+                            item["account_id_hex"],
+                            item["group_id_hex"],
+                            item["message_id_hex"],
+                            serialized,
+                            now - 10,
+                            now - 10,
+                        ),
+                    )
+                store._checkpoint_and_verify_bound()
+
+            seed = event(1)
+            seed["text"] = payload
+            seed_expired_terminal(seed)
+            for index in range(2, 5):
+                item = event(index)
+                item["text"] = payload
+                inserted, state = store.record(item)
+                self.assertTrue(inserted)
+                self.assertEqual("pending", state)
+                self.assertIsNone(store.get(seed["message_id_hex"]))
+                self.assertLessEqual(store._allocated_bytes(), store.max_bytes)
+                seed_expired_terminal(item)
+                seed = item
+
+            self.assertEqual({"failed": 1}, store.snapshot())
+            store.close()
+
+    def test_gc_never_evicts_live_handed_by_retention_or_count(self):
+        for kwargs in (
+            {"terminal_retention_s": 0},
+            {"max_terminal": 0},
+        ):
+            with self.subTest(**kwargs), tempfile.TemporaryDirectory() as tmp:
+                store = spool.InboundSpool(Path(tmp) / "spool.sqlite3", **kwargs)
+                store.open()
+                handed = event(1)
+                store.record(handed)
+                store.claim(handed["message_id_hex"])
+                store.transition(
+                    handed["message_id_hex"],
+                    "handed",
+                    "host_handoff_started",
+                )
+
+                store.record(event(2))
+
+                self.assertEqual("handed", store.get(handed["message_id_hex"]).state)
+                store.close()
+
+    def test_completed_debounce_batch_releases_pending_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(
+                Path(tmp) / "spool.sqlite3",
+                max_pending=2,
+            )
+            store.open()
+            first, second = event(1), event(2)
+            store.record(first, debounce_buffered=True)
+            store.record(second, debounce_buffered=True)
+            merged = dict(first, text="merged")
+            representative = store.form_batch(
+                [first["message_id_hex"], second["message_id_hex"]],
+                merged,
+            )
+            store.claim(representative)
+            store.transition(representative, "handed", "host_handoff_started")
+            store.transition(representative, "completed", "host_returned")
+
+            inserted, state = store.record(event(3))
+
+            self.assertEqual((True, "pending"), (inserted, state))
+            self.assertEqual("completed", store.get(first["message_id_hex"]).state)
+            self.assertEqual("completed", store.get(second["message_id_hex"]).state)
+            store.close()
+
     def test_transaction_mode_rolls_back_partial_batch_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")
@@ -255,9 +383,14 @@ class InboundSpoolTests(unittest.TestCase):
                 child = subprocess.Popen(
                     [sys.executable, __file__, "--crash-child", str(path), str(marker), crash_state]
                 )
-                wait_for(marker)
-                os.kill(child.pid, signal.SIGKILL)
-                self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                try:
+                    wait_for(marker)
+                    os.kill(child.pid, signal.SIGKILL)
+                    self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
                 probe = subprocess.run(
                     [sys.executable, __file__, "--probe", str(path)],
                     check=True,
@@ -288,9 +421,14 @@ class InboundSpoolTests(unittest.TestCase):
                         crash_point,
                     ]
                 )
-                wait_for(marker)
-                os.kill(child.pid, signal.SIGKILL)
-                self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                try:
+                    wait_for(marker)
+                    os.kill(child.pid, signal.SIGKILL)
+                    self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
                 probe_result = subprocess.run(
                     [sys.executable, __file__, "--probe-all", str(path)],
                     check=True,
@@ -301,6 +439,58 @@ class InboundSpoolTests(unittest.TestCase):
                 result = json.loads(probe_result.stdout)
                 self.assertEqual(expected_pending, result["counts"].get("pending", 0))
                 self.assertEqual(expected_pending, len(result["texts"]))
+
+    def test_claim_double_fault_reopens_and_recovers_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")
+            store.open()
+            item = event(1)
+            store.record(item)
+            original_generation = store.generation
+            original_verify = store._checkpoint_and_verify_bound
+            failed_once = False
+
+            def fail_verification_once():
+                nonlocal failed_once
+                if not failed_once:
+                    failed_once = True
+                    raise spool.InboundSpoolError("synthetic original verification failure")
+                return original_verify()
+
+            class FailCompensatingUpdate:
+                def __init__(self, db):
+                    self.db = db
+
+                def __getattr__(self, name):
+                    return getattr(self.db, name)
+
+                def __enter__(self):
+                    self.db.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.db.__exit__(*args)
+
+                def execute(self, statement, parameters=()):
+                    if "claim_post_commit_verification_failed" in statement:
+                        raise sqlite3.OperationalError("synthetic compensation failure")
+                    return self.db.execute(statement, parameters)
+
+            store._checkpoint_and_verify_bound = fail_verification_once
+            store._db = FailCompensatingUpdate(store._db)
+            with self.assertRaisesRegex(
+                spool.InboundSpoolError,
+                "synthetic original verification failure",
+            ):
+                store.claim(item["message_id_hex"])
+
+            recovered = store.get(item["message_id_hex"])
+            self.assertTrue(store.is_open)
+            self.assertGreater(store.generation, original_generation)
+            self.assertEqual("pending", recovered.state)
+            self.assertEqual("recovered_abandoned_claim", recovered.disposition)
+            self.assertEqual([item["message_id_hex"]], [row.message_id for row in store.due()])
+            store.close()
 
 
 def crash_child(path: Path, marker: Path, state: str):

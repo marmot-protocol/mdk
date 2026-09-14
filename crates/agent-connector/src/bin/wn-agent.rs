@@ -30,6 +30,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Inspect or change the local Share usage and diagnostics permission.
+    UsageDiagnostics {
+        #[command(subcommand)]
+        command: UsageCommand,
+        #[arg(long)]
+        home: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Create or reuse a local agent account and print phone bootstrap details
     Bootstrap(BootstrapArgs),
     /// Securely import an existing local-signing Nostr identity
@@ -237,6 +246,42 @@ struct ImportIdentityArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Some(Commands::UsageDiagnostics {
+            command,
+            home,
+            json,
+        }) => run_async(async move {
+            let home = resolve_bootstrap_home(home);
+            let command = match command {
+                UsageCommand::Show => agent_connector::UsageDiagnosticsCommand::Show,
+                UsageCommand::Enable => agent_connector::UsageDiagnosticsCommand::Enable,
+                UsageCommand::Disable => agent_connector::UsageDiagnosticsCommand::Disable,
+            };
+            match agent_connector::manage_usage_diagnostics(&home, command).await {
+                Ok(report) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+                    } else {
+                        println!(
+                            "Saved usage and diagnostics permission: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}",
+                            report.settings.decision,
+                            report.status.telemetry,
+                            report.status.product_analytics,
+                            report.disclosure
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(_) => {
+                    if json {
+                        println!("{{\"ok\":false,\"error\":\"usage_diagnostics_failed\"}}");
+                    } else {
+                        eprintln!("Could not read or save usage and diagnostics consent");
+                    }
+                    ExitCode::FAILURE
+                }
+            }
+        }),
         Some(Commands::Bootstrap(args)) => run_async(run_bootstrap_command(args)),
         Some(Commands::ImportIdentity(args)) => run_import_identity_command(args),
         None => run_async(run_serve_command(cli.serve)),
@@ -675,4 +720,11 @@ fn read_auth_token(path: Option<&PathBuf>) -> Result<Option<String>, String> {
         return Err(format!("{} is empty", path.display()));
     }
     Ok(Some(token))
+}
+
+#[derive(Debug, Subcommand)]
+enum UsageCommand {
+    Show,
+    Enable,
+    Disable,
 }

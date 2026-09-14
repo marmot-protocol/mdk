@@ -25,14 +25,17 @@ pub(crate) mod commands;
 pub mod daemon;
 mod error;
 mod secret;
+mod terminal;
 pub mod tui;
+
+pub(crate) use terminal::{terminal_safe_json_display, terminal_safe_text};
 
 pub use args::SecretStoreKind;
 pub(crate) use args::{
     AccountCommand, ChatsCommand, Cli, Command, DaemonCommand, DebugCommand, FollowsCommand,
     GroupCommand, GroupsCommand, KeyPackageCommand, MaintenancePolicySetting, MediaCommand,
     MessageCommand, MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand,
-    SettingsCommand, StreamCommand, UsersCommand,
+    SettingsCommand, StreamCommand, UsageDiagnosticsCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
 pub(crate) use secret::ImportNsec;
@@ -48,10 +51,54 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The directory a private file must be created in, or `None` when the path is
+/// a bare file name: `Path::parent` reports `Some("")` for `avatar.png`, and
+/// creating or chmod-ing `""` fails with `ENOENT` on Unix before the file is
+/// even opened.
+pub(crate) fn private_parent_dir(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+/// Write a file inside the `wn` home layout. Every directory on the way to
+/// it is created if missing and tightened to `0700`: those directories are
+/// `wn`'s own, and their contents (databases, secrets, sockets, logs) must
+/// never be readable by other local users.
 pub(crate) fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = private_parent_dir(path) {
         create_private_dir_all(parent)?;
     }
+    write_private_file_contents(path, bytes)
+}
+
+/// Write a caller-chosen output file — a decrypted download — with private
+/// mode, without touching directories that already exist. The destination is
+/// the caller's working directory or an `--output` directory of their
+/// choosing; a shared `0755` directory is theirs to keep shared, and one owned
+/// by another user cannot be chmod-ed at all. Only directories this call has
+/// to create are made `0700`; the file itself is always `0600`.
+pub(crate) fn write_private_output_file(
+    path: &Path,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    if let Some(parent) = private_parent_dir(path) {
+        create_missing_dirs_private(parent)?;
+    }
+    write_private_file_contents(path, bytes)
+}
+
+/// `create_dir_all` whose newly created directories are `0700`. Directories
+/// that already exist are left exactly as found: `DirBuilder::recursive` does
+/// not revisit them, so no existing mode is changed.
+fn create_missing_dirs_private(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, PRIVATE_DIR_MODE);
+    builder.create(path)
+}
+
+fn write_private_file_contents(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -64,7 +111,7 @@ pub(crate) fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> std::i
 }
 
 pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = private_parent_dir(path) {
         create_private_dir_all(parent)?;
     }
     let mut options = std::fs::OpenOptions::new();
@@ -169,6 +216,13 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
 
     if matches!(cli.command, Command::Tui { .. }) {
         return tui::run_tui(cli).await;
+    }
+
+    // File inputs and output destinations mean the caller's files. A forwarded
+    // command runs inside `wnd`, whose working directory is unrelated, so pin
+    // them to the caller's directory before either execution path.
+    if let Ok(caller_dir) = std::env::current_dir() {
+        resolve_relative_paths(&mut cli, &caller_dir);
     }
 
     let home = resolve_home(cli.home.clone());
@@ -335,6 +389,46 @@ pub(crate) fn validate_materialized_secret_identity(
     Ok(())
 }
 
+/// Resolve every caller-relative file input and output destination in `cli`
+/// against `base`, and turn an absent download destination into `base` itself
+/// (the handlers treat a directory output as "default file name in there").
+/// Relative paths are joined, never canonicalized, so an output that does not
+/// exist yet still resolves.
+pub(crate) fn resolve_relative_paths(cli: &mut Cli, base: &Path) {
+    fn resolve(base: &Path, value: &mut String) {
+        if Path::new(value.as_str()).is_relative() {
+            *value = base.join(value.as_str()).to_string_lossy().into_owned();
+        }
+    }
+    let base_dir = || base.to_string_lossy().into_owned();
+    match &mut cli.command {
+        Command::Groups { command } => match command {
+            GroupsCommand::Create {
+                image: Some(image), ..
+            } => resolve(base, image),
+            GroupsCommand::SetImage { file_path, .. } => resolve(base, file_path),
+            GroupsCommand::DownloadImage { output, .. } => match output {
+                Some(output) => resolve(base, output),
+                None => *output = Some(base_dir()),
+            },
+            _ => {}
+        },
+        Command::Media { command } => match command {
+            MediaCommand::Upload { file_paths, .. } => {
+                for file_path in file_paths {
+                    resolve(base, file_path);
+                }
+            }
+            MediaCommand::Download { output, .. } => match output {
+                Some(output) => resolve(base, output),
+                None => *output = Some(base_dir()),
+            },
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 fn is_background_stream_watch(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -431,13 +525,14 @@ pub(crate) fn command_output_result(
             // logged by callers and must remain privacy-safe.
             stderr: format!(
                 "error: sync failed; completed prefix:\n{}\nerror: {}\n",
-                sync.partial_plain, sync.source
+                sync.partial_plain,
+                terminal_safe_text(&sync.source.to_string())
             ),
         },
         Err(err) => CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("error: {err}\n"),
+            stderr: format!("error: {}\n", terminal_safe_text(&err.to_string())),
         },
     }
 }
@@ -497,6 +592,11 @@ async fn execute_inner(
         account_home.clone(),
     )?;
     match command {
+        Command::UsageDiagnostics { command } => {
+            let runtime = app.runtime();
+            marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
+            usage_diagnostics_command(&runtime, command)
+        }
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
         }
@@ -747,7 +847,7 @@ fn daemon_client_error_with_code(
     CliOutput {
         code: 1,
         stdout: String::new(),
-        stderr: format!("error: {err}\n"),
+        stderr: format!("error: {}\n", terminal_safe_text(&err.to_string())),
     }
 }
 
@@ -886,18 +986,26 @@ pub(crate) fn group_list_plain(groups: &[AppGroupRecord]) -> String {
         .join("\n")
 }
 
-fn group_plain(group: &AppGroupRecord) -> String {
+pub(crate) fn group_plain(group: &AppGroupRecord) -> String {
     let mut line = format!(
         "{} name={} endpoint={}",
-        group.group_id_hex, group.profile.name, group.endpoint
+        terminal_safe_text(&group.group_id_hex),
+        terminal_safe_text(&group.profile.name),
+        terminal_safe_text(&group.endpoint)
     );
     if group.avatar_url.present {
-        line.push_str(&format!(" avatar_url={}", group.avatar_url.url));
+        line.push_str(&format!(
+            " avatar_url={}",
+            terminal_safe_text(&group.avatar_url.url)
+        ));
         if let Some(dim) = &group.avatar_url.dim {
-            line.push_str(&format!(" avatar_dim={dim}"));
+            line.push_str(&format!(" avatar_dim={}", terminal_safe_text(dim)));
         }
         if let Some(thumbhash) = &group.avatar_url.thumbhash {
-            line.push_str(&format!(" avatar_thumbhash={thumbhash}"));
+            line.push_str(&format!(
+                " avatar_thumbhash={}",
+                terminal_safe_text(thumbhash)
+            ));
         }
     }
     line
@@ -908,17 +1016,42 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "group_id": group.group_id_hex,
         "endpoint": group.endpoint,
         "profile": group.profile,
-        "image": group.image,
+        // Presence, hash, and type only. The full component carries the avatar
+        // decryption key, the Blossom upload secret, and key-bearing `data_hex`;
+        // none of the CLI, TUI, or daemon consumers need them (mdk#1253).
+        "image": crate::commands::groups::group_image_summary_json(&group.image),
         "avatar_url": group.avatar_url,
         "admin_policy": group.admin_policy,
         "nostr_routing": group.nostr_routing,
         "agent_text_stream": group.agent_text_stream,
         "encrypted_media": group.encrypted_media,
+        "message_retention": group.message_retention,
         "archived": group.archived,
         "pending_confirmation": group.pending_confirmation,
         "welcomer_account_id": group.welcomer_account_id_hex,
         "via_welcome_message_id": group.via_welcome_message_id_hex,
+        // Lifecycle projection (additive, mdk#1788): whether ordinary outbound
+        // work is gated by a disband in flight, the durable local request
+        // outcome, the terminal flag, and the local membership classification.
+        "disbanding": group.disbanding,
+        "disbanded": group.disbanded,
+        "disband_request": group.disband_request,
+        "unrecoverable": group.unrecoverable,
+        "self_membership": self_membership_json(&group),
+        "leave_requested_at_ms": group.leave_requested_at_ms,
     })
+}
+
+/// `member`, `left`, or `removed`: the local membership classification as a
+/// stable lowercase token, matching the other snake_case lifecycle strings in
+/// CLI JSON rather than the storage enum's Rust variant spelling.
+pub(crate) fn self_membership_json(group: &AppGroupRecord) -> Value {
+    json!(
+        json!(group.self_membership)
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "member".to_owned())
+    )
 }
 
 /// Render a `chats` row: the group record (`group_json`) enriched with the
@@ -1117,6 +1250,16 @@ fn app_for(
     directory_relays: Vec<String>,
     account_home: AccountHome,
 ) -> Result<MarmotApp, WnError> {
+    app_for_role(home, relay, directory_relays, account_home, true)
+}
+
+fn app_for_role(
+    home: PathBuf,
+    relay: Option<String>,
+    directory_relays: Vec<String>,
+    account_home: AccountHome,
+    silent: bool,
+) -> Result<MarmotApp, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
@@ -1125,6 +1268,7 @@ fn app_for(
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
         .with_directory_relay_urls(directory_relays);
+    config.usage_diagnostics_silent = silent;
     // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
     // pinned convergence settlement window (e.g. `0` for integration tests).
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
@@ -1304,6 +1448,29 @@ fn json_wn_error(err: WnError) -> CliOutput {
         ),
         stderr: String::new(),
     }
+}
+
+pub(crate) fn usage_diagnostics_command(
+    runtime: &marmot_app::MarmotAppRuntime,
+    command: UsageDiagnosticsCommand,
+) -> Result<CommandOutput, WnError> {
+    if !matches!(command, UsageDiagnosticsCommand::Show) {
+        runtime
+            .set_usage_diagnostics_consent(matches!(command, UsageDiagnosticsCommand::Enable))?;
+    }
+    let settings = runtime.stored_usage_diagnostics_settings()?;
+    let mut status = runtime.usage_diagnostics_status();
+    status.consent = runtime.usage_diagnostics_settings()?.decision;
+    Ok(CommandOutput {
+        plain: format!(
+            "Saved usage and diagnostics permission: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}\n",
+            settings.decision,
+            status.telemetry,
+            status.product_analytics,
+            marmot_app::USAGE_DIAGNOSTICS_DISCLOSURE
+        ),
+        json: json!({"settings":settings,"status":status,"disclosure":marmot_app::USAGE_DIAGNOSTICS_DISCLOSURE}),
+    })
 }
 
 #[cfg(test)]
@@ -2162,6 +2329,356 @@ mod tests {
     }
 
     #[test]
+    fn private_parent_dir_skips_bare_file_names() {
+        assert_eq!(crate::private_parent_dir(Path::new("avatar.png")), None);
+        assert_eq!(
+            crate::private_parent_dir(Path::new("out/avatar.png")),
+            Some(Path::new("out"))
+        );
+        assert_eq!(
+            crate::private_parent_dir(Path::new("/tmp/avatar.png")),
+            Some(Path::new("/tmp"))
+        );
+    }
+
+    #[test]
+    fn write_private_file_accepts_a_bare_file_name_relative_path() {
+        // A bare name has an empty parent; writing must not try to create or
+        // chmod "" before opening the file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bare.bin");
+        crate::write_private_file(&path, b"ok").expect("absolute path writes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+        let nested = dir.path().join("nested").join("deep.bin");
+        crate::write_private_file(&nested, b"ok").expect("nested path creates parents");
+        assert!(nested.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_output_file_leaves_existing_directories_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+        // A download destination is the caller's directory, not wn's: a
+        // shared 0755 directory must stay 0755 after the file lands in it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let direct = shared.join("note.txt");
+        crate::write_private_output_file(&direct, b"ok").expect("download into existing dir");
+        assert_eq!(std::fs::read(&direct).unwrap(), b"ok");
+        assert_eq!(mode(&shared), 0o755, "existing parent must keep its mode");
+        assert_eq!(
+            mode(&direct),
+            0o600,
+            "the plaintext file itself stays private"
+        );
+
+        // Directories the download has to create are private; the existing
+        // ancestor above them is still untouched.
+        let nested = shared.join("a").join("b").join("note.txt");
+        crate::write_private_output_file(&nested, b"ok").expect("download creates missing dirs");
+        assert_eq!(mode(&shared), 0o755);
+        assert_eq!(mode(&shared.join("a")), 0o700);
+        assert_eq!(mode(&shared.join("a").join("b")), 0o700);
+        assert_eq!(mode(&nested), 0o600);
+
+        // The home-layout writer is the one that tightens: same shape, and the
+        // directory it created for the file is 0700.
+        let home_file = dir.path().join("home").join("state.json");
+        crate::write_private_file(&home_file, b"ok").expect("home write");
+        assert_eq!(mode(&dir.path().join("home")), 0o700);
+    }
+
+    #[test]
+    fn relative_file_paths_resolve_against_the_caller_directory_before_forwarding() {
+        let base = Path::new("/callers/cwd");
+        let mut cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "upload",
+            "GROUP",
+            "a.png",
+            "/abs/b.png",
+            "--send",
+        ])
+        .expect("upload parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Media {
+                command: crate::MediaCommand::Upload { file_paths, .. },
+            } => assert_eq!(
+                file_paths,
+                &vec!["/callers/cwd/a.png".to_owned(), "/abs/b.png".to_owned()]
+            ),
+            other => panic!("expected media upload, got {other:?}"),
+        }
+
+        let mut cli = Cli::try_parse_from(["wn", "groups", "set-image", "GROUP", "avatar.png"])
+            .expect("set-image parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::SetImage { file_path, .. },
+            } => assert_eq!(file_path, "/callers/cwd/avatar.png"),
+            other => panic!("expected groups set-image, got {other:?}"),
+        }
+
+        let mut cli =
+            Cli::try_parse_from(["wn", "groups", "create", "pics", "--image", "founding.png"])
+                .expect("create parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::Create { image, .. },
+            } => assert_eq!(image.as_deref(), Some("/callers/cwd/founding.png")),
+            other => panic!("expected groups create, got {other:?}"),
+        }
+
+        // An absent download destination becomes the caller's directory so a
+        // forwarded download never lands in the daemon's working directory.
+        let mut cli = Cli::try_parse_from(["wn", "groups", "download-image", "GROUP"])
+            .expect("download-image parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::DownloadImage { output, .. },
+            } => assert_eq!(output.as_deref(), Some("/callers/cwd")),
+            other => panic!("expected groups download-image, got {other:?}"),
+        }
+        let mut cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "download",
+            "GROUP",
+            "aa",
+            "--output",
+            "out/file.bin",
+        ])
+        .expect("media download parses");
+        crate::resolve_relative_paths(&mut cli, base);
+        match &cli.command {
+            Command::Media {
+                command: crate::MediaCommand::Download { output, .. },
+            } => assert_eq!(output.as_deref(), Some("/callers/cwd/out/file.bin")),
+            other => panic!("expected media download, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_edit_parses_hyphen_leading_replacement_text() {
+        let cli = Cli::try_parse_from([
+            "wn", "messages", "edit", "GROUP", "TARGET", "fixed", "--typo",
+        ])
+        .expect("edit args parse");
+        match cli.command {
+            Command::Messages {
+                command:
+                    crate::MessageCommand::Edit {
+                        group_id,
+                        message_id,
+                        text,
+                    },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(message_id, "TARGET");
+                assert_eq!(text, vec!["fixed".to_owned(), "--typo".to_owned()]);
+            }
+            other => panic!("expected a messages edit command, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wn", "messages", "edit", "GROUP", "TARGET"]).is_err(),
+            "edit requires replacement text"
+        );
+    }
+
+    #[test]
+    fn message_retry_event_id_is_optional_context() {
+        let cli = Cli::try_parse_from(["wn", "messages", "retry", "GROUP"]).expect("retry parses");
+        match cli.command {
+            Command::Messages {
+                command: crate::MessageCommand::Retry { group_id, event_id },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(event_id, None);
+            }
+            other => panic!("expected a messages retry command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["wn", "message", "retry", "GROUP", "EVENT"])
+            .expect("legacy retry with event id parses");
+        match cli.command {
+            Command::Message {
+                command: crate::MessageCommand::Retry { event_id, .. },
+            } => assert_eq!(event_id.as_deref(), Some("EVENT")),
+            other => panic!("expected a message retry command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn groups_retention_disband_and_admin_flags_parse() {
+        let cli = Cli::try_parse_from(["wn", "groups", "retention", "GROUP", "--set", "1h"])
+            .expect("retention parses");
+        match cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::Retention { group_id, set },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(set.as_deref(), Some("1h"));
+            }
+            other => panic!("expected a groups retention command, got {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["wn", "groups", "disband", "GROUP"]).expect("disband parses");
+        match cli.command {
+            Command::Groups {
+                command: crate::GroupsCommand::Disband { confirm, .. },
+            } => assert!(
+                !confirm,
+                "confirmation is an explicit flag, never a default"
+            ),
+            other => panic!("expected a groups disband command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "wn",
+            "groups",
+            "add-members",
+            "GROUP",
+            "carol",
+            "dave",
+            "--admin",
+            "carol",
+        ])
+        .expect("add-members parses");
+        match cli.command {
+            Command::Groups {
+                command:
+                    crate::GroupsCommand::AddMembers {
+                        members, admins, ..
+                    },
+            } => {
+                assert_eq!(members, vec!["carol".to_owned(), "dave".to_owned()]);
+                assert_eq!(admins, vec!["carol".to_owned()]);
+            }
+            other => panic!("expected a groups add-members command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "wn",
+            "groups",
+            "create",
+            "ephemeral",
+            "--retention",
+            "1d",
+            "--image",
+            "avatar.png",
+        ])
+        .expect("create with founding options parses");
+        match cli.command {
+            Command::Groups {
+                command:
+                    crate::GroupsCommand::Create {
+                        retention, image, ..
+                    },
+            } => {
+                assert_eq!(retention.as_deref(), Some("1d"));
+                assert_eq!(image.as_deref(), Some("avatar.png"));
+            }
+            other => panic!("expected a groups create command, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wn", "groups", "update", "GROUP"]).is_err(),
+            "groups update needs --name or --description"
+        );
+        assert!(
+            Cli::try_parse_from(["wn", "group", "update", "GROUP"]).is_err(),
+            "legacy group update needs --name or --description"
+        );
+    }
+
+    #[test]
+    fn media_upload_accepts_many_files_and_send_takes_references() {
+        let cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "upload",
+            "GROUP",
+            "a.png",
+            "b.png",
+            "--send",
+            "--message",
+            "two",
+        ])
+        .expect("multi-file upload parses");
+        match cli.command {
+            Command::Media {
+                command:
+                    crate::MediaCommand::Upload {
+                        file_paths, send, ..
+                    },
+            } => {
+                assert_eq!(file_paths, vec!["a.png".to_owned(), "b.png".to_owned()]);
+                assert!(send);
+            }
+            other => panic!("expected a media upload command, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["wn", "media", "upload", "GROUP"]).is_err(),
+            "upload needs at least one file"
+        );
+        let cli = Cli::try_parse_from(["wn", "media", "send", "GROUP", "{\"x\":1}", "ab"])
+            .expect("media send parses");
+        match cli.command {
+            Command::Media {
+                command: crate::MediaCommand::Send { attachments, .. },
+            } => assert_eq!(attachments.len(), 2),
+            other => panic!("expected a media send command, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "wn",
+            "media",
+            "set-endpoints",
+            "GROUP",
+            "https://a",
+            "https://b",
+        ])
+        .expect("set-endpoints parses");
+        match cli.command {
+            Command::Media {
+                command:
+                    crate::MediaCommand::SetEndpoints {
+                        urls, locator_kind, ..
+                    },
+            } => {
+                assert_eq!(urls.len(), 2);
+                assert_eq!(locator_kind, "blossom-v1");
+            }
+            other => panic!("expected a media set-endpoints command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retention_duration_parser_accepts_seconds_suffixes_and_off() {
+        use super::commands::groups::parse_retention_duration;
+        assert_eq!(parse_retention_duration("0").unwrap(), 0);
+        assert_eq!(parse_retention_duration("off").unwrap(), 0);
+        assert_eq!(parse_retention_duration("90").unwrap(), 90);
+        assert_eq!(parse_retention_duration("45s").unwrap(), 45);
+        assert_eq!(parse_retention_duration("2m").unwrap(), 120);
+        assert_eq!(parse_retention_duration("1h").unwrap(), 3_600);
+        assert_eq!(parse_retention_duration("1d").unwrap(), 86_400);
+        assert_eq!(parse_retention_duration("1w").unwrap(), 604_800);
+        for invalid in ["", "soon", "-1", "1x", "h", "1.5h"] {
+            assert!(
+                parse_retention_duration(invalid).is_err(),
+                "must reject {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn message_send_event_parses_kind_tags_and_content() {
         let cli = Cli::try_parse_from([
             "wn",
@@ -2713,5 +3230,154 @@ mod tests {
             "missing subcommand must be ok:false, got: {value}"
         );
         assert_eq!(value["error"]["code"], "usage");
+    }
+
+    fn sample_group(name: &str) -> marmot_app::AppGroupRecord {
+        serde_json::from_value(json!({
+            "group_id_hex": "aa".repeat(16),
+            "endpoint": "wss://relay.example\u{1b}]8;;https://evil.example\u{7}",
+            "nostr_routing": {
+                "component_id": 1,
+                "component": "marmot.transport.nostr.routing.v1",
+                "nostr_group_id_hex": "bb".repeat(16),
+                "relays": ["wss://relay.example"],
+                "data_hex": ""
+            },
+            "profile": {
+                "component_id": 2,
+                "component": "marmot.group.profile.v1",
+                "name": name,
+                "description": "",
+                "data_hex": ""
+            },
+            "image": {
+                "component_id": 3,
+                "component": "marmot.group.blossom-image.v1",
+                "present": false,
+                "image_hash_hex": "",
+                "image_key_hex": "",
+                "image_nonce_hex": "",
+                "image_upload_key_hex": "",
+                "data_hex": ""
+            },
+            "admin_policy": {
+                "component_id": 4,
+                "component": "marmot.group.admin-policy.v1",
+                "admins": [],
+                "data_hex": ""
+            },
+            "avatar_url": {
+                "component_id": 5,
+                "component": "marmot.group.avatar-url.v1",
+                "present": true,
+                "url": "https://cdn.example/a\u{1b}[2J.png",
+                "dim": "64x64\u{7}",
+                "thumbhash": "thumb\u{202e}",
+                "data_hex": ""
+            }
+        }))
+        .expect("sample group")
+    }
+
+    const SENTINEL_IMAGE_KEY: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const SENTINEL_UPLOAD_KEY: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const SENTINEL_IMAGE_NONCE: &str = "333333333333333333333333";
+    const SENTINEL_IMAGE_DATA: &str = "4444deadbeef4444";
+
+    /// A group whose encrypted image component carries sentinel capability keys.
+    fn sample_group_with_image_secrets() -> marmot_app::AppGroupRecord {
+        let mut group = sample_group("pictures");
+        group.image = serde_json::from_value(json!({
+            "component_id": 3,
+            "component": "marmot.group.blossom-image.v1",
+            "present": true,
+            "image_hash_hex": "55".repeat(32),
+            "image_key_hex": SENTINEL_IMAGE_KEY,
+            "image_nonce_hex": SENTINEL_IMAGE_NONCE,
+            "image_upload_key_hex": SENTINEL_UPLOAD_KEY,
+            "media_type": "image/png",
+            "data_hex": SENTINEL_IMAGE_DATA,
+        }))
+        .expect("image component");
+        group
+    }
+
+    fn assert_no_image_secrets(label: &str, value: &serde_json::Value) {
+        let rendered = value.to_string();
+        for secret in [
+            SENTINEL_IMAGE_KEY,
+            SENTINEL_UPLOAD_KEY,
+            SENTINEL_IMAGE_NONCE,
+            SENTINEL_IMAGE_DATA,
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "{label} must not carry image capability material: {rendered}"
+            );
+        }
+        let image = &value["image"];
+        for key in [
+            "image_key_hex",
+            "image_upload_key_hex",
+            "image_nonce_hex",
+            "data_hex",
+        ] {
+            assert!(image.get(key).is_none(), "{label} image must omit {key}");
+        }
+        assert_eq!(image["present"], true, "{label}");
+        assert_eq!(image["image_hash_hex"], "55".repeat(32), "{label}");
+        assert_eq!(image["media_type"], "image/png", "{label}");
+        assert_eq!(
+            image["component"], "marmot.group.blossom-image.v1",
+            "{label}"
+        );
+    }
+
+    /// mdk#1253: every `wn` surface that renders a group (`groups show`/`list`,
+    /// `chats` rows, the daemon group-state feed, and the create response)
+    /// reports image presence, hash, and type but never the decryption key,
+    /// upload secret, or key-bearing component bytes.
+    #[test]
+    fn group_json_surfaces_redact_image_capability_keys() {
+        let group = sample_group_with_image_secrets();
+        assert_no_image_secrets("group_json", &crate::group_json(group.clone()));
+        assert_no_image_secrets("chat_json", &crate::chat_json(group.clone(), None));
+        assert_no_image_secrets(
+            "group_state_stream_response",
+            &serde_json::to_value(crate::daemon::group_state_stream_response(
+                group.clone(),
+                "InitialGroupState",
+                None,
+            ))
+            .expect("stream response serializes")["result"]["group"],
+        );
+        let created =
+            crate::commands::groups::created_group_json(&"66".repeat(32), group, Vec::new())
+                .expect("create json");
+        assert_no_image_secrets("created_group_json", &created);
+        assert_eq!(created["name"], "pictures");
+        assert_no_image_secrets(
+            "group_image_summary_json",
+            &json!({ "image": crate::commands::groups::group_image_summary_json(
+                &sample_group_with_image_secrets().image
+            ) }),
+        );
+    }
+
+    #[test]
+    fn group_plain_sanitizes_profile_and_avatar_fields() {
+        let group = sample_group("ops\u{1b}]52;c;YXR0YWNr\u{7}\nforged");
+        let listed = crate::group_list_plain(&[group]);
+        assert_eq!(
+            listed,
+            format!(
+                "{} name=ops]52;c;YXR0YWNrforged endpoint=wss://relay.example]8;;https://evil.example avatar_url=https://cdn.example/a[2J.png avatar_dim=64x64 avatar_thumbhash=thumb",
+                "aa".repeat(16)
+            )
+        );
+        assert!(!listed.contains('\n'));
+        assert!(!listed.contains('\u{1b}'));
     }
 }

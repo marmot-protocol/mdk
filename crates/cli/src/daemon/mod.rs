@@ -117,7 +117,7 @@ fn server_output(
         Err(err) => CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("{label}: {err}\n"),
+            stderr: format!("{label}: {}\n", crate::terminal_safe_text(&err.to_string())),
         },
     }
 }

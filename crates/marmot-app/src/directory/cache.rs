@@ -134,6 +134,65 @@ impl DirectoryCache {
         Ok(entries)
     }
 
+    /// Public identity/profile fields only: no follow, key-package, or local-label reads.
+    /// Profile-less promoted identities remain searchable by npub or pubkey.
+    /// Search includes un-promoted profiles without making them sync candidates.
+    pub(crate) fn public_search_records(
+        &self,
+        now: i64,
+    ) -> Result<Vec<UserDirectoryRecord>, AppError> {
+        self.public_search_records_capped(now, super::cached_search::CACHED_SEARCH_MAX_RECORDS)
+    }
+
+    fn public_search_records_capped(
+        &self,
+        now: i64,
+        max: usize,
+    ) -> Result<Vec<UserDirectoryRecord>, AppError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "WITH candidates AS (
+                 SELECT account_id_hex, npub, profile_json, 0 AS tier FROM directory_users
+                 UNION ALL
+                 SELECT account_id_hex, npub, profile_json, 1 AS tier
+                 FROM directory_search_graph_users
+                 WHERE profile_json IS NOT NULL
+                   AND (metadata_expires_at IS NULL OR metadata_expires_at > ?1)
+             ), ranked AS (
+                 SELECT account_id_hex, npub, profile_json,
+                     ROW_NUMBER() OVER (
+                         PARTITION BY account_id_hex
+                         ORDER BY COALESCE(json_extract(profile_json, '$.created_at'), -1) DESC, tier
+                     ) AS choice
+                 FROM candidates
+             )
+             SELECT account_id_hex, npub, profile_json FROM ranked
+             WHERE choice = 1 ORDER BY account_id_hex LIMIT ?2",
+        )?;
+        let cap = i64::try_from(max).unwrap_or(i64::MAX);
+        let rows = statement.query_map([now, cap], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (account_id_hex, npub, profile_json) = row?;
+            Ok(UserDirectoryRecord {
+                account_id_hex,
+                npub,
+                profile: optional_value(profile_json)?,
+                local_account: None,
+                follows: Vec::new(),
+                follow_source_relays: Vec::new(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+        })
+        .collect()
+    }
+
     /// Look an account up for search: the promoted directory tier first, then
     /// the un-promoted search graph.
     ///
@@ -770,6 +829,49 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn public_search_materialization_stops_at_its_cap() {
+        let (_dir, cache) = test_cache();
+        for id in 1..=4 {
+            cache
+                .put(&directory_record(account_id(id), vec![]))
+                .unwrap();
+        }
+        // Mirrored rows consume one identity slot, not two.
+        let rows = cache.public_search_records_capped(i64::MAX, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].account_id_hex, account_id(1));
+        assert_eq!(rows[2].account_id_hex, account_id(3));
+        assert_eq!(
+            cache
+                .public_search_records_capped(i64::MAX, 4)
+                .unwrap()
+                .len(),
+            4
+        );
+
+        // The fresher search-tier profile wins without emitting a duplicate.
+        let mut newer = directory_record(account_id(1), vec![]).profile.unwrap();
+        newer.created_at += 1;
+        newer.name = Some("new name".into());
+        cache
+            .put_search_graph_record(
+                &DirectorySearchGraphRecord {
+                    account_id_hex: account_id(1),
+                    npub: "npub-new".into(),
+                    profile: Some(newer.clone()),
+                    follows: None,
+                    metadata_updated_at: Some(newer.created_at),
+                    metadata_expires_at: None,
+                },
+                0,
+            )
+            .unwrap();
+        let rows = cache.public_search_records_capped(0, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].profile.as_ref(), Some(&newer));
     }
 
     #[test]

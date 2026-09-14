@@ -16,7 +16,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent,
-    SendResult,
+    SendResult, SupersededIntentKind, SupersededIntentOutcome,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -136,6 +136,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -207,6 +208,7 @@ impl TransportPeeler for EpochGatePeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -267,17 +269,21 @@ fn build_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorag
     (engine, storage)
 }
 
-fn build_epoch_gate_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+fn build_epoch_gate_client(
+    id: &[u8],
+    clock: Option<ManualConvergenceClock>,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
-    let engine = EngineBuilder::new(storage.clone())
+    let mut builder = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
-        .peeler(Box::new(EpochGatePeeler))
-        .build()
-        .unwrap();
-    (engine, storage)
+        .peeler(Box::new(EpochGatePeeler));
+    if let Some(clock) = clock {
+        builder = builder.convergence_clock(Arc::new(clock));
+    }
+    (builder.build().unwrap(), storage)
 }
 
 fn build_client_with_storage(
@@ -1872,6 +1878,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -2025,6 +2032,7 @@ async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -2121,6 +2129,7 @@ async fn convergence_apply_heals_fully_evicted_shaped_record() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -2861,6 +2870,7 @@ async fn engine_defers_child_commit_until_parent_arrives() {
                 description: None,
             },
             created_at_ms: 1_001,
+            reissue_attempts: 0,
         })
         .expect("persist already-queued admin group-state intent");
 
@@ -3134,6 +3144,7 @@ fn queue_intent(
             group_id: group_id.clone(),
             intent,
             created_at_ms,
+            reissue_attempts: 0,
         })
         .expect("persist queued outbound intent");
 }
@@ -3174,6 +3185,7 @@ async fn pass_opens_while_app_message_intents_are_queued() {
         SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: b"queued-chat".to_vec(),
+            expected_epoch: None,
         },
         1_000_001,
     );
@@ -3231,6 +3243,7 @@ async fn queued_app_regeneration_converges_authenticated_input_before_fairness_s
         SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, "queued after authenticated input"),
+            expected_epoch: None,
         },
         1_000_001,
     );
@@ -3585,6 +3598,7 @@ async fn restart_with_only_app_messages_opens_pass_without_delay() {
         SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: b"queued-chat".to_vec(),
+            expected_epoch: None,
         },
         1_000_001,
     );
@@ -4421,8 +4435,10 @@ async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"must remain queued"),
+                expected_epoch: None,
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .unwrap();
     let mut stored_group = storage.get_group(&group_id).unwrap();
@@ -4599,6 +4615,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&restarted, b"must not send while halted"),
+            expected_epoch: None,
         })
         .await
         .expect_err("send must refuse Unrecoverable after restart");
@@ -4695,6 +4712,7 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         .send(SendIntent::AppMessage {
             group_id,
             payload: app_payload_for(&restarted, b"send resumes after verified repair"),
+            expected_epoch: None,
         })
         .await
         .expect("verified repair returns the group to Stable");
@@ -5102,6 +5120,7 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"typed inside the pass window"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -5290,6 +5309,7 @@ async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"typed inside the fork window"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -5882,6 +5902,7 @@ async fn future_app_without_reachable_commit_is_retained_without_gating_sends() 
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"current branch remains usable"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8094,6 +8115,7 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"queued until stable"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8255,6 +8277,7 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"still able to send"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8350,6 +8373,7 @@ async fn never_validating_commit_is_terminal_and_does_not_gate_sends() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"send after invalid commit"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8413,6 +8437,7 @@ async fn undecodable_convergence_row_does_not_gate_sends() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"send despite garbage row"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8505,6 +8530,7 @@ async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"send despite fail-open rows"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8523,7 +8549,7 @@ async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
 #[tokio::test]
 async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol", None);
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
@@ -8601,6 +8627,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"send after full catch-up"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8636,7 +8663,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
 #[tokio::test]
 async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
     let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol", None);
     let (mut david, _david_storage) = build_client(b"david");
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -8809,6 +8836,7 @@ async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epo
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"send after terminal stale"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -8983,6 +9011,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"queued through trait lifecycle"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -9066,6 +9095,7 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
                 description: None,
             },
             created_at_ms: 0,
+            reissue_attempts: 0,
         })
         .unwrap();
 
@@ -9108,8 +9138,10 @@ async fn restart_schedules_groups_with_durable_queued_intents() {
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"send after restart"),
+                expected_epoch: None,
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .unwrap();
     drop(alice);
@@ -9161,6 +9193,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
                 initial_admins: vec![],
             },
             created_at_ms: 0,
+            reissue_attempts: 0,
         })
         .unwrap();
     let app_intent_id = MessageId::new(b"later-app".to_vec());
@@ -9171,8 +9204,10 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, b"after invite publish resolves"),
+                expected_epoch: None,
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .unwrap();
 
@@ -9297,6 +9332,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"queued across restart"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -9388,6 +9424,7 @@ async fn send_app(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(engine, payload),
+            expected_epoch: None,
         })
         .await
         .expect("send app");
@@ -9715,7 +9752,11 @@ async fn forked_epoch_with_an_unreadable_witness(
 ) {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let (mut carol, _carol_storage) = build_epoch_gate_client(b"carol");
+    // These lineage probes admit commits at 1_000 and must keep that
+    // generation collecting while they retry opaque input. Real elapsed time
+    // can cross the cutoff during fixture setup on a busy test runner.
+    let (mut carol, _carol_storage) =
+        build_epoch_gate_client(b"carol", Some(ManualConvergenceClock::new(1_000, 1_000)));
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
@@ -9975,4 +10016,970 @@ async fn join_epoch_is_anchored_so_a_rival_forking_there_adjudicates() {
     let members = carol.members(&group_id).unwrap();
     assert!(members.iter().any(|member| member.id == eve.self_id()));
     assert!(!members.iter().any(|member| member.id == david.self_id()));
+}
+
+/// A rival that consumes its proposal **by reference** must adjudicate against
+/// the retained anchor at the fork epoch, exactly like one whose proposals are
+/// inline.
+///
+/// The SelfRemove auto-commit is the production shape: the leaver sends a
+/// `Leave` proposal and every peer that sees it auto-commits the *same*
+/// `ProposalRef`, so two rivals at one epoch reference one proposal. On a
+/// device that already applied one of them that proposal record is
+/// `Processed`, and the rewind base for the rival is the retained anchor at
+/// the fork epoch — which must therefore carry the proposal store as it stood
+/// when the device *left* that epoch. An anchor captured before the proposal
+/// arrived restores a store without it, OpenMLS cannot resolve the rival's
+/// `ProposalRef`, and the pass finds no candidate at all: the device keeps
+/// whichever branch arrived first and reports `Settled`.
+async fn assert_by_reference_rival_adjudicates(first_label: &[u8], second_label: &[u8]) {
+    let (mut first, _first_storage) = build_client(first_label);
+    let (mut second, _second_storage) = build_client(second_label);
+    let (mut leaver, _leaver_storage) = build_client(b"bob");
+    let (mut observer, observer_storage) = build_client(b"dave");
+
+    let leaver_kp = leaver.fresh_key_package().await.unwrap();
+    let second_kp = second.fresh_key_package().await.unwrap();
+    let observer_kp = observer.fresh_key_package().await.unwrap();
+    let (group_id, create) = first
+        .create_group(CreateGroupRequest {
+            name: "by-reference-rival".into(),
+            description: String::new(),
+            members: vec![leaver_kp, second_kp, observer_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    first.confirm_published(pending).await.unwrap();
+    leaver
+        .join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    second
+        .join_welcome(welcome_for(&welcomes, second_label))
+        .await
+        .unwrap();
+    observer
+        .join_welcome(welcome_for(&welcomes, b"dave"))
+        .await
+        .unwrap();
+
+    // One SelfRemove proposal, auto-committed by reference on both peers.
+    let leave = route(
+        proposal(
+            leaver
+                .send(SendIntent::Leave {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap(),
+        ),
+        &group_id,
+    );
+    first.ingest(leave.clone()).await.unwrap();
+    second.ingest(leave.clone()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    first.advance_convergence(&group_id).await.unwrap();
+    second.advance_convergence(&group_id).await.unwrap();
+    let first_auto = first
+        .drain_auto_publish()
+        .into_iter()
+        .next()
+        .expect("the first peer auto-commits the self-remove");
+    let second_auto = second
+        .drain_auto_publish()
+        .into_iter()
+        .next()
+        .expect("the second peer auto-commits the same self-remove");
+    let first_commit = route(first_auto.msg, &group_id);
+    let rival = route(second_auto.msg, &group_id);
+    first.confirm_published(first_auto.pending).await.unwrap();
+    second.confirm_published(second_auto.pending).await.unwrap();
+
+    // The observer takes the proposal and the first commit: it advances to
+    // epoch 2, anchors epoch 1, and marks the proposal `Processed`. Both are
+    // buffered rather than ingested because the observer is a remaining member
+    // too, so ingesting the `Leave` would stage a third rival for the same
+    // `ProposalRef` and change the shape under test.
+    for message in [leave.clone(), first_commit.clone()] {
+        observer
+            .buffer_openmls_convergence_message_at(&group_id, message, 500)
+            .unwrap();
+    }
+    observer
+        .converge_stored_openmls_messages_at(&group_id, 500_000)
+        .unwrap();
+    assert_eq!(observer.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&observer_storage, &leave, MessageState::Processed);
+    assert_message_state(&observer_storage, &first_commit, MessageState::Processed);
+    assert!(
+        observer_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-1".to_string()),
+        "the fork epoch must be anchored"
+    );
+
+    // Now the by-reference rival forks from that anchored epoch. Route it
+    // through the production seam so it crosses `commit_should_enter_convergence`.
+    assert!(matches!(
+        observer.ingest(rival.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let result = observer
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("the by-reference rival is adjudicated");
+    assert_eq!(result.errors, Vec::new());
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(!observer_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // Adjudicated, not merely error-free: the deterministic tiebreak decides
+    // which branch the observer holds, and the loser is parked reconsiderable.
+    if committer_wins(&second.self_id(), &first.self_id()) {
+        assert_eq!(result.accepted_commits, vec![content_hex(&rival)]);
+        assert_message_state(&observer_storage, &rival, MessageState::Processed);
+        assert_message_state(
+            &observer_storage,
+            &first_commit,
+            MessageState::ConvergenceDeferred,
+        );
+    } else {
+        // The rival must lose branch *selection* — not lose because the pass
+        // could not build its candidate state at all, which is what an anchor
+        // missing the by-reference proposal produces.
+        assert_eq!(result.accepted_commits, vec![content_hex(&first_commit)]);
+        assert!(
+            result.deferred_messages.iter().any(|deferred| {
+                deferred.message_id == content_hex(&rival)
+                    && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
+            }),
+            "the rival is an eligible candidate that lost, got {:?}",
+            result.deferred_messages
+        );
+        assert_message_state(&observer_storage, &first_commit, MessageState::Processed);
+        assert_message_state(&observer_storage, &rival, MessageState::ConvergenceDeferred);
+    }
+    assert_message_state(&observer_storage, &leave, MessageState::Processed);
+    assert_eq!(observer.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(
+        !observer
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == leaver.self_id()),
+        "both branches remove the leaver, whichever one wins"
+    );
+}
+
+/// The rival wins the tiebreak, so the observer must withdraw the branch it
+/// already adopted and re-apply the group's history over the rival's.
+#[tokio::test]
+async fn by_reference_rival_that_wins_the_tiebreak_displaces_the_adopted_branch() {
+    assert_by_reference_rival_adjudicates(b"alice", b"carol").await;
+}
+
+/// The other direction: the incumbent wins the tiebreak, so the by-reference
+/// rival must still be classified *eligible* — `NonSelectedEligibleBranch`,
+/// "this branch lost selection", never `MissingCandidateParent`, "the pass
+/// could not evaluate this". Measured, so it is not assumed: this direction
+/// already held before the anchor fix, so it pins the classification rather
+/// than reproducing the bug. Keep it — selection must follow the ordering
+/// rule, and a regression that flipped the loser to unevaluable would be
+/// invisible in the winning direction alone.
+#[tokio::test]
+async fn by_reference_rival_that_loses_the_tiebreak_leaves_the_adopted_branch() {
+    assert_by_reference_rival_adjudicates(b"carol", b"alice").await;
+}
+
+/// A retry sweep cannot cache a group verdict for subsequent live arrivals:
+/// the graph can gain a rival between calls without the canonical epoch moving.
+#[tokio::test]
+async fn live_deferral_reclassifies_graph_after_a_retry_sweep_and_new_rival() {
+    let (mut carol, group_id, commits, witness) =
+        forked_epoch_with_an_unreadable_witness("deferral-lineage-after-retry").await;
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, commits[0].clone(), 1_000)
+        .unwrap();
+    assert_eq!(
+        carol.ingest(witness.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred {
+            group_id: group_id.clone(),
+            lineage: DeferralLineage::Uncontested,
+        }
+    );
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, commits[1].clone(), 1_000)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let redelivered = TransportMessage {
+        id: MessageId::new(b"new-wrapper-after-rival".to_vec()),
+        ..witness
+    };
+    assert_eq!(
+        carol.ingest(redelivered).await.unwrap(),
+        IngestOutcome::TransportDeferred {
+            group_id,
+            lineage: DeferralLineage::ContestedFork,
+        },
+        "live recovery evidence must use the current stored graph"
+    );
+}
+
+/// Two admins commit a profile change from the same epoch; branch selection
+/// keeps one and parks the other. The parked committer already told its caller
+/// the change saved, so its intent must be re-issued when the winner left the
+/// edited field alone, and reported as a conflict when the winner changed the
+/// same field (mdk#1734).
+async fn race_profile_edits(
+    alice_edit: (Option<&str>, Option<&str>),
+    bob_edit: (Option<&str>, Option<&str>),
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    MessageId,
+    MessageId,
+) {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: "before".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let edit = |(name, description): (Option<&str>, Option<&str>)| SendIntent::UpdateGroupData {
+        group_id: group_id.clone(),
+        name: name.map(str::to_owned),
+        description: description.map(str::to_owned),
+    };
+    let (alice_commit, alice_pending) = evolution(alice.send(edit(alice_edit)).await.unwrap());
+    let (bob_commit, bob_pending) = evolution(bob.send(edit(bob_edit)).await.unwrap());
+    let alice_commit_id = alice_commit.id.clone();
+    let bob_commit_id = bob_commit.id.clone();
+    assert!(
+        alice_storage
+            .own_commit_intent(&alice_commit_id)
+            .unwrap()
+            .is_some(),
+        "staging an own profile commit retains its intent"
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    assert!(
+        alice_storage
+            .own_commit_intent(&alice_commit_id)
+            .unwrap()
+            .is_some(),
+        "confirming a publish keeps the intent until the branch is decided"
+    );
+
+    // Each side receives the rival from the same source epoch and adjudicates.
+    for (engine, rival) in [(&mut alice, &bob_commit), (&mut bob, &alice_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        let result = engine
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+        assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    }
+    (
+        alice,
+        alice_storage,
+        bob,
+        bob_storage,
+        group_id,
+        alice_commit_id,
+        bob_commit_id,
+    )
+}
+
+#[tokio::test]
+async fn superseded_profile_edit_is_reissued_when_the_winner_left_the_field_alone() {
+    let (mut alice, alice_storage, mut bob, bob_storage, group_id, alice_commit_id, bob_commit_id) =
+        race_profile_edits(
+            (Some("alice renamed it"), None),
+            (None, Some("bob described it")),
+        )
+        .await;
+    let alice_wins = committer_wins(&alice.self_id(), &bob.self_id());
+    let (loser, loser_storage, loser_commit_id, winner, winner_storage) = if alice_wins {
+        (
+            &mut bob,
+            &bob_storage,
+            &bob_commit_id,
+            &mut alice,
+            &alice_storage,
+        )
+    } else {
+        (
+            &mut alice,
+            &alice_storage,
+            &alice_commit_id,
+            &mut bob,
+            &bob_storage,
+        )
+    };
+
+    // The winner's own commit is live; nothing to re-issue there.
+    assert!(
+        winner
+            .reissue_superseded_own_commits_from_state()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        winner_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The loser's commit was parked; the winner touched the other field, so
+    // the edit is still valid and gets queued again with one attempt spent.
+    let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].commit_id, *loser_commit_id);
+    assert_eq!(reports[0].kind, SupersededIntentKind::GroupProfile);
+    assert_eq!(reports[0].outcome, SupersededIntentOutcome::Reissued);
+    assert!(
+        loser_storage
+            .own_commit_intent(loser_commit_id)
+            .unwrap()
+            .is_none(),
+        "a decided record is consumed"
+    );
+    let queued = loser_storage
+        .list_queued_outbound_intents(&group_id)
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].reissue_attempts, 1);
+    assert!(
+        loser
+            .reissue_superseded_own_commits_from_state()
+            .unwrap()
+            .is_empty(),
+        "re-issue is decided exactly once"
+    );
+
+    // The ordinary drain regenerates the edit against the canonical state and
+    // the winner applies it, so both fields end up everywhere.
+    let drained = loser
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let (reissued_commit, reissued_pending) = evolution(
+        drained
+            .into_iter()
+            .next()
+            .expect("the re-queued edit regenerates into a commit"),
+    );
+    loser.confirm_published(reissued_pending).await.unwrap();
+    assert!(
+        loser_storage
+            .own_commit_intent(&reissued_commit.id)
+            .unwrap()
+            .is_some(),
+        "a confirmed commit stays reconsiderable inside the rewind horizon, so its record is kept"
+    );
+    winner
+        .buffer_openmls_convergence_message_at(
+            &group_id,
+            route(reissued_commit.clone(), &group_id),
+            3_000_000,
+        )
+        .unwrap();
+    let applied = winner
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
+        .unwrap();
+    assert_eq!(applied.convergence_status, ConvergenceStatus::Settled);
+    for storage in [&alice_storage, &bob_storage] {
+        let group = storage.get_group(&group_id).unwrap();
+        assert_eq!(group.name, "alice renamed it");
+        assert_eq!(group.description, "bob described it");
+    }
+
+    // Records are garbage-collected once the group has advanced past the
+    // rewind horizon, and never before: with a one-commit horizon, two further
+    // commits retire the re-issued commit's record while the newest stays.
+    loser
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .unwrap();
+    let mut newest = None;
+    for index in 0..2 {
+        let (commit, pending) = evolution(
+            loser
+                .send(SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some(format!("later edit {index}")),
+                    description: None,
+                })
+                .await
+                .unwrap(),
+        );
+        loser.confirm_published(pending).await.unwrap();
+        newest = Some(commit.id.clone());
+    }
+    loser.reissue_superseded_own_commits_from_state().unwrap();
+    let remaining = loser_storage
+        .list_own_commit_intents(Some(&group_id))
+        .unwrap()
+        .into_iter()
+        .map(|record| record.commit_id)
+        .collect::<Vec<_>>();
+    assert!(
+        !remaining.contains(&reissued_commit.id),
+        "a confirmed commit below the rewind horizon no longer needs its intent"
+    );
+    assert!(
+        remaining.contains(&newest.expect("two later commits")),
+        "a commit still inside the horizon keeps its intent"
+    );
+}
+
+#[tokio::test]
+async fn superseded_profile_edit_on_the_same_field_is_reported_as_a_conflict() {
+    let (mut alice, alice_storage, mut bob, bob_storage, group_id, alice_commit_id, bob_commit_id) =
+        race_profile_edits((Some("alice's name"), None), (Some("bob's name"), None)).await;
+    let alice_wins = committer_wins(&alice.self_id(), &bob.self_id());
+    let (loser, loser_storage, loser_commit_id, winner_name) = if alice_wins {
+        (&mut bob, &bob_storage, &bob_commit_id, "alice's name")
+    } else {
+        (&mut alice, &alice_storage, &alice_commit_id, "bob's name")
+    };
+    let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].commit_id, *loser_commit_id);
+    assert_eq!(reports[0].outcome, SupersededIntentOutcome::Conflict);
+    assert!(
+        loser_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "a conflicting edit is dropped, never re-queued"
+    );
+    for storage in [&alice_storage, &bob_storage] {
+        assert_eq!(
+            storage.get_group(&group_id).unwrap().name,
+            winner_name,
+            "the winner's value stands on both devices"
+        );
+    }
+}
+
+#[tokio::test]
+async fn superseded_invite_retains_recovery_material_after_reporting() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    let (inviter, storage, winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
+        (&mut bob, &bob_storage, &mut alice)
+    } else {
+        (&mut alice, &alice_storage, &mut bob)
+    };
+    let key_package = carol.fresh_key_package().await.unwrap();
+    let invite = SendIntent::Invite {
+        group_id: group_id.clone(),
+        key_packages: vec![key_package],
+        initial_admins: vec![],
+    };
+    let SendResult::GroupEvolution {
+        msg: invite_commit,
+        pending,
+        welcomes,
+        ..
+    } = inviter.send(invite.clone()).await.unwrap()
+    else {
+        panic!("invite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    let (rename, pending) = evolution(
+        winner
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("canonical".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    winner.confirm_published(pending).await.unwrap();
+    for (engine, rival) in [(&mut *inviter, &rename), (&mut *winner, &invite_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        assert_eq!(
+            engine
+                .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+                .unwrap()
+                .convergence_status,
+            ConvergenceStatus::Settled
+        );
+    }
+    assert!(
+        !inviter
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == carol.self_id())
+    );
+    assert!(
+        carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == carol.self_id())
+    );
+    let reports = inviter.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].outcome,
+        SupersededIntentOutcome::ReinviteRequired
+    );
+    let retained = storage.own_commit_intent(&invite_commit.id).unwrap()
+        .expect("fresh-material recovery must retain the original recipients across a lost event/restart");
+    assert_eq!(retained.intent, invite);
+    assert!(
+        inviter
+            .reissue_superseded_own_commits_from_state()
+            .unwrap()
+            .is_empty(),
+        "the same pending recovery must not repeatedly announce supersession"
+    );
+    // Resolving the same cached material cannot replay a consumed invitation.
+    let SendIntent::Invite {
+        key_packages: old_packages,
+        ..
+    } = invite
+    else {
+        unreachable!()
+    };
+    assert!(
+        inviter
+            .reissue_invite_with_key_packages(&invite_commit.id, old_packages)
+            .is_err()
+    );
+    assert!(
+        storage
+            .own_commit_intent(&invite_commit.id)
+            .unwrap()
+            .is_some()
+    );
+    let old_payload = app_payload_for(&carol, b"history on the parked branch");
+    let SendResult::ApplicationMessage {
+        msg: old_message, ..
+    } = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: old_payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("old-branch application message");
+    };
+    let old_history = carol_storage.get_message(&old_message.id).unwrap();
+    let fresh = carol.fresh_key_package().await.unwrap();
+    let report = inviter
+        .reissue_invite_with_key_packages(&invite_commit.id, vec![fresh])
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+    let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].reissue_attempts, 1);
+    let mut drained = inviter
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: fresh_commit,
+        pending,
+        welcomes,
+        ..
+    } = drained.remove(0)
+    else {
+        panic!("reinvite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    winner
+        .buffer_openmls_convergence_message_at(&group_id, route(fresh_commit, &group_id), 3_000_000)
+        .unwrap();
+    winner
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
+        .unwrap();
+    let replacement = welcome_for(&welcomes, b"carol");
+    let stale_record = carol_storage.get_group(&group_id).unwrap();
+    // A full offer inbox retires its oldest offer without pinning the account
+    // cursor or consuming the replacement KeyPackage before consent.
+    use cgka_traits::storage::WelcomeStorage;
+    let mut filler_ids = Vec::new();
+    for n in 0..4u8 {
+        let id = cgka_traits::MessageId::new(vec![0xc0 + n; 32]);
+        carol_storage
+            .put_welcome(&cgka_traits::welcome::PendingWelcome {
+                message_id: id.clone(),
+                group_id: group_id.clone(),
+                welcome_bytes: vec![],
+                rejoin: Some(cgka_traits::welcome::RejoinWelcome {
+                    epoch: stale_record.epoch,
+                    content_id: cgka_traits::MessageId::new(vec![0xd0 + n; 32]),
+                    welcomer: inviter.self_id(),
+                    local_state_token: vec![0; 32],
+                }),
+            })
+            .unwrap();
+        filler_ids.push(id);
+    }
+    assert!(matches!(
+        carol.ingest(replacement.clone()).await.unwrap(),
+        IngestOutcome::LocalState {
+            state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
+        }
+    ));
+    assert!(!carol.last_ingest_left_object_unpersisted());
+    assert_eq!(carol_storage.list_welcomes().unwrap().len(), 4);
+    assert!(
+        carol_storage
+            .has_ingress_dedup_marker(&filler_ids[0])
+            .unwrap()
+    );
+    assert!(
+        !carol_storage
+            .has_ingress_dedup_marker(&cgka_traits::MessageId::new(vec![0xd0; 32]))
+            .unwrap(),
+        "capacity eviction must leave authenticated content retryable under another wrapper"
+    );
+    assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
+    assert!(matches!(
+        carol.join_welcome(replacement.clone()).await,
+        Err(cgka_traits::EngineError::InvalidTransition(_))
+    ));
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap(),
+        stale_record,
+        "an offer is not consent"
+    );
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&GroupId::new(vec![0xff; 16])))
+            .unwrap()
+            .is_empty()
+    );
+    let offer = carol
+        .pending_group_rejoins_for(Some(&group_id))
+        .unwrap()
+        .into_iter()
+        .find(|offer| offer.message_id == replacement.id)
+        .unwrap();
+    let token = offer.rejoin.unwrap().local_state_token;
+    assert!(
+        carol
+            .confirm_group_rejoin(&replacement.id, &[0; 32])
+            .await
+            .is_err()
+    );
+    assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
+    // A consent screen must be refreshed if the local branch changes, even
+    // when that fork advances to the same epoch as the incoming Welcome.
+    let (_, pending) = evolution(
+        carol
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    carol.confirm_published(pending).await.unwrap();
+    assert!(
+        carol
+            .confirm_group_rejoin(&replacement.id, &token)
+            .await
+            .is_err()
+    );
+    let token = carol
+        .pending_group_rejoins_for(Some(&group_id))
+        .unwrap()
+        .into_iter()
+        .find(|offer| offer.message_id == replacement.id)
+        .unwrap()
+        .rejoin
+        .unwrap()
+        .local_state_token;
+    // The offer survives reconstruction without consuming its KeyPackage.
+    drop(carol);
+    let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
+    carol
+        .confirm_group_rejoin(&replacement.id, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_storage.get_message(&old_message.id).unwrap().payload,
+        old_history.payload,
+        "explicit rejoin preserves the existing local message history"
+    );
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
+    for id in filler_ids {
+        assert!(
+            carol_storage.has_ingress_dedup_marker(&id).unwrap(),
+            "confirmation terminally retires sibling offers as well as the selected one"
+        );
+    }
+    for n in 1..4u8 {
+        assert!(
+            carol_storage
+                .has_ingress_dedup_marker(&cgka_traits::MessageId::new(vec![0xd0 + n; 32]))
+                .unwrap(),
+            "confirmation, unlike eviction, terminally retires sibling content"
+        );
+    }
+    assert_eq!(
+        carol.members(&group_id).unwrap(),
+        winner.members(&group_id).unwrap()
+    );
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap().name,
+        "canonical"
+    );
+    for reverse in [false, true] {
+        let (sender, receiver, text) = if reverse {
+            (&mut *winner, &mut carol, b"reply".as_slice())
+        } else {
+            (&mut carol, &mut *winner, b"after rejoin".as_slice())
+        };
+        let payload = app_payload_for(sender, text);
+        let sent = sender
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let SendResult::ApplicationMessage { msg, .. } = sent else {
+            panic!("application")
+        };
+        assert!(matches!(
+            receiver.ingest(route(msg, &group_id)).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+    }
+}
+
+#[tokio::test]
+async fn reinvite_lookup_budget_and_pacing_survive_restart() {
+    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
+    let (mut client, storage) = build_client(b"reinvite-budget");
+    let (group_id, created) = client
+        .create_group(CreateGroupRequest {
+            name: "retry budget".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        client.confirm_published(pending).await.unwrap();
+    }
+    let commit_id = cgka_traits::MessageId::new(vec![0xa1; 32]);
+    storage
+        .put_own_commit_intent(&OwnCommitIntent {
+            commit_id: commit_id.clone(),
+            group_id: group_id.clone(),
+            source_epoch: EpochId(0),
+            intent: SendIntent::Invite {
+                group_id,
+                key_packages: vec![],
+                initial_admins: vec![],
+            },
+            baseline: OwnCommitBaseline::None,
+            reissue_attempts: 0,
+            created_at_ms: 0,
+            reinvite: Some(ReinviteRetry::default()),
+        })
+        .unwrap();
+    let mut now = 0;
+    for attempt in 1..=8 {
+        assert!(client.reserve_reinvite_lookup(&commit_id, now).unwrap());
+        assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
+        drop(client);
+        client = build_client_with_storage(b"reinvite-budget", storage.clone());
+        let record = client.pending_reinvites().unwrap().remove(0);
+        let retry = record.reinvite.unwrap();
+        assert_eq!(retry.lookup_attempts, attempt);
+        assert!(retry.next_attempt_at_ms > now);
+        now = retry.next_attempt_at_ms;
+    }
+    assert!(
+        now > 48 * 60 * 60 * 1_000,
+        "eight attempts must leave sleeping recipients more than two days to replenish material"
+    );
+    assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
+    drop(client);
+    let mut client = build_client_with_storage(b"reinvite-budget", storage);
+    assert!(client.pending_reinvites().unwrap().is_empty());
+    assert!(
+        client.reinvite_recovery_records().unwrap()[0]
+            .reinvite
+            .as_ref()
+            .unwrap()
+            .abandoned
+    );
+    assert!(
+        !client
+            .reserve_reinvite_lookup(&commit_id, u64::MAX)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn reinvite_reports_unapplied_admin_grants_without_losing_missing_recipients() {
+    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
+    for mixed in [false, true] {
+        for already_admin in [false, true] {
+            let (mut alice, storage) = build_client(b"alice");
+            let (mut bob, _) = build_client(b"bob");
+            let (mut carol, _) = build_client(b"carol");
+            let bob_kp = bob.fresh_key_package().await.unwrap();
+            let (group_id, created) = alice
+                .create_group(CreateGroupRequest {
+                    name: "canonical group".into(),
+                    description: String::new(),
+                    members: vec![bob_kp.clone()],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: if already_admin {
+                        vec![bob.self_id()]
+                    } else {
+                        vec![]
+                    },
+                })
+                .await
+                .unwrap();
+            if let SendResult::GroupCreated { pending, .. } = created {
+                alice.confirm_published(pending).await.unwrap();
+            }
+            let commit_id = MessageId::new(vec![0xa1; 16]);
+            let mut old_packages = vec![bob_kp];
+            let mut requested_admins = vec![bob.self_id()];
+            let fresh = if mixed {
+                old_packages.push(carol.fresh_key_package().await.unwrap());
+                requested_admins.push(carol.self_id());
+                vec![carol.fresh_key_package().await.unwrap()]
+            } else {
+                vec![]
+            };
+            storage
+                .put_own_commit_intent(&OwnCommitIntent {
+                    commit_id: commit_id.clone(),
+                    group_id: group_id.clone(),
+                    source_epoch: EpochId(0),
+                    intent: SendIntent::Invite {
+                        group_id: group_id.clone(),
+                        key_packages: old_packages,
+                        initial_admins: requested_admins,
+                    },
+                    baseline: OwnCommitBaseline::None,
+                    reissue_attempts: 0,
+                    created_at_ms: 0,
+                    reinvite: Some(ReinviteRetry::default()),
+                })
+                .unwrap();
+            let report = alice
+                .reissue_invite_with_key_packages(&commit_id, fresh.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                report.outcome,
+                if !already_admin {
+                    SupersededIntentOutcome::Conflict
+                } else if mixed {
+                    SupersededIntentOutcome::Reissued
+                } else {
+                    SupersededIntentOutcome::AlreadySatisfied
+                }
+            );
+            if !already_admin {
+                assert!(report.reason.contains("admin grants"));
+            }
+            assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+            let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+            assert_eq!(queued.len(), usize::from(mixed));
+            if mixed {
+                let SendIntent::Invite {
+                    key_packages,
+                    initial_admins,
+                    ..
+                } = &queued[0].intent
+                else {
+                    panic!("missing recipient invitation must remain queued");
+                };
+                assert_eq!(key_packages, &fresh);
+                assert_eq!(initial_admins, &[carol.self_id()]);
+            }
+        }
+    }
 }

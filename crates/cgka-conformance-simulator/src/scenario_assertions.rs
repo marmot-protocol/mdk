@@ -6,6 +6,16 @@ use serde_json::Value;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScenarioPredicateV2 {
+    /// Public semantic state must agree at one checkpoint. Automatic app
+    /// maintenance may add epochs beyond the requested logical mutations.
+    PublicGroupState {
+        clients: Vec<String>,
+        members: Vec<String>,
+        admins: Vec<String>,
+        name: String,
+        description: String,
+        minimum_epoch: u64,
+    },
     ClientState {
         client: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

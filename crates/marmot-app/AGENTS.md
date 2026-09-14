@@ -12,7 +12,7 @@ App runtime bridge for the first real Marmot app surfaces.
   `account_worker.rs` (the per-account worker: command enum, worker loop, reconnect backoff, runtime-event publishers),
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
-  (agent-text-stream discovery and the brokered-QUIC watch machinery), `audit_tracker.rs` (the forensic audit-log
+  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
   tracker upload worker), and `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers). Keep `mod.rs`
   re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
@@ -21,8 +21,9 @@ App runtime bridge for the first real Marmot app surfaces.
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
   the cursor unit tests), `projection.rs` (timeline/group projection accessors, the `*_for_group` component reads, the
-  kind-1210 group-system row synthesis, and the local-send projection helpers), `push.rs` (push-token registration and
-  notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
+  kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
+  transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
+  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
   per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
   are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
@@ -40,6 +41,13 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).
+- Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
+  typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
+  `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment
+  outcomes indexed by position among the message's `imeta` tags. Bindings surface `Rejected` entries in place; tracing
+  logs only aggregate counts and kinds. Keep the three download error classes distinct: `MediaAttachmentRejected`
+  (structural), `MediaUnfetchable` (valid reference, no locator fetchable under group/client policy, nothing dialed),
+  and `MediaDownloadFailed` (transport, integrity, or decryption after a locator was selected).
 - Keep the mechanical `storage_sqlite` `Stored*` <-> app-DTO mapper free functions (account state, groups, components,
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
@@ -47,11 +55,35 @@ App runtime bridge for the first real Marmot app surfaces.
   the upload client, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for
   audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and HTTP upload. Audit-log
   unit tests live in its own `#[cfg(test)] mod tests`.
+- Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
+  or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
+  by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
+  reserved v1-v3 filenames and their segments from `accounts/` and failed-wipe `.wipe-tombstones/` remnants
+  without reading payloads, even when recording is disabled. Match the frozen 32-lowercase-hex legacy engine ID,
+  not the current audit ID width; pin the live layout through AccountHome-backed tests.
+  Keep this after lease acquisition and before exposing the app; never traverse symlinks or delete v4/future
+  filenames, names outside the reserved legacy forms, or the separate key-reveal log. Unexpected containers
+  and other cleanup errors are reported with aggregate counts, are nonfatal, and retry on next open.
+  Account/device names are forbidden in rows and headers; hardware model is system-sourced, never a label.
 - Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
   never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
-  Do not add a trigger path that bypasses the size-1 coalescing queue in `runtime/audit_tracker.rs`, and do not let one
-  oversized or failing file block the files behind it. Retention/deletion of sealed segments is mdk#1014, not this
-  contract.
+  Checkpoint only complete immutable upload snapshots after successful upload.
+  Defer an unfinished trailing JSONL row and preserve it for a later upload; an HTTP length limit alone is insufficient.
+  Automatic triggers use a fixed 30-second window and the size-1 coalescing queue in `runtime/audit_tracker.rs`.
+  Later triggers cannot postpone that window or shorten a failure cooldown. Manual upload APIs remain immediate.
+  Incomplete snapshots wait for the next trigger. Automatic failures retry after 60 seconds, doubling up to five
+  minutes; authentication failures wait at least five minutes, and Retry-After can extend the delay up to five minutes.
+  Stop automatic passes on endpoint-wide failures
+  (authentication, rate limits, server/transport failures); file-specific failures and oversized files must not block
+  the files behind them.
+  Treat a `413` with no `Retry-After` as the endpoint's verdict on that file (RFC 9110 15.5.14 has a server send the
+  header when the refusal is temporary): acknowledge it as too-large so it is reported once and never re-posted. Unlike
+  the local ceiling this verdict is escapable: it is keyed on the file's size and mtime, deleting the sidecar clears it,
+  and a manual per-file upload never consults it. A `413` carrying any `Retry-After`, parseable or not, is a cooldown
+  and retries like any other rejection.
+  Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
+  Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
+  Retention/deletion of v4 sealed segments is mdk#1014, not this contract.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
   prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
   segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and
@@ -121,7 +153,7 @@ App runtime bridge for the first real Marmot app surfaces.
   opt-in and off by default: `MarmotRelayPlane::telemetry_exporter` is the single construction gate, relay-identity
   resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
-  build. Keep per-attempt collector DNS validation and pinning in `relay_telemetry_export/host_safety.rs`: validate
+  build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/proxies, and retain TLS verification. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. See
   `docs/marmot-architecture/relay-observability.md` and `overview/dial-safety.md`.
@@ -130,6 +162,12 @@ App runtime bridge for the first real Marmot app surfaces.
 
 ```sh
 cargo test -p marmot-app
+# Accelerated recovery/retry scenarios (also enabled by workspace CI):
+cargo test -p marmot-app --features test-policy-overrides
 # Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):
 cargo test -p marmot-app --features otlp-export
 ```
+
+Tests that require shortened production policy intervals must use
+`#[cfg(feature = "test-policy-overrides")]`; normal test builds deliberately
+ignore those configuration overrides.

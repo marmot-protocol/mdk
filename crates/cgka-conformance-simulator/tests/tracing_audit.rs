@@ -304,7 +304,7 @@ fn collect_rust_source_files(dir: &Path, files: &mut Vec<PathBuf>) {
         if path.components().any(|component| {
             matches!(
                 component.as_os_str().to_str(),
-                Some("target" | "tests" | "benches")
+                Some("target" | "tests" | "tests.rs" | "benches")
             )
         }) {
             continue;

@@ -39,13 +39,30 @@ newer-schema, unsafe-permission, or unwritable spool fails connection/intake
 closed and preserves the existing state for operator recovery.
 
 Hermes does not yet expose a typed durable turn-start or finality callback. The
-adapter therefore records `handed` immediately before calling the host. If the
-process dies after that boundary, the next owner marks the obligation
-`unresolved` and does not replay it blindly into a possibly recovering Hermes
-turn. This slice closes the pre-handoff queue/debounce crash windows without
+adapter therefore records `handed` immediately before calling the host and
+`unresolved` after even a normal return: Hermes may only have buffered the
+message or started background processing. If the process dies during that
+handoff, the next owner also marks the remaining `handed` obligation
+`unresolved`. These unknown outcomes are never automatically replayed into a
+possibly recovering Hermes turn. The schema reserves `completed` for a future
+proven finality boundary; the adapter does not currently produce it.
+
+Unknown outcomes share bounded terminal retention with intentional skips and
+exhausted retries: by default, journal admission prunes entries older than
+seven days and retains at most 8192 terminal entries. This is an operational
+recovery window, not a permanent completion ledger. Pending prompts are never
+evicted by that retention policy. Pre-handoff dispatch failures use their own
+bounded retry budget, separate from capacity and shutdown deferrals, and then
+move to `failed`, allowing later same-group work to proceed. Failed disposition
+writes remain fenced from dispatch until the spool retry loop confirms their
+durable state. Existing version-1 spools migrate in place while preserving
+obligations. Shutdown fences admission, cancels and joins debounce producers, and
+then drains the keyed queue before closing the spool. This slice closes the
+queue/debounce crash windows without
 claiming exactly-once external tool effects, complete session lineage, or
-general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state
-counts only; payloads and identifiers are never logged.
+general delivery idempotency. `InboundSpool.snapshot()` provides aggregate state
+counts for direct spool inspection; it is not wired into the readiness probe.
+Payloads and identifiers are never logged.
 
 ### Quiet ambient continuity
 
@@ -133,7 +150,7 @@ install a moving branch for production:
 
 ```sh
 set -eu
-MDK_PLUGIN_REF=<40-character-reviewed-MDK-commit>
+MDK_PLUGIN_REF="${MDK_PLUGIN_REF:?set MDK_PLUGIN_REF to the reviewed 40-character commit}"
 case "$MDK_PLUGIN_REF" in
   *[!0-9a-f]*|'') printf '%s\n' "MDK_PLUGIN_REF must be lowercase hexadecimal" >&2; exit 1 ;;
 esac
@@ -167,6 +184,10 @@ pre-releases.
 
 Prerequisites:
 
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors. The former `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES`
+  setting is ignored; the connector now chunks live previews itself.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
@@ -212,7 +233,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
 ```
@@ -229,7 +250,7 @@ repeated or given a comma-separated list to authorize multiple senders:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -245,7 +266,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -275,7 +296,7 @@ To accept Marmot messages from any sender (explicit opt-in):
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users
@@ -670,7 +691,8 @@ not a disk-streaming or low-memory-mobile transfer mode.
   the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
-- Status records are included in the stream transcript hash and chunk count.
+- `stream_finish` sends the acknowledged final text. The shared Rust publisher
+  owns chunking and transcript hashing, including status and progress records.
 
 Run the shim tests with:
 

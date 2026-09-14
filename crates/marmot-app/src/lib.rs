@@ -59,7 +59,6 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use storage_sqlite::{
     SecurePruneAppEventsResult, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
     TimelineProjectionUpdate,
@@ -74,7 +73,12 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod agent_streams;
 mod app_telemetry;
+#[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
+mod collector_host_safety;
+pub mod product_analytics;
+pub use product_analytics::*;
 mod audit_log;
+mod chat_presentation;
 mod client;
 mod config;
 mod conversions;
@@ -88,6 +92,7 @@ mod key_package_records;
 #[cfg(test)]
 mod local_open_test_gate;
 mod media;
+mod profile_pseudonyms;
 #[cfg(feature = "media-benchmarks")]
 #[doc(hidden)]
 pub use media::MediaDownloadBenchmarkTransport;
@@ -101,17 +106,29 @@ mod relay_telemetry_export;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
+#[cfg(feature = "test-policy-overrides")]
+mod test_support;
 
+pub use cgka_traits::engine::{
+    SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
+pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
-    AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult,
-    AgentStreamWatchOptions, AgentTextStreamCryptoContext, CatchUpAccountsSummary,
-    ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport, ManagedAccount, MarmotAppEvent,
-    MarmotAppRuntime, RelayFailure, RuntimeAccountError, RuntimeAgentStreamMessage,
+    AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
+    AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
+    AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
+    AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
+    CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
+    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery,
+    OnboardingDevicePackage, OnboardingFinding, OnboardingIssue, OnboardingOptions,
+    OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus,
+    OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
+    RuntimeAccountAttentionSubscription, RuntimeAccountError, RuntimeAgentStreamMessage,
     RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
     RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
     RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
@@ -120,9 +137,17 @@ pub use runtime::{
     SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
     default_directory_discovery_relays,
 };
+pub use runtime::{
+    CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
+    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
+    RuntimePresentedChatListSubscription,
+};
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
-    ChatPinState, TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
+    ChatPinState, ChatPresentationVersion, ConversationPresentation, PresentationResolution,
+    PresentationSource, PresentationText, PresentedChatListSnapshot, PresentedChatRow,
+    SelectedAvatar, TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
 };
 
 pub use agent_streams::{
@@ -167,8 +192,9 @@ pub use groups::{
     AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
     AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
     AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
-    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
-    PendingGroupInvite, group_system_event_from_message,
+    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
+    GroupRejoinInvitation, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite,
+    group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -176,9 +202,12 @@ pub use ids::{
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
-    MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS, MediaAttachmentReference,
+    MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS, MediaAttachmentOutcome,
+    MediaAttachmentReference, MediaAttachmentRejection, MediaAttachmentRejectionKind,
     MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
     MediaUploadRequest, MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
+    media_attachment_outcomes_from_media_json, media_attachment_outcomes_from_tags,
+    parse_media_attachment,
 };
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
@@ -194,6 +223,7 @@ pub use notifications::{
     build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
     parse_provider_token, push_token_fingerprint,
 };
+pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
@@ -275,9 +305,9 @@ use directory::records::display_name_for_profile;
 use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
 use key_package_records::{
-    account_key_package_record_from_fetched, key_package_from_hex_with_optional_source,
-    key_package_from_record, merge_key_package_records, parse_key_package_event_id_hex,
-    publish_endpoints_from_bootstrap,
+    account_key_package_record_from_fetched, account_key_package_relay_events_from_records,
+    key_package_from_hex_with_optional_source, key_package_from_record, merge_key_package_records,
+    parse_key_package_event_id_hex, publish_endpoints_from_bootstrap,
 };
 #[cfg(test)]
 use key_package_records::{
@@ -404,152 +434,6 @@ const DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER: &str =
 pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
-const DEFAULT_PROFILE_ADJECTIVES: &[&str] = &[
-    "Agile", "Amber", "Angry", "Balanced", "Bold", "Brave", "Breezy", "Bright", "Brisk", "Bubbly",
-    "Calm", "Caring", "Cheerful", "Clear", "Clever", "Coral", "Cosmic", "Cozy", "Crimson", "Crisp",
-    "Curious", "Daring", "Dawn", "Deep", "Diamond", "Dreamy", "Eager", "Earnest", "Easy",
-    "Electric", "Emerald", "Festive", "Fiery", "Fleet", "Forest", "Fresh", "Frosty", "Gentle",
-    "Glad", "Golden", "Graceful", "Grand", "Grateful", "Green", "Happy", "Hardy", "Hearty",
-    "Hidden", "Honest", "Hopeful", "Humble", "Indigo", "Ivory", "Jade", "Jolly", "Kind", "Lively",
-    "Loyal", "Lucky", "Majestic", "Maple", "Mellow", "Merry", "Mighty", "Mindful", "Misty",
-    "Modest", "Mossy", "Neat", "Nifty", "Nimble", "Noble", "Olive", "Open", "Patient", "Peaceful",
-    "Plum", "Polar", "Proud", "Quiet", "Radiant", "Rapid", "Ready", "Restful", "Rosy", "Ruby",
-    "Rustic", "Sage", "Scarlet", "Serene", "Sharp", "Shiny", "Silver", "Sincere", "Sky", "Smooth",
-    "Solar", "Solid", "Spirited", "Spry", "Steady", "Stellar", "Stormy", "Sturdy", "Sunlit",
-    "Sunny", "Swift", "Tame", "Tangy", "Tender", "Tidy", "Topaz", "Tranquil", "Trusty", "Twilight",
-    "Upbeat", "Valiant", "Verdant", "Vivid", "Warm", "Willing", "Winsome", "Wise", "Witty",
-    "Wondrous", "Woodland", "Young", "Zesty",
-];
-const DEFAULT_PROFILE_NOUNS: &[&str] = &[
-    "Albatross",
-    "Alpaca",
-    "Ant",
-    "Antelope",
-    "Armadillo",
-    "Badger",
-    "Bat",
-    "Bear",
-    "Beaver",
-    "Bee",
-    "Bison",
-    "Bluebird",
-    "Bobcat",
-    "Bullfrog",
-    "Bumblebee",
-    "Butterfly",
-    "Camel",
-    "Caribou",
-    "Cat",
-    "Caterpillar",
-    "Cheetah",
-    "Chickadee",
-    "Chinchilla",
-    "Chipmunk",
-    "Cobra",
-    "Condor",
-    "Cougar",
-    "Crab",
-    "Crane",
-    "Cricket",
-    "Crow",
-    "Deer",
-    "Dingo",
-    "Dolphin",
-    "Dove",
-    "Dragonfly",
-    "Duck",
-    "Eagle",
-    "Egret",
-    "Elephant",
-    "Elk",
-    "Falcon",
-    "Fawn",
-    "Ferret",
-    "Finch",
-    "Firefly",
-    "Flamingo",
-    "Flounder",
-    "Fox",
-    "Gazelle",
-    "Gecko",
-    "Giraffe",
-    "Goat",
-    "Goose",
-    "Gopher",
-    "Grouse",
-    "Hare",
-    "Hawk",
-    "Hedgehog",
-    "Heron",
-    "Hippo",
-    "Hornet",
-    "Horse",
-    "Hummingbird",
-    "Ibex",
-    "Iguana",
-    "Jackal",
-    "Jaguar",
-    "Jay",
-    "Kestrel",
-    "Kingfisher",
-    "Kiwi",
-    "Koala",
-    "Ladybug",
-    "Lark",
-    "Leopard",
-    "Lion",
-    "Llama",
-    "Lynx",
-    "Macaw",
-    "Magpie",
-    "Mallard",
-    "Manatee",
-    "Marmot",
-    "Meerkat",
-    "Mink",
-    "Mole",
-    "Mongoose",
-    "Monkey",
-    "Moose",
-    "Mouse",
-    "Narwhal",
-    "Newt",
-    "Nightingale",
-    "Octopus",
-    "Opossum",
-    "Orca",
-    "Oriole",
-    "Ostrich",
-    "Otter",
-    "Owl",
-    "Panda",
-    "Parrot",
-    "Peacock",
-    "Pelican",
-    "Penguin",
-    "Pheasant",
-    "Pigeon",
-    "Pony",
-    "Porcupine",
-    "Puffin",
-    "Quail",
-    "Rabbit",
-    "Raccoon",
-    "Ram",
-    "Raven",
-    "Reindeer",
-    "Rhino",
-    "Roadrunner",
-    "Robin",
-    "Salamander",
-    "Salmon",
-    "Seal",
-    "Swan",
-    "Tiger",
-    "Turtle",
-    "Wolf",
-    "Yak",
-];
 
 type AppRuntime = AccountDeviceRuntime<
     MarmotRelayPlaneAccountAdapter,
@@ -607,10 +491,12 @@ pub struct MarmotApp {
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
+    pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    product_analytics: ProductAnalytics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
     /// account worker share this client so the worker can reuse the same relay
@@ -1170,6 +1056,27 @@ pub struct AccountKeyPackageRecord {
     pub relay: bool,
 }
 
+/// Observed relay history for an account's kind-30443 KeyPackage events.
+///
+/// This is the validated, event-ID-deduplicated window returned by a single
+/// fetch — current and superseded events together. `is_current` is the winner
+/// only among those observed valid events, not a global relay guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageRelayEvent {
+    pub account_id_hex: String,
+    /// Exact validated `d` tag / addressable slot.
+    pub key_package_id: String,
+    pub key_package_ref_hex: String,
+    pub key_package_event_id: String,
+    /// Relay event timestamp. Never a local overlay time.
+    pub created_at: u64,
+    pub key_package_bytes: usize,
+    /// Normalized observations for this exact event.
+    pub source_relays: Vec<String>,
+    /// Winner only within this returned validated window.
+    pub is_current: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct KeyPackageDeletionTarget {
     pub event_id_hex: String,
@@ -1189,19 +1096,19 @@ pub(crate) struct KeyPackageDeletionResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountUnread {
     pub account_id_hex: String,
-    /// Total unread messages across all unarchived conversations.
+    /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations that require badge attention:
-    /// unread messages, a manual-unread reminder, or a pending invitation.
+    /// Number of eligible conversations that require badge attention:
+    /// unread messages or an independent manual-unread reminder.
     pub unread_conversations: u64,
     /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread or pending confirmation. A row that already has
+    /// manually marked unread. A row that already has
     /// unread messages is omitted so hosts can compute
     /// `unread_count + attention_only_conversations` without overlap.
     #[serde(default)]
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder or pending invitation with no unread messages.
+    /// manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 
@@ -1320,17 +1227,32 @@ impl MarmotApp {
         self.relay_plane.relay_telemetry().await
     }
 
+    /// Effective settings for this app instance, including its active consent permit.
+    /// An unstarted instance reports export disabled even if a grant is persisted.
+    /// Read `usage_diagnostics_settings` for the consent decision before startup.
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
-        normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
-            self.shared_storage()?.relay_telemetry_settings()?,
-        ))
+        let mut settings =
+            normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
+                self.shared_storage()?.relay_telemetry_settings()?,
+            ))?;
+        settings.export_enabled = self.product_analytics.permit().is_some();
+        Ok(settings)
     }
 
+    /// Deprecated consent control: use `set_usage_diagnostics_consent` instead.
+    /// Disable revokes both exporters; enable requires an existing combined grant.
+    /// Retained for interval configuration and source compatibility.
     pub fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettings,
     ) -> Result<RelayTelemetrySettings, AppError> {
         let settings = normalize_relay_telemetry_settings(settings)?;
+        if settings.export_enabled && self.product_analytics.permit().is_none() {
+            return Err(ProductAnalyticsError::ConsentRequired.into());
+        }
+        if !settings.export_enabled {
+            self.set_usage_diagnostics_consent(false)?;
+        }
         self.shared_storage()?
             .set_relay_telemetry_settings(&relay_telemetry_settings_to_storage(settings.clone()))?;
         Ok(settings)
@@ -1369,13 +1291,12 @@ impl MarmotApp {
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
-        let storage = self.shared_storage()?;
-        if let Some(install_id) = storage.telemetry_install_id()? {
-            return Ok(install_id);
+        if self.product_analytics.permit().is_none() {
+            return Err(ProductAnalyticsError::ConsentRequired.into());
         }
-        let install_id = generate_telemetry_install_id();
-        storage.set_telemetry_install_id(&install_id)?;
-        Ok(install_id)
+        self.shared_storage()?
+            .telemetry_install_id()?
+            .ok_or_else(|| ProductAnalyticsError::ConsentRequired.into())
     }
 
     pub fn with_relay_and_config(
@@ -1426,6 +1347,11 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
+        let product_analytics = ProductAnalytics::default();
+        product_analytics.silence(
+            config.usage_diagnostics_silent
+                || config.cursor_persistence == CursorPersistence::Frozen,
+        );
         Self {
             account_home: AccountHome::open(&root),
             root,
@@ -1455,10 +1381,12 @@ impl MarmotApp {
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
+            presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1500,6 +1428,11 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
+        let product_analytics = ProductAnalytics::default();
+        product_analytics.silence(
+            config.usage_diagnostics_silent
+                || config.cursor_persistence == CursorPersistence::Frozen,
+        );
         Self {
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
@@ -1529,10 +1462,12 @@ impl MarmotApp {
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
+            presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1553,6 +1488,7 @@ impl MarmotApp {
     ) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        audit_log::cleanup_legacy_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
         *app.root_runtime_lease
@@ -1679,12 +1615,7 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
-        let seen_events_index = open
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
+        let seen_events_index = open.state.seen_events.iter().cloned().collect();
         let checkpointed_transport_timestamp = open.state.last_transport_timestamp;
         // The wedge clock is the one detector threshold a test has to be able
         // to shorten: its production value is an hour, and reading a clock
@@ -1697,8 +1628,11 @@ impl MarmotApp {
         } else {
             crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
+        let _ = open.runtime.take_maintenance_activity();
         let mut client = AppClient {
+            send_telemetry: None,
             app: self.clone(),
+            maintenance_observation_generation: self.product_analytics.permit(),
             runtime: open.runtime,
             _session_guard: open.session_guard,
             adapter: open.adapter,
@@ -1712,6 +1646,7 @@ impl MarmotApp {
             seen_events_index,
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
+            pending_recovery_status_updates: std::collections::HashSet::new(),
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -1731,18 +1666,29 @@ impl MarmotApp {
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
+            pending_superseded_change_events: Vec::new(),
+            maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
+            released_backfill_reload_pending: true,
+            #[cfg(test)]
+            fail_next_released_backfill_reload: false,
+            #[cfg(test)]
+            fail_next_terminal_recovery_retire: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
-        let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
-        client.restore_persisted_epoch_backfill_intents(persisted_backfills);
+        // Initial access also restores durable backfill work, with or without
+        // new releases, so open does not read the intent table twice.
+        client.transport_receipts()?;
+        // After that call, never before: it restores the durable intents, drops
+        // the terminal ones and retires their runs, so a group retired there
+        // cannot have its evidence re-seeded into the detector here.
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
         client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         // Reads only the durable terminal guards, never live group state, so it
@@ -1822,6 +1768,26 @@ impl MarmotApp {
                         .app
                         .clear_key_package_cutover_replacement_pending(&client.state.label);
                 }
+            }
+        }
+        // A generator revision is account-device state, independent of the
+        // strict protocol-profile cutover markers. Local-only/frozen opens
+        // must not start network maintenance.
+        if self.cursor_persistence() == CursorPersistence::Advance {
+            let result = async {
+                if client.runtime.key_package_generation_upgrade_due()? {
+                    client.runtime.publish_fresh_key_package().await?;
+                }
+                Ok::<_, marmot_account::AccountError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "key package generator upgrade remains retryable"
+                );
             }
         }
     }
@@ -2592,8 +2558,8 @@ impl MarmotApp {
     /// materialized `chat_list_rows` projection (a single grouped
     /// `COUNT`/`SUM`), so this does not require switching into, or loading a
     /// full session/timeline for, any account — non-active accounts are
-    /// reported too. `attention_only_conversations` covers pending invitations
-    /// and manual-only unread rows without overlapping unread-message totals.
+    /// reported too. Pending invitations are excluded. `attention_only_conversations`
+    /// covers manual-only unread rows without overlapping unread-message totals.
     ///
     /// Only local-signing accounts are reported (matching `managed_accounts`).
     /// The chat-list projection is built from the on-disk store if missing;
@@ -3210,8 +3176,25 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .set_group_self_membership(group_id_hex, membership)?;
+        let storage = self.account_storage(&account.label)?;
+        // A voluntary departure stays voluntary. `Left` is written the moment
+        // this device publishes its leave; the commit that later realizes it
+        // is authored by a peer, and the roster-derived classification of
+        // that commit reads as an eviction. Now that peers apply a leave
+        // within seconds (mdk#1736) the two writes land back to back, so the
+        // eviction must never overwrite the recorded intent.
+        if membership == SelfMembership::Removed
+            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        {
+            tracing::debug!(
+                target: "marmot_app",
+                method = "set_group_self_membership",
+                "keeping voluntary Left classification over a realized removal"
+            );
+            return Ok(());
+        }
+        storage.set_group_self_membership(group_id_hex, membership)?;
+        self.presentation_signals.wake();
         Ok(())
     }
 
@@ -3250,16 +3233,6 @@ impl MarmotApp {
         Ok(())
     }
 
-    pub(crate) fn pending_epoch_backfill_intents(
-        &self,
-        label: &str,
-    ) -> Result<Vec<storage_sqlite::StoredEpochBackfillIntent>, AppError> {
-        self.ensure_account_state(label)?;
-        Ok(self
-            .account_storage(label)?
-            .pending_epoch_backfill_intents()?)
-    }
-
     pub(crate) fn clear_epoch_backfill_intents(
         &self,
         label: &str,
@@ -3271,15 +3244,27 @@ impl MarmotApp {
         Ok(())
     }
 
+    pub(crate) fn clear_epoch_backfill_intents_for_groups(
+        &self,
+        label: &str,
+        group_ids_hex: &[String],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .clear_epoch_backfill_intents_for_groups(group_ids_hex)?;
+        Ok(())
+    }
+
     pub(crate) fn record_epoch_stall_evidence(
         &self,
         label: &str,
         evidence: &[storage_sqlite::StoredEpochStallEvidence],
-    ) -> Result<(), AppError> {
+        fruitless_threshold: u32,
+    ) -> Result<Vec<GroupId>, AppError> {
         self.ensure_account_state(label)?;
-        self.account_storage(label)?
-            .record_epoch_stall_evidence(evidence)?;
-        Ok(())
+        Ok(self
+            .account_storage(label)?
+            .record_recovery_evidence(evidence, fruitless_threshold)?)
     }
 
     pub(crate) fn epoch_stall_evidence(
@@ -3568,7 +3553,7 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v3.jsonl`. The v3 schema contains
+        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::new(
@@ -3647,8 +3632,11 @@ impl MarmotApp {
             signer: signer.clone(),
         };
         let routing = self.routing_for(&state)?;
-        let runtime =
+        let mut runtime =
             AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+        if let Some(timing) = dev_maintenance_timing(&self.config) {
+            runtime = runtime.with_maintenance_timing(timing);
+        }
         Ok(OpenAppAccount {
             runtime,
             session_guard,
@@ -3725,6 +3713,11 @@ impl MarmotApp {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
+            // Live MLS state is deleted on disband, so the app-owned tombstone
+            // is the only readable terminal marker here: at a deferred open
+            // (mdk#1161) every engine group record answers `GroupNotHydrated`.
+            // Departures are reconciled against the engine record instead, in
+            // `reconcile_hydrated_account_state`.
             if disbanded_group_ids.contains(&hex::encode(group_id.as_slice())) {
                 continue;
             }
@@ -4153,15 +4146,14 @@ impl MarmotApp {
         Ok(records)
     }
 
-    pub async fn account_key_package_records(
+    async fn fetch_validated_account_key_package_records(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
-        owned_key_packages: Vec<KeyPackage>,
+        method: &'static str,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
-        let mut packages = self.local_key_package_records(label, owned_key_packages)?;
 
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
         let mut relay_lists = if has_explicit_bootstrap_relays {
@@ -4210,6 +4202,7 @@ impl MarmotApp {
             .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
             .await?;
         sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
         for record in relay_records {
             match key_package_from_record(record) {
                 Ok(fetched) => {
@@ -4218,15 +4211,47 @@ impl MarmotApp {
                 Err(err) => {
                     tracing::warn!(
                         target: "marmot_app::key_packages",
-                        method = "account_key_package_records",
+                        method = method,
                         error_kind = err.privacy_safe_kind(),
                         "skipping invalid key package event while listing account packages"
                     );
                 }
             }
         }
+        Ok(packages)
+    }
 
+    pub async fn account_key_package_records(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        owned_key_packages: Vec<KeyPackage>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let mut packages = self.local_key_package_records(label, owned_key_packages)?;
+        packages.extend(
+            self.fetch_validated_account_key_package_records(
+                label,
+                bootstrap_relays,
+                "account_key_package_records",
+            )
+            .await?,
+        );
         Ok(merge_key_package_records(packages))
+    }
+
+    pub async fn account_key_package_relay_events(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRelayEvent>, AppError> {
+        let packages = self
+            .fetch_validated_account_key_package_records(
+                label,
+                bootstrap_relays,
+                "account_key_package_relay_events",
+            )
+            .await?;
+        Ok(account_key_package_relay_events_from_records(packages))
     }
 
     pub async fn delete_key_package_event(
@@ -4782,6 +4807,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(delta.label.clone());
+        self.presentation_signals.wake();
         Ok(())
     }
 
@@ -4811,6 +4837,7 @@ impl MarmotApp {
                 &classifier,
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        self.presentation_signals.wake();
         self.hydrate_chat_list_row(Some(&mut row))?;
 
         // Only the created row belongs on the response tail. Preserve any
@@ -4842,6 +4869,7 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
+        self.presentation_signals.wake();
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5084,6 +5112,7 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;
 
@@ -5092,7 +5121,10 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()
-            .map(|(_, storage)| storage)
+            .map(|(label, storage)| {
+                let _ = self.presentation_signals.account_resets.send(label);
+                storage
+            })
             .collect::<Vec<_>>();
         let directory_caches = self
             .directory_caches
@@ -5192,6 +5224,16 @@ impl MarmotApp {
     }
 
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        let permit = self.product_analytics.permit();
+        let result = self.account_storage_unobserved(label);
+        if let Err(error) = &result {
+            self.product_analytics
+                .storage_failure(permit.as_ref(), error);
+        }
+        result
+    }
+
+    fn account_storage_unobserved(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         self.ensure_storage_open("account storage")?;
         if let Some(storage) = self
             .account_storages
@@ -5222,7 +5264,24 @@ impl MarmotApp {
                 SqlcipherDatabaseKind::Session,
             )?
         };
-        let storage = SqliteAccountStorage::open_encrypted(&path, &key)?;
+        let migration_observation =
+            self.product_analytics
+                .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        let opened = SqliteAccountStorage::open_encrypted(&path, &key);
+        if let Some(observation) = migration_observation {
+            match &opened {
+                Ok(storage) if storage.migration_summary().0 > 0 => {
+                    let (applied, duration) = storage.migration_summary();
+                    observation.count("success", ProductUnit::Transition, applied as u64);
+                    observation.finish_with_duration("success", duration);
+                }
+                Err(cgka_traits::StorageError::UnsupportedSchemaVersion { .. }) => {
+                    observation.finish("unsupported")
+                }
+                _ => observation.discard(),
+            }
+        }
+        let storage = opened?;
         // Publishing under `_lifecycle` is what keeps this connection reachable
         // by a later `close_storage`; see `begin_storage_open`.
         let mut storages = self
@@ -5249,13 +5308,16 @@ impl MarmotApp {
         message: &AppMessageProjection,
         received_at: u64,
     ) -> Result<AppProjectionUpdate, AppError> {
-        let storage_update = self
-            .account_storage(label)?
-            .record_app_event_with_retention(
+        // Keep source/retention and chat-list refresh atomic: a refresh failure
+        // must leave the accepted fanout able to reconstruct its completion.
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage.record_app_event_with_retention(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
             )?;
-        self.app_projection_update(label, storage_update)
+            self.app_projection_update(label, storage_update)
+        })
     }
 
     /// As [`Self::record_account_app_event`], but a conflicting row's
@@ -5268,13 +5330,15 @@ impl MarmotApp {
         message: &AppMessageProjection,
     ) -> Result<AppProjectionUpdate, AppError> {
         let now = unix_now_seconds();
-        let storage_update = self
-            .account_storage(label)?
-            .record_app_event_refreshing_moderation_grant_with_retention(
-                &stored_app_event_from_projection(message, now),
-                message.retention,
-            )?;
-        self.app_projection_update(label, storage_update)
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage
+                .record_app_event_refreshing_moderation_grant_with_retention(
+                    &stored_app_event_from_projection(message, now),
+                    message.retention,
+                )?;
+            self.app_projection_update(label, storage_update)
+        })
     }
 
     pub(crate) fn finalize_account_app_event_source_retention(
@@ -5286,16 +5350,33 @@ impl MarmotApp {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
-        self.account_storage(label)?
-            .finalize_app_event_source_retention(
-                group_id_hex,
-                message_id_hex,
-                source_message_id_hex,
-                source_epoch,
-                retention,
-            )?
-            .map(|update| self.app_projection_update(label, update))
-            .transpose()
+        let observation = self
+            .product_analytics
+            .begin(
+                ProductFamily::MessageAction,
+                "publication",
+                ProductUnit::Transition,
+            )
+            .map(ProductObservation::counts_only);
+        let storage = self.account_storage(label)?;
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .finalize_app_event_source_retention(
+                    group_id_hex,
+                    message_id_hex,
+                    source_message_id_hex,
+                    source_epoch,
+                    retention,
+                )?
+                .map(|update| self.app_projection_update(label, update))
+                .transpose()
+        })?;
+        if update.is_some()
+            && let Some(observation) = observation
+        {
+            observation.count("confirmed", ProductUnit::Transition, 1);
+        }
+        Ok(update)
     }
 
     pub(crate) fn invalidate_timeline_source_message(
@@ -5677,6 +5758,11 @@ impl MarmotApp {
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
+        // Close live bounded windows before a label can bind to another store.
+        let _ = self
+            .presentation_signals
+            .account_resets
+            .send(label.to_owned());
         if let Ok(account) = self.account_home().account(label) {
             self.account_publish_clients
                 .lock()
@@ -5761,9 +5847,13 @@ impl MarmotApp {
     }
 
     #[cfg(test)]
-    fn with_test_relay_client(mut self, client: Arc<dyn NostrRelayClient>) -> Self {
-        self.relay_plane = MarmotRelayPlane::new_with_loopback(
+    fn with_test_relay_client<C>(mut self, client: Arc<C>) -> Self
+    where
+        C: NostrRelayClient + crate::relay_plane::DirectoryRelayFetcher + 'static,
+    {
+        self.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
             None,
+            client.clone(),
             client.clone(),
             self.config.allow_loopback_relay_endpoints,
         );
@@ -5912,6 +6002,24 @@ pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -
         AppError::ExternalSignerRejected
     } else {
         AppError::from(error)
+    }
+}
+
+/// The maintenance scheduling override a runtime should apply, if any.
+/// Production always runs [`MaintenanceTiming::default`]: the knob is honored
+/// only in explicit `test-policy-overrides` builds, and a configured value in
+/// any other build is reported and ignored.
+fn dev_maintenance_timing(config: &MarmotAppConfig) -> Option<MaintenanceTiming> {
+    let timing = config.dev_maintenance_timing?;
+    if cfg!(feature = "test-policy-overrides") {
+        Some(timing)
+    } else {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "open_account",
+            "ignoring dev_maintenance_timing without test-policy-overrides; production maintenance windows required"
+        );
+        None
     }
 }
 
@@ -6267,18 +6375,6 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
 
 fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
     cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
-}
-
-fn default_profile_pseudonym(account_id_hex: &str) -> String {
-    let digest = Sha256::digest(account_id_hex.as_bytes());
-    let adjective_index =
-        u16::from_be_bytes([digest[0], digest[1]]) as usize % DEFAULT_PROFILE_ADJECTIVES.len();
-    let noun_index =
-        u16::from_be_bytes([digest[2], digest[3]]) as usize % DEFAULT_PROFILE_NOUNS.len();
-    format!(
-        "{} {}",
-        DEFAULT_PROFILE_ADJECTIVES[adjective_index], DEFAULT_PROFILE_NOUNS[noun_index]
-    )
 }
 
 fn unix_now_seconds() -> u64 {

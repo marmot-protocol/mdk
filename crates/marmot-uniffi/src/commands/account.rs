@@ -40,10 +40,11 @@ impl Marmot {
     /// badge (mdk#461, mdk#1460). Each entry is read from that account's
     /// materialized chat-list projection, so this does not require switching
     /// into, or loading a full session/timeline for, any account — non-active
-    /// (not-`running`) accounts are reported too. Sign-capable local and
-    /// external-signer accounts are included, matching `list_accounts`.
-    /// `attention_only_conversations` covers pending invitations and
-    /// manual-only unread rows without overlapping unread-message totals.
+    /// (not-`running`) local-signing accounts are reported too. This legacy
+    /// getter omits accounts whose projection read fails.
+    /// `attention_only_conversations` covers manual-only unread rows without
+    /// overlapping unread-message totals. Pending invitations, archived chats
+    /// and departed or departing groups do not contribute attention.
     pub fn account_unread_summary(
         &self,
     ) -> Result<Vec<conversions::AccountUnreadFfi>, MarmotKitError> {
@@ -365,7 +366,8 @@ impl Marmot {
     }
 
     /// List the local and relay-discovered Marmot KeyPackage publications for
-    /// `account_ref`.
+    /// `account_ref`. Relay-backed rows are the current winner per addressable
+    /// slot in the validated fetch window.
     pub async fn account_key_packages(
         &self,
         account_ref: String,
@@ -374,6 +376,23 @@ impl Marmot {
         Ok(self
             .runtime
             .account_key_packages(&account_ref, endpoints(&bootstrap_relays))
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Observed relay history for `account_ref`: current and superseded
+    /// kind-30443 events from one validated fetch window. Clients can pass a
+    /// superseded event id and its source relays to the existing deletion API.
+    pub async fn account_key_package_relay_events(
+        &self,
+        account_ref: String,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<Vec<conversions::AccountKeyPackageRelayEventFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_key_package_relay_events(&account_ref, endpoints(&bootstrap_relays))
             .await?
             .into_iter()
             .map(Into::into)

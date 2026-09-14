@@ -1,0 +1,72 @@
+{
+  "observed_foreground_sessions": 1,
+  "observed_onboarding_steps": {
+    "local_ready": 1
+  },
+  "measurements": [
+    {
+      "event": "app_compose",
+      "operation": "",
+      "outcome": "",
+      "unit": "",
+      "duration_bucket": "",
+      "partial": "",
+      "action": "cancel",
+      "screen": "",
+      "section": "",
+      "failure_stage": "",
+      "error_class": "",
+      "activity": "",
+      "media_kind": "",
+      "source": "",
+      "count_lower": 2,
+      "count_upper": 2,
+      "rows": 1
+    },
+    {
+      "event": "mdk_maintenance_summary",
+      "operation": "pending",
+      "outcome": "",
+      "unit": "backlog",
+      "duration_bucket": "",
+      "partial": "false",
+      "action": "",
+      "screen": "",
+      "section": "",
+      "failure_stage": "",
+      "error_class": "",
+      "activity": "",
+      "media_kind": "",
+      "source": "",
+      "count_lower": 1,
+      "count_upper": 1,
+      "rows": 1
+    },
+    {
+      "event": "mdk_maintenance_summary",
+      "operation": "self_update",
+      "outcome": "performed",
+      "unit": "attempt",
+      "duration_bucket": "le_1s",
+      "partial": "false",
+      "action": "",
+      "screen": "",
+      "section": "",
+      "failure_stage": "",
+      "error_class": "",
+      "activity": "",
+      "media_kind": "",
+      "source": "",
+      "count_lower": 3,
+      "count_upper": 5,
+      "rows": 1
+    }
+  ],
+  "invalid_rows": 0,
+  "notes": [
+    "Counts are bucket bounds; a null upper bound is unbounded.",
+    "Backlog sums represent state samples, not unique obligations or failures.",
+    "Sessions are observed opted-in foreground sessions, not people.",
+    "Partial and complete windows are separate; lost data is not inferred."
+  ]
+}

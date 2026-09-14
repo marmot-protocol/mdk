@@ -177,6 +177,23 @@ impl AppClient {
         let groups = run_retention_group_sweeps(inputs, |input, retention_seconds| {
             self.sweep_expired_retention_for_group(input, retention_seconds, now_ms)
         });
+        for group in &groups {
+            let outcome = match group.status {
+                RetentionSweepStatus::NoExpiredMessages => "no_work_due",
+                RetentionSweepStatus::Pruned => "performed",
+                RetentionSweepStatus::Failed => "failure",
+                RetentionSweepStatus::DeferredClockSkew
+                | RetentionSweepStatus::DeferredUnread
+                | RetentionSweepStatus::DeferredScanExhausted => "deferred",
+            };
+            self.app.product_analytics.observe(
+                crate::ProductFamily::Maintenance,
+                "retention",
+                outcome,
+                crate::ProductUnit::Attempt,
+                None,
+            );
+        }
         trace_retention_sweep_summary(&groups);
         Ok(RetentionSweepReport { groups })
     }

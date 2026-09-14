@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [features]
+product-analytics-export = ["marmot-app/product-analytics-export"]
 default = []
 otlp-export = ["marmot-app/otlp-export"]
 test-policy-overrides = ["marmot-app/test-policy-overrides"]

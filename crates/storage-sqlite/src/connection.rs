@@ -672,6 +672,12 @@ where
                     StorageError::Backend(detail) => {
                         StorageError::Backend(format!("sqlite transaction {sql}: {detail}"))
                     }
+                    StorageError::Corruption(detail) => {
+                        StorageError::Corruption(format!("sqlite transaction {sql}: {detail}"))
+                    }
+                    StorageError::Capacity(detail) => {
+                        StorageError::Capacity(format!("sqlite transaction {sql}: {detail}"))
+                    }
                     other => StorageError::Backend(format!("sqlite transaction {sql}: {other}")),
                 })
             }
@@ -722,6 +728,8 @@ impl fmt::Debug for SqlCipherKey {
 
 #[derive(Clone)]
 pub struct SqliteAccountStorage {
+    migrations_applied: usize,
+    migration_duration: Duration,
     pub(crate) connection: SharedConnection,
     pub(crate) openmls: SqliteOpenMlsStorage,
 }
@@ -793,6 +801,11 @@ impl SqliteSynchronous {
 }
 
 impl SqliteAccountStorage {
+    /// Neutral open-time result. Existing ledger entries are not new migrations.
+    pub fn migration_summary(&self) -> (usize, Duration) {
+        (self.migrations_applied, self.migration_duration)
+    }
+
     /// Export one group's convergence/OpenMLS state, including any durable
     /// convergence pass, for a sensitive test-only replay capsule.
     #[cfg(feature = "test-conformance-replay")]
@@ -855,12 +868,16 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Self> {
         apply_operational_pragmas(&connection, &options)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
-        migrations::run_all(&mut connection)?;
+        let migration_started = std::time::Instant::now();
+        let migrations_applied = migrations::run_all(&mut connection)?;
+        let migration_duration = migration_started.elapsed();
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
         Ok(Self {
             connection,
             openmls,
+            migrations_applied,
+            migration_duration,
         })
     }
 
@@ -2173,6 +2190,18 @@ mod tests {
         assert_eq!(pragma_i64(&conn, "secure_delete"), 0);
         assert_eq!(pragma_i64(&conn, "trusted_schema"), 1);
         assert_eq!(pragma_i64(&conn, "synchronous"), 1);
+    }
+
+    #[test]
+    fn migration_summary_does_not_count_existing_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-summary.sqlite");
+        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let first = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(first.migration_summary().0 > 0);
+        first.close().unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(reopened.migration_summary().0, 0);
     }
 
     #[test]

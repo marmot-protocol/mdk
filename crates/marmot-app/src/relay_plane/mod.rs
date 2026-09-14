@@ -43,9 +43,9 @@ pub use telemetry::{
 };
 
 pub(crate) use directory::{
-    DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
-    DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
-    DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
+    DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
+    DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
+    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::RelaySafetyPolicy;
 pub(crate) use telemetry::rollup_from_snapshots;
@@ -596,16 +596,18 @@ impl MarmotRelayPlane {
 
     #[cfg(test)]
     pub(crate) fn new_with_directory_fetcher_for_test(
+        subscription_rebuild_lookback: Option<Duration>,
         relay_client: Arc<dyn NostrRelayClient>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
+        allow_loopback: bool,
     ) -> Self {
         Self::from_adapter(
-            Some(Duration::from_secs(120)),
+            subscription_rebuild_lookback,
             NostrTransportAdapter::new(relay_client),
             None,
             None,
             directory_fetcher,
-            false,
+            allow_loopback,
         )
     }
 
@@ -918,6 +920,42 @@ impl MarmotRelayPlane {
         self.inner
             .directory
             .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
+            .await
+    }
+
+    pub(crate) async fn fetch_directory_events_with_completion(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        queries: Vec<DirectoryEventQuery>,
+    ) -> Result<DirectoryFetchOutcome, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "directory fetch")?;
+        self.inner
+            .directory
+            .fetch_events_with_completion(DirectoryFetchRequest::new(endpoints, queries)?)
+            .await
+    }
+
+    pub(crate) async fn inspect_directory_events(
+        &self,
+        endpoint: TransportEndpoint,
+        query: DirectoryEventQuery,
+        signer: Option<Arc<dyn nostr::NostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, directory::DirectoryInspectionError> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(vec![endpoint], "onboarding inspection")
+            .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?;
+        self.inner
+            .directory
+            .inspect_events(
+                DirectoryFetchRequest::new(endpoints, vec![query])
+                    .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?,
+                signer,
+            )
             .await
     }
 
@@ -1754,6 +1792,7 @@ impl MarmotRelayPlaneAccountAdapter {
         local_items: &[NostrReconciliationItem],
         reconcile_since: u64,
         reconcile_until: u64,
+        progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
     ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
@@ -1782,6 +1821,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 local_items,
                 reconcile_since,
                 reconcile_until,
+                progress,
             )
             .await;
         let metric = result
@@ -1812,6 +1852,7 @@ impl MarmotRelayPlaneAccountAdapter {
         local_items: &[NostrReconciliationItem],
         reconcile_since: u64,
         reconcile_until: u64,
+        progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
     ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
@@ -1846,6 +1887,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 local_items,
                 reconcile_since,
                 reconcile_until,
+                progress,
             )
             .await;
         let metric = result

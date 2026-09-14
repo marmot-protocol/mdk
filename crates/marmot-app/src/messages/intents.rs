@@ -109,6 +109,12 @@ fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<Str
         }
         // Code blocks, math blocks, and thematic breaks carry no inline
         // mentions.
+        Block::Details { summary, body, .. } => {
+            collect_inline_mention_hexes(summary, out);
+            for block in body {
+                collect_block_mention_hexes(block, out);
+            }
+        }
         Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => {}
     }
 }
@@ -817,6 +823,57 @@ mod mention_tests {
         let capped = markdown_mention_scan_input(&input);
         assert_eq!(capped, "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
         assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    #[test]
+    fn mention_p_tags_walk_details_summary_and_body() {
+        let summary_hex = valid_pubkey_hex();
+        let body_hex = valid_pubkey_hex();
+        let summary_npub = npub_for_account_id(&summary_hex).unwrap();
+        let body_npub = npub_for_account_id(&body_hex).unwrap();
+        let closed = format!(
+            "<details>\n<summary>hi @{summary_npub}</summary>\nalso @{body_npub}\n</details>"
+        );
+        let opened = format!(
+            "<details open>\n<summary>hi @{summary_npub}</summary>\nalso @{body_npub}\n</details>"
+        );
+        let expected = vec![
+            vec!["p".to_owned(), summary_hex.clone()],
+            vec!["p".to_owned(), body_hex.clone()],
+        ];
+        assert_eq!(mention_p_tags(&closed), expected);
+        assert_eq!(mention_p_tags(&opened), expected);
+        let nested = format!(
+            "<details>\n<summary>outer</summary>\n<details>\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>\n</details>"
+        );
+        assert_eq!(mention_p_tags(&nested), expected);
+        let in_code = format!(
+            "<details>\n<summary>`@{summary_npub}`</summary>\n```\n@{body_npub}\n```\n</details>"
+        );
+        assert!(mention_p_tags(&in_code).is_empty());
+        let ignored_attr = format!(
+            "<details title=\"@{summary_npub}\">\n<summary>plain</summary>\nbody\n</details>"
+        );
+        assert!(mention_p_tags(&ignored_attr).is_empty());
+        let duplicate = format!(
+            "<details>\n<summary>@{summary_npub}</summary>\nagain @{summary_npub}\n</details>"
+        );
+        assert_eq!(
+            mention_p_tags(&duplicate),
+            vec![vec!["p".to_owned(), summary_hex.clone()]]
+        );
+        let fallback = format!("<details>\n<summary>hi @{summary_npub}</summary>\nbody");
+        assert_eq!(
+            mention_p_tags(&fallback),
+            vec![vec!["p".to_owned(), summary_hex.clone()]]
+        );
+        let later = format!(
+            "<details>\n    code\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>"
+        );
+        assert_eq!(mention_p_tags(&later), expected);
+        let heading_fallback =
+            format!("<details>\n<summary>@{summary_npub}\n# heading\n\n@{body_npub}\n</details>");
+        assert_eq!(mention_p_tags(&heading_fallback), expected);
     }
 
     #[test]

@@ -93,6 +93,23 @@ pub enum MarmotEventFfi {
         stalled_epoch: u64,
         arms: u32,
     },
+    /// A group change this device committed lost a same-epoch race and was
+    /// withdrawn by branch selection. `kind` names the change
+    /// (`group_profile`, `app_components`, `remove_members`, `invite`),
+    /// `outcome` says what the runtime did about it (`reissued`, `conflict`,
+    /// `already_satisfied`, `reinvite_required`, `abandoned`, `not_member`),
+    /// and `reason` is a stable low-cardinality explanation. Only `reissued`
+    /// needs no user action; every other outcome means the change did not
+    /// land and the host should tell the user (mdk#1734).
+    GroupChangeSuperseded {
+        account_id_hex: String,
+        account_label: String,
+        group_id_hex: String,
+        commit_id_hex: String,
+        kind: String,
+        outcome: String,
+        reason: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -388,6 +405,23 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 stalled_epoch,
                 arms,
             },
+            MarmotAppEvent::GroupChangeSuperseded {
+                account_id_hex,
+                account_label,
+                group_id,
+                commit_id_hex,
+                kind,
+                outcome,
+                reason,
+            } => Self::GroupChangeSuperseded {
+                account_id_hex,
+                account_label,
+                group_id_hex: hex::encode(group_id.as_slice()),
+                commit_id_hex,
+                kind: kind.as_str().to_owned(),
+                outcome: outcome.as_str().to_owned(),
+                reason: reason.to_owned(),
+            },
         }
     }
 }
@@ -414,6 +448,39 @@ mod tests {
             } => {
                 assert_eq!(message_id_hex, "22".repeat(32));
                 assert_eq!(resource, "transport_deferred_residence_budget");
+            }
+            other => panic!("unexpected FFI event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn superseded_group_change_reaches_the_ffi_as_stable_strings() {
+        // A host that cannot see the runtime's typed enums still has to tell
+        // "your change was re-issued" from "your change was dropped", so the
+        // kind and outcome cross as the same stable strings the runtime logs.
+        let event = MarmotAppEvent::GroupChangeSuperseded {
+            account_id_hex: "aa".repeat(32),
+            account_label: "alice".to_owned(),
+            group_id: GroupId::new(vec![0x11; 16]),
+            commit_id_hex: "22".repeat(32),
+            kind: cgka_traits::engine::SupersededIntentKind::GroupProfile,
+            outcome: cgka_traits::engine::SupersededIntentOutcome::Conflict,
+            reason: "winner changed the same field",
+        };
+        match MarmotEventFfi::from(event) {
+            MarmotEventFfi::GroupChangeSuperseded {
+                group_id_hex,
+                commit_id_hex,
+                kind,
+                outcome,
+                reason,
+                ..
+            } => {
+                assert_eq!(group_id_hex, "11".repeat(16));
+                assert_eq!(commit_id_hex, "22".repeat(32));
+                assert_eq!(kind, "group_profile");
+                assert_eq!(outcome, "conflict");
+                assert_eq!(reason, "winner changed the same field");
             }
             other => panic!("unexpected FFI event: {other:?}"),
         }

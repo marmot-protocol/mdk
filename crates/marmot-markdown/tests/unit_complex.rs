@@ -595,6 +595,7 @@ fn mixed_document_block_kinds() {
             Block::List { .. } => "L",
             Block::Table { .. } => "T",
             Block::MathBlock { .. } => "M",
+            Block::Details { .. } => "D",
         })
         .collect();
     assert_eq!(kinds, vec!["H1", "P", "H2", "BQ", "H2", "Code", "H2", "L"]);

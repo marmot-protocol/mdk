@@ -612,7 +612,11 @@ pub(crate) fn write_client_stream_response(
 
     if let Some(error) = &response.error {
         let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "error: {}", error.message)?;
+        writeln!(
+            stderr,
+            "error: {}",
+            crate::terminal_safe_text(&error.message)
+        )?;
         stderr.flush()?;
         return Ok(());
     }
@@ -644,18 +648,24 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
             };
             format!(
                 "{label} group={} from={}: {}",
-                message
-                    .get("group_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<unknown>"),
-                message
-                    .get("from")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<unknown>"),
-                message
-                    .get("plaintext")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
+                crate::terminal_safe_text(
+                    message
+                        .get("group_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<unknown>")
+                ),
+                crate::terminal_safe_text(
+                    message
+                        .get("from")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<unknown>")
+                ),
+                crate::terminal_safe_text(
+                    message
+                        .get("plaintext")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                )
             )
         }
         Some("stream_preview") => {
@@ -664,18 +674,24 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
                 .unwrap_or(&serde_json::Value::Null);
             format!(
                 "stream preview {} [{}]: {}",
-                preview
-                    .get("stream_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<latest>"),
-                preview
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                preview
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
+                crate::terminal_safe_text(
+                    preview
+                        .get("stream_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<latest>")
+                ),
+                crate::terminal_safe_text(
+                    preview
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                crate::terminal_safe_text(
+                    preview
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                )
             )
         }
         Some("agent_stream_delta") => {
@@ -684,18 +700,22 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
                 .unwrap_or(&serde_json::Value::Null);
             format!(
                 "agent stream delta {} #{}: {}",
-                delta
-                    .get("stream_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<unknown>"),
+                crate::terminal_safe_text(
+                    delta
+                        .get("stream_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<unknown>")
+                ),
                 delta
                     .get("seq")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or_default(),
-                delta
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
+                crate::terminal_safe_text(
+                    delta
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                )
             )
         }
         Some("timeline_subscription_ready") => {
@@ -703,7 +723,10 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
                 .get("group_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("<all>");
-            format!("timeline subscription ready group={group_id}")
+            format!(
+                "timeline subscription ready group={}",
+                crate::terminal_safe_text(group_id)
+            )
         }
         Some("initial_timeline_page") | Some("timeline_updated") => {
             timeline_stream_page_plain(result)
@@ -711,7 +734,7 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
         Some("timeline_projection_updated") => timeline_projection_stream_plain(result),
         Some("notification_subscription_ready") => "notification subscription ready".to_owned(),
         Some("notification") => notification_stream_plain(result),
-        _ => result.to_string(),
+        _ => crate::terminal_safe_json_display(&result.to_string()),
     }
 }
 
@@ -742,7 +765,13 @@ pub(crate) fn notification_stream_plain(result: &serde_json::Value) -> String {
         .get("preview_text")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    format!("notification {trigger} group={group_id} from={sender}: {preview}")
+    format!(
+        "notification {} group={} from={}: {}",
+        crate::terminal_safe_text(trigger),
+        crate::terminal_safe_text(group_id),
+        crate::terminal_safe_text(sender),
+        crate::terminal_safe_text(preview)
+    )
 }
 
 pub(crate) fn timeline_stream_page_plain(result: &serde_json::Value) -> String {
@@ -792,7 +821,9 @@ pub(crate) fn timeline_projection_stream_plain(result: &serde_json::Value) -> St
         .and_then(serde_json::Value::as_str)
         .unwrap_or("SnapshotRefresh");
     format!(
-        "timeline projection updated group={group_id} changes={changes} chat_list_trigger={chat_list_trigger}"
+        "timeline projection updated group={} changes={changes} chat_list_trigger={}",
+        crate::terminal_safe_text(group_id),
+        crate::terminal_safe_text(chat_list_trigger)
     )
 }
 
@@ -808,14 +839,18 @@ pub(crate) fn timeline_stream_message_plain(message: &serde_json::Value) -> Stri
     };
     format!(
         "group={} from={}: {}{}",
-        message
-            .get("group_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("<unknown>"),
-        message
-            .get("from")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("<unknown>"),
+        crate::terminal_safe_text(
+            message
+                .get("group_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>")
+        ),
+        crate::terminal_safe_text(
+            message
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>")
+        ),
         crate::commands::messages::timeline_message_display_text(message),
         deleted
     )

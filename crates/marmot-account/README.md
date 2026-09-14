@@ -20,6 +20,21 @@ key storage, and runtime coordination with a `TransportAdapter`.
 - Keeps transport routing policy generic so the first implementation can be Nostr without baking Nostr into the session
   or engine crates.
 
+## KeyPackage generator upgrades
+
+The lifecycle records the generator revision independently of app versions. Records written before revision
+tracking default to zero; revision 1 regenerates packages to omit RFC 9420 default capability advertisements.
+MarmotApp attempts the upgrade on account activation, and `run_due_maintenance` retries durable publication work.
+Embedders that use `AccountDeviceRuntime` directly must drive maintenance themselves.
+
+Fresh private material, its revision, and replacement intent are stored atomically before signing/publication.
+Only a relay acknowledgement promotes the current revision; remaining targets keep their existing fanout retries.
+An old pending replacement is superseded with a strictly newer authoring timestamp in the same stable slot, and
+its private bundle is retained until expiry because publication may already have occurred. Previous unused current
+bundles retain their existing expiry/consumption policy. Ordinary releases do not bump the generator revision.
+Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
+older pending revision because that requires generating new private material.
+
 ## Routing model
 
 `AccountHome` is the durable app-core boundary for local account setup. It keeps public summaries separate from secret

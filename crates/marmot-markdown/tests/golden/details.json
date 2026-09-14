@@ -1,0 +1,63 @@
+{
+  "blocks": [
+    {
+      "Details": {
+        "summary": [
+          {
+            "Text": "Tap to expand"
+          }
+        ],
+        "open": false,
+        "body": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Text": "Hidden body "
+                },
+                {
+                  "Strong": [
+                    {
+                      "Text": "bold"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "blank_lines_before": [
+          0
+        ]
+      }
+    },
+    {
+      "Details": {
+        "summary": [
+          {
+            "Text": "More"
+          }
+        ],
+        "open": true,
+        "body": [
+          {
+            "Paragraph": {
+              "inlines": [
+                {
+                  "Code": "code"
+                }
+              ]
+            }
+          }
+        ],
+        "blank_lines_before": [
+          1
+        ]
+      }
+    }
+  ],
+  "blank_lines_before": [
+    0,
+    1
+  ]
+}

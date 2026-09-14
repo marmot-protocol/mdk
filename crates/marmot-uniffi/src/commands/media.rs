@@ -14,14 +14,19 @@ use crate::errors::MarmotKitError;
 ///
 /// `source_epoch` is required because it is MLS metadata rather than an
 /// `imeta` field and is needed to download the attachment later.
+///
+/// Rejections surface as `MarmotKitError::MediaAttachmentRejected` with the
+/// same `kind` and `details` that a timeline row reports in its `Rejected`
+/// media outcome for the identical tag, because both run the one shared
+/// parser.
 #[uniffi::export]
 pub fn parse_media_imeta_tag(
     tag: MessageTagFfi,
     source_epoch: u64,
 ) -> Result<MediaAttachmentReferenceFfi, MarmotKitError> {
-    marmot_app::media_attachment_from_imeta_tag(&tag.values, Some(source_epoch), false)
-        .and_then(MediaAttachmentReferenceFfi::try_from)
-        .map_err(media_reference_error)
+    let reference = marmot_app::parse_media_attachment(&tag.values, Some(source_epoch), false)
+        .map_err(|rejection| MarmotKitError::from(marmot_app::AppError::from(rejection)))?;
+    MediaAttachmentReferenceFfi::try_from(reference).map_err(media_reference_error)
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -102,6 +107,13 @@ impl Marmot {
 
     /// Fetch an encrypted media blob and decrypt it using the group's
     /// encrypted media component secret.
+    ///
+    /// Failures are typed by class: `MediaAttachmentRejected` when the supplied
+    /// reference is structurally invalid, `MediaUnfetchable` when it is valid
+    /// but no locator may be fetched under the group's current policy or this
+    /// client's host-safety rules (nothing was dialed), and
+    /// `MediaDownloadFailed` for transport, timeout, integrity, and decryption
+    /// failures after a locator was selected.
     pub async fn download_media(
         &self,
         account_ref: String,
@@ -119,6 +131,10 @@ impl Marmot {
 
     /// Typed media references projected from group message history. Host apps
     /// can pass a returned `reference` back to `download_media`.
+    ///
+    /// Only attachments the shared parser accepted are returned; a rejected
+    /// attachment still consumes its `attachment_index`, and its typed reason
+    /// is available on the message's timeline row `media` outcomes.
     pub fn list_media(
         &self,
         account_ref: String,
@@ -138,6 +154,10 @@ impl Marmot {
     }
 }
 
+/// Map media-boundary failures onto their typed FFI errors. Structural
+/// rejections, unfetchable references, and download failures already carry
+/// their class in `AppError` and convert through `From`; the remaining
+/// payload/profile validation failures are `InvalidMediaReference`.
 fn media_reference_error(error: marmot_app::AppError) -> MarmotKitError {
     match error {
         marmot_app::AppError::InvalidAppMessagePayload(details)

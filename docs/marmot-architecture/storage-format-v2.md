@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-09-03
+updated: 2026-09-08
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -12,6 +12,74 @@ This document owns MDK's local SQLCipher storage-format contract. It is not a
 Marmot wire format and does not constrain other Marmot implementations. The
 canonical protocol specifies which state must be reproducible; this document
 specifies how `storage-sqlite` currently persists that state.
+
+## Released transport receipts
+
+Schema migration `0060_released_transport_receipts` adds a bounded, account-local
+release journal. The engine calls `MessageStorage::release_message_for_replay`
+when resource policy releases retained raw transport bytes. A backend without
+host receipt bookkeeping may use the trait's delete-only default. A backend
+that advertises possession or suppresses delivery must atomically revoke those
+receipts or persist the evidence needed to revoke them after restart.
+
+The app's receipt stores are advisory transport indexes used for duplicate checks
+and bounded reconciliation queries. Engine row absence alone cannot replace
+their possession answer: older databases did not backfill every accepted wrapper
+into the engine's transport markers. The journal records explicit releases while
+preserving these existing query paths; deriving every receipt from engine state
+would also need a migration-compatible mapping for historical transport ids.
+
+For app-owned databases, SQLCipher atomically deletes the raw row, removes its
+reconciliation inventory and persisted seen entry, and records the id and owning group in
+`cgka_released_transport_receipts`. Ordinary message deletion does not create
+replay work. The journal retains no payload or secret, cascades when the group
+is deleted, and refuses a new release before deleting bytes when 8,192 pending
+entries already exist. It never evicts outstanding replay evidence to admit a
+new journal entry. App ownership means a durable `account_state` row, established
+by MarmotApp before engine hydration. The check shares the release transaction
+and does not require an existing receipt: the app may hold only an unsaved
+in-memory seen entry. A standalone SQLite engine database without app ownership
+uses ordinary deletion and accumulates no journal or app backfill work, so the
+journal bound is not a lifetime limit on standalone engine releases. If an
+app-owned journal fills, the release error aborts that group's current deferred
+sweep, including retries of unrelated rows. Recovery resumes after the app
+consumes the journal; retaining the raw bytes and replay evidence takes priority
+over progress while the journal is full.
+
+`AppClient::transport_receipts` is the account-owned synchronization boundary.
+Its `SynchronizedTransportReceipts` view requires an exclusive client borrow and
+owns access to duplicate membership, reconciliation inventory, and pending seen
+checkpoint entries. The raw membership index exposes no production lookup API.
+The SDK drain passes the same view from its duplicate check into engine admission,
+so no intervening engine step or second pre-ingest journal query is needed.
+Direct ingestion creates its own view; post-ingest access synchronizes again
+because that engine step may have released more input. Account open restores
+pending backfill intents through this boundary, including when the journal is
+empty. Low-level storage reads and other read-only app APIs retain their existing
+behavior; this view is for the owning account client, not concurrent observers.
+
+The app consumes release evidence on account open, before receipt checkpoints,
+reconciliation and duplicate shortcuts, after engine ingest, and when observing
+engine effects. The empty-journal path remains a bounded existence query, without
+rebuilding the seen ring/index or loading all backfill intents. Consumption
+again removes both durable receipts (including an intervening stale checkpoint),
+arms the existing durable group backfill intent, and acknowledges the journal
+in one transaction. The caller then clears its in-memory seen ring/index
+synchronously, before any await or fallible operation. Process death before
+consumption leaves the journal; death after acknowledgment leaves clean disk
+receipts and durable backfill. Neither case relies on delivery of the engine's
+in-memory `TransportObjectResourceRefused` event. Completing an older backfill
+must retain durable intents for groups rearmed into pending or queued work,
+including a new release at the same epoch. The next execution owns their cleanup;
+otherwise an old completion can erase the restart recovery edge before that
+execution starts. Exact-ID replay still passes through the ordinary authentication
+and engine deduplication paths.
+
+This prevents future release/receipt mismatches. It cannot reconstruct releases
+that happened before this journal existed; bounded repair of historical receipt
+claims is tracked in [#1724](https://github.com/marmot-protocol/mdk/issues/1724).
+Missing historical wrapper markers alone do not prove a release, so migration
+0060 does not clear existing receipt history indiscriminately.
 
 ## Versioning model
 

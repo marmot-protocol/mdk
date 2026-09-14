@@ -24,7 +24,7 @@ AmbientContextStore = ambient_context.AmbientContextStore
 class AmbientContextStoreTests(unittest.TestCase):
     def test_abrupt_process_restart_preserves_private_fact_until_acknowledged(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             group_id = "22" * 32
             event_id = "33" * 32
             secret_text = "message plaintext must never persist"
@@ -76,7 +76,7 @@ os._exit(0)
 
     def test_acknowledged_event_stays_deduped_across_restart(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             group_id = "22" * 32
             event_id = "33" * 32
             store = AmbientContextStore(path)
@@ -93,7 +93,7 @@ os._exit(0)
 
     def test_abrupt_process_death_releases_claim_for_new_exclusive_owner(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             script = """
 import importlib.util
 import os
@@ -129,7 +129,7 @@ os._exit(0)
 
     def test_abrupt_death_after_handoff_commit_never_replays_accepted_fact(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             script = """
 import importlib.util
 import os
@@ -168,7 +168,7 @@ os._exit(0)
 
     def test_store_refuses_overlapping_process_owner(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             first = AmbientContextStore(path)
             first.open()
             second = AmbientContextStore(path)
@@ -178,7 +178,7 @@ os._exit(0)
 
     def test_claims_are_exclusive_and_release_restores_pending_fact(self):
         with tempfile.TemporaryDirectory() as directory:
-            store = AmbientContextStore(Path(directory) / "private" / "ambient.sqlite3")
+            store = AmbientContextStore(Path(directory).resolve() / "private" / "ambient.sqlite3")
             group_id = "22" * 32
             store.record(group_id, "event", "message_deleted")
 
@@ -193,7 +193,7 @@ os._exit(0)
 
     def test_active_claim_is_retained_while_new_fact_is_refused_at_hard_bound(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             store = AmbientContextStore(
                 path,
                 max_groups=1,
@@ -213,7 +213,7 @@ os._exit(0)
 
     def test_overlapping_claims_keep_group_event_byte_and_age_bounds_absolute(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "private"
+            root = Path(directory).resolve() / "private"
             group_a, group_b = "aa" * 32, "bb" * 32
             store = AmbientContextStore(
                 root / "bounded.sqlite3",
@@ -244,7 +244,7 @@ os._exit(0)
 
     def test_equal_timestamp_eviction_prefers_seen_tombstone_to_pending_fact(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             store = AmbientContextStore(path, max_events=1)
             group_id = "22" * 32
             store.record(group_id, "old", "message_deleted", observed_at=100)
@@ -257,7 +257,7 @@ os._exit(0)
 
     def test_disabled_generation_cannot_lazy_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
-            store = AmbientContextStore(Path(directory) / "private" / "ambient.sqlite3")
+            store = AmbientContextStore(Path(directory).resolve() / "private" / "ambient.sqlite3")
             store.record("22" * 32, "event", "message_deleted")
             store.disable_generation()
             with self.assertRaises(AmbientContextError):
@@ -266,7 +266,7 @@ os._exit(0)
 
     def test_open_reapplies_lower_configured_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             store = AmbientContextStore(path, max_events=3, max_events_per_group=3)
             for index in range(3):
                 store.record("22" * 32, f"event-{index}", "message_deleted")
@@ -279,7 +279,7 @@ os._exit(0)
     def test_pending_and_tombstones_share_aggregate_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
             store = AmbientContextStore(
-                Path(directory) / "private" / "ambient.sqlite3",
+                Path(directory).resolve() / "private" / "ambient.sqlite3",
                 max_groups=3,
                 max_events_per_group=3,
                 max_events=3,
@@ -302,7 +302,7 @@ os._exit(0)
     def test_pending_and_tombstones_share_per_group_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             store = AmbientContextStore(
-                Path(directory) / "private" / "ambient.sqlite3",
+                Path(directory).resolve() / "private" / "ambient.sqlite3",
                 max_events_per_group=2,
                 max_events=10,
             )
@@ -324,7 +324,7 @@ os._exit(0)
 
     def test_schema_v1_store_migrates_without_losing_pending_fact(self):
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory) / "private"
+            parent = Path(directory).resolve() / "private"
             parent.mkdir(mode=0o700)
             path = parent / "ambient.sqlite3"
             observed_at = ambient_context.time.time()
@@ -372,7 +372,7 @@ os._exit(0)
 
     def test_malformed_store_fails_closed_and_releases_owner_lock(self):
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory) / "private"
+            parent = Path(directory).resolve() / "private"
             parent.mkdir(mode=0o700)
             path = parent / "ambient.sqlite3"
             db = sqlite3.connect(path)
@@ -393,7 +393,7 @@ os._exit(0)
 
     def test_permission_hardening_falls_back_when_nofollow_chmod_is_unsupported(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             real_chmod = os.chmod
 
             def unsupported_nofollow(candidate, mode, *, dir_fd=None, follow_symlinks=True):
@@ -409,7 +409,7 @@ os._exit(0)
 
     def test_event_group_age_and_byte_bounds_evict_oldest_deterministically(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "private" / "ambient.sqlite3"
+            path = Path(directory).resolve() / "private" / "ambient.sqlite3"
             store = AmbientContextStore(
                 path,
                 max_groups=2,
@@ -437,7 +437,7 @@ os._exit(0)
 
     def test_refuses_symlink_file_and_parent(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             target = root / "target"
             target.mkdir()
             parent_link = root / "linked-parent"

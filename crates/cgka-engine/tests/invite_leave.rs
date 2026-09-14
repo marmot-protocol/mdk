@@ -180,6 +180,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -1220,6 +1221,7 @@ async fn post_eviction_app_message(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -1407,6 +1409,7 @@ async fn send_after_realized_eviction_is_rejected_terminally() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -1443,8 +1446,10 @@ fn queue_app_message_intent(
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(engine, b"queued before removal"),
+                expected_epoch: None,
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .expect("queue outbound intent");
     id
@@ -2091,6 +2096,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             if error.from == "ActiveMember" && error.to == "JoinWelcome"
     ));
 
+    assert!(
+        cgka_traits::storage::WelcomeStorage::list_welcomes(&carol_storage)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.message_id == fresh_carol_welcome.id),
+        "a validated replacement must remain available for explicit recipient confirmation"
+    );
+
     // Once Carol processes the removal from her trusted epoch-2 branch, the
     // exact same Welcome is a legitimate retry and installs the epoch-4 rejoin.
     let routed_remove = TransportMessage {
@@ -2112,7 +2125,48 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             .any(|member| member.id == carol_id),
         "trusted removal must clear Carol's active membership before re-entry"
     );
-    carol.join_welcome(fresh_carol_welcome).await.unwrap();
+    // A malformed offer and an unhydratable removed group precede the valid
+    // recovery in storage order. Neither may abort the account-wide sweep.
+    use cgka_traits::storage::WelcomeStorage;
+    let owned_offer = carol_storage.take_welcome(&fresh_carol_welcome.id).unwrap();
+    let mut malformed = owned_offer.clone();
+    malformed.message_id = cgka_traits::MessageId::new(vec![0xe1; 32]);
+    malformed.welcome_bytes = vec![0xff];
+    carol_storage.put_welcome(&malformed).unwrap();
+    let mut missing_mls_group = carol_storage.get_group(&group_id).unwrap();
+    missing_mls_group.id = GroupId::new(vec![0xe2; 16]);
+    carol_storage.put_group(&missing_mls_group).unwrap();
+    let mut blocked = owned_offer.clone();
+    blocked.message_id = cgka_traits::MessageId::new(vec![0xe3; 32]);
+    blocked.group_id = missing_mls_group.id.clone();
+    carol_storage.put_welcome(&blocked).unwrap();
+    carol_storage.put_welcome(&owned_offer).unwrap();
+    carol.hydrate_stable_groups_from_storage().unwrap();
+    assert!(
+        carol.retry_rejoins_after_trusted_removal().await.unwrap(),
+        "owned Welcome must recover past bad candidates without another relay delivery"
+    );
+    let retained_offers = carol_storage.list_welcomes().unwrap();
+    assert!(
+        !retained_offers
+            .iter()
+            .any(|offer| offer.message_id == malformed.message_id),
+        "undecodable bytes must not poison every later maintenance pass"
+    );
+    assert!(
+        retained_offers
+            .iter()
+            .any(|offer| offer.message_id == blocked.message_id),
+        "an unhydratable group's otherwise valid material stays owned for repair"
+    );
+    assert!(
+        !carol.retry_rejoins_after_trusted_removal().await.unwrap(),
+        "an already quarantined group must remain isolated on later sweeps too"
+    );
+    assert!(matches!(
+        carol.join_welcome(fresh_carol_welcome).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
     assert_eq!(carol.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         carol.members(&group_id).unwrap(),
@@ -2120,16 +2174,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
     );
 
     // David takes the fresh Welcome first. His still-unconsumed epoch-2
-    // Welcome is distinct valid MLS material, but it must not replace epoch 4.
+    // Welcome is distinct valid MLS material, but cannot replace epoch 4
+    // without explicit recipient consent, even though a lower-epoch offer is retained.
     david.join_welcome(fresh_david_welcome).await.unwrap();
     let downgrade_error = david
         .join_welcome(stale_david_welcome)
         .await
         .expect_err("an older Welcome must not downgrade active group state");
-    assert!(matches!(
-        downgrade_error,
-        EngineError::WelcomeAlreadyProcessed
-    ));
+    assert!(matches!(downgrade_error, EngineError::InvalidTransition(_)));
     assert_eq!(david.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         david.members(&group_id).unwrap(),
@@ -2429,7 +2481,7 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
     );
 
     let error = carol
-        .join_welcome(unauthorized_newer_welcome)
+        .join_welcome(unauthorized_newer_welcome.clone())
         .await
         .expect_err("a newer self-promoted fork must not replace active state");
     assert!(
@@ -2446,9 +2498,46 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
         "failed replacement must restore the original Marmot group record"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), before.epoch);
+    let offer = carol
+        .pending_group_rejoins_for(Some(&group_id))
+        .unwrap()
+        .remove(0);
+    assert_eq!(offer.rejoin.as_ref().unwrap().welcomer, bob.self_id());
+    let mut rewrapped = unauthorized_newer_welcome.clone();
+    rewrapped.id = cgka_traits::MessageId::new(vec![0x91; 32]);
+    assert!(carol.join_welcome(rewrapped.clone()).await.is_err());
+    assert_eq!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    carol.decline_group_rejoin(&offer.message_id).unwrap();
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
+    rewrapped.id = cgka_traits::MessageId::new(vec![0x92; 32]);
+    assert!(matches!(
+        carol.join_welcome(rewrapped).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
     let payload = app_payload_for(&carol, b"original state remains usable");
     carol
-        .send(SendIntent::AppMessage { group_id, payload })
+        .send(SendIntent::AppMessage {
+            group_id,
+            payload,
+            expected_epoch: None,
+        })
         .await
         .expect("failed replacement must leave the original live group usable");
 }
@@ -2861,6 +2950,124 @@ async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_p
 }
 
 #[tokio::test]
+async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_publish() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("alice.sqlite3");
+        let key = storage_sqlite::SqlCipherKey::new("synthetic leave deadline key").unwrap();
+        let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+        let build = |storage| {
+            EngineBuilder::new(storage)
+                .legacy_compatibility_profile()
+                .identity(pad32(b"alice"))
+                .account_identity_proof_signer(proof_signer(b"alice"))
+                .feature_registry(selfremove_registry())
+                .peeler(Box::new(MockPeeler))
+                .convergence_clock(std::sync::Arc::new(clock.clone()))
+                .build()
+                .unwrap()
+        };
+        let mut alice = build(SqliteAccountStorage::open_encrypted(&database, &key).unwrap());
+        let mut bob = build_client(b"bob");
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "leave deadline".into(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } = created
+        else {
+            panic!("expected group creation");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None
+        );
+        let SendResult::Proposal { mut msg } = bob
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected SelfRemove proposal");
+        };
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+        assert_eq!(
+            bob.scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "the leaving device cannot commit its own departure"
+        );
+        alice.ingest(msg).await.unwrap();
+        if reopen {
+            // Drop the sole database owner; a clone would not test SQLCipher reopen.
+            drop(alice);
+            alice = build(SqliteAccountStorage::open_encrypted(&database, &key).unwrap());
+            alice.hydrate_all_stored_groups().unwrap();
+        }
+        assert_eq!(
+            alice.drain_pending_convergence_groups(),
+            vec![group_id.clone()]
+        );
+        let delay = alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap()
+            .expect("a processed SelfRemove must keep the runtime timer armed");
+        assert!((10..=50).contains(&delay));
+        clock.advance_ms(delay - 1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            Some(1)
+        );
+        clock.advance_ms(1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            Some(0)
+        );
+        alice.advance_convergence(&group_id).await.unwrap();
+        let mut publications = alice.drain_auto_publish();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "a staged auto-commit now awaits publication, not another lifecycle wakeup"
+        );
+        alice
+            .confirm_published(publications.remove(0).pending)
+            .await
+            .unwrap();
+        assert_eq!(alice.members(&group_id).unwrap().len(), 1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
 async fn selfremove_full_flow_with_auto_commit() {
     // MIP-03 end-to-end (post-§149):
     //   alice creates group with bob + carol, confirms; both join via welcome
@@ -2916,6 +3123,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"should not send after leave"),
+            expected_epoch: None,
         })
         .await
         .unwrap_err();
@@ -2967,6 +3175,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"wait for auto confirm"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3070,6 +3279,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked before restart"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3084,6 +3294,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked after restart"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3135,6 +3346,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked while leave is current"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3192,6 +3404,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"still blocked after stale self-remove"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3372,6 +3585,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"hello before selfremove commit"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -3393,6 +3607,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"hello after observing a proposal"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3414,6 +3629,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"after confirm"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -3633,4 +3849,44 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn forgotten_group_rejects_welcome_without_authenticated_creation_time() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, storage) = build_with_storage(b"bob");
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "missing invitation time".into(),
+            description: String::new(),
+            members: vec![key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(bob.forget_group_local(&group_id).unwrap());
+    let cutoff = storage.group_local_reset_cutoff(&group_id).unwrap();
+    let mut welcome = welcomes.remove(0);
+    // The mock transport supplies no authenticated inner time. A later outer
+    // time must not substitute for it, even though the MLS Welcome is valid.
+    welcome.timestamp = Timestamp(u64::MAX);
+    assert!(matches!(
+        bob.join_welcome(welcome).await,
+        Err(cgka_traits::EngineError::InvalidWelcome)
+    ));
+    assert!(storage.is_group_forgotten(&group_id).unwrap());
+    assert_eq!(storage.group_local_reset_cutoff(&group_id).unwrap(), cutoff);
+    assert!(storage.list_groups().unwrap().is_empty());
+    assert!(bob.drain_events().is_empty());
 }

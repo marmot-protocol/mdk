@@ -105,6 +105,10 @@ pub(crate) enum WnError {
     InvalidTranscriptHashLength(usize),
     #[error("choose either --server-cert-der-hex or --insecure-local")]
     ConflictingStreamTrust,
+    #[error(
+        "QUIC endpoint must be a public address; --insecure-local permits loopback endpoints only"
+    )]
+    UnsafeQuicEndpoint,
     #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
     InsecureLocalRequiresLoopback(SocketAddr),
     #[error("messages subscribe requires the daemon; start it with `wn daemon start`")]
@@ -133,6 +137,22 @@ pub(crate) enum WnError {
     InvalidMediaAttachment(String),
     #[error("invalid mute duration: {0}")]
     InvalidMuteDuration(String),
+    #[error("invalid retention duration: {0}")]
+    InvalidRetentionDuration(String),
+    #[error("message {0} is not in the local projection for this group")]
+    UnknownMessage(String),
+    #[error("message {message_id} was not authored by the selected account")]
+    NotMessageAuthor { message_id: String },
+    #[error("group image file is empty; use clear-image to remove the current image")]
+    EmptyGroupImage,
+    #[error("group {0} has no encrypted group image")]
+    GroupImageAbsent(String),
+    #[error("rejoin token must be 32 bytes of hex copied from recovery-status")]
+    InvalidRejoinToken,
+    #[error("welcome id must be non-empty hex")]
+    InvalidWelcomeId,
+    #[error("initial admin {0} is not one of the invited members")]
+    InitialAdminNotInvited(String),
     #[error("exporting private keys is disabled by White Noise CLI policy")]
     PrivateKeyExportDisabled,
     #[error("{command} requires {flag}: {reason}")]
@@ -328,6 +348,10 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "conflicting_stream_trust",
             "message": err.to_string(),
         }),
+        WnError::UnsafeQuicEndpoint => json!({
+            "code": "unsafe_quic_endpoint",
+            "message": err.to_string(),
+        }),
         WnError::InsecureLocalRequiresLoopback(addr) => json!({
             "code": "insecure_local_requires_loopback",
             "message": err.to_string(),
@@ -402,6 +426,55 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "invalid_media_attachment",
             "message": err.to_string(),
             "reason": reason,
+        }),
+        WnError::InvalidRetentionDuration(duration) => json!({
+            "code": "invalid_retention_duration",
+            "message": err.to_string(),
+            "duration": duration,
+            "repair": {
+                "format": "seconds, or a number with s/m/h/d/w suffix; 0 or off disables",
+            },
+        }),
+        WnError::UnknownMessage(message_id) => json!({
+            "code": "unknown_message",
+            "message": err.to_string(),
+            "target_message_id": message_id,
+            "repair": {
+                "action": "sync the group and pass a message id from `messages list`",
+            },
+        }),
+        WnError::NotMessageAuthor { message_id } => json!({
+            "code": "not_message_author",
+            "message": err.to_string(),
+            "target_message_id": message_id,
+        }),
+        WnError::EmptyGroupImage => json!({
+            "code": "empty_group_image",
+            "message": err.to_string(),
+            "repair": {
+                "clear": "wn groups clear-image <group-hex>",
+            },
+        }),
+        WnError::GroupImageAbsent(group_id) => json!({
+            "code": "group_image_absent",
+            "message": err.to_string(),
+            "group_id": group_id,
+        }),
+        WnError::InvalidRejoinToken => json!({
+            "code": "invalid_rejoin_token",
+            "message": err.to_string(),
+            "repair": {
+                "source": "wn groups recovery-status <group-hex>",
+            },
+        }),
+        WnError::InvalidWelcomeId => json!({
+            "code": "invalid_welcome_id",
+            "message": err.to_string(),
+        }),
+        WnError::InitialAdminNotInvited(member) => json!({
+            "code": "initial_admin_not_invited",
+            "message": err.to_string(),
+            "member": member,
         }),
         WnError::InvalidMuteDuration(duration) => json!({
             "code": "invalid_mute_duration",
@@ -586,6 +659,64 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "group_id": group_id,
         }),
+        // Terminal for outbound work and not an engine bug: without this arm
+        // a removed sender's refusal renders as the catch-all `command_failed`,
+        // which scripts and the TUI cannot distinguish from a transient fault.
+        AppError::GroupRemoved(group_id) => json!({
+            "code": "group_removed",
+            "message": err.to_string(),
+            "group_id": group_id,
+        }),
+        // A durable disband request or an authenticated inbound disband
+        // candidate gates ordinary outbound work. Scripts must be able to
+        // tell "this group is ending" from a transient fault.
+        AppError::GroupDisbanding(group_id) => json!({
+            "code": "group_disbanding",
+            "message": err.to_string(),
+            "group_id": group_id,
+            "repair": {
+                "status": "wn groups disband-status <group-hex>",
+            },
+        }),
+        AppError::GroupInviteNotPending => json!({
+            "code": "group_invite_not_pending",
+            "message": err.to_string(),
+        }),
+        AppError::InvalidEncryptedMedia(reason) => json!({
+            "code": "invalid_encrypted_media",
+            "message": err.to_string(),
+            "reason": reason,
+        }),
+        // Raised by the CLI pre-check and, if a commit lands in between, by the
+        // account worker itself; both surface the same typed code and fields.
+        AppError::MediaReferenceStaleEpoch {
+            source_epoch,
+            current_epoch,
+        } => json!({
+            "code": "media_reference_stale_epoch",
+            "message": err.to_string(),
+            "source_epoch": source_epoch,
+            "current_epoch": current_epoch,
+            "repair": {
+                "action": "wn media upload <group-hex> <file-path> [--send]",
+            },
+        }),
+        // Raised by the account worker when the group's epoch is mid-change: a
+        // commit this device staged awaits its publish outcome, or retained
+        // peer commits are not yet applied. Nothing was published.
+        AppError::MediaReferenceEpochUnsettled { source_epoch } => json!({
+            "code": "media_reference_epoch_unsettled",
+            "message": err.to_string(),
+            "source_epoch": source_epoch,
+            "repair": {
+                "action": "wn sync, then retry `wn media send`; if the group epoch advanced, `wn media upload <group-hex> <file-path> [--send]`",
+            },
+        }),
+        AppError::InvalidAppMessagePayload(reason) => json!({
+            "code": "invalid_app_message_payload",
+            "message": err.to_string(),
+            "reason": reason,
+        }),
         AppError::Transport(err) => json!({
             "code": "relay_transport",
             "message": err.to_string(),
@@ -728,6 +859,28 @@ fn engine_error_json(err: &EngineError) -> Value {
             "code": "invalid_transition",
             "message": transition.to_string(),
         }),
+        EngineError::LeaveAlreadyRequested { group_id } => json!({
+            "code": "leave_already_requested",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+        }),
+        EngineError::DisbandingNotEnabled { group_id } => json!({
+            "code": "disbanding_not_enabled",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+            "repair": {
+                "enable": "wn groups enable-disbanding <group-hex>",
+            },
+        }),
+        EngineError::DisbandingUnsupportedMembers { group_id, members } => json!({
+            "code": "disbanding_unsupported_members",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+            "members": members
+                .iter()
+                .map(|member| hex::encode(member.as_slice()))
+                .collect::<Vec<_>>(),
+        }),
         other => json!({
             "code": "engine_error",
             "message": other.to_string(),
@@ -740,6 +893,26 @@ mod tests {
     use marmot_account::AccountError;
 
     use super::*;
+
+    #[test]
+    fn unsafe_quic_endpoint_json_omits_addresses_and_certificates() {
+        let err = WnError::UnsafeQuicEndpoint;
+        let message = err.to_string();
+        assert!(message.contains("public address"));
+        assert!(message.contains("--insecure-local"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("::1"));
+        assert!(!message.contains("cert"));
+
+        let json = wn_error_json(&err);
+        assert_eq!(json["code"], "unsafe_quic_endpoint");
+        assert_eq!(json["message"], message);
+        assert!(json.get("addr").is_none());
+        assert!(json.get("candidate").is_none());
+        let rendered = json.to_string();
+        assert!(!rendered.contains("127.0.0.1"));
+        assert!(!rendered.contains("cert"));
+    }
 
     #[test]
     fn missing_key_package_errors_include_repair_guidance() {

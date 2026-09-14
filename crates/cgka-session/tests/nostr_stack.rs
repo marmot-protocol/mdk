@@ -35,6 +35,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello through the nostr stack"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -389,6 +390,7 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
     assert_eq!(
         carol_joined.effects.events,
         vec![GroupEvent::GroupJoined {
+            explicitly_confirmed: false,
             group_id: created.group_id.clone(),
             via_welcome: welcome_report.message_id,
             welcomer: Some(alice.account_id.clone()),
@@ -449,6 +451,7 @@ async fn send_app_message(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(sender, payload),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -509,6 +512,7 @@ async fn publish_confirm_and_deliver_welcome(
     assert_eq!(
         joined.effects.events,
         vec![GroupEvent::GroupJoined {
+            explicitly_confirmed: false,
             group_id: match &confirmed.events[0] {
                 GroupEvent::GroupCreated { group_id } => group_id.clone(),
                 other => panic!("expected GroupCreated event, got {other:?}"),

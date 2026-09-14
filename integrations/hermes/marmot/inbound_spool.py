@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TERMINAL_STATES = frozenset({"completed", "intentionally_skipped", "unresolved", "failed"})
 
 
@@ -33,10 +33,6 @@ class SpoolFullError(InboundSpoolError):
 
 class SpoolLockedError(InboundSpoolError):
     """Another live process owns this spool."""
-
-
-# Compatibility name kept local to the first schema implementation.
-InboundSpoolFull = SpoolFullError
 
 
 class StaleClaim(InboundSpoolError):
@@ -53,6 +49,7 @@ class SpoolRecord:
     source_ids: tuple[str, ...]
     reply_anchor: Optional[str]
     attempts: int
+    dispatch_attempts: int
     next_attempt_at: float
     disposition: Optional[str]
 
@@ -116,7 +113,16 @@ class InboundSpool:
             os.close(fd)
             # Explicit transaction mode is required: record/batch/transition
             # methods use ``with db`` as their crash-atomic commit boundary.
-            db = sqlite3.connect(self.path, timeout=5, isolation_level="IMMEDIATE")
+            # The Hermes adapter owns a serialized worker for this connection.
+            # Disabling sqlite's creator-thread check lets that worker keep all
+            # blocking operations off the asyncio loop; serialization remains
+            # the caller's responsibility.
+            db = sqlite3.connect(
+                self.path,
+                timeout=5,
+                isolation_level="IMMEDIATE",
+                check_same_thread=False,
+            )
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
@@ -184,8 +190,8 @@ class InboundSpool:
                 pending = int(db.execute(
                     "SELECT count(*) FROM events WHERE state IN ('pending','claimed','coalesced')"
                 ).fetchone()[0])
-                if pending >= self.max_pending or self._allocated_bytes() + len(payload.encode("utf-8")) > self.max_bytes:
-                    raise InboundSpoolFull("inbound spool capacity exhausted")
+                if pending >= self.max_pending or self._live_allocated_bytes() + len(payload.encode("utf-8")) > self.max_bytes:
+                    raise SpoolFullError("inbound spool capacity exhausted")
                 db.execute(
                     "INSERT INTO events(account_id,group_id,message_id,state,event_json,source_ids_json,"
                     "reply_anchor,attempts,next_attempt_at,disposition,created_at,changed_at) "
@@ -326,18 +332,48 @@ class InboundSpool:
             if changed != 1:
                 raise StaleClaim("inbound claim lost a compare-and-set race")
             row = db.execute("SELECT * FROM events WHERE message_id=?", (message_id,)).fetchone()
-        self._checkpoint_and_verify_bound()
+        try:
+            self._checkpoint_and_verify_bound()
+        except Exception:
+            # The claim transaction has already committed. If post-commit
+            # checkpoint/permission verification fails, compensate the owned
+            # row immediately so the same process can retry it and preserve FIFO.
+            try:
+                with db:
+                    db.execute(
+                        "UPDATE events SET state='pending',owner_id=NULL,generation=NULL,next_attempt_at=0,"
+                        "disposition='claim_post_commit_verification_failed',changed_at=? "
+                        "WHERE message_id=? AND state='claimed' AND owner_id=? AND generation=?",
+                        (time.time(), message_id, self.owner_id, self.generation),
+                    )
+            except Exception:
+                # A double fault must not strand the committed claim outside
+                # due(). Reopen under a fresh generation; normal generation
+                # recovery demotes every stale claim before the original
+                # verification error is re-raised to the caller.
+                try:
+                    self.close(graceful=False)
+                except Exception:
+                    pass
+                try:
+                    self.open()
+                except Exception:
+                    pass
+            raise
         return self._record_from_row(row)
 
-    def defer(self, message_id: str, *, delay_s: float, reason: str) -> None:
+    def defer(
+        self, message_id: str, *, delay_s: float, reason: str, dispatch_failure: bool = False
+    ) -> None:
         db = self._require_db()
         now = time.time()
         with db:
             changed = db.execute(
                 "UPDATE events SET state='pending',owner_id=NULL,generation=NULL,attempts=attempts+1,"
+                "dispatch_attempts=dispatch_attempts+?,"
                 "next_attempt_at=?,disposition=?,changed_at=? WHERE message_id=? AND state='claimed' "
                 "AND owner_id=? AND generation=?",
-                (now + max(0.01, float(delay_s)), reason, now, message_id, self.owner_id, self.generation),
+                (int(dispatch_failure), now + max(0.01, float(delay_s)), reason, now, message_id, self.owner_id, self.generation),
             ).rowcount
             if changed != 1:
                 raise StaleClaim("cannot defer a stale inbound claim")
@@ -417,7 +453,7 @@ class InboundSpool:
     def _initialize_schema(self) -> None:
         db = self._require_db()
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, SCHEMA_VERSION):
             raise InboundSpoolError("unsupported inbound spool schema version")
         if version == 0:
             with db:
@@ -444,6 +480,7 @@ class InboundSpool:
                         owner_id TEXT,
                         generation INTEGER,
                         attempts INTEGER NOT NULL DEFAULT 0,
+                        dispatch_attempts INTEGER NOT NULL DEFAULT 0,
                         next_attempt_at REAL NOT NULL DEFAULT 0,
                         disposition TEXT,
                         created_at REAL NOT NULL,
@@ -452,23 +489,30 @@ class InboundSpool:
                     );
                     CREATE INDEX events_due ON events(state,next_attempt_at,seq);
                     CREATE INDEX events_group_fifo ON events(group_id,seq);
-                    PRAGMA user_version=1;
+                    PRAGMA user_version=2;
                     """
                 )
+        elif version == 1:
+            # Old attempts include capacity/shutdown deferrals. They cannot be
+            # treated as dispatch failures without prematurely failing prompts.
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("ALTER TABLE events ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0")
+                db.execute("PRAGMA user_version=2")
         columns = {str(row[1]) for row in db.execute("PRAGMA table_info(events)")}
-        if {"seq", "account_id", "group_id", "message_id", "state", "event_json"} - columns:
+        if {"seq", "account_id", "group_id", "message_id", "state", "event_json", "dispatch_attempts"} - columns:
             raise InboundSpoolError("inbound spool schema is corrupt")
 
     def _gc_terminal_locked(self, now: float) -> None:
         db = self._require_db()
         cutoff = now - self.terminal_retention_s
         db.execute(
-            "DELETE FROM events WHERE state IN ('handed','completed','intentionally_skipped','unresolved','failed') "
+            "DELETE FROM events WHERE state IN ('completed','intentionally_skipped','unresolved','failed') "
             "AND changed_at<?",
             (cutoff,),
         )
         terminal = db.execute(
-            "SELECT message_id FROM events WHERE state IN ('handed','completed','intentionally_skipped','unresolved','failed') "
+            "SELECT message_id FROM events WHERE state IN ('completed','intentionally_skipped','unresolved','failed') "
             "ORDER BY changed_at DESC LIMIT -1 OFFSET ?",
             (self.max_terminal,),
         ).fetchall()
@@ -484,12 +528,19 @@ class InboundSpool:
                 pass
         return total
 
+    def _live_allocated_bytes(self) -> int:
+        """Return allocated bytes excluding reusable SQLite freelist pages."""
+        db = self._require_db()
+        page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+        reusable = int(db.execute("PRAGMA freelist_count").fetchone()[0]) * page_size
+        return max(0, self._allocated_bytes() - reusable)
+
     def _checkpoint_and_verify_bound(self) -> None:
         db = self._require_db()
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._make_sidecars_private()
         if self._allocated_bytes() > self.max_bytes:
-            raise InboundSpoolFull("inbound spool storage bound exhausted")
+            raise SpoolFullError("inbound spool storage bound exhausted")
 
     def _prepare_private_parent(self) -> None:
         parent = self.path.parent
@@ -550,6 +601,7 @@ class InboundSpool:
             source_ids=tuple(json.loads(row["source_ids_json"])),
             reply_anchor=str(row["reply_anchor"]) if row["reply_anchor"] else None,
             attempts=int(row["attempts"]),
+            dispatch_attempts=int(row["dispatch_attempts"]),
             next_attempt_at=float(row["next_attempt_at"]),
             disposition=str(row["disposition"]) if row["disposition"] else None,
         )

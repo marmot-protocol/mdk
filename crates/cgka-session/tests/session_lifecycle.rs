@@ -98,6 +98,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -339,6 +340,7 @@ async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change(
         .send(SendIntent::AppMessage {
             group_id,
             payload: post_promotion_payload,
+            expected_epoch: None,
         })
         .await
         .expect("promotion preserves public session behavior");
@@ -395,6 +397,7 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&bob, b"invitee first message"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -463,6 +466,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         vec![GroupEvent::GroupJoined {
             group_id: created.group_id.clone(),
             via_welcome: welcome_id,
+            explicitly_confirmed: false,
             welcomer: Some(alice.self_id()),
         }]
     );
@@ -471,6 +475,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello through session"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -535,6 +540,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello after restart"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -724,6 +730,7 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&bob, b"still leaving"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -816,6 +823,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: queued_payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -829,7 +837,27 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
             ..CanonicalizationPolicy::default()
         })
         .expect("convergence policy accepted");
-    let advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    // Background convergence is a cooperative quantum, not a drain-to-completion API.
+    // Under CI load it can adopt epoch 2 and exhaust its 500ms budget before draining
+    // the queued intent. Follow the scheduled continuation as the runtime worker does.
+    // Check the deadline between complete calls; never cancel a live MLS/storage step.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued outbound work did not publish within the convergence deadline"
+        );
+        if !advanced.publish.is_empty() {
+            break;
+        }
+        assert!(
+            advanced.pending_convergence.contains(&created.group_id),
+            "queued outbound work must publish or schedule another convergence quantum"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    }
 
     assert_eq!(carol.epoch(&created.group_id).unwrap(), EpochId(2));
     assert!(

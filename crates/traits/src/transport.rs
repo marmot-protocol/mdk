@@ -4,8 +4,9 @@
 use crate::types::{MemberId, MessageId};
 use serde::{Deserialize, Serialize};
 
-/// Unix-seconds timestamp. Opaque — used for ordering hints only; the engine
-/// never trusts it for correctness (coordinator dedup is by `MessageId`).
+/// Unix-seconds timestamp. Trust depends on the containing field: transport
+/// timestamps are ordering/replay hints, while peeled Welcome creation times
+/// must be authenticated by the peeler. Coordinator dedup is by `MessageId`.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]

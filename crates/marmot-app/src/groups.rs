@@ -133,7 +133,7 @@ pub struct PendingGroupInvite {
     pub welcomer: Option<MemberId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRecord {
     pub group_id_hex: String,
     /// Compatibility profile for all profile-gated behavior in this group.
@@ -153,8 +153,8 @@ pub struct AppGroupRecord {
     pub prior_nostr_routes: Vec<AppPriorNostrRoute>,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
-    /// URL-based group avatar. When `present`, it takes precedence over `image`
-    /// for rendering (spec: `marmot.group.avatar-url.v1`).
+    /// URL-based group avatar, used when no valid encrypted `image` is available.
+    /// When both sources are present, encrypted group image material wins.
     #[serde(default)]
     pub avatar_url: AppGroupAvatarUrlComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,
@@ -180,6 +180,9 @@ pub struct AppGroupRecord {
     /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_member_ids_hex: Option<Vec<String>>,
+    /// Current authoritative two-member roster, including explicitly named groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_member_ids_hex: Option<Vec<String>>,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily (`Left`) or was removed (`Removed`).
     #[serde(default)]
@@ -708,6 +711,17 @@ impl Default for AppGroupMessageRetentionComponent {
     }
 }
 
+impl std::fmt::Debug for AppGroupRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupRecord")
+            .field("member_count", &self.member_count)
+            .field("archived", &self.archived)
+            .field("pending_confirmation", &self.pending_confirmation)
+            .field("self_membership", &self.self_membership)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AppGroupRecord {
     pub(crate) fn new(
         group_id_hex: String,
@@ -738,6 +752,7 @@ impl AppGroupRecord {
             pending_confirmation: false,
             member_count: None,
             direct_member_ids_hex: None,
+            presentation_member_ids_hex: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
             disbanding: false,
@@ -831,13 +846,21 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() && members.len() == 2 {
-            Some(
-                members
+        self.presentation_member_ids_hex = (members.len() == 2
+            && members
+                .iter()
+                .all(|member| member.id.as_slice().len() == 32)
+            && members[0].id != members[1].id)
+            .then(|| {
+                let mut ids: Vec<_> = members
                     .iter()
-                    .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
-                    .collect(),
-            )
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            });
+        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
+            self.presentation_member_ids_hex.clone()
         } else {
             None
         };
@@ -933,9 +956,10 @@ impl AppGroupRecord {
             GroupConfirmationProjection::Preserve => {}
             GroupConfirmationProjection::Accepted => {
                 self.pending_confirmation = false;
-                self.archived = false;
+                // Acceptance preserves explicit archive intent. Restore is a separate command.
             }
-            GroupConfirmationProjection::Pending {
+            GroupConfirmationProjection::Welcome {
+                explicitly_confirmed,
                 via_welcome_message_id_hex,
                 welcomer_account_id_hex,
             } => {
@@ -952,8 +976,13 @@ impl AppGroupRecord {
                 {
                     return;
                 }
-                self.pending_confirmation = true;
-                self.archived = false;
+                self.pending_confirmation = !explicitly_confirmed;
+                // Only the engine's successful consented rejoin clears archive.
+                // Offers and ordinary invitation acceptance preserve explicit archive intent;
+                // the replay guard above prevents an old join from undoing a later archive.
+                if explicitly_confirmed {
+                    self.archived = false;
+                }
                 self.via_welcome_message_id_hex = Some(via_welcome_message_id_hex);
                 self.welcomer_account_id_hex = welcomer_account_id_hex;
             }
@@ -998,6 +1027,31 @@ fn normalized_relays(relays: &[String]) -> Vec<String> {
     relays.sort();
     relays.dedup();
     relays
+}
+
+/// Advisory recovery state, separate from user invite acceptance and MLS membership.
+/// Subscribe to GroupStateUpdated, then re-read this durable snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRecoveryStatus {
+    pub group_id_hex: String,
+    /// Repeated relay-confirmed full-history replays recovered nothing.
+    /// Hosts may show "Unable to restore group synchronization"; this is not removal evidence.
+    pub automatic_recovery_failed: bool,
+    /// Lost invitations awaiting fresh material on this inviter device.
+    pub pending_reinvites: u32,
+    /// Exhausted recovery attempts requiring a new user-initiated invitation.
+    pub failed_reinvites: u32,
+    pub rejoin_invitations: Vec<GroupRejoinInvitation>,
+}
+
+/// A fully validated Welcome awaiting a recipient's explicit decision to
+/// replace their existing active group copy. The sender must be shown to the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRejoinInvitation {
+    pub welcome_id_hex: String,
+    pub welcomer_account_id_hex: String,
+    pub epoch: u64,
+    pub local_state_token: String,
 }
 
 #[cfg(test)]
@@ -1835,7 +1889,8 @@ pub(crate) struct EventGroupProjection<'a> {
 pub(crate) enum GroupConfirmationProjection {
     Preserve,
     Accepted,
-    Pending {
+    Welcome {
+        explicitly_confirmed: bool,
         via_welcome_message_id_hex: String,
         welcomer_account_id_hex: Option<String>,
     },
@@ -2056,8 +2111,10 @@ pub(crate) fn observe_event(
                         GroupEvent::GroupJoined {
                             via_welcome,
                             welcomer,
+                            explicitly_confirmed,
                             ..
-                        } => GroupConfirmationProjection::Pending {
+                        } => GroupConfirmationProjection::Welcome {
+                            explicitly_confirmed: *explicitly_confirmed,
                             via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
                             welcomer_account_id_hex: welcomer
                                 .as_ref()
@@ -2423,7 +2480,8 @@ mod confirmation_state_tests {
     }
 
     fn pending(via_welcome: &str, welcomer: Option<&str>) -> GroupConfirmationProjection {
-        GroupConfirmationProjection::Pending {
+        GroupConfirmationProjection::Welcome {
+            explicitly_confirmed: false,
             via_welcome_message_id_hex: via_welcome.to_owned(),
             welcomer_account_id_hex: welcomer.map(str::to_owned),
         }
@@ -2462,10 +2520,9 @@ mod confirmation_state_tests {
         );
     }
 
-    // A re-invite after the user declined (pending=false, archived=true) must
-    // also re-surface the group as a fresh pending invite.
+    // A new invitation is pending but does not restore explicit archive intent.
     #[test]
-    fn reinvite_after_decline_resurfaces_as_pending() {
+    fn reinvite_after_decline_preserves_archive_until_supported_rejoin() {
         let mut record = test_record();
         record.apply_confirmation_state(pending("welcome-1", None));
 
@@ -2475,7 +2532,7 @@ mod confirmation_state_tests {
 
         record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
         assert!(record.pending_confirmation);
-        assert!(!record.archived);
+        assert!(record.archived);
         assert_eq!(
             record.via_welcome_message_id_hex.as_deref(),
             Some("welcome-2")
@@ -2484,6 +2541,27 @@ mod confirmation_state_tests {
             record.welcomer_account_id_hex.as_deref(),
             Some("welcomer-2")
         );
+    }
+
+    #[test]
+    fn acceptance_preserves_archive_and_consented_rejoin_restores_once() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("old", None));
+        record.archived = true;
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(record.archived);
+        assert!(!record.pending_confirmation);
+        let rejoin = GroupConfirmationProjection::Welcome {
+            explicitly_confirmed: true,
+            via_welcome_message_id_hex: "new".into(),
+            welcomer_account_id_hex: None,
+        };
+        record.apply_confirmation_state(rejoin.clone());
+        assert!(!record.archived);
+        assert!(!record.pending_confirmation);
+        record.archived = true;
+        record.apply_confirmation_state(rejoin);
+        assert!(record.archived, "replayed join cannot undo a later archive");
     }
 
     // A true replay (same welcome id on an already-resolved group) must NOT

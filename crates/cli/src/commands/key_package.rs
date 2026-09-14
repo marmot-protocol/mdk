@@ -3,12 +3,16 @@
 use std::collections::HashSet;
 
 use marmot_account::AccountHome;
-use marmot_app::{AccountKeyPackageRecord, FetchedKeyPackage, MarmotApp, MarmotAppRuntime};
+use marmot_app::{
+    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, FetchedKeyPackage, MarmotApp,
+    MarmotAppRuntime,
+};
 use serde_json::{Value, json};
 
 use crate::{
     CommandOutput, KeyPackageCommand, WnError, account_selector_or_default, ensure_local_signing,
     npub_for_account_id, parse_public_key, relay_endpoints, relay_lists_json, resolve_account,
+    terminal_safe_text,
 };
 
 pub(crate) async fn key_package_command(
@@ -158,7 +162,12 @@ pub(crate) async fn key_package_command_with_runtime(
                 plain: format!(
                     "fetched key package for {account_id} bytes={} relays={}",
                     fetched.key_package.bytes().len(),
-                    fetched.source_relays.join(",")
+                    fetched
+                        .source_relays
+                        .iter()
+                        .map(|relay| terminal_safe_text(relay))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ),
                 json: key_package_fetch_json(fetched),
             })
@@ -207,39 +216,39 @@ pub(crate) async fn key_package_command_with_runtime(
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
-            let records = runtime
-                .account_key_packages(&account.label, Vec::new())
+            let events = runtime
+                .account_key_package_relay_events(&account.label, Vec::new())
                 .await?;
             let mut deleted = Vec::new();
             let mut failed = Vec::new();
             let mut seen_event_ids = HashSet::new();
             let mut accepted_relays = 0_usize;
-            for record in records.into_iter().filter(|record| record.relay) {
-                if !seen_event_ids.insert(record.key_package_event_id.clone()) {
+            for event in events {
+                if !seen_event_ids.insert(event.key_package_event_id.clone()) {
                     continue;
                 }
-                let relays = match relay_endpoints(record.source_relays.clone()) {
+                let relays = match relay_endpoints(event.source_relays.clone()) {
                     Ok(relays) => relays,
                     Err(err) => {
-                        failed.push(FailedKeyPackageDeletion::from_record(&record, &err));
+                        failed.push(FailedKeyPackageDeletion::from_relay_event(&event, &err));
                         continue;
                     }
                 };
                 let accepted = match runtime
-                    .delete_key_package(&account.label, &record.key_package_event_id, relays)
+                    .delete_key_package(&account.label, &event.key_package_event_id, relays)
                     .await
                 {
                     Ok(accepted) => accepted,
                     Err(err) => {
-                        failed.push(FailedKeyPackageDeletion::from_record(&record, &err));
+                        failed.push(FailedKeyPackageDeletion::from_relay_event(&event, &err));
                         continue;
                     }
                 };
                 accepted_relays += accepted;
                 deleted.push(DeletedKeyPackage {
-                    event_id: record.key_package_event_id,
-                    key_package_id: record.key_package_id,
-                    key_package_ref: record.key_package_ref_hex,
+                    event_id: event.key_package_event_id,
+                    key_package_id: event.key_package_id,
+                    key_package_ref: event.key_package_ref_hex,
                     accepted_relays: accepted,
                 });
             }
@@ -280,11 +289,11 @@ struct FailedKeyPackageDeletion {
 }
 
 impl FailedKeyPackageDeletion {
-    fn from_record(record: &AccountKeyPackageRecord, err: &impl std::fmt::Display) -> Self {
+    fn from_relay_event(event: &AccountKeyPackageRelayEvent, err: &impl std::fmt::Display) -> Self {
         Self {
-            event_id: record.key_package_event_id.clone(),
-            key_package_id: record.key_package_id.clone(),
-            key_package_ref: record.key_package_ref_hex.clone(),
+            event_id: event.key_package_event_id.clone(),
+            key_package_id: event.key_package_id.clone(),
+            key_package_ref: event.key_package_ref_hex.clone(),
             error: err.to_string(),
         }
     }

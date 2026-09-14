@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 import unittest.mock
@@ -120,7 +121,7 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
             # Unit adapters directly invoke inbound hooks without connect(). Give
             # each instance private stores so tests exercise real durability
             # boundaries without touching the operator's default Marmot home.
-            store_root = Path(tempfile.mkdtemp(dir=TEST_SPOOL_ROOT.name))
+            store_root = Path(tempfile.mkdtemp(dir=TEST_SPOOL_ROOT.name)).resolve()
             self._inbound_spool_test_path = str(store_root / "inbound.sqlite3")
             self._ambient_context_test_path = str(store_root / "ambient.sqlite3")
 
@@ -559,6 +560,12 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
         await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
 
+        await client.stream_finish("55" * 32, "33" * 32, "final", idempotency_key="finish-1")
+        self.assertEqual(requests[3]["type"], "stream_finish")
+        self.assertEqual(requests[3]["final_text"], "final")
+        self.assertEqual(requests[3]["idempotency_key"], "finish-1")
+        self.assertNotIn("transcript_hash_hex", requests[3])
+        self.assertNotIn("chunk_count", requests[3])
         self.assertEqual(requests[0]["idempotency_key"], "key-1")
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
@@ -996,15 +1003,19 @@ class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
         adapter = load_adapter_module()
         platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
 
-        disabled = await adapter.probe_readiness(platform_config(enabled=False))
-        self.assertEqual(disabled["state"], "disabled")
-
-        with unittest.mock.patch.dict(
+        with tempfile.TemporaryDirectory() as empty_home, unittest.mock.patch.dict(
             os.environ,
-            {"MARMOT_AGENT_SOCKET": "", "MARMOT_HOME": ""},
+            {
+                "HOME": empty_home,
+                "MARMOT_AGENT_SOCKET": "",
+                "MARMOT_HOME": empty_home,
+            },
             clear=False,
         ):
-            invalid = await adapter.probe_readiness(platform_config(enabled=True))
+            disabled = await adapter.probe_readiness(platform_config(enabled=False))
+            self.assertEqual(disabled["state"], "disabled")
+            with unittest.mock.patch.dict(os.environ, {"MARMOT_HOME": ""}):
+                invalid = await adapter.probe_readiness(platform_config(enabled=True))
         self.assertEqual(invalid["state"], "invalid_config")
 
         class ReadyClient:
@@ -1037,6 +1048,37 @@ class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("account_id_hex", ready)
         self.assertNotIn("group_id_hex", ready)
         self.assertEqual(client.group_lookup, ("11" * 32, "22" * 32))
+
+    async def test_probe_ignores_malformed_account_entries_individually(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        None,
+                        "malformed",
+                        {"local_signing": True, "account_id_hex": "not-hex"},
+                        {"local_signing": False, "account_id_hex": "33" * 32},
+                        {"local_signing": True, "account_id_hex": "11" * 32},
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        readiness = await adapter.probe_readiness(
+            platform_config(
+                enabled=True,
+                extra={
+                    "socket_path": "/tmp/passive-probe.sock",
+                    "group_id_hex": "22" * 32,
+                },
+            ),
+            client=ReadyClient(),
+        )
+        self.assertEqual("ready", readiness["state"])
 
     async def test_probe_distinguishes_unreachable_and_account_unselected(self):
         adapter = load_adapter_module()
@@ -1112,80 +1154,6 @@ class MediaCapabilityContractTests(unittest.TestCase):
 class TranscriptTests(unittest.TestCase):
     def setUp(self):
         self.adapter = load_adapter_module()
-
-    def test_quic_varint_encoder_matches_rfc9000_boundaries(self):
-        cases = {
-            0: "00",
-            32: "20",
-            63: "3f",
-            64: "4040",
-            16383: "7fff",
-            16384: "80004000",
-            1073741823: "bfffffff",
-            1073741824: "c000000040000000",
-            4611686018427387903: "ffffffffffffffff",
-        }
-
-        for value, expected_hex in cases.items():
-            with self.subTest(value=value):
-                self.assertEqual(self.adapter._encode_quic_varint(value).hex(), expected_hex)
-
-        with self.assertRaises(ValueError):
-            self.adapter._encode_quic_varint(-1)
-        with self.assertRaises(ValueError):
-            self.adapter._encode_quic_varint(4611686018427387904)
-
-    def test_transcript_matches_rust_status_hash_fixture(self):
-        # Mirrors crates/cgka-conformance-simulator/tests/agent_text_stream_vectors.rs:
-        # fixed stream_id 0x40..0x5f, fixed start_event_id 0xc0..0xdf,
-        # record type 1 text_delta "hello", then record type 3 status "thinking".
-        transcript = self.adapter.AgentTextStreamTranscript(
-            stream_id_hex=bytes(range(0x40, 0x60)).hex(),
-            start_message_id_hex=bytes(range(0xC0, 0xE0)).hex(),
-            chunk_bytes=1024,
-        )
-
-        self.assertEqual(
-            transcript.hash_hex,
-            "e4ef961892a7425c1c279f747920ac18d55810732f2aa6b20b330f2666714c78",
-        )
-        transcript.append_text("hello")
-        transcript.append_status("thinking")
-
-        self.assertEqual(transcript.chunk_count, 2)
-        self.assertEqual(
-            transcript.hash_hex,
-            "c0bc23a83a5607f29babfd40464c454306674b82b4653c88fd6f8dbb77e1415c",
-        )
-
-    def test_default_stream_chunking_matches_connector_compose_default(self):
-        self.assertEqual(self.adapter.DEFAULT_STREAM_CHUNK_BYTES, 1024)
-
-        transcript = self.adapter.AgentTextStreamTranscript(
-            stream_id_hex="11" * 32,
-            start_message_id_hex="22" * 32,
-            chunk_bytes=self.adapter.DEFAULT_STREAM_CHUNK_BYTES,
-        )
-        transcript.append_text("a" * (self.adapter.DEFAULT_STREAM_CHUNK_BYTES + 1))
-
-        self.assertEqual(transcript.chunk_count, 2)
-        self.assertEqual(
-            [len(chunk) for chunk in self.adapter.split_text_deltas("a" * 1025, 1024)],
-            [1024, 1],
-        )
-
-    def test_effective_stream_chunking_clamps_to_policy_frame_len(self):
-        self.assertEqual(
-            self.adapter.effective_stream_chunk_bytes(
-                self.adapter.DEFAULT_STREAM_CHUNK_BYTES,
-                4,
-            ),
-            4,
-        )
-        self.assertEqual(
-            [len(chunk) for chunk in self.adapter.split_text_deltas("abcdefghi", 4)],
-            [4, 4, 1],
-        )
 
     def test_append_only_delta_rejects_replacements(self):
         state = self.adapter.AppendOnlyTextState()
@@ -1523,7 +1491,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         await adapter.disconnect()
 
         with self.assertRaises(self.adapter_module.InboundSpoolError):
-            adapter._ensure_inbound_spool_open()
+            await adapter._ensure_inbound_spool_open()
         with self.assertRaisesRegex(Exception, "generation is closed"):
             adapter._ambient_context.record("22" * 32, "late", "message_deleted")
         self.assertFalse(adapter._inbound_spool.is_open)
@@ -2409,8 +2377,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -2456,10 +2424,9 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(fake_client.stream_finalizes), 1)
         self.assertEqual(fake_client.stream_finalizes[0][1], "hello")
-        self.assertEqual(fake_client.stream_finalizes[0][3], 2)
         self.assertEqual(fake_client.final_sends, [])
 
-    async def test_stream_transcript_chunks_at_policy_frame_len_from_begin_response(self):
+    async def test_stream_finish_leaves_policy_chunking_to_server(self):
         class FakeClient:
             def __init__(self):
                 self.stream_appends = []
@@ -2480,8 +2447,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -2511,7 +2478,6 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.stream_appends, [("55" * 32, "abcdefghi")])
         self.assertEqual(len(fake_client.stream_finalizes), 1)
         self.assertEqual(fake_client.stream_finalizes[0][1], "abcdefghi")
-        self.assertEqual(fake_client.stream_finalizes[0][3], 3)
         self.assertEqual(fake_client.final_sends, [])
 
     async def test_draft_stream_skips_empty_visible_frames(self):
@@ -2710,8 +2676,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -2775,13 +2741,11 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(
+            async def stream_finish(
                 self,
                 stream_id_hex,
                 stream_capability,
                 final_text,
-                transcript_hash_hex,
-                chunk_count,
                 idempotency_key=None,
             ):
                 self.stream_finalizes.append((stream_id_hex, final_text))
@@ -2879,7 +2843,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
@@ -2944,8 +2908,8 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
-                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
+                self.stream_finalizes.append((stream_id_hex, final_text))
                 return {"type": "stream_finalized", "stream_id_hex": stream_id_hex}
 
             async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
@@ -3046,13 +3010,11 @@ class _DeliveryRoutingFakeClient:
         self.stream_appends.append((stream_id_hex, append_text))
         return {"type": "ack"}
 
-    async def stream_finalize(
+    async def stream_finish(
         self,
         stream_id_hex,
         stream_capability,
         final_text,
-        transcript_hash_hex,
-        chunk_count,
         idempotency_key=None,
     ):
         self.stream_finalizes.append((stream_id_hex, final_text))
@@ -3756,12 +3718,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await stream.append_replacement("hello")
         self.assertEqual(stream.text.text, "")
-        self.assertEqual(stream.transcript.chunk_count, 0)
 
         # The same text is re-appendable and now commits exactly once.
         await stream.append_replacement("hello")
         self.assertEqual(stream.text.text, "hello")
-        self.assertEqual(stream.transcript.chunk_count, 1)
         self.assertEqual(fake_client.appends, [("55" * 32, "hello"), ("55" * 32, "hello")])
 
     async def test_pending_suffix_for_does_not_mutate_and_commit_advances(self):
@@ -3959,11 +3919,54 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(retry, return_exceptions=True)
 
         self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
-        # An empty/queued host return is not a durable finality callback. Both
-        # source ids retain explicit handoff/coalescing dispositions until
-        # Phase 2 provides one.
-        self.assertEqual("handed", adapter._inbound_spool.get(first["message_id_hex"]).state)
-        self.assertEqual("coalesced", adapter._inbound_spool.get(second["message_id_hex"]).state)
+        self.assertEqual(
+            "unresolved",
+            adapter._inbound_spool.get(first["message_id_hex"]).state,
+        )
+        self.assertEqual(
+            "unresolved",
+            adapter._inbound_spool.get(second["message_id_hex"]).state,
+        )
+
+    async def test_pre_handoff_poison_dead_letters_and_unblocks_group_fifo(self):
+        first = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "poison",
+            "mentions_self": True,
+        }
+        second = dict(first, message_id_hex="55" * 32, text="later")
+        adapter = self._adapter(client=object())
+        await adapter._ensure_inbound_spool_open()
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+
+        async def fail_before_handoff(_event):
+            raise ValueError("synthetic poison")
+
+        adapter._should_run_turn = fail_before_handoff
+        async def suppress_admission():
+            return None
+
+        adapter._admit_due_spooled = suppress_admission
+        for _ in range(len(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S) + 1):
+            claim = adapter._inbound_spool.claim(
+                first["message_id_hex"],
+                ignore_backoff=True,
+            )
+            await adapter._dispatch_inbound_message(
+                claim.event,
+                spool_message_id=claim.message_id,
+            )
+
+        failed = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("failed", failed.state)
+        self.assertEqual("pre_handoff_retry_exhausted", failed.disposition)
+        admitted = adapter._inbound_spool.claim(second["message_id_hex"])
+        self.assertEqual(second["message_id_hex"], admitted.message_id)
 
     # --- Behavior 3: stream_progress wire type --------------------------------
     async def test_stream_progress_sends_progress_wire_type(self):
@@ -4330,7 +4333,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 return {"is_direct": False}
 
         with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory) / "private" / "ambient.sqlite3")
+            path = str(Path(directory).resolve() / "private" / "ambient.sqlite3")
             group_id = "22" * 32
             first = self._adapter(FakeClient(), {"ambient_context_path": path})
             await first._handle_mutation(
@@ -4527,7 +4530,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await adapter._dispatch_inbound_message(event, spool_message_id=message_id)
 
         self.assertEqual(accepted, ["accepted"])
-        self.assertEqual(adapter._inbound_spool.get(message_id).state, "handed")
+        self.assertEqual(adapter._inbound_spool.get(message_id).state, "unresolved")
         ambient_path = adapter._ambient_context.path
         adapter._ambient_context.close()
         adapter._inbound_spool.close()
@@ -4645,14 +4648,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 for value in events:
                     yield wire_event(value)
 
-        adapter = self._adapter(FakeClient(), {"debounce_ms": 5})
+        adapter = self._adapter(
+            FakeClient(),
+            {"debounce_ms": 500, "group_activation": "always"},
+        )
         await adapter._consume_inbound_once()
         # Wait for the debounce flush task to fire, then drain the per-group queue
         # (the flush enqueues the coalesced turn onto it).
-        for _ in range(200):
-            if adapter.events:
-                break
-            await asyncio.sleep(0.005)
+        await asyncio.gather(*list(adapter._debounce_tasks.values()))
         await adapter._inbound_queue.join()
 
         self.assertEqual(len(adapter.events), 1)
@@ -4766,9 +4769,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         try:
             loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 0.0))
             for _ in range(300):
-                if attempts["n"] >= 2 and delays:
+                if attempts["n"] >= 2 and delays and adapter.events:
                     break
                 await asyncio.sleep(0.005)
+            await adapter._inbound_queue.join()
         finally:
             self.adapter_module.reconnect_backoff_ms = real_backoff
             loop_task.cancel()
@@ -4923,7 +4927,6 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             account_id_hex="11" * 32,
             group_id_hex="22" * 32,
             quic_candidates=(),
-            chunk_bytes=1024,
         )
 
         self.assertTrue(client.request_ids[0])
@@ -4962,33 +4965,23 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                 return {"type": "ack"}
 
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
-                return await self._preview("append", adapter_module.TEXT_DELTA_RECORD, append_text, idempotency_key)
+                return await self._preview("append", "append", append_text, idempotency_key)
 
             async def stream_status(self, stream_id_hex, stream_capability, status_text, idempotency_key=None):
-                return await self._preview("status", adapter_module.STATUS_RECORD, status_text, idempotency_key)
+                return await self._preview("status", "status", status_text, idempotency_key)
 
             async def stream_progress(self, stream_id_hex, stream_capability, progress_text, idempotency_key=None):
-                return await self._preview("progress", adapter_module.PROGRESS_DELTA_RECORD, progress_text, idempotency_key)
+                return await self._preview("progress", "progress", progress_text, idempotency_key)
 
-            async def stream_finalize(
+            async def stream_finish(
                 self,
                 stream_id_hex,
                 stream_capability,
                 final_text,
-                transcript_hash_hex,
-                chunk_count,
                 idempotency_key=None,
             ):
-                self.finalize_calls.append((transcript_hash_hex, chunk_count, idempotency_key))
-                transcript = adapter_module.AgentTextStreamTranscript(
-                    stream_id_hex,
-                    "66" * 32,
-                    chunk_bytes=1024,
-                )
-                for record_type, text in self.records:
-                    transcript._append_record(record_type, text)
-                assert transcript.hash_hex == transcript_hash_hex
-                assert transcript.chunk_count == chunk_count
+                self.finalize_calls.append((final_text, idempotency_key))
+                assert final_text == "".join(text for kind, text in self.records if kind == "append")
                 return {
                     "type": "stream_finalized",
                     "stream_id_hex": stream_id_hex,
@@ -5001,7 +4994,6 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             account_id_hex="11" * 32,
             group_id_hex="22" * 32,
             quic_candidates=["quic://127.0.0.1:4433"],
-            chunk_bytes=1024,
         )
         await stream.append_replacement("hello")
         await stream.status("thinking")
@@ -5018,7 +5010,7 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(fake_client.records), 3)
         self.assertEqual(len(fake_client.finalize_calls), 1)
-        self.assertTrue(fake_client.finalize_calls[0][2])
+        self.assertTrue(fake_client.finalize_calls[0][1])
 
     async def test_exhausted_preview_retry_blocks_a_different_pending_mutation(self):
         adapter_module = self.adapter_module
@@ -5064,7 +5056,6 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             account_id_hex="11" * 32,
             group_id_hex="22" * 32,
             quic_candidates=(),
-            chunk_bytes=1024,
         )
 
         with unittest.mock.patch.object(adapter_module, "STREAM_PREVIEW_RETRY_BACKOFF_S", ()):
@@ -5097,17 +5088,15 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
-            async def stream_finalize(
+            async def stream_finish(
                 self,
                 stream_id_hex,
                 stream_capability,
                 final_text,
-                transcript_hash_hex,
-                chunk_count,
                 idempotency_key=None,
             ):
                 self.stream_finalizes.append(
-                    (stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key)
+                    (stream_id_hex, final_text, idempotency_key)
                 )
                 if len(self.stream_finalizes) == 1:
                     raise adapter_module.AgentControlError(
@@ -5143,8 +5132,53 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(final.success)
         self.assertEqual(fake_client.final_sends, [])
         self.assertEqual(len(fake_client.stream_finalizes), 2)
-        self.assertTrue(fake_client.stream_finalizes[0][4])
-        self.assertEqual(fake_client.stream_finalizes[1][4], fake_client.stream_finalizes[0][4])
+        self.assertTrue(fake_client.stream_finalizes[0][2])
+        self.assertEqual(fake_client.stream_finalizes[1][2], fake_client.stream_finalizes[0][2])
+
+    async def test_finish_retains_retry_key(self):
+        module = self.adapter_module
+        for operation in ("send", "edit"):
+            with self.subTest(operation=operation):
+                client = unittest.mock.Mock()
+                client.stream_append = unittest.mock.AsyncMock(return_value={"type": "ack"})
+                client.stream_cancel = unittest.mock.AsyncMock()
+                client.send_final = unittest.mock.AsyncMock()
+                receipt = {"type": "stream_finalized", "message_ids_hex": ["77" * 32]}
+                client.stream_finish = unittest.mock.AsyncMock(side_effect=[
+                    module.AgentControlError("lost receipt", code="timeout", retryable=True),
+                    receipt,
+                ])
+                adapter = module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}), client=client,
+                )
+                stream = module.MarmotLiveStream(
+                    client=client, account_id_hex="11" * 32, group_id_hex="22" * 32,
+                    stream_id_hex="55" * 32, stream_capability="33" * 32,
+                    start_message_id_hex="66" * 32, parent_message_id_hex=None,
+                )
+                message_id = module._stream_message_id(stream.stream_id_hex)
+                adapter._active_streams[message_id] = stream
+                adapter._last_chat_stream["22" * 32] = stream
+                with unittest.mock.patch.object(module, "STREAM_FINALIZE_RETRY_BACKOFF_S", ()):
+                    if operation == "send":
+                        failed = await adapter.send("22" * 32, "hello")
+                    else:
+                        failed = await adapter.edit_message("22" * 32, message_id, "hello", finalize=True)
+                    self.assertFalse(failed.success)
+                    self.assertTrue(failed.retryable)
+                    self.assertIs(adapter._last_chat_stream["22" * 32], stream)
+                    self.assertIs(adapter._active_streams[message_id], stream)
+                    if operation == "send":
+                        retried = await adapter.send("22" * 32, "hello")
+                    else:
+                        retried = await adapter.edit_message("22" * 32, message_id, "hello", finalize=True)
+                self.assertTrue(retried.success)
+                self.assertEqual(retried.message_id, "77" * 32)
+                self.assertEqual(client.stream_finish.await_count, 2)
+                for call in client.stream_finish.await_args_list:
+                    self.assertEqual(call.kwargs["idempotency_key"], stream.finalize_idempotency_key)
+                client.stream_cancel.assert_not_awaited()
+                client.send_final.assert_not_awaited()
 
     async def test_finalize_rejection_falls_back_to_plain_send_final(self):
         adapter_module = self.adapter_module
@@ -5166,7 +5200,7 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
             async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finish(self, stream_id_hex, stream_capability, final_text, idempotency_key=None):
                 raise adapter_module.AgentControlError(
                     "transcript hash mismatch",
                     code="stream_finalize_rejected",
@@ -5436,10 +5470,12 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 client=unittest.mock.AsyncMock(),
             )
-            private_error = OSError(f"stat failed for {image}")
+            private_error = OSError(f"open failed for {image}")
 
             with (
-                unittest.mock.patch.object(self.adapter_module.Path, "stat", side_effect=private_error),
+                unittest.mock.patch.object(
+                    self.adapter_module, "open_outbound_media_source", side_effect=private_error
+                ),
                 unittest.mock.patch.object(self.adapter_module.logger, "debug") as debug_log,
                 self.assertRaises(self.adapter_module.AgentControlError) as raised,
             ):
@@ -6567,7 +6603,7 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
+    async def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -6586,8 +6622,17 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
         self.assertEqual(status["toolset"], "platform")
         self.assertEqual(status["schema"]["properties"], {})
-        self.assertIs(status["handler"], self.adapter_module._marmot_status_tool)
+        self.assertTrue(callable(status["handler"]))
         self.assertTrue(status["is_async"])
+        status_result = json.loads(
+            await status["handler"](
+                {},
+                task_id="status-task",
+                session_id="status-session",
+                user_task="status-user-task",
+            )
+        )
+        self.assertIn("state", status_result)
         history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
@@ -6626,7 +6671,13 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
         live_adapter = FakeAdapter()
         self.adapter_module._remember_live_adapter(live_adapter)
-        result = json.loads(await self.adapter_module._marmot_status_tool({}))
+        result = json.loads(
+            await self.adapter_module._marmot_status_tool(
+                {},
+                tool_call_id="status-probe",
+                dispatcher_context={"source": "test"},
+            )
+        )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["state"], "ready")
@@ -6645,12 +6696,16 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
+                self.tools = []
 
             def get_config(self, key, default=None):
                 return settings.get(key, default)
 
             def register_platform(self, **kwargs):
                 self.platforms.append(kwargs)
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
 
         ctx = FakeContext()
         self.adapter_module.register(ctx)
@@ -6663,6 +6718,13 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(built.account_id_hex, settings["account_id_hex"])
         self.assertEqual(built.group_id_hex, settings["group_id_hex"])
         self.assertEqual(config.extra, {})
+
+        seed = platform["env_enablement_fn"]()
+        self.assertEqual(seed["socket_path"], settings["socket_path"])
+        self.assertEqual(
+            seed["home_channel"],
+            {"chat_id": settings["home_channel"], "name": "Marmot"},
+        )
 
         captured = {}
 
@@ -6684,6 +6746,81 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         effective = captured["config"]
         self.assertEqual(effective.extra["socket_path"], settings["socket_path"])
         self.assertEqual(effective.home_channel.chat_id, settings["home_channel"])
+
+        status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
+        observed = {}
+
+        async def fake_probe(probe_config, **_kwargs):
+            observed["config"] = probe_config
+            return {"state": "ready"}
+
+        config_module = sys.modules["gateway.config"]
+        with (
+            unittest.mock.patch.object(
+                self.adapter_module,
+                "_live_adapter",
+                return_value=None,
+            ),
+            unittest.mock.patch.object(
+                config_module,
+                "load_gateway_config",
+                return_value=types.SimpleNamespace(
+                    platforms={self.adapter_module.Platform("marmot"): config}
+                ),
+                create=True,
+            ),
+            unittest.mock.patch.object(
+                self.adapter_module,
+                "probe_readiness",
+                side_effect=fake_probe,
+            ),
+        ):
+            status_result = json.loads(await status["handler"]({}))
+        self.assertTrue(status_result["ok"])
+        self.assertEqual(observed["config"].extra["socket_path"], settings["socket_path"])
+        self.assertEqual(
+            observed["config"].home_channel.chat_id,
+            settings["home_channel"],
+        )
+
+    async def test_marmot_status_probes_loaded_config_without_live_adapter(self):
+        module = self.adapter_module
+        config_module = sys.modules["gateway.config"]
+        config = config_module.PlatformConfig(
+            enabled=True,
+            extra={
+                "socket_path": "/tmp/passive-probe.sock",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+            },
+        )
+
+        class PlatformConfigs:
+            def get(self, platform):
+                return config if platform.value == "marmot" else None
+
+        setattr(
+            config_module,
+            "load_gateway_config",
+            lambda: types.SimpleNamespace(platforms=PlatformConfigs()),
+        )
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        setattr(module, "MarmotAgentControlClient", lambda *_args, **_kwargs: ReadyClient())
+        result = json.loads(await module._marmot_status_tool({}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "ready")
 
     async def test_marmot_status_reports_staged_failures(self):
         module = self.adapter_module
@@ -6854,11 +6991,11 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-    def make_adapter(self, *, extra=None):
+    def make_adapter(self, *, extra=None, client=None):
         merged = {"account_id_hex": "11" * 32, "profile_name_onboarding": False}
         merged.update(extra or {})
         return self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra=merged), client=object()
+            self.config_cls(extra=merged), client=client if client is not None else object()
         )
 
     async def test_journal_commit_precedes_queue_admission(self):
@@ -6876,9 +7013,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await adapter._inbound_queue.join()
         self.assertEqual(["claimed"], observed)
         record = adapter._inbound_spool.get(message_id)
-        self.assertEqual("handed", record.state)
+        self.assertEqual("unresolved", record.state)
+        self.assertEqual("host_handoff_outcome_unknown", record.disposition)
         self.assertEqual("durable", record.event["text"])
-        adapter._inbound_spool.close()
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_queue_full_stays_pending_then_retries_without_connector_replay(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
@@ -6900,40 +7038,224 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await adapter._inbound_queue.join()
         await asyncio.sleep(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S[0] + 0.02)
-        adapter._admit_due_spooled()
+        await adapter._admit_due_spooled()
         await adapter._inbound_queue.join()
         delivered = adapter._inbound_spool.get("33" * 32)
-        self.assertEqual("handed", delivered.state)
+        self.assertEqual("unresolved", delivered.state)
         self.assertEqual(attempts, delivered.attempts)
         self.assertEqual([item.text for item in adapter.events], ["durable"])
-        adapter._inbound_spool.close()
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_capacity_deferrals_do_not_exhaust_dispatch_failure_retries(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        call = adapter._inbound_spool_call
+        store = adapter._inbound_spool
+        await call(store.record, event)
+        try:
+            for reason in ("queue_full", "shutdown_before_queue_admission", "dispatch_cancelled_before_handoff"):
+                for _ in self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S:
+                    await call(store.claim, event["message_id_hex"], ignore_backoff=True)
+                    await call(store.defer, event["message_id_hex"], delay_s=0.01, reason=reason)
+            adapter._should_run_turn = unittest.mock.AsyncMock(side_effect=OSError("temporary RPC failure"))
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await adapter._inbound_queue.join()
+            record = await call(store.get, event["message_id_hex"])
+            self.assertEqual("pending", record.state)
+            adapter._should_run_turn = unittest.mock.AsyncMock(return_value=True)
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await adapter._inbound_queue.join()
+            self.assertEqual(["durable"], [message.text for message in adapter.events])
+        finally:
+            await adapter.disconnect()
+
+    async def test_failed_dispatch_disposition_retries_without_restart(self):
+        for operation_name, post_commit in (("get", False), ("defer", False), ("defer", True)):
+            with self.subTest(operation=operation_name, post_commit=post_commit):
+                adapter = self.make_adapter(extra={"group_activation": "always"})
+                await adapter._ensure_inbound_spool_open()
+                call = adapter._inbound_spool_call
+                store = adapter._inbound_spool
+                first = self.adapter_module._normalize_inbound_message_event(self.make_event(text="first"))
+                second = self.adapter_module._normalize_inbound_message_event(self.make_event(message_id="55", text="second"))
+                await call(store.record, first)
+                await call(store.record, second)
+                claim = await call(store.claim, first["message_id_hex"])
+                original = getattr(store, operation_name)
+                unavailable = True
+                delivered = asyncio.Event()
+                original_handle = adapter.handle_message
+
+                async def observe_delivery(message):
+                    await original_handle(message)
+                    if len(adapter.events) == 2:
+                        delivered.set()
+
+                adapter.handle_message = observe_delivery
+
+                def fault(*args, **kwargs):
+                    if unavailable:
+                        if post_commit:
+                            original(*args, **kwargs)
+                        raise self.adapter_module.sqlite3.OperationalError("synthetic disposition storage failure")
+                    return original(*args, **kwargs)
+
+                setattr(store, operation_name, fault)
+                adapter._should_run_turn = unittest.mock.AsyncMock(side_effect=OSError("temporary RPC failure"))
+                retry = None
+                try:
+                    with unittest.mock.patch.object(self.adapter_module, "INBOUND_SPOOL_RETRY_BACKOFF_S", (0.01, 0.01)):
+                        await adapter._dispatch_inbound_message(claim.event, spool_message_id=claim.message_id)
+                        self.assertIn(claim.message_id, adapter._inbound_dispatch_dispositions)
+                        self.assertFalse(await adapter._try_admit_spooled(claim.message_id, ignore_backoff=True))
+                        adapter._should_run_turn = unittest.mock.AsyncMock(return_value=True)
+                        unavailable = False
+                        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+                        adapter._inbound_spool_wakeup.set()
+                        # The production retry loop polls once per second. Wait
+                        # for delivery, not a 1-second polling budget that races
+                        # that timer on a faster CI runner.
+                        await asyncio.wait_for(delivered.wait(), timeout=5)
+                        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+                    self.assertEqual(["first", "second"], [message.text for message in adapter.events])
+                    self.assertEqual({}, adapter._inbound_dispatch_dispositions)
+                    self.assertEqual(1, (await call(store.get, claim.message_id)).dispatch_attempts)
+                finally:
+                    unavailable = False
+                    if retry is not None:
+                        retry.cancel()
+                        await asyncio.gather(retry, return_exceptions=True)
+                    await adapter.disconnect()
+
+    async def test_handoff_disposition_storage_failure_never_replays_host(self):
+        for post_commit in (False, True):
+            with self.subTest(post_commit=post_commit):
+                adapter = self.make_adapter(extra={"group_activation": "always"})
+                store = adapter._inbound_spool
+                original = store.transition
+                unavailable = True
+
+                def fault(message_id, state, disposition):
+                    if unavailable and state == "unresolved":
+                        if post_commit:
+                            original(message_id, state, disposition)
+                        raise self.adapter_module.sqlite3.OperationalError("synthetic terminal storage failure")
+                    return original(message_id, state, disposition)
+
+                store.transition = fault
+                try:
+                    await adapter._handle_control_event(self.make_event())
+                    await adapter._inbound_queue.join()
+                    self.assertEqual(["durable"], [message.text for message in adapter.events])
+                    unavailable = False
+                    await adapter._retry_inbound_dispatch_dispositions()
+                    await adapter._admit_due_spooled()
+                    await adapter._inbound_queue.join()
+                    record = await adapter._inbound_spool_call(store.get, "33" * 32)
+                    self.assertEqual("unresolved", record.state)
+                    self.assertEqual({}, adapter._inbound_dispatch_dispositions)
+                    self.assertEqual(["durable"], [message.text for message in adapter.events])
+                finally:
+                    unavailable = False
+                    await adapter.disconnect()
 
     async def test_mention_policy_skip_is_explicit_terminal_disposition(self):
-        adapter = self.make_adapter(extra={"group_activation": "mention"})
+        class MultiPartyClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"type": "group_info", "is_direct": False, "member_count": 3}
+
+        adapter = self.make_adapter(
+            extra={"group_activation": "mention"}, client=MultiPartyClient()
+        )
         await adapter._handle_control_event(self.make_event(mentions_self=False))
         await adapter._inbound_queue.join()
         record = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("intentionally_skipped", record.state)
         self.assertEqual("mention_policy_skip", record.disposition)
         self.assertEqual([], adapter.events)
-        adapter._inbound_spool.close()
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_group_info_error_defers_then_recovery_unblocks_group_fifo(self):
+        class RecoveringClient:
+            fail_lookup = True
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                if self.fail_lookup:
+                    raise RuntimeError("synthetic group lookup failure")
+                return {"type": "group_info", "is_direct": True, "member_count": 2}
+
+        client = RecoveringClient()
+        adapter = self.make_adapter(
+            extra={"group_activation": "mention"}, client=client
+        )
+        await adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first", mentions_self=False)
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second", mentions_self=False)
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        async def suppress_admission():
+            return None
+
+        adapter._admit_due_spooled = suppress_admission
+
+        first_claim = adapter._inbound_spool.claim(
+            first["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            first_claim.event, spool_message_id=first_claim.message_id
+        )
+        deferred = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("pending", deferred.state)
+        self.assertEqual("dispatch_failed_before_handoff", deferred.disposition)
+        with self.assertRaises(self.adapter_module.StaleClaim):
+            adapter._inbound_spool.claim(
+                second["message_id_hex"], ignore_backoff=True
+            )
+
+        client.fail_lookup = False
+        first_claim = adapter._inbound_spool.claim(
+            first["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            first_claim.event, spool_message_id=first_claim.message_id
+        )
+        second_claim = adapter._inbound_spool.claim(
+            second["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            second_claim.event, spool_message_id=second_claim.message_id
+        )
+
+        self.assertEqual(["first", "second"], [event.text for event in adapter.events])
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+        )
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(second["message_id_hex"]).state
+        )
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_retry_loop_survives_one_admission_error(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
-        adapter._ensure_inbound_spool_open()
+        await adapter._ensure_inbound_spool_open()
         event = self.adapter_module._normalize_inbound_message_event(self.make_event())
         adapter._inbound_spool.record(event)
         original_admit = adapter._try_admit_spooled
         attempts = 0
         failed_once = asyncio.Event()
 
-        def flaky_admit(message_id):
+        async def flaky_admit(message_id):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 failed_once.set()
                 raise self.adapter_module.InboundSpoolError("synthetic admission failure")
-            return original_admit(message_id)
+            return await original_admit(message_id)
 
         adapter._try_admit_spooled = flaky_admit
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
@@ -6950,7 +7272,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            adapter._inbound_spool.close()
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_debounce_enqueue_failure_releases_and_preserves_same_group_fifo(self):
         adapter = self.make_adapter(
@@ -6988,9 +7310,9 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
 
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
-        self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
-        self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
-        adapter._inbound_spool.close()
+        self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("55" * 32).state)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_failed_debounce_release_retries_without_restart(self):
         adapter = self.make_adapter(
@@ -7030,13 +7352,13 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
-            self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
+            self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
             self.assertEqual({}, adapter._debounce_release_pending)
             self.assertFalse(retry.done())
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            adapter._inbound_spool.close()
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_post_commit_debounce_release_error_retries_idempotently_and_preserves_fifo(self):
         adapter = self.make_adapter(
@@ -7076,7 +7398,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         # The first mutation committed before surfacing an error. Repeating the
         # CAS release changes zero rows but still retires the process-local handle.
-        adapter._retry_pending_debounce_releases()
+        await adapter._retry_pending_debounce_releases()
         self.assertEqual({}, adapter._debounce_release_pending)
 
         adapter._enqueue_debounced = original_enqueue
@@ -7095,9 +7417,9 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(2, release_attempts)
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
-        self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
-        self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
-        adapter._inbound_spool.close()
+        self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("unresolved", adapter._inbound_spool.get("55" * 32).state)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_disconnect_survives_unexpected_release_exception_and_reopen_recovers_once(self):
         adapter = self.make_adapter(
@@ -7121,20 +7443,238 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         adapter._inbound_spool.release_debounce = original_release
         adapter._enable_store_generation()
-        adapter._ensure_inbound_spool_open()
+        await adapter._ensure_inbound_spool_open()
+        adapter._inbound_spool_admission_enabled = True
         recovered = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("pending", recovered.state)
         self.assertEqual("recovered_debounce_buffer", recovered.disposition)
-        adapter._admit_due_spooled()
+        await adapter._admit_due_spooled()
         await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
-        adapter._admit_due_spooled()
+        await adapter._admit_due_spooled()
         await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
         self.assertEqual([item.text for item in adapter.events], ["recover after reopen"])
-        adapter._inbound_spool.close()
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_disconnect_fences_successor_admission_before_queue_cancel(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first")
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        first_claim = adapter._inbound_spool.claim(first["message_id_hex"])
+        handed = asyncio.Event()
+        calls = []
+
+        async def blocking_handle(message):
+            calls.append(message.text)
+            handed.set()
+            await asyncio.Event().wait()
+
+        adapter.handle_message = blocking_handle
+        adapter._inbound_queue.enqueue(
+            first_claim.group_id,
+            lambda: adapter._dispatch_inbound_message(
+                first_claim.event, spool_message_id=first_claim.message_id
+            ),
+        )
+        await asyncio.wait_for(handed.wait(), timeout=1)
+
+        await adapter.disconnect()
+
+        self.assertEqual(["first"], calls)
+        self.assertFalse(adapter._inbound_spool_admission_enabled)
+        self.assertEqual(set(), adapter._inbound_queue._pending)
+        self.assertFalse(adapter._inbound_spool.is_open)
+        adapter._inbound_spool.open()
+        try:
+            self.assertEqual(
+                "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+            )
+            self.assertEqual(
+                "pending", adapter._inbound_spool.get(second["message_id_hex"]).state
+            )
+        finally:
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_shutdown_fence_releases_a_claim_completed_after_admission_started(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        await adapter._inbound_spool_call(adapter._inbound_spool.record, event)
+        claimed = asyncio.Event()
+        release = asyncio.Event()
+        original_call = adapter._inbound_spool_call
+
+        async def pause_claim(operation, *args, **kwargs):
+            result = await original_call(operation, *args, **kwargs)
+            if operation == adapter._inbound_spool.claim:
+                claimed.set()
+                await release.wait()
+            return result
+
+        adapter._inbound_spool_call = pause_claim
+        admission = asyncio.create_task(adapter._try_admit_spooled(event["message_id_hex"]))
+        try:
+            await asyncio.wait_for(claimed.wait(), timeout=1)
+            adapter._inbound_spool_admission_enabled = False
+            release.set()
+            self.assertFalse(await asyncio.wait_for(admission, timeout=1))
+            self.assertEqual(set(), adapter._inbound_queue._pending)
+            record = await original_call(adapter._inbound_spool.get, event["message_id_hex"])
+            self.assertEqual("pending", record.state)
+            adapter._inbound_spool_admission_enabled = True
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            self.assertEqual(["durable"], [message.text for message in adapter.events])
+        finally:
+            release.set()
+            await asyncio.gather(admission, return_exceptions=True)
+            await adapter.disconnect()
+
+    async def test_reopened_spool_rejects_a_previous_generation_claim_result(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        await adapter._inbound_spool_call(adapter._inbound_spool.record, event)
+        claimed = asyncio.Event()
+        release = asyncio.Event()
+        original_call = adapter._inbound_spool_call
+
+        async def pause_claim(operation, *args, **kwargs):
+            result = await original_call(operation, *args, **kwargs)
+            if operation == adapter._inbound_spool.claim:
+                claimed.set()
+                await release.wait()
+            return result
+
+        adapter._inbound_spool_call = pause_claim
+        admission = asyncio.create_task(adapter._try_admit_spooled(event["message_id_hex"]))
+        try:
+            await asyncio.wait_for(claimed.wait(), timeout=1)
+            generation = adapter._inbound_spool.generation
+            await original_call(adapter._inbound_spool.close, graceful=False)
+            await original_call(adapter._inbound_spool.open)
+            self.assertGreater(adapter._inbound_spool.generation, generation)
+            release.set()
+            self.assertFalse(await asyncio.wait_for(admission, timeout=1))
+            self.assertEqual(set(), adapter._inbound_queue._pending)
+            record = await original_call(adapter._inbound_spool.get, event["message_id_hex"])
+            self.assertEqual("pending", record.state)
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            self.assertEqual(["durable"], [message.text for message in adapter.events])
+        finally:
+            release.set()
+            await asyncio.gather(admission, return_exceptions=True)
+            await adapter.disconnect()
+
+    async def test_disconnect_joins_a_debounce_flush_waiting_for_claim(self):
+        adapter = self.make_adapter(extra={"group_activation": "always", "debounce_ms": 1})
+        claimed = asyncio.Event()
+        cancelling_producers = asyncio.Event()
+        release = asyncio.Event()
+        original_call = adapter._inbound_spool_call
+        original_cancel_debounce = adapter._cancel_debounce_tasks
+        original_cancel_queue = adapter._inbound_queue.cancel_all
+        producer = None
+        producer_done_at_queue_cancel = []
+
+        async def pause_claim(operation, *args, **kwargs):
+            nonlocal producer
+            result = await original_call(operation, *args, **kwargs)
+            if operation == adapter._inbound_spool.claim:
+                producer = asyncio.current_task()
+                claimed.set()
+                await release.wait()
+            return result
+
+        async def cancel_debounce():
+            cancelling_producers.set()
+            await original_cancel_debounce()
+
+        async def cancel_queue():
+            producer_done_at_queue_cancel.append(producer.done())
+            await original_cancel_queue()
+
+        adapter._inbound_spool_call = pause_claim
+        adapter._cancel_debounce_tasks = cancel_debounce
+        adapter._inbound_queue.cancel_all = cancel_queue
+        shutdown = None
+        try:
+            await adapter._handle_control_event(self.make_event())
+            await asyncio.wait_for(claimed.wait(), timeout=1)
+            shutdown = asyncio.create_task(adapter.disconnect())
+            await asyncio.wait_for(cancelling_producers.wait(), timeout=1)
+            release.set()
+            await asyncio.wait_for(shutdown, timeout=1)
+            self.assertEqual([True], producer_done_at_queue_cancel)
+            self.assertTrue(producer.done())
+            self.assertEqual([], adapter.events)
+            self.assertEqual(set(), adapter._inbound_queue._pending)
+            self.assertFalse(adapter._inbound_spool.is_open)
+            await original_call(adapter._inbound_spool.open)
+            record = await original_call(adapter._inbound_spool.get, "33" * 32)
+            self.assertEqual("pending", record.state)
+        finally:
+            release.set()
+            await asyncio.gather(
+                *(task for task in (shutdown, producer) if task is not None),
+                return_exceptions=True,
+            )
+            await adapter.disconnect()
+
+    async def test_post_commit_claim_verification_error_retries_once_and_preserves_fifo(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first")
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        original_verify = adapter._inbound_spool._checkpoint_and_verify_bound
+        failed_once = False
+
+        def fail_once():
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise self.adapter_module.InboundSpoolError(
+                    "synthetic post-commit claim verification failure"
+                )
+            return original_verify()
+
+        adapter._inbound_spool._checkpoint_and_verify_bound = fail_once
+        with self.assertRaisesRegex(
+            self.adapter_module.InboundSpoolError, "post-commit claim"
+        ):
+            await adapter._try_admit_spooled(first["message_id_hex"])
+        recovered = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("pending", recovered.state)
+        self.assertEqual("claim_post_commit_verification_failed", recovered.disposition)
+
+        adapter._inbound_spool._checkpoint_and_verify_bound = original_verify
+        await adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual(["first", "second"], [message.text for message in adapter.events])
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state
+        )
+        self.assertEqual(
+            "unresolved", adapter._inbound_spool.get(second["message_id_hex"]).state
+        )
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_retry_loop_survives_unexpected_debounce_release_exception(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
-        adapter._ensure_inbound_spool_open()
+        await adapter._ensure_inbound_spool_open()
         event = self.adapter_module._normalize_inbound_message_event(self.make_event())
         message_id = event["message_id_hex"]
         adapter._inbound_spool.record(event, debounce_buffered=True)
@@ -7142,11 +7682,11 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         original_retry = adapter._retry_pending_debounce_releases
         failed_once = asyncio.Event()
 
-        def flaky_retry():
+        async def flaky_retry():
             if not failed_once.is_set():
                 failed_once.set()
                 raise ValueError("synthetic unexpected release failure")
-            return original_retry()
+            return await original_retry()
 
         adapter._retry_pending_debounce_releases = flaky_retry
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
@@ -7165,11 +7705,11 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            adapter._inbound_spool.close()
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_debounce_release_reason_is_latest_reason_wins(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
-        adapter._ensure_inbound_spool_open()
+        await adapter._ensure_inbound_spool_open()
         event = self.adapter_module._normalize_inbound_message_event(self.make_event())
         message_id = event["message_id_hex"]
         adapter._inbound_spool.record(event, debounce_buffered=True)
@@ -7179,27 +7719,28 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             raise self.adapter_module.InboundSpoolError("synthetic release failure")
 
         adapter._inbound_spool.release_debounce = fail_release
-        adapter._release_debounce_items([event], reason="older_reason")
-        adapter._release_debounce_items([event], reason="latest_reason")
+        await adapter._release_debounce_items([event], reason="older_reason")
+        await adapter._release_debounce_items([event], reason="latest_reason")
         self.assertEqual("latest_reason", adapter._debounce_release_pending[message_id])
 
         adapter._inbound_spool.release_debounce = original_release
-        adapter._retry_pending_debounce_releases()
+        await adapter._retry_pending_debounce_releases()
         self.assertEqual({}, adapter._debounce_release_pending)
         self.assertEqual("latest_reason", adapter._inbound_spool.get(message_id).disposition)
-        adapter._inbound_spool.close()
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_retry_loop_survives_raw_sqlite_read_error(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
-        adapter._ensure_inbound_spool_open()
+        await adapter._ensure_inbound_spool_open()
         event = self.adapter_module._normalize_inbound_message_event(self.make_event())
         adapter._inbound_spool.record(event)
         original_due = adapter._inbound_spool.due
         failed_once = asyncio.Event()
+        loop = asyncio.get_running_loop()
 
         def flaky_due(*, now=None):
             if not failed_once.is_set():
-                failed_once.set()
+                loop.call_soon_threadsafe(failed_once.set)
                 raise self.adapter_module.sqlite3.OperationalError(
                     "synthetic raw sqlite failure"
                 )
@@ -7221,11 +7762,11 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            adapter._inbound_spool.close()
+            await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
     async def test_cancel_after_handoff_preserves_cancellation_and_recovers_unresolved(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
-        adapter._ensure_inbound_spool_open()
+        await adapter._ensure_inbound_spool_open()
         event = self.adapter_module._normalize_inbound_message_event(self.make_event())
         message_id = event["message_id_hex"]
         adapter._inbound_spool.record(event)
@@ -7242,7 +7783,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.wait_for(handed.wait(), timeout=1)
         self.assertEqual("handed", adapter._inbound_spool.get(message_id).state)
-        adapter._inbound_spool.close(graceful=False)
+        await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
         dispatch.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await dispatch
@@ -7252,7 +7793,53 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         record = adapter._inbound_spool.get(message_id)
         self.assertEqual("unresolved", record.state)
         self.assertEqual("host_handoff_outcome_unknown", record.disposition)
-        adapter._inbound_spool.close()
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_blocking_spool_record_keeps_event_loop_responsive(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        original_record = adapter._inbound_spool.record
+
+        def slow_record(*args, **kwargs):
+            time.sleep(0.15)
+            return original_record(*args, **kwargs)
+
+        adapter._inbound_spool.record = slow_record
+        started = time.monotonic()
+        handling = asyncio.create_task(adapter._handle_control_event(self.make_event()))
+        await asyncio.sleep(0.02)
+        self.assertFalse(handling.done())
+        self.assertLess(time.monotonic() - started, 0.10)
+        await asyncio.wait_for(handling, timeout=1)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual(["durable"], [message.text for message in adapter.events])
+        await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_cancel_before_handoff_preserves_cancellation_when_defer_fails(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event)
+        adapter._inbound_spool.claim(message_id)
+        entered = asyncio.Event()
+
+        async def block_before_handoff(_event):
+            entered.set()
+            await asyncio.Event().wait()
+
+        def fail_defer(*args, **kwargs):
+            raise self.adapter_module.InboundSpoolError("synthetic cancellation persistence failure")
+
+        adapter._should_run_turn = block_before_handoff
+        adapter._inbound_spool.defer = fail_defer
+        dispatch = asyncio.create_task(
+            adapter._dispatch_inbound_message(event, spool_message_id=message_id)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        dispatch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await dispatch
+        await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
 
 
 if __name__ == "__main__":

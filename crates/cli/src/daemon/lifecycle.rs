@@ -504,7 +504,7 @@ pub(crate) fn daemon_error(json: bool, code: &str, message: String) -> CliOutput
     CliOutput {
         code: 1,
         stdout: String::new(),
-        stderr: format!("error: {message}\n"),
+        stderr: format!("error: {}\n", crate::terminal_safe_text(&message)),
     }
 }
 

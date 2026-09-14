@@ -432,6 +432,18 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
             assert!(
+                report
+                    .step_log
+                    .iter()
+                    .all(|step| !matches!(step.status, crate::ScenarioStepStatus::Failed { .. })),
+                "case {case_index} failed before observation: {:#?}",
+                report
+                    .step_log
+                    .iter()
+                    .filter(|step| matches!(step.status, crate::ScenarioStepStatus::Failed { .. }))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
                 report.expectation_failures.is_empty(),
                 "{} expectation failures: {:#?}",
                 case.scenario.name,

@@ -80,6 +80,28 @@ fn roundtrip_math_and_html() {
 }
 
 #[test]
+fn roundtrip_details() {
+    roundtrip("<details open>\n<summary>*More*</summary>\n\ninner **bold**\n\n</details>");
+}
+
+#[test]
+fn legacy_details_without_gaps_deserializes() {
+    let json = r#"{
+        "blocks": [
+            {"Details": {"summary": [], "open": false, "body": []}}
+        ]
+    }"#;
+    let document: Document = serde_json::from_str(json).expect("deserialize");
+    let marmot_markdown::Block::Details {
+        blank_lines_before, ..
+    } = &document.blocks[0]
+    else {
+        panic!("expected details");
+    };
+    assert!(blank_lines_before.is_empty());
+}
+
+#[test]
 fn roundtrip_nostr_mention_and_uri() {
     let body = "xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9";
     let md = format!("Hello @npub1{body} via nostr:npub1{body}.");

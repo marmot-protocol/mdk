@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-08-19
+updated: 2026-09-10
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -50,11 +50,11 @@ mdk#379).
 
 | Value class | Memory | `Debug`/`Display` | FFI | Tracing/logs | Forensic audit |
 | --- | --- | --- | --- | --- | --- |
-| Key material (account secret, SQLCipher keys, media/avatar keys, exporter secrets) | `Zeroizing` for raw buffers and copies | Redacted (hand-written `Debug`, never derive on the holding struct) | Setters accept, accessors never return | Never | Never, either mode |
-| Bearer/upload tokens (OTLP, audit tracker) | Short-lived; avoid long-lived copies | Redacted | Write-only: setters in, no read-back | Never | Never, either mode |
-| Plaintext / decoded content | n/a | Only on message DTOs that never reach tracing | Allowed (it is the product) | Never | Full-data mode only; scrubbed at the sink in obfuscated mode |
-| Full pubkeys / npubs | n/a | Allowed on DTOs | Allowed | Never | Full-data mode only; scrubbed at the sink; salted member refs are the obfuscated form |
-| Relay URLs / endpoints | n/a | Structured fields only (never inside error `reason` strings) | Allowed | Never — log `endpoint_count` or a privacy-safe error kind | Allowed (audit is local-only, explicit opt-in) |
+| Key material (account secret, SQLCipher keys, media/avatar keys, exporter secrets) | `Zeroizing` for raw buffers and copies | Redacted (hand-written `Debug`, never derive on the holding struct) | Setters accept, accessors never return | Never | Never |
+| Bearer/upload tokens (OTLP, audit tracker) | Short-lived; avoid long-lived copies | Redacted | Write-only: setters in, no read-back | Never | Never |
+| Plaintext / decoded content | n/a | Only on message DTOs that never reach tracing | Allowed (it is the product) | Never | Never |
+| Full pubkeys / npubs | n/a | Allowed on DTOs | Allowed | Never | Never; deterministic member hashes provide correlation |
+| Relay URLs / endpoints | n/a | Structured fields only (never inside error `reason` strings) | Allowed | Never — log `endpoint_count` or a privacy-safe error kind | Allowed (explicit opt-in forensic recording/upload; sensitive) |
 | Account/group/message ids | n/a | Allowed on DTOs | Allowed | Never | Allowed (hashed/truncated forms preferred) |
 | Errors wrapping any of the above | n/a | Constructors keep `Display` free of URLs/ids/values | n/a | Log `error_kind = privacy_safe_kind()` (or `io::ErrorKind`, variant names) — never `{err}`/`error = %err` | `error_kind` strings only |
 
@@ -104,3 +104,20 @@ Relay identity is the sole identifier permitted to leave the device, and only as
 identifier of the reporter. This carve-out applies to the export channel alone and never to logs or traces. The full
 contract, metric catalogue, and architecture live in
 [`../relay-observability.md`](../relay-observability.md).
+
+## Optional usage analytics
+
+The [usage and diagnostics collector](../usage-diagnostics.md) is a second explicit
+export boundary. Product observations use approved finite schemas, coarse metadata,
+bucketed counts/durations, temporary IDs, and memory-only queues under the shared
+revocable permission. No content, account/group IDs, or persistent installation ID
+enters product payloads. Stock Aptabase still receives source IP information and
+performs daily grouping and country/region enrichment. Temporary IDs do not remove
+rare-event or timing risks; preserve existing relay dashboard safeguards. Audit
+logging retains its separate consent. Native UI adoption and deployed logging and
+retention verification are separate from MDK implementation evidence.
+
+Forensic audit v4 excludes account labels and free-form device labels/names in both JSONL and upload headers.
+Platform, app version and optional system hardware model remain; model metadata must never be a hostname,
+serial number or user-assigned name. Deterministic account/member hashes and existing forensic identifiers remain
+linkable sensitive data, distinct from aggregate-only telemetry. See [audit logging](../audit-logging.md).

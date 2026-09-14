@@ -99,6 +99,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -212,8 +213,10 @@ fn seed_probe_work_rows(
         intent: SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: vec![0x73, suffix],
+            expected_epoch: None,
         },
         created_at_ms: u64::from(suffix),
+        reissue_attempts: 0,
     };
     storage
         .put_queued_outbound_intent(&queued)
@@ -559,6 +562,27 @@ impl OutboundIntentStorage for FlakyGroupRecordStorage {
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+    fn put_own_commit_intent(
+        &self,
+        record: &cgka_traits::storage::OwnCommitIntent,
+    ) -> StorageResult<()> {
+        self.inner.put_own_commit_intent(record)
+    }
+    fn own_commit_intent(
+        &self,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.own_commit_intent(commit_id)
+    }
+    fn list_own_commit_intents(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> StorageResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.list_own_commit_intents(group_id)
+    }
+    fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_own_commit_intent(commit_id)
     }
 }
 
@@ -1523,6 +1547,7 @@ async fn quarantined_group_blocks_convergence_and_send() {
             .send(cgka_traits::engine::SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: b"blocked".to_vec(),
+                expected_epoch: None,
             })
             .await,
         Err(EngineError::UnknownGroup(id)) if id == group_id

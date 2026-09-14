@@ -890,6 +890,42 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn forget_group_local(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if !account.is_active_local_signing() {
+            use cgka_traits::storage::GroupStorage;
+            let changed = self
+                .app
+                .account_storage(&account.label)?
+                .forget_group_local(group_id, cgka_traits::Timestamp(crate::unix_now_seconds()))?;
+            if changed {
+                publish_app_runtime_group_state_updated(
+                    &self.events,
+                    &account.account_id_hex,
+                    &account.label,
+                    group_id,
+                );
+            }
+            return Ok(changed);
+        }
+
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ForgetGroupLocal {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn delete_group_local(
         &self,
         account_ref: &str,
@@ -918,6 +954,59 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::DeleteGroupLocal {
                 group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn group_recovery_status(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn confirm_group_rejoin(
+        &self,
+        account_ref: &str,
+        welcome_id: &cgka_traits::MessageId,
+        token: &[u8],
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ConfirmGroupRejoin {
+                welcome_id: welcome_id.clone(),
+                token: token.to_vec(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn decline_group_rejoin(
+        &self,
+        account_ref: &str,
+        welcome_id: &cgka_traits::MessageId,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DeclineGroupRejoin {
+                welcome_id: welcome_id.clone(),
                 respond,
             })
             .await
@@ -1234,17 +1323,28 @@ impl AccountManager {
         group_id: &GroupId,
         payload: Vec<u8>,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::SendMessage {
-                group_id: group_id.clone(),
-                payload,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let enqueued_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::SendMessage {
+                    enqueued_at,
+                    group_id: group_id.clone(),
+                    payload,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::OutboundMessageResponse,
+            enqueued_at.elapsed(),
+            result.is_ok(),
+        );
+        let summary = result?;
         self.schedule_audit_log_tracker_update("send_message");
         Ok(summary)
     }
@@ -1376,17 +1476,28 @@ impl AccountManager {
         group_id: &GroupId,
         intent: AppMessageIntent,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::SendAppEvent {
-                group_id: group_id.clone(),
-                intent,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let enqueued_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::SendAppEvent {
+                    enqueued_at,
+                    group_id: group_id.clone(),
+                    intent,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::OutboundMessageResponse,
+            enqueued_at.elapsed(),
+            result.is_ok(),
+        );
+        let summary = result?;
         self.schedule_audit_log_tracker_update("send_app_event");
         Ok(summary)
     }
@@ -1702,7 +1813,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<usize, AppError> {
-        let command = self.worker_commands(account_ref).await?;
+        let command = self.worker_commands_for_setup(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::PublishSetupKeyPackage { respond })

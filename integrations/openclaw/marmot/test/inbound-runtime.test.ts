@@ -689,6 +689,68 @@ describe("startMarmotInbound", () => {
     stop();
   });
 
+  it("cancels startup-raced debounce work on external abort and accepts replay", async () => {
+    vi.useFakeTimers();
+    const event = inboundEvent("cc", "d4");
+    const dispatched: MarmotInboundMessage[] = [];
+    const config = {
+      channels: { marmot: { debounceMs: 25, profileNameOnboarding: false } },
+    };
+    const externalController = new AbortController();
+    let releaseAccountList!: () => void;
+    const accountListGate = new Promise<void>((resolve) => {
+      releaseAccountList = resolve;
+    });
+    const startupRacedClient = {
+      async accountList() {
+        await accountListGate;
+        return {
+          type: "account_list",
+          accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+        };
+      },
+      async *subscribeInbound(
+        _filter?: unknown,
+        _signal?: AbortSignal,
+        hooks?: { onReady?: () => void },
+      ): AsyncGenerator<AgentControlEvent> {
+        hooks?.onReady?.();
+        yield event;
+      },
+    } as unknown as MarmotAgentControlClient;
+
+    const firstStop = startMarmotInbound(
+      { config, logger: noopLogger },
+      (message) => {
+        dispatched.push(message);
+      },
+      {
+        signal: externalController.signal,
+        clientFactory: () => startupRacedClient,
+      },
+    );
+
+    externalController.abort();
+    releaseAccountList();
+    await vi.advanceTimersByTimeAsync(25);
+    expect(dispatched).toHaveLength(0);
+
+    const secondStop = startMarmotInbound(
+      { config, logger: noopLogger },
+      (message) => {
+        dispatched.push(message);
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await vi.advanceTimersByTimeAsync(25);
+    expect(dispatched.map((message) => message.messageIdHex)).toEqual([
+      event.message.message_id_hex,
+    ]);
+
+    firstStop();
+    secondStop();
+  });
+
   it("cancels a buffered debounce on stop and accepts the replay after restart", async () => {
     vi.useFakeTimers();
     const event = inboundEvent("cc", "d4");

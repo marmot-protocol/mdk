@@ -111,3 +111,31 @@ cargo test -p storage-sqlite
 ```
 
 See [`AGENTS.md`](AGENTS.md) for module layout and migration rules.
+
+## Deferred recovery preparation benchmark
+
+`MessageStorage::list_deferred_message_metadata` preserves insertion order and exact encoded payload
+lengths while omitting normalized payload blobs. The engine uses it for sweep preparation and readiness,
+then fetches full records only for selected attempts, retirement, or bounded lifecycle normalization.
+Legacy format-1 rows still require their record blob until existing bounded promotion converts them.
+The default trait implementation remains compatible with other backends.
+
+Run the opt-in paired benchmark against encrypted temporary files:
+
+```sh
+MDK_DEFERRED_PREPARATION_BENCHMARK_OUT=target/deferred-preparation.json \
+  CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p storage-sqlite \
+  --lib deferred_metadata_file_backed_benchmark -- --ignored --nocapture
+```
+
+It generates 0/4,096 processed rows and 0/64/512/2,048 deferred rows with 4 KiB payloads, varies
+row epochs over 17 values, includes persisted lifecycle fields, alternates query order, and writes ten warmed samples after two warmups to the requested private JSON file.
+Reported blob bytes count full-record values materialized in Rust; they exclude SQLite pages,
+metadata values, and filesystem cache effects. This measures storage enumeration, not retained
+MLS context construction or scheduler wake pressure. No timing threshold is asserted.
+
+On the September 6, 2026 local run, 4,096 processed plus 2,048 deferred rows took about 29.8 ms
+for the full-row query versus 15.1 ms for metadata, avoiding 8 MiB of full payload copies per query.
+The query still enumerates all deferred metadata so an unattempted row beyond a previously
+attempted prefix remains visible. Candidate-graph cost and repeated zero-attempt wake pacing
+remain follow-up work in [#1715](https://github.com/marmot-protocol/mdk/issues/1715).

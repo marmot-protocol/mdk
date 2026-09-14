@@ -142,6 +142,21 @@ fn walk(block: Block, refs: &HashMap<String, LinkRef>) -> Block {
                 })
                 .collect(),
         },
+        Block::Details {
+            summary,
+            open,
+            body,
+            blank_lines_before,
+        } => Block::Details {
+            summary: if summary.is_empty() {
+                Vec::new()
+            } else {
+                tokenize(&extract_raw(summary), refs)
+            },
+            open,
+            body: walk_blocks(body, refs),
+            blank_lines_before,
+        },
         Block::Table {
             alignments,
             header,

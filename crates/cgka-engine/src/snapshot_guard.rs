@@ -155,8 +155,10 @@ mod tests {
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: vec![id],
+                expected_epoch: None,
             },
             created_at_ms: u64::from(id),
+            reissue_attempts: 0,
         }
     }
 

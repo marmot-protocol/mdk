@@ -19,7 +19,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 pub const MEMBERSHIP_REENTRY_FAMILY: &str = "membership-reentry/v1";
-pub const MEMBERSHIP_REENTRY_GENERATOR_VERSION: &str = "1";
+pub const MEMBERSHIP_REENTRY_GENERATOR_VERSION: &str = "2";
 
 const ARM_COUNT: u64 = 10;
 
@@ -347,17 +347,12 @@ pub fn generate_membership_reentry_case(seed: u64, case_index: u64) -> Generated
             epoch += 1;
             assert_client_state(&mut steps, "alice", epoch, clients.len());
 
-            let refusal_step = steps.len();
-            steps.push(ScenarioStep::ExpectTickError {
-                client: victim.into(),
-                error: "invalid_transition".into(),
+            // The fully validated offer is durable, but cannot change active
+            // membership without consent. Delivery itself no longer fails.
+            steps.push(ScenarioStep::Tick {
+                clients: vec![victim.into()],
             });
-            expected.push(TraceExpectation::ExpectedError {
-                step_index: refusal_step,
-                client: victim.into(),
-                operation: "tick".into(),
-                error: "invalid_transition".into(),
-            });
+            assert_client_state(&mut steps, victim, epoch - 2, clients.len());
 
             // A newer Welcome cannot authenticate its own lineage. Only after
             // the victim applies the commit from its currently trusted branch

@@ -120,7 +120,27 @@ impl Hash for KeyPackage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendIntent {
     /// Encrypt + send an application-layer payload to the group.
-    AppMessage { group_id: GroupId, payload: Vec<u8> },
+    AppMessage {
+        group_id: GroupId,
+        payload: Vec<u8>,
+        /// The MLS epoch this payload must be encrypted under, for payloads
+        /// that bind key material to an epoch the wire format does not carry.
+        /// An encrypted-media `imeta` reference is the case today: recipients
+        /// derive the media key from the epoch of the message that delivers
+        /// the tag, so ciphertext produced at epoch N is unreadable when the
+        /// tag ships at N+1.
+        ///
+        /// `None` (the default, and every ordinary message) lets the engine
+        /// retain the intent while the group's epoch is unsettled and encrypt
+        /// it under whatever epoch the group lands on. A pinned message has
+        /// no such freedom: the engine refuses it with
+        /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
+        /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
+        /// time if convergence moved the epoch during the send. Nothing is
+        /// persisted or published in either case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_epoch: Option<EpochId>,
+    },
     /// Invite new members via their KeyPackages.
     Invite {
         group_id: GroupId,
@@ -175,6 +195,76 @@ pub enum SendIntent {
 ///
 /// `GroupEvolution` carries both the commit and any welcomes produced by
 /// member additions.
+/// Which kind of own commit convergence superseded (mdk#1734).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersededIntentKind {
+    GroupProfile,
+    AppComponents,
+    RemoveMembers,
+    Invite,
+}
+
+impl SupersededIntentKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupProfile => "group_profile",
+            Self::AppComponents => "app_components",
+            Self::RemoveMembers => "remove_members",
+            Self::Invite => "invite",
+        }
+    }
+}
+
+/// What the engine did with a superseded own commit's intent (mdk#1734).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersededIntentOutcome {
+    /// The intent is still valid against the canonical state and has been
+    /// queued again; the next outbound drain re-issues it.
+    Reissued,
+    /// The winning branch changed the same field or component. The caller's
+    /// edit is dropped; the winner's value stands.
+    Conflict,
+    /// The winning branch already produced the requested state (for example
+    /// it removed the same members), so there is nothing to re-issue.
+    AlreadySatisfied,
+    /// A lost invite cannot be replayed: its KeyPackages were consumed by the
+    /// parked Welcome. The inviter must re-invite with fresh material.
+    ReinviteRequired,
+    /// The intent lost more races than the engine will retry, or the outbound
+    /// queue is full; the caller must repeat the change deliberately.
+    Abandoned,
+    /// This device is no longer a member of the group.
+    NotMember,
+}
+
+impl SupersededIntentOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reissued => "reissued",
+            Self::Conflict => "conflict",
+            Self::AlreadySatisfied => "already_satisfied",
+            Self::ReinviteRequired => "reinvite_required",
+            Self::Abandoned => "abandoned",
+            Self::NotMember => "not_member",
+        }
+    }
+}
+
+/// One superseded own commit and what became of its intent. Carries no
+/// payloads or member identities beyond the group and commit ids so it can
+/// travel through effects and runtime events unchanged (mdk#1734).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededIntentReport {
+    pub group_id: GroupId,
+    pub commit_id: MessageId,
+    pub kind: SupersededIntentKind,
+    pub outcome: SupersededIntentOutcome,
+    /// Fixed, privacy-safe explanation for logs and UI copy.
+    pub reason: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
     /// The requested idempotent mutation was already reflected by canonical
@@ -442,6 +532,9 @@ pub enum GroupEvent {
         /// MLS-authenticated Welcome author derived from the GroupInfo signer
         /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
+        /// Local recipient explicitly authorized replacement of an active branch.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        explicitly_confirmed: bool,
     },
     /// A raw transport object was released solely because a local durable
     /// resource budget expired. This is not a protocol validity verdict and

@@ -135,6 +135,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -224,6 +225,7 @@ impl TransportPeeler for EphemeralIdPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -1780,6 +1782,7 @@ async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
         .send(SendIntent::AppMessage {
             group_id: gid.clone(),
             payload: before_enable_payload,
+            expected_epoch: None,
         })
         .await
         .unwrap()
@@ -1847,6 +1850,7 @@ async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
         .send(SendIntent::AppMessage {
             group_id: gid.clone(),
             payload: before_disable_payload,
+            expected_epoch: None,
         })
         .await
         .unwrap()

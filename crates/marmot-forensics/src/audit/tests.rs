@@ -547,14 +547,14 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             fields: vec!["name".into(), "description".into()],
             component_ids: vec![0x8001],
             target_count: None,
-            message_ids: vec!["m".into()],
+            message_ids: vec!["ab".repeat(32)],
             from_epoch: Some(1),
             to_epoch: Some(2),
             error_kind: None,
             detail: None,
         },
         AuditEventKind::TransportReceived {
-            msg_id: Some("m".into()),
+            msg_id: Some("ab".repeat(32)),
             transport: AuditTransportWire {
                 transport: Some("nostr".into()),
                 delivery_plane: Some("group".into()),
@@ -577,20 +577,20 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             payload_digest: "d".repeat(64),
         },
         AuditEventKind::IngestEntry {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             envelope_kind: "welcome".into(),
             transport_source: "nostr".into(),
             payload_len: 1,
-            payload_digest: "d".into(),
+            payload_digest: "d".repeat(64),
         },
         AuditEventKind::IngestOutcome {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             outcome_kind: "stale".into(),
             stale_reason: Some("already_seen".into()),
             epoch: Some(0),
         },
         AuditEventKind::IngestError {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             error_kind: "unknown_group".into(),
             detail: Some("unknown group".into()),
         },
@@ -598,7 +598,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             intent_kind: "app_message".into(),
         },
         AuditEventKind::RecipientExpectation {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             expectation: RecipientExpectation {
                 artifact_kind: MessageArtifactKind::Commit,
                 recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
@@ -613,13 +613,13 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             result_kind: "group_evolution".into(),
             outbound_messages: vec![
                 OutboundMessage {
-                    msg_id: "m".into(),
+                    msg_id: "ab".repeat(32),
                     artifact_kind: MessageArtifactKind::Commit,
                     transport: None,
                     recipient_expectation: None,
                 },
                 OutboundMessage {
-                    msg_id: "w1".into(),
+                    msg_id: "cd".repeat(32),
                     artifact_kind: MessageArtifactKind::Welcome,
                     transport: None,
                     recipient_expectation: None,
@@ -640,7 +640,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::CreateGroupOutcome {
             result_kind: "group_created".into(),
             outbound_messages: vec![OutboundMessage {
-                msg_id: "w1".into(),
+                msg_id: "cd".repeat(32),
                 artifact_kind: MessageArtifactKind::Welcome,
                 transport: None,
                 recipient_expectation: Some(RecipientExpectation {
@@ -658,7 +658,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             detail: Some("feature missing".into()),
         },
         AuditEventKind::PublishAttempt {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             artifact_kind: Some(MessageArtifactKind::Commit),
             target_kind: "group".into(),
             relay_url: None,
@@ -672,7 +672,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             }),
         },
         AuditEventKind::PublishOutcome {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             artifact_kind: Some(MessageArtifactKind::Commit),
             target_kind: "group".into(),
             relay_url: None,
@@ -686,7 +686,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             transport: None,
         },
         AuditEventKind::PublishFailure {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             artifact_kind: Some(MessageArtifactKind::Welcome),
             stage: "required_acks".into(),
             target_kind: "group".into(),
@@ -701,7 +701,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             from_epoch: 0,
             to_epoch: 1,
             pending_kind: "create_group".into(),
-            origin_commit_id: Some("m".into()),
+            origin_commit_id: Some("ab".repeat(32)),
         },
         AuditEventKind::EpochRolledBack {
             pending_epoch: 1,
@@ -722,7 +722,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             membership_change_source: Some(MembershipChangeSource::AdminAction),
             actor_member_ref: Some("a".repeat(32)),
             subject_member_ref: Some("b".repeat(32)),
-            origin_commit_id: Some("m".into()),
+            origin_commit_id: Some("ab".repeat(32)),
             fields: vec!["members".into()],
             component_ids: Vec::new(),
             value: Some(GroupStateValue {
@@ -732,10 +732,8 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::SourceContext {
             source: AuditSourceContext {
-                account_label: Some("Alice".into()),
-                device_label: Some("Alice iPhone".into()),
                 device_id: Some("device-1".into()),
-                device_name: Some("iPhone".into()),
+                hardware_model: Some("iPhone17,3".into()),
                 platform: Some("ios".into()),
                 app_version: Some("2026.6.8".into()),
                 upload_trigger: Some("managed_send".into()),
@@ -760,7 +758,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             candidate_digest: "c".repeat(64),
             incumbent_digest: Some("d".repeat(64)),
             winner: ForkWinner::Candidate,
-            invalidated_msg_id: Some("m".into()),
+            invalidated_msg_id: Some("ab".repeat(32)),
         },
         AuditEventKind::ConvergenceRunState {
             phase: ConvergencePhase::Evaluating,
@@ -776,7 +774,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 branch_id: "br-1".into(),
                 fork_epoch: 2,
                 tip_epoch: 3,
-                commit_ids: vec!["m".into()],
+                commit_ids: vec!["ab".repeat(32)],
                 commit_count: Some(1),
                 state_digest: None,
                 tip_digest: Some("a".repeat(64)),
@@ -808,7 +806,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             error_kinds: vec!["missing_retained_anchor".into()],
         },
         AuditEventKind::PeelerOutcome {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             artifact_kind: None,
             outcome: PeelerOutcomeKind::DecryptFailed,
             fallback_snapshot_used: true,
@@ -824,7 +822,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             reason: Some("not_lowest_index".into()),
         },
         AuditEventKind::MessageStateChanged {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
             previous_state: Some("created".into()),
             new_state: "epoch_invalidated".into(),
@@ -834,7 +832,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             residence_ms: Some(5_000),
         },
         AuditEventKind::Rejection {
-            msg_id: "m".into(),
+            msg_id: "ab".repeat(32),
             reason: "unattributable_sender".into(),
         },
         AuditEventKind::SubscriptionRebuild {
@@ -938,7 +936,7 @@ fn audit_event_kind_round_trips_all_variants() {
 #[test]
 fn audit_log_event_schema_tracks_kind_catalog() {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/audit-log-event.v3.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
     assert_eq!(
         schema
             .pointer("/properties/schema_version/const")
@@ -969,11 +967,11 @@ fn audit_log_event_schema_tracks_kind_catalog() {
 }
 
 /// The trigger enum is a schema-visible catalog, so the two halves must move
-/// together. Without this the v3 `$defs` can be reverted to a narrower set — or
+/// together. Without this the v4 `$defs` can be reverted to a narrower set — or
 /// left behind when a variant is added — and every other test still passes,
 /// because nothing else compares the two.
 #[test]
-fn v3_schema_tracks_the_epoch_stall_backfill_trigger_catalog() {
+fn v4_schema_tracks_the_epoch_stall_backfill_trigger_catalog() {
     let triggers = [
         EpochStallBackfillTrigger::UndecryptableThreshold,
         EpochStallBackfillTrigger::ContestedForkDeferral,
@@ -1001,7 +999,7 @@ fn v3_schema_tracks_the_epoch_stall_backfill_trigger_catalog() {
         .collect::<std::collections::BTreeSet<_>>();
 
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/audit-log-event.v3.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
     let defined = schema
         .pointer("/$defs/epochStallBackfillTrigger/enum")
         .and_then(serde_json::Value::as_array)
@@ -1019,9 +1017,12 @@ fn v3_schema_tracks_the_epoch_stall_backfill_trigger_catalog() {
 }
 
 #[test]
-fn v3_schema_cannot_express_former_sensitive_audit_fields() {
-    let schema = include_str!("../../schema/audit-log-event.v3.schema.json");
+fn v4_schema_cannot_express_former_sensitive_audit_fields() {
+    let schema = include_str!("../../schema/audit-log-event.v4.schema.json");
     for forbidden in [
+        "account_label",
+        "device_label",
+        "device_name",
         "audit_data_mode",
         "full_data",
         "message_content_decoded",
@@ -1039,7 +1040,7 @@ fn v3_schema_cannot_express_former_sensitive_audit_fields() {
     ] {
         assert!(
             !schema.contains(forbidden),
-            "v3 schema unexpectedly exposes former sensitive field {forbidden}"
+            "v4 schema unexpectedly exposes former sensitive field {forbidden}"
         );
     }
 }
@@ -1173,8 +1174,9 @@ fn assert_keys_within_schema(
 #[test]
 fn sample_events_serialize_within_schema_property_names() {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/audit-log-event.v3.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
     let defs = schema["$defs"].clone();
+    let validator = jsonschema::validator_for(&schema).unwrap();
 
     // Every sample kind, wrapped in a full event, must serialize using only keys
     // the schema allows (recursively, including nested wire/candidate/value/etc.).
@@ -1192,6 +1194,12 @@ fn sample_events_serialize_within_schema_property_names() {
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_keys_within_schema(&value, &schema, &defs, "event");
+        assert!(
+            validator.is_valid(&value),
+            "sample {} must satisfy the full v4 schema: {:?}",
+            event.kind.type_tag(),
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
     }
 
     // Also exercise a fully-populated context (transport wire + convergence +
@@ -1234,7 +1242,6 @@ fn sample_events_serialize_within_schema_property_names() {
                 inferred: Some(false),
             }),
             source: Some(AuditSourceContext {
-                account_label: Some("Alice".into()),
                 ..Default::default()
             }),
         }),
@@ -1244,6 +1251,10 @@ fn sample_events_serialize_within_schema_property_names() {
     };
     let value = serde_json::to_value(&event).unwrap();
     assert_keys_within_schema(&value, &schema, &defs, "event");
+    assert!(
+        validator.is_valid(&value),
+        "full context must satisfy the v4 schema"
+    );
 }
 
 fn segment_paths(path: &Path) -> Vec<PathBuf> {
@@ -1463,14 +1474,8 @@ fn normalize_run(bytes: &[u8]) -> String {
 /// mdk#1181: a transient roll failure must not stop rotation for the rest of
 /// the recorder's life.
 ///
-/// This is the counter-lifetime hazard class. `segment_roll_failed` is a latch
-/// whose lifetime is the *directory-unwritable episode*, not the recorder's,
-/// so every site that resets the other per-episode fields (`active_bytes`,
-/// `seq`, the session id, the health counters) must reset it too. Leaving it
-/// set through `swap_to_fresh_file` meant a single `EACCES`/`ENOSPC`/`EMFILE`
-/// let the active file grow back past the app's 64 MiB upload ceiling — the
-/// permanent-failure cliff this issue exists to close. Adding another
-/// per-episode field means enumerating reset-sites x fields again.
+/// A successful destructive rotation must clear the retry deadline as well as
+/// resetting the recorder state, so a subsequent full file can roll immediately.
 #[test]
 #[cfg(unix)]
 fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
@@ -1489,7 +1494,7 @@ fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
     .unwrap();
 
     // The episode: the directory is momentarily unwritable, so the roll-on-open
-    // cannot rename and latches.
+    // cannot rename and schedules a retry.
     fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
     if fs::write(logs.join("probe.tmp"), b"").is_ok() {
         // Root ignores permission bits, so the roll cannot be made to fail
@@ -1574,10 +1579,22 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
     // Enough rows to seal more than one segment, so this covers two boundaries
     // rather than one.
     const ROWS: usize = 8_000;
+    fn record_source_context(recorder: &JsonlRecorder) {
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SourceContext {
+                source: AuditSourceContext {
+                    platform: Some("test".into()),
+                    ..Default::default()
+                },
+            },
+        ));
+    }
 
     let rotated_dir = TempDir::new().unwrap();
     let rotated_path = default_jsonl_path(rotated_dir.path(), "engine-abc");
     let rotated = JsonlRecorder::open(&rotated_path, "engine-abc".to_string()).unwrap();
+    record_source_context(&rotated);
     record_numbered_rows(&rotated, ROWS);
     let segments = segment_paths(&rotated_path);
     assert!(
@@ -1591,13 +1608,15 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
     }
     rotated_bytes.extend_from_slice(&fs::read(&rotated_path).unwrap());
 
-    // The baseline: one recorder, the same rows, no rotation. Failing its first
-    // reopen latches `segment_roll_failed`, so after the compensating
-    // rename-back it writes one continuous file for the rest of the run.
+    // Disable rotation explicitly for the baseline; elapsed wall time must not
+    // change whether this recorder rolls on a loaded runner.
     let plain_dir = TempDir::new().unwrap();
     let plain_path = default_jsonl_path(plain_dir.path(), "engine-abc");
     let plain = JsonlRecorder::open(&plain_path, "engine-abc".to_string()).unwrap();
-    plain.fail_next_segment_reopen();
+    plain
+        .disable_segment_rotation
+        .store(true, Ordering::Relaxed);
+    record_source_context(&plain);
     record_numbered_rows(&plain, ROWS);
     assert!(
         segment_paths(&plain_path).is_empty(),
@@ -1613,4 +1632,99 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
         "rotation must not add, drop, or pad a single byte"
     );
     assert_eq!(normalize_run(&rotated_bytes), normalize_run(&plain_bytes));
+}
+
+#[test]
+fn segment_retry_recovers_without_restart_after_backoff() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.fail_next_segment_reopen();
+    record_until_roll_attempted(&recorder, &path);
+    let before = fs::read(&path).unwrap();
+    let mut inner = recorder.inner.lock().unwrap();
+    let deadline = inner
+        .segment_retry_after
+        .expect("failed rotation schedules retry");
+    recorder.try_roll_segment(&mut inner, deadline - Duration::from_secs(1));
+    assert!(
+        segment_paths(&path).is_empty(),
+        "backoff must suppress repeated scans"
+    );
+    recorder.try_roll_segment(&mut inner, deadline);
+    assert!(inner.segment_retry_after.is_none());
+    drop(inner);
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(fs::read(&segments[0]).unwrap(), before);
+    assert!(fs::read(&path).unwrap().is_empty());
+}
+
+#[test]
+fn failed_flush_does_not_seal_or_discard_buffered_rows() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut inner = recorder.inner.lock().unwrap();
+    inner.writer = BufWriter::new(File::open(&path).unwrap());
+    inner
+        .writer
+        .write_all(b"buffered but unwritable\n")
+        .unwrap();
+    assert!(recorder.roll_into_segment(&mut inner).is_err());
+    assert_eq!(inner.writer.buffer(), b"buffered but unwritable\n");
+    assert_eq!(inner.health.flush_failures, 1);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(segment_paths(&path).is_empty());
+}
+
+#[test]
+fn failed_compensation_keeps_a_tracked_writer_and_can_recover() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.fail_next_segment_reopen();
+    recorder.fail_segment_restore.store(true, Ordering::Relaxed);
+    let mut inner = recorder.inner.lock().unwrap();
+    assert!(recorder.roll_into_segment(&mut inner).is_err());
+    assert_ne!(inner.writer_path, path);
+    assert!(inner.writer_path.exists());
+    assert!(!path.exists());
+    let pending_path = inner.writer_path.clone();
+    let pending_bytes = fs::read(&pending_path).unwrap();
+    drop(inner);
+    assert!(
+        recorder.rotate().is_err(),
+        "must not report discarding a file it retained"
+    );
+    assert_eq!(fs::read(&pending_path).unwrap(), pending_bytes);
+    assert!(!path.exists());
+    let mut inner = recorder.inner.lock().unwrap();
+    assert!(JsonlRecorder::write_record(
+        &mut inner,
+        AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: "app_message".into()
+            }
+        )
+    ));
+    recorder.roll_into_segment(&mut inner).unwrap();
+    assert_eq!(inner.writer_path, path);
+    assert!(path.exists());
+    drop(inner);
+    let all: Vec<AuditEvent> = segment_paths(&path)
+        .iter()
+        .flat_map(|p| {
+            fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<AuditEvent>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].seq, all[0].seq + 1);
+    recorder.rotate().unwrap();
 }
