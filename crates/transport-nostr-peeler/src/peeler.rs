@@ -282,6 +282,7 @@ impl TransportPeeler for NostrMlsPeeler {
             group_id: None,
             sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
             content: PeeledContent::Welcome {
+                created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
                 bytes: welcome_bytes,
             },
             origin: msg.clone(),
@@ -1035,9 +1036,14 @@ mod tests {
             peeled.sender,
             Some(MemberId::new(sender.public_key().to_bytes().to_vec()))
         );
+        let unwrapped =
+            nostr::nips::nip59::extract_rumor(&receiver, &event.to_verified_nostr_event().unwrap())
+                .await
+                .unwrap();
         assert_eq!(
             peeled.content,
             PeeledContent::Welcome {
+                created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
                 bytes: b"mls welcome bytes".to_vec(),
             }
         );

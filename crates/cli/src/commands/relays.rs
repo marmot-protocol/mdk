@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::{
     CommandOutput, RelaysCommand, WnError, ensure_local_signing, npub_for_account_id,
     relay_endpoints, relay_lists_json, replaceable_list_inconclusive, resolve_account,
-    validate_relay_url,
+    terminal_safe_text, validate_relay_url,
 };
 
 pub(crate) async fn relays_command(
@@ -37,11 +37,7 @@ pub(crate) async fn relays_command_with_runtime(
             let status = app.account_relay_list_status(&account.label)?;
             let relays = relays_for_type(&status, relay_type.as_deref())?;
             Ok(CommandOutput {
-                plain: if relays.is_empty() {
-                    "no relays".to_owned()
-                } else {
-                    relays.join("\n")
-                },
+                plain: relay_list_plain(&relays),
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
@@ -136,7 +132,7 @@ async fn update_relay_list(
     };
     let relays = relays_for_type(&status, Some(&relay_type))?;
     Ok(CommandOutput {
-        plain: relays.join("\n"),
+        plain: relay_list_plain(&relays),
         json: json!({
             "account_id": account.account_id_hex,
             "npub": npub_for_account_id(&account.account_id_hex)?,
@@ -164,6 +160,17 @@ fn update_relay_values(relays: &mut Vec<String>, url: &str, add: bool) {
     }
     relays.sort();
     relays.dedup();
+}
+
+fn relay_list_plain(relays: &[String]) -> String {
+    if relays.is_empty() {
+        return "no relays".to_owned();
+    }
+    relays
+        .iter()
+        .map(|relay| terminal_safe_text(relay))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn relays_for_type(
@@ -226,6 +233,18 @@ mod tests {
                 "wss://new.example",
                 "wss://write.example",
             ]
+        );
+    }
+
+    #[test]
+    fn relay_list_plain_sanitizes_endpoints_and_keeps_row_separators() {
+        assert_eq!(relay_list_plain(&[]), "no relays");
+        assert_eq!(
+            relay_list_plain(&[
+                "wss://relay.example\u{1b}]8;;https://evil.example\u{7}".to_owned(),
+                "wss://other.example".to_owned()
+            ]),
+            "wss://relay.example]8;;https://evil.example\nwss://other.example"
         );
     }
 }

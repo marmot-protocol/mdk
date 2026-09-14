@@ -297,7 +297,10 @@ mod tests {
         assert_eq!(left.last_read_timeline_at, right.last_read_timeline_at);
         assert_eq!(left.conversation_created_at, right.conversation_created_at);
         assert_eq!(left.activity_sort_at, right.activity_sort_at);
-        assert_eq!(left.updated_at, right.updated_at);
+        // The first query can rebuild the projection and advance its
+        // maintenance stamp. Every content field must still match the create
+        // response, and the later query must not move the stamp backwards.
+        assert!(right.updated_at >= left.updated_at);
         assert_eq!(
             std::mem::discriminant(&left.self_membership),
             std::mem::discriminant(&right.self_membership)

@@ -108,6 +108,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -282,6 +283,55 @@ impl LeaveWriteFault {
     }
 }
 
+/// Nth-write arm like [`LeaveWriteFault`], but scoped to
+/// `update_message_state(_, Failed)` so unrelated state transitions in the
+/// same ingest do not consume it.
+#[derive(Clone, Default)]
+struct FailedStateWriteFault(Arc<AtomicUsize>);
+
+impl FailedStateWriteFault {
+    #[cfg(feature = "test-policy-overrides")]
+    fn arm_on_write(&self, write: usize) {
+        assert!(write > 0);
+        self.0.store(write, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    fn disarm(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    fn should_fail(&self, new_state: MessageState) -> bool {
+        if new_state != MessageState::Failed {
+            return false;
+        }
+        matches!(
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                }),
+            Ok(1)
+        )
+    }
+}
+
+/// Counts rollbacks onto a retained epoch anchor. One per anchor per candidate
+/// generation is the cached shape; one per anchor per bounded slice is not.
+#[derive(Clone, Default)]
+struct RetainedAnchorRewindCounter(Arc<AtomicUsize>);
+
+impl RetainedAnchorRewindCounter {
+    fn note(&self, name: &str) {
+        if name.starts_with("openmls-retained-anchor-") {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
 /// selected record/cache writes. Every other call delegates unchanged.
 struct FaultStorage {
@@ -289,6 +339,10 @@ struct FaultStorage {
     fault: PutGroupFault,
     capability_fault: CapabilityWriteFault,
     leave_write_fault: LeaveWriteFault,
+    intent_write_fault: LeaveWriteFault,
+    failed_state_fault: FailedStateWriteFault,
+    preparation_delay: PreparationDelay,
+    retained_anchor_rewinds: RetainedAnchorRewindCounter,
 }
 
 impl GroupStorage for FaultStorage {
@@ -309,7 +363,45 @@ impl GroupStorage for FaultStorage {
     }
 }
 
+#[derive(Clone, Default)]
+struct PreparationDelay {
+    metadata_ms: Arc<AtomicUsize>,
+    graph_ms: Arc<AtomicUsize>,
+    metadata_calls: Arc<AtomicUsize>,
+    graph_calls: Arc<AtomicUsize>,
+}
+
 impl MessageStorage for FaultStorage {
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<cgka_traits::message::DeferredMessageMetadata>> {
+        self.preparation_delay
+            .metadata_calls
+            .fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.preparation_delay.metadata_ms.load(Ordering::SeqCst) as u64,
+        ));
+        self.inner.list_deferred_message_metadata(group_id)
+    }
+
+    fn list_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if states.contains(&MessageState::Processed) {
+            self.preparation_delay
+                .graph_calls
+                .fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(
+                self.preparation_delay.graph_ms.load(Ordering::SeqCst) as u64,
+            ));
+        }
+        self.inner
+            .list_messages_in_states(group_id, states, at_or_after_epoch)
+    }
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         if self.leave_write_fault.should_fail() {
             return Err(StorageError::Busy(
@@ -325,6 +417,11 @@ impl MessageStorage for FaultStorage {
         self.inner.delete_message(id)
     }
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
+        if self.failed_state_fault.should_fail(new_state) {
+            return Err(StorageError::Busy(
+                "injected message-state write failure".into(),
+            ));
+        }
         self.inner.update_message_state(id, new_state)
     }
     fn list_messages(
@@ -372,6 +469,7 @@ impl MessageStorage for FaultStorage {
         self.inner.list_group_snapshots(group_id)
     }
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.retained_anchor_rewinds.note(name);
         self.inner.rollback_group_to_snapshot(group_id, name)
     }
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
@@ -411,6 +509,11 @@ impl MessageStorage for FaultStorage {
 
 impl OutboundIntentStorage for FaultStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected queued intent write failure".into(),
+            ));
+        }
         self.inner.put_queued_outbound_intent(record)
     }
     fn list_queued_outbound_intents(
@@ -421,6 +524,37 @@ impl OutboundIntentStorage for FaultStorage {
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+    fn put_own_commit_intent(
+        &self,
+        record: &cgka_traits::storage::OwnCommitIntent,
+    ) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected own intent write failure".into(),
+            ));
+        }
+        self.inner.put_own_commit_intent(record)
+    }
+    fn own_commit_intent(
+        &self,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.own_commit_intent(commit_id)
+    }
+    fn list_own_commit_intents(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> StorageResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.list_own_commit_intents(group_id)
+    }
+    fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected own intent delete failure".into(),
+            ));
+        }
+        self.inner.delete_own_commit_intent(commit_id)
     }
 }
 
@@ -684,6 +818,10 @@ fn build_fault_selfremove_client(
         fault,
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -706,6 +844,10 @@ fn build_capability_fault_client(
         fault: PutGroupFault::default(),
         capability_fault,
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -729,6 +871,10 @@ fn build_leave_write_fault_client(
         fault: PutGroupFault::default(),
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault,
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(identity))
@@ -1489,4 +1635,851 @@ async fn update_group_data_record_write_failure_leaves_group_stable() {
     let record = handle.get_group(&group_id).unwrap();
     assert_eq!(record.name, "successful rename");
     assert_eq!(record.description, "preserve me");
+}
+
+/// Opaque input remains retryable; it lets this test distinguish a completed
+/// failed peel (durable attempt) from a slice that never reaches the peeler.
+struct OpaquePeeler;
+
+#[async_trait]
+impl TransportPeeler for OpaquePeeler {
+    async fn peel_group_message(
+        &self,
+        _msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Err(PeelerError::DecryptFailed)
+    }
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+async fn slow_preparation_case(
+    backlog: usize,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Vec<MessageId>,
+    PreparationDelay,
+) {
+    let delay = PreparationDelay::default();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: delay.clone(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"slow-preparation"))
+    .account_identity_proof_signer(proof_signer(b"slow-preparation"))
+    .peeler(Box::new(OpaquePeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = bob
+        .create_group(CreateGroupRequest {
+            name: "slow preparation".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("group creation");
+    };
+    bob.confirm_published(pending).await.unwrap();
+    let message = TransportMessage {
+        id: MessageId::new(b"slow-preparation-opaque".to_vec()),
+        payload: vec![42; 32],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let mut ids = Vec::new();
+    for index in 0..backlog {
+        let message = TransportMessage {
+            id: MessageId::new(format!("slow-preparation-{index}").into_bytes()),
+            ..message.clone()
+        };
+        assert!(matches!(
+            bob.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        ids.push(message.id);
+    }
+    (bob, storage, group_id, ids, delay)
+}
+
+/// A backlog of opaque rows over a group that has left `anchors` epochs
+/// behind, so every swept row is offered each retained anchor's peel context.
+async fn past_peel_backlog_case(
+    anchors: usize,
+    backlog: usize,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Vec<MessageId>,
+    RetainedAnchorRewindCounter,
+) {
+    let rewinds = RetainedAnchorRewindCounter::default();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let handle = storage.clone();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner: storage,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: rewinds.clone(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"past-peel-backlog"))
+    .account_identity_proof_signer(proof_signer(b"past-peel-backlog"))
+    .peeler(Box::new(OpaquePeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = bob
+        .create_group(CreateGroupRequest {
+            name: "past peel backlog".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("group creation");
+    };
+    bob.confirm_published(pending).await.unwrap();
+
+    // Each advance retains the epoch it leaves behind, so the sweep has
+    // `anchors` historical peel contexts to offer every row.
+    for epoch in 0..anchors {
+        let SendResult::GroupEvolution { pending, .. } = bob
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("past peel backlog {epoch}")),
+                description: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("group data update");
+        };
+        bob.confirm_published(pending).await.unwrap();
+    }
+
+    let mut ids = Vec::new();
+    for index in 0..backlog {
+        let message = TransportMessage {
+            id: MessageId::new(format!("past-peel-{index}").into_bytes()),
+            payload: vec![42; 32],
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        };
+        assert!(matches!(
+            bob.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        ids.push(message.id);
+    }
+    (bob, handle, group_id, ids, rewinds)
+}
+
+/// A historical peel context is derived from an immutable retained anchor, so
+/// it stays valid for the whole candidate generation. Re-deriving it per
+/// bounded slice made a long backlog pay one rewind of live state per anchor
+/// per slice.
+#[tokio::test]
+async fn a_past_peel_context_is_derived_once_per_generation_not_once_per_slice() {
+    const ANCHORS: usize = 3;
+    // Deeper than two explicit-time row slices, so the generation is still
+    // open after the second one and no completion convergence rewinds on its
+    // own account.
+    let (mut bob, storage, group_id, ids, rewinds) = past_peel_backlog_case(ANCHORS, 200).await;
+    // Live ingest deliberately keeps no cross-message context cache; measure
+    // only what the sweeps add.
+    let before_sweeps = rewinds.count();
+
+    bob.converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let first_slice_rewinds = rewinds.count() - before_sweeps;
+    let attempts_after_first_slice = deferred_attempts(&storage, &ids);
+    assert_eq!(
+        first_slice_rewinds, ANCHORS,
+        "the first slice must derive each historical peel context exactly once"
+    );
+
+    bob.converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .unwrap();
+    assert!(
+        deferred_attempts(&storage, &ids) > attempts_after_first_slice,
+        "the second slice must offer those contexts to further rows"
+    );
+    assert_eq!(
+        rewinds.count() - before_sweeps,
+        first_slice_rewinds,
+        "a later slice of the same generation must reuse those contexts"
+    );
+}
+
+fn deferred_attempts(storage: &SqliteAccountStorage, ids: &[MessageId]) -> u32 {
+    ids.iter()
+        .map(|id| {
+            storage
+                .get_message(id)
+                .unwrap()
+                .deferred_peel
+                .unwrap()
+                .distinct_context_attempts
+        })
+        .sum()
+}
+
+async fn assert_slow_preparation_makes_durable_progress(metadata: bool) {
+    let (mut bob, storage, group_id, ids, delay) = slow_preparation_case(4).await;
+    let before = deferred_attempts(&storage, &ids);
+    delay.metadata_calls.store(0, Ordering::SeqCst);
+    delay.graph_calls.store(0, Ordering::SeqCst);
+    let selected = if metadata {
+        &delay.metadata_ms
+    } else {
+        &delay.graph_ms
+    };
+    selected.store(600, Ordering::SeqCst);
+    for _ in 0..3 {
+        bob.advance_convergence(&group_id).await.unwrap();
+    }
+    let attempts = deferred_attempts(&storage, &ids);
+    eprintln!(
+        "slow preparation: metadata={metadata}, attempts_before={before}, attempts_after={attempts}, metadata_calls={}, graph_calls={}",
+        delay.metadata_calls.load(Ordering::SeqCst),
+        delay.graph_calls.load(Ordering::SeqCst)
+    );
+    // Positive control: identical durable work succeeds through the explicit-time
+    // API. Its deterministic row allowance still applies, but it has no deadline.
+    bob.advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let control = deferred_attempts(&storage, &ids);
+    assert!(
+        control > before,
+        "control must perform real decryption work"
+    );
+    assert_eq!(
+        attempts, 3,
+        "each expired slice must finish exactly one row"
+    );
+}
+
+#[tokio::test]
+async fn slow_metadata_preparation_does_not_starve_background_retries() {
+    assert_slow_preparation_makes_durable_progress(true).await;
+}
+
+#[tokio::test]
+async fn slow_fingerprint_preparation_does_not_starve_background_retries() {
+    assert_slow_preparation_makes_durable_progress(false).await;
+}
+
+/// Restart/legacy normalization is a durable work unit, so a slow read must
+/// neither prevent it nor cause the same call to exceed its 64-row allowance.
+#[tokio::test]
+async fn slow_preparation_normalizes_bounded_slices_before_peeling() {
+    let (mut bob, storage, group_id, ids, delay) = slow_preparation_case(96).await;
+    for id in &ids {
+        let mut row = storage.get_message(id).unwrap();
+        row.deferred_peel = None;
+        storage.put_message(&row).unwrap();
+    }
+    delay.metadata_ms.store(600, Ordering::SeqCst);
+    bob.advance_convergence(&group_id).await.unwrap();
+    let normalized = ids
+        .iter()
+        .filter(|id| storage.get_message(id).unwrap().deferred_peel.is_some())
+        .count();
+    assert_eq!(normalized, 64, "normalization must obey the row allowance");
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        deferred_attempts(&storage, &ids),
+        0,
+        "normalization consumes the expired slice"
+    );
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        deferred_attempts(&storage, &ids),
+        1,
+        "the next slice must reach a peel"
+    );
+}
+
+/// Due rows spend the one progress allowance on release, rather than being
+/// retried after expiry or all released in a single already-expired quantum.
+#[tokio::test]
+async fn slow_preparation_releases_exactly_one_expired_row() {
+    let (mut bob, storage, group_id, ids, delay) = slow_preparation_case(4).await;
+    for id in &ids {
+        let mut row = storage.get_message(id).unwrap();
+        row.deferred_peel
+            .as_mut()
+            .unwrap()
+            .residence_deadline_monotonic_ms = 0;
+        storage.put_message(&row).unwrap();
+    }
+    delay.metadata_ms.store(600, Ordering::SeqCst);
+    bob.advance_convergence(&group_id).await.unwrap();
+    let remaining = storage.list_deferred_message_metadata(&group_id).unwrap();
+    assert_eq!(remaining.len(), 3);
+    assert!(remaining.iter().all(|row| {
+        row.deferred_peel
+            .as_ref()
+            .unwrap()
+            .distinct_context_attempts
+            == 0
+    }));
+}
+
+/// Queued output must not turn background recovery into a four-row foreground
+/// send attempt. The frozen raw generation still completes before output drains.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn queued_output_preserves_background_recovery_allowance() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+    use cgka_traits::storage::DeferredPeelGenerationStorage;
+
+    for explicit_time in [false, true] {
+        let (mut engine, storage, group_id, ids, _delay) = slow_preparation_case(96).await;
+        // Keep the production four-row foreground limit. Its independent time
+        // budget is enlarged only to make this row-accounting test deterministic.
+        engine.set_foreground_deferred_peel_budget(5_000, 4);
+        let payload = MarmotAppEvent::new(
+            hex::encode(engine.self_id().as_slice()),
+            1_700_000_000,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            "queued during opaque recovery",
+        )
+        .encode()
+        .unwrap();
+        let result = engine
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let SendResult::Queued { intent_id, .. } = result else {
+            panic!("foreground send must queue behind a partial generation");
+        };
+        assert_eq!(
+            deferred_attempts(&storage, &ids),
+            4,
+            "actual foreground send retains its four-row allowance"
+        );
+        let advanced = if explicit_time {
+            engine
+                .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+                .await
+                .unwrap()
+        } else {
+            engine.advance_convergence(&group_id).await.unwrap()
+        };
+        let background_attempts = deferred_attempts(&storage, &ids) - 4;
+        eprintln!(
+            "queued background recovery: explicit_time={explicit_time}, attempts={background_attempts}"
+        );
+        assert!(
+            (1..=64).contains(&background_attempts),
+            "wall-clock recovery must make progress within its row allowance: {background_attempts}"
+        );
+        if explicit_time {
+            assert_eq!(
+                background_attempts, 64,
+                "explicit-time recovery keeps its deterministic row slice"
+            );
+        }
+        assert!(
+            advanced.is_empty(),
+            "queued output must wait for the whole frozen generation"
+        );
+        assert!(
+            storage
+                .deferred_peel_generation(&group_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Complete with deterministic row slices. Wall-clock throughput is
+        // host-dependent; the public entry point was exercised above.
+        let mut drained = Vec::new();
+        for pass in 0..8 {
+            drained.extend(
+                engine
+                    .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001 + pass)
+                    .await
+                    .unwrap(),
+            );
+            if !drained.is_empty() {
+                break;
+            }
+        }
+        assert!(matches!(
+            drained.as_slice(),
+            [SendResult::ApplicationMessage { .. }]
+        ));
+        assert_eq!(
+            deferred_attempts(&storage, &ids),
+            96,
+            "every opaque row gets one definitive attempt before output"
+        );
+        assert!(
+            storage
+                .deferred_peel_generation(&group_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .advance_convergence(&group_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an in-flight queued result must not regenerate twice"
+        );
+        engine.confirm_queued_outbound_intent(&intent_id).unwrap();
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+async fn setup_own_intent_fault_case(
+    fault: LeaveWriteFault,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: fault,
+        failed_state_fault: FailedStateWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"own-intent-fault"))
+    .account_identity_proof_signer(proof_signer(b"own-intent-fault"))
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, result) = engine
+        .create_group(CreateGroupRequest {
+            name: "intent retention".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = result else {
+        panic!("create")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    (engine, storage, group_id)
+}
+
+#[tokio::test]
+async fn own_intent_record_failure_releases_the_unreturned_pending_commit() {
+    let fault = LeaveWriteFault::default();
+    let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+    let epoch = engine.epoch(&group_id).unwrap();
+    let intent = SendIntent::UpdateGroupData {
+        group_id: group_id.clone(),
+        name: Some("retained edit".into()),
+        description: None,
+    };
+    fault.arm_on_write(1);
+    assert!(matches!(
+        engine.send(intent.clone()).await,
+        Err(EngineError::Storage(StorageError::Busy(_)))
+    ));
+    assert!(
+        storage
+            .list_own_commit_intents(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.epoch(&group_id).unwrap(), epoch);
+    let result = engine
+        .send(intent)
+        .await
+        .expect("the failed staging must remain retryable");
+    let SendResult::GroupEvolution { pending, .. } = result else {
+        panic!("retry stages immediately: {result:?}")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    assert!(engine.epoch(&group_id).unwrap() > epoch);
+}
+
+#[tokio::test]
+async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
+    for fail_on_write in 1..=2 {
+        let fault = LeaveWriteFault::default();
+        let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+        // Persist an independently evidenced superseded edit against the current
+        // baseline. This targets the recovery transfer, not branch selection.
+        let commit_id = MessageId::new(vec![42; 32]);
+        storage
+            .put_own_commit_intent(&cgka_traits::storage::OwnCommitIntent {
+                commit_id: commit_id.clone(),
+                group_id: group_id.clone(),
+                source_epoch: engine.epoch(&group_id).unwrap(),
+                intent: SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some("retry edit".into()),
+                    description: None,
+                },
+                baseline: cgka_traits::storage::OwnCommitBaseline::GroupProfile {
+                    name: "intent retention".into(),
+                    description: String::new(),
+                },
+                reinvite: None,
+                reissue_attempts: 0,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        fault.arm_on_write(fail_on_write);
+        assert!(matches!(
+            engine.reissue_superseded_own_commit(&commit_id),
+            Err(EngineError::Storage(StorageError::Busy(_)))
+        ));
+        assert!(
+            storage.own_commit_intent(&commit_id).unwrap().is_some(),
+            "failed transfer must retain the source"
+        );
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty(),
+            "failed source deletion must roll back the queue write"
+        );
+        let report = engine
+            .reissue_superseded_own_commit(&commit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.outcome,
+            cgka_traits::engine::SupersededIntentOutcome::Reissued
+        );
+        assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+        let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].reissue_attempts, 1);
+        assert!(
+            engine
+                .reissue_superseded_own_commit(&commit_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+/// Marker prefix for synthetic transport objects [`MarkerOpaquePeeler`]
+/// refuses to peel, so a test can retain `PeelDeferred` rows while real MLS
+/// traffic for the same group still peels and applies.
+#[cfg(feature = "test-policy-overrides")]
+const OPAQUE_MARKER: &[u8] = b"opaque-marker::";
+
+#[cfg(feature = "test-policy-overrides")]
+struct MarkerOpaquePeeler;
+
+#[cfg(feature = "test-policy-overrides")]
+#[async_trait]
+impl TransportPeeler for MarkerOpaquePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload.starts_with(OPAQUE_MARKER) {
+            return Err(PeelerError::DecryptFailed);
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn opaque_row(label: &[u8], group_id: &GroupId) -> TransportMessage {
+    let mut payload = OPAQUE_MARKER.to_vec();
+    payload.extend_from_slice(label);
+    payload.resize(OPAQUE_MARKER.len() + 32, 7);
+    TransportMessage {
+        id: MessageId::new(label.to_vec()),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+/// Retiring a terminal group's deferred-peel backlog is one durable unit.
+/// A storage failure part-way through must leave every row `PeelDeferred` —
+/// a row flipped `Failed` without its in-memory slot returned and without a
+/// transition audit row would be invisible to the retry, which enumerates
+/// `PeelDeferred` only, so it would hold its share of the account budget for
+/// the rest of the engine incarnation.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pass() {
+    let failed_state_fault = FailedStateWriteFault::default();
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let mut carol = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: failed_state_fault.clone(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"carol-retire-atomic"))
+    .account_identity_proof_signer(proof_signer(b"carol-retire-atomic"))
+    .feature_registry(selfremove_registry())
+    .peeler(Box::new(MarkerOpaquePeeler))
+    .build()
+    .unwrap();
+    carol
+        .set_convergence_policy(cgka_engine::canonicalization::CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..cgka_engine::canonicalization::CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let mut alice = build_selfremove_client(b"alice-retire-atomic");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_a, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "retire atomically".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let welcome = welcomes
+        .iter()
+        .find(|welcome| {
+            matches!(&welcome.envelope, TransportEnvelope::Welcome { recipient }
+                if recipient == &MemberId::new(pad32(b"carol-retire-atomic")))
+        })
+        .cloned()
+        .expect("welcome for carol");
+    carol.join_welcome(welcome).await.unwrap();
+    carol.drain_events();
+
+    // Two retained rows in group A.
+    let rows = [
+        opaque_row(b"retire-atomic-0001", &group_a),
+        opaque_row(b"retire-atomic-0002", &group_a),
+    ];
+    for row in &rows {
+        assert!(matches!(
+            carol.ingest(row.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    let row_bytes = handle.get_message(&rows[0].id).unwrap().payload.len();
+
+    // A live group of carol's own, so the shared account budget is observable
+    // after group A goes terminal.
+    let (group_b, created_b) = carol
+        .create_group(CreateGroupRequest {
+            name: "carol's own".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created_b else {
+        panic!("group creation");
+    };
+    carol.confirm_published(pending).await.unwrap();
+    // Exactly the two group-A rows' worth of account budget.
+    carol.set_deferred_peel_limits_for_tests(512, usize::MAX, row_bytes.saturating_mul(2));
+
+    // Alice removes carol. The second row's `Failed` write fails mid-retire.
+    let removal = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_a.clone(),
+            members: vec![MemberId::new(pad32(b"carol-retire-atomic"))],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_a.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected group evolution, got {other:?}"),
+    };
+    failed_state_fault.arm_on_write(2);
+    // The removing commit may realize the removal on the direct apply or
+    // through a convergence pass; drive both so the retirement runs wherever
+    // this delivery happens to own it.
+    let mut error = carol.ingest(removal).await.err();
+    for _ in 0..4 {
+        if error.is_some()
+            || carol
+                .group_record(&group_a)
+                .is_ok_and(|group| group.removed)
+        {
+            break;
+        }
+        error = carol.advance_convergence(&group_a).await.err();
+    }
+    let error = error.expect("the injected mid-retire write failure must surface");
+    assert!(
+        format!("{error:?}").contains("injected message-state write failure"),
+        "unexpected retire error: {error:?}"
+    );
+
+    for row in &rows {
+        assert_eq!(
+            handle.get_message(&row.id).unwrap().state,
+            MessageState::PeelDeferred,
+            "a failed retirement must leave every row deferred for the next \
+             pass, never a mix the retry cannot see"
+        );
+    }
+    assert!(
+        matches!(
+            carol
+                .ingest(opaque_row(b"budget-probe-0001", &group_b))
+                .await
+                .unwrap(),
+            IngestOutcome::ResourceRefused { .. }
+        ),
+        "nothing was released, so the account budget is still fully charged"
+    );
+
+    // The terminal gate retries on the next advance and completes.
+    failed_state_fault.disarm();
+    carol.advance_convergence(&group_a).await.unwrap();
+    for row in &rows {
+        assert_eq!(
+            handle.get_message(&row.id).unwrap().state,
+            MessageState::Failed,
+            "the retry retires the whole backlog"
+        );
+    }
+    assert!(
+        matches!(
+            carol
+                .ingest(opaque_row(b"budget-probe-0002", &group_b))
+                .await
+                .unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "the completed retirement released the account bytes"
+    );
 }

@@ -54,12 +54,51 @@ int main(void) {
 }
 ```
 
+`MarmotMarkdownBlock` appends an additive `Details` tag whose fields live
+behind `MarmotMarkdownDetails`. Existing discriminants and union stride stay
+the same; regenerate `marmot.h` and consumer bindings to handle the new tag.
+Older clients cannot render it.
+
+`marmot_account_id_hex` and `marmot_normalize_member_ref` now accept
+`nprofile` and `nostr:nprofile` references (plus the existing
+hex/`npub`/`marmot://profile/` forms) and discard relay hints.
+Duplicate type-0 TLV entries keep the first key. After wrapper
+normalization, encoded tokens longer than 1023 UTF-8 bytes are
+rejected; a valid 1023-byte token still decodes when wrapped. The app
+helper's legacy NIP-21 parser may still accept a colon-suffixed
+`nostr:<npub>:` form, but C/UniFFI wrapper normalization rejects it.
+`marmot_default_profile_pseudonym`
+hashes the supplied canonical hex account-id text; decode a scanned
+reference first. Passing uppercase hex or an undecoded `npub` silently
+produces a different name, not an error. `marmot_random_profile_pseudonym` is a cosmetic
+random roll from the same wordlists. Free those strings with
+`marmot_string_free` and normalized records with
+`marmot_member_ref_free`. Regenerate `marmot.h` after pulling this
+surface. Android mention/QR migration remains a separate consumer
+issue.
+
+`marmot_account_key_packages` returns the current KeyPackage winner per
+addressable slot plus local-only rows. `marmot_account_key_package_relay_events`
+returns observed relay history from the same validated fetch window, including
+superseded events. Free that list with
+`marmot_account_key_package_relay_event_list_free`. Existing
+`MarmotAccountKeyPackage` layout and `marmot_account_key_package_list_free`
+are unchanged.
+
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
 against both linkage models (valgrind when available). Pass `--debug` first
 to reuse debug/test-profile dependencies for a faster local or PR smoke run;
 release and scheduled validation use the default release build.
+
+## Audit v4 adoption
+
+Use `MarmotAuditLogTrackerConfigV4` and `marmot_set_audit_log_tracker_config_v4` to supply optional
+system `hardware_model`, platform and app version. Free its returned config with
+`marmot_audit_log_tracker_config_v4_free`. Never pass a device name, hostname or serial number as the model.
+The legacy config/setter retains its binary layout, ignores `device_label`, and returns that field as NULL;
+it never reinterprets an old device name as a hardware model. Both setters use the same v4-only upload gate.
 
 ## Rules of the road
 
@@ -86,6 +125,32 @@ release and scheduled validation use the default release build.
   callback invocation (clear/free do not wait for a running callback).
 - Free every subscription handle before the client that created it.
 
+## Host-driven agent publishing
+
+`marmot_agent_publisher_new` anchors a stream and returns an opaque handle.
+Pass a QUIC candidate and broker trust options; cryptographic keys and
+transcript framing stay inside MDK. Append text, status, or progress using
+`marmot_agent_publisher_append`. Its receipt reports accepted record count
+and any preview transport failure; transport loss preserves the transcript.
+
+`marmot_agent_publisher_finish` seals the transcript and sends the durable
+final message. Inspect the returned send disposition for delivery state.
+If sending fails, call finish again on the same handle; the sealed request
+is retained. After success, repeated finish returns the original receipt.
+Appends after sealing fail. These guarantees last for the handle's lifetime;
+publisher state is not restored after a process restart.
+
+Cancel or free a handle to stop its preview. A finish already in progress
+wins over cancellation. Free every publisher before its client, and never
+free a handle concurrently with another call using it. Free info, append
+receipts, and send receipts with their matching generated free functions.
+
+For private integration fixtures, `marmot_client_new_with_options` accepts
+an explicit loopback relay policy and an optional host secret-store vtable.
+Existing constructors keep their public-only policy. Loopback broker access
+requires a separate publisher trust opt-in; neither permits private or
+link-local endpoints. Local insecure trust is intended only for tests.
+
 ## Regenerating the header
 
 ```sh
@@ -95,3 +160,22 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
+
+## Selected chat-list presentation
+
+The additive `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
+plus MDK-selected title/avatar descriptors. Existing struct layouts and functions are unchanged.
+`marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
+whole-list replacements. The initial item has sequence zero. A repeated snapshot call returns CLOSED with NULL.
+
+This fallible subscription offers blocking next with timeout and typed storage/preparation errors. It has no callback
+pump: hosts drive next on their own worker and decide how to retry errors. Timeouts preserve the refresh obligation.
+Free each result with `marmot_presented_chat_list_update_free` and the handle with
+`marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
+for version ordering, localization, readiness, and account-switch behavior.
+
+## Bounded chat screens
+
+C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
+See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
+for paging, sequence handling, cancellation, C ownership, and compatibility.

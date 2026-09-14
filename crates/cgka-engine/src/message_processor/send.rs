@@ -28,6 +28,16 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
+        self.do_send_ready_with_reissue_attempts(intent, 0).await
+    }
+
+    /// `do_send_ready` for an intent that has already been re-queued
+    /// `reissue_attempts` times after losing same-epoch races (mdk#1734).
+    pub(crate) async fn do_send_ready_with_reissue_attempts(
+        &mut self,
+        intent: SendIntent,
+        reissue_attempts: u32,
+    ) -> Result<SendResult, EngineError> {
         let group_id = super::send_intent_group_id(&intent).clone();
         if self.storage.disband_tombstone(&group_id)?.is_some() {
             return Err(EngineError::InvalidTransition(
@@ -44,7 +54,9 @@ impl<S: StorageProvider> Engine<S> {
         // fail with an opaque `UseAfterEviction` backend error anyway. Gate
         // here (not just `do_send`) so queued-intent drains hit the same
         // deterministic terminal error. Every intent kind is blocked,
-        // including `Leave` — there is nothing left to leave.
+        // including `Leave` — there is nothing left to leave. Disband reaches
+        // the tombstone gate above first, so the message below stays
+        // accurate.
         let group = self.stored_group_record(&group_id)?;
         if group.as_ref().is_some_and(|group| group.removed) {
             return Err(EngineError::InvalidTransition(
@@ -76,9 +88,21 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        match intent {
-            SendIntent::AppMessage { group_id, payload } => {
-                self.do_send_app_message(group_id, payload).await
+        // Retain the intent behind every own group evolution through the
+        // rewind horizon, so a supersession can re-issue it
+        // (mdk#1734). The baseline is read before staging so it describes the
+        // state the caller was looking at.
+        let recording = self.own_commit_recording(&intent)?;
+        let retained_intent = recording.as_ref().map(|_| intent.clone());
+        let source_epoch = group.as_ref().map(|group| group.epoch).unwrap_or_default();
+        let result = match intent {
+            SendIntent::AppMessage {
+                group_id,
+                payload,
+                expected_epoch,
+            } => {
+                self.do_send_app_message(group_id, payload, expected_epoch)
+                    .await
             }
             SendIntent::Invite {
                 group_id,
@@ -108,7 +132,28 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_enable_group_disbanding(group_id).await
             }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
+        };
+        if let (
+            Some((_, baseline)),
+            Some(retained_intent),
+            Ok(SendResult::GroupEvolution { msg, pending, .. }),
+        ) = (recording, retained_intent, &result)
+            && let Err(error) = self.record_own_commit_intent(
+                msg.id.clone(),
+                group_id,
+                source_epoch,
+                retained_intent,
+                baseline,
+                reissue_attempts,
+            )
+        {
+            // Staging already acquired the pending publication slot. If
+            // intent retention fails, the caller receives no handle with
+            // which to release it, so compensate before returning.
+            Box::pin(self.do_publish_failed(*pending)).await?;
+            return Err(error);
         }
+        result
     }
 
     async fn do_send_invite(
@@ -849,6 +894,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
+        expected_epoch: Option<EpochId>,
     ) -> Result<SendResult, EngineError> {
         // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
@@ -868,9 +914,24 @@ impl<S: StorageProvider> Engine<S> {
             .take_mls_group(&group_id)?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
+        // The authoritative epoch is the loaded MLS state, read at the last
+        // moment before encryption. `do_send` may have folded retained peer
+        // commits into this send on the way here, so a payload pinned to the
+        // epoch the caller saw can legitimately no longer be encrypted under
+        // it. Nothing has been written yet; hand the untouched group back.
+        let source_epoch = EpochId(mls_group.epoch().as_u64());
+        if let Some(expected) = expected_epoch
+            && expected != source_epoch
+        {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::AppMessageEpochMismatch {
+                expected,
+                current: source_epoch,
+            });
+        }
+
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
-        let source_epoch = EpochId(mls_group.epoch().as_u64());
         let own_application_stamp = OwnApplicationConvergenceStamp {
             sender: self.identity.self_id().clone(),
             source_epoch_authenticator: hex::encode(mls_group.epoch_authenticator().as_slice()),

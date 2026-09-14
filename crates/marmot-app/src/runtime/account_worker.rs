@@ -212,9 +212,27 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    ForgetGroupLocal {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+
     DeleteGroupLocal {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    GroupRecoveryStatus {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+    },
+    ConfirmGroupRejoin {
+        welcome_id: cgka_traits::MessageId,
+        token: Vec<u8>,
+        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+    },
+    DeclineGroupRejoin {
+        welcome_id: cgka_traits::MessageId,
+        respond: oneshot::Sender<Result<(), AppError>>,
     },
     AcceptGroupInvite {
         group_id: GroupId,
@@ -277,11 +295,13 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendMessage {
+        enqueued_at: Instant,
         group_id: GroupId,
         payload: Vec<u8>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendAppEvent {
+        enqueued_at: Instant,
         group_id: GroupId,
         intent: AppMessageIntent,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -427,6 +447,7 @@ impl AccountWorkerCommand {
                 | Self::ClearPushRegistration { .. }
                 | Self::SetNativePushEnabled { .. }
                 | Self::RemovePushRegistration { .. }
+                | Self::ForgetGroupLocal { .. }
         )
     }
 }
@@ -695,6 +716,13 @@ async fn run_app_runtime_account_worker(
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let startup_sync_result = {
         let mut initial_sync = std::pin::pin!(async {
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            if let Some(barrier) = shared.take_next_startup_sync_barrier() {
+                // First acknowledge entry, then hold sync until the test has
+                // exercised the command loop below.
+                barrier.wait().await;
+                barrier.wait().await;
+            }
             let summary = client
                 .sync_with_stage_telemetry(&startup_stage_telemetry)
                 .await?;
@@ -767,6 +795,12 @@ async fn run_app_runtime_account_worker(
                                     AccountWorkerCommand::QuarantinedGroups { respond },
                                 ))),
                             }
+                        }
+                        Some(AccountWorkerCommand::ConfirmGroupRejoin { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                        }
+                        Some(AccountWorkerCommand::DeclineGroupRejoin { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
                         }
                         Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) => {
                             // `initial_sync` owns `&mut client`, so the command
@@ -903,6 +937,7 @@ async fn run_app_runtime_account_worker(
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
+        product: shared.product_analytics.clone(),
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -985,9 +1020,13 @@ async fn run_app_runtime_account_worker(
     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
+    let product_backlog = shared.product_analytics.backlog_source();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
+    let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
+    let mut presentation_wakeups = app.presentation_signals.subscribe_work();
+    let mut presentation_due = true;
     // Prepare exact Welcome attempts under the serialized owner, then let only
     // relay I/O run independently. The worker stays available for inbound
     // delivery, maintenance, media completions, timers, and commands while a
@@ -1003,6 +1042,7 @@ async fn run_app_runtime_account_worker(
             }
         });
 
+    let mut yield_to_convergence = false;
     'worker: loop {
         tokio::select! {
             biased;
@@ -1043,186 +1083,189 @@ async fn run_app_runtime_account_worker(
                     let _ = respond.send(());
                 }
             }
-            _ = scheduled_convergence.timer.as_mut() => {
-                let groups = scheduled_convergence.take_ready();
-                match client.sync_runtime_groups().await {
-                    Ok(()) => {
-                        let mut remaining = groups.len();
-                        for group_id in groups {
-                            // Each group's convergence pass is a long blocking
-                            // stretch of synchronous engine + SQLite work with
-                            // no await inside it, so `JoinHandle::abort` cannot
-                            // land there: without this check the shutdown budget
-                            // is spent running the whole batch to completion.
-                            // The group boundary is the only cut point where no
-                            // snapshot guard is live, so it is also the only one
-                            // that cannot leave a group half-rolled-back.
-                            // Undispatched groups need no hand-off — their
-                            // convergence inputs are durable, so the next
-                            // runtime rediscovers them at catch-up.
-                            if lifecycle.is_stopping() {
-                                tracing::debug!(
-                                    target: "marmot_app::runtime",
-                                    method = "scheduled_convergence",
-                                    skipped_groups = remaining,
-                                    "shutdown requested; leaving remaining convergence passes for the next runtime",
-                                );
-                                break;
-                            }
-                            remaining -= 1;
-                            match client.advance_convergence_after_runtime_sync(&group_id).await {
-                                Ok(summary) => {
-                                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-                                    match client.convergence_schedule_state(&group_id) {
-                                        Ok(state) => scheduled_convergence
-                                            .schedule_after_pass(&group_id, state),
-                                        Err(err) => {
-                                            scheduled_convergence
-                                                .schedule_retry_groups([group_id.clone()]);
-                                            publish_app_runtime_account_error(
-                                                &events,
-                                                &account_id_hex,
-                                                &account_label,
-                                                account_error_message(
-                                                    "convergence schedule state failed",
-                                                    &err,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                    schedule_pending_convergence_groups(
-                                        &mut scheduled_convergence,
-                                        &mut client,
-                                    );
-                                    let _ = run_pending_epoch_backfill_reporting_arm(
-                                        &mut client,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        &shared,
-                                        EpochBackfillExecutionSeam::Maintenance,
-                                    )
-                                    .await;
-                                    if sync_summary_triggers_audit_tracker_update(&summary) {
-                                        shared.schedule_audit_log_tracker_update("scheduled_convergence");
-                                    }
-                                }
-                                Err(err) => {
-                                    let mut retry_groups = client.take_pending_convergence_groups();
-                                    retry_groups.push(group_id.clone());
-                                    scheduled_convergence.schedule_retry_groups(retry_groups);
-                                    publish_app_runtime_account_error(
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        account_error_message("scheduled convergence failed", &err),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let account_inactive = err.is_account_not_active();
-                        scheduled_convergence.schedule_retry_groups(groups);
-                        publish_app_runtime_account_error(
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            account_error_message("scheduled convergence sync failed", &err),
-                        );
-                        if account_inactive
-                            && let Err(activation_error) = client.prepare_transport().await
-                        {
-                            publish_app_runtime_account_error(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message(
-                                    "scheduled convergence transport reactivation failed",
-                                    &activation_error,
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
+            // Alternate a command and a ready recovery quantum. A permanently
+            // nonempty command channel must not starve group convergence.
             command = async {
                 match pending.pop_front() {
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
-            } => {
+            }, if !yield_to_convergence || !scheduled_convergence.has_ready() => {
+                yield_to_convergence = true;
                 match command {
                     Some(command) => {
-                        pending.push_back(command);
-                        while let Some(command) = pending.pop_front() {
-                            let command = match command {
-                                AccountWorkerCommand::Drain { respond } => {
-                                    if let Some(recovery) = &mut welcome_recovery {
-                                        recovery.drain_waiters.push(respond);
-                                    } else {
-                                        let _ = respond.send(());
-                                    }
-                                    continue;
+                        let command = match command {
+                            AccountWorkerCommand::Drain { respond } => {
+                                if let Some(recovery) = &mut welcome_recovery {
+                                    recovery.drain_waiters.push(respond);
+                                } else {
+                                    let _ = respond.send(());
                                 }
-                                command => command,
-                            };
-                            let may_change_push_registration_work =
-                                command.may_change_push_registration_work();
-                            match command {
-                                AccountWorkerCommand::CatchUp { respond } => {
-                                    handle_account_worker_catch_up(
-                                        &mut client,
-                                        respond,
-                                        &mut commands,
-                                        &mut pending,
-                                        AccountWorkerCatchUpContext {
-                                            app: &app,
-                                            events: &events,
-                                            account_id_hex: &account_id_hex,
-                                            account_label: &account_label,
-                                            shared: &shared,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                command => {
-                                    handle_account_worker_command(
-                                        &mut client,
-                                        command,
-                                        AccountWorkerCommandContext {
-                                            commands: &mut commands,
-                                            pending: &mut pending,
-                                            app: &app,
-                                            events: &events,
-                                            account_id_hex: &account_id_hex,
-                                            account_label: &account_label,
-                                            shared: &shared,
-                                            media_http: &media_http,
-                                            scheduled_convergence: &mut scheduled_convergence,
-                                        },
-                                    )
-                                    .await;
-                                }
+                                continue;
                             }
-                            schedule_pending_convergence_groups(
-                                &mut scheduled_convergence,
-                                &mut client,
-                            );
-                            scheduled_runtime_group_subscription_refresh.observe_pending(
-                                client.has_pending_runtime_group_subscription_refresh(),
+                            command => command,
+                        };
+                        let may_change_push_registration_work =
+                            command.may_change_push_registration_work();
+                        match command {
+                            AccountWorkerCommand::CatchUp { respond } => {
+                                handle_account_worker_catch_up(
+                                    &mut client,
+                                    respond,
+                                    &mut commands,
+                                    &mut pending,
+                                    AccountWorkerCatchUpContext {
+                                        app: &app,
+                                        events: &events,
+                                        account_id_hex: &account_id_hex,
+                                        account_label: &account_label,
+                                        shared: &shared,
+                                    },
+                                )
+                                .await;
+                            }
+                            command => {
+                                handle_account_worker_command(
+                                    &mut client,
+                                    command,
+                                    AccountWorkerCommandContext {
+                                        commands: &mut commands,
+                                        pending: &mut pending,
+                                        app: &app,
+                                        events: &events,
+                                        account_id_hex: &account_id_hex,
+                                        account_label: &account_label,
+                                        shared: &shared,
+                                        media_http: &media_http,
+                                        scheduled_convergence: &mut scheduled_convergence,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        if may_change_push_registration_work {
+                            scheduled_push_retry.observe_pending(
+                                client.has_pending_push_registration_work(),
                                 &command_tx,
                             );
-                            if may_change_push_registration_work {
-                                scheduled_push_retry.observe_pending(
-                                    client.has_pending_push_registration_work(),
-                                    &command_tx,
-                                );
-                            }
                         }
                     }
                     None => return,
                 }
+            }
+            _ = scheduled_convergence.timer.as_mut() => {
+                yield_to_convergence = false;
+                let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                // Recovery owns the live client, but member/roster reads can
+                // use the last committed snapshot while its relay I/O waits.
+                // Mutations retain worker FIFO order; reads use the snapshot.
+                let read_snapshot = capture_group_read_snapshot(
+                    &client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    "runtime scheduled convergence snapshot failed",
+                );
+                Box::pin(serve_snapshot_reads_until(
+                    read_snapshot,
+                    async {
+                        #[cfg(any(test, feature = "test-policy-overrides"))]
+                        if let Some(barrier) = shared.take_next_scheduled_convergence_barrier() {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                        match client.retry_pending_runtime_group_subscription_refresh().await {
+                            Ok(_) => {
+                                // Shutdown is safe here: no engine snapshot guard is live.
+                                if lifecycle.is_stopping() { return; }
+                                match client.advance_convergence_after_runtime_sync(&group_id).await {
+                                    Ok(summary) => {
+                                        publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                        // A pass that superseded one of this
+                                        // device's own commits reports it
+                                        // through the client's pending
+                                        // buffer; this arm is the only seam
+                                        // that can observe such a pass
+                                        // without a later command to drain
+                                        // it (mdk#1734).
+                                        publish_client_pending_projection_updates(
+                                            &mut client,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                        );
+                                        match client.convergence_schedule_state(&group_id) {
+                                            Ok(state) => scheduled_convergence
+                                                .schedule_after_pass(&group_id, state),
+                                            Err(err) => {
+                                                scheduled_convergence
+                                                    .schedule_retry_groups([group_id.clone()]);
+                                                publish_app_runtime_account_error(
+                                                    &events,
+                                                    &account_id_hex,
+                                                    &account_label,
+                                                    account_error_message(
+                                                        "convergence schedule state failed",
+                                                        &err,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        schedule_pending_convergence_groups(
+                                            &mut scheduled_convergence,
+                                            &mut client,
+                                        );
+                                        let _ = run_pending_epoch_backfill_reporting_arm(
+                                            &mut client,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            &shared,
+                                            EpochBackfillExecutionSeam::Maintenance,
+                                        )
+                                        .await;
+                                        if sync_summary_triggers_audit_tracker_update(&summary) {
+                                            shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let mut retry_groups = client.take_pending_convergence_groups();
+                                        retry_groups.push(group_id.clone());
+                                        scheduled_convergence.schedule_retry_groups(retry_groups);
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message("scheduled convergence failed", &err),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                scheduled_convergence.schedule_retry_groups([group_id]);
+                                publish_app_runtime_account_error(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    account_error_message("scheduled convergence sync failed", &err),
+                                );
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &mut pending,
+                    &app,
+                    &account_label,
+                ))
+                .await;
             }
             done = media_http_rx.recv() => {
                 match done {
@@ -1241,6 +1284,8 @@ async fn run_app_runtime_account_worker(
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
                 // commands remain queued until that durable sequence lands.
+                let delivery_started = matches!(&received, Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(_)))
+                    .then(Instant::now);
                 let (result, overflow_recovery_incomplete) = match received {
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                         (client.ingest_received_delivery(*delivery).await, false)
@@ -1275,10 +1320,34 @@ async fn run_app_runtime_account_worker(
                     }
                     Err(err) => (Err(err), false),
                 };
+                if result.is_err() && let Some(started) = delivery_started {
+                    shared.app_performance_telemetry().record(
+                        AppPerformanceOperation::InboundDeliveryProjection,
+                        started.elapsed(),
+                        false,
+                    );
+                }
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        // An inline convergence pass on a delivered rival can
+                        // supersede one of this device's own commits; the
+                        // report waits in the client's pending buffer and this
+                        // arm has no later command to drain it (mdk#1734).
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        if let Some(started) = delivery_started {
+                            shared.app_performance_telemetry().record(
+                                AppPerformanceOperation::InboundDeliveryProjection,
+                                started.elapsed(),
+                                true,
+                            );
+                        }
                         start_post_join_history_after_visibility(
                             &mut client,
                             &summary,
@@ -1506,7 +1575,22 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
+            result = presentation_wakeups.changed() => {
+                if result.is_ok() { presentation_due = true; }
+            }
+            _ = tokio::task::yield_now(), if presentation_due => {
+                if lifecycle.is_stopping() { continue 'worker; }
+                presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
+                    Ok(more) => more,
+                    Err(_) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
+                            "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
+                        false
+                    }
+                };
+            }
             _ = maintenance_tick.tick() => {
+                presentation_due = true;
                 // Periodic maintenance is never urgent, and its longest legs
                 // run well past the whole shutdown budget: the key-package
                 // catch-up below is capped at 15s, and an armed epoch-gap
@@ -1522,12 +1606,21 @@ async fn run_app_runtime_account_worker(
                     &mut legacy_message_promotion,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
-                    match timeout(
-                        Duration::from_secs(15),
-                        client.sync_with_partial_progress(),
-                    )
-                    .await
-                    {
+                    let observation = shared.product_analytics.begin(
+                        crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
+                    );
+                    let catch_up = timeout(
+                        Duration::from_secs(15), client.sync_with_partial_progress(),
+                    ).await;
+                    let outcome = match &catch_up {
+                        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
+                        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
+                        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+                    };
+                    if let Some(observation) = observation {
+                        observation.finish(outcome.as_str());
+                    }
+                    match catch_up {
                         Ok(Ok(summary)) => {
                             publish_app_runtime_summary(
                                 &events,
@@ -1611,9 +1704,27 @@ async fn run_app_runtime_account_worker(
                         account_error_message("post-join maintenance subscription failed", &err),
                     );
                 }
+                let backlog_permit = shared.product_analytics.permit();
                 match client.run_due_maintenance().await {
                     Ok(summary) => {
-                        let _ = summary;
+                        if let Some(permit) = &backlog_permit {
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Maintenance, "pending",
+                                u64::from(summary.deferred),
+                            );
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Maintenance, "ambiguous",
+                                u64::from(summary.ambiguous_exposure),
+                            );
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Maintenance, "failed",
+                                u64::from(client.maintenance_failed_backlog),
+                            );
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Recovery, "quarantine",
+                                client.runtime.quarantined_group_count() as u64,
+                            );
+                        }
                         publish_client_pending_projection_updates(
                             &mut client,
                             &events,
@@ -1647,9 +1758,9 @@ async fn run_app_runtime_account_worker(
 
 /// Run a steady-state catch-up while preserving prompt read-only projection
 /// access. The sync future exclusively borrows the live client, so reads that
-/// arrive before another state-changing command are answered from a snapshot
-/// captured immediately before the sync. Once a non-read command is deferred,
-/// later reads remain behind it to preserve worker FIFO semantics.
+/// arrive during sync are answered from a snapshot captured immediately before
+/// it, including when mutations are deferred. Mutations retain FIFO order;
+/// reads observe pre-sync state until the window ends.
 /// Additional catch-up requests received before such a command coalesce onto
 /// the in-flight sync.
 struct AccountWorkerCatchUpContext<'a> {
@@ -1709,7 +1820,7 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
-            let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
+            let snapshot_reads_available = read_snapshot.is_some();
             match command {
                 AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
                     let snapshot = read_snapshot
@@ -1751,6 +1862,12 @@ async fn handle_account_worker_catch_up(
                         .as_ref()
                         .expect("snapshot availability checked above");
                     let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                }
+                AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
+                AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
                 }
                 AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
                     // The pinned sync exclusively owns the live client. This
@@ -2135,7 +2252,7 @@ fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
 
 /// Eagerly drain a deferred open's hydration without serving commands, for
 /// paths (reconnect) whose callers previously relied on the fully-eager open.
-async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError> {
+pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError> {
     loop {
         let progress = client
             .runtime
@@ -2165,6 +2282,37 @@ async fn handle_startup_hydration_command(
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
+        AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => {
+            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+        }
+        AccountWorkerCommand::ConfirmGroupRejoin {
+            welcome_id,
+            token,
+            respond,
+        } => {
+            let result = client.confirm_group_rejoin(&welcome_id, &token).await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeclineGroupRejoin {
+            welcome_id,
+            respond,
+        } => {
+            let result = client.decline_group_rejoin(&welcome_id);
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            let _ = respond.send(result);
+        }
         AccountWorkerCommand::Members { group_id, respond } => {
             let _ = client
                 .runtime
@@ -2235,6 +2383,7 @@ async fn handle_startup_hydration_command(
 const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 
 struct MediaHttpContext {
+    product: crate::product_analytics::ProductAnalytics,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
     /// Prevent concurrent host retries from uploading the same durable blob
@@ -2252,6 +2401,7 @@ struct MediaHttpDone {
     /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
     permit: OwnedSemaphorePermit,
     completion: MediaHttpCompletion,
+    cancellation: Option<crate::ProductObservation>,
 }
 
 enum MediaHttpCompletion {
@@ -2284,6 +2434,11 @@ fn spawn_media_http<T>(
     work: impl std::future::Future<Output = T> + Send + 'static,
     into_done: impl FnOnce(T) -> MediaHttpCompletion + Send + 'static,
 ) {
+    let cancellation = media_http.product.begin(
+        crate::ProductFamily::Media,
+        "cancel",
+        crate::ProductUnit::Attempt,
+    );
     let tx = media_http.tx.clone();
     let mut worker_lifetime = media_http.worker_lifetime.subscribe();
     tokio::spawn(async move {
@@ -2295,6 +2450,7 @@ fn spawn_media_http<T>(
         let _ = tx.send(MediaHttpDone {
             permit,
             completion: into_done(output),
+            cancellation,
         });
     });
 }
@@ -2344,7 +2500,14 @@ async fn complete_media_http(
     shared: &RuntimeSharedServices,
     media_http: &MediaHttpContext,
 ) {
-    let MediaHttpDone { permit, completion } = done;
+    let MediaHttpDone {
+        permit,
+        completion,
+        cancellation,
+    } = done;
+    if let Some(cancellation) = cancellation {
+        cancellation.discard();
+    }
     match completion {
         MediaHttpCompletion::Upload {
             finish,
@@ -2356,10 +2519,26 @@ async fn complete_media_http(
                 Ok(result) => client.finish_encrypted_media_upload(finish, result).await,
                 Err(err) => Err(err),
             };
-            shared.app_performance_telemetry().record(
+            // Mixed uploads are one batch attempt, classified as other.
+            let media_type = result
+                .as_ref()
+                .ok()
+                .and_then(|v| {
+                    v.attachments
+                        .first()
+                        .filter(|first| {
+                            v.attachments
+                                .iter()
+                                .all(|item| item.reference.media_type == first.reference.media_type)
+                        })
+                        .map(|item| item.reference.media_type.as_str())
+                })
+                .unwrap_or("");
+            shared.app_performance_telemetry().record_media(
                 AppPerformanceOperation::MediaUpload,
                 started_at.elapsed(),
                 result.is_ok(),
+                media_type,
             );
             let _ = respond.send(result);
         }
@@ -2368,10 +2547,11 @@ async fn complete_media_http(
             respond,
             started_at,
         } => {
-            shared.app_performance_telemetry().record(
+            shared.app_performance_telemetry().record_media(
                 AppPerformanceOperation::MediaDownload,
                 started_at.elapsed(),
                 result.is_ok(),
+                result.as_ref().map(|v| v.media_type.as_str()).unwrap_or(""),
             );
             let _ = respond.send(result);
         }
@@ -2394,10 +2574,11 @@ async fn complete_media_http(
                     Err(persistence_error) => Err(persistence_error),
                 },
             };
-            shared.app_performance_telemetry().record(
+            shared.app_performance_telemetry().record_media(
                 AppPerformanceOperation::GroupCreateImageUpload,
                 started_at.elapsed(),
                 succeeded,
+                "image/",
             );
             let _ = respond.send(response);
         }
@@ -2440,10 +2621,9 @@ fn capture_group_read_snapshot(
 }
 
 /// Serve safe snapshot reads while `work` exclusively borrows the live client.
-/// Mutations stay queued FIFO behind `work`; once a mutation is deferred,
-/// later reads wait with it. Worker-owned catch-up is remembered without
-/// poisoning those reads, because create/invite spawn it immediately after
-/// the caller-visible reply.
+/// Mutations stay queued FIFO behind `work`; reads continue observing the
+/// snapshot until it completes. Worker-owned catch-up runs afterward because
+/// create/invite spawn it immediately after the caller-visible reply.
 async fn serve_snapshot_reads_until<Fut>(
     read_snapshot: Option<crate::client::GroupReadSnapshot>,
     work: Fut,
@@ -2477,7 +2657,7 @@ where
         let Some(command) = command else {
             continue;
         };
-        let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
+        let snapshot_reads_available = read_snapshot.is_some();
         match command {
             AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
                 let snapshot = read_snapshot
@@ -2544,6 +2724,21 @@ struct AccountWorkerCommandContext<'a> {
     scheduled_convergence: &'a mut ScheduledConvergence,
 }
 
+// Keep response ownership and error classification outside the large async dispatch
+// frame. Inlining the result moves at every arm grows debug poll stacks substantially.
+#[inline(never)]
+fn respond_diagnosed<T>(
+    shared: &RuntimeSharedServices,
+    permit: Option<&crate::DiagnosticsPermit>,
+    respond: oneshot::Sender<Result<T, AppError>>,
+    result: Result<T, AppError>,
+) -> Result<(), Result<T, AppError>> {
+    if let Err(error) = &result {
+        shared.product_analytics.storage_failure(permit, error);
+    }
+    respond.send(result)
+}
+
 /// Commands that arrived while a previous handler held `&mut client` stay in
 /// `pending` until that handler returns. Read commands (`Members` /
 /// `MemberIdsPage` / `GroupMlsState` / `GroupRoster` / `QuarantinedGroups`) are
@@ -2554,6 +2749,24 @@ async fn handle_account_worker_command(
     command: AccountWorkerCommand,
     context: AccountWorkerCommandContext<'_>,
 ) {
+    let events = context.events;
+    let account_id_hex = context.account_id_hex;
+    let account_label = context.account_label;
+    if account_worker_command_future(client, command, context).await {
+        // One publication seam covers all successful dispatch completions. Early
+        // admission failures and cancelled commands retain their previous behavior.
+        publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+    }
+}
+
+// Construct only the selected command's async state. The synchronous factory's
+// construction frame is gone before polling begins, keeping dispatch overhead
+// out of nested engine/publication stacks on 2 MiB runtime threads.
+fn account_worker_command_future<'a>(
+    client: &'a mut AppClient,
+    command: AccountWorkerCommand,
+    context: AccountWorkerCommandContext<'a>,
+) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     let AccountWorkerCommandContext {
         commands,
         pending,
@@ -2565,22 +2778,27 @@ async fn handle_account_worker_command(
         media_http,
         scheduled_convergence,
     } = context;
+    let storage_permit = shared.product_analytics.permit();
     match command {
-        AccountWorkerCommand::ConnectivityRestored { respond } => {
+        AccountWorkerCommand::ConnectivityRestored { respond } => Box::pin(async move {
             let result = client.note_connectivity_restored().map(|_| ());
             scheduled_convergence.wake_after_connectivity_restored();
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::NetworkStartupSettled { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::NetworkStartupSettled { respond } => Box::pin(async move {
             let _ = respond.send(());
-        }
-        AccountWorkerCommand::StartupCatchUpResult { result, respond } => {
+            true
+        }),
+        AccountWorkerCommand::StartupCatchUpResult { result, respond } => Box::pin(async move {
             let _ = respond.send(result);
-        }
-        AccountWorkerCommand::Drain { respond } => {
+            true
+        }),
+        AccountWorkerCommand::Drain { respond } => Box::pin(async move {
             let _ = respond.send(());
-        }
-        AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
+            true
+        }),
+        AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => Box::pin(async move {
             let pending = match client
                 .retry_pending_runtime_group_subscription_refresh()
                 .await
@@ -2597,17 +2815,25 @@ async fn handle_account_worker_command(
                 }
             };
             let _ = respond.send(pending);
-        }
+            true
+        }),
         #[cfg(test)]
-        AccountWorkerCommand::UnhydratedGroupCount { respond } => {
+        AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
-        }
-        AccountWorkerCommand::CatchUp { respond } => {
+            true
+        }),
+        AccountWorkerCommand::CatchUp { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
             let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_client_pending_projection_updates(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
                     let backfill_result = run_pending_epoch_backfill_reporting_arm(
                         client,
                         events,
@@ -2659,12 +2885,19 @@ async fn handle_account_worker_command(
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
-        }
-        AccountWorkerCommand::RepairFullHistory { respond } => {
+            true
+        }),
+        AccountWorkerCommand::RepairFullHistory { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
             let result = match client.repair_full_history().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_client_pending_projection_updates(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("repair_full_history");
                     }
@@ -2702,7 +2935,8 @@ async fn handle_account_worker_command(
                     .map(AccountCatchUpFailure::classification),
             );
             let _ = respond.send(result);
-        }
+            true
+        }),
         AccountWorkerCommand::CreateGroup {
             queued_at,
             name,
@@ -2710,7 +2944,7 @@ async fn handle_account_worker_command(
             options,
             prepared_image_upload_id,
             respond,
-        } => {
+        } => Box::pin(async move {
             let telemetry = shared.app_performance_telemetry();
             telemetry.record(
                 AppPerformanceOperation::GroupCreateQueueWait,
@@ -2765,7 +2999,8 @@ async fn handle_account_worker_command(
                 }
             }
             let created = result.is_ok();
-            let response_sent = respond.send(result).is_ok();
+            let response_sent =
+                respond_diagnosed(shared, storage_permit.as_ref(), respond, result).is_ok();
             telemetry.record(
                 AppPerformanceOperation::GroupCreateResponseHandoff,
                 response_handoff_started_at.elapsed(),
@@ -2779,50 +3014,51 @@ async fn handle_account_worker_command(
                     account_label,
                     "runtime post-create snapshot failed",
                 );
-                serve_snapshot_reads_until(
-                    read_snapshot,
-                    async {
-                        client
-                            .drive_unpublished_welcome_delivery(Some(&telemetry))
-                            .await;
-                        publish_pending_welcome_delivery_events(
-                            events,
-                            account_id_hex,
-                            account_label,
-                            client,
+                Box::pin(serve_snapshot_reads_until(
+                read_snapshot,
+                async {
+                    client
+                        .drive_unpublished_welcome_delivery(Some(&telemetry))
+                        .await;
+                    publish_pending_welcome_delivery_events(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        client,
+                    );
+                    let subscription_started_at = Instant::now();
+                    let subscription_refresh = client.sync_runtime_groups().await;
+                    telemetry.record(
+                        AppPerformanceOperation::GroupCreateSubscriptionRefresh,
+                        subscription_started_at.elapsed(),
+                        subscription_refresh.is_ok(),
+                    );
+                    if let Err(error) = subscription_refresh {
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "create_group_subscription_refresh",
+                            error_kind = error.privacy_safe_kind(),
+                            "confirmed group creation could not refresh subscriptions immediately"
                         );
-                        let subscription_started_at = Instant::now();
-                        let subscription_refresh = client.sync_runtime_groups().await;
-                        telemetry.record(
-                            AppPerformanceOperation::GroupCreateSubscriptionRefresh,
-                            subscription_started_at.elapsed(),
-                            subscription_refresh.is_ok(),
-                        );
-                        if let Err(error) = subscription_refresh {
-                            tracing::warn!(
-                                target: "marmot_app::runtime",
-                                method = "create_group_subscription_refresh",
-                                error_kind = error.privacy_safe_kind(),
-                                "confirmed group creation could not refresh subscriptions immediately"
-                            );
-                        }
-                        client
-                            .retry_pending_push_registration_shares_best_effort()
-                            .await;
-                    },
-                    commands,
-                    pending,
-                    app,
-                    account_label,
-                )
-                .await;
+                    }
+                    client
+                        .retry_pending_push_registration_shares_best_effort()
+                        .await;
+                },
+                commands,
+                pending,
+                app,
+                account_label,
+            ))
+            .await;
             }
-        }
+            true
+        }),
         AccountWorkerCommand::StagePreparedGroupImage {
             plaintext,
             media_type,
             respond,
-        } => {
+        } => Box::pin(async move {
             let started_at = Instant::now();
             let result = client.stage_prepared_initial_group_image(&plaintext, &media_type);
             shared.app_performance_telemetry().record(
@@ -2830,13 +3066,14 @@ async fn handle_account_worker_command(
                 started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UploadPreparedGroupImage {
             upload_id,
             server,
             respond,
-        } => {
+        } => Box::pin(async move {
             match client.prepare_initial_group_image_upload(
                 &upload_id,
                 server,
@@ -2847,15 +3084,21 @@ async fn handle_account_worker_command(
                 }
                 Ok(PreparedGroupImageUploadStart::Http(http)) => {
                     if let Err(err) = reserve_prepared_group_image_upload(media_http, &upload_id) {
-                        let _ = respond.send(Err(err));
-                        return;
+                        let _ =
+                            respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
+                        return false;
                     }
                     let permit = match reserve_media_http(media_http) {
                         Ok(permit) => permit,
                         Err(err) => {
                             release_prepared_group_image_upload(media_http, &upload_id);
-                            let _ = respond.send(Err(err));
-                            return;
+                            let _ = respond_diagnosed(
+                                shared,
+                                storage_permit.as_ref(),
+                                respond,
+                                Err(err),
+                            );
+                            return false;
                         }
                     };
                     let started_at = Instant::now();
@@ -2869,23 +3112,27 @@ async fn handle_account_worker_command(
                     });
                 }
                 Err(err) => {
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                 }
             }
-        }
+            true
+        }),
         AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond } => {
-            let result =
-                client
-                    .prepared_initial_group_image_status(&upload_id)
-                    .map(|mut status| {
-                        if prepared_group_image_upload_is_in_flight(media_http, &upload_id) {
-                            status.state = crate::AppPreparedGroupImageUploadState::Uploading;
-                        }
-                        status
-                    });
-            let _ = respond.send(result);
+            Box::pin(async move {
+                let result =
+                    client
+                        .prepared_initial_group_image_status(&upload_id)
+                        .map(|mut status| {
+                            if prepared_group_image_upload_is_in_flight(media_http, &upload_id) {
+                                status.state = crate::AppPreparedGroupImageUploadState::Uploading;
+                            }
+                            status
+                        });
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
         }
-        AccountWorkerCommand::PreparedGroupImages { respond } => {
+        AccountWorkerCommand::PreparedGroupImages { respond } => Box::pin(async move {
             let result = client.prepared_initial_group_images().map(|mut statuses| {
                 for status in &mut statuses {
                     if prepared_group_image_upload_is_in_flight(media_http, &status.upload_id) {
@@ -2894,9 +3141,10 @@ async fn handle_account_worker_command(
                 }
                 statuses
             });
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::Members { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::Members { group_id, respond } => Box::pin(async move {
             // On-demand promotion (mdk#1161): normally a no-op (the startup
             // pipeline hydrated everything), but if the pipeline aborted on a
             // storage error the leftover groups must still promote on first
@@ -2906,14 +3154,21 @@ async fn handle_account_worker_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => Box::pin(async move {
             // The page is one worker command, but each requested group keeps
             // the same on-demand promotion and quarantine gate as `Members`.
-            let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
-        }
-        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                member_ids_page_after_hydration(client, &group_ids),
+            );
+            true
+        }),
+        AccountWorkerCommand::GroupMlsState { group_id, respond } => Box::pin(async move {
             // See the Members arm: on-demand promotion for pipeline-abort
             // leftovers.
             let _ = client
@@ -2921,13 +3176,15 @@ async fn handle_account_worker_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::GroupRoster { group_id, respond } => Box::pin(async move {
             let result = group_roster_after_hydration(client, &group_id);
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => Box::pin(async move {
             let result = client.enable_group_disbanding(&group_id).await;
             if result.is_ok() {
                 publish_app_runtime_group_state_updated(
@@ -2937,9 +3194,10 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::DisbandGroup { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DisbandGroup { group_id, respond } => Box::pin(async move {
             let result = client.disband_group(&group_id).await;
             publish_app_runtime_group_state_updated(
                 events,
@@ -2947,61 +3205,72 @@ async fn handle_account_worker_command(
                 account_label,
                 &group_id,
             );
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::AcknowledgeDisbandFailure { group_id, respond } => {
-            let result = client.acknowledge_disband_failure(&group_id);
-            if matches!(result, Ok(true)) {
-                publish_app_runtime_group_state_updated(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    &group_id,
-                );
-            }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::QuarantinedGroups { respond } => {
-            let result = Ok(client.quarantined_groups());
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond } => {
-            let result = client.retry_hydrate_quarantined_group(&group_id);
-            if matches!(result, Ok(true)) {
-                // The group is live again; the engine queued a
-                // `GroupHydrationRecovered` event. Drain it now so
-                // subscribers see the typed recovery event
-                // deterministically at retry time rather than only
-                // when unrelated relay traffic later triggers a
-                // drain (mdk#426). Publish those events plus a
-                // `GroupStateUpdated` so chat-list / projection
-                // consumers refresh and the group leaves the recovery
-                // surface and reappears as a normal chat.
-                match client.drain_pending_session_events().await {
-                    Ok(summary) => {
-                        publish_app_runtime_summary(events, account_id_hex, account_label, &summary)
-                    }
-                    Err(err) => publish_app_runtime_account_error(
+            Box::pin(async move {
+                let result = client.acknowledge_disband_failure(&group_id);
+                if matches!(result, Ok(true)) {
+                    publish_app_runtime_group_state_updated(
                         events,
                         account_id_hex,
                         account_label,
-                        account_error_message("retry recovery drain failed", &err),
-                    ),
+                        &group_id,
+                    );
                 }
-                publish_app_runtime_group_state_updated(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    &group_id,
-                );
-            }
-            let _ = respond.send(result);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
+        }
+        AccountWorkerCommand::QuarantinedGroups { respond } => Box::pin(async move {
+            let result = Ok(client.quarantined_groups());
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond } => {
+            Box::pin(async move {
+                let result = client.retry_hydrate_quarantined_group(&group_id);
+                if matches!(result, Ok(true)) {
+                    // The group is live again; the engine queued a
+                    // `GroupHydrationRecovered` event. Drain it now so
+                    // subscribers see the typed recovery event
+                    // deterministically at retry time rather than only
+                    // when unrelated relay traffic later triggers a
+                    // drain (mdk#426). Publish those events plus a
+                    // `GroupStateUpdated` so chat-list / projection
+                    // consumers refresh and the group leaves the recovery
+                    // surface and reappears as a normal chat.
+                    match client.drain_pending_session_events().await {
+                        Ok(summary) => publish_app_runtime_summary(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            &summary,
+                        ),
+                        Err(err) => publish_app_runtime_account_error(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            account_error_message("retry recovery drain failed", &err),
+                        ),
+                    }
+                    publish_app_runtime_group_state_updated(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &group_id,
+                    );
+                }
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
         }
         AccountWorkerCommand::UpdateMessageRetention {
             group_id,
             disappearing_message_secs,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .update_message_retention(&group_id, disappearing_message_secs)
                 .await;
@@ -3019,13 +3288,14 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
             group_id,
             endpoints,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .replace_encrypted_media_blob_endpoints(&group_id, endpoints)
                 .await;
@@ -3043,15 +3313,16 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UpdateGroupAvatarUrl {
             group_id,
             url,
             dim,
             thumbhash,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .update_group_avatar_url(&group_id, url, dim, thumbhash)
                 .await;
@@ -3073,31 +3344,34 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::SafeExportSecret {
             group_id,
             component_id,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.safe_export_secret(&group_id, component_id);
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::ExporterSecret {
             group_id,
             label,
             length,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.exporter_secret(&group_id, &label, length);
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::InviteMembers {
             group_id,
             members,
             initial_admins,
             respond,
-        } => {
+        } => Box::pin(async move {
             let telemetry = shared.app_performance_telemetry();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
@@ -3127,7 +3401,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             if canonical {
                 // Reply first so the inviter is not blocked on Welcome publish.
                 // Snapshot reads (members, MLS state, roster) are served from a
@@ -3140,7 +3414,7 @@ async fn handle_account_worker_command(
                     account_label,
                     "runtime post-invite snapshot failed",
                 );
-                serve_snapshot_reads_until(
+                Box::pin(serve_snapshot_reads_until(
                     read_snapshot,
                     async {
                         client
@@ -3157,15 +3431,16 @@ async fn handle_account_worker_command(
                     pending,
                     app,
                     account_label,
-                )
+                ))
                 .await;
             }
-        }
+            true
+        }),
         AccountWorkerCommand::RemoveMembers {
             group_id,
             members,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
                 client.remove_members(&group_id, &member_refs).await
@@ -3185,9 +3460,10 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::LeaveGroup { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::LeaveGroup { group_id, respond } => Box::pin(async move {
             let result = client.leave_group(&group_id).await;
             // Drain the kind-1210 "member left" row this commit queued. Sibling
             // mutators (invite/remove/profile) already flush
@@ -3212,9 +3488,26 @@ async fn handle_account_worker_command(
                 account_label,
                 &group_id,
             );
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::DeleteGroupLocal { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::ForgetGroupLocal { group_id, respond } => Box::pin(async move {
+            let result = client.forget_group_local(&group_id).await;
+            if result.is_ok() {
+                scheduled_convergence.note_success(&group_id);
+            }
+            if matches!(result, Ok(true)) {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DeleteGroupLocal { group_id, respond } => Box::pin(async move {
             let result = client.delete_group_local(&group_id).await;
             if matches!(result, Ok(true)) {
                 publish_app_runtime_group_state_updated(
@@ -3224,9 +3517,44 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => Box::pin(async move {
+            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+            true
+        }),
+        AccountWorkerCommand::ConfirmGroupRejoin {
+            welcome_id,
+            token,
+            respond,
+        } => Box::pin(async move {
+            let result = client.confirm_group_rejoin(&welcome_id, &token).await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
             let _ = respond.send(result);
-        }
-        AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => {
+            true
+        }),
+        AccountWorkerCommand::DeclineGroupRejoin {
+            welcome_id,
+            respond,
+        } => Box::pin(async move {
+            let result = client.decline_group_rejoin(&welcome_id);
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            let _ = respond.send(result);
+            true
+        }),
+        AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => Box::pin(async move {
             let result = client.accept_group_invite(&group_id);
             if result.is_ok() {
                 publish_app_runtime_group_state_updated(
@@ -3237,14 +3565,15 @@ async fn handle_account_worker_command(
                 );
             }
             let retry_after_response = result.is_ok();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             if retry_after_response {
                 client
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
-        }
-        AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => {
+            true
+        }),
+        AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => Box::pin(async move {
             let result = client.decline_group_invite(&group_id).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -3260,13 +3589,14 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::SetGroupArchived {
             group_id,
             archived,
             respond,
-        } => {
+        } => Box::pin(async move {
             // The archive projection events (ArchiveChanged chat-list
             // update + GroupStateUpdated) are published by the single
             // caller `MarmotAppRuntime::set_group_archived` after this
@@ -3277,13 +3607,14 @@ async fn handle_account_worker_command(
             // the archive-specific trigger. Keep this worker handler
             // limited to mutating the authoritative in-memory state.
             let result = client.set_group_archived(&group_id, archived);
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::PromoteAdmin {
             group_id,
             member_ref,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.promote_admin(&group_id, &member_ref).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -3299,13 +3630,14 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::DemoteAdmin {
             group_id,
             member_ref,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.demote_admin(&group_id, &member_ref).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -3321,9 +3653,10 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::SelfDemoteAdmin { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SelfDemoteAdmin { group_id, respond } => Box::pin(async move {
             let result = client.self_demote_admin(&group_id).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -3339,14 +3672,15 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UpdateGroupProfile {
             group_id,
             name,
             description,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .update_group_profile(&group_id, name.as_deref(), description.as_deref())
                 .await;
@@ -3364,14 +3698,15 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UpdateGroupImage {
             group_id,
             plaintext,
             media_type,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .update_group_image(&group_id, plaintext, &media_type)
                 .await;
@@ -3389,14 +3724,15 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::DownloadGroupImage { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DownloadGroupImage { group_id, respond } => Box::pin(async move {
             let permit = match reserve_media_http(media_http) {
                 Ok(permit) => permit,
                 Err(err) => {
-                    let _ = respond.send(Err(err));
-                    return;
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
+                    return false;
                 }
             };
             match client.prepare_group_image_download(&group_id).await {
@@ -3404,18 +3740,35 @@ async fn handle_account_worker_command(
                     MediaHttpCompletion::GroupImage { result, respond }
                 }),
                 Err(err) => {
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                 }
             }
-        }
+            true
+        }),
         AccountWorkerCommand::SendMessage {
+            enqueued_at,
             group_id,
             payload,
             respond,
-        } => {
+        } => Box::pin(async move {
             let send_started_at = Instant::now();
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                enqueued_at.elapsed(),
+                true,
+            );
+            let mut first_projection = true;
+            client.send_telemetry = Some(shared.app_performance_telemetry());
             let result = client
                 .send_with_local_projection(&group_id, &payload, |update| {
+                    if first_projection {
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::OutboundMessageLocalProjection,
+                            enqueued_at.elapsed(),
+                            true,
+                        );
+                        first_projection = false;
+                    }
                     publish_app_runtime_projection_update(
                         events,
                         account_id_hex,
@@ -3424,19 +3777,29 @@ async fn handle_account_worker_command(
                     );
                 })
                 .await;
+            client.send_telemetry = None;
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::SendAppEvent {
+            enqueued_at,
             group_id,
             intent,
             respond,
-        } => {
+        } => Box::pin(async move {
             let send_started_at = Instant::now();
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                enqueued_at.elapsed(),
+                true,
+            );
+            let mut first_projection = true;
+            client.send_telemetry = Some(shared.app_performance_telemetry());
             let result = match intent {
                 AppMessageIntent::Reaction {
                     target_message_id,
@@ -3448,6 +3811,14 @@ async fn handle_account_worker_command(
                             &target_message_id,
                             &emoji,
                             |update| {
+                                if first_projection {
+                                    shared.app_performance_telemetry().record(
+                                        AppPerformanceOperation::OutboundMessageLocalProjection,
+                                        enqueued_at.elapsed(),
+                                        true,
+                                    );
+                                    first_projection = false;
+                                }
                                 publish_app_runtime_projection_update(
                                     events,
                                     account_id_hex,
@@ -3460,6 +3831,14 @@ async fn handle_account_worker_command(
                 }
                 intent => client
                     .send_app_event_with_local_projection(&group_id, intent, |update| {
+                        if first_projection {
+                            shared.app_performance_telemetry().record(
+                                AppPerformanceOperation::OutboundMessageLocalProjection,
+                                enqueued_at.elapsed(),
+                                true,
+                            );
+                            first_projection = false;
+                        }
                         publish_app_runtime_projection_update(
                             events,
                             account_id_hex,
@@ -3470,26 +3849,29 @@ async fn handle_account_worker_command(
                     .await
                     .map(|(_event, summary)| summary),
             };
+            client.send_telemetry = None;
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::BuildMediaImetaTag {
             group_id,
             reference,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.build_media_imeta_tag(&group_id, &reference).await;
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UploadMedia {
             group_id,
             request,
             respond,
-        } => {
+        } => Box::pin(async move {
             let started_at = Instant::now();
             let permit = match reserve_media_http(media_http) {
                 Ok(permit) => permit,
@@ -3499,8 +3881,8 @@ async fn handle_account_worker_command(
                         started_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
-                    return;
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
+                    return false;
                 }
             };
             match client
@@ -3523,16 +3905,17 @@ async fn handle_account_worker_command(
                         started_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                 }
             }
-        }
+            true
+        }),
         AccountWorkerCommand::DownloadMedia {
             group_id,
             reference,
             enqueued_at,
             respond,
-        } => {
+        } => Box::pin(async move {
             let telemetry = shared.app_performance_telemetry();
             telemetry.record(
                 AppPerformanceOperation::MediaDownloadQueueWait,
@@ -3547,8 +3930,8 @@ async fn handle_account_worker_command(
                         enqueued_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
-                    return;
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
+                    return false;
                 }
             };
             let preparation_started = Instant::now();
@@ -3584,25 +3967,30 @@ async fn handle_account_worker_command(
                         enqueued_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                 }
             }
-        }
+            true
+        }),
         AccountWorkerCommand::SecureDeleteExpiredPlaintext { group_id, respond } => {
-            let result = client.secure_delete_expired_plaintext_for_group(&group_id);
-            let _ = respond.send(result);
+            Box::pin(async move {
+                let result = client.secure_delete_expired_plaintext_for_group(&group_id);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
         }
-        AccountWorkerCommand::SweepExpiredRetention { now_ms, respond } => {
+        AccountWorkerCommand::SweepExpiredRetention { now_ms, respond } => Box::pin(async move {
             let result = client.sweep_expired_retention(now_ms);
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::StartAgentTextStream {
             group_id,
             stream_id,
             parent_message_id,
             quic_candidates,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .start_agent_text_stream_with_local_projection(
                     &group_id,
@@ -3619,13 +4007,14 @@ async fn handle_account_worker_command(
                     },
                 )
                 .await;
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::FinishAgentTextStream {
             group_id,
             request,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .finish_agent_text_stream_with_local_projection(&group_id, request, |update| {
                     publish_app_runtime_projection_update(
@@ -3636,9 +4025,10 @@ async fn handle_account_worker_command(
                     );
                 })
                 .await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => Box::pin(async move {
             let result = client.retry_group_convergence(&group_id).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -3654,28 +4044,32 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::PendingWelcomeDeliveries { respond } => Box::pin(async move {
             let result = client.pending_welcome_deliveries();
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::RedeliverWelcome {
             message_id_hex,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.redeliver_welcome(&message_id_hex).await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::PublishKeyPackage { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::PublishKeyPackage { respond } => Box::pin(async move {
             let result = async {
                 let key_package = client.publish_key_package().await?;
                 Ok(key_package.bytes().len())
             }
             .await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::PublishSetupKeyPackage { respond } => Box::pin(async move {
             let started_at = Instant::now();
             let result = async {
                 let key_package = client.publish_setup_key_package().await?;
@@ -3687,43 +4081,87 @@ async fn handle_account_worker_command(
                 started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::RotateKeyPackage { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RotateKeyPackage { respond } => Box::pin(async move {
             let result = async {
                 let key_package = client.rotate_key_package().await?;
                 Ok(key_package.bytes().len())
             }
             .await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => {
-            let _ = respond.send(client.key_package_maintenance_status());
-        }
-        AccountWorkerCommand::DurablyOwnedKeyPackages { respond } => {
-            let _ = respond.send(client.durably_owned_key_packages());
-        }
-        AccountWorkerCommand::MaintenanceStatus { group_id, respond } => {
-            let _ = respond.send(client.maintenance_status(&group_id));
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.key_package_maintenance_status(),
+            );
+            true
+        }),
+        AccountWorkerCommand::DurablyOwnedKeyPackages { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.durably_owned_key_packages(),
+            );
+            true
+        }),
+        AccountWorkerCommand::MaintenanceStatus { group_id, respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.maintenance_status(&group_id),
+            );
+            true
+        }),
         AccountWorkerCommand::ScheduleManualSelfUpdate { group_id, respond } => {
-            let _ = respond.send(client.schedule_manual_self_update(&group_id));
+            Box::pin(async move {
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.schedule_manual_self_update(&group_id),
+                );
+                true
+            })
         }
-        AccountWorkerCommand::PeriodicMaintenancePolicy { respond } => {
-            let _ = respond.send(client.periodic_maintenance_policy());
-        }
+        AccountWorkerCommand::PeriodicMaintenancePolicy { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.periodic_maintenance_policy(),
+            );
+            true
+        }),
         AccountWorkerCommand::SetPeriodicMaintenancePolicy { policy, respond } => {
-            let _ = respond.send(client.set_periodic_maintenance_policy(policy));
+            Box::pin(async move {
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.set_periodic_maintenance_policy(policy),
+                );
+                true
+            })
         }
-        AccountWorkerCommand::PauseMaintenance { respond } => {
+        AccountWorkerCommand::PauseMaintenance { respond } => Box::pin(async move {
             client.pause_maintenance();
             let _ = respond.send(Ok(()));
-        }
-        AccountWorkerCommand::ResumeMaintenance { respond } => {
+            true
+        }),
+        AccountWorkerCommand::ResumeMaintenance { respond } => Box::pin(async move {
             client.resume_maintenance();
             let _ = respond.send(Ok(()));
-        }
-        AccountWorkerCommand::RunDueMaintenance { respond } => {
+            true
+        }),
+        AccountWorkerCommand::RunDueMaintenance { respond } => Box::pin(async move {
             let result = client.run_due_maintenance().await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -3733,19 +4171,21 @@ async fn handle_account_worker_command(
                     account_label,
                 );
             }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::SharePushRegistration { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SharePushRegistration { respond } => Box::pin(async move {
             let result = client.share_push_registration().await;
-            let _ = respond.send(result);
-        }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::UpsertPushRegistration {
             platform,
             raw_token,
             server_pubkey_hex,
             relay_hint,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client
                 .upsert_and_share_push_registration(
                     platform,
@@ -3754,50 +4194,64 @@ async fn handle_account_worker_command(
                     relay_hint,
                 )
                 .await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::ClearPushRegistration { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::ClearPushRegistration { respond } => Box::pin(async move {
             let result = client.clear_and_share_push_registration().await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::SetNativePushEnabled { enabled, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SetNativePushEnabled { enabled, respond } => Box::pin(async move {
             let result = client
                 .app
                 .set_native_push_enabled(&client.state.label, enabled);
             let should_retry = result.is_ok();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             if should_retry {
                 client
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
-        }
+            true
+        }),
         AccountWorkerCommand::RemovePushRegistration {
             registration,
             respond,
-        } => {
+        } => Box::pin(async move {
             let result = client.remove_push_registration(registration).await;
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::RetryPushRegistration { respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RetryPushRegistration { respond } => Box::pin(async move {
             let pending = client
                 .retry_pending_push_registration_shares_best_effort()
                 .await;
             let _ = respond.send(pending);
-        }
-        AccountWorkerCommand::DeleteAuditLog { path, respond } => {
+            true
+        }),
+        AccountWorkerCommand::DeleteAuditLog { path, respond } => Box::pin(async move {
             let result = client.rotate_audit_log_if_active(&path);
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::SetAuditRecording { enabled, respond } => {
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SetAuditRecording { enabled, respond } => Box::pin(async move {
             client.set_audit_recording(enabled);
             let _ = respond.send(Ok(()));
-        }
+            true
+        }),
     }
-    // Publishing from this seam — rather than inside each send arm — keeps
-    // every command path covered; the summary is empty for commands that
-    // applied nothing.
-    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+}
+
+fn group_recovery_after_hydration(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> Result<crate::GroupRecoveryStatus, AppError> {
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(group_id)?;
+    client.group_recovery_status(group_id)
 }
 
 pub(super) fn group_roster_after_hydration(
@@ -4246,31 +4700,33 @@ impl ScheduledConvergence {
         self.reset_timer_to_earliest();
     }
 
-    fn take_ready(&mut self) -> Vec<GroupId> {
-        let Some(earliest) = self.deadlines.values().copied().min() else {
-            self.reset_timer_to_earliest();
-            return Vec::new();
-        };
-        let now = TokioInstant::now();
-        let mut ready: Vec<GroupId> = self
+    fn has_ready(&self) -> bool {
+        !self.deadlines.is_empty() && self.timer.deadline() <= TokioInstant::now()
+    }
+
+    fn take_ready(&mut self) -> Option<GroupId> {
+        // One group per worker turn: a pass can await relay recovery, so taking
+        // every overdue group would multiply that wait by the account's size.
+        // Earliest-first keeps an unsettled group from jumping ahead when it
+        // re-arms; undispatched groups retain their original deadlines.
+        let next = self
             .deadlines
             .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(group_id, _)| group_id.clone())
-            .collect();
-        if ready.is_empty() {
-            ready.extend(
-                self.deadlines
-                    .iter()
-                    .filter(|(_, deadline)| **deadline == earliest)
-                    .map(|(group_id, _)| group_id.clone()),
-            );
-        }
-        for group_id in &ready {
-            self.deadlines.remove(group_id);
-        }
+            .min_by(
+                |(left_group, left_deadline), (right_group, right_deadline)| {
+                    left_deadline
+                        .cmp(right_deadline)
+                        .then_with(|| left_group.as_slice().cmp(right_group.as_slice()))
+                },
+            )
+            .map(|(group_id, _)| group_id.clone());
+        let Some(group_id) = next else {
+            self.reset_timer_to_earliest();
+            return None;
+        };
+        self.deadlines.remove(&group_id);
         self.reset_timer_to_earliest();
-        ready
+        Some(group_id)
     }
 
     fn note_success(&mut self, group_id: &GroupId) {
@@ -4434,6 +4890,22 @@ fn publish_sync_summary_with_audit(
 /// policy choice visible instead of conflating deferral with no pending work.
 /// Explicit full-history repair already performed the unfloored replay and
 /// consumes the same intent without calling this helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyPackageMaintenanceCatchUpOutcome {
+    Completed,
+    Failed,
+    TimedOut,
+}
+impl KeyPackageMaintenanceCatchUpOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "success",
+            Self::Failed => "failure",
+            Self::TimedOut => "timeout",
+        }
+    }
+}
+
 async fn run_pending_epoch_backfill_reporting_arm(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -4443,7 +4915,26 @@ async fn run_pending_epoch_backfill_reporting_arm(
     seam: EpochBackfillExecutionSeam,
 ) -> Result<(), AccountCatchUpFailure> {
     let backfill_armed = client.has_pending_epoch_backfill();
-    let mut result = match client.run_pending_epoch_backfill(seam).await {
+    let observation = backfill_armed
+        .then(|| {
+            shared.product_analytics.begin(
+                crate::ProductFamily::Recovery,
+                "backfill",
+                crate::ProductUnit::Attempt,
+            )
+        })
+        .flatten();
+    let backfill_result = client.run_pending_epoch_backfill(seam).await;
+    if let Some(observation) = observation {
+        observation.finish(match &backfill_result {
+            Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
+            Ok(EpochBackfillRunOutcome::Incomplete(_)) => "partial",
+            Ok(EpochBackfillRunOutcome::Deferred) => "deferred",
+            Ok(EpochBackfillRunOutcome::NotPending) => "no_work_due",
+            Err(_) => "failure",
+        });
+    }
+    let mut result = match backfill_result {
         // An incomplete replay published the same real summary: it ingested
         // whatever it reached before the relays failed to confirm they had
         // served the account's stored history. Its intent stays pending, so the
@@ -4590,6 +5081,22 @@ fn publish_client_pending_projection_updates(
 ) {
     for update in client.take_pending_projection_updates() {
         publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+    }
+    for group_id in client.pending_recovery_status_updates.drain() {
+        publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
+    // Superseded own commits ride the same drain: every worker seam that can
+    // observe convergence effects already flushes projection updates here.
+    for report in client.take_pending_superseded_change_events() {
+        let _ = events.send(MarmotAppEvent::GroupChangeSuperseded {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            group_id: report.group_id,
+            commit_id_hex: hex::encode(report.commit_id.as_slice()),
+            kind: report.kind,
+            outcome: report.outcome,
+            reason: report.reason,
+        });
     }
 }
 
@@ -4746,6 +5253,351 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reads_bypass_deferred_work() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = app.client("alice").await.unwrap();
+        let snapshot = client.group_read_snapshot().unwrap();
+        let (commands, mut receiver) = mpsc::channel(8);
+        let (respond, mut mutation) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
+            .unwrap();
+        let (respond, read) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        let (release, work) = oneshot::channel::<()>();
+        let mut pending = VecDeque::new();
+        let serve = serve_snapshot_reads_until(
+            Some(snapshot),
+            work,
+            &mut receiver,
+            &mut pending,
+            &app,
+            "alice",
+        );
+        let check = async {
+            assert!(
+                timeout(Duration::from_secs(1), read)
+                    .await
+                    .expect("snapshot read must finish while work is held")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                mutation.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(serve, check);
+        result.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::ConnectivityRestored { .. })
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-policy-overrides")]
+    async fn due_convergence_interleaves_with_a_backlog_of_worker_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let alice = home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::default()
+                .with_dev_settlement_quiescence_ms(100)
+                .with_dev_scheduled_convergence_delay_ms(60_000),
+        )
+        .with_test_relay_client(relay);
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.publish_key_package("bob").await.unwrap();
+        let first = runtime
+            .create_group(
+                "alice",
+                "first",
+                std::slice::from_ref(&bob.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = runtime
+            .create_group(
+                "alice",
+                "second",
+                std::slice::from_ref(&bob.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        runtime.catch_up_accounts().await.unwrap();
+        let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+        runtime
+            .update_group_profile("alice", &first, Some("first changed".into()), None)
+            .await
+            .unwrap();
+        runtime
+            .update_group_profile("alice", &second, Some("second changed".into()), None)
+            .await
+            .unwrap();
+        // Wait for durable evidence that both inbound commits have armed a pass,
+        // rather than assuming the second delivery beats the first timer.
+        use cgka_traits::storage::ConvergencePassStorage;
+        let storage = app.account_storage("bob").unwrap();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if storage.convergence_pass(&first).unwrap().is_some()
+                    && storage.convergence_pass(&second).unwrap().is_some()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both inbound commits arm durable convergence passes");
+        // Only Bob participates in the barrier and queue assertion. Alice's
+        // real publications above already supplied all the recovery work.
+        runtime
+            .accounts()
+            .workers
+            .lock()
+            .await
+            .remove(&alice.account_id_hex)
+            .unwrap()
+            .shutdown()
+            .await;
+        let first_pass = Arc::new(tokio::sync::Barrier::new(2));
+        runtime
+            .shared_services()
+            .set_next_scheduled_convergence_barrier(first_pass.clone());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(30), first_pass.wait())
+            .await
+            .expect("first recovery pass starts with both group deadlines due");
+        let next_pass = Arc::new(tokio::sync::Barrier::new(2));
+        runtime
+            .shared_services()
+            .set_next_scheduled_convergence_barrier(next_pass.clone());
+        let mut responses = Vec::new();
+        for _ in 0..8 {
+            let (respond, response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                    group_id: first.clone(),
+                    respond,
+                })
+                .expect("the held worker's command queue has capacity");
+            responses.push(response);
+        }
+        first_pass.wait().await;
+        timeout(Duration::from_secs(30), next_pass.wait())
+            .await
+            .expect("recovery progresses despite queued commands");
+        let queued_count = responses.len();
+        let mut remaining = Vec::new();
+        for mut response in responses {
+            match response.try_recv() {
+                Ok(result) => {
+                    result.expect("a completed queued command must succeed");
+                }
+                Err(oneshot::error::TryRecvError::Empty) => remaining.push(response),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    panic!("the worker dropped a queued command without replying");
+                }
+            }
+        }
+        let completed = queued_count - remaining.len();
+        assert!(
+            completed <= 1,
+            "a due group must run after at most one queued command, observed {completed}"
+        );
+        next_pass.wait().await;
+        timeout(Duration::from_secs(5), async {
+            for response in remaining {
+                response
+                    .await
+                    .expect("the worker must reply to every queued command")
+                    .expect("every queued command must succeed");
+            }
+        })
+        .await
+        .expect("recovery must not starve the queued commands");
+        runtime.drain_in_flight_work().await.unwrap();
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_warning_notifications_survive_projection_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("recovery notifications", &[])
+            .await
+            .unwrap();
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        let (events, mut received) = broadcast::channel(16);
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        while received.try_recv().is_ok() {}
+        assert_eq!(
+            client
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), epoch, 1),
+            BackfillDecision::Arm
+        );
+        for _ in 0..3 {
+            let _ = client.epoch_stall.observe_fruitless_completion([&group_id]);
+        }
+        client.persist_epoch_stall_evidence([&group_id]);
+        client
+            .finish_scheduled_convergence_effects(
+                &group_id,
+                &marmot_account::AccountDeviceEffects::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.pending_group_projection_updates.is_empty(),
+            "the checkpoint consumed the storage delta"
+        );
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id)
+        );
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a status transition is broadcast once"
+        );
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
+                group_id: group_id.clone(),
+                via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
+                welcomer: None,
+                explicitly_confirmed: true,
+            }],
+            ..Default::default()
+        };
+        client.observe_recovery_health(&effects).unwrap();
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id)
+        );
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoin_decisions_answer_during_startup_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let (events, _) = broadcast::channel(16);
+        let mut deferred = Vec::new();
+        let mut setup = None;
+        let id = cgka_traits::MessageId::new(vec![0x75; 32]);
+        let (respond, mut confirm) = oneshot::channel();
+        handle_startup_hydration_command(
+            &mut client,
+            AccountWorkerCommand::ConfirmGroupRejoin {
+                welcome_id: id.clone(),
+                token: vec![0; 32],
+                respond,
+            },
+            &mut deferred,
+            &events,
+            "",
+            "alice",
+            &mut setup,
+        )
+        .await;
+        assert!(
+            confirm
+                .try_recv()
+                .expect("confirm must answer without deferral")
+                .is_err()
+        );
+        let (respond, mut decline) = oneshot::channel();
+        handle_startup_hydration_command(
+            &mut client,
+            AccountWorkerCommand::DeclineGroupRejoin {
+                welcome_id: id,
+                respond,
+            },
+            &mut deferred,
+            &events,
+            "",
+            "alice",
+            &mut setup,
+        )
+        .await;
+        assert!(
+            decline
+                .try_recv()
+                .expect("decline must answer without deferral")
+                .is_err()
+        );
+        assert!(
+            deferred.is_empty(),
+            "unrelated hydration must not retain rejoin decisions"
+        );
+    }
+
     #[test]
     fn generated_setup_priority_selects_the_exact_durable_initial_key_package() {
         for phase in [
@@ -4821,6 +5673,7 @@ mod tests {
         let (worker_lifetime, _) = watch::channel(());
         (
             MediaHttpContext {
+                product: Default::default(),
                 tx,
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -4903,6 +5756,7 @@ mod tests {
         let permit = reserve_media_http(&media_http).unwrap();
         let (respond, response) = oneshot::channel();
         let done = MediaHttpDone {
+            cancellation: None,
             permit,
             completion: MediaHttpCompletion::PreparedGroupImageUpload {
                 upload_id: staged.upload_id.clone(),
@@ -5438,6 +6292,7 @@ mod tests {
         let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
         let (media_http_worker_lifetime, _) = watch::channel(());
         let media_http = MediaHttpContext {
+            product: Default::default(),
             tx: media_http_tx,
             permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
             prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -5859,8 +6714,7 @@ mod tests {
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
 
         let ready = scheduled.take_ready();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0], group_id);
+        assert_eq!(ready, Some(group_id));
     }
 
     #[tokio::test]
@@ -5870,7 +6724,7 @@ mod tests {
 
         scheduled.schedule_unsettled_groups([group_id.clone()]);
         let ready = scheduled.take_ready();
-        assert_eq!(ready, vec![group_id.clone()]);
+        assert_eq!(ready, Some(group_id.clone()));
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
     }
 
@@ -5882,7 +6736,7 @@ mod tests {
         scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingUnopenable);
 
         let ready = scheduled.take_ready();
-        assert_eq!(ready, vec![group_id.clone()]);
+        assert_eq!(ready, Some(group_id.clone()));
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
         assert_eq!(scheduled.unsettled_rearm_attempts.get(&group_id), Some(&1));
     }
@@ -6050,7 +6904,7 @@ mod tests {
         scheduled.schedule_groups_with_delays([(noisy.clone(), Duration::from_millis(500))]);
 
         assert_eq!(scheduled.deadlines[&first], first_deadline);
-        assert_eq!(scheduled.take_ready(), vec![first]);
+        assert_eq!(scheduled.take_ready(), Some(first));
         assert!(scheduled.deadlines.contains_key(&noisy));
     }
 
@@ -6068,7 +6922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_ready_drains_every_overdue_group_in_one_tick() {
+    async fn take_ready_preserves_other_overdue_groups_for_later_worker_turns() {
         let first = test_group_id(24);
         let second = test_group_id(25);
         let future = test_group_id(26);
@@ -6084,13 +6938,34 @@ mod tests {
 
         let ready = scheduled.take_ready();
 
-        assert_eq!(ready.len(), 2);
-        assert!(ready.contains(&first));
-        assert!(ready.contains(&second));
+        assert_eq!(ready, Some(second));
+        assert_eq!(scheduled.deadlines[&first], now);
+        assert_eq!(scheduled.take_ready(), Some(first));
         assert_eq!(
             scheduled.deadlines.keys().collect::<Vec<_>>(),
             vec![&future]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fifty_overdue_groups_progress_despite_one_group_rearming() {
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let groups: Vec<_> = (1..=50).map(test_group_id).collect();
+        scheduled.schedule_groups(groups.clone());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let deadlines = scheduled.deadlines.clone();
+
+        for group in &groups {
+            assert_eq!(scheduled.take_ready(), Some(group.clone()));
+            scheduled.schedule_unsettled_groups([group.clone()]);
+            for later in groups
+                .iter()
+                .filter(|later| later.as_slice() > group.as_slice())
+            {
+                assert_eq!(scheduled.deadlines[later], deadlines[later]);
+            }
+        }
+        assert_eq!(scheduled.deadlines.len(), 50);
     }
 
     #[tokio::test]

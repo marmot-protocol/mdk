@@ -84,6 +84,11 @@ static int walk_markdown(const struct MarmotMarkdownDocument *doc) {
             printf("smoke:   block %zu: list with %zu items\n", i,
                    b->LIST_BLOCK.items_len);
             break;
+        case MARMOT_MARKDOWN_BLOCK_DETAILS:
+            printf("smoke:   block %zu: details (open=%d body=%zu)\n", i,
+                   b->DETAILS.details ? (int)b->DETAILS.details->open : -1,
+                   b->DETAILS.details ? b->DETAILS.details->body_len : 0);
+            break;
         default:
             printf("smoke:   block %zu: other (tag %d)\n", i, (int)b->tag);
             break;
@@ -108,6 +113,27 @@ int main(int argc, char **argv) {
     marmot_string_free(NULL);
     marmot_account_summary_list_free(NULL);
     marmot_markdown_document_free(NULL);
+    marmot_chat_list_window_snapshot_free(NULL);
+    marmot_account_attention_snapshot_free(NULL);
+    marmot_chat_list_window_subscription_free(NULL);
+    marmot_account_attention_subscription_free(NULL);
+    check(marmot_open_chat_list_window(NULL, NULL, 0, NULL, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "window open preflights output");
+    check(marmot_chat_list_window_subscription_page(NULL, 0, 0, 1, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "window page preflights output");
+    check(marmot_account_attention_subscription_next(NULL, 5000, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "attention next preflights output");
+    marmot_presented_chat_row_free(NULL);
+    marmot_presented_chat_list_snapshot_free(NULL);
+    marmot_presented_chat_list_update_free(NULL);
+    marmot_presented_chat_list_subscription_free(NULL);
+    check(marmot_presented_chat_list_subscription_next(NULL, 5000, NULL) ==
+              MARMOT_STATUS_NULL_POINTER,
+          "presented next validates output before reading");
+    check(marmot_open_presented_chat_list(NULL, NULL, 0, NULL) ==
+              MARMOT_STATUS_NULL_POINTER,
+          "presented open validates output before subscribing");
+
     ok("NULL frees are no-ops");
 
     /* ---- construct + lifecycle ---------------------------------------- */
@@ -130,6 +156,34 @@ int main(int argc, char **argv) {
     bool stopping = true;
     st = marmot_client_is_stopping(client, &stopping);
     check(st == MARMOT_STATUS_OK && !stopping, "client not stopping");
+
+    MarmotAuditLogTrackerConfigV4 audit_config = {
+        .endpoint = NULL,
+        .authorization_bearer_token = "test-upload-token",
+        .source = {.hardware_model = "TestModel", .platform = "linux", .app_version = "test"},
+    };
+    MarmotAuditLogTrackerConfigV4 *audit_result = NULL;
+    st = marmot_set_audit_log_tracker_config_v4(client, &audit_config, &audit_result);
+    check(st == MARMOT_STATUS_OK && audit_result != NULL, "v4 audit config crosses the ABI");
+    if (audit_result) {
+        check(audit_result->authorization_bearer_token == NULL, "audit token is write-only");
+        check(audit_result->source.hardware_model &&
+              strcmp(audit_result->source.hardware_model, "TestModel") == 0,
+              "v4 audit hardware model survives the ABI");
+        marmot_audit_log_tracker_config_v4_free(audit_result);
+    }
+
+    MarmotAuditLogTrackerConfig legacy_audit_config = {
+        .endpoint = NULL, .authorization_bearer_token = NULL,
+        .source = {.device_label = "PRIVATE_DEVICE_NAME", .platform = "linux", .app_version = "test"},
+    };
+    MarmotAuditLogTrackerConfig *legacy_audit_result = NULL;
+    st = marmot_set_audit_log_tracker_config(client, &legacy_audit_config, &legacy_audit_result);
+    check(st == MARMOT_STATUS_OK && legacy_audit_result != NULL, "legacy audit config remains callable");
+    if (legacy_audit_result) {
+        check(legacy_audit_result->source.device_label == NULL, "legacy audit device label is discarded");
+        marmot_audit_log_tracker_config_free(legacy_audit_result);
+    }
 
     st = marmot_client_start(client);
     if (st == MARMOT_STATUS_OK) {
@@ -160,6 +214,22 @@ int main(int argc, char **argv) {
     check(headings == 1, "walked tree found the heading");
     marmot_markdown_document_free(doc);
 
+    doc = NULL;
+    st = marmot_parse_markdown(client,
+                               "<details>\n<summary>More</summary>\nHidden **bold**\n</details>",
+                               &doc);
+    check(st == MARMOT_STATUS_OK && doc != NULL, "details markdown parsed");
+    if (doc == NULL) {
+        return 1;
+    }
+    check(doc->blocks_len == 1, "details is a single top-level block");
+    check(doc->blocks[0].tag == MARMOT_MARKDOWN_BLOCK_DETAILS, "details tag");
+    check(doc->blocks[0].DETAILS.details != NULL, "details payload");
+    check(!doc->blocks[0].DETAILS.details->open, "details default closed");
+    check(doc->blocks[0].DETAILS.details->summary_len == 1, "details summary");
+    check(doc->blocks[0].DETAILS.details->body_len == 1, "details body");
+    marmot_markdown_document_free(doc);
+
     /* ---- offline reads ------------------------------------------------ */
     MarmotAccountSummaryList *accounts = NULL;
     st = marmot_list_accounts(client, &accounts);
@@ -170,6 +240,22 @@ int main(int argc, char **argv) {
     check(accounts->len == 0, "fresh home has no accounts");
     marmot_account_summary_list_free(accounts);
 
+    MarmotAccountAttentionSubscription *attention = NULL;
+    st = marmot_subscribe_account_attention(client, &attention);
+    check(st == MARMOT_STATUS_OK && attention != NULL, "independent attention opens");
+    if (attention != NULL) {
+        MarmotAccountAttentionSnapshot *snapshot = NULL;
+        st = marmot_account_attention_subscription_snapshot(attention, &snapshot);
+        check(st == MARMOT_STATUS_OK && snapshot != NULL, "attention initial snapshot");
+        if (snapshot != NULL) {
+            check(snapshot->accounts_len == 0 && snapshot->sequence == 0, "empty account set");
+            marmot_account_attention_snapshot_free(snapshot);
+        }
+        st = marmot_account_attention_subscription_next(attention, 5, &snapshot);
+        check(st == MARMOT_STATUS_TIMEOUT && snapshot == NULL, "attention timeout preserves ownership");
+        marmot_account_attention_subscription_free(attention);
+    }
+
     /* Directory lookups for an unknown id resolve to absent (NULL out). */
     char *npub = NULL;
     const char *unknown_id =
@@ -177,6 +263,23 @@ int main(int argc, char **argv) {
     st = marmot_npub(client, unknown_id, &npub);
     check(st == MARMOT_STATUS_OK, "npub lookup call succeeds");
     marmot_string_free(npub);
+
+    char *account_hex = NULL;
+    const char *bootstrap_id =
+        "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    st = marmot_account_id_hex(client, bootstrap_id, &account_hex);
+    check(st == MARMOT_STATUS_OK && account_hex != NULL, "account_id_hex hex");
+    marmot_string_free(account_hex);
+
+    char *pseudonym = NULL;
+    st = marmot_default_profile_pseudonym(client, bootstrap_id, &pseudonym);
+    check(st == MARMOT_STATUS_OK && pseudonym != NULL, "default profile pseudonym");
+    marmot_string_free(pseudonym);
+
+    char *random_name = NULL;
+    st = marmot_random_profile_pseudonym(client, &random_name);
+    check(st == MARMOT_STATUS_OK && random_name != NULL, "random profile pseudonym");
+    marmot_string_free(random_name);
 
     /* ---- boundary validation ------------------------------------------ */
     /* Out-of-range enum discriminants are rejected instead of becoming

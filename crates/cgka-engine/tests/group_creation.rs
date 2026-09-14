@@ -476,6 +476,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: self.welcome_sender.clone(),
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -1448,6 +1449,7 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id,
             payload: app_payload_for(&alice, "usable immediately"),
+            expected_epoch: None,
         })
         .await
         .expect("canonical solo group accepts work without confirm_published");
@@ -1504,6 +1506,7 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
             .send(cgka_traits::engine::SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&alice, "must be gated"),
+                expected_epoch: None,
             })
             .await
             .is_err(),
@@ -1873,6 +1876,7 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&current, "still usable"),
+            expected_epoch: None,
         })
         .await
         .expect("legacy group remains usable by current-configured engine");
@@ -2036,6 +2040,7 @@ async fn nostr_routing_component_drives_group_message_route() {
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"hello"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -2408,6 +2413,465 @@ async fn create_group_rejects_relabelled_legacy_key_package_profile() {
                 if message.contains("decoded account proof is Legacy")
         ),
         "unexpected error: {err:?}"
+    );
+}
+
+/// Build a correctly signed package so a rejection proves semantic validation,
+/// rather than a broken signature caused by editing serialized bytes.
+fn key_package_with_advertised_capabilities(
+    profile: ProtocolProfile,
+    extra_extensions: &[u16],
+    extra_proposals: &[u16],
+) -> cgka_traits::engine::KeyPackage {
+    let identity_seed = b"capability-invitee";
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let identity = pad32(identity_seed);
+    let credential = CredentialWithKey {
+        credential: BasicCredential::new(identity.clone()).into(),
+        signature_key: signer.public().into(),
+    };
+    let mut dictionary = AppDataDictionary::new();
+    let mut components = default_group_components();
+    components.insert(APP_COMPONENTS_COMPONENT_ID);
+    let mut extensions = Vec::new();
+    let mut extension_types = vec![ExtensionType::AppDataDictionary];
+    if profile == ProtocolProfile::Current {
+        components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        dictionary.insert(
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+            account_identity_proof_component(
+                &identity,
+                &signer.to_public_vec(),
+                ciphersuite,
+                ciphersuite.signature_algorithm(),
+                1_700_000_000,
+                proof_signer(identity_seed).as_ref(),
+            )
+            .unwrap(),
+        );
+    } else {
+        extensions.push(
+            account_identity_proof_extension(
+                &identity,
+                &signer.to_public_vec(),
+                ciphersuite,
+                ciphersuite.signature_algorithm(),
+                proof_signer(identity_seed).as_ref(),
+            )
+            .unwrap(),
+        );
+        extension_types.push(ExtensionType::from(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE));
+    }
+    dictionary.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&components),
+    );
+    extensions.push(Extension::AppDataDictionary(
+        AppDataDictionaryExtension::new(dictionary),
+    ));
+    extension_types.extend(extra_extensions.iter().copied().map(ExtensionType::from));
+    let mut proposals = vec![openmls::prelude::ProposalType::AppDataUpdate];
+    proposals.extend(
+        extra_proposals
+            .iter()
+            .copied()
+            .map(openmls::prelude::ProposalType::from),
+    );
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&extension_types),
+            Some(&proposals),
+            None,
+        ))
+        .leaf_node_extensions(Extensions::from_vec(extensions).unwrap())
+        .build(ciphersuite, &provider, &signer, credential)
+        .unwrap();
+    let message: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(message.tls_serialize_detached().unwrap())
+        .with_protocol_profile(profile)
+}
+
+#[tokio::test]
+async fn create_and_invite_reject_explicit_default_key_package_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
+        let mut bob = build_profile_client_on_storage(
+            b"valid-first-invitee",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let valid_first = bob.fresh_key_package().await.unwrap();
+        let rejected_member = MemberId::new(pad32(b"capability-invitee"));
+        // Test every forbidden id separately, including the historical 0x0003
+        // RequiredCapabilities advertisement. Directory metadata stays usable
+        // for discovery and private-bundle maintenance.
+        for (extensions, proposals) in (1..=5)
+            .map(|id| (vec![id], vec![]))
+            .chain((1..=7).map(|id| (vec![], vec![id])))
+        {
+            let kp = key_package_with_advertised_capabilities(profile, &extensions, &proposals);
+            key_package_metadata(&kp).expect("valid signatures, identity, and lifetime");
+            let error = alice
+                .create_group(CreateGroupRequest {
+                    name: "invalid-capabilities".into(),
+                    description: String::new(),
+                    members: vec![valid_first.clone(), kp],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                })
+                .await
+                .expect_err("forbidden advertisement must fail before group creation");
+            assert!(
+                matches!(error, EngineError::InvalidKeyPackageCapabilities { ref member }
+                    if member == &rejected_member),
+                "{error:?}"
+            );
+            assert!(storage.list_groups().unwrap().is_empty());
+        }
+        let (group_id, result) = alice
+            .create_group(CreateGroupRequest {
+                name: "existing".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        if let SendResult::GroupCreated { pending, .. } = result {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        let epoch = alice.epoch(&group_id).unwrap();
+        let members = alice.members(&group_id).unwrap();
+        for (extensions, proposals) in (1..=5)
+            .map(|id| (vec![id], vec![]))
+            .chain((1..=7).map(|id| (vec![], vec![id])))
+        {
+            let kp = key_package_with_advertised_capabilities(profile, &extensions, &proposals);
+            let error = alice
+                .send(SendIntent::Invite {
+                    group_id: group_id.clone(),
+                    key_packages: vec![valid_first.clone(), kp],
+                    initial_admins: vec![],
+                })
+                .await
+                .expect_err("forbidden advertisement must fail before an Add commit");
+            assert!(
+                matches!(error, EngineError::InvalidKeyPackageCapabilities { ref member }
+                    if member == &rejected_member),
+                "{error:?}"
+            );
+            assert_eq!(alice.epoch(&group_id).unwrap(), epoch);
+            assert_eq!(alice.members(&group_id).unwrap(), members);
+        }
+        // RFC 9420 section 7.2 requires unknown capability values to be ignored.
+        // A valid retry also proves rejection left no pending commit behind.
+        let kp = key_package_with_advertised_capabilities(profile, &[0x0a0a], &[0x0a0a]);
+        let result = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![kp],
+                initial_admins: vec![],
+            })
+            .await
+            .expect("unknown capabilities remain usable");
+        let SendResult::GroupEvolution { pending, .. } = result else {
+            panic!("expected invite")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn fresh_key_packages_omit_default_mls_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let mut alice = build_profile_client_on_storage(
+            b"alice",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let kp = alice.fresh_key_package().await.unwrap();
+        let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+        let key_package = match message.extract() {
+            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+            other => panic!("expected KeyPackage, got {other:?}"),
+        }
+        .validate(
+            &openmls_rust_crypto::RustCrypto::default(),
+            ProtocolVersion::Mls10,
+        )
+        .unwrap();
+        assert_non_default_mls_capabilities(key_package.leaf_node().capabilities());
+        assert_eq!(
+            key_package
+                .leaf_node()
+                .capabilities()
+                .extensions()
+                .contains(&ExtensionType::from(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)),
+            profile == ProtocolProfile::Legacy,
+        );
+    }
+}
+
+#[tokio::test]
+async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let mut registry = FeatureRegistry::new();
+        for (index, name) in [
+            "application-id",
+            "ratchet-tree",
+            "required-capabilities",
+            "external-pub",
+            "external-senders",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            registry.register(
+                Feature(name),
+                CapabilityRequirement {
+                    requires: Capability::Extension(index as u16 + 1),
+                    level: RequirementLevel::Required,
+                    description: "implicit MLS extension support",
+                },
+            );
+        }
+        for (index, name) in [
+            "add",
+            "update",
+            "remove",
+            "psk",
+            "reinit",
+            "external-init",
+            "group-context-extensions",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            registry.register(
+                Feature(name),
+                CapabilityRequirement {
+                    requires: Capability::Proposal(index as u16 + 1),
+                    level: RequirementLevel::Required,
+                    description: "implicit MLS proposal support",
+                },
+            );
+        }
+        for (name, capability) in [
+            ("custom-extension", Capability::Extension(0xff01)),
+            ("custom-proposal", Capability::Proposal(0xff02)),
+        ] {
+            registry.register(
+                Feature(name),
+                CapabilityRequirement {
+                    requires: capability,
+                    level: RequirementLevel::Optional,
+                    description: "non-default advertisement control",
+                },
+            );
+        }
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let builder = EngineBuilder::new(storage.clone())
+            .identity(pad32(b"alice"))
+            .account_identity_proof_signer(proof_signer(b"alice"))
+            .protocol_profile(profile)
+            .feature_registry(registry)
+            .peeler(Box::new(MockPeeler::default()));
+        let builder = if profile == ProtocolProfile::Legacy {
+            builder.legacy_compatibility_profile()
+        } else {
+            builder
+        };
+        let mut alice = builder.build().unwrap();
+        let kp = alice.fresh_key_package().await.unwrap();
+        let metadata = key_package_metadata(&kp).unwrap();
+        assert!(
+            metadata
+                .mls_extensions
+                .iter()
+                .all(|id| !(1..=5).contains(id))
+        );
+        assert!(
+            metadata
+                .mls_proposals
+                .iter()
+                .all(|id| !(1..=7).contains(id))
+        );
+        assert!(metadata.mls_extensions.contains(&0xff01));
+        assert!(metadata.mls_proposals.contains(&0xff02));
+        let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+        let MlsMessageBodyIn::KeyPackage(kp) = message.extract() else {
+            panic!("expected KeyPackage")
+        };
+        let kp = kp
+            .validate(
+                &openmls_rust_crypto::RustCrypto::default(),
+                ProtocolVersion::Mls10,
+            )
+            .unwrap();
+        assert_non_default_mls_capabilities(kp.leaf_node().capabilities());
+
+        // Peers have no registry entries for defaults and do not advertise
+        // them, but must be accepted when GroupContext explicitly requires them.
+        let mut bob = build_profile_client_on_storage(
+            b"bob",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let constructable = alice
+            .constructable_capabilities(std::slice::from_ref(&bob_kp))
+            .unwrap();
+        assert!((1..=5).all(|id| constructable.extensions.contains(&id)));
+        assert!((1..=7).all(|id| constructable.proposals.contains(&id)));
+        let (group_id, result) = alice
+            .create_group(CreateGroupRequest {
+                name: "explicit default requirements".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let welcomes = match result {
+            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            SendResult::GroupCreated { welcomes, pending } => {
+                alice.confirm_published(pending).await.unwrap();
+                welcomes
+            }
+            other => panic!("expected founding result, got {other:?}"),
+        };
+        bob.join_welcome(welcomes.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        let group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_non_default_mls_capabilities(group.own_leaf_node().unwrap().capabilities());
+        let required = group.extensions().required_capabilities().unwrap();
+        assert!((1..=5).all(|id| {
+            required
+                .extension_types()
+                .contains(&ExtensionType::from(id))
+        }));
+        assert!((1..=7).all(|id| {
+            required
+                .proposal_types()
+                .contains(&openmls::prelude::ProposalType::from(id))
+        }));
+        let mut carol = build_profile_client_on_storage(
+            b"carol",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let result = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![carol.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupEvolution {
+            welcomes, pending, ..
+        } = result
+        else {
+            panic!("expected invite")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        carol
+            .join_welcome(welcomes.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn founding_leaves_omit_default_mls_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
+        let (group_id, _) = alice
+            .create_group(CreateGroupRequest {
+                name: "capability advertisement".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_non_default_mls_capabilities(group.own_leaf_node().unwrap().capabilities());
+        assert_eq!(
+            group
+                .own_leaf_node()
+                .unwrap()
+                .capabilities()
+                .extensions()
+                .contains(&ExtensionType::from(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)),
+            profile == ProtocolProfile::Legacy,
+        );
+        // RequiredCapabilities remains a valid GroupContext extension even
+        // though its default type must not be advertised in LeafNode capabilities.
+        let required = group.extensions().required_capabilities().unwrap();
+        assert!(
+            required
+                .extension_types()
+                .contains(&ExtensionType::AppDataDictionary)
+        );
+        assert!(
+            required
+                .proposal_types()
+                .contains(&openmls::prelude::ProposalType::AppDataUpdate)
+        );
+    }
+}
+
+fn assert_non_default_mls_capabilities(capabilities: &Capabilities) {
+    // RFC 9420 section 7.2: default extension ids 1..=5 and proposal ids
+    // 1..=7 MUST NOT appear in the signed LeafNode capability lists.
+    for extension in capabilities.extensions() {
+        assert!(
+            !(1..=5).contains(&u16::from(*extension)),
+            "default extension {extension:?}"
+        );
+    }
+    for proposal in capabilities.proposals() {
+        assert!(
+            !(1..=7).contains(&u16::from(*proposal)),
+            "default proposal {proposal:?}"
+        );
+    }
+    assert!(
+        capabilities
+            .extensions()
+            .contains(&ExtensionType::AppDataDictionary)
+    );
+    assert!(
+        capabilities
+            .proposals()
+            .contains(&openmls::prelude::ProposalType::AppDataUpdate)
     );
 }
 
@@ -2856,6 +3320,7 @@ async fn two_engine_happy_path_create_and_join() {
     assert!(matches!(
         &events[0],
         cgka_traits::engine::GroupEvent::GroupJoined {
+            explicitly_confirmed: false,
             welcomer: Some(welcomer),
             ..
         } if *welcomer == alice_id && *welcomer != transport_claimed_sender
@@ -2969,6 +3434,7 @@ async fn audit_log_records_welcome_recipient_expectation() {
             cgka_traits::engine::SendIntent::AppMessage {
                 group_id: gid.clone(),
                 payload,
+                expected_epoch: None,
             },
             None,
         )

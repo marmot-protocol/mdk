@@ -569,7 +569,13 @@ impl Marmot {
     }
 
     /// Normalize a member reference for group-management UI. Accepts hex,
-    /// `npub`, `nostr:npub...`, and `marmot://profile/...` references.
+    /// `npub`, `nostr:npub...`, `nprofile`, `nostr:nprofile...`, and
+    /// `marmot://profile/...` references. nprofile relay hints are
+    /// discarded and never used for routing or membership authorization.
+    /// Duplicate type-0 TLV entries keep the first key. After wrapper
+    /// normalization, the nprofile fallback rejects encoded tokens longer
+    /// than 1023 UTF-8 bytes; a valid 1023-byte token still decodes when
+    /// wrapped.
     pub fn normalize_member_ref(&self, member_ref: String) -> Result<MemberRefFfi, MarmotKitError> {
         normalize_member_ref_ffi(&member_ref)
     }
@@ -800,6 +806,26 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Reset a group on this account-device, without sending an
+    /// MLS leave or disband. Erases local history and protocol state, cancels
+    /// group work, and rejects old welcomes. A valid Welcome whose authenticated
+    /// inner creation time is strictly newer than the reset's Unix-second
+    /// cutoff can join the same group with fresh state. Equal-second invitations
+    /// are rejected; receipt time and outer wrapper time do not establish freshness. Hosts
+    /// should close the group's UI subscriptions and clear their media caches.
+    /// Returns true when resetting, false when already awaiting a fresh Welcome.
+    pub async fn forget_group_local(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .forget_group_local(&account_ref, &group_id)
+            .await?)
+    }
+
     /// Delete this group's local app data without performing an MLS leave. The
     /// caller should cancel any active UI subscriptions for the group before
     /// invoking the wipe. The runtime removes the active transport route, then
@@ -836,6 +862,50 @@ impl Marmot {
             .update_message_retention(&account_ref, &group_id, disappearing_message_secs)
             .await?;
         Ok(summary.into())
+    }
+
+    /// Re-read on GroupStateUpdated; display uncertainty separately from whether
+    /// the user accepted the original invitation.
+    pub async fn group_recovery_status(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<crate::conversions::GroupRecoveryStatusFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_recovery_status(&account_ref, &group_id)
+            .await?
+            .into())
+    }
+
+    /// Call only after explicit user consent to replace the active copy. Show
+    /// the offer's authenticated inviter and pass its exact id and state token.
+    pub async fn confirm_group_rejoin(
+        &self,
+        account_ref: String,
+        welcome_id_hex: String,
+        local_state_token: String,
+    ) -> Result<crate::conversions::GroupRecoveryStatusFfi, MarmotKitError> {
+        let welcome_id = cgka_traits::MessageId::new(welcome_id_bytes(&welcome_id_hex)?);
+        let token = rejoin_token_bytes(&local_state_token)?;
+        Ok(self
+            .runtime
+            .confirm_group_rejoin(&account_ref, &welcome_id, &token)
+            .await?
+            .into())
+    }
+
+    pub async fn decline_group_rejoin(
+        &self,
+        account_ref: String,
+        welcome_id_hex: String,
+    ) -> Result<(), MarmotKitError> {
+        let welcome_id = cgka_traits::MessageId::new(welcome_id_bytes(&welcome_id_hex)?);
+        Ok(self
+            .runtime
+            .decline_group_rejoin(&account_ref, &welcome_id)
+            .await?)
     }
 
     pub async fn accept_group_invite(
@@ -1291,6 +1361,23 @@ impl Marmot {
     }
 }
 
+fn welcome_id_bytes(value: &str) -> Result<Vec<u8>, MarmotKitError> {
+    hex::decode(value).map_err(|_| MarmotKitError::InvalidHex {
+        details: "invalid Welcome identifier".into(),
+    })
+}
+
+fn rejoin_token_bytes(value: &str) -> Result<Vec<u8>, MarmotKitError> {
+    if value.len() != 64 {
+        return Err(MarmotKitError::InvalidHex {
+            details: "rejoin token must contain 32 bytes".into(),
+        });
+    }
+    hex::decode(value).map_err(|_| MarmotKitError::InvalidHex {
+        details: "invalid rejoin token".into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use cgka_traits::TransportEndpoint;
@@ -1513,6 +1600,36 @@ mod tests {
             ensure_can_demote_admin(&state(false, false), &group_id_hex, absent_member)
                 .expect_err("non-admin demote should fail");
         assert!(matches!(demote_err, MarmotKitError::NotGroupAdmin { .. }));
+    }
+
+    #[test]
+    fn welcome_identifiers_preserve_opaque_lengths() {
+        for length in [8, 16, 32, 48] {
+            assert_eq!(
+                welcome_id_bytes(&"aa".repeat(length)).unwrap(),
+                vec![0xaa; length]
+            );
+        }
+        assert!(welcome_id_bytes("xyz").is_err());
+    }
+
+    #[test]
+    fn rejoin_tokens_require_exactly_32_bytes() {
+        assert_eq!(
+            rejoin_token_bytes(&"aa".repeat(32)).unwrap(),
+            vec![0xaa; 32]
+        );
+        for invalid in [
+            String::new(),
+            "aa".repeat(16),
+            "aa".repeat(33),
+            "zz".repeat(32),
+        ] {
+            assert!(matches!(
+                rejoin_token_bytes(&invalid),
+                Err(MarmotKitError::InvalidHex { .. })
+            ));
+        }
     }
 
     #[test]

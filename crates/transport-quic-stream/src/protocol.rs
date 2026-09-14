@@ -1,7 +1,6 @@
 //! Direct-path QUIC protocol/ALPN identifiers, frame-size constants, and the
 //! plaintext/frame-length cap helpers shared across the transport.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
@@ -9,7 +8,6 @@ use cgka_traits::agent_text_stream::{
 };
 
 pub(crate) const FRAME_LEN_BYTES: usize = 4;
-pub(crate) const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 /// Direct-path QUIC ALPN, pinned by spec/transports/quic.md. Both peers MUST
 /// negotiate exactly this protocol; it is the direct-path counterpart to the

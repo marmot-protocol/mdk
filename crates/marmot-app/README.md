@@ -21,9 +21,12 @@ It owns these local SQLite stores:
 For `N` active signing accounts whose stores have been opened, this is up to `2N + 1` current SQLite files.
 `session.sqlite` contains authoritative protocol and recovery state and has a numbered migration history. The two
 directory tiers are reconcilable caches, but normal upgrades should preserve them; `shared.sqlite3` also contains
-durable installation settings that are not disposable. The per-account directory cache and shared store currently
-initialize tables without independent numbered migration ledgers, so schema evolution for either must not rely on the
-session database's migration version.
+durable installation settings that are not disposable. The per-account cache has its own numbered
+`app_cache_schema_migrations` ledger and refuses versions newer than the binary supports. Each migration commits its
+schema/data changes and ledger row atomically; version 1 validates and adopts existing unversioned tables and converts
+legacy JSON records without discarding directory or search data. Invalid shapes or migration names fail closed.
+The shared store still initializes tables without a numbered ledger; neither tier uses the session database's
+migration version.
 
 The app runtime exposes those projections through account status, group listing/showing, message listing, and
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases
@@ -37,6 +40,10 @@ those relay-list events from supplied bootstrap relays and store discovered user
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
 KeyPackage ref separately; normal publish reuses only a cached current-profile last-resort package, while explicit
 rotate, a legacy cache entry, or lifetime-policy rejection creates a new current-profile package under the same slot.
+Account inventory listing (`account_key_package_records` / `account_key_packages`) exposes one current relay
+event per addressable slot in the validated fetch window. `account_key_package_relay_events` returns that
+window's current and superseded public events so a client can delete a superseded event id without targeting
+the current winner or inventing a second Published row.
 
 Account open performs the strict profile cutover before transport processing: the encrypted session transactionally
 retires every locally stored legacy KeyPackage private bundle, then the app best-effort deletes cached and
@@ -48,16 +55,49 @@ including their Media V1 state, but membership additions and re-additions are re
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list
 event, pre-cache direct follows, and cache profile metadata for those likely contacts. Runtime startup builds chunked
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
-keep warming the cache. The crate exposes two searches over that data for TUI/mobile pickers: `search_user_directory`
-answers offline from cached follow edges, and `search_users` streams matches while traversing the live follow graph,
-ranked by social distance. Live traversal is bounded by construction -- capped radius, batched author-scoped fetches
-under a per-radius timeout, and a per-search lifecycle that ends when its consumer drops the subscription -- and
-strangers it discovers are never promoted into the directory. It is not a crawler for the whole Nostr social graph.
+keep warming the cache. `search_cached_users(searcher, query, limit)` searches public profiles learned through
+**any connected account**, including un-promoted profiles from previous searches, without relay access or group
+membership reads. A profile learned during a search under one account is intentionally searchable under another account.
+Private labels/nicknames do not participate. `is_followed_by_searcher` is relative only to the
+selected account; another account's follows never confer that label. The older `search_user_directory` remains the
+explicit offline graph-radius query.
+
+`search_users` emits a `CachedResultsFound` batch, then streams Vertex profile discovery independently of the bounded
+follow-graph traversal. The runtime resolves group co-members on the graph path, after the subscription is returned.
+Consumers insert `new_results` and replace `updated_results` by `account_id_hex`, then re-sort; `total_result_count`
+counts unique people. Results with radius 255 have no established graph distance yet and may receive one later.
+Radius 1 also includes group co-members, so only the explicit follow flag means "You follow". Requested radius windows
+filter known distances; other cached/provider identities remain discoverable and can recur on later pages.
+Deduplicate by account ID across searches/pages as well as within a stream. Cache materialization is capped at
+10,000 distinct identities per account cache (in account-ID order), matching the shared directory's existing cap;
+the cache-only API and the stream's initial cache batch return at most 10,000 results. At that scale, local results
+can be partial; network enrichment remains available.
+
+Hosts should use the cache-only call off the UI thread on each query change, debounce network searches separately,
+and discard results when the query or selected account changes. Dropping the streaming subscription cancels both
+network sources, including blocked membership reads. A failed cache read or unavailable group membership is an
+optional-source failure: search continues without that input rather than emitting a terminal error. Vertex's signed
+profiles are cached only in the un-promoted search tier; discovering a stranger never creates a live per-author
+subscription. Traversal retains its radius, candidate, batch, and timeout bounds. Aggregate `search_stage` timings
+separate cache reads, membership, provider response, profile hydration, and network completion, without logging
+queries or identities.
 
 Group creation and invites still take pubkeys at the action boundary. The app canonicalizes and deduplicates the
-requested roster, reuses current cached KeyPackages, and resolves cold members in bounded multi-author relay batches
-before building the MLS add. Hosts may prewarm that same bounded composition lookup without reserving packages or
-durably admitting strangers; the final mutation revalidates every package. New Nostr-routed groups generate
+requested roster and fetches current KeyPackages in bounded multi-author relay batches before building the MLS add.
+Cached packages remain useful for discovery, but cannot authorize an invitation or substitute for a failed relay
+lookup. Hosts may prewarm that same bounded composition lookup without reserving packages or durably admitting
+strangers; the final action reuses discovery routes but fetches packages again before the mutation validates them. This
+also applies to another account on the same installation: its local package record is not an invitation shortcut,
+and its published package must be reachable on relays. Relay freshness is not proof that the recipient still owns
+private material; it avoids authorizing from a stale local copy. Each prewarm call requests a fresh readiness signal,
+so hosts should debounce roster changes. The process-local prewarm cache retains only bounded relay metadata;
+only completed discovery and advertised-outbox metadata hops can renew its freshness deadline. A usable package
+returned after an incomplete metadata hop does not make previously cached routes fresh.
+
+Directory diagnostics (`key-package check` / `fetch`) may still describe cached public packages. Their availability
+result is advisory and does not guarantee a fresh relay lookup or acceptance by the Create/Invite admission policy.
+
+New Nostr-routed groups generate
 `marmot.transport.nostr.routing.v1` at creation, store the component bytes in
 signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.

@@ -26,7 +26,14 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/lib/pkgconfig" "$OUT_DIR/include"
 
 echo "==> Building release cdylib + staticlib"
-cargo build --release --locked -p "$CRATE_NAME"
+FEATURE_ARGS=()
+if [[ "${OTLP_EXPORT:-0}" == "1" || "${OTLP_EXPORT:-}" == "true" ]]; then
+  FEATURE_ARGS+=(--features otlp-export)
+fi
+if [[ "${PRODUCT_ANALYTICS_EXPORT:-0}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
+  FEATURE_ARGS+=(--features product-analytics-export)
+fi
+cargo build --release --locked -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 # Darwin has no libdl: dlopen lives in libSystem.
 case "$(uname -s)" in

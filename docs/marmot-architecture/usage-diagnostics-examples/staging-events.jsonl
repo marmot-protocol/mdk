@@ -1,0 +1,5 @@
+{"eventName":"mdk_session_started","sessionId":"f4c20a46-d592-4fcf-b82d-1184b984d56a","props":{"launch_reason":"ordinary"}}
+{"eventName":"mdk_onboarding_step","sessionId":"f4c20a46-d592-4fcf-b82d-1184b984d56a","props":{"step":"local_ready","path":"create","outcome":"success"}}
+{"event_name":"mdk_maintenance_summary","session_id":"1cbd7fce-2fa7-4106-90b9-5e68e7ec1e10","string_props":{"operation":"self_update","unit":"attempt","outcome":"performed","count_bucket":"3_5","duration_bucket":"le_1s","partial":"false"}}
+{"event_name":"mdk_maintenance_summary","session_id":"1cbd7fce-2fa7-4106-90b9-5e68e7ec1e10","string_props":{"operation":"pending","unit":"backlog","count_bucket":"1","partial":"false"}}
+{"eventName":"app_compose","sessionId":"b9cedc1b-83b3-46d0-96d5-ae64c84ba61f","props":{"action":"cancel","count_bucket":"2","partial":"true"}}

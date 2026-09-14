@@ -60,6 +60,17 @@ pub(crate) struct MlsGroupCache {
 }
 
 impl MlsGroupCache {
+    pub(crate) fn forget_group(&self, group_id: &GroupId) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(group_id);
+        self.taken
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(group_id);
+    }
+
     fn store(&self, group_id: &GroupId, generation: u64, group: MlsGroup) {
         let mut entries = self
             .entries
@@ -211,6 +222,7 @@ mod tests {
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload: payload.to_vec(),
+                    expected_epoch: None,
                 })
                 .await
                 .map(|_| ())

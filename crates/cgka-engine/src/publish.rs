@@ -420,6 +420,12 @@ impl<S: StorageProvider> Engine<S> {
         });
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
+                // No endpoint accepted the commit, so nothing can supersede it
+                // later: the caller already learned the failure directly and
+                // the retained intent must not be re-issued behind its back.
+                if let Some(origin_commit_id) = origin_commit_id.as_ref() {
+                    storage.delete_own_commit_intent(origin_commit_id)?;
+                }
                 if has_pending_commit {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
                     // No endpoint accepted this staged evolution. Retire its

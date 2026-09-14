@@ -3,15 +3,18 @@ use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, i64_to_u64,
-    message_state_from_i64, message_state_to_i64, serialize,
+    message_state_from_i64, message_state_to_i64, serialize, unix_now_seconds_i64,
 };
 use cgka_traits::engine::GroupEvent;
-use cgka_traits::message::{DeferredPeelLifecycle, MessageRecord, MessageState};
+use cgka_traits::message::{
+    DeferredMessageMetadata, DeferredPeelLifecycle, MessageRecord, MessageState,
+};
 use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
+const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
 const NORMALIZED_MESSAGE_STORAGE_FORMAT: i64 = 2;
 const MESSAGE_FORMAT_PROMOTION_BATCH_MAX: usize = 256;
 
@@ -47,6 +50,53 @@ pub struct StorageFormatBenchSizes {
 }
 
 impl SqliteAccountStorage {
+    /// Retire stale host receipts and durably arm backfill before acknowledging
+    /// release evidence. The caller must remove returned ids from its in-memory
+    /// seen ring synchronously, before its next checkpoint or duplicate check.
+    /// A process death after commit is safe: both disk receipt stores are already
+    /// clean and backfill intent survives. An interrupted engine effects batch
+    /// needs no special handling because the release journal is authoritative.
+    pub fn consume_released_transport_receipts(&self) -> StorageResult<Vec<MessageId>> {
+        // Avoid a write transaction on the ordinary no-release hot path.
+        if !self
+            .lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM cgka_released_transport_receipts)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()?
+        {
+            return Ok(Vec::new());
+        }
+        let consume = || {
+            let conn = self.lock()?;
+            let ids = conn
+                .prepare_cached("SELECT id FROM cgka_released_transport_receipts ORDER BY id")
+                .storage()?
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            for id in &ids {
+                retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+            }
+            conn.execute_cached(
+                "INSERT INTO app_epoch_backfill_intents(group_id, stalled_epoch, updated_at)
+                 SELECT group_id, MAX(epoch), ?1 FROM cgka_released_transport_receipts
+                 GROUP BY group_id
+                 ON CONFLICT(group_id) DO UPDATE SET
+                    stalled_epoch = MAX(app_epoch_backfill_intents.stalled_epoch, excluded.stalled_epoch),
+                    updated_at = excluded.updated_at",
+                params![unix_now_seconds_i64()],
+            ).storage()?;
+            conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
+                .storage()?;
+            Ok(ids.into_iter().map(MessageId::new).collect())
+        };
+        retry_on_busy(|| self.connection.with_transaction(consume))
+    }
+
     /// Read aggregate value sizes without returning any stored content.
     #[cfg(feature = "storage-format-benchmarks")]
     pub fn storage_format_bench_sizes(
@@ -213,6 +263,53 @@ impl MessageStorage for SqliteAccountStorage {
         }
     }
 
+    fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
+        let release = || {
+            let conn = self.lock()?;
+            // App ownership is durable before engine hydration. It must not
+            // depend on individual receipts: the app's active seen ring may
+            // not have checkpointed yet, and inventory writes are best-effort.
+            // A standalone engine has no app consumer and needs only deletion.
+            if !conn
+                .query_row_cached("SELECT EXISTS(SELECT 1 FROM account_state)", [], |row| {
+                    row.get::<_, bool>(0)
+                })
+                .storage()?
+            {
+                return delete_message_on_connection(&conn, &record.id);
+            }
+            // Bound journal metadata even if a host never consumes it. At the
+            // bound, fail before deleting bytes; never evict replay evidence.
+            let recorded = conn
+                .execute_cached(
+                    "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
+                 SELECT ?1, ?2, ?3 WHERE
+                    (SELECT count(*) FROM cgka_released_transport_receipts) < ?4
+                    OR EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = ?1)
+                 ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
+                    params![
+                        record.id.as_slice(),
+                        record.group_id.as_slice(),
+                        epoch_to_i64(record.epoch)?,
+                        RELEASED_TRANSPORT_RECEIPT_CAPACITY
+                    ],
+                )
+                .storage()?;
+            if recorded == 0 {
+                return Err(StorageError::Backend(
+                    "released transport receipt journal is full".into(),
+                ));
+            }
+            retire_transport_receipts(&conn, &record.id)?;
+            delete_message_on_connection(&conn, &record.id)
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            release()
+        } else {
+            retry_on_busy(|| self.connection.with_transaction(release))
+        }
+    }
+
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
         // #424: when this runs inside an engine `with_transaction` (convergence
         // apply path), the outer SQL transaction is already open and owns
@@ -271,6 +368,81 @@ impl MessageStorage for SqliteAccountStorage {
             |row| row.get(0),
         )
         .storage()
+    }
+
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DeferredMessageMetadata>> {
+        let conn = self.lock()?;
+        // length(BLOB) reads its size without copying it into Rust. Legacy
+        // format 1 has no independent metadata, so only those rows need the
+        // record blob; they promote through the existing bounded migration.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, group_id, epoch, storage_format,
+                    CASE WHEN storage_format = 1 THEN record END,
+                    CASE WHEN typeof(payload) = 'blob' THEN length(payload) END,
+                    deferred_peel
+             FROM cgka_messages WHERE group_id = ?1 AND state = ?2 AND epoch >= 0
+             ORDER BY insert_order",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map(
+                params![
+                    group_id.as_slice(),
+                    message_state_to_i64(MessageState::PeelDeferred)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                    ))
+                },
+            )
+            .storage()?;
+        rows.map(|row| {
+            let (id, group_id, epoch, format, record, payload_len, lifecycle) = row.storage()?;
+            match format {
+                1 => {
+                    let record = record.ok_or_else(|| {
+                        StorageError::Serialization(
+                            "legacy message row is missing its record blob".into(),
+                        )
+                    })?;
+                    Ok(DeferredMessageMetadata::from(deserialize::<MessageRecord>(
+                        &record,
+                    )?))
+                }
+                NORMALIZED_MESSAGE_STORAGE_FORMAT => Ok(DeferredMessageMetadata {
+                    id: MessageId::new(id),
+                    group_id: GroupId::new(group_id),
+                    epoch: EpochId(i64_to_u64(epoch)?),
+                    payload_len: usize::try_from(payload_len.ok_or_else(|| {
+                        StorageError::Serialization(
+                            "normalized message row is missing its payload blob".into(),
+                        )
+                    })?)
+                    .map_err(|_| {
+                        StorageError::Serialization("invalid deferred payload length".into())
+                    })?,
+                    deferred_peel: lifecycle
+                        .as_deref()
+                        .map(deserialize::<DeferredPeelLifecycle>)
+                        .transpose()?,
+                }),
+                version => Err(StorageError::Serialization(format!(
+                    "unsupported message storage format {version}"
+                ))),
+            }
+        })
+        .collect()
     }
 
     fn list_messages_in_states(
@@ -443,9 +615,9 @@ impl MessageStorage for SqliteAccountStorage {
                 .storage()?;
                 conn.execute_cached(
                     "DELETE FROM cgka_ingress_dedup
-                     WHERE insert_order NOT IN (
+                     WHERE insert_order <= (
                         SELECT insert_order FROM cgka_ingress_dedup
-                        ORDER BY insert_order DESC LIMIT ?1
+                        ORDER BY insert_order DESC LIMIT 1 OFFSET ?1
                      )",
                     params![INGRESS_DEDUP_MARKER_CAPACITY],
                 )
@@ -522,8 +694,13 @@ impl MessageStorage for SqliteAccountStorage {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FULL_MESSAGE_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 fn message_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageColumns> {
-    Ok((
+    let columns: MessageColumns = (
         row.get(0)?,
         row.get(1)?,
         row.get(2)?,
@@ -532,7 +709,16 @@ fn message_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageColumns> 
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
-    ))
+    );
+    #[cfg(test)]
+    FULL_MESSAGE_READS.with(|stats| {
+        let (rows, bytes) = stats.get();
+        stats.set((
+            rows + 1,
+            bytes + columns.5.as_ref().map_or(0, Vec::len) + columns.6.as_ref().map_or(0, Vec::len),
+        ));
+    });
+    Ok(columns)
 }
 
 fn decode_message_columns(columns: MessageColumns) -> StorageResult<MessageRecord> {
@@ -751,6 +937,20 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
+fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
+    conn.execute_cached(
+        "DELETE FROM seen_events WHERE event_id = ?1",
+        params![hex::encode(id.as_slice())],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "DELETE FROM transport_reconciliation_items WHERE event_id = ?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    Ok(())
+}
+
 /// Delete a protocol message and its not-yet-acknowledged application event on
 /// the same connection/transaction so neither row can outlive the other.
 fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
@@ -803,7 +1003,404 @@ mod tests {
     use cgka_traits::storage::{
         GroupStorage, MessageStorage, StorageError, StorageProvider, StorageResult,
     };
-    use cgka_traits::types::{EpochId, MemberId};
+    use cgka_traits::types::{EpochId, MemberId, MessageId};
+    use rusqlite::params;
+
+    #[test]
+    fn released_transport_receipt_journal_does_not_limit_standalone_engine_lifetime() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        // Exercise more distinct releases than the app journal can retain.
+        // This database has no app owner and consequently no journal consumer.
+        store
+            .with_transaction(|storage| -> StorageResult<()> {
+                for id in 0..=super::RELEASED_TRANSPORT_RECEIPT_CAPACITY {
+                    let mut record =
+                        sample_message(MessageId::new(id.to_be_bytes().to_vec()), gid(1), 0);
+                    record.state = MessageState::PeelDeferred;
+                    storage.put_message(&record)?;
+                    storage.release_message_for_replay(&record)?;
+                    assert!(matches!(
+                        storage.get_message(&record.id),
+                        Err(StorageError::NotFound)
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn released_transport_receipt_journal_tracks_app_without_persisted_receipts() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut record = sample_message(mid(1), gid(1), 0);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        // Neither receipt table has ever been populated. Ownership alone must
+        // preserve the evidence needed by an app with unsaved seen entries.
+        store.release_message_for_replay(&record).unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id]
+        );
+    }
+
+    #[test]
+    fn released_transport_receipts_survive_reopen_and_retire_both_receipt_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.db");
+        let key = crate::SqlCipherKey::new("synthetic release regression").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        let seed_receipts = |store: &SqliteAccountStorage| {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO seen_events(event_id, seen_at) VALUES (?1, 1)",
+                params![hex::encode(record.id.as_slice())],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO transport_reconciliation_items(route_kind, route_id, event_id, created_at)
+                VALUES(1, ?1, ?2, 1)", params![vec![9_u8; 32], record.id.as_slice()]).unwrap();
+        };
+        seed_receipts(&store);
+        store.release_message_for_replay(&record).unwrap();
+        assert!(matches!(
+            store.get_message(&record.id),
+            Err(StorageError::NotFound)
+        ));
+        for table in ["seen_events", "transport_reconciliation_items"] {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        // Model an old app checkpoint before it has consumed the release.
+        seed_receipts(&store);
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id.clone()]
+        );
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.pending_epoch_backfill_intents().unwrap().len(), 1);
+        for table in ["seen_events", "transport_reconciliation_items"] {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            store.pending_epoch_backfill_intents().unwrap().len(),
+            1,
+            "death after journal acknowledgement must not lose recovery intent"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn released_transport_receipt_transaction_rolls_back_with_raw_bytes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut record = sample_message(mid(1), gid(1), 0);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            storage.release_message_for_replay(&record)?;
+            Err(StorageError::Backend("injected interruption".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(store.get_message(&record.id).unwrap(), record);
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        store.release_message_for_replay(&record).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_release_ack BEFORE DELETE ON
+            cgka_released_transport_receipts BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        assert!(store.consume_released_transport_receipts().is_err());
+        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_release_ack;")
+            .unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id]
+        );
+    }
+
+    #[test]
+    fn released_transport_receipt_capacity_never_drops_replay_evidence_or_raw_bytes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .with_transaction(|storage| -> StorageResult<()> {
+                let conn = storage.lock()?;
+                for id in 0_u64..8192 {
+                    conn.execute(
+                        "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
+                    VALUES(?1, ?2, 0)",
+                        params![id.to_be_bytes().as_slice(), gid(1).as_slice()],
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let record = sample_message(mid(42), gid(1), 0);
+        store.put_message(&record).unwrap();
+        assert!(store.release_message_for_replay(&record).is_err());
+        assert_eq!(store.get_message(&record.id).unwrap(), record);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM cgka_released_transport_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            8192
+        );
+        store.delete_group(&gid(1)).unwrap();
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty(),
+            "account group deletion must retire its release journal"
+        );
+    }
+
+    #[test]
+    fn deferred_metadata_does_not_read_normalized_payloads() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut expected = Vec::new();
+        for id in [9, 2, 7] {
+            let mut message = sample_message(mid(id), gid(1), u64::from(id));
+            message.state = MessageState::PeelDeferred;
+            message.payload = vec![id; 16 * 1024];
+            expected.push(cgka_traits::message::DeferredMessageMetadata::from(
+                message.clone(),
+            ));
+            store.put_message(&message).unwrap();
+        }
+        store
+            .put_message(&sample_message(mid(3), gid(1), 0))
+            .unwrap();
+        super::FULL_MESSAGE_READS.with(|stats| stats.set((0, 0)));
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::FULL_MESSAGE_READS.with(|stats| stats.get()),
+            (0, 0),
+            "scheduler metadata must not materialize normalized message payloads"
+        );
+    }
+
+    #[test]
+    fn deferred_metadata_preserves_legacy_and_normalized_rows_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let key = crate::SqlCipherKey::new("synthetic metadata regression").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
+        let mut expected = Vec::new();
+        for (index, id) in [9, 2, 7].into_iter().enumerate() {
+            let mut message = sample_message(mid(id), gid(1), u64::from(id));
+            message.state = MessageState::PeelDeferred;
+            message.payload = vec![id; 1024 + index];
+            message.deferred_peel = Some(DeferredPeelLifecycle {
+                first_observed_wall_ms: 10_000,
+                wall_high_water_ms: 10_400,
+                clock_instance_id: 7,
+                residence_deadline_monotonic_ms: 2_000,
+                residence_deadline_wall_ms: 11_000,
+                distinct_context_attempts: index as u32,
+                last_context_fingerprint: Some([id; 32]),
+            });
+            if index == 1 {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            message.id.as_slice(),
+                            message.group_id.as_slice(),
+                            message.epoch.0 as i64,
+                            super::message_state_to_i64(message.state),
+                            serialize(&message).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            } else {
+                store.put_message(&message).unwrap();
+            }
+            expected.push(cgka_traits::message::DeferredMessageMetadata::from(message));
+        }
+        let mut unrelated = sample_message(mid(4), gid(2), 0);
+        unrelated.state = MessageState::PeelDeferred;
+        store.put_message(&unrelated).unwrap();
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        store.promote_legacy_message_rows(2).unwrap();
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        store
+            .update_message_state(&mid(2), MessageState::Processed)
+            .unwrap();
+        expected.remove(1);
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        store.close().unwrap();
+    }
+
+    /// Compare full-row preparation with metadata preparation in the same
+    /// encrypted database. Logical bytes exclude SQLite pages and cache effects.
+    #[test]
+    #[ignore = "explicit encrypted-storage preparation benchmark"]
+    fn deferred_metadata_file_backed_benchmark() {
+        let mut measurements = Vec::new();
+        for processed in [0, 4096] {
+            for deferred in [0, 64, 512, 2048] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("preparation.db");
+                let key = crate::SqlCipherKey::new("synthetic preparation benchmark").unwrap();
+                let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+                store
+                    .with_transaction(|tx| {
+                        for index in 0..processed + deferred {
+                            let mut message = sample_message(
+                                cgka_traits::MessageId::new((index as u64).to_be_bytes().to_vec()),
+                                gid(1),
+                                (index % 17) as u64,
+                            );
+                            message.state = if index < processed {
+                                MessageState::Processed
+                            } else {
+                                MessageState::PeelDeferred
+                            };
+                            message.payload = vec![0x71; 4096];
+                            if index >= processed {
+                                message.deferred_peel = Some(DeferredPeelLifecycle {
+                                    first_observed_wall_ms: 10_000,
+                                    wall_high_water_ms: 10_400,
+                                    clock_instance_id: 7,
+                                    residence_deadline_monotonic_ms: 2_000,
+                                    residence_deadline_wall_ms: 11_000,
+                                    distinct_context_attempts: 3,
+                                    last_context_fingerprint: Some([0xA5; 32]),
+                                });
+                            }
+                            tx.put_message(&message)?;
+                        }
+                        Ok::<_, StorageError>(())
+                    })
+                    .unwrap();
+                let mut timings = [std::time::Duration::ZERO; 2];
+                let mut full_reads = [(0, 0); 2];
+                for repetition in 0..12 {
+                    for mode in [repetition % 2, 1 - repetition % 2] {
+                        super::FULL_MESSAGE_READS.with(|stats| stats.set((0, 0)));
+                        let start = std::time::Instant::now();
+                        let count = if mode == 0 {
+                            store
+                                .list_messages_in_states(
+                                    &gid(1),
+                                    &[MessageState::PeelDeferred],
+                                    EpochId(0),
+                                )
+                                .unwrap()
+                                .len()
+                        } else {
+                            store.list_deferred_message_metadata(&gid(1)).unwrap().len()
+                        };
+                        assert_eq!(count, deferred);
+                        if repetition >= 2 {
+                            timings[mode] += start.elapsed();
+                            full_reads[mode] = super::FULL_MESSAGE_READS.with(|stats| stats.get());
+                        }
+                    }
+                }
+                measurements.push(serde_json::json!({
+                    "processed": processed, "deferred": deferred,
+                    "payload_bytes": 4096, "epochs": 17, "samples": 10,
+                    "full_avg_us": timings[0].as_micros() / 10,
+                    "metadata_avg_us": timings[1].as_micros() / 10,
+                    "full_rows": full_reads[0].0, "full_blob_bytes": full_reads[0].1,
+                    "metadata_full_rows": full_reads[1].0,
+                    "metadata_full_blob_bytes": full_reads[1].1,
+                }));
+                store.close().unwrap();
+                assert_ne!(&std::fs::read(&path).unwrap()[..16], b"SQLite format 3\0");
+            }
+        }
+        if let Some(path) = std::env::var_os("MDK_DEFERRED_PREPARATION_BENCHMARK_OUT") {
+            fs_private::write_private(
+                std::path::Path::new(&path),
+                &serde_json::to_vec_pretty(&measurements).unwrap(),
+            )
+            .unwrap();
+        }
+    }
 
     fn application_event(message_id: cgka_traits::MessageId) -> GroupEvent {
         GroupEvent::MessageReceived {
@@ -1082,6 +1679,142 @@ mod tests {
         store.put_ingress_dedup_marker(&id).unwrap();
         store.put_ingress_dedup_marker(&id).unwrap();
         assert!(store.has_ingress_dedup_marker(&id).unwrap());
+    }
+
+    #[test]
+    fn ingress_prune_query_work() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use rusqlite::{StatementStatus, params};
+        use std::sync::Mutex;
+
+        static PRUNE_SQL: Mutex<String> = Mutex::new(String::new());
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            // Sparse keys catch incorrect cutoffs based on MAX(rowid) - capacity.
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+                 INSERT INTO cgka_ingress_dedup(insert_order, id)
+                 SELECT x*3, CAST(printf('%032x', x) AS BLOB) FROM n",
+                params![INGRESS_DEDUP_MARKER_CAPACITY],
+            )
+            .unwrap();
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_PROFILE,
+                Some(|event| {
+                    let TraceEvent::Profile(statement, _) = event else {
+                        return;
+                    };
+                    if statement
+                        .sql()
+                        .starts_with("DELETE FROM cgka_ingress_dedup")
+                    {
+                        *PRUNE_SQL.lock().unwrap() = statement.sql().into_owned();
+                    }
+                }),
+            );
+        }
+        let id = mid(42);
+        store.put_ingress_dedup_marker(&id).unwrap();
+        store.put_ingress_dedup_marker(&id).unwrap();
+        let conn = store.lock().unwrap();
+        conn.trace_v2(TraceEventCodes::empty(), None);
+        let bounds: (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), min(insert_order) FROM cgka_ingress_dedup",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bounds, (INGRESS_DEDUP_MARKER_CAPACITY, 6));
+        conn.execute(
+            "INSERT INTO cgka_ingress_dedup(id) VALUES (?1)",
+            params![mid(43).as_slice()],
+        )
+        .unwrap();
+        let production_sql = PRUNE_SQL.lock().unwrap().clone();
+        assert!(!production_sql.is_empty());
+        let legacy_sql = "DELETE FROM cgka_ingress_dedup WHERE insert_order NOT IN (
+            SELECT insert_order FROM cgka_ingress_dedup ORDER BY insert_order DESC LIMIT ?1)";
+        let mut measurements = Vec::new();
+        for sql in [legacy_sql, production_sql.as_str()] {
+            let mut statement = conn.prepare(sql).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                conn.execute_batch("SAVEPOINT bench").unwrap();
+                assert_eq!(
+                    statement
+                        .execute(params![INGRESS_DEDUP_MARKER_CAPACITY])
+                        .unwrap(),
+                    1
+                );
+                conn.execute_batch("ROLLBACK TO bench; RELEASE bench")
+                    .unwrap();
+            }
+            measurements.push((
+                statement.get_status(StatementStatus::VmStep) / 20,
+                start.elapsed() / 20,
+            ));
+        }
+        assert!(
+            measurements[0].0 > measurements[1].0 * 5,
+            "ingress prune capacity={INGRESS_DEDUP_MARKER_CAPACITY}: old={:?}, new={:?} (VM steps, elapsed)",
+            measurements[0],
+            measurements[1]
+        );
+    }
+
+    #[test]
+    fn pending_replay_query_work() {
+        use rusqlite::StatementStatus;
+        use std::time::Instant;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 4096)
+             INSERT INTO pending_application_events(message_id, group_id, message_insert_order, record)
+             SELECT randomblob(16), randomblob(16), x, randomblob(128) FROM n",
+        )
+        .unwrap();
+        let legacy = "SELECT record FROM pending_application_events
+                      ORDER BY message_insert_order, message_id";
+        conn.execute_batch("DROP INDEX idx_pending_application_events_order")
+            .unwrap();
+        let mut measurements = Vec::new();
+        for index in 0..2 {
+            if index == 1 {
+                conn.execute_batch(
+                    "CREATE INDEX idx_pending_application_events_order
+                     ON pending_application_events(message_insert_order, message_id)",
+                )
+                .unwrap();
+            }
+            let mut statement = conn.prepare(legacy).unwrap();
+            let start = Instant::now();
+            for _ in 0..20 {
+                let rows = statement
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap();
+                assert_eq!(
+                    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap().len(),
+                    4096
+                );
+            }
+            measurements.push((
+                statement.get_status(StatementStatus::VmStep) / 20,
+                start.elapsed() / 20,
+            ));
+            if index == 1 {
+                assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+            }
+        }
+        assert!(
+            measurements[1].0 * 2 < measurements[0].0,
+            "pending application order: old={:?}, new={:?} (VM steps, elapsed)",
+            measurements[0],
+            measurements[1]
+        );
     }
 
     #[test]

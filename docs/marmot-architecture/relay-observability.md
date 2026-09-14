@@ -125,7 +125,7 @@ query time.
 
 **Backend — decided: Grafana.** Relay data goes to Grafana (Prometheus/TSDB behind it), which is the right home for
 latency histograms and percentile/ranking dashboards, and where the server-side strfry fleet metrics already live — so
-client-experienced and server-side relay views sit side by side. **Aptabase is reserved for future product analytics**
+client-experienced and server-side relay views sit side by side. **Aptabase handles optional [product analytics](usage-diagnostics.md)**
 (usage, retention, feature events); its anonymous event-count model is a poor fit for latency distributions and has no
 native histogram/percentile story, so relay telemetry does not go there. During internal testing (`k = 1`), clients push
 directly to the first-party Grafana/OTLP endpoint; the IP-stripping proxy and dashboard k-anonymity gate are stood up
@@ -180,7 +180,7 @@ Server-side strfry fleet telemetry is independent and can proceed in parallel at
 
 - **k value: `k = 1` for now.** During internal testing we want as much data as possible; the only reporters are our own
   builds. Raise to a conservative value (and stand up the IP-stripping proxy) before any external rollout.
-- **Backend: Grafana** for relay data; Aptabase reserved for future product analytics (see
+- **Backend: Grafana** for relay data; Aptabase for optional product analytics (see
   [Collection and export architecture](#collection-and-export-architecture)).
 - **Histogram buckets: fine-grained** (see [Histogram resolution](#histogram-resolution)).
 

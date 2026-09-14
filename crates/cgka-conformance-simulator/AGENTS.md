@@ -55,6 +55,8 @@ Git commit; require a clean build and retain the exact source revision plus comm
     overrides the environment. File-backed `restart()` drops all engine/storage handles, reopens the encrypted database,
     and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
     `GroupEvolution`.
+    The per-tick no-progress guard includes durable deferred-row context attempts; an unchanged backlog count alone
+    does not mean a bounded sweep stalled. Identical durable state still fails the guard.
 
 - **Module:** `src/cross_route_scenario.rs`
   - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The
@@ -87,7 +89,9 @@ Git commit; require a clean build and retain the exact source revision plus comm
   - **Role:** Serializable active application-message probe results. A
     `ProbeBidirectionalDecryptability` scenario step sends one logical event per named client, drains every attached
     client, and records each directed sender-to-recipient edge by exact logical event id and recipient ledger
-    disposition. This is a mutating probe, not a passive observation.
+    disposition. A queued send becomes published only when the authenticated sender ledger proves publication;
+    up to eight transport rounds deliver messages released during convergence. Unpublished or undelivered probes
+    still fail. This is a mutating probe, not a passive observation.
 
 - **Module:** `cgka_engine::convergence`
   - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for
@@ -439,3 +443,12 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   through `transport-nostr-peeler`.
 - **`HarnessClient` exposes only what tests need.** If you need the inner `Engine<S>`, that's a smell — extend the
   harness API instead and keep tests at one abstraction level.
+- **App-runtime maintenance runs on real time unless the build says otherwise.** Own-leaf rotations wait out a
+  60-second quiet window plus up to 30 seconds of jitter. `AppRuntimeHarness::new_with_immediate_maintenance` zeroes
+  those windows through `MarmotAppConfig::with_dev_maintenance_timing`, which is honored only when this crate is built
+  with `test-policy-overrides` (now also enabling `marmot-app/test-policy-overrides`). Gate any journey that depends
+  on it with `cfg_attr(not(feature = "test-policy-overrides"), ignore)` and check
+  `AppRuntimeHarness::honors_maintenance_timing_override()` rather than assuming the knob took effect. That build
+  also switches `AppRuntimeHarness::new()` to marmot-app's instant-settlement test default, so journeys that claim
+  production settlement must use `new_with_pinned_settlement` or `new_with_immediate_maintenance` (both pin the
+  1,000 ms window), and a recipe that enables the feature must select its tests explicitly rather than run the crate.

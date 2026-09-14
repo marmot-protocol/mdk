@@ -51,4 +51,4 @@ fi
 cd "$HERMES_AGENT_REPO"
 export PYTHONDONTWRITEBYTECODE=1
 exec "$HERMES_AGENT_REPO/.venv/bin/python" \
-    "$MDK_REPO/integrations/hermes/marmot/tests/e2e_connector.py"
+    "$MDK_REPO/integrations/hermes/tests/marmot/e2e_connector.py"

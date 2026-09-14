@@ -8,8 +8,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - A thin, **control-plane-only** OpenClaw channel plugin. `wn-agent` owns the
   Marmot account, MLS state, Nostr transport, and QUIC previews; this plugin
   only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
-- Keep transcript hashing byte-for-byte with the authoritative Rust
-  `AgentTextStreamTranscriptV1` (`crates/traits/src/agent_text_stream.rs`).
+- Use `stream_finish` with acknowledged final text; Rust owns transcript hashing and chunking.
 - No QUIC, crypto, relay, or MLS logic here.
 - Privacy-safe logging only: no account ids, group ids, message ids, pubkeys,
   relay URLs, payloads, ciphertext, plaintext, or key material.
@@ -22,7 +21,6 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 
 ## Key files
 
-- `src/transcript.ts` — transcript-hash mirror + UTF-8 chunk splitter (Rust-anchored).
 - `src/client.ts` — agent-control NDJSON client (request/response + `subscribe_inbound` stream).
 - `src/append-only.ts` — append-only suffix tracker for progressive updates.
 - `src/live.ts` — live-preview state machine → `stream_begin`/`append`/`finalize`/`cancel`.
@@ -37,12 +35,10 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/security.ts` — OpenClaw `dm.allowFrom` → `wn-agent` welcomer allowlist sync.
 - `src/channel.ts` — `createChatChannelPlugin` (meta, capabilities, config, message, security, threading).
 - `index.ts` / `setup-entry.ts` — plugin runtime + setup entries.
-- `test/` — Vitest unit + parity tests; `test/vectors/transcript-vectors.json` is generated from the Rust impl.
+- `test/` — Vitest unit and connector tests.
 
 ## Rules
 
-- Regenerate `test/vectors/transcript-vectors.json` from the Rust
-  `AgentTextStreamTranscriptV1` if the Rust transcript hashing ever changes.
 - Keep the `openclaw` dependency pinned; before bumping, verify the
   `openclaw/plugin-sdk/*` subpath exports against the new version's types, and
   re-verify the deliberate test-only `dist/plugins/loader.js` import used by the

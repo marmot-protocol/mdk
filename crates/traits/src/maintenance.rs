@@ -228,8 +228,16 @@ pub struct SignedPublicationArtifact {
     pub bytes: Vec<u8>,
 }
 
+/// Durable generator policy revision, independent of app/workspace versions.
+/// Revision 1 omits RFC 9420 section 7.2 default capability advertisements.
+/// Bump only when existing published packages must be regenerated.
+pub const KEY_PACKAGE_GENERATION_REVISION: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingKeyPackageReplacement {
+    /// Generator policy that produced this exact bundle. Missing on pre-migration records.
+    #[serde(default)]
+    pub generation_revision: u32,
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
     /// Transport authoring time selected before signing. The private bundle
@@ -275,6 +283,10 @@ pub struct KeyPackageLifecycleState {
     pub publication_targets: Vec<TransportFanoutTarget>,
     pub refresh_at: Option<Timestamp>,
     pub upgrade_rotation_recorded: bool,
+    /// Generator policy of the acknowledged current package, promoted atomically
+    /// with that package. Zero denotes records written before revision tracking.
+    #[serde(default)]
+    pub generation_revision: u32,
     /// The reference proven to have been consumed by a successfully processed
     /// MLS Welcome. This comes from the Welcome's encrypted-group-secrets
     /// entries matched against local bundles, never from a transport tag.
@@ -307,6 +319,7 @@ impl KeyPackageLifecycleState {
             publication_targets: Vec::new(),
             refresh_at: None,
             upgrade_rotation_recorded: false,
+            generation_revision: 0,
             last_consumed_key_package_ref: None,
             last_consumed_at: None,
             retained_private_material: Vec::new(),

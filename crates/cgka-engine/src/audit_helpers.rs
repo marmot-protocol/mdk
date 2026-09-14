@@ -391,6 +391,7 @@ pub(crate) fn ingest_outcome_event(
             ),
             IngestOutcome::LocalState { state } => Some(
                 match state {
+                    LocalIngestState::RejoinConfirmationRequired => "rejoin_confirmation_required",
                     LocalIngestState::Removed => "removed",
                     LocalIngestState::Quarantined => "quarantined",
                 }
@@ -698,7 +699,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn group_state_change_kind_strings_match_v3_schema() {
+    fn group_state_change_kind_strings_match_v4_schema() {
         let member = MemberId::new(vec![0; 32]);
         let changes = [
             GroupStateChange::MemberAdded {
@@ -731,9 +732,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let schema: serde_json::Value = serde_json::from_str(include_str!(
-            "../../marmot-forensics/schema/audit-log-event.v3.schema.json"
+            "../../marmot-forensics/schema/audit-log-event.v4.schema.json"
         ))
-        .expect("v3 schema parses");
+        .expect("v4 schema parses");
         let defined = schema
             .pointer("/$defs/groupStateChangeKind/enum")
             .and_then(serde_json::Value::as_array)

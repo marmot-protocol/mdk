@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      recovery_only:
+        description: Run only the production-policy 1024-message recovery journeys
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ env:
 jobs:
   simulator-nightly:
     name: Full simulator, campaigns, and vectors
+    if: ${{ !inputs.recovery_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 150
 
@@ -178,3 +184,87 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "Simulator nightly failed (${run_date})" \
             --body "The simulator nightly failed. Run: ${RUN_URL}"
+
+  public-app-catchup:
+    name: Public app 1024-message recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
+      MDK_APP_JOURNEY_ARTIFACTS: ${{ github.workspace }}/target/public-app-catchup-evidence
+      MDK_BACKLOG_TRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Cache production-policy Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: public-app-catchup-release
+
+      - name: Record source provenance
+        run: |
+          umask 077
+          mkdir -p target/public-app-catchup-evidence
+          git rev-parse HEAD > target/public-app-catchup-evidence/source-commit.txt
+          rustc --version > target/public-app-catchup-evidence/rust-version.txt
+
+      - name: Build public recovery tests with production policy
+        id: build_catchup
+        timeout-minutes: 15
+        # Keep this separate from workspace test-policy feature unification.
+        run: >-
+          cargo test --release --locked -p cgka-conformance-simulator
+          --test app_runtime_journeys --no-run
+
+      - name: Recover the original 1024-message backlog
+        if: ${{ !cancelled() && steps.build_catchup.outcome == 'success' }}
+        timeout-minutes: 20
+        # Each journey owns a 900-second watchdog and closes every runtime.
+        run: >-
+          cargo test --release --locked -p cgka-conformance-simulator
+          --test app_runtime_journeys public_app_1024_message_backlog_recovers_completely
+          -- --exact --ignored --test-threads=1 --nocapture
+
+      - name: Recover the 1024-message backlog with extra epochs
+        if: ${{ !cancelled() && steps.build_catchup.outcome == 'success' }}
+        timeout-minutes: 20
+        run: >-
+          cargo test --release --locked -p cgka-conformance-simulator
+          --test app_runtime_journeys public_app_1024_message_backlog_with_extra_epochs_recovers_completely
+          -- --exact --ignored --test-threads=1 --nocapture
+
+      - name: Upload public recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: public-app-catchup-${{ github.sha }}
+          path: |
+            target/public-app-catchup-evidence/*.txt
+            target/public-app-catchup-evidence/app-journey-*/*.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Report scheduled recovery failure
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          run_date="$(date -u +%F)"
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Public app recovery nightly failed (${run_date})" \
+            --body "The production-policy 1024-message recovery lane failed. Run and retained evidence: ${RUN_URL}"

@@ -94,6 +94,19 @@ just clippy
 just test
 ```
 
+MDK also maintains a compile-only browser WASM boundary for `cgka-traits`,
+`cgka-engine`, and `transport-nostr-peeler`. Install the Rust target, ensure
+`CC_wasm32_unknown_unknown` names a Clang binary with a `wasm32` backend when
+the system Clang lacks one, and run:
+
+```sh
+rustup target add wasm32-unknown-unknown
+just wasm-check
+```
+
+This gate does not run browser acceptance tests and does not claim browser
+support for SQLCipher storage, the app runtime, bindings, CLI, or daemon.
+
 The repository's [`.cargo/config.toml`](.cargo/config.toml) supplies a 4 MiB
 `RUST_MIN_STACK` for Cargo-launched tests and debug binaries. Unoptimized
 OpenMLS group construction and tree deserialization can exceed Rust's

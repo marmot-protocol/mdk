@@ -95,6 +95,27 @@ pub enum MarmotStatus {
     AccountWorkerResponseTimedOut = 60,
     GroupInviteNotPending = 61,
     MissingMemberInboxRoute = 62,
+    GroupRemoved = 63,
+    OnboardingActionUnavailable = 64,
+    OnboardingRequired = 65,
+    ConsentRequired = 66,
+    InvalidProductAnalyticsConfiguration = 67,
+    InvalidProductObservation = 68,
+    ChatPresentationNotReady = 69,
+    /// An `imeta` reference failed the shared strict parser (mdk#1787).
+    /// The detail string carries the stable rejection kind label and the
+    /// presentation text.
+    MediaAttachmentRejected = 70,
+    /// The reference is valid but no locator may be fetched under the
+    /// current policy; nothing was dialed.
+    MediaUnfetchable = 71,
+    /// Fetch, integrity, or decryption failed after a locator was selected.
+    MediaDownloadFailed = 72,
+    ChatWindowInvalidLimit = 73,
+    ChatWindowStale = 74,
+    ChatWindowAnchorOutside = 75,
+    ChatWindowClosed = 76,
+    ChatWindowQuery = 77,
 }
 
 thread_local! {
@@ -115,6 +136,16 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
+        MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
+        MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
+        MarmotKitError::ChatWindowClosed => MarmotStatus::ChatWindowClosed,
+        MarmotKitError::ChatWindowQuery { .. } => MarmotStatus::ChatWindowQuery,
+        MarmotKitError::ConsentRequired => MarmotStatus::ConsentRequired,
+        MarmotKitError::InvalidProductAnalyticsConfiguration => {
+            MarmotStatus::InvalidProductAnalyticsConfiguration
+        }
+        MarmotKitError::InvalidProductObservation => MarmotStatus::InvalidProductObservation,
         MarmotKitError::DuplicateIdentity { .. } => MarmotStatus::DuplicateIdentity,
         MarmotKitError::UnknownAccount { .. } => MarmotStatus::UnknownAccount,
         MarmotKitError::UnknownGroup { .. } => MarmotStatus::UnknownGroup,
@@ -149,11 +180,16 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidChatPin { .. } => MarmotStatus::InvalidChatPin,
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
+        MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
+        MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
+        MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
         MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
+        MarmotKitError::OnboardingActionUnavailable => MarmotStatus::OnboardingActionUnavailable,
+        MarmotKitError::OnboardingRequired => MarmotStatus::OnboardingRequired,
         MarmotKitError::AccountSetupRetryRequired => MarmotStatus::AccountSetupRetryRequired,
         MarmotKitError::AccountSetupResetNotApplicable => {
             MarmotStatus::AccountSetupResetNotApplicable
@@ -168,12 +204,14 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         }
         MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
+        MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
             MarmotStatus::CreatedGroupProjectionUnavailable
         }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
+        MarmotKitError::ChatPresentationNotReady => MarmotStatus::ChatPresentationNotReady,
         MarmotKitError::DirectConversationIndexNotReady => {
             MarmotStatus::DirectConversationIndexNotReady
         }
@@ -192,9 +230,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn onboarding_status_codes_preserve_the_master_group_removed_value() {
+        assert_eq!(MarmotStatus::GroupRemoved as i32, 63);
+        assert_eq!(MarmotStatus::OnboardingActionUnavailable as i32, 64);
+        assert_eq!(MarmotStatus::OnboardingRequired as i32, 65);
+    }
+
+    #[test]
     fn every_runtime_error_variant_maps_to_a_distinct_status() {
         let _guard = crate::memory::audit::test_lock();
+        // Every `MarmotKitError` variant, in declaration order. `status_from_error`'s
+        // exhaustive match forces a new arm for a new variant; add the variant
+        // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::ChatWindowInvalidLimit,
+            MarmotKitError::ChatWindowStale,
+            MarmotKitError::ChatWindowAnchorOutside,
+            MarmotKitError::ChatWindowClosed,
+            MarmotKitError::ChatWindowQuery {
+                details: "query".into(),
+            },
+            MarmotKitError::ConsentRequired,
+            MarmotKitError::InvalidProductAnalyticsConfiguration,
+            MarmotKitError::InvalidProductObservation,
             MarmotKitError::DuplicateIdentity {
                 account: "a".into(),
             },
@@ -205,10 +263,42 @@ mod tests {
                 group_id_hex: "aa".into(),
             },
             MarmotKitError::GroupInviteNotPending,
+            MarmotKitError::CreatedGroupProjectionUnavailable {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::InvalidGroupMembershipPage { max_groups: 1 },
+            MarmotKitError::InvalidCachedIdentityPage { max_accounts: 1 },
+            MarmotKitError::GroupHydrationPending {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::DirectConversationIndexNotReady,
+            MarmotKitError::ChatPresentationNotReady,
+            MarmotKitError::InvalidChatPin {
+                details: "d".into(),
+            },
+            MarmotKitError::InvalidMessageDraft {
+                details: "d".into(),
+            },
+            MarmotKitError::InvalidMediaReference {
+                details: "d".into(),
+            },
+            MarmotKitError::MediaAttachmentRejected {
+                kind: marmot_uniffi::conversions::MediaAttachmentRejectionKindFfi::MissingField,
+                details: "d".into(),
+            },
+            MarmotKitError::MediaUnfetchable {
+                details: "d".into(),
+            },
+            MarmotKitError::MediaDownloadFailed {
+                details: "d".into(),
+            },
             MarmotKitError::InvalidHex {
                 details: "d".into(),
             },
             MarmotKitError::InvalidIdentity {
+                details: "d".into(),
+            },
+            MarmotKitError::InvalidKeyPackageEvent {
                 details: "d".into(),
             },
             MarmotKitError::MissingKeyPackage {
@@ -220,15 +310,43 @@ mod tests {
             MarmotKitError::Publish {
                 details: "d".into(),
             },
+            MarmotKitError::FollowListUnavailable,
             MarmotKitError::TransportClosed,
+            MarmotKitError::RuntimeBusy,
+            MarmotKitError::AccountSessionBusy,
+            MarmotKitError::AccountSetupRecoveryRequired,
+            MarmotKitError::AccountSetupRetryRequired,
+            MarmotKitError::OnboardingActionUnavailable,
+            MarmotKitError::OnboardingRequired,
+            MarmotKitError::AccountSetupResetNotApplicable,
+            MarmotKitError::AccountSetupKeyPackageRecoveryAvailable,
             MarmotKitError::RuntimeStopping,
+            MarmotKitError::AccountCatchUp {
+                details: "d".into(),
+            },
             MarmotKitError::NotGroupAdmin {
                 group_id_hex: "aa".into(),
             },
             MarmotKitError::AdminCannotSelfRemove {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::LeaveAlreadyRequested {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::WouldRemoveLastAdmin {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::DisbandingUnsupportedMembers {
+                group_id_hex: "aa".into(),
+                member_ids_hex: vec!["bb".into()],
+            },
+            MarmotKitError::DisbandingNotEnabled {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupDisbanding {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupRemoved {
                 group_id_hex: "aa".into(),
             },
             MarmotKitError::MemberNotInGroup {
@@ -246,6 +364,9 @@ mod tests {
             MarmotKitError::StorageBusy {
                 details: "d".into(),
             },
+            MarmotKitError::StorageClosed {
+                details: "d".into(),
+            },
             MarmotKitError::SecretNotFound {
                 details: "d".into(),
             },
@@ -259,15 +380,28 @@ mod tests {
             MarmotKitError::Io {
                 details: "d".into(),
             },
-            MarmotKitError::Runtime {
-                details: "d".into(),
-            },
             MarmotKitError::ExternalSignerUnavailable {
                 account: "a".into(),
             },
             MarmotKitError::ExternalSignerMismatch,
             MarmotKitError::ExternalSignerRejected,
+            MarmotKitError::GroupSendQueueFull {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupUnrecoverableRepairRequired {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::Runtime {
+                details: "d".into(),
+            },
+            MarmotKitError::AccountWorkerBusy,
+            MarmotKitError::AccountWorkerResponseTimedOut,
         ];
+        assert_eq!(
+            variants.len(),
+            68,
+            "list every MarmotKitError variant exactly once (update this count with the enum)"
+        );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {
             let status = status_from_error(err);

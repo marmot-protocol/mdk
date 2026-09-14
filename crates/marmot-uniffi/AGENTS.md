@@ -10,6 +10,7 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
   `package-macos-artifacts.sh`, `validate-ios-artifact.sh`, `validate-macos-artifact.sh`, `validate-swift-package.sh`,
   and `validate-swift-package-macos.sh`.
 - Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
+- Own `chat-projections-smoke.sh`, the host Swift/Kotlin chat-screen DTO round-trip check.
 - Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
 
@@ -28,6 +29,14 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 - The generated Swift binding is platform-independent, so releases publish `MarmotKit-<id>.swift` exactly once, from
   the iOS job. `package-macos-artifacts.sh` records its SHA-256 in the macOS manifest but must not emit the file;
   emitting it would collide with the iOS asset name on the shared release. The release job asserts both hashes match.
+- Timeline and reply-preview `media` is an ordered `Vec<MediaAttachmentOutcomeFfi>`; a rejected `imeta` attachment
+  stays in place as `Rejected { attachment_index, rejection }` with a stable `MediaAttachmentRejectionKindFfi`
+  (mdk#1787). Timeline rows and `parse_media_imeta_tag` are the surfaces that carry the typed reason, and they must
+  report the same kind and detail for the same tag. `list_media` is the downloadable-only gallery view: it returns
+  accepted records only, numbered by tag position so its `attachment_index` matches the timeline outcome, and it
+  deliberately does not emit a record for a rejected attachment (a gallery host renders placeholders from the timeline
+  row, and mdk#1448 replaces `list_media`). Route all three through `marmot_app::parse_media_attachment` / the shared
+  outcome helpers; do not reintroduce a `filter_map(.ok())` that drops the verdict in the timeline projection.
 - Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes, not Nostr `nostr_group_id` route handles.
   Accept non-empty opaque MLS group ids, including the 16-byte ids OpenMLS generates for MDK today, and do not validate
   them with the 32-byte route-id/pubkey/message-id rule.
@@ -53,6 +62,11 @@ OTLP export builds:
 ```sh
 cargo check -p marmot-uniffi --features otlp-export
 ```
+
+Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires `swiftc`) and
+`just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
+libraries, Android platform, annotations, and coroutines jars). These host checks do not replace release-artifact or
+device validation.
 
 Release-artifact checks (after `xcframework.sh`):
 

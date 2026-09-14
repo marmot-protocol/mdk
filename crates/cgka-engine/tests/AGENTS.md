@@ -56,6 +56,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** same-epoch fork resolution through the unified distributed-convergence route (committer, observer,
     and restarted-committer shapes) plus the missing-anchor fail-closed halt
 
+- **File:** `deferred_peel_lifecycle.rs`
+  - **Owns:** Durable deferred retry lifecycles, generation barriers, capacity limits, context-cache invalidation,
+    foreground budgets, and background work/time budgets with restart and eventual-completion checks.
+
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, and retained-anchor behavior
 
@@ -79,7 +83,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     seam that projects the record plus direct-ingest capability-cache coverage. No torn record or capability cache,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
-    stored convergence so it is eventually applied
+    stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
+    rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
+    candidate generation rather than once per bounded slice
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open

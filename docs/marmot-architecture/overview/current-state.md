@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-08-24
+updated: 2026-09-14
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,84 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
+It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
+required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
+archive; successful rejoin restores departed conversations. Independent live account attention reuses the Unread
+eligibility keys, reports unavailable accounts explicitly, and refreshes affected accounts without opening lists.
+C4 M4 adds UniFFI/C handles, typed window errors and native ownership/parity checks;
+release and client adoption remain separate. See the [native handoff](../further-context/chat-projections-native.md),
+[bounded live chat-list windows](../further-context/chat-list-windows.md) and
+[independent account attention](../further-context/account-attention.md).
+
+Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
+it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined
+conversation again. Changes to those registration inputs still queue the new revision for all joined groups.
+Account workers process scheduled convergence one group per turn, retaining the other groups' deadlines and
+alternating queued commands with due recovery passes so neither queue starves the other. Each pass retries group
+subscriptions only when a refresh is pending; an unchanged group set needs no account-wide refresh. A running
+engine or relay operation still completes before a queued command executes; this is not a wall-clock send latency
+guarantee.
+
+Accepted disband requests keep a worker wakeup even without other group work, and hydration restores that wakeup
+after restart. The selected inbound convergence replay retains authenticated disband evidence before removing the
+former roster. Terminal event projection uses the retained display components and authoritative tombstone instead
+of querying deleted MLS state. Failed requests and unrecoverable groups do not acquire an idle retry loop from this scheduling.
+
+`forget_group_local` is a separate account-device operation from leaving, disbanding, and deleting chat history.
+It transactionally deletes local app and MLS state with a durable reset cutoff, then removes runtime scheduling and
+subscriptions. It needs no peer acknowledgement and works on stalled or pending-disband groups. While awaiting a
+new Welcome it cannot resume group work. A fully validated Welcome for the same MLS group id may join with clean
+state only when its sender-authenticated inner creation time is strictly newer than the cutoff and its author
+matches the MLS inviter. Missing timestamps and equal-second/older invitations are rejected, even when received
+later or rewrapped. Normal invitation confirmation policy still applies. The cutoff survives the new join and
+restart for Welcome admission. Ordinary post-join messages pass normal MLS validation and the new join-epoch floor,
+without a wall-clock drop filter that could mute peers with skewed clocks. Unreadable transport traffic follows the
+normal bounded deferred-peel policy; previous chat history and rewind anchors remain erased. Repeated forgetting while awaiting
+a Welcome preserves the cutoff; forgetting after a successful join establishes a new one. Clock skew can cause a
+legitimate invitation to fall before the boundary; generate another invitation after the sender clock crosses it.
+Timestamp filtering is replay policy, not proof against an authorized inviter deliberately redating old content.
+Legacy permanent markers migrate to a cutoff at migration time. Ordinary `delete_group_local` still retains
+membership and permits fresh messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
+must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
+network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
+
+Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
+canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
+explicitly confirm replacing that MLS state; local message history remains. `group_recovery_status` exposes offers,
+pending/failed inviter recovery, and an `automatic_recovery_failed` warning after repeated relay-confirmed full-history
+replays recover nothing. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
+Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
+See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
+
+The additive presented-chat-list contract exposes complete existing rows plus durable MDK-selected title/avatar
+through Rust, UniFFI and C. An attached initial snapshot and ordered replacement updates cover both presentation and
+ordinary row changes. Android/iOS adoption remains separate; see the
+[native integration contract](../../../crates/marmot-uniffi/README.md#selected-chat-list-presentation).
+
+Deferred transport resource release now preserves app replay eligibility across
+lost engine effects and restart. SQLCipher records release evidence atomically
+with raw-byte deletion; app recovery retires both inventory and duplicate
+receipts before readmission. See [released transport receipts](../storage-format-v2.md#released-transport-receipts).
+The production retention and retry limits remain unchanged.
+
+MDK now exposes opt-in durable onboarding for imported identities, with per-step
+validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
+It requires single-device acknowledgment before KeyPackage publication and offers
+advisory detection of packages that may belong to another installation.
+Account onboarding gates normal worker commands until required checks and
+KeyPackage publication complete. Hosts can cancel an interactive attempt at any
+step, including approved or ready checkpoints: the account stays signed out, the
+attempt is retired, and its exact evidence is retained in the latest cancellation
+checkpoint. A later cancellation replaces earlier evidence even if publication
+is uncertain. Explicit recovery preserves unreadable/exhausted checkpoints as
+opaque evidence and establishes a fresh approval epoch; hosts must adopt the
+epoch-aware approval APIs for recovered attempts. Ordinary checkpoints remain
+v3; recovered checkpoints use v4 to exclude unsafe older readers. Cancellation of a proposal is
+distinct from cancelling a signer future and from ending the attempt. Open Chats
+remains host-owned. Host apps still need to adopt the identity-only
+entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).
 
 Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the
 unifying bump above the previous `0.8.0` release), Marmot-TS gives us an independent TypeScript implementation, and the
@@ -38,6 +116,10 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 
 - **Distributed convergence** — deterministic branch selection for unordered transport input, including the durable
   frozen-pass boundary, in [`../distributed-convergence.md`](../distributed-convergence.md)
+- **Bounded offline recovery** — background deferred peeling shares a row/time budget and reuses historical
+  contexts within each sweep. The local public app regression recovers all 1,024 backlog messages, exchanges fresh
+  traffic and preserves the timeline after restart; see
+  [`APP_PATH_COVERAGE.md`](../../../crates/cgka-conformance-simulator/APP_PATH_COVERAGE.md) for scope and evidence.
 
 **In PR / design:**
 
@@ -55,6 +137,12 @@ one-second selection-relevant quiescence window and five-second absolute cap, re
 only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
 another group.
 
+Relay reconciliation replay progress is owned by each account's encrypted route state. It survives
+subscription rebuilds and empty or failed comparisons, and advances before fetch I/O independently
+of admitted event inventory. Retired routes are counted separately from reconciliation failures.
+The SDK requires a route-scoped progress store instead of evicting cursors from a shared cache;
+see [reconciliation progress ownership](../../../crates/transport-nostr-adapter/README.md#reconciliation-progress-ownership).
+
 ## Protocol implementations
 
 ### MDK (this repository)
@@ -68,6 +156,12 @@ idempotent Blossom upload, and canonical group creation are separate host-visibl
 uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
+
+The workspace maintains a compile-only browser WASM boundary for `cgka-traits`, `cgka-engine`, and
+`transport-nostr-peeler` on `wasm32-unknown-unknown`. Required CI keeps those three libraries compiling with
+warnings denied, and `just wasm-check` provides the matching local gate. This is a portability boundary, not a
+browser-runtime acceptance claim: SQLCipher storage, `marmot-app`, UniFFI/C bindings, the CLI, and daemons remain
+outside its scope, and browser execution still requires downstream acceptance coverage.
 
 Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
@@ -112,7 +206,10 @@ This repository now has the main engine candidate:
   relay/directory cache, relay-list setup, KeyPackage lookup, runtime subscriptions, and app-facing
   group/message/member methods. Detailed group creation returns the exact chat-list row committed with the local
   projection; founding Welcome fanout stays post-response and its app repair index is reconstructed from
-  engine-authoritative retained obligations.
+  engine-authoritative retained obligations. Its per-account directory cache has an independent numbered migration
+  ledger and future-version refusal; installation-wide `shared.sqlite3` now has its own independent
+  `shared_schema_migrations` history with transactional adoption of recognized unversioned layouts. See
+  [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
 - `crates/cli` — first real CLI, daemon, and TUI surface over `marmot-app`. It is intentionally product-facing rather
   than a lab harness, and its JSON envelope is shaped for daemon/TUI/testing callers.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations
@@ -131,7 +228,10 @@ This repository now has the main engine candidate:
   `stream_id + start_event_id` without account state, relay integration, or payload persistence.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
-- `crates/marmot-forensics` — opt-in JSONL forensic audit schema and recorder traits.
+- `crates/marmot-forensics` — opt-in v4 JSONL forensic audit schema and recorder traits. Account/device display names
+  are excluded; platform, app version and optional system hardware model are retained. App uploads validate v4-only
+  snapshots. Exclusive-root app startup removes recognized legacy forensic files and segments, including failed-wipe
+  remnants, while preserving v4 files and the separate key-reveal log. See [audit logging](../audit-logging.md).
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
 - `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.
 - `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.
@@ -187,7 +287,9 @@ reached durable local readiness. `Publishing` includes bounded in-session retry 
 local visibility via `wn relay-stats`, an opt-in index→identity resolution boundary, a relay-plane rollup, and an
 opt-in OTLP exporter (wire encoding behind the `marmot-app` `otlp-export` feature) — all aggregate, off by default, and
 carrying relay identity as the sole label. Wiring its periodic push into a long-running host against the production
-first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md).
+first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md). Each OTLP attempt
+now validates every resolved collector address and pins the client, with redirects and proxies disabled. The existing
+explicit loopback-test endpoint contract remains local-only; see [Dial Safety](dial-safety.md).
 - **Nostr account transport shape** — the likely production shape includes a Nostr user directory, account bootstrap for
   relay-list events, a shared multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing, and explicit
   relay URL safety policy. This is captured as a working note in
@@ -224,3 +326,8 @@ first-party endpoint remains ops work; see [`../relay-observability.md`](../rela
 - Canonicalization contract:
   [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
 - Distributed convergence: [`../distributed-convergence.md`](../distributed-convergence.md)
+
+Usage and diagnostics now has a shared consent receipt and independent OTLP and
+stock-Aptabase exporter paths; see [the host contract](../usage-diagnostics.md).
+Native consent UI adoption and deployed Aptabase retention verification remain
+separate rollout work.

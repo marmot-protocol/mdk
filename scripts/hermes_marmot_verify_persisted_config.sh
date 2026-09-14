@@ -120,5 +120,5 @@ env -i \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="$HERMES_AGENT_REPO/.venv/bin:$PATH" \
     "$HERMES_AGENT_REPO/.venv/bin/python" \
-    "$MDK_REPO/integrations/hermes/marmot/tests/real_hermes_persisted_config.py"
+    "$MDK_REPO/integrations/hermes/tests/marmot/real_hermes_persisted_config.py"
 wait "$socket_server_pid"

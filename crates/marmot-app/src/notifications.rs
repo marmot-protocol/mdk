@@ -1602,6 +1602,7 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
+        | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
 }

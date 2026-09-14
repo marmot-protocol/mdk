@@ -286,6 +286,69 @@ pub mod metric_names {
     /// Existing-database opens that skipped the recovery probe via a cached
     /// v2-open verdict (each avoided one passphrase KDF derivation, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_SKIPS: &str = "app_sqlcipher_migration_probe_skips";
+    /// Send command admission and worker queue wait.
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION: &str =
+        "app_outbound_message_queue_wait_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS: &str =
+        "app_outbound_message_queue_wait_attempts";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES: &str =
+        "app_outbound_message_queue_wait_successes";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES: &str =
+        "app_outbound_message_queue_wait_failures";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_DURATION: &str =
+        "app_outbound_message_local_projection_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_ATTEMPTS: &str =
+        "app_outbound_message_local_projection_attempts";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_SUCCESSES: &str =
+        "app_outbound_message_local_projection_successes";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_FAILURES: &str =
+        "app_outbound_message_local_projection_failures";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_DURATION: &str =
+        "app_outbound_message_local_accept_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_ATTEMPTS: &str =
+        "app_outbound_message_local_accept_attempts";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_SUCCESSES: &str =
+        "app_outbound_message_local_accept_successes";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_FAILURES: &str =
+        "app_outbound_message_local_accept_failures";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_DURATION: &str =
+        "app_outbound_message_publish_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_ATTEMPTS: &str = "app_outbound_message_publish_attempts";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_SUCCESSES: &str =
+        "app_outbound_message_publish_successes";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_FAILURES: &str = "app_outbound_message_publish_failures";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_DURATION: &str =
+        "app_outbound_message_response_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_ATTEMPTS: &str =
+        "app_outbound_message_response_attempts";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_SUCCESSES: &str =
+        "app_outbound_message_response_successes";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_FAILURES: &str =
+        "app_outbound_message_response_failures";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_DURATION: &str =
+        "app_host_outbound_message_visible_duration_ms";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_ATTEMPTS: &str =
+        "app_host_outbound_message_visible_attempts";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_SUCCESSES: &str =
+        "app_host_outbound_message_visible_successes";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_FAILURES: &str =
+        "app_host_outbound_message_visible_failures";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_DURATION: &str =
+        "app_host_inbound_message_visible_duration_ms";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_ATTEMPTS: &str =
+        "app_host_inbound_message_visible_attempts";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_SUCCESSES: &str =
+        "app_host_inbound_message_visible_successes";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_FAILURES: &str =
+        "app_host_inbound_message_visible_failures";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_DURATION: &str =
+        "app_inbound_delivery_projection_duration_ms";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_ATTEMPTS: &str =
+        "app_inbound_delivery_projection_attempts";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_SUCCESSES: &str =
+        "app_inbound_delivery_projection_successes";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_FAILURES: &str =
+        "app_inbound_delivery_projection_failures";
     /// One-sided outbound message send duration histogram.
     pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
     /// One-sided outbound message send attempts.
@@ -1178,6 +1241,70 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.outbound_message_queue_wait,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_local_projection,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_local_accept,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_publish,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_response,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_outbound_message_visible,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_DURATION,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_ATTEMPTS,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_SUCCESSES,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_inbound_message_visible,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_DURATION,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_ATTEMPTS,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_SUCCESSES,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.inbound_delivery_projection,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_DURATION,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_ATTEMPTS,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_SUCCESSES,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.outbound_message_send,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_DURATION,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS,
@@ -1652,8 +1779,8 @@ pub enum RelayExportError {
     #[cfg(feature = "otlp-export")]
     #[error("relay telemetry export authorization token is not configured")]
     MissingAuthorizationToken,
-    /// The OTLP push could not be sent.
-    #[cfg(feature = "otlp-export")]
+    /// The collector request could not be sent.
+    #[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
     #[error("relay telemetry export request failed to send")]
     Request,
     /// The collector returned a non-success status.
@@ -1673,8 +1800,15 @@ impl MarmotRelayPlane {
     /// never sent over a non-TLS transport.
     pub fn telemetry_exporter(
         &self,
-        config: RelayTelemetryExportConfig,
+        mut config: RelayTelemetryExportConfig,
+        permit: crate::DiagnosticsPermit,
     ) -> Option<RelayTelemetryExporter> {
+        if let Some(resource) = &mut config.resource {
+            resource.service_instance_id = permit.diagnostic_id.clone();
+        }
+        if !permit.valid() {
+            return None;
+        }
         if !config.export_allowed() {
             if config.enabled {
                 // Opted in but the URL/auth/resource gate is incomplete: fail
@@ -1691,9 +1825,18 @@ impl MarmotRelayPlane {
         Some(RelayTelemetryExporter {
             relay_plane: self.clone(),
             config,
-            started_at: std::time::SystemTime::now(),
+            permit,
+            baseline: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
+struct ExportCollectionPeriod {
+    started: std::time::SystemTime,
+    baseline: RelayTelemetryExportBatch,
+    previous: RelayTelemetryExportBatch,
 }
 
 /// Opt-in exporter that pushes relay telemetry to a first-party OTLP collector.
@@ -1701,12 +1844,11 @@ impl MarmotRelayPlane {
 /// Only constructed by [`MarmotRelayPlane::telemetry_exporter`] when opted in.
 #[derive(Clone)]
 pub struct RelayTelemetryExporter {
+    permit: crate::DiagnosticsPermit,
+    #[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
+    baseline: std::sync::Arc<std::sync::Mutex<Option<ExportCollectionPeriod>>>,
     relay_plane: MarmotRelayPlane,
     config: RelayTelemetryExportConfig,
-    /// Collection start, used as the cumulative `start_time` for OTLP points.
-    /// Only read by the feature-gated OTLP push.
-    #[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
-    started_at: std::time::SystemTime,
 }
 
 impl RelayTelemetryExporter {
@@ -1733,6 +1875,9 @@ impl RelayTelemetryExporter {
         engine: Option<EngineReorgMetrics>,
         app_performance: Option<AppPerformanceSnapshot>,
     ) -> RelayTelemetryExportBatch {
+        if !self.permit.valid() {
+            return RelayTelemetryExportBatch::default();
+        }
         let rollup = self.relay_plane.telemetry_rollup(engine).await;
         // The exporter only exists when opted in, so resolution is always
         // available here; default to an empty resolution defensively.
@@ -1746,8 +1891,11 @@ impl RelayTelemetryExporter {
 }
 
 #[cfg(feature = "otlp-export")]
+use crate::collector_host_safety as host_safety;
+
+#[cfg(feature = "otlp-export")]
 mod otlp {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{
@@ -1762,6 +1910,7 @@ mod otlp {
 
     use crate::config::RelayTelemetryResource;
 
+    use super::host_safety::{self, REQUEST_TIMEOUT};
     use super::{ExportMetricValue, RelayExportError, RelayTelemetryExportBatch};
 
     const SCOPE_NAME: &str = "marmot.relay_telemetry";
@@ -1924,34 +2073,83 @@ mod otlp {
         resource: &RelayTelemetryResource,
         authorization_bearer_token: &str,
         started_at: SystemTime,
+        permit: &crate::DiagnosticsPermit,
     ) -> Result<(), RelayExportError> {
-        let request = to_request(
+        push_with_resolver(
             batch,
+            metrics_url,
             resource,
-            unix_nano(started_at),
-            unix_nano(SystemTime::now()),
-        );
-        let body = request.encode_to_vec();
-        // Bound both connect and overall request time so a stuck collector
-        // cannot hang an export indefinitely (both stay well under the default
-        // poll interval).
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
+            authorization_bearer_token,
+            started_at,
+            host_safety::system_resolve,
+            Some(permit),
+        )
+        .await
+    }
+
+    async fn push_with_resolver<F, Fut>(
+        batch: &RelayTelemetryExportBatch,
+        metrics_url: &str,
+        resource: &RelayTelemetryResource,
+        authorization_bearer_token: &str,
+        started_at: SystemTime,
+        resolver: F,
+        permit: Option<&crate::DiagnosticsPermit>,
+    ) -> Result<(), RelayExportError>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>>,
+    {
+        // Include our explicit DNS lookup in the overall attempt deadline.
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let pin = if let Some(permit) = permit {
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return Err(RelayExportError::Request),
+                    result = host_safety::resolve_with(metrics_url, resolver) => result?,
+                }
+            } else {
+                host_safety::resolve_with(metrics_url, resolver).await?
+            };
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let client = pin.build_client()?;
+            let request = to_request(
+                batch,
+                resource,
+                unix_nano(started_at),
+                unix_nano(SystemTime::now()),
+            );
+            let body = request.encode_to_vec();
+            let request = client
+                .post(pin.url)
+                .header("content-type", "application/x-protobuf")
+                .bearer_auth(authorization_bearer_token)
+                .body(body);
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let response = if let Some(permit) = permit {
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return Err(RelayExportError::Request),
+                    result = request.send() => result,
+                }
+            } else {
+                request.send().await
+            }
             .map_err(|_| RelayExportError::Request)?;
-        let response = client
-            .post(metrics_url)
-            .header("content-type", "application/x-protobuf")
-            .bearer_auth(authorization_bearer_token)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| RelayExportError::Request)?;
-        if !response.status().is_success() {
-            return Err(RelayExportError::Status(response.status().as_u16()));
-        }
-        Ok(())
+            if !response.status().is_success() {
+                return Err(RelayExportError::Status(response.status().as_u16()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RelayExportError::Request)?
     }
 
     #[cfg(test)]
@@ -1963,6 +2161,102 @@ mod otlp {
             ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayTelemetryExportBatch,
             metric_names,
         };
+
+        fn test_resource() -> RelayTelemetryResource {
+            RelayTelemetryResource {
+                service_version: "1.0".into(),
+                service_instance_id: "test-instance".into(),
+                deployment_environment: "test".into(),
+                tenant: "test-tenant".into(),
+                os_type: "test-os".into(),
+                os_version: "1.0".into(),
+                device_model_identifier: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn relay_telemetry_host_safety_rejects_before_any_connection() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            for endpoint in [
+                format!(
+                    "https://public.example:{}/private?secret=query",
+                    addr.port()
+                ),
+                format!("http://public.example:{}/private?secret=query", addr.port()),
+                format!("http://user:password@localhost:{}/", addr.port()),
+                format!("http://localhost:{}/#fragment", addr.port()),
+            ] {
+                let result = push_with_resolver(
+                    &RelayTelemetryExportBatch::default(),
+                    &endpoint,
+                    &test_resource(),
+                    "bearer-secret",
+                    SystemTime::now(),
+                    |_, _| async { Ok(vec![addr.ip()]) },
+                    None,
+                )
+                .await;
+                let error = result.unwrap_err();
+                assert_eq!(format!("{error:?}"), "Request");
+                assert_eq!(
+                    error.to_string(),
+                    "relay telemetry export request failed to send"
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unsafe or malformed destination received a connection"
+            );
+        }
+
+        #[tokio::test]
+        async fn relay_telemetry_host_safety_incomplete_config_never_resolves_or_sends() {
+            use crate::config::RelayTelemetryExportConfig;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let complete = RelayTelemetryExportConfig {
+                enabled: true,
+                endpoint: Some(format!(
+                    "http://localhost:{}/metrics",
+                    listener.local_addr().unwrap().port()
+                )),
+                authorization_bearer_token: Some("bearer-secret".into()),
+                resource: Some(test_resource()),
+                ..Default::default()
+            };
+            let plane = crate::MarmotRelayPlane::full_history();
+            assert!(
+                plane
+                    .telemetry_exporter(complete.clone(), crate::product_analytics::test_permit())
+                    .is_some()
+            );
+            for case in 0..7 {
+                let mut config = complete.clone();
+                match case {
+                    0 => config.enabled = false,
+                    1 => config.endpoint = None,
+                    2 => config.authorization_bearer_token = None,
+                    3 => config.authorization_bearer_token = Some(" ".into()),
+                    4 => config.resource = None,
+                    5 => config.resource.as_mut().unwrap().tenant.clear(),
+                    _ => config.endpoint = Some("https://user:password@localhost/".into()),
+                }
+                // Construction is the only entrance to export; no exporter
+                // exists on these paths to invoke a DNS resolver or HTTP push.
+                assert!(
+                    plane
+                        .telemetry_exporter(config, crate::product_analytics::test_permit())
+                        .is_none()
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
 
         #[test]
         fn to_request_maps_points_to_otlp_metrics() {
@@ -2126,6 +2420,14 @@ impl RelayTelemetryExporter {
         engine: Option<EngineReorgMetrics>,
         app_performance: Option<AppPerformanceSnapshot>,
     ) -> Result<usize, RelayExportError> {
+        if !self.permit.valid()
+            || self
+                .permit
+                .telemetry_rejected
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(RelayExportError::Request);
+        }
         let endpoint = self
             .config
             .endpoint
@@ -2141,18 +2443,61 @@ impl RelayTelemetryExporter {
             .authorization_bearer_token
             .as_deref()
             .ok_or(RelayExportError::MissingAuthorizationToken)?;
-        let batch = self
-            .build_batch_with_app_performance(engine, app_performance)
-            .await;
+        // Baseline every source series before resolving export labels. A relay whose
+        // label becomes available later must not expose its pre-consent history.
+        let rollup = self.relay_plane.telemetry_rollup(engine).await;
+        let internal_labels = RelayLabelResolution::from_pairs(rollup.relays.iter().map(|relay| {
+            (
+                RelayIndex(relay.relay_index),
+                cgka_traits::TransportEndpoint(relay.relay_index.to_string()),
+            )
+        }));
+        let raw_batch = build_export_batch_with_app_performance(
+            &rollup,
+            &internal_labels,
+            app_performance.as_ref(),
+        );
+        let (mut batch, started_at) = self.since_baseline(raw_batch);
+        if !self.permit.valid() {
+            return Err(RelayExportError::Request);
+        }
+        let resolution = self
+            .relay_plane
+            .resolve_relay_labels(&self.config)
+            .await
+            .unwrap_or_default();
+        batch.points.retain_mut(|point| {
+            let Some(index) = point.relay.as_deref() else {
+                return true;
+            };
+            let Some(endpoint) = index
+                .parse()
+                .ok()
+                .and_then(|index| resolution.label_for(RelayIndex(index)))
+            else {
+                return false;
+            };
+            point.relay = Some(endpoint.0.clone());
+            true
+        });
+        if !self.permit.valid() {
+            return Err(RelayExportError::Request);
+        }
         let count = batch.len();
         otlp::push(
             &batch,
             &endpoint,
             resource,
             authorization_bearer_token,
-            self.started_at,
+            started_at,
+            &self.permit,
         )
-        .await?;
+        .await
+        .inspect_err(|error| {
+            if matches!(error, RelayExportError::Status(400 | 401 | 403 | 404 | 422)) {
+                self.permit.reject_telemetry();
+            }
+        })?;
         tracing::debug!(
             target: "marmot_app::relay_telemetry_export",
             method = "export_once",
@@ -2196,6 +2541,9 @@ impl RelayTelemetryExporter {
             .await
             {
                 Ok(Ok(count)) => return Ok(count),
+                Ok(Err(err @ RelayExportError::Status(400 | 401 | 403 | 404 | 422))) => {
+                    return Err(err);
+                }
                 Ok(Err(err)) => last_error = Some(err),
                 Err(_) => last_error = Some(RelayExportError::Request),
             }
@@ -2254,8 +2602,17 @@ impl RelayTelemetryExporter {
             );
         }
         loop {
+            if !self.permit.valid()
+                || self
+                    .permit
+                    .telemetry_rejected
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
             let delay = jittered_export_interval(self.config.interval);
             tokio::select! {
+                _ = self.permit.cancelled()=>break,
                 _ = tokio::time::sleep(delay) => {
                     if self
                         .export_once_with_retries_and_app_performance(
@@ -2287,3 +2644,137 @@ impl RelayTelemetryExporter {
 
 #[cfg(test)]
 mod tests;
+
+impl RelayTelemetryExporter {
+    /// Keep local lifetime measurements intact; each exporter has its own collection epoch.
+    #[cfg(any(test, feature = "otlp-export"))]
+    fn since_baseline(
+        &self,
+        current: RelayTelemetryExportBatch,
+    ) -> (RelayTelemetryExportBatch, std::time::SystemTime) {
+        let mut state = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = state.as_ref().is_some_and(|period| {
+            current.points.iter().any(|point| {
+                period
+                    .previous
+                    .points
+                    .iter()
+                    .chain(period.baseline.points.iter())
+                    .find(|old| {
+                        old.name == point.name
+                            && old.relay == point.relay
+                            && old.failure == point.failure
+                    })
+                    .is_some_and(|old| metric_reset(&point.value, &old.value))
+            })
+        });
+        if state.is_none() || reset {
+            *state = Some(ExportCollectionPeriod {
+                started: std::time::SystemTime::now(),
+                baseline: current.clone(),
+                previous: current.clone(),
+            });
+        }
+        let period = state.as_mut().expect("initialized export baseline");
+        let started = period.started;
+        for point in &current.points {
+            if let Some(old) = period.previous.points.iter_mut().find(|old| {
+                old.name == point.name && old.relay == point.relay && old.failure == point.failure
+            }) {
+                *old = point.clone();
+            } else {
+                period.previous.points.push(point.clone());
+            }
+        }
+        let baseline = &mut period.baseline;
+        let mut output = current.clone();
+        for point in &mut output.points {
+            let index = baseline.points.iter().position(|old| {
+                old.name == point.name && old.relay == point.relay && old.failure == point.failure
+            });
+            // Optional sources may already contain pre-consent history when first
+            // supplied. Establish their baseline before exporting any cumulative data.
+            let index = index.unwrap_or_else(|| {
+                baseline.points.push(point.clone());
+                baseline.points.len() - 1
+            });
+            let old = &baseline.points[index];
+            match (&mut point.value, &old.value) {
+                (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => {
+                    *value -= base
+                }
+                (ExportMetricValue::Histogram(value), ExportMetricValue::Histogram(base)) => {
+                    for (count, base) in value.bucket_counts.iter_mut().zip(&base.bucket_counts) {
+                        *count -= base;
+                    }
+                    value.overflow_count -= base.overflow_count;
+                    value.sum_ms -= base.sum_ms;
+                }
+                _ => {}
+            }
+        }
+        let counters = output.points.clone();
+        for point in &mut output.points {
+            if point.name == metric_names::OBSERVED_REORG_RATE {
+                let count = |name| {
+                    counters
+                        .iter()
+                        .find_map(|p| match p.value {
+                            ExportMetricValue::Counter(v) if p.name == name => Some(v),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                };
+                let settles = count(metric_names::SETTLES);
+                let reorgs = count(metric_names::POST_SETTLE_REORGS);
+                point.value = ExportMetricValue::Gauge(if settles == 0 {
+                    0.0
+                } else {
+                    reorgs as f64 / settles as f64
+                });
+            }
+            if point.name == metric_names::FIRST_DELIVERER_RATE {
+                let count = |name| {
+                    counters
+                        .iter()
+                        .find_map(|p| match p.value {
+                            ExportMetricValue::Counter(v)
+                                if p.name == name && p.relay == point.relay =>
+                            {
+                                Some(v)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                };
+                let total = count(metric_names::DELIVERY_COUNT);
+                let redundant = count(metric_names::REDUNDANT_COUNT);
+                point.value = ExportMetricValue::Gauge(if total == 0 {
+                    0.0
+                } else {
+                    total.saturating_sub(redundant) as f64 / total as f64
+                });
+            }
+        }
+        (output, started)
+    }
+}
+#[cfg(any(test, feature = "otlp-export"))]
+fn metric_reset(value: &ExportMetricValue, baseline: &ExportMetricValue) -> bool {
+    match (value, baseline) {
+        (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => value < base,
+        (ExportMetricValue::Histogram(value), ExportMetricValue::Histogram(base)) => {
+            value.bounds_ms != base.bounds_ms
+                || value.bucket_counts.len() != base.bucket_counts.len()
+                || value.sum_ms < base.sum_ms
+                || value.overflow_count < base.overflow_count
+                || value
+                    .bucket_counts
+                    .iter()
+                    .zip(&base.bucket_counts)
+                    .any(|(v, b)| v < b)
+        }
+        (ExportMetricValue::Gauge(_), ExportMetricValue::Gauge(_)) => false,
+        _ => true,
+    }
+}

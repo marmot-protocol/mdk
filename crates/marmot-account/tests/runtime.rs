@@ -37,8 +37,8 @@ use cgka_traits::{
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
-    KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom, MonotonicClock,
-    NoopKeyPackagePublisher, PendingResolution, PublishedApplicationMessage,
+    KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom, MaintenanceTiming,
+    MonotonicClock, NoopKeyPackagePublisher, PendingResolution, PublishedApplicationMessage,
     StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy, WallClock,
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -176,6 +176,7 @@ impl TransportPeeler for MockPeeler {
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
+                created_at: None,
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),
@@ -317,22 +318,24 @@ async fn welcome_for_key_package(
         })
         .await
         .unwrap();
-    match &created.effects.publish[0] {
+    let welcomes = match &created.effects.publish[0] {
         PublishWork::GroupCreated { welcomes, pending } => {
             inviter.confirm_published(*pending).await.unwrap();
             welcomes
-                .iter()
-                .find(|message| {
-                    matches!(
-                        &message.envelope,
-                        TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
-                    )
-                })
-                .expect("welcome addressed to key package owner")
-                .clone()
         }
-        other => panic!("expected GroupCreated publish work, got {other:?}"),
-    }
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes,
+        _ => panic!("expected group creation publish work"),
+    };
+    welcomes
+        .iter()
+        .find(|message| {
+            matches!(
+                &message.envelope,
+                TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
+            )
+        })
+        .expect("welcome addressed to key package owner")
+        .clone()
 }
 
 /// MIP-03 self-remove feature registration, mirroring the cgka-session
@@ -369,6 +372,7 @@ struct RecordingAdapterInner {
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
+    endpoint_gate: Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
 }
 
 struct WelcomePublishGate {
@@ -480,6 +484,12 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        let endpoint_gate = self.inner.endpoint_gate.lock().unwrap().clone();
+        if let Some((endpoint, gate)) = endpoint_gate
+            && request.target.endpoints().contains(&endpoint)
+        {
+            gate.acquire().await.unwrap().forget();
+        }
         let welcome_gate = if matches!(&request.message.envelope, TransportEnvelope::Welcome { .. })
         {
             self.inner.welcome_gate.lock().unwrap().clone()
@@ -662,6 +672,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 }
 
 include!("runtime/frozen_fanout.rs");
+include!("runtime/key_package_generation_upgrade.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
@@ -1007,6 +1018,17 @@ async fn automatic_maintenance_publication_preserves_private_material_ownership(
 
     runtime.run_due_maintenance().await.unwrap();
 
+    let activity = runtime.take_maintenance_activity();
+    assert_eq!(activity.key_package_attempts, 1);
+    assert_eq!(activity.attempt_durations.len(), 1);
+    assert!(activity.attempt_durations[0].key_package);
+    assert!(!activity.attempt_durations[0].failed);
+    assert!(
+        runtime
+            .take_maintenance_activity()
+            .attempt_durations
+            .is_empty()
+    );
     let published = publisher.publications();
     assert_eq!(published.len(), 1);
     assert_eq!(
@@ -2264,6 +2286,7 @@ async fn post_join_rotation_does_not_block_application_send_and_returns_disposit
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice_hex, b"send while rotation is pending"),
+            expected_epoch: None,
         })
         .await
         .expect("post-join maintenance must not block application sends");
@@ -3811,6 +3834,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -4547,7 +4571,18 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
     );
 
     let publishes_before = adapter.publishes().len();
-    runtime.run_due_maintenance().await.unwrap();
+    for _ in 0..60 {
+        runtime.run_due_maintenance().await.unwrap();
+    }
+    let activity = runtime.take_maintenance_activity();
+    assert_eq!(
+        activity.failed_transitions, 0,
+        "restored failure is state, not sixty new edges"
+    );
+    assert_eq!(
+        activity.self_update_attempts, 0,
+        "terminal obligations do not execute"
+    );
 
     assert_eq!(
         sole_evolution(&runtime, &group_id).phase,
@@ -4588,5 +4623,222 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
         adapter.publishes().len(),
         publishes_before,
         "no self-update may be attempted in a group this device has left"
+    );
+}
+
+#[tokio::test]
+async fn maintenance_timing_defaults_match_production_windows() {
+    let timing = MaintenanceTiming::default();
+    assert_eq!(timing.quiet, Duration::from_secs(60));
+    assert_eq!(timing.contention_jitter_max, Duration::from_millis(30_000));
+    assert_eq!(timing.eose_timeout, Duration::from_secs(5 * 60));
+    assert_eq!(timing.post_eose_grace, Duration::from_secs(15));
+    assert_eq!(MaintenanceTiming::immediate().quiet, Duration::ZERO);
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot maintenance timing key").unwrap();
+    let runtime = AccountDeviceRuntime::new(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    assert_eq!(
+        runtime.maintenance_timing(),
+        MaintenanceTiming::default(),
+        "a runtime built without an override runs production maintenance windows"
+    );
+}
+
+/// One single-member group with periodic rotation disabled, reopened under
+/// `timing` with clocks that never advance. Returns the reopened runtime, the
+/// group, and its epoch before any maintenance.
+async fn manual_only_group_runtime(
+    timing: MaintenanceTiming,
+) -> (
+    tempfile::TempDir,
+    AccountDeviceRuntime<RecordingAdapter, StaticTransportRouting, RecordingKeyPackages>,
+    cgka_traits::GroupId,
+    cgka_traits::EpochId,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot maintenance timing group key").unwrap();
+    let mut initial_runtime = AccountDeviceRuntime::new(
+        current_session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    let (group_id, created) = initial_runtime
+        .create_group(CreateGroupRequest {
+            name: "timing group".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(created.failures.is_empty());
+    let mut maintenance_state = initial_runtime
+        .session()
+        .group_maintenance(&group_id)
+        .unwrap()
+        .unwrap();
+    maintenance_state.periodic_enrolled = false;
+    maintenance_state.next_periodic_rotation_at = None;
+    initial_runtime
+        .session()
+        .put_group_maintenance(&maintenance_state)
+        .unwrap();
+    let source_epoch = initial_runtime.session().epoch(&group_id).unwrap();
+    drop(initial_runtime);
+
+    let runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .required_acks(1)
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group-a.example".into())],
+            ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(timing);
+    (dir, runtime, group_id, source_epoch)
+}
+
+#[tokio::test]
+async fn immediate_maintenance_timing_publishes_a_manual_self_update_without_waiting() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+
+    // Sweep one: the zero quiet window is already satisfied, so the
+    // obligation moves straight to its zero-length jitter.
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Jitter
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
+    // Sweep two: the jitter deadline is already due, so the rotation publishes
+    // and confirms without either clock having moved.
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+}
+
+#[tokio::test]
+async fn default_maintenance_timing_holds_a_manual_self_update_in_its_quiet_window() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::default()).await;
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    for _ in 0..3 {
+        runtime.run_due_maintenance().await.unwrap();
+    }
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Quiet,
+        "sixty seconds of quiet have not elapsed, so nothing may rotate"
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+}
+
+#[tokio::test]
+async fn immediate_maintenance_timing_walks_a_post_join_obligation_without_waiting() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    // A post-join obligation as the engine creates it at join: waiting on the
+    // retained-history subscription, with the full 30-second jitter sampled.
+    let obligation_id = cgka_traits::MessageId::new(vec![7; 32]);
+    runtime
+        .session()
+        .put_maintenance_obligation(&cgka_traits::maintenance::MaintenanceObligation {
+            id: obligation_id.clone(),
+            group_id: group_id.clone(),
+            trigger: cgka_traits::MaintenanceTrigger::PostJoin,
+            phase: cgka_traits::MaintenancePhase::CatchUp,
+            created_at: cgka_traits::Timestamp(100_000),
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash: Some(runtime.session().own_leaf_hash(&group_id).unwrap()),
+            sampled_jitter_ms: 30_000,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })
+        .unwrap();
+    runtime
+        .mark_post_join_subscription_installed(&group_id)
+        .unwrap();
+
+    let mut phases = Vec::new();
+    for _ in 0..3 {
+        runtime.run_due_maintenance().await.unwrap();
+        phases.push(
+            runtime
+                .session()
+                .maintenance_obligation(&obligation_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+        );
+    }
+    assert_eq!(
+        phases,
+        [
+            cgka_traits::MaintenancePhase::EoseTimeout,
+            cgka_traits::MaintenancePhase::Quiet,
+            cgka_traits::MaintenancePhase::Jitter,
+        ],
+        "zero EOSE timeout, grace, and quiet windows advance one phase per sweep"
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "the sampled 30-second jitter is bounded by the zero window: {effects:?}"
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
     );
 }

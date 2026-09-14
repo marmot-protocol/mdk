@@ -1101,6 +1101,7 @@ fn is_retryable_app_error(error: &AppError) -> bool {
             | AppError::TransportClosed
             | AppError::AccountCatchUp(_)
             | AppError::DirectConversationIndexNotReady
+            | AppError::ChatPresentationNotReady
     )
 }
 

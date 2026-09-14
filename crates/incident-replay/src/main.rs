@@ -29,9 +29,15 @@ use incident_replay::{
     IncidentSourceFormatV1, Outcome, is_stream, parse, parse_stream, route,
 };
 
-/// Match the workspace's audit-artifact ceiling and reject oversized forensic
-/// input before parsing can allocate from attacker-controlled JSON/NDJSON.
-const MAX_INCIDENT_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
+/// Bound the in-memory `String` and the parsed event `Vec` for this
+/// operator-run CLI, and reject an oversized export before parsing can
+/// allocate from attacker-controlled JSON/NDJSON.
+///
+/// Sized from observed fleet exports — the largest was 72.9 MB as of
+/// 2026-09-03 — with room left for groups to age. Deliberately not tied to the
+/// audit upload ceiling: a Goggles group export is a server-side concatenation
+/// of many uploads, so nothing bounds it by what one upload may be.
+const MAX_INCIDENT_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -225,6 +231,21 @@ mod tests {
             read_utf8_limited(io::Cursor::new("ciao".as_bytes()), 4).unwrap(),
             "ciao"
         );
+    }
+
+    /// A group export is a server-side concatenation of many uploads, so it
+    /// legitimately exceeds any single upload's ceiling. Sparse: `set_len`
+    /// reserves the size without writing, and the NUL bytes it reads back are
+    /// valid UTF-8.
+    #[test]
+    fn an_export_larger_than_one_upload_is_read() {
+        let over_one_upload = 64 * 1024 * 1024 + 1;
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        file.as_file().set_len(over_one_upload).expect("sparse len");
+
+        let export = read_incident_export(file.path()).expect("export is read");
+
+        assert_eq!(export.len() as u64, over_one_upload);
     }
 
     #[test]

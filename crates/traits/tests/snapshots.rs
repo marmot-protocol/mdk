@@ -601,6 +601,7 @@ fn snapshot_send_intents() {
         SendIntent::AppMessage {
             group_id: gid(),
             payload: b"hello".to_vec(),
+            expected_epoch: None,
         }
     );
     insta::assert_json_snapshot!(
@@ -683,6 +684,7 @@ fn snapshot_group_events() {
         GroupEvent::GroupJoined {
             group_id: gid(),
             via_welcome: mid(),
+            explicitly_confirmed: false,
             welcomer: Some(mem_id()),
         }
     );

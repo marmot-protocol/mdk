@@ -237,6 +237,7 @@ pub struct EngineMetrics {
     /// Deferred-peel work-shape observability. All values are aggregate and
     /// candidate contexts themselves remain exclusively in engine memory.
     deferred_peel_sweeps: u64,
+    deferred_lineage_classifications: u64,
     deferred_peel_candidate_enumerations: u64,
     deferred_peel_candidate_contexts: u64,
     deferred_peel_candidate_context_depth: BucketHistogram,
@@ -284,6 +285,7 @@ impl Default for EngineMetrics {
             foreground_deferred_errors: 0,
             foreground_deferred_budget_overrun_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             deferred_peel_sweeps: 0,
+            deferred_lineage_classifications: 0,
             deferred_peel_candidate_enumerations: 0,
             deferred_peel_candidate_contexts: 0,
             deferred_peel_candidate_context_depth: BucketHistogram::new(&WORK_COUNT_BUCKET_BOUNDS),
@@ -440,6 +442,11 @@ impl EngineMetrics {
         self.outbound_queue_accept_ms.record(duration_ms);
     }
 
+    pub(crate) fn note_deferred_lineage_classification(&mut self) {
+        self.deferred_lineage_classifications =
+            self.deferred_lineage_classifications.saturating_add(1);
+    }
+
     pub(crate) fn note_deferred_peel_sweep(&mut self) {
         self.deferred_peel_sweeps = self.deferred_peel_sweeps.saturating_add(1);
     }
@@ -565,6 +572,7 @@ impl EngineMetrics {
                 .foreground_deferred_budget_overrun_ms
                 .snapshot(),
             deferred_peel_sweeps: self.deferred_peel_sweeps,
+            deferred_lineage_classifications: self.deferred_lineage_classifications,
             deferred_peel_candidate_enumerations: self.deferred_peel_candidate_enumerations,
             deferred_peel_candidate_contexts: self.deferred_peel_candidate_contexts,
             deferred_peel_candidate_context_depth: self
@@ -662,6 +670,9 @@ pub struct EngineMetricsSnapshot {
     pub foreground_deferred_budget_overrun_ms: HistogramSnapshot,
     /// Deferred-peel retry sweeps invoked, including empty or gated sweeps.
     pub deferred_peel_sweeps: u64,
+    /// Group graph classifications requested by live transport deferrals.
+    /// Retry sweeps consume no lineage report and must not increment this count.
+    pub deferred_lineage_classifications: u64,
     /// Candidate-branch enumerations actually performed (cache misses).
     pub deferred_peel_candidate_enumerations: u64,
     /// Candidate contexts captured across all enumerations.

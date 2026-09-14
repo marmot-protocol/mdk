@@ -10,6 +10,8 @@ name = "marmot_c"
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [features]
+otlp-export = ["marmot-uniffi/otlp-export"]
+product-analytics-export = ["marmot-uniffi/product-analytics-export"]
 default = []
 # Test-only accounting of every FFI allocation/free pair; used by the
 # roundtrip tests to prove deep-free completeness. Never enable in release
@@ -18,10 +20,13 @@ alloc-audit = []
 
 [dependencies]
 marmot-uniffi.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "time"] }
 libc.workspace = true
 # Holds a host-supplied secret-key hex only as long as the boundary needs it.
 zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+keyring-core.workspace = true
+nostr-relay-builder.workspace = true
+transport-quic-broker.workspace = true

@@ -33,6 +33,10 @@ cli-e2e = { max-threads = 2 }
 # admission long enough to trip the action-correlation timeout even though the
 # same scenario is stable in isolation.
 process-orchestrator = { max-threads = 1 }
+# Every public app journey starts a local relay and several SQLCipher runtimes
+# and then waits on real settlement windows. Two at a time keeps the smoke lane
+# moving without letting eleven of them starve each other's relay admission.
+app-runtime-journeys = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'package(wn-cli) & binary(cli)'
@@ -41,6 +45,10 @@ test-group = 'cli-e2e'
 [[profile.default.overrides]]
 filter = 'package(cgka-conformance-simulator) & binary(process_orchestrator)'
 test-group = 'process-orchestrator'
+
+[[profile.default.overrides]]
+filter = 'package(cgka-conformance-simulator) & (binary(app_runtime_journeys) | binary(app_runtime_interaction_journeys))'
+test-group = 'app-runtime-journeys'
 
 # These cross-process recovery cases each launch several runtimes and local
 # relays. Reserve the full nextest worker budget so CPU pressure cannot turn a

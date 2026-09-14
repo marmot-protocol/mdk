@@ -10,6 +10,8 @@
 //! item is re-exported here so the rest of the crate keeps reaching them at
 //! `crate::conversions::*`.
 
+mod product_analytics;
+pub use product_analytics::*;
 mod account;
 mod agent_stream;
 mod audit;
@@ -23,6 +25,7 @@ mod maintenance;
 mod media;
 mod message;
 mod notification;
+mod onboarding;
 mod push;
 mod relay;
 mod telemetry;
@@ -45,6 +48,7 @@ pub use maintenance::*;
 pub use media::*;
 pub use message::*;
 pub use notification::*;
+pub use onboarding::*;
 pub use push::*;
 pub use relay::*;
 pub use telemetry::*;
@@ -736,3 +740,9 @@ mod tests {
         );
     }
 }
+
+mod presentation;
+pub use presentation::*;
+
+mod chat_window;
+pub use chat_window::*;

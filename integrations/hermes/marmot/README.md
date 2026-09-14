@@ -24,6 +24,54 @@ model-callable `marmot_history` tool can fetch one exact message id or page olde
 messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
 lookup is best-effort and never drops the current inbound message if it fails.
 
+## Inbound durability boundary
+
+Every normalized `inbound_message` is committed to a private, schema-versioned
+SQLite WAL journal before the adapter reserves its id, places it in a debounce
+batch, or attempts per-group queue admission. The default journal is
+`$MARMOT_HOME/hermes/inbound-spool-v1.sqlite3`; `MARMOT_INBOUND_SPOOL_PATH`
+may select another private parent directory. The parent must be mode `0700` and
+the database, lock, WAL, and shared-memory files are kept mode `0600`.
+
+One process owns a spool through a non-blocking advisory lock and a persisted
+generation. On startup, an exclusive new owner reclaims prior-generation
+`claimed` rows in per-group FIFO order. Queue-capacity rejection leaves the row
+pending with bounded backoff rather than dropping it. Debounce-buffered rows
+are explicitly ineligible for live retry-loop claims until their batch is
+persisted; a new exclusive owner releases an abandoned buffer for FIFO replay.
+Debounce batches retain all source ids, the effective reply anchor, and explicit
+coalesced dispositions. Mention-policy and profile-onboarding decisions are
+terminal explicit skips.
+Pending rows are never evicted to satisfy a bound; an exhausted, corrupt,
+newer-schema, unsafe-permission, or unwritable spool fails connection/intake
+closed and preserves the existing state for operator recovery.
+
+Hermes does not yet expose a typed durable turn-start or finality callback. The
+adapter therefore records `handed` immediately before calling the host and
+`unresolved` after even a normal return: Hermes may only have buffered the
+message or started background processing. If the process dies during that
+handoff, the next owner also marks the remaining `handed` obligation
+`unresolved`. These unknown outcomes are never automatically replayed into a
+possibly recovering Hermes turn. The schema reserves `completed` for a future
+proven finality boundary; the adapter does not currently produce it.
+
+Unknown outcomes share bounded terminal retention with intentional skips and
+exhausted retries: by default, journal admission prunes entries older than
+seven days and retains at most 8192 terminal entries. This is an operational
+recovery window, not a permanent completion ledger. Pending prompts are never
+evicted by that retention policy. Pre-handoff dispatch failures use their own
+bounded retry budget, separate from capacity and shutdown deferrals, and then
+move to `failed`, allowing later same-group work to proceed. Failed disposition
+writes remain fenced from dispatch until the spool retry loop confirms their
+durable state. Existing version-1 spools migrate in place while preserving
+obligations. Shutdown fences admission, cancels and joins debounce producers, and
+then drains the keyed queue before closing the spool. This slice closes the
+queue/debounce crash windows without
+claiming exactly-once external tool effects, complete session lineage, or
+general delivery idempotency. `InboundSpool.snapshot()` provides aggregate state
+counts for direct spool inspection; it is not wired into the readiness probe.
+Payloads and identifiers are never logged.
+
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
 id or the latest inbound message and accept arbitrary non-blank, control-free
@@ -31,20 +79,67 @@ reaction content of at most 64 Unicode scalar values. Adds are idempotent;
 removal can target exact content or clear all active own reactions atomically;
 processing-status reaction policy remains a separate host concern.
 
+The model-callable `marmot_status` tool exposes the plugin's passive readiness
+probe on a supported Hermes operator surface. It reports staged booleans for
+plugin discovery, enablement, configuration, `wn-agent` reachability,
+authentication, account selection, home-group resolution, and media capability.
+It never returns account or group identifiers. `state: ready` is the only fully
+ready result; `gateway_inactive` means no live Marmot adapter is available to
+probe in that Hermes process.
+
+Hermes's `PlatformEntry.is_connected` callback is a synchronous configuration
+and auto-enablement gate, so this plugin deliberately keeps that callback free
+of socket I/O: it means "configured", not "the companion service is live".
+Operational `BasePlatformAdapter.is_connected` remains false until `connect()`
+successfully reaches `wn-agent`; `marmot_status` is the authoritative staged
+health readback. A configured plugin with no companion service is therefore not
+reported as operationally connected.
+
+On current Hermes releases, non-secret values from
+`plugins.entries.marmot.settings` are merged into the effective platform config
+before validation, adapter construction, standalone delivery, and readiness
+checks. Legacy `platforms.marmot.extra` values take precedence when both forms
+are present; environment variables remain available for legacy cohorts and
+secret-bearing configuration.
+
 For live previews, the plugin retries `stream_begin` with one stable v2 request
 id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must
 not be logged or persisted.
 
-For a real Hermes install, install it by copying or symlinking this directory to:
+Install through Hermes's standard plugin flow from one reviewed MDK revision.
+Hermes 0.19.0 does not expose `plugins install --ref`, so the portable immutable
+path is to check out the exact commit first and install its plugin subdirectory
+from that local repository. Keep the full 40-character commit explicit; do not
+install a moving branch for production:
 
 ```sh
-~/.hermes/plugins/marmot
+set -eu
+MDK_PLUGIN_REF="${MDK_PLUGIN_REF:?set MDK_PLUGIN_REF to the reviewed 40-character commit}"
+case "$MDK_PLUGIN_REF" in
+  *[!0-9a-f]*|'') printf '%s\n' "MDK_PLUGIN_REF must be lowercase hexadecimal" >&2; exit 1 ;;
+esac
+test "${#MDK_PLUGIN_REF}" -eq 40
+MDK_PLUGIN_CHECKOUT="$(mktemp -d)"
+trap 'rm -rf "$MDK_PLUGIN_CHECKOUT"' EXIT HUP INT TERM
+git clone --filter=blob:none --no-checkout \
+  https://github.com/marmot-protocol/mdk.git "$MDK_PLUGIN_CHECKOUT"
+git -C "$MDK_PLUGIN_CHECKOUT" fetch --depth=1 origin "$MDK_PLUGIN_REF"
+git -C "$MDK_PLUGIN_CHECKOUT" checkout --detach "$MDK_PLUGIN_REF"
+test "$(git -C "$MDK_PLUGIN_CHECKOUT" rev-parse HEAD)" = "$MDK_PLUGIN_REF"
+hermes plugins install \
+  "file://$MDK_PLUGIN_CHECKOUT#integrations/hermes/marmot"
+hermes plugins enable marmot
 ```
 
-The current Hermes plugin loader expects platform plugins as directories directly
-under `~/.hermes/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and
-adapter implementation files.
+Hermes clones the detached exact-commit checkout and copies only this plugin
+subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
+workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
+installed plugin. Hermes versions that expose `plugins install --ref` may use it
+as a shorter equivalent. The release installer below consumes an archive built
+from these same files. A community-index entry should pin an immutable commit
+or release tag; until such an entry is published, use the exact-checkout source
+command above.
 
 ## Release Install (Hermes Already Installed)
 
@@ -54,10 +149,30 @@ pre-releases.
 
 Prerequisites:
 
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors. The former `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES`
+  setting is ignored; the connector now chunks live previews itself.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+
+### Hermes compatibility
+
+| Cohort | Immutable source | Required result |
+| --- | --- | --- |
+| Supported floor | Hermes Agent `0.19.0` (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) | Plugin install, discovery, explicit media methods, and standalone sender work. Hermes has no generic outbound-media capability contract, so the plugin does not claim one. |
+| Current candidate | `7166071fcaadb36df26f6d753dda97da6b5d699e` | Same compatibility surface as the floor, tested from source. |
+| Outbound-media API candidate | `672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc` from Hermes PR 36817 | The plugin feature-detects `MediaKind` and declares image, document, video, and voice routing through `MEDIA_KINDS`. |
+
+Inbound and outbound capabilities are reported separately by
+`adapter.media_capability_status()`. Inbound attachments use bounded local
+copies provided by `wn-agent`; outbound attachments are restaged and revalidated
+before publication. Operators may continue using the explicit `send_image`,
+`send_document`, `send_video`, and `send_voice` methods on every supported
+cohort. Generic Hermes media dispatch is advertised only when the host exports
+its candidate capability API.
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 
@@ -83,7 +198,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
 ```
@@ -100,7 +215,7 @@ repeated or given a comma-separated list to authorize multiple senders:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -116,7 +231,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -146,7 +261,7 @@ To accept Marmot messages from any sender (explicit opt-in):
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.21"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users
@@ -541,10 +656,11 @@ not a disk-streaming or low-memory-mobile transfer mode.
   the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
-- Status records are included in the stream transcript hash and chunk count.
+- `stream_finish` sends the acknowledged final text. The shared Rust publisher
+  owns chunking and transcript hashing, including status and progress records.
 
 Run the shim tests with:
 
 ```sh
-python3 -m unittest discover -s integrations/hermes/marmot/tests
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
 ```

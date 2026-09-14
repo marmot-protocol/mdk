@@ -6,8 +6,9 @@ use marmot_uniffi::conversions::{
     AppProtocolProfileFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandFailureReasonFfi,
     DisbandRequestFfi, EncryptedMediaVersionFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
     GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRosterFfi,
-    MemberRefFfi, SelfMembershipFfi,
+    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi,
+    GroupRecoveryStatusFfi, GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi,
+    SelfMembershipFfi,
 };
 // Group-creation option/image records live on the command module rather
 // than `conversions`, because they are inputs, not projections.
@@ -354,6 +355,35 @@ mod tests {
     use crate::memory::boxed;
     use marmot_uniffi::conversions::SendAcceptDispositionFfi;
 
+    #[test]
+    fn recovery_status_deep_free_preserves_all_fields() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let mirror: MarmotGroupRecoveryStatus = GroupRecoveryStatusFfi {
+            group_id_hex: "01".repeat(16),
+            automatic_recovery_failed: true,
+            pending_reinvites: 2,
+            failed_reinvites: 1,
+            rejoin_invitations: vec![GroupRejoinInvitationFfi {
+                welcome_id_hex: "02".repeat(32),
+                welcomer_account_id_hex: "03".repeat(32),
+                epoch: 4,
+                local_state_token: "04".repeat(32),
+            }],
+        }
+        .into();
+        assert!(mirror.automatic_recovery_failed);
+        assert_eq!((mirror.pending_reinvites, mirror.failed_reinvites), (2, 1));
+        assert_eq!(mirror.rejoin_invitations_len, 1);
+        assert_eq!(unsafe { (*mirror.rejoin_invitations).epoch }, 4);
+        unsafe {
+            marmot_group_recovery_status_free(boxed(mirror));
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
     fn record() -> AppGroupRecordFfi {
         AppGroupRecordFfi {
             group_id_hex: "01".repeat(16),
@@ -608,5 +638,27 @@ impl MarmotCreateGroupOptions {
             initial_image,
             disappearing_message_secs: self.disappearing_message_secs,
         })
+    }
+}
+
+c_mirror! {
+    /// Embedded replacement offer; show the authenticated inviter before confirmation.
+    MarmotGroupRejoinInvitation from GroupRejoinInvitationFfi {
+        str welcome_id_hex,
+        str welcomer_account_id_hex,
+        copy epoch: u64,
+        str local_state_token,
+    }
+}
+
+c_mirror! {
+    /// Durable advisory membership health and explicit rejoin offers.
+    MarmotGroupRecoveryStatus from GroupRecoveryStatusFfi,
+    free marmot_group_recovery_status_free {
+        str group_id_hex,
+        copy automatic_recovery_failed: bool,
+        copy pending_reinvites: u32,
+        copy failed_reinvites: u32,
+        vec rejoin_invitations/rejoin_invitations_len: MarmotGroupRejoinInvitation,
     }
 }

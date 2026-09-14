@@ -3180,9 +3180,25 @@ async fn canonical_vector_fixtures_match_generated_traces() {
         let fixture: VectorFixture =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture contents"))
                 .unwrap_or_else(|e| panic!("{fixture_name} parses: {e}"));
-        let observed_trace = run_vector_fixture_report(&fixture)
+        let report = run_vector_fixture_report(&fixture)
             .await
-            .expect("fixture scenario runs")
+            .expect("fixture scenario runs");
+        assert!(
+            report.step_log.iter().all(|step| !matches!(
+                step.status,
+                cgka_conformance_simulator::ScenarioStepStatus::Failed { .. }
+            )),
+            "fixture {fixture_name} failed before observation: {:#?}",
+            report
+                .step_log
+                .iter()
+                .filter(|step| matches!(
+                    step.status,
+                    cgka_conformance_simulator::ScenarioStepStatus::Failed { .. }
+                ))
+                .collect::<Vec<_>>()
+        );
+        let observed_trace = report
             .observed_trace
             .expect("successful fixture report has an observed trace");
         assert_vector_fixture_matches(fixture_name, &fixture, observed_trace);

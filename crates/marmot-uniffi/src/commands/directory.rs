@@ -28,13 +28,36 @@ impl Marmot {
         marmot_app::npub_for_account_id(&account_id_hex).ok()
     }
 
-    /// Normalize a public-key reference (npub or hex) to canonical hex.
-    /// `None` if it isn't a valid public key. Used to resolve a scanned or
-    /// deep-linked npub back to the account id the rest of the API expects.
+    /// Normalize a public-key reference (hex, `npub`, `nostr:npub`,
+    /// `nprofile`, `nostr:nprofile`, or a `marmot://profile/` link) to
+    /// canonical hex. `None` if it isn't a valid public identity
+    /// reference. nprofile relay hints are discarded. Duplicate type-0
+    /// TLV entries keep the first key. After wrapper normalization, the
+    /// nprofile fallback rejects encoded tokens longer than 1023 UTF-8
+    /// bytes; a valid 1023-byte token still decodes when wrapped. Used
+    /// to resolve a scanned or deep-linked mention back to the account
+    /// id the rest of the API expects.
     pub fn account_id_hex(&self, reference: String) -> Option<String> {
         normalize_member_ref_ffi(&reference)
             .ok()
             .map(|normalized| normalized.account_id_hex)
+    }
+
+    /// Deterministic cosmetic display name for a canonical hex account id.
+    ///
+    /// The seed is hashed as supplied UTF-8 text and is not normalized.
+    /// Decode a scanned reference with [`Self::account_id_hex`] first.
+    /// This does not start networking or mutate a profile.
+    pub fn default_profile_pseudonym(&self, account_id_hex: String) -> String {
+        marmot_app::default_profile_pseudonym(&account_id_hex)
+    }
+
+    /// Random cosmetic display name from the shared wordlists.
+    ///
+    /// This does not generate a signing key, create an account, or
+    /// promise uniqueness or anonymity.
+    pub fn random_profile_pseudonym(&self) -> String {
+        marmot_app::random_profile_pseudonym()
     }
 
     /// Parse plaintext message content into the same Markdown AST returned on
@@ -144,29 +167,35 @@ impl Marmot {
             .into())
     }
 
-    /// Search the searcher's web of trust, streaming matches as each radius
-    /// resolves.
+    /// Search public identities cached through any connected account, without
+    /// network or group-membership work. Follow flags refer only to the selected
+    /// searcher. Call off the UI thread; zero limit returns no rows.
+    pub fn search_cached_users(
+        &self,
+        account_id_hex: String,
+        query: String,
+        limit: u32,
+    ) -> Result<Vec<conversions::UserDirectorySearchResultFfi>, MarmotKitError> {
+        Ok(self
+            .app
+            .search_cached_users(&account_id_hex, &query, limit as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Stream cached public identities across accounts, then independent provider
+    /// and graph results. The radius window bounds known social distances;
+    /// cached/provider identities without a known distance remain discoverable.
+    /// Those identities can recur when paging radii: deduplicate by account id
+    /// across pages as well as within each subscription.
     ///
-    /// `radius_start`/`radius_end` are inclusive social distances: 0 is the
-    /// searcher, 1 their direct follows. Lower radii are still traversed to
-    /// reach the window, they just do not emit — which is what makes
-    /// `radius_start` usable for paging further out without re-delivering
-    /// results the host already has.
-    ///
-    /// Returns as soon as the traversal is spawned; drive
-    /// [`UserSearchSubscription::next_update`] in a loop until it yields
-    /// `None`. Dropping the subscription cancels the traversal, so a host that
-    /// abandons a search should release it rather than draining it.
-    ///
-    /// Radius 1 covers more than the follow list: people sharing a group with
-    /// the searcher are seeded into it, because sharing a group is social
-    /// proximity even when neither has followed the other. That membership is
-    /// gathered here, where both the app and the runtime are in scope, rather
-    /// than inside the search — hosts pass nothing extra for it.
-    ///
-    /// People found this way are deliberately *not* added to the local
-    /// directory: a search result is not a relationship. `user_profile` keeps
-    /// answering only for accounts the user has actually interacted with.
+    /// Returns without waiting for group membership. Consume until completion,
+    /// inserting `new_results` and replacing `updated_results` by account id.
+    /// Release the subscription on query/account changes to cancel its work.
+    /// Direct-follow labels use `is_followed_by_searcher`, not radius 1 (which
+    /// also includes group co-members). Search never promotes strangers into
+    /// the directory's live subscription set.
     pub async fn search_users(
         &self,
         account_id_hex: String,
@@ -174,22 +203,14 @@ impl Marmot {
         radius_start: u8,
         radius_end: u8,
     ) -> Result<Arc<UserSearchSubscription>, MarmotKitError> {
-        // Seeds are radius 1 by definition, so a window that stops at radius 0
-        // cannot use them -- and gathering them costs a membership read per
-        // group. Ask only when the answer can matter.
-        let radius_one_seeds = if radius_end >= 1 {
-            self.runtime.group_co_members(&account_id_hex).await?
-        } else {
-            Vec::new()
-        };
         let inner = self
-            .app
+            .runtime
             .search_users(UserSearchParams {
                 searcher_account_id_hex: account_id_hex,
                 query,
                 radius_start,
                 radius_end,
-                radius_one_seeds,
+                radius_one_seeds: Vec::new(),
             })
             .await?;
         Ok(UserSearchSubscription::new(inner))
@@ -207,6 +228,11 @@ mod tests {
     use crate::conversions::{
         MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserSearchUpdateFfi,
     };
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
+    ));
 
     async fn wait_for_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -481,6 +507,13 @@ mod tests {
         .await
         .expect("publish profile");
 
+        let cached = kit
+            .search_cached_users(account_id_hex.clone(), "needle".into(), 20)
+            .unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].account_id_hex, account_id_hex);
+        assert!(!cached[0].is_followed_by_searcher);
+
         let subscription = kit
             .search_users(account_id_hex.clone(), "needle".to_owned(), 0, 0)
             .await
@@ -507,5 +540,46 @@ mod tests {
             SearchUpdateTriggerFfi::SearchCompleted
         ));
         assert!(subscription.next_update().await.is_none());
+    }
+
+    #[test]
+    fn account_id_hex_and_pseudonyms_are_offline_and_match_app_helpers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        for case in cases() {
+            assert_eq!(
+                kit.account_id_hex(case.reference.clone()).as_deref(),
+                case.ffi_account_id_hex,
+                "case {}",
+                case.name
+            );
+        }
+
+        assert_eq!(
+            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+            marmot_app::default_profile_pseudonym(ACCOUNT_ID)
+        );
+        assert_eq!(
+            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+            "Loyal Crane"
+        );
+        let random = kit.random_profile_pseudonym();
+        let (adjective, noun) = random.split_once(' ').expect("adjective noun");
+        assert!(!noun.contains(' '));
+        assert!(
+            adjective
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        );
+        assert!(
+            noun.chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        );
+        assert!(adjective.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
+        assert!(noun.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
     }
 }

@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-04
+updated: 2026-09-10
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -25,7 +25,7 @@ runtime. It complements the policy docs:
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay metrics may carry only `relay`; account sync/catch-up failure counters carry only the closed `failure_stage` and `error_class` attributes. Other app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Agent connector reconciliation telemetry | Always collected while `wn-agent` runs: process-local cumulative counters for the shared inbound catch-up driver and the invite-policy worker (passes, outcomes, accounts/candidate rows considered), plus one privacy-safe `tracing` event per scheduled pass carrying a `source` label, duration, result, and aggregate counts (mdk#1380). | No. Counters are process-local; tracing events follow the no-ids/no-urls/no-content rules. | [`reconcile_telemetry.rs`](../../crates/agent-connector/src/reconcile_telemetry.rs), [`event_projection.rs`](../../crates/agent-connector/src/event_projection.rs), [`invite_policy.rs`](../../crates/agent-connector/src/invite_policy.rs) |
 | Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
-| Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
+| Product analytics | Stock Aptabase via the opt-in usage and diagnostics collector; approved finite observations and memory-only queues. No crash SDK is added. | Yes, with the product export feature, configuration, and combined consent. | [Usage and diagnostics](usage-diagnostics.md) |
 
 ## Source map
 
@@ -232,10 +232,18 @@ Collected operations:
 | `account_setup_local_ready_handoff` | Complete generated-account caller latency through local worker readiness. | The host may render local state but must not claim invite readiness. |
 | `account_setup_network_ready` | Background work from local-ready scheduling through bootstrap and KeyPackage confirmation plus journal completion. | Success is the invite-receivable boundary. |
 | `outbound_message_send` | Worker `SendMessage` and `SendAppEvent` commands until their send call returns a `SendSummary` or error. | One-sided local send/publish confirmation only. It is not end-to-end remote delivery or read latency. |
-| `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension; includes either cache-only reuse or create-time relay resolution below. |
-| `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Aggregate duration only. No member count label, account/relay identity, reservation, or package consumption. |
-| `group_create_key_package_cache_reuse` | Successful create-time lookup when every canonical member was satisfied by revalidated local/directory state. | Closed operation name, not a caller-supplied label. A prewarm should shift the later Create wait into this bucket. |
-| `group_create_key_package_network_resolution` | Successful create-time lookup that required relay-list or KeyPackage network work for at least one canonical member. | Closed operation name, not a member-count or relay label. |
+| `outbound_message_queue_wait` | Send API entry until the worker starts `SendMessage` / `SendAppEvent`. | Includes worker lookup, channel admission, and FIFO wait. Only commands actually started contribute samples. |
+| `outbound_message_local_projection` | Same API origin until the first persisted local projection is about to be broadcast. | One sample per command with a local projection. This is optimistic state, not durable outbox acceptance or host rendering. |
+| `outbound_message_local_accept` | Sum of session send/queue preparation and application fanout journal preparation, ending at durable fanout writes before relay I/O. | Local work only, including sibling app-message preparation in the same effects batch; not elapsed time from the UI action. Journal preparation also belongs to the wider `outbound_message_publish` envelope. Recorded when the account returns effects, including unknown publication outcomes; no sample if that call errors or the process exits first. |
+| `outbound_message_publish` | Account publication and reconciliation of the send's effects batch. | Includes transport journal preparation, possible sibling publications, retries and acknowledgement processing. Success requires publication evidence for this exact app event; accepted-pending and completion-unknown count as unsuccessful publication, even when the command succeeds. Not a raw relay-OK timestamp or recipient delivery. |
+| `outbound_message_response` | Send API entry until the caller consumes the worker result. | Includes queue wait and post-publication work. A cancelled caller contributes no completed-response sample; accepted work may still finish. Admission errors before enqueue are excluded. |
+| `inbound_delivery_projection` | Worker claims a live relay delivery through ingestion, incidental publication, and projection broadcast. | Includes non-chat deliveries that reach ingestion and failures. Excludes known receipts skipped before ingestion, transport queue residence, startup/catch-up batches, and host rendering. |
+| `host_outbound_message_visible` | Host measures user send action through first rendered local bubble. | Report `OutboundMessageVisible` through the existing host-performance API; never infer it from SDK completion. |
+| `host_inbound_message_visible` | Host receives a message update through its first rendered frame. | Report `InboundMessageVisible`. This measures host rendering delay, not sender-to-recipient latency. |
+| `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension, including failures and empty rosters. Every non-empty roster fetches KeyPackages from relays. |
+| `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Every call fetches KeyPackages; bounded discovery routes may be reused. Aggregate duration only, with no member count label, identity, reservation, or package consumption. |
+| `group_create_key_package_cache_reuse` | Retired operation; retained in the snapshot/export schema for compatibility. | Create no longer emits samples, including for empty rosters. A prewarm only reuses discovery routes; final KeyPackages still come from relays. |
+| `group_create_key_package_network_resolution` | Successful create-time lookup for a non-empty roster; every member requires a relay KeyPackage fetch. | Closed operation name, not a member-count or relay label. |
 | `group_create_queue_wait` | Time from enqueueing `CreateGroup` until the account worker begins it. | Separates worker contention from create work. |
 | `group_create_image_preprocess` | Prepared founding-image validation, dimension inspection, encryption, and SQLCipher staging. | Contains no network time. Rejections occur before encryption and upload. |
 | `group_create_image_upload` | Optional initial image selection/upload. | Recorded only when an initial image was supplied. |
@@ -248,7 +256,7 @@ Collected operations:
 | `group_create_post_mutation_catch_up` | Detached account catch-up scheduled after the create command response. | Also contributes to aggregate account catch-up telemetry. |
 | `group_create_total_caller_latency` | Public runtime create entry through the row-bearing worker response. | Includes queue wait, lookup, canonical MLS persistence, derived-index preparation, app projection persistence, and response handoff; excludes Welcome fanout and detached catch-up. |
 | `group_invite_members` | `AccountManager::invite_members()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Measures the public runtime invite envelope after any UniFFI admin preflight. |
-| `group_invite_key_package_lookup` | Invite path KeyPackage resolution for every requested member before routing refresh. | Captures local cached lookups plus relay directory fetches used to obtain invitee KeyPackages. |
+| `group_invite_key_package_lookup` | Invite path KeyPackage resolution for every requested member before routing refresh. | Captures fresh relay KeyPackage resolution, including discovery work when bounded route metadata cannot be reused. |
 | `group_invite_routing_refresh` | Invite path `AppClient::refresh_routing()` after KeyPackage lookup and before pre-send runtime sync. | Captures local route/projection refresh work that affects publish targets. |
 | `group_invite_pre_send_sync` | Invite path `AppClient::sync_runtime_groups()` immediately before engine send. | Separates pre-send relay/runtime sync from MLS commit and publish. |
 | `group_invite_engine_publish` | Invite path `AccountDeviceRuntime::send_with_audit_context()` plus publish-failure check. | Covers MLS Add/Commit staging, commit publish, local publish confirmation, and Welcome publish. |
@@ -276,8 +284,22 @@ latencies do not immediately fall into overflow:
 
 These app-performance samples deliberately do not include account labels, account ids, group ids, member refs, message
 ids, relay URLs, media URLs, payload sizes, content types, upload endpoints, download endpoints, or error strings.
-Host applications can only select the closed `HostPerformanceOperation` enum; callers cannot supply metric names,
-label names, or label values. Adding a new cross-platform operation requires an MDK API change and review.
+Message journey checks run with `just test-message-journeys` and also participate in the ordinary workspace test matrix.
+The subprocess checks exit without destructors after optimistic projection, durable fanout preparation, relay acceptance
+before its acknowledgement returns, and final projection before the send response. Reopening must preserve one timeline
+row and retry the exact transport event where acceptance was durable. A projection-only interruption has no accepted
+outbox entry: its row remains unconfirmed and is not automatically published. This gate prevents false success; it does
+not claim that orphaned optimistic rows already have automatic recovery. Additional checks cover caller cancellation,
+queue wait behind a stalled relay, unknown-outcome reconnect retries, and authoritative timeline refresh after overflow.
+
+These are correctness gates, not device benchmarks. Compare histogram distributions on representative devices; do not
+sum phase percentiles or treat SDK projection and host render timings as a single end-to-end sample. Counters and
+histograms are process-local, with no per-message correlation identifiers or persisted timing journal.
+
+OTLP host milestones use the closed `HostPerformanceOperation` enum without caller-supplied metric names or labels.
+For app-specific measurements such as inbox layout, image decoding, or navigation, use `record_host_timing` with a
+registered product event name. This consent-gated path sends duration buckets and outcomes to Aptabase; it does not
+add OTLP series or local app-performance snapshot fields. See the [registration example](usage-diagnostics.md#custom-host-timings).
 
 The `app_account_sync_failures` and `app_account_catch_up_failures` counters are the only app-performance metrics with
 metric attributes. Every failed attempt emits exactly one point in a bounded classification bucket:
@@ -392,13 +414,29 @@ be resolved. The gate requires all the following:
 
 - `enabled == true`;
 - an endpoint is configured;
-- the endpoint is `https`, or `http` to a loopback host (`localhost`, `127.0.0.1`, or `::1`) for local testing;
+- the endpoint has a host and a usable port, no embedded credentials or fragment, and uses `https`, or `http` to
+  exact `localhost` or a loopback IP literal for local testing;
 - `authorization_bearer_token` is present and non-empty;
 - `resource` is present and has all required attributes.
 
 If export is enabled but the URL/auth/resource gate is incomplete, construction fails closed and logs a warning without
 resolving relay identities or pushing metrics. If `marmot-app` is built without `otlp-export`, runtime configuration
 logs a warning when export is requested, but no exporter task is started.
+
+Before each OTLP request attempt (including retries), the exporter resolves the configured hostname once, validates
+**every** address with the shared host-safety classifier, and pins reqwest to those addresses. Mixed public/unsafe
+answers and empty/failed DNS results fail closed. Literal IPs use the same classifier without DNS. The explicit
+loopback-test endpoints must resolve exclusively to loopback, so even a misresolved HTTP `localhost` cannot send
+plaintext bearer auth off-device. Normal HTTPS names resolving to loopback are rejected. TLS certificate verification
+and SNI stay tied to the original URL; local HTTPS does not bypass verification.
+
+The exporter disables automatic redirects and system proxies, keeps the configured path/query, and attaches bearer
+auth only after the destination is validated and pinned. A 3xx response returns a numeric non-success status without
+contacting its target. Connect and overall attempt limits remain 10s and 30s; DNS has its own 10s bound inside the
+30s attempt. No DNS lease or connection pool survives to a retry. Validation, DNS, and transport failures map to the
+existing privacy-safe `RelayExportError::Request`; error display/debug contains no endpoint, address, token, or body.
+See [Dial Safety](./overview/dial-safety.md). This change does not alter collection, labels, consent, batching, retry
+scheduling, or the no-disk-queue contract, and does not add private-network collector support.
 
 Runtime behavior:
 
@@ -734,4 +772,4 @@ cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 ```
 
 The repo-level `just check` and `just test` recipes include the `otlp-export` feature set through the shared
-`otlp-features` variable.
+`diagnostics-features` variable.

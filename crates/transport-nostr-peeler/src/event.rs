@@ -8,7 +8,7 @@ use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Nostr event shape consumed and produced at the peeler boundary.
 ///

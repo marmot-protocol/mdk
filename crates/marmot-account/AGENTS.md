@@ -54,6 +54,12 @@ relay auth, or transport-specific relay discovery.
   is a terminal verdict (`local_member_removed` is the live one), and re-arming it would send a `SelfUpdate` into a group
   the device has left, once per tick, uncounted by `MaintenanceRunSummary.failures`. `Complete` is deliberately not
   guarded — a withdrawn commit un-completing the obligation it satisfied is the PCS re-arm this layer owes.
+- The same two reconcilers also hand a withdrawn own commit's intent back to the engine
+  (`reissue_superseded_own_commit` on the event path, `reissue_superseded_own_commits_from_state` in
+  `run_due_maintenance`) and return the engine's `SupersededIntentReport`s in `AccountDeviceEffects::superseded_intents`.
+  Every seam that produces effects must carry them through (`extend`/`absorb`); `marmot-app` turns each report into one
+  `MarmotAppEvent::GroupChangeSuperseded`, so a report dropped here is a saved change the user is never told was lost
+  (mdk#1734).
 - Roll back pending work when publication fails before any external exposure is possible. Once publication intent is durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication instead.
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.
 

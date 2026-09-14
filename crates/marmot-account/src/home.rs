@@ -122,6 +122,8 @@ pub enum AccountSetupKind {
     GeneratedIdentity,
     PublicIdentity,
     ExternalSigner,
+    /// Host-driven setup must remain gated until its app checkpoint completes.
+    InteractiveIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -411,6 +413,24 @@ impl AccountHome {
         &self,
         secret_key: &str,
     ) -> AccountHomeResult<NostrAccountImport> {
+        self.import_nostr_account_with_setup_kind(secret_key, AccountSetupKind::ImportedIdentity)
+    }
+
+    /// Persist the interactive setup provenance before making a new identity
+    /// visible. A crash before the app writes its detailed checkpoint remains
+    /// distinguishable from a completed or legacy account.
+    pub fn import_nostr_account_for_onboarding(
+        &self,
+        secret_key: &str,
+    ) -> AccountHomeResult<NostrAccountImport> {
+        self.import_nostr_account_with_setup_kind(secret_key, AccountSetupKind::InteractiveIdentity)
+    }
+
+    fn import_nostr_account_with_setup_kind(
+        &self,
+        secret_key: &str,
+        kind: AccountSetupKind,
+    ) -> AccountHomeResult<NostrAccountImport> {
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
         let account_id_hex = keys.public_key().to_hex();
@@ -445,9 +465,7 @@ impl AccountHome {
             signed_out: false,
         };
         if let Some(setup) = self.raw_account_setup_state(&account.label)? {
-            if setup.account_id_hex != account.account_id_hex
-                || setup.kind != AccountSetupKind::ImportedIdentity
-            {
+            if setup.account_id_hex != account.account_id_hex || setup.kind != kind {
                 return Err(AccountHomeError::AccountExists(account.label));
             }
             match self.secret_store.load_secret(&account) {
@@ -481,7 +499,7 @@ impl AccountHome {
         let setup = AccountSetupState {
             account_id_hex: account.account_id_hex.clone(),
             reused_account_id_credential,
-            kind: AccountSetupKind::ImportedIdentity,
+            kind,
             phase: AccountSetupPhase::LocalStateCreated,
         };
         self.write_account_setup_state(&account.label, &setup)?;
@@ -623,6 +641,119 @@ impl AccountHome {
         }
     }
 
+    /// App-owned onboarding checkpoint. Unlike setup context, this survives
+    /// setup completion so a host can distinguish checked from legacy accounts.
+    /// Bytes are private and atomically replaced; this layer assigns no meaning
+    /// to their schema or to the onboarding policy.
+    pub fn set_account_onboarding(&self, account_ref: &str, bytes: &[u8]) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        write_secret_bytes(
+            self.account_dir(&account.label).join("onboarding.json"),
+            bytes,
+        )
+    }
+
+    pub fn account_onboarding(&self, account_ref: &str) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(self.account_dir(&account.label).join("onboarding.json")) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Retain the last cancelled checkpoint while removing its active gate.
+    /// The caller must first durably sign out and retain any setup journal.
+    /// A later cancellation replaces this evidence even if publication is uncertain.
+    pub fn archive_account_onboarding(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.signed_out {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let directory = self.account_dir(&account.label);
+        match fs::rename(
+            directory.join("onboarding.json"),
+            directory.join("onboarding-cancelled.json"),
+        ) {
+            Ok(()) => {
+                fs::File::open(directory)?.sync_all()?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Private opaque recovery journal. The app owns its schema and retains the
+    /// interrupted checkpoints here before clearing their active gates.
+    pub fn set_account_onboarding_recovery(
+        &self,
+        account_ref: &str,
+        bytes: &[u8],
+    ) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        write_secret_bytes(
+            self.account_dir(&account.label)
+                .join("onboarding-recovery.json"),
+            bytes,
+        )
+    }
+
+    pub fn account_onboarding_recovery(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(
+            self.account_dir(&account.label)
+                .join("onboarding-recovery.json"),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace old gates with an app-supplied recovery tombstone. Write the
+    /// active gate before atomically renaming it over the cancelled gate, so
+    /// older readers always encounter a checkpoint they must validate.
+    pub fn finish_recovered_account_onboarding(
+        &self,
+        account_ref: &str,
+        tombstone: &[u8],
+    ) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.signed_out || self.account_onboarding_recovery(&account.label)?.is_none() {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let directory = self.account_dir(&account.label);
+        write_secret_bytes(directory.join("onboarding.json"), tombstone)?;
+        fs::rename(
+            directory.join("onboarding.json"),
+            directory.join("onboarding-cancelled.json"),
+        )?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Read the retained cancellation record for an explicit onboarding restart.
+    pub fn cancelled_account_onboarding(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(
+            self.account_dir(&account.label)
+                .join("onboarding-cancelled.json"),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Remove an explicitly-authorized legacy incomplete setup while retaining
     /// the matching account-id-keyed credential for the immediate retry.
     pub fn reset_incomplete_setup_preserving_credential(
@@ -731,8 +862,31 @@ impl AccountHome {
     }
 
     pub fn accounts(&self) -> AccountHomeResult<Vec<AccountSummary>> {
+        self.read_accounts(false)
+    }
+
+    /// List the complete account catalog or report a read error. Unlike `accounts`,
+    /// this never hides an account whose record cannot be read or decoded.
+    /// Metadata-probe errors also propagate: an inaccessible directory is not an
+    /// empty catalog. This holds the shared mutation lock across enumeration to
+    /// serialize with guarded mutations through this `AccountHome`.
+    /// The legacy `accounts` method retains its unlocked, best-effort behavior.
+    pub fn accounts_strict(&self) -> AccountHomeResult<Vec<AccountSummary>> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.read_accounts(true)
+    }
+
+    fn read_accounts(&self, strict: bool) -> AccountHomeResult<Vec<AccountSummary>> {
         let dir = self.accounts_dir();
-        if !dir.exists() {
+        let exists = if strict {
+            dir.try_exists()?
+        } else {
+            dir.exists()
+        };
+        if !exists {
             return Ok(Vec::new());
         }
 
@@ -740,9 +894,15 @@ impl AccountHome {
         let mut skipped_unreadable_records = 0usize;
         for entry in fs::read_dir(dir)? {
             let path = entry?.path().join(ACCOUNT_RECORD_FILE);
-            if path.exists() {
+            let exists = if strict {
+                path.try_exists()?
+            } else {
+                path.exists()
+            };
+            if exists {
                 match read_json(path) {
                     Ok(account) => accounts.push(account),
+                    Err(error) if strict => return Err(error),
                     Err(_) => skipped_unreadable_records += 1,
                 }
             }

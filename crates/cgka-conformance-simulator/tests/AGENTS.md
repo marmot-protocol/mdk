@@ -7,6 +7,28 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 ## Files
 
+- **File:** `support/offline_catchup.rs`
+  - **Owns:** Compact reconstruction of the exact checkpoint 368/1,024-message inputs. Pinned SHA-256 values
+    cover serialized metadata, actions and expected outcomes; compare against checkpoint `9282a643` before
+    intentionally changing these workloads. Shared by engine regressions and public app journeys.
+
+- **File:** `public_app_families.rs`
+  - **Owns:** Seeded public send/leave, membership re-entry, admin handoff and small offline recovery family contracts,
+    capability preflight, interaction coverage, and explicit real-socket strict oracle canaries.
+
+- **File:** `app_runtime_journeys.rs`
+  - **Owns:** Basic public app acceptance journeys and the explicit slow 1,024-message public catch-up gates,
+    including the extra-epoch released-object replay regression (#1721),
+    also selected by the dedicated required public recovery CI job with production policy.
+    Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
+    persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
+
+- **File:** `app_runtime_interaction_journeys.rs`
+  - **Owns:** Public app interaction journeys that the serialized generated families do not reach: two groups on
+    one device with a removal and reopen, two admins editing different profile fields at the same instant, a
+    concurrent invite plus rename, a member removed while its device is closed, a voluntary leave with three
+    remaining auto-committers, and the explicit slow manual self-update. Same harness and evidence layout as `app_runtime_journeys.rs`; see `../APP_PATH_COVERAGE.md`.
+
 - **File:** `agent_text_stream_vectors.rs`
   - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
     encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the

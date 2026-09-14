@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
@@ -12,10 +12,12 @@ use cgka_session::{
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
+    SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
     GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
@@ -65,6 +67,64 @@ const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// Keep this aligned with the adapter's fixed reconnect interval so restoring
 /// connectivity does not leave a user send behind the ambiguity backoff.
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
+
+/// Local scheduling windows for own-leaf maintenance rotations.
+///
+/// These are anti-contention and catch-up delays, not protocol policy. A
+/// rotation waits until the group has been free of valid state-bearing input
+/// for `quiet`, then a sampled delay of up to `contention_jitter_max` spreads
+/// simultaneous rotations apart so freshly joined devices do not all commit in
+/// the same second. Production always runs the defaults. Test harnesses that
+/// drive [`AccountDeviceRuntime::run_due_maintenance`] explicitly may shorten
+/// them through [`AccountDeviceRuntime::with_maintenance_timing`]. Periodic
+/// rotation scheduling, its 24 to 36 day cadence and 15 minute jitter, is not
+/// covered by this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceTiming {
+    /// Minimum time a group must stay free of valid commits and proposals
+    /// before an obligation may rotate.
+    pub quiet: Duration,
+    /// Upper bound of the sampled post-quiet delay for post-join and manual
+    /// rotations. Persisted deadlines have whole-second granularity.
+    pub contention_jitter_max: Duration,
+    /// How long a post-join obligation waits for the retained-history
+    /// subscription's end-of-stored-events marker before giving up on it.
+    pub eose_timeout: Duration,
+    /// Grace after end-of-stored-events, or its timeout, before the quiet
+    /// window starts.
+    pub post_eose_grace: Duration,
+}
+
+impl MaintenanceTiming {
+    /// Every window zero: a manual or post-join rotation publishes within a
+    /// few consecutive maintenance sweeps. For harnesses that call
+    /// `run_due_maintenance` directly, never for production runtimes.
+    pub const fn immediate() -> Self {
+        Self {
+            quiet: Duration::ZERO,
+            contention_jitter_max: Duration::ZERO,
+            eose_timeout: Duration::ZERO,
+            post_eose_grace: Duration::ZERO,
+        }
+    }
+
+    fn contention_jitter_max_ms(self) -> u64 {
+        u64::try_from(self.contention_jitter_max.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Default for MaintenanceTiming {
+    fn default() -> Self {
+        Self {
+            quiet: Duration::from_secs(MAINTENANCE_QUIET_SECS),
+            contention_jitter_max: Duration::from_millis(
+                cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
+            ),
+            eose_timeout: Duration::from_secs(MAINTENANCE_EOSE_TIMEOUT_SECS),
+            post_eose_grace: Duration::from_secs(MAINTENANCE_POST_EOSE_GRACE_SECS),
+        }
+    }
+}
 
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. Completion order therefore cannot reorder reports or select a
@@ -262,6 +322,59 @@ impl PreparedSessionCommit {
     }
 }
 
+/// Neutral deltas since the last drain. Durable state loads are never transitions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceActivity {
+    /// Bounded neutral execution samples; counters remain complete on overflow.
+    pub attempt_durations: Vec<MaintenanceAttemptDuration>,
+    pub retired_key_packages: u64,
+    pub self_update_attempts: u64,
+    pub key_package_attempts: u64,
+    pub key_package_failed_attempts: u64,
+    pub failed_attempts: u64,
+    pub completed_transitions: u64,
+    pub deferred_transitions: u64,
+    pub failed_transitions: u64,
+}
+/// One actual scheduler execution, without any account or obligation identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceAttemptDuration {
+    pub key_package: bool,
+    pub failed: bool,
+    pub duration: std::time::Duration,
+}
+impl MaintenanceActivity {
+    /// Merge neutral execution deltas without wrapping counters.
+    pub fn absorb(&mut self, previous: Self) {
+        let remaining = 256usize.saturating_sub(self.attempt_durations.len());
+        self.attempt_durations
+            .extend(previous.attempt_durations.into_iter().take(remaining));
+        self.retired_key_packages = self
+            .retired_key_packages
+            .saturating_add(previous.retired_key_packages);
+        self.self_update_attempts = self
+            .self_update_attempts
+            .saturating_add(previous.self_update_attempts);
+        self.key_package_attempts = self
+            .key_package_attempts
+            .saturating_add(previous.key_package_attempts);
+        self.key_package_failed_attempts = self
+            .key_package_failed_attempts
+            .saturating_add(previous.key_package_failed_attempts);
+        self.failed_attempts = self
+            .failed_attempts
+            .saturating_add(previous.failed_attempts);
+        self.completed_transitions = self
+            .completed_transitions
+            .saturating_add(previous.completed_transitions);
+        self.deferred_transitions = self
+            .deferred_transitions
+            .saturating_add(previous.deferred_transitions);
+        self.failed_transitions = self
+            .failed_transitions
+            .saturating_add(previous.failed_transitions);
+    }
+}
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -270,7 +383,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     wall_clock: Arc<dyn WallClock>,
     monotonic_clock: Arc<dyn MonotonicClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
+    maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
+    maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Exact Welcome events whose relay-only publish phase currently runs
     /// outside the serialized account owner. Other maintenance/manual retry
@@ -298,7 +413,9 @@ where
             wall_clock: Arc::new(SystemWallClock),
             monotonic_clock: Arc::new(SystemMonotonicClock::default()),
             maintenance_random: Arc::new(OsMaintenanceRandom),
+            maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
+            maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
@@ -325,12 +442,28 @@ where
         self
     }
 
+    /// Replace the maintenance scheduling windows. Production runtimes keep
+    /// [`MaintenanceTiming::default`]; this exists for test harnesses only.
+    pub fn with_maintenance_timing(mut self, timing: MaintenanceTiming) -> Self {
+        self.maintenance_timing = timing;
+        self
+    }
+
+    pub fn maintenance_timing(&self) -> MaintenanceTiming {
+        self.maintenance_timing
+    }
+
     pub fn session(&self) -> &AccountDeviceSession {
         &self.session
     }
 
     pub fn session_mut(&mut self) -> &mut AccountDeviceSession {
         &mut self.session
+    }
+
+    /// Abandon a group locally without sending a leave or disband.
+    pub fn forget_group_local(&mut self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.forget_group_local(group_id)?)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
@@ -373,6 +506,11 @@ where
     /// Backs the application's per-group recovery surface (mdk#426).
     pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
         self.session.quarantined_groups()
+    }
+
+    /// Number of currently quarantined groups without cloning their identities.
+    pub fn quarantined_group_count(&self) -> usize {
+        self.session.quarantined_group_count()
     }
 
     /// Re-attempt hydration of a single quarantined group. `Ok(true)` if it
@@ -664,6 +802,7 @@ where
                     publication_targets: Vec::new(),
                     refresh_at: None,
                     upgrade_rotation_recorded: false,
+                    generation_revision: 0,
                     last_consumed_key_package_ref: None,
                     last_consumed_at: None,
                     retained_private_material: Vec::new(),
@@ -678,10 +817,22 @@ where
             .into());
         }
 
-        if lifecycle.pending_replacement.is_none() {
+        if lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_none_or(|pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
+        {
             let created_at = Timestamp(
                 lifecycle
                     .authored_event_created_at
+                    .into_iter()
+                    .chain(
+                        lifecycle
+                            .pending_replacement
+                            .as_ref()
+                            .map(|pending| pending.authored_created_at),
+                    )
+                    .max()
                     .map(|previous| previous.0.saturating_add(1))
                     .unwrap_or(now.0)
                     .max(now.0),
@@ -885,6 +1036,7 @@ where
             cgka_traits::MaintenancePhase::Fanout
         };
         lifecycle.upgrade_rotation_recorded = true;
+        lifecycle.generation_revision = replacement.generation_revision;
         lifecycle.last_consumed_key_package_ref = None;
         lifecycle.last_consumed_at = None;
         let retired = if previous_was_consumed {
@@ -907,13 +1059,32 @@ where
         Ok(self.session.durably_owned_key_packages()?)
     }
 
+    /// Whether account activation owes a generator-policy upgrade. A pending
+    /// replacement owns the work until ACK; its revision prevents regenerating
+    /// on every retry while the acknowledged current revision is still old.
+    pub fn key_package_generation_upgrade_due(&self) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .key_package_lifecycle()?
+            .is_some_and(|lifecycle| {
+                lifecycle.pending_replacement.as_ref().map_or_else(
+                    || {
+                        lifecycle.current_key_package.is_some()
+                            && lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                    },
+                    |pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION,
+                )
+            }))
+    }
+
     pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
         let now = self.wall_clock.now();
         Ok(match self.session.key_package_lifecycle()? {
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
-                    pending.signed_event.is_none()
+                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                        || pending.signed_event.is_none()
                         || pending
                             .targets
                             .iter()
@@ -925,6 +1096,7 @@ where
                             == lifecycle.current_key_package_ref
                         || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
                         || !lifecycle.upgrade_rotation_recorded
+                        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
                 }
             },
         })
@@ -935,7 +1107,8 @@ where
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
-                lifecycle.authored_signed_event.is_some()
+                lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                    && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
                         matches!(
                             target.state,
@@ -1028,7 +1201,8 @@ where
                     && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
                     && (lifecycle.current_key_package.is_none()
                         || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
-                        || !lifecycle.upgrade_rotation_recorded)
+                        || !lifecycle.upgrade_rotation_recorded
+                        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
             }
         })
     }
@@ -1086,6 +1260,12 @@ where
         if deleted > 0 {
             self.session
                 .promote_key_package_lifecycle(&retired, &lifecycle)?;
+            let mut activity = self
+                .maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            activity.retired_key_packages =
+                activity.retired_key_packages.saturating_add(deleted as u64);
         }
         Ok(deleted)
     }
@@ -1181,16 +1361,15 @@ where
             grace_until: None,
             quiet_since: Some(now),
             own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
-            sampled_jitter_ms: self.maintenance_random.sample_inclusive(
-                0,
-                cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
-            ),
+            sampled_jitter_ms: self
+                .maintenance_random
+                .sample_inclusive(0, self.maintenance_timing.contention_jitter_max_ms()),
             not_before: None,
             attempt_count: 0,
             semantic_rearm_count: 0,
             last_failure_code: None,
         };
-        self.session.put_maintenance_obligation(&obligation)?;
+        self.persist_maintenance_obligation(&obligation)?;
         self.maintenance_quiet_monotonic
             .insert(id.clone(), self.monotonic_clock.elapsed());
         Ok(id)
@@ -1206,9 +1385,10 @@ where
                 && obligation.eose_deadline_at.is_none()
             {
                 obligation.eose_deadline_at = Some(Timestamp(
-                    now.0.saturating_add(MAINTENANCE_EOSE_TIMEOUT_SECS),
+                    now.0
+                        .saturating_add(self.maintenance_timing.eose_timeout.as_secs()),
                 ));
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
             }
         }
         Ok(())
@@ -1225,9 +1405,10 @@ where
             {
                 obligation.phase = MaintenancePhase::Grace;
                 obligation.grace_until = Some(Timestamp(
-                    now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                    now.0
+                        .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                 ));
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
             }
         }
         Ok(())
@@ -1249,7 +1430,7 @@ where
                 obligation.phase = MaintenancePhase::Quiet;
                 obligation.quiet_since = Some(now);
                 obligation.not_before = None;
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
                 self.maintenance_quiet_monotonic
                     .insert(obligation.id, self.monotonic_clock.elapsed());
             }
@@ -1282,38 +1463,53 @@ where
         // supersessions whose announcement never reached
         // `reconcile_superseded_maintenance`. This is the maintenance sweep, so
         // it is where a stranded evolution would otherwise do its damage.
-        self.reconcile_superseded_maintenance_from_state(now)?;
+        let superseded = self.reconcile_superseded_maintenance_from_state(now)?;
+        output.superseded_intents.extend(superseded);
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
-        if self.key_package_has_pending_fanout()?
-            && let Err(_error) = self.retry_key_package_fanout().await
-        {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "run_due_maintenance",
-                error_kind = "key_package_fanout_retry",
-                "key package exact-event fanout remains retryable"
-            );
+        if self.key_package_has_pending_fanout()? {
+            let started = self.monotonic_clock.elapsed();
+            let result = self.retry_key_package_fanout().await;
+            self.note_key_package_maintenance_attempt(result.is_err());
+            self.note_maintenance_duration(started, true, result.is_err());
+            if result.is_err() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "run_due_maintenance",
+                    error_kind = "key_package_fanout_retry",
+                    "key package exact-event fanout remains retryable"
+                );
+            }
         }
         let key_package_due = self.key_package_network_maintenance_due()?;
+        // Paused maintenance may finish existing publication intent, but an
+        // obsolete pending generator revision requires fresh private material
+        // and therefore waits for resume like every other new preparation.
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
-            .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some());
-        if key_package_due
-            && (!self.maintenance_paused || key_package_prepared)
-            && let Err(error) = self.publish_fresh_key_package().await
-        {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "run_due_maintenance",
-                error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
-                    "clock_skew_blocked"
-                } else {
-                    "key_package_retry"
-                },
-                "key package maintenance remains retryable"
-            );
+            .is_some_and(|lifecycle| {
+                lifecycle.pending_replacement.is_some_and(|pending| {
+                    pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                })
+            });
+        if key_package_due && (!self.maintenance_paused || key_package_prepared) {
+            let started = self.monotonic_clock.elapsed();
+            let result = self.publish_fresh_key_package().await;
+            self.note_key_package_maintenance_attempt(result.is_err());
+            self.note_maintenance_duration(started, true, result.is_err());
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "run_due_maintenance",
+                    error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
+                        "clock_skew_blocked"
+                    } else {
+                        "key_package_retry"
+                    },
+                    "key package maintenance remains retryable"
+                );
+            }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
 
@@ -1385,7 +1581,7 @@ where
                     semantic_rearm_count: 0,
                     last_failure_code: None,
                 };
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
                 self.maintenance_quiet_monotonic
                     .insert(id, self.monotonic_clock.elapsed());
             }
@@ -1441,7 +1637,8 @@ where
                     {
                         obligation.phase = MaintenancePhase::EoseTimeout;
                         obligation.grace_until = Some(Timestamp(
-                            now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                            now.0
+                                .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                         ));
                     }
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
@@ -1468,11 +1665,12 @@ where
                         .get(&obligation.id)
                         .map(|started| {
                             self.monotonic_clock.elapsed().saturating_sub(*started)
-                                >= Duration::from_secs(MAINTENANCE_QUIET_SECS)
+                                >= self.maintenance_timing.quiet
                         })
                         .unwrap_or_else(|| {
                             obligation.quiet_since.is_some_and(|started| {
-                                now.0.saturating_sub(started.0) >= MAINTENANCE_QUIET_SECS
+                                now.0.saturating_sub(started.0)
+                                    >= self.maintenance_timing.quiet.as_secs()
                             })
                         });
                     if !quiet_long_enough {
@@ -1482,7 +1680,17 @@ where
                         )?;
                         continue;
                     }
-                    let jitter_secs = obligation.sampled_jitter_ms.saturating_add(999) / 1_000;
+                    // Periodic rotations keep their own wide spread; only the
+                    // contention jitter of post-join and manual rotations is
+                    // bounded by the configured window.
+                    let jitter_ms = if obligation.trigger == MaintenanceTrigger::Periodic {
+                        obligation.sampled_jitter_ms
+                    } else {
+                        obligation
+                            .sampled_jitter_ms
+                            .min(self.maintenance_timing.contention_jitter_max_ms())
+                    };
+                    let jitter_secs = jitter_ms.saturating_add(999) / 1_000;
                     obligation.phase = MaintenancePhase::Jitter;
                     obligation.not_before = Some(Timestamp(now.0.saturating_add(jitter_secs)));
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
@@ -1530,7 +1738,28 @@ where
                                 queued: Vec::new(),
                                 pending_convergence: Vec::new(),
                             };
-                            let retried = self.publish_session_effects(retry).await?;
+                            self.maintenance_activity
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .self_update_attempts += 1;
+                            let started = self.monotonic_clock.elapsed();
+                            let retried = self.publish_session_effects(retry).await;
+                            self.note_maintenance_duration(
+                                started,
+                                false,
+                                retried.as_ref().map_or(true, |e| {
+                                    !e.failures.is_empty()
+                                        && !e.pending.iter().any(|r| {
+                                            matches!(r, PendingResolution::Confirmed { .. })
+                                        })
+                                }),
+                            );
+                            let retried = retried.inspect_err(|_error| {
+                                self.maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed_attempts += 1;
+                            })?;
                             let confirmed = retried.pending.iter().any(|resolution| {
                                 matches!(
                                     resolution,
@@ -1538,6 +1767,14 @@ where
                                         if *resolved == pending
                                 )
                             });
+                            if !confirmed && !retried.failures.is_empty() {
+                                let mut activity = self
+                                    .maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                activity.failed_attempts =
+                                    activity.failed_attempts.saturating_add(1);
+                            }
                             output.absorb_account_effects(retried);
                             if confirmed {
                                 self.complete_maintenance_obligation(&mut obligation, now)?;
@@ -1581,16 +1818,39 @@ where
             }
 
             let group_id = obligation.group_id.clone();
-            match self
+            self.maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .self_update_attempts += 1;
+            let started = self.monotonic_clock.elapsed();
+            let sent = self
                 .send(SendIntent::SelfUpdate {
                     group_id: group_id.clone(),
                 })
-                .await
-            {
+                .await;
+            self.note_maintenance_duration(
+                started,
+                false,
+                sent.as_ref().map_or(true, |e| {
+                    !e.failures.is_empty()
+                        && !e
+                            .pending
+                            .iter()
+                            .any(|r| matches!(r, PendingResolution::Confirmed { .. }))
+                }),
+            );
+            match sent {
                 Ok(effects) => {
                     let confirmed = effects.pending.iter().any(|resolution| {
                         matches!(resolution, PendingResolution::Confirmed { .. })
                     });
+                    if !confirmed && !effects.failures.is_empty() {
+                        let mut activity = self
+                            .maintenance_activity
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        activity.failed_attempts = activity.failed_attempts.saturating_add(1);
+                    }
                     output.absorb_account_effects(effects);
                     if confirmed {
                         self.complete_maintenance_obligation(&mut obligation, now)?;
@@ -1604,6 +1864,10 @@ where
                     }
                 }
                 Err(error) => {
+                    self.maintenance_activity
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .failed_attempts += 1;
                     obligation.phase = MaintenancePhase::Retry;
                     obligation.attempt_count = obligation.attempt_count.saturating_add(1);
                     obligation.last_failure_code = Some(
@@ -1620,13 +1884,78 @@ where
         Ok(output)
     }
 
+    fn note_maintenance_duration(
+        &self,
+        started: std::time::Duration,
+        key_package: bool,
+        failed: bool,
+    ) {
+        let duration = self.monotonic_clock.elapsed().saturating_sub(started);
+        let mut activity = self
+            .maintenance_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if activity.attempt_durations.len() < 256 {
+            activity.attempt_durations.push(MaintenanceAttemptDuration {
+                key_package,
+                failed,
+                duration,
+            });
+        }
+    }
+
+    fn note_key_package_maintenance_attempt(&self, failed: bool) {
+        let mut activity = self
+            .maintenance_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        activity.key_package_attempts = activity.key_package_attempts.saturating_add(1);
+        if failed {
+            activity.key_package_failed_attempts =
+                activity.key_package_failed_attempts.saturating_add(1);
+        }
+    }
+
+    pub fn take_maintenance_activity(&self) -> MaintenanceActivity {
+        std::mem::take(
+            &mut *self
+                .maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+    fn persist_maintenance_obligation(&self, after: &MaintenanceObligation) -> AccountResult<()> {
+        let before = self
+            .session
+            .maintenance_obligation(&after.id)?
+            .map(|v| v.phase);
+        self.session.put_maintenance_obligation(after)?;
+        if before.as_ref() != Some(&after.phase) {
+            let mut activity = self
+                .maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let count = match after.phase {
+                MaintenancePhase::Complete => &mut activity.completed_transitions,
+                MaintenancePhase::Failed => &mut activity.failed_transitions,
+                MaintenancePhase::Retry
+                | MaintenancePhase::ClockSkewBlocked
+                | MaintenancePhase::EoseTimeout
+                | MaintenancePhase::Paused => &mut activity.deferred_transitions,
+                _ => return Ok(()),
+            };
+            *count = count.saturating_add(1);
+        }
+        Ok(())
+    }
+
     fn put_maintenance_obligation_if_changed(
         &self,
         before: &MaintenanceObligation,
         after: &MaintenanceObligation,
     ) -> AccountResult<()> {
         if before != after {
-            self.session.put_maintenance_obligation(after)?;
+            self.persist_maintenance_obligation(after)?;
         }
         Ok(())
     }
@@ -1686,7 +2015,7 @@ where
     ) -> AccountResult<()> {
         obligation.phase = MaintenancePhase::Complete;
         obligation.last_failure_code = None;
-        self.session.put_maintenance_obligation(obligation)?;
+        self.persist_maintenance_obligation(obligation)?;
         self.maintenance_quiet_monotonic.remove(&obligation.id);
         if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
             state.last_own_leaf_rotation_at = Some(completed_at);
@@ -1784,8 +2113,14 @@ where
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
+        let accept_started = Instant::now();
         let effects = self.session.send(intent).await?;
+        let local_accept_duration = accept_started.elapsed();
+        let publish_started = Instant::now();
         let mut output = self.publish_session_effects(effects).await?;
+        output.local_accept_duration =
+            Some(local_accept_duration + output.local_accept_duration.unwrap_or_default());
+        output.publish_duration = Some(publish_started.elapsed());
         if let Some(group_id) = disposition_group
             && self.post_join_rotation_pending(&group_id)?
         {
@@ -1804,13 +2139,19 @@ where
             SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
+        let accept_started = Instant::now();
         let effects = self
             .session
             .send_with_audit_context(intent, context.clone())
             .await?;
+        let local_accept_duration = accept_started.elapsed();
+        let publish_started = Instant::now();
         let mut output = self
             .publish_session_effects_with_audit_context(effects, Some(context))
             .await?;
+        output.local_accept_duration =
+            Some(local_accept_duration + output.local_accept_duration.unwrap_or_default());
+        output.publish_duration = Some(publish_started.elapsed());
         if let Some(group_id) = disposition_group
             && self.post_join_rotation_pending(&group_id)?
         {
@@ -1867,7 +2208,8 @@ where
         output.absorb_session_effects(rollback_effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok(output)
     }
 
@@ -1994,13 +2336,19 @@ where
         payload: Vec<u8>,
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
+        let accept_started = Instant::now();
         let effects = self
             .session
             .queue_app_message_with_audit_context(group_id.clone(), payload, context.clone())
             .await?;
+        let local_accept_duration = accept_started.elapsed();
+        let publish_started = Instant::now();
         let mut output = self
             .publish_session_effects_with_audit_context(effects, Some(context))
             .await?;
+        output.local_accept_duration =
+            Some(local_accept_duration + output.local_accept_duration.unwrap_or_default());
+        output.publish_duration = Some(publish_started.elapsed());
         if self.post_join_rotation_pending(&group_id)? {
             output.maintenance_disposition =
                 SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
@@ -2128,6 +2476,17 @@ where
         Ok(self.session.deferred_peel_cutoff_delay_ms(group_id)?)
     }
 
+    /// Milliseconds until a scheduled SelfRemove auto-commit for this group is
+    /// due; schedulers must keep a wakeup armed while this is `Some`.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<u64>> {
+        Ok(self
+            .session
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
+    }
+
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
     }
@@ -2206,7 +2565,8 @@ where
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok(output)
     }
 
@@ -2380,7 +2740,8 @@ where
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok((output, blocked_groups))
     }
 
@@ -2418,7 +2779,7 @@ where
                     }
                     obligation.phase = MaintenancePhase::Failed;
                     obligation.last_failure_code = Some("local_member_removed".into());
-                    self.session.put_maintenance_obligation(&obligation)?;
+                    self.persist_maintenance_obligation(&obligation)?;
                     self.maintenance_quiet_monotonic.remove(&obligation.id);
                 }
                 if let Some(mut state) = self.session.group_maintenance(&group_id)? {
@@ -2448,7 +2809,13 @@ where
         Ok(())
     }
 
-    fn reconcile_superseded_maintenance(&mut self, events: &[GroupEvent]) -> AccountResult<()> {
+    /// Retire the evolutions behind commits this batch announced as
+    /// superseded, and decide what becomes of the intent behind each own
+    /// commit (mdk#1734). Returns the per-commit decisions for the effects.
+    fn reconcile_superseded_maintenance(
+        &mut self,
+        events: &[GroupEvent],
+    ) -> AccountResult<Vec<SupersededIntentReport>> {
         let superseded = events
             .iter()
             .filter_map(|event| match event {
@@ -2461,10 +2828,11 @@ where
             })
             .collect::<Vec<_>>();
         if superseded.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let now = self.wall_clock.now();
+        let mut reports = Vec::new();
         for (group_id, invalidated_commit_id) in superseded {
             let evolutions = self.session.group_evolutions_for_group(&group_id)?;
             for evolution in evolutions.into_iter().filter(|evolution| {
@@ -2473,8 +2841,14 @@ where
             }) {
                 self.mark_evolution_superseded(evolution, now)?;
             }
+            if let Some(report) = self
+                .session
+                .reissue_superseded_own_commit(&invalidated_commit_id)?
+            {
+                reports.push(report);
+            }
         }
-        Ok(())
+        Ok(reports)
     }
 
     /// Re-derive a supersession whose `GroupStateInvalidated` announcement was
@@ -2512,7 +2886,10 @@ where
     /// here — and the event path never un-marks a superseded evolution, so
     /// neither does this. It is therefore a fixed point: a converged account
     /// writes nothing, and a flipped evolution is skipped on every later run.
-    fn reconcile_superseded_maintenance_from_state(&mut self, now: Timestamp) -> AccountResult<()> {
+    fn reconcile_superseded_maintenance_from_state(
+        &mut self,
+        now: Timestamp,
+    ) -> AccountResult<Vec<SupersededIntentReport>> {
         for evolution in self.session.group_evolutions()? {
             if evolution.phase == GroupEvolutionPhase::SupersededByConvergence {
                 continue;
@@ -2528,7 +2905,9 @@ where
             }
             self.mark_evolution_superseded(evolution, now)?;
         }
-        Ok(())
+        // Own commits carry their intent separately from evolutions; derive
+        // their supersession from the same stored dispositions (mdk#1734).
+        Ok(self.session.reissue_superseded_own_commits_from_state()?)
     }
 
     /// Retire an evolution that branch selection superseded, and settle the
@@ -2598,7 +2977,7 @@ where
             obligation.last_failure_code = Some("superseded_by_convergence".into());
             self.maintenance_quiet_monotonic
                 .insert(obligation.id.clone(), self.monotonic_clock.elapsed());
-            self.session.put_maintenance_obligation(&obligation)?;
+            self.persist_maintenance_obligation(&obligation)?;
         }
         Ok(())
     }
@@ -3283,6 +3662,7 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        let stage_started = application_message.as_ref().map(|_| Instant::now());
         let (pending, pending_kind, post_confirmation_welcomes) = match continuation {
             Some(continuation) => (
                 Some(continuation.pending),
@@ -3364,6 +3744,11 @@ where
                 self.rollback_unstaged_pending(pending, output, queue)
                     .await?;
                 return Err(error.into());
+            }
+            if let Some(started) = stage_started {
+                // Sum only local application-message preparation, before relay I/O.
+                output.local_accept_duration =
+                    Some(output.local_accept_duration.unwrap_or_default() + started.elapsed());
             }
             Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await
         } else {
@@ -4242,7 +4627,9 @@ fn current_key_package_republish_blocker(
         Some("missing_authored_signed_event")
     } else if lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref {
         Some("current_key_package_ref_consumed")
-    } else if !lifecycle.upgrade_rotation_recorded {
+    } else if !lifecycle.upgrade_rotation_recorded
+        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+    {
         Some("upgrade_rotation_required")
     } else {
         None
@@ -4426,6 +4813,13 @@ fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountDeviceEffects {
+    /// Sum of local engine acceptance and application fanout journal preparation.
+    /// Excludes relay I/O; a batch can stage sibling application messages.
+    /// Present only when effects return; not propagated from absorbed batches.
+    pub local_accept_duration: Option<Duration>,
+    /// Publication and reconciliation duration for this send's effects batch.
+    /// This is not a raw relay acknowledgement or recipient-delivery timestamp.
+    pub publish_duration: Option<Duration>,
     pub events: Vec<GroupEvent>,
     pub queued: Vec<QueuedIntentRef>,
     pub pending_convergence: Vec<GroupId>,
@@ -4453,6 +4847,11 @@ pub struct AccountDeviceEffects {
     /// group so the caller can re-deliver the stored welcome via
     /// [`AccountDeviceRuntime::redeliver_welcome`] without re-committing.
     pub welcome_failures: Vec<WelcomeDeliveryFailure>,
+    /// Own commits that convergence superseded during this batch, with what
+    /// became of the intent behind each: re-queued for the next drain, or
+    /// dropped with a stated reason (mdk#1734). Hosts surface these to the
+    /// user; the original command already returned success.
+    pub superseded_intents: Vec<SupersededIntentReport>,
     pub pending: Vec<PendingResolution>,
     pub maintenance_disposition: SendMaintenanceDisposition,
 }
@@ -4507,6 +4906,8 @@ impl AccountDeviceEffects {
         self.published_app_messages
             .append(&mut other.published_app_messages);
         self.welcome_failures.append(&mut other.welcome_failures);
+        self.superseded_intents
+            .append(&mut other.superseded_intents);
         self.pending.append(&mut other.pending);
         if other.maintenance_disposition
             == SendMaintenanceDisposition::PostJoinRotationPendingRetryable
@@ -4682,6 +5083,7 @@ mod tests {
         assert!(!supports_deferred_commit_publish(&SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: Vec::new(),
+            expected_epoch: None,
         }));
         assert!(!supports_deferred_commit_publish(&SendIntent::Leave {
             group_id: group_id.clone(),

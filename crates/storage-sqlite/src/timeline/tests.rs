@@ -1,5 +1,64 @@
 use super::*;
 
+#[test]
+fn modifier_lookup_bounds() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    cgka_traits::StorageProvider::with_transaction(&store, |store| {
+        for index in 0..1_000 {
+            store.record_app_event(&chat(
+                &format!("history-{index}"),
+                "alice",
+                index,
+                "history",
+            ))?;
+            store.record_app_event(&reaction(
+                &format!("reaction-{index}"),
+                "bob",
+                &format!("history-{index}"),
+                index,
+                "+",
+            ))?;
+        }
+        store.record_app_event(&reaction("earlier", "carol", "history-0", 0, "+"))?;
+        Ok::<_, cgka_traits::StorageError>(())
+    })
+    .unwrap();
+    let conn = store.lock().unwrap();
+    conn.flush_prepared_statement_cache();
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            if let TraceEvent::Profile(stmt, _) = event
+                && stmt.sql().contains("FROM message_modifier_edges AS edges")
+            {
+                assert!(stmt.get_status(rusqlite::StatementStatus::VmStep) < 512);
+                LOOKUPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    );
+    for target in ["missing", "history-0"] {
+        for kind in [MARMOT_APP_EVENT_KIND_REACTION, MARMOT_APP_EVENT_KIND_DELETE] {
+            let events =
+                app_events_targeting_message_tx(&conn, &"11".repeat(32), kind, target).unwrap();
+            let ids = events
+                .iter()
+                .map(|event| event.message_id_hex.as_str())
+                .collect::<Vec<_>>();
+            if target == "history-0" && kind == MARMOT_APP_EVENT_KIND_REACTION {
+                assert_eq!(ids, ["earlier", "reaction-0"]);
+            } else {
+                assert!(ids.is_empty());
+            }
+        }
+    }
+    conn.trace_v2(TraceEventCodes::empty(), None);
+    assert_eq!(LOOKUPS.load(Ordering::Relaxed), 4);
+}
+
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
 }
@@ -1513,6 +1572,70 @@ fn reply_preview_carries_parent_source_epoch_and_media() {
         .expect("reply preview");
     assert_eq!(preview.source_epoch, Some(5));
     assert!(preview.media.is_some());
+}
+
+#[test]
+fn corrupt_media_json_is_preserved_without_failing_the_page_or_reply_query() {
+    // mdk#1787: a media column that no longer parses is corruption, not "no
+    // media". The row and its siblings must still load, the text must remain,
+    // and the container must reach the app layer as a diagnostic (a JSON
+    // string) so the projection can report one undecodable attachment.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    let mut parent = chat("parent", "alice", 1, "look at this");
+    parent.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        "m image/png".to_owned(),
+        "filename diagram.png".to_owned(),
+    ]];
+    store.record_app_event(&parent).unwrap();
+    store
+        .record_app_event(&reply("reply", "bob", "parent", 2, "answer"))
+        .unwrap();
+    store
+        .record_app_event(&chat("healthy", "carol", 3, "unrelated"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE message_timeline SET media_json = '{not-json'
+             WHERE group_id_hex = ?1 AND message_id_hex = 'parent'",
+            params![&group_id],
+        )
+        .unwrap();
+
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_id),
+            ..TimelineMessageQuery::default()
+        })
+        .expect("a corrupt media column must not fail the page query");
+
+    assert_eq!(page.messages.len(), 3);
+    let by_id = |id: &str| {
+        page.messages
+            .iter()
+            .find(|message| message.message_id_hex == id)
+            .unwrap()
+    };
+    let corrupt = by_id("parent");
+    assert_eq!(corrupt.plaintext, "look at this");
+    assert_eq!(
+        corrupt.media,
+        Some(serde_json::Value::String("{not-json".to_owned()))
+    );
+    let preview = by_id("reply")
+        .reply_preview
+        .as_ref()
+        .expect("reply preview");
+    assert_eq!(preview.plaintext, "look at this");
+    assert_eq!(
+        preview.media,
+        Some(serde_json::Value::String("{not-json".to_owned()))
+    );
+    assert!(by_id("healthy").media.is_none());
 }
 
 #[test]

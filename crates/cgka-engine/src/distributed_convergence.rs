@@ -1122,10 +1122,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(unrecoverable_result(epoch));
         }
 
-        // A contested deferred-peel generation buffers recovered evidence
+        // A deferred-peel generation buffers recovered evidence
         // durably but must not adjudicate a prefix. The sweep clears this
         // barrier only after every retained raw row has a definitive result
-        // under the final context fingerprint (mdk#1176).
+        // under the final context fingerprint (mdk#1176). Uncontested catch-up
+        // needs the same barrier so commit replay cannot prune epoch material
+        // before the raw application backlog has been peeled.
         if self
             .storage
             .deferred_peel_generation(group_id)
@@ -1285,7 +1287,7 @@ impl<S: StorageProvider> Engine<S> {
             reject_legacy_group_additions: self.new_protocol_profile
                 == cgka_traits::group::ProtocolProfile::Current,
         };
-        let admitted_message_ids: HashSet<MessageId> = pass
+        let admitted_message_ids: Vec<MessageId> = pass
             .members
             .iter()
             .map(|member| member.message_id.clone())
@@ -1813,6 +1815,11 @@ impl<S: StorageProvider> Engine<S> {
                 // so later drains do not re-fail them forever against the
                 // removed-copy send gate.
                 self.discard_queued_outbound_intents_for_removed_group(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                // Same for retained inbound rows: see
+                // `retire_deferred_peel_rows_for_terminal_group` for why no
+                // later sweep can reach them.
+                self.retire_deferred_peel_rows_for_terminal_group(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
             }
             self.push_group_state_change(
@@ -2513,6 +2520,7 @@ pub(crate) mod tests {
                 group_id: None,
                 sender: None,
                 content: PeeledContent::Welcome {
+                    created_at: None,
                     bytes: msg.payload.clone(),
                 },
                 origin: msg.clone(),

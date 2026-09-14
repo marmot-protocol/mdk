@@ -286,6 +286,24 @@ impl AgentConnector {
         group_filter: Option<&str>,
         delivered: &mut DeliveredInboundCursor,
     ) -> Result<Vec<AgentControlEvent>, ConnectorError> {
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Agent,
+            "replay",
+            marmot_app::ProductUnit::Attempt,
+        );
+        let result = self.replay_missed_inbound_unobserved(account_filter, group_filter, delivered);
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    fn replay_missed_inbound_unobserved(
+        &self,
+        account_filter: Option<&str>,
+        group_filter: Option<&str>,
+        delivered: &mut DeliveredInboundCursor,
+    ) -> Result<Vec<AgentControlEvent>, ConnectorError> {
         // Replay for the filtered account, or for every local account on an unscoped
         // subscription (mirroring the live path, which emits for all local accounts).
         let accounts = match account_filter {

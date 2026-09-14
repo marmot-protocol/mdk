@@ -7,6 +7,57 @@ use cgka_traits::types::{EpochId, GroupId};
 use rusqlite::{OptionalExtension, params};
 
 impl GroupStorage for SqliteAccountStorage {
+    fn forget_group_local(&self, id: &GroupId, at: cgka_traits::Timestamp) -> StorageResult<bool> {
+        self.forget_group_local_data(&hex::encode(id.as_slice()), at)
+    }
+
+    fn is_group_forgotten(&self, id: &GroupId) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM locally_forgotten_groups WHERE group_id = ?1 AND awaiting_welcome = 1)",
+                params![id.as_slice()],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
+    fn group_local_reset_cutoff(
+        &self,
+        id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::Timestamp>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT forgotten_at FROM locally_forgotten_groups WHERE group_id = ?1",
+                params![id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?
+            .map(|at| crate::codec::i64_to_u64(at).map(cgka_traits::Timestamp))
+            .transpose()
+    }
+
+    fn complete_group_local_reset(&self, id: &GroupId) -> StorageResult<()> {
+        let conn = self.lock()?;
+        // The old app-only deletion path forbids rehydrating erased media keys
+        // from retained MLS state. This join has new MLS state, so that barrier
+        // must not carry into the new membership (including a lower fork epoch).
+        conn.execute_cached(
+            "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
+             WHERE group_id_hex = ?1 AND EXISTS (
+                 SELECT 1 FROM locally_forgotten_groups
+                 WHERE group_id = ?2 AND awaiting_welcome = 1)",
+            params![hex::encode(id.as_slice()), id.as_slice()],
+        )
+        .storage()?;
+        conn.execute_cached(
+            "UPDATE locally_forgotten_groups SET awaiting_welcome = 0 WHERE group_id = ?1",
+            params![id.as_slice()],
+        )
+        .storage()?;
+        Ok(())
+    }
+
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.lock()?
             .execute_cached(
@@ -41,58 +92,11 @@ impl GroupStorage for SqliteAccountStorage {
 
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
         self.connection.note_openmls_write();
-        let mls_group_key = mls_group_key(id)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        tx.execute_cached(
-            "DELETE FROM transport_reconciliation_items
-             WHERE route_kind = 1 AND route_id IN (
-                 SELECT transport_group_id
-                 FROM cgka_transport_group_routes
-                 WHERE group_id = ?1
-             )",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute_cached(
-            "DELETE FROM transport_reconciliation_route_state
-             WHERE route_kind = 1 AND route_id IN (
-                 SELECT transport_group_id
-                 FROM cgka_transport_group_routes
-                 WHERE group_id = ?1
-             )",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute_cached(
-            "DELETE FROM transport_reconciliation_scheduler
-             WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
-                 SELECT transport_group_id
-                 FROM cgka_transport_group_routes
-                 WHERE group_id = ?1
-             )",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        let deleted = tx
-            .execute_cached(
-                "DELETE FROM cgka_groups WHERE id = ?1",
-                params![id.as_slice()],
-            )
-            .storage()?;
-        if deleted == 0 {
+        if delete_group_tx(&tx, id)? == 0 {
             return Err(StorageError::NotFound);
         }
-        tx.execute_cached(
-            "DELETE FROM pending_application_events WHERE group_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute_cached(
-            "DELETE FROM openmls_values WHERE provider_version = ?1 AND group_key = ?2",
-            params![openmls_traits::storage::CURRENT_VERSION, mls_group_key],
-        )
-        .storage()?;
         tx.commit().storage()?;
         Ok(())
     }
@@ -149,6 +153,61 @@ impl GroupStorage for SqliteAccountStorage {
     fn delete_transport_group_routes_for_group(&self, group_id: &GroupId) -> StorageResult<()> {
         super::transport_routes::delete_for_group(self, group_id)
     }
+}
+
+/// Called inside the same transaction as the local-forget marker and app wipe.
+pub(crate) fn delete_group_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &GroupId,
+) -> StorageResult<usize> {
+    let mls_group_key = mls_group_key(id)?;
+    tx.execute_cached(
+        "DELETE FROM transport_reconciliation_items
+             WHERE route_kind = 1 AND route_id IN (
+                 SELECT transport_group_id
+                 FROM cgka_transport_group_routes
+                 WHERE group_id = ?1
+             )",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "DELETE FROM transport_reconciliation_route_state
+             WHERE route_kind = 1 AND route_id IN (
+                 SELECT transport_group_id
+                 FROM cgka_transport_group_routes
+                 WHERE group_id = ?1
+             )",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "DELETE FROM transport_reconciliation_scheduler
+             WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
+                 SELECT transport_group_id
+                 FROM cgka_transport_group_routes
+                 WHERE group_id = ?1
+             )",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    let deleted = tx
+        .execute_cached(
+            "DELETE FROM cgka_groups WHERE id = ?1",
+            params![id.as_slice()],
+        )
+        .storage()?;
+    tx.execute_cached(
+        "DELETE FROM pending_application_events WHERE group_id = ?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "DELETE FROM openmls_values WHERE provider_version = ?1 AND group_key = ?2",
+        params![openmls_traits::storage::CURRENT_VERSION, mls_group_key],
+    )
+    .storage()?;
+    Ok(deleted)
 }
 
 #[cfg(test)]

@@ -28,11 +28,12 @@
 //!
 //! ## HTML is not parsed
 //!
-//! Unlike CommonMark proper, this parser **does not** recognize HTML
+//! Unlike CommonMark proper, this parser **does not** recognize general HTML
 //! blocks or raw HTML inlines. Tag-like sequences (`<div>`, `<!-- ... -->`,
 //! etc.) are passed through as literal text and HTML-escaped at render
 //! time. Only autolinks — `<scheme:body>` and `<email@host>` — get
-//! structured treatment.
+//! structured treatment, plus a bounded [`Block::Details`] extension for
+//! structural `<details>` / `<summary>` lines (see the crate README).
 //!
 //! ## Untrusted destinations
 //!
@@ -60,6 +61,7 @@
 pub mod ast;
 mod block;
 mod destination;
+mod details;
 mod entity;
 mod inline;
 mod nostr;
@@ -95,6 +97,13 @@ pub use destination::classify_link_destination;
 ///   literal.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
+/// - Bounded `<details>` / `<summary>` disclosure blocks. The opener and
+///   closer each occupy their own logical line after quote/list prefixes and
+///   at most three columns of local indent. Compact one-line HTML stays
+///   literal. Recognition is limited to a 65536-byte original-source prefix
+///   and a 4096-byte structural tag cap. Missing or empty summaries yield an
+///   empty `summary` list; clients may localize a fallback label. Failed
+///   candidates remain ordinary Markdown with their tags literal.
 /// - Nostr bare mentions (`@npub1…`) and URIs (`nostr:<hrp>1…`) for the
 ///   whitelisted HRPs `npub`, `note`, `nevent`, `nprofile`, `naddr`,
 ///   `nrelay`. `nsec` is deliberately rejected from the ergonomic
@@ -109,4 +118,171 @@ pub use destination::classify_link_destination;
 pub fn parse(input: &str) -> Document {
     let (blocks, blank_lines_before, refs) = block::parse_blocks(input);
     inline::parse_inlines(blocks, blank_lines_before, &refs)
+}
+
+#[cfg(test)]
+mod details_work_tests {
+    use super::*;
+    use crate::details::Work;
+
+    #[test]
+    fn many_failed_openers_stay_linear() {
+        let mut md = String::new();
+        for _ in 0..200 {
+            md.push_str("<details>\n");
+        }
+        md.push_str("tail\n");
+        let doc = parse(&md);
+        assert!(
+            !doc.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Details { .. }))
+        );
+        let work = Work::get();
+        assert!(
+            work < 200 * 64,
+            "failed openers must not rescan quadratically, work={work}"
+        );
+    }
+
+    #[test]
+    fn unmatched_backtick_first_line_stays_linear() {
+        use crate::details::MAX_DETAILS_SCAN_BYTES;
+        let mut prev = 0usize;
+        for n in [4_000usize, 8_000, 16_000, 32_000] {
+            Work::reset();
+            let md = format!("<details>\n{}\n</details>", "`".repeat(n));
+            let _ = parse(&md);
+            let work = Work::get();
+            assert!(
+                work <= n * 16 + 4_096,
+                "backtick close-search must stay linear, n={n} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, n={n} prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
+        Work::reset();
+        let near_cap = 65_519.min(MAX_DETAILS_SCAN_BYTES.saturating_sub(16));
+        let md = format!("<details>\n{}\n</details>", "`".repeat(near_cap));
+        let _ = parse(&md);
+        let work = Work::get();
+        assert!(
+            work <= near_cap * 16 + 4_096,
+            "FFI-cap backtick line must stay linear, work={work}"
+        );
+    }
+
+    #[test]
+    fn summary_opener_plus_backticks_stays_linear() {
+        let mut prev = 0usize;
+        for n in [4_000usize, 8_000, 16_000, 32_000] {
+            Work::reset();
+            let md = format!("<details>\n<summary>{}\n</details>", "`".repeat(n));
+            let _ = parse(&md);
+            let work = Work::get();
+            assert!(
+                work <= n * 16 + 4_096,
+                "summary+backtick search must stay linear, n={n} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, n={n} prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
+    }
+
+    #[test]
+    fn unequal_backtick_runs_stay_linear() {
+        Work::reset();
+        let mut md = String::from("<details>\n<summary>");
+        for len in 1..=64 {
+            md.push_str(&"`".repeat(len));
+            md.push('x');
+        }
+        md.push_str("\n</details>");
+        let _ = parse(&md);
+        let work = Work::get();
+        assert!(
+            work < 64 * 64 * 8,
+            "unequal run lengths must not rescan suffixes, work={work}"
+        );
+    }
+
+    #[test]
+    fn multiline_scanner_actual_work_is_linear() {
+        let mut prev = 0usize;
+        for n in [1_000usize, 2_000, 4_000, 8_000] {
+            Work::reset();
+            let mut md = String::from("<details>\n<summary>\n");
+            for _ in 0..n {
+                md.push_str("x\n");
+            }
+            md.push_str("</details>");
+            let _ = parse(&md);
+            let work = Work::get();
+            let bytes = md.len();
+            assert!(
+                work <= bytes * 16 + 4_096,
+                "multiline continuation must stay linear, n={n} bytes={bytes} work={work}"
+            );
+            if prev > 0 {
+                assert!(
+                    work <= prev.saturating_mul(3),
+                    "work must not jump quadratically, n={n} prev={prev} work={work}"
+                );
+            }
+            prev = work;
+        }
+        Work::reset();
+        let near_cap = 32_000usize;
+        let mut md = String::from("<details>\n<summary>\n");
+        for _ in 0..near_cap {
+            md.push_str("x\n");
+        }
+        let bytes = md.len();
+        let _ = parse(&md);
+        let work = Work::get();
+        assert!(
+            work <= bytes * 16 + 4_096,
+            "many-line open summary near the FFI cap must stay linear, bytes={bytes} work={work}"
+        );
+    }
+
+    #[test]
+    fn deferred_summary_closers_with_later_code_spans_stay_linear() {
+        for n in [500, 1_000, 2_000] {
+            let md = format!(
+                "<details>\n<summary>`\n{}{}",
+                "</summary>\n".repeat(n),
+                "``code``\n".repeat(n),
+            );
+            let _ = parse(&md);
+            let work = Work::get();
+            assert!(work <= md.len() * 16 + 4_096, "work={work}");
+        }
+    }
+
+    #[test]
+    fn bounded_summary_never_copies_unbounded_suffix() {
+        Work::reset();
+        let huge = format!("<summary>{}", "z".repeat(1_000_000));
+        let classified = crate::details::parse_summary_line_bounded(&huge, 16);
+        assert!(matches!(
+            classified,
+            crate::details::SummaryLine::OpenOnly { .. }
+        ));
+        let work = Work::get();
+        assert!(
+            work < 8_192,
+            "a 16-byte budget must not copy a 1MB suffix, work={work}"
+        );
+    }
 }

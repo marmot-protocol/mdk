@@ -314,6 +314,7 @@ fn group(id: &str, name: &str) -> StoredAccountGroup {
         pending_confirmation: false,
         member_count: None,
         direct_member_ids_hex: None,
+        presentation_member_ids_hex: None,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
         nostr_routing_last_epoch: 0,
@@ -560,6 +561,58 @@ fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
     assert!(
         store.pending_epoch_backfill_intents().unwrap().is_empty(),
         "deleting the owning protocol group must consume its recovery intent"
+    );
+}
+
+#[test]
+fn epoch_backfill_intents_clear_by_group_at_whatever_epoch_is_stored() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    insert_protocol_group_marker(&store, &[0xbb]);
+
+    let aa_epoch_8 = StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 8,
+    };
+    let bb_epoch_3 = StoredEpochBackfillIntent {
+        group_id_hex: "bb".to_owned(),
+        stalled_epoch: 3,
+    };
+    store
+        .arm_epoch_backfill_intents(&[aa_epoch_8, bb_epoch_3.clone()])
+        .unwrap();
+
+    store
+        .clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
+        .unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![bb_epoch_3.clone()],
+        "clearing by group retires that group and leaves every other group armed"
+    );
+
+    // The stored epoch is not part of the key: re-arm at a different epoch and
+    // the same by-group clear still retires it.
+    store
+        .arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
+            group_id_hex: "aa".to_owned(),
+            stalled_epoch: 41,
+        }])
+        .unwrap();
+    store
+        .clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
+        .unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![bb_epoch_3.clone()],
+        "a by-group clear is not epoch-sensitive"
+    );
+
+    store.clear_epoch_backfill_intents_for_groups(&[]).unwrap();
+    assert_eq!(
+        store.pending_epoch_backfill_intents().unwrap(),
+        vec![bb_epoch_3],
+        "an empty slice clears nothing"
     );
 }
 
@@ -2348,7 +2401,7 @@ fn push_registration_preserves_created_at_when_token_rotates() {
 }
 
 #[test]
-fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh() {
+fn push_registration_preserves_progress_on_resume_and_requeues_changed_routing() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .save_account_projection_state(
@@ -2397,7 +2450,40 @@ fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh
         .mark_push_registration_shared("alice", "first", 10, 11)
         .unwrap();
 
+    let mut resumed = registration.clone();
+    resumed.updated_at_ms = 100;
+    let unchanged = store
+        .upsert_push_registration(resumed.clone(), vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(unchanged.registration.updated_at_ms, 10);
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["bb".to_owned()],
+        "foreground registration must retain partial delivery progress"
+    );
+    assert!(
+        store
+            .complete_push_registration_share("bb", "first", 10)
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 10, 101)
+            .unwrap()
+    );
+    let unchanged = store
+        .upsert_push_registration(resumed, vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(unchanged.registration.last_shared_at_ms, Some(101));
+    assert!(
+        store
+            .pending_push_registration_shares("first", 10)
+            .unwrap()
+            .is_empty()
+    );
+
     let mut refreshed = registration;
+    refreshed.relay_hint = Some("wss://relay.example".to_owned());
     refreshed.updated_at_ms = 10;
     let stored = store
         .upsert_push_registration(refreshed, vec![1, 2, 3])
@@ -3725,4 +3811,312 @@ fn stored_account_group_component_debug_redacts_blossom_image_payload() {
     assert!(!rendered.contains(UPLOAD_KEY_HEX));
     assert!(rendered.contains("marmot.group.blossom.image.v1"));
     assert!(rendered.contains("redacted"));
+}
+
+#[test]
+fn seen_event_pruning_edges() {
+    for capacity in [0, 1, 3, 8] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO seen_events(rowid, event_id, seen_at) VALUES
+                 (2, 'old', 1), (5, 'tie-first', 9), (11, 'tie-last', 9);",
+            )
+            .unwrap();
+        }
+        store
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    ..StoredAccountState::default()
+                },
+                capacity,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        let restored = store.load_account_projection_state("alice", 8).unwrap();
+        let expected = ["old", "tie-first", "tie-last"];
+        assert_eq!(
+            restored.seen_events,
+            expected[3_usize.saturating_sub(capacity)..]
+        );
+    }
+}
+
+#[test]
+fn seen_event_prune_query_work() {
+    use rusqlite::StatementStatus;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::Mutex;
+
+    static PRUNE_SQL: Mutex<String> = Mutex::new(String::new());
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            let TraceEvent::Profile(statement, _) = event else {
+                return;
+            };
+            if statement.sql().starts_with("DELETE FROM seen_events") {
+                *PRUNE_SQL.lock().unwrap() = statement.sql().into_owned();
+            }
+        }),
+    );
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                ..StoredAccountState::default()
+            },
+            0,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let conn = store.lock().unwrap();
+    conn.trace_v2(TraceEventCodes::empty(), None);
+    let production_sql = PRUNE_SQL.lock().unwrap().clone();
+    assert!(!production_sql.is_empty());
+    // Compare the old schema/query with the migrated schema and actual API SQL.
+    for capacity in [256, 4_096, 16_384] {
+        conn.execute_batch("DELETE FROM seen_events; DROP INDEX idx_seen_events_recency;")
+            .unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+             INSERT INTO seen_events(event_id, seen_at) SELECT printf('%064x', x), x/8 FROM n",
+            params![capacity],
+        )
+        .unwrap();
+        let legacy_sql = "DELETE FROM seen_events WHERE event_id NOT IN (
+            SELECT event_id FROM seen_events ORDER BY seen_at DESC, rowid DESC LIMIT ?1)";
+        let mut measurements = Vec::new();
+        for sql in [legacy_sql, production_sql.as_str()] {
+            if sql == production_sql {
+                conn.execute_batch("CREATE INDEX idx_seen_events_recency ON seen_events(seen_at);")
+                    .unwrap();
+            }
+            let mut statement = conn.prepare(sql).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                conn.execute_batch("SAVEPOINT bench").unwrap();
+                assert_eq!(statement.execute(params![capacity]).unwrap(), 1);
+                conn.execute_batch("ROLLBACK TO bench; RELEASE bench")
+                    .unwrap();
+            }
+            measurements.push((
+                statement.get_status(StatementStatus::VmStep) / 20,
+                start.elapsed() / 20,
+            ));
+            if sql == production_sql {
+                assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+            }
+        }
+        assert!(
+            measurements[0].0 > measurements[1].0 * 5,
+            "seen prune capacity={capacity}: old={:?}, new={:?} (VM steps, elapsed)",
+            measurements[0],
+            measurements[1]
+        );
+    }
+}
+
+#[test]
+fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
+    use cgka_traits::storage::GroupStorage;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".into(),
+        seen_events: vec![],
+        last_transport_timestamp: None,
+        groups: vec![group("aa", "forgotten"), group("bb", "kept")],
+    };
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    insert_protocol_group_marker(&store, &[0xbb]);
+    store
+        .record_app_event(&app_event("msg-aa", "aa", 10))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO pending_push_registration_removals (
+            group_id_hex, account_label, account_id_hex, platform, token_fingerprint,
+            server_pubkey_hex, registration_created_at_ms, registration_updated_at_ms, queued_at_ms
+         ) VALUES ('aa', 'alice', 'account', 1, 'token', 'server', 0, 0, 0);",
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_forget BEFORE DELETE ON cgka_groups
+         WHEN OLD.id = x'aa' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    let id = cgka_traits::GroupId::new(vec![0xaa]);
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .is_err()
+    );
+    assert!(!store.is_group_forgotten(&id).unwrap());
+    assert!(store.list_groups().unwrap().contains(&id));
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM app_events WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_forget")
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(
+        store
+            .pending_push_registration_removals()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.list_groups().unwrap(),
+        vec![cgka_traits::GroupId::new(vec![0xbb])]
+    );
+    assert!(store.local_group_deletion_frontier("aa").unwrap().is_none());
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_groups WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "a stale app snapshot cannot restore the chat"
+    );
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
+                []
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_groups WHERE group_id_hex = 'bb'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
+    use cgka_traits::storage::{GroupStorage, StorageProvider};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let id = cgka_traits::GroupId::new(vec![0xaa]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![group("aa", "old membership")],
+                ..Default::default()
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .forget_group_local(&id, cgka_traits::Timestamp(200))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
+    assert!(
+        !store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    let failed: Result<(), StorageError> = store.with_transaction(|storage| {
+        storage.complete_group_local_reset(&id)?;
+        insert_protocol_group_marker(storage, id.as_slice());
+        Err(StorageError::Backend("injected join failure".into()))
+    });
+    assert!(failed.is_err());
+    assert!(
+        !store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(store.list_groups().unwrap().is_empty());
+    store
+        .with_transaction::<_, StorageError, _>(|storage| {
+            storage.complete_group_local_reset(&id)?;
+            insert_protocol_group_marker(storage, id.as_slice());
+            Ok(())
+        })
+        .unwrap();
+    assert!(!store.is_group_forgotten(&id).unwrap());
+    assert!(
+        store
+            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
+    assert!(store.list_groups().unwrap().contains(&id));
+    // A second reset cannot move the boundary backward if the local clock regresses.
+    assert!(
+        store
+            .forget_group_local(&id, cgka_traits::Timestamp(90))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_local_reset_cutoff(&id).unwrap(),
+        Some(cgka_traits::Timestamp(100))
+    );
 }

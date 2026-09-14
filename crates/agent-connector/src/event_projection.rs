@@ -696,6 +696,7 @@ pub(crate) fn control_event_from_runtime_event_with_runtime(
                 group_id,
                 via_welcome,
                 welcomer,
+                ..
             } => {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 if !inbound_filter_matches(

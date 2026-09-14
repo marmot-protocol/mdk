@@ -10,6 +10,7 @@ name = "marmot_uniffi"
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [features]
+product-analytics-export = ["marmot-app/product-analytics-export"]
 default = []
 cli = ["uniffi/cli"]
 otlp-export = ["marmot-app/otlp-export"]

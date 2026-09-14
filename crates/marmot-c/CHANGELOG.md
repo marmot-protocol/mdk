@@ -7,6 +7,119 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
+  commands and independent live account-attention summaries across Swift/Kotlin and C.
+  Existing list/read APIs and C record layouts remain; new typed window errors append
+  status codes 73–77. Regenerate bindings and use matching libraries.
+
+- `MarmotAccountKeyPackageRelayEvent`, `MarmotAccountKeyPackageRelayEventList`,
+  `marmot_account_key_package_relay_events`, and
+  `marmot_account_key_package_relay_event_list_free` for observed KeyPackage
+  relay history, including superseded same-slot events. Existing
+  `MarmotAccountKeyPackage` layout is unchanged.
+- `marmot_forget_group_local` deletes local chat and MLS state without publishing a leave,
+  stops group work, and permits a fresh authenticated invitation to rejoin. Rebuild with
+  matching headers/libraries; hosts must clear their own media caches and close group views.
+- `marmot_default_profile_pseudonym` and `marmot_random_profile_pseudonym`
+  for the shared cosmetic display-name helpers. Free the owned UTF-8
+  strings with `marmot_string_free`. These functions add no status values or
+  struct layouts.
+- `MarmotMediaAttachmentOutcome` (tagged union: `Accepted { attachment_index, reference }` /
+  `Rejected { attachment_index, rejection }`), `MarmotMediaAttachmentRejection`, and
+  `MarmotMediaAttachmentRejectionKind` for per-attachment parse outcomes (#1787).
+- `MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED` (70), `MARMOT_STATUS_MEDIA_UNFETCHABLE` (71), and
+  `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` (72), appended after the existing codes.
+
+### Changed
+
+- `marmot_account_unread_summary` now uses the Unread list's eligibility for all
+  `MarmotAccountUnread` fields (`unread_count`, `unread_conversations`,
+  `attention_only_conversations`, and `has_unread`). Pending invitations and
+  departed or departing groups, including durably queued leave/disband requests,
+  no longer contribute; archived chats remain excluded. Muted active chats and
+  manual-only reminders still contribute. Struct layouts are unchanged. Hosts
+  that display invitation badges must derive those separately from invitation state.
+
+- Account storage advances through migrations 70–71 for local group reset boundaries.
+  Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in
+  [the CLI changelog](../cli/CHANGELOG.md#unreleased).
+- `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
+  references and discards relay hints. Existing hex, `npub`, and
+  `marmot://profile/` forms keep their established OK-plus-NULL contract.
+  Duplicate type-0 TLV entries keep the first key. After wrapper
+  normalization, encoded tokens longer than 1023 UTF-8 bytes are
+  rejected; a valid 1023-byte token still decodes when wrapped.
+- `marmot_normalize_member_ref` documents the same nprofile spellings,
+  first-wins type-0 rule, and 1023-byte encoded-token limit.
+- **In-place ABI break, recompile required.** `MarmotTimelineMessageRecord.media` and
+  `MarmotTimelineReplyPreview.media` hold `MarmotMediaAttachmentOutcome` items rather than
+  `MarmotMediaAttachmentReference`, so the element type and array stride change; a binary built
+  against the previous header would misread the array. This is an Unreleased 0.9 change with no
+  in-place dylib swap supported: rebuild C consumers against the new `include/marmot.h` and
+  switch on the outcome tag. No `…V2` compatibility mirror is provided because no shipped C
+  consumer upgrades the library without a rebuild. A malformed or unsupported attachment now keeps
+  its position with a typed reason instead of disappearing; the parent record's deep-free releases
+  either payload.
+- `MarmotMediaRecord.attachment_index` counts the position among the message's `imeta` tags,
+  rejected siblings included, matching the timeline outcome index.
+- `marmot_download_media` returns `MARMOT_STATUS_MEDIA_UNFETCHABLE` when no locator may be
+  fetched under the current policy and `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` for transport,
+  integrity, and decryption failures. Structurally invalid host-supplied references return
+  `MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED` from every media command instead of
+  `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`, which now covers group-profile/policy mismatches
+  and unusable upload requests.
+
+## [0.9.21] - 2026-09-10
+
+This cohort also exposes host-driven agent stream publishing and the v4 audit
+tracker configuration. Rebuild with the matching header and library. Account
+storage advances through migrations 68–69; back up before upgrading because
+downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#0921---2026-09-10).
+
+### Added
+
+- Additive `MarmotMarkdownBlock::Details` with an indirect `MarmotMarkdownDetails`
+  payload for bounded `<details>` / `<summary>` display blocks. Existing block
+  discriminants and union stride are unchanged; C consumers must regenerate
+  compatible bindings to render the new tag.
+- `marmot_search_cached_users`, `MarmotUserDirectorySearchResultList`, and
+  `marmot_user_directory_search_result_list_free` for network-free public cache search across connected accounts.
+
+### Changed
+
+- Group creation, invites, and composition prewarming fetch current KeyPackages from relays, including for local
+  sibling accounts; cached packages no longer substitute when resolution fails. Prewarm retains discovery routes
+  only, and `MarmotMemberKeyPackagePrewarmSummary::reused_members` remains present but always returns zero.
+- Create and Invite reject KeyPackages that explicitly advertise RFC 9420 default extension/proposal capabilities.
+  **Compatibility:** inviting a peer still publishing an affected package fails (`InvalidKeyPackageCapabilities` in
+  the Rust engine) until that peer generates and publishes a conforming package. Upgraded recipients automatically
+  regenerate once on account activation; the durable generator revision advances only after a relay ACK, with
+  retries across restarts. Peers that have not upgraded are not repaired by a sender's upgrade. This deliberately
+  keeps nonconforming signed leaves out of new membership state. Previous unused private bundles retain their
+  expiry/consumption policy and historical Welcome processing is unchanged.
+
+- Search results include `is_followed_by_searcher`; streaming updates include keyed `updated_results` replacements
+  and a `CachedResultsFound` trigger. Consumers must merge by account ID, including across radius pages, and use
+  the explicit follow flag instead of radius 1 for badges. C consumers must rebuild against the matching generated
+  header and library because both search-result and search-update struct layouts changed.
+
+## [0.9.20] - 2026-09-08
+
+### Added
+
+- Presented chat-list reads and subscriptions, chat presentation records, and
+  unified usage-diagnostics consent and settings APIs.
+- Explicit onboarding recovery/query and epoch-aware approval/acknowledgment
+  commands. `MarmotOnboardingSnapshot` includes `recovery_epoch`; C consumers
+  must rebuild against the matching generated header and library.
+
+### Changed
+
+- `marmot_cancel_onboarding` documentation now matches the runtime: approved or
+  ready attempts may be cancelled without first resuming a repair.
+
 ## [0.9.16] - 2026-09-01
 
 ### Added
@@ -38,5 +151,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.16...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...HEAD
+[0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

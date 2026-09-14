@@ -97,6 +97,7 @@ fn passthrough_welcome(msg: &TransportMessage) -> Result<PeeledMessage, PeelerEr
         group_id: None,
         sender: None,
         content: PeeledContent::Welcome {
+            created_at: None,
             bytes: msg.payload.clone(),
         },
         origin: msg.clone(),
@@ -213,6 +214,7 @@ struct NotifyEpochGatePeeler {
 struct CancellableEpochSealedPeeler {
     blocked: Arc<AtomicBool>,
     blocked_attempts: Arc<AtomicU64>,
+    delay_ms: Arc<AtomicU64>,
 }
 
 impl CancellableEpochSealedPeeler {
@@ -220,6 +222,7 @@ impl CancellableEpochSealedPeeler {
         Self {
             blocked: Arc::new(AtomicBool::new(false)),
             blocked_attempts: Arc::new(AtomicU64::new(0)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -247,6 +250,10 @@ impl TransportPeeler for CancellableEpochSealedPeeler {
         if self.blocked.load(Ordering::SeqCst) {
             self.blocked_attempts.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;
+        }
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         EpochSealedPeeler.peel_group_message(msg, ctx).await
     }
@@ -289,6 +296,10 @@ impl NotifyEpochGatePeeler {
 
     fn gated_attempts(&self) -> u64 {
         self.gated_attempts.load(Ordering::SeqCst)
+    }
+
+    fn unblock(&self) {
+        self.gated.store(false, Ordering::SeqCst);
     }
 }
 
@@ -505,6 +516,7 @@ async fn send_app(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(engine, content),
+            expected_epoch: None,
         })
         .await
         .expect("send app");
@@ -1054,6 +1066,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "queued application"),
+                expected_epoch: None,
             })
             .await
             .unwrap();
@@ -1114,6 +1127,41 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
         assert_eq!(metrics.outbound_wire_prepare_ms.sample_count(), 0);
         assert_eq!(metrics.outbound_queue_accept_ms.sample_count(), 3);
     }
+}
+
+#[tokio::test]
+async fn deferred_peel_scheduler_wakes_for_new_context_before_residence_expiry() {
+    let (_alice, mut carol, _storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs().await;
+    assert!(matches!(
+        carol.ingest(commit3).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(0)
+    );
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert!(
+        carol
+            .deferred_peel_cutoff_delay_ms(&group_id)
+            .unwrap()
+            .is_some_and(|delay| delay > 0),
+        "unchanged context sleeps until expiry rather than spinning"
+    );
+    carol.ingest(commit2).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(0),
+        "the newly available decryption context needs an immediate scheduler wake"
+    );
+    carol.advance_convergence_inputs(&group_id).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        None
+    );
 }
 
 /// The core #339 fix: a deferred row is not re-peeled while the
@@ -1208,6 +1256,7 @@ async fn deferred_lifecycle_normalization_is_pending_not_budget_exhaustion() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "send after lifecycle normalization"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1267,6 +1316,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "later direct send"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1290,6 +1340,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "send after fresh row"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1335,13 +1386,16 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
             IngestOutcome::TransportDeferred { .. }
         ));
     }
-    carol.set_foreground_deferred_peel_budget(25, 4);
+    // The notify gate determines the cancellation point. Leave enough wall
+    // time for enumeration even when other file-backed tests are running.
+    carol.set_foreground_deferred_peel_budget(5_000, 4);
     peeler.block_on_attempt(4);
     assert!(matches!(
         carol
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "restart queued"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1453,6 +1507,104 @@ async fn contested_generation_barrier_survives_restart_and_blocks_prefix_converg
             .is_none()
     );
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+}
+
+#[tokio::test]
+async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
+    let client = build_notify_client(b"carol");
+    let (mut alice, mut carol, storage, peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(client).await;
+    let template = send_app(&mut alice, &group_id, "uncontested restart backlog").await;
+    for index in 0..65 {
+        assert!(matches!(
+            carol
+                .ingest(TransportMessage {
+                    id: MessageId::new(format!("uncontested-restart-{index}").into_bytes()),
+                    ..template.clone()
+                })
+                .await
+                .unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+
+    // Cancel the first foreground peel after enumeration, leaving a real
+    // partially examined generation rather than injecting its storage marker.
+    carol.set_foreground_deferred_peel_budget(5_000, 4);
+    peeler.block_on_attempt(1);
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "queued during catch-up"),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_some()
+    );
+
+    assert_eq!(
+        peeler.gated_attempts(),
+        1,
+        "the sweep must reach the blocked peel"
+    );
+    peeler.unblock();
+    assert!(matches!(
+        carol.ingest(commit2).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    drop(carol);
+
+    let (mut restarted, _, _) = build_counting_client_with_storage_and_clock(
+        b"carol",
+        storage.clone(),
+        ManualConvergenceClock::new(3_000, 30_000),
+    );
+    restarted.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        restarted
+            .converge_stored_openmls_messages(&group_id)
+            .unwrap()
+            .convergence_status,
+        cgka_engine::canonicalization::ConvergenceStatus::Syncing
+    );
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(1));
+
+    // Maintenance resumes in bounded background slices; an outbound preflight
+    // intentionally attempts only four rows and cannot finish this backlog.
+    for _ in 0..8 {
+        restarted.retry_deferred_peels(&group_id).await.unwrap();
+        if restarted.epoch(&group_id).unwrap() == EpochId(2) {
+            break;
+        }
+    }
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+    restarted.ingest(commit3).await.unwrap();
+    for _ in 0..8 {
+        restarted.retry_deferred_peels(&group_id).await.unwrap();
+    }
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(3));
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !storage
+            .list_messages(&group_id, EpochId(0))
+            .unwrap()
+            .iter()
+            .any(|record| record.state == MessageState::PeelDeferred)
+    );
 }
 
 /// The gate must not block legitimate retries: once the epoch advances, the
@@ -1577,9 +1729,14 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
     );
     assert_eq!(
         carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
-        Some(1_000)
+        Some(0)
     );
     carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(1_000),
+        "after its first context attempt, the original residence budget is unchanged"
+    );
     let before_restart = carol_storage.get_message(&stuck_app.id).unwrap();
     let lifecycle = before_restart
         .deferred_peel
@@ -1789,6 +1946,199 @@ async fn later_deferring_group_first_sweep_keeps_exact_account_byte_total() {
     assert_eq!(
         carol.engine_metrics().deferred_peel_peak_bytes_per_account,
         (bytes_a + bytes_b) as u64
+    );
+}
+
+/// Carol ends up removed from group A while still live in group B, holding one
+/// deferred row in each. Returns her (pre-restart), her storage, the two
+/// groups, group A's deferred row id, and a group-B wrap template plus the
+/// exact byte size one of its rows charges.
+#[cfg(feature = "test-policy-overrides")]
+async fn carol_removed_from_group_a_and_live_in_group_b() -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    MessageId,
+    GroupId,
+    TransportMessage,
+    usize,
+) {
+    let (mut alice, mut carol, storage, _peeler, group_a, commit2, commit3) =
+        carol_behind_two_epochs().await;
+    let carol_id = carol.self_id().clone();
+    // Catch carol up so alice's removing commit is one she can actually apply.
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+
+    let (removal, pending) = evolution(
+        alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_a.clone(),
+                members: vec![carol_id],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+
+    // One group-A row carol defers and, once removed, can never release.
+    let deferred_a = send_app(&mut alice, &group_a, "group A deferred bytes").await;
+    assert!(matches!(
+        carol.ingest(deferred_a.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert!(
+        !storage
+            .get_message(&deferred_a.id)
+            .unwrap()
+            .payload
+            .is_empty(),
+        "the group-A row must actually charge the account budget"
+    );
+
+    let group_b = add_group_two_epochs_ahead(&mut alice, &mut carol).await;
+    let template_b = send_app(&mut alice, &group_b, "group B deferred bytes").await;
+    let first_b = TransportMessage {
+        id: MessageId::new(b"terminal-release-b-0001".to_vec()),
+        ..template_b.clone()
+    };
+    assert!(matches!(
+        carol.ingest(first_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_b = storage.get_message(&first_b.id).unwrap().payload.len();
+
+    carol.ingest(route(removal, &group_a)).await.unwrap();
+    assert!(
+        carol.group_record(&group_a).unwrap().removed,
+        "the removing commit must have made carol's copy of group A terminal"
+    );
+
+    (
+        carol,
+        storage,
+        group_a,
+        deferred_a.id,
+        group_b,
+        template_b,
+        bytes_b,
+    )
+}
+
+/// Restart carol with the given account byte budget and hand back the engine.
+#[cfg(feature = "test-policy-overrides")]
+fn restart_carol_with_account_budget(
+    storage: SqliteAccountStorage,
+    account_byte_limit: usize,
+) -> Engine<SqliteAccountStorage> {
+    let clock = ManualConvergenceClock::new(2_000, 20_000);
+    let (mut restarted, _, _) =
+        build_counting_client_with_storage_and_clock(b"carol", storage, clock);
+    restarted.hydrate_all_stored_groups().unwrap();
+    restarted.set_deferred_peel_limits_for_tests(512, usize::MAX, account_byte_limit);
+    restarted
+}
+
+/// Account-wide byte accounting is reconstructed from durable deferred rows on
+/// every open, so a terminal group's retired backlog must not keep charging the
+/// account across a restart: a live group has to be able to admit the whole
+/// budget afterwards.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn terminal_group_releases_its_account_byte_budget_across_restart() {
+    let (carol, storage, _group_a, _deferred_a, _group_b, template_b, bytes_b) =
+        carol_removed_from_group_a_and_live_in_group_b().await;
+    drop(carol);
+
+    // Exactly two group-B rows worth of account budget.
+    let mut restarted = restart_carol_with_account_budget(storage, bytes_b.saturating_mul(2));
+
+    let second_b = TransportMessage {
+        id: MessageId::new(b"terminal-release-b-0002".to_vec()),
+        ..template_b.clone()
+    };
+    assert!(
+        matches!(
+            restarted.ingest(second_b).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "a live group must be able to spend the whole account byte budget once \
+         the terminal group's rows are retired"
+    );
+
+    let overflow_b = TransportMessage {
+        id: MessageId::new(b"terminal-release-b-0003".to_vec()),
+        ..template_b
+    };
+    assert!(
+        matches!(
+            restarted.ingest(overflow_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "the account budget is still enforced past that point"
+    );
+}
+
+/// The terminal gate in `prepare_convergence_input_advance` is the only
+/// recovery for a crash between a marker site's `removed` record write and its
+/// own deferred-row purge — every marker site writes the record first, and
+/// `realize_self_eviction` early-returns on an already-`removed` record, so
+/// nothing else revisits those rows.
+///
+/// The precondition is reached by running the real removal and then putting
+/// group A's row back to `PeelDeferred`: the single inverse of the step a
+/// crash would have skipped. That is a *state* a crash genuinely leaves — a
+/// retained row behind a `removed` record — not a stubbed mechanism, and the
+/// recovery under test is driven entirely through `advance_convergence`.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn terminal_gate_retires_a_deferred_row_a_crash_left_behind() {
+    let (carol, storage, group_a, deferred_a, _group_b, template_b, bytes_b) =
+        carol_removed_from_group_a_and_live_in_group_b().await;
+    drop(carol);
+    storage
+        .update_message_state(&deferred_a, MessageState::PeelDeferred)
+        .unwrap();
+
+    // Restart so the account budget is recounted from durable rows: group A's
+    // row is charged again, exactly as it would be after the crash.
+    let mut restarted =
+        restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(2));
+    restarted.drain_events();
+
+    restarted.advance_convergence(&group_a).await.unwrap();
+
+    assert_eq!(
+        storage.get_message(&deferred_a).unwrap().state,
+        MessageState::Failed,
+        "one advance through the terminal gate must retire the row a crash \
+         stranded behind the removed marker"
+    );
+    assert!(
+        !restarted
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::TransportObjectResourceRefused { .. })),
+        "the crash-window recovery is as silent as the marker sites"
+    );
+
+    // The budget is really back: group B, already holding one row, can spend
+    // the rest of the two-row account budget. It could not while group A's
+    // stranded row was still charged.
+    let second_b = TransportMessage {
+        id: MessageId::new(b"crash-window-b-0002".to_vec()),
+        ..template_b
+    };
+    assert!(
+        matches!(
+            restarted.ingest(second_b).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "the retired row's account bytes must be released, not just its \
+         durable state flipped"
     );
 }
 
@@ -2156,17 +2506,15 @@ async fn join_epoch_recorded_on_welcome_join() {
     );
 }
 
-/// Seam parity with `replay_buffered_messages` (5ae9a440): the deferred-peel
-/// sweep must NOT relabel `Processed` a `PeelDeferred` row that
-/// `ingest_group_message` terminalized during the sweep. The reachable case is
-/// `SelfEvicted`: a future-epoch commit sits `PeelDeferred`; once our own leaf
-/// is removed the group is `!is_active` (still `Stable`, not quarantined), so
-/// re-ingesting the deferred row hits the `!is_active` gate, which persists it
-/// `Failed`. That ingest-committed verdict is authoritative — sweeping it back
-/// to `Processed` would feed a row we were evicted on into canonicalization
-/// (`openmls_projection` / `distributed_convergence` select on `Processed`).
-#[tokio::test]
-async fn deferred_peel_self_evicted_row_stays_failed_not_swept_processed() {
+/// Carol holds one future-epoch `PeelDeferred` commit and is then removed by
+/// alice's commit, which she applies through the ordinary ingest seam. Returns
+/// carol, her storage, the group, and the retained future commit.
+async fn carol_removed_while_holding_a_future_epoch_deferred_row() -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    TransportMessage,
+) {
     // alice (admin) removes carol; bob keeps the group non-trivial afterwards.
     let (mut alice, _alice_storage) = build_client(b"alice-deferred-self-evict");
     let (mut bob, _bob_storage) = build_client(b"bob-deferred-self-evict");
@@ -2255,14 +2603,560 @@ async fn deferred_peel_self_evicted_row_stays_failed_not_swept_processed() {
         "carol must have been evicted by the removal"
     );
 
-    // The deferred future-commit row re-ingests against the inactive group →
-    // `SelfEvicted`, so ingest persists it `Failed`. Regression: the sweep must
-    // not clobber that `Failed` back to `Processed`.
-    carol.retry_deferred_peels(&group_id).await.unwrap();
+    (carol, carol_storage, group_id, future_commit)
+}
+
+/// A removed copy holds no deferred-peel backlog. The commit that evicted this
+/// device's leaf is the last moment a sweep can ever run for the group, so the
+/// removal itself owes the retirement — with no `retry_deferred_peels` call and
+/// no refusal event.
+#[tokio::test]
+async fn removal_retires_deferred_peel_rows_without_refusal() {
+    let (mut carol, carol_storage, group_id, future_commit) =
+        carol_removed_while_holding_a_future_epoch_deferred_row().await;
+
+    assert!(
+        carol_storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty(),
+        "a removed copy must leave no deferred-peel row holding account byte \
+         budget and row slots nothing can ever release"
+    );
     assert_eq!(
         carol_storage.get_message(&future_commit.id).unwrap().state,
         MessageState::Failed,
-        "a row we were evicted on must stay Failed after the deferred-peel \
-         sweep, not be swept into canonicalization as Processed"
+        "the retired row leaves the retry lifecycle"
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::TransportObjectResourceRefused { .. })),
+        "retiring a terminal group's backlog must be silent"
+    );
+}
+
+/// Seam parity with `replay_buffered_messages` (5ae9a440): the deferred-peel
+/// sweep must NOT relabel `Processed` a row that `ingest_group_message`
+/// terminalized *during* the sweep. The group here stays live and
+/// non-terminal, so the sweep really does enumerate and re-ingest the row —
+/// the reachable terminal verdict is app-message retention: the row was
+/// retained while its epoch was in the future, and by the time a changed peel
+/// context makes it readable the group has moved more than
+/// `max_past_epochs` beyond it, so OpenMLS reports it too distant in the past
+/// and ingest persists `Failed`. That ingest-committed verdict is
+/// authoritative — sweeping it back to `Processed` would feed an
+/// unauthenticated row into canonicalization (`openmls_projection` /
+/// `distributed_convergence` select on `Processed`).
+#[tokio::test]
+async fn deferred_peel_row_terminalized_by_ingest_stays_failed_not_swept_processed() {
+    let (mut alice, _alice_storage) = build_client(b"alice-sweep-terminal");
+    let (mut carol, carol_storage, _carol_peeler) = build_counting_client(b"carol-sweep-terminal");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "sweep-terminal".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol-sweep-terminal"))
+        .await
+        .unwrap();
+    carol.drain_events();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    let commit = async |alice: &mut Engine<SqliteAccountStorage>, label: &str| {
+        let (msg, pending) = evolution(
+            alice
+                .send(SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some(label.to_string()),
+                    description: None,
+                })
+                .await
+                .unwrap(),
+        );
+        alice.confirm_published(pending).await.unwrap();
+        route(msg, &group_id)
+    };
+
+    // One commit takes alice to epoch 2; the app message is sealed there —
+    // inside carol's membership, so this is app retention, not the
+    // pre-membership classification. Carol, still at epoch 1, cannot peel it.
+    let mut commits = vec![commit(&mut alice, "alice-edit-0").await];
+    let deferred_app = send_app(&mut alice, &group_id, "readable only far too late").await;
+    assert!(matches!(
+        carol.ingest(deferred_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+
+    // Eight more commits carry the group `max_past_epochs` (5) and then some
+    // beyond the app message's epoch before carol catches up.
+    for index in 1..9 {
+        commits.push(commit(&mut alice, &format!("alice-edit-{index}")).await);
+    }
+    for commit in commits {
+        carol.ingest(commit).await.unwrap();
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(10));
+    assert_eq!(
+        carol_storage.get_message(&deferred_app.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "precondition: the sweep must have a row to enumerate and re-ingest"
+    );
+
+    carol.drain_events();
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage.get_message(&deferred_app.id).unwrap().state,
+        MessageState::Failed,
+        "a row ingest terminalized inside the sweep must stay Failed, not be \
+         swept into canonicalization as Processed"
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::TransportObjectResourceRefused { .. })),
+        "the Failed verdict came from ingest's classification, not from a \
+         residence or retry-budget refusal"
+    );
+    assert!(
+        !carol.group_record(&group_id).unwrap().is_terminal(),
+        "the guard only means something on a live, non-terminal group"
+    );
+}
+
+/// The public background advance used to multiply the 64-row sweep allowance
+/// by its outer reprocessing loop. One call must now return with a durable
+/// partial generation, and restart must be able to finish every retained row.
+#[tokio::test]
+async fn background_advance_bounds_work_across_sweeps_and_resumes_after_restart() {
+    let (mut engine, storage, group_id, _peer) = contested_rival_app_backlog(192).await;
+    engine.advance_convergence(&group_id).await.unwrap();
+    let remaining = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len();
+    assert!(
+        (128..192).contains(&remaining),
+        "one background call must process at most 64 rows and make progress: {remaining}"
+    );
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_some()
+    );
+    drop(engine);
+    let mut restarted =
+        build_epoch_sealed_client_with_storage(b"candidate-cache-incumbent", storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    for _ in 0..12 {
+        restarted.advance_convergence(&group_id).await.unwrap();
+        if storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+    }
+    panic!("bounded calls must eventually finish the durable backlog after restart");
+}
+
+/// A slow but finite peeler must finish its current row and then give control
+/// back to the host, rather than using the whole 64-row allowance past deadline.
+#[tokio::test]
+async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
+    let peeler = CancellableEpochSealedPeeler::new();
+    let (mut engine, storage, group_id, _peer) =
+        contested_rival_app_backlog_with_peeler(64, peeler.clone()).await;
+    peeler.delay_ms.store(40, Ordering::SeqCst);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine.advance_convergence(&group_id),
+    )
+    .await
+    .expect("background call should stop cooperatively")
+    .unwrap();
+    let remaining = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len();
+    assert!(
+        (1..64).contains(&remaining),
+        "elapsed budget must return with partial durable progress: {remaining}"
+    );
+    peeler.delay_ms.store(0, Ordering::SeqCst);
+    for _ in 0..8 {
+        engine.advance_convergence(&group_id).await.unwrap();
+        if storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+    }
+    panic!("budget yield must not abandon remaining rows");
+}
+
+/// Explicit-time callers must finish the same row slice even when peels take
+/// longer than the production wall budget. The next slice remains row-bounded.
+#[tokio::test]
+async fn explicit_time_advance_ignores_wall_budget_but_keeps_row_bound() {
+    let peeler = CancellableEpochSealedPeeler::new();
+    let (mut engine, storage, group_id, _peer) =
+        contested_rival_app_backlog_with_peeler(96, peeler.clone()).await;
+    peeler.delay_ms.store(10, Ordering::SeqCst);
+    engine
+        .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let remaining = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len();
+    assert_eq!(
+        remaining, 32,
+        "elapsed wall time must not change the 64-row slice"
+    );
+    peeler.delay_ms.store(0, Ordering::SeqCst);
+    for _ in 0..8 {
+        engine
+            .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+            .await
+            .unwrap();
+        if storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+    }
+    panic!("deterministic slices must finish retained work");
+}
+
+/// Opaque future messages all try the same retained past anchor. Snapshot
+/// materialization must be proportional to anchors in the sweep, not rows.
+#[tokio::test]
+async fn historical_peel_context_materialization_is_amortized_within_a_sweep() {
+    use cgka_traits::storage::{GroupStorage, StorageProvider};
+    let mut write_counts = Vec::new();
+    for backlog in [1, 32] {
+        let (mut alice, mut carol, storage, peeler, group_id, commit2, _commit3) =
+            carol_behind_two_epochs().await;
+        carol.ingest(commit2).await.unwrap();
+        assert_eq!(storage.get_group(&group_id).unwrap().epoch, EpochId(2));
+        let template = send_app(&mut alice, &group_id, "future opaque workload").await;
+        let mut ids = Vec::new();
+        for index in 0..backlog {
+            let wrapped = TransportMessage {
+                id: MessageId::new(format!("past-cache-{index}").into_bytes()),
+                ..template.clone()
+            };
+            ids.push((wrapped.id.clone(), 0));
+            assert!(matches!(
+                carol.ingest(wrapped).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ));
+        }
+        for (id, attempts) in &mut ids {
+            *attempts = peeler.attempts_for(id);
+        }
+        let mut snapshots_before = storage.list_group_snapshots(&group_id).unwrap();
+        snapshots_before.sort();
+        let before = storage.mls_write_generation().unwrap();
+        carol.retry_deferred_peels(&group_id).await.unwrap();
+        let writes = storage.mls_write_generation().unwrap() - before;
+        assert!(
+            writes > 0,
+            "the sweep must actually materialize a historical anchor"
+        );
+        for (id, attempts) in ids {
+            assert!(
+                peeler.attempts_for(&id) >= attempts + 2,
+                "each row must try live and historical contexts"
+            );
+        }
+        assert_eq!(storage.get_group(&group_id).unwrap().epoch, EpochId(2));
+        let mut snapshots_after = storage.list_group_snapshots(&group_id).unwrap();
+        snapshots_after.sort();
+        assert_eq!(
+            snapshots_after, snapshots_before,
+            "temporary restore guards must be released"
+        );
+        assert_eq!(
+            storage
+                .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+                .unwrap()
+                .len(),
+            backlog
+        );
+        write_counts.push(writes);
+    }
+    assert_eq!(
+        write_counts[0], write_counts[1],
+        "32 failed peels must materialize the same anchor only once, like one failed peel"
+    );
+}
+
+/// A failed opaque sweep must do real decryption work and persist attempts,
+/// without repeating the group-history classification only live ingest reports.
+#[tokio::test]
+async fn opaque_retry_batch_does_not_repeat_live_lineage_classification() {
+    let (mut alice, mut carol, storage, peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let template = send_app(&mut alice, &group_id, "future opaque batch").await;
+    let classifications_before = carol.engine_metrics().deferred_lineage_classifications;
+    let mut rows = Vec::new();
+    for index in 0..32 {
+        let wrapped = TransportMessage {
+            id: MessageId::new(format!("lineage-scan-{index}").into_bytes()),
+            ..template.clone()
+        };
+        assert!(matches!(
+            carol.ingest(wrapped.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        rows.push((wrapped.id.clone(), peeler.attempts_for(&wrapped.id)));
+    }
+    let classifications = carol.engine_metrics().deferred_lineage_classifications;
+    assert_eq!(classifications - classifications_before, 32);
+    assert_eq!(carol.retry_deferred_peels(&group_id).await.unwrap(), 0);
+    for (id, attempts) in rows {
+        assert!(peeler.attempts_for(&id) > attempts, "each row was retried");
+        let retained = storage.get_message(&id).unwrap();
+        assert_eq!(retained.state, MessageState::PeelDeferred);
+        assert_eq!(retained.deferred_peel.unwrap().distinct_context_attempts, 1);
+    }
+    assert_eq!(
+        carol.engine_metrics().deferred_lineage_classifications,
+        classifications,
+        "the sweep must not rescan the stored graph for each discarded lineage"
+    );
+}
+
+/// Current-profile client on caller-supplied storage and clock, so terminal
+/// group lifecycles (disband) can be driven under an epoch-gated peeler.
+#[cfg(feature = "test-policy-overrides")]
+fn build_current_gated_client<P>(
+    name: &[u8],
+    peeler: P,
+    storage: SqliteAccountStorage,
+    clock: ManualConvergenceClock,
+) -> Engine<SqliteAccountStorage>
+where
+    P: TransportPeeler + 'static,
+{
+    let mut engine = EngineBuilder::new(storage)
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+        .peeler(Box::new(peeler))
+        .convergence_clock(Arc::new(clock))
+        .build()
+        .unwrap();
+    engine
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    engine
+}
+
+/// Alice (admin) holds one future-epoch `PeelDeferred` row plus a durable
+/// disband request. Bob runs five epochs ahead of her, so the retained row
+/// stays unpeelable at every epoch alice reaches — including the epoch her own
+/// disband commit lands in. The returned catch-up commits are the two bob
+/// commits alice can still apply.
+#[cfg(feature = "test-policy-overrides")]
+async fn alice_disbanding_with_future_epoch_deferred_row() -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    CountingEpochGatePeeler,
+    ManualConvergenceClock,
+    GroupId,
+    TransportMessage,
+    Vec<TransportMessage>,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let peeler = CountingEpochGatePeeler::new();
+    let mut alice = build_current_gated_client(
+        b"alice-disband-deferred",
+        peeler.clone(),
+        storage.clone(),
+        clock.clone(),
+    );
+    let mut bob = build_current_gated_client(
+        b"bob-disband-deferred",
+        CountingEpochGatePeeler::new(),
+        SqliteAccountStorage::in_memory().unwrap(),
+        ManualConvergenceClock::new(0, 10_000),
+    );
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "disband-deferred".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id(), bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcomes = match created {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for(&welcomes, b"bob-disband-deferred"))
+        .await
+        .unwrap();
+    alice.drain_events();
+
+    // Five bob commits at source epochs 0..=4. Alice applies the first two
+    // and never sees the rest, so the fifth is four epochs beyond her.
+    let mut commits = Vec::new();
+    for index in 0..5 {
+        let (msg, pending) = evolution(
+            bob.send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("bob-edit-{index}")),
+                description: None,
+            })
+            .await
+            .unwrap(),
+        );
+        bob.confirm_published(pending).await.unwrap();
+        commits.push(route(msg, &group_id));
+    }
+    let deferred = commits.pop().expect("five bob commits");
+    let catchup = vec![commits[0].clone(), commits[1].clone()];
+
+    assert!(matches!(
+        alice.ingest(deferred.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        storage.get_message(&deferred.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the future-epoch commit is retained pending a later peel"
+    );
+
+    alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(alice.disbanding_in_progress(&group_id).unwrap());
+    alice.drain_events();
+
+    (alice, storage, peeler, clock, group_id, deferred, catchup)
+}
+
+/// The retirement is keyed on the tombstone, never on the disbanding window.
+/// Before the tombstone the group is still live — a peer's own disband commit
+/// can itself be one of these retained rows — so the rows must keep their
+/// retry slots through a peer commit and a full advance inside that window.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn deferred_peel_row_in_the_disbanding_window_keeps_its_retry_slot() {
+    let (mut alice, storage, _peeler, _clock, group_id, deferred, catchup) =
+        alice_disbanding_with_future_epoch_deferred_row().await;
+
+    // A peer commit alice can apply, then a full advance: still inside the
+    // disbanding window, which prepares the terminal commit but writes no
+    // tombstone.
+    alice.ingest(catchup[0].clone()).await.unwrap();
+    alice.advance_convergence(&group_id).await.unwrap();
+
+    assert_eq!(
+        storage.get_message(&deferred.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "a row must keep its retry slot until the tombstone is written"
+    );
+    assert!(alice.disbanding_in_progress(&group_id).unwrap());
+    assert!(
+        alice.group_record(&group_id).unwrap().disbanded.is_none(),
+        "no tombstone yet: this is the pre-terminal window"
+    );
+}
+
+/// A disbanded copy holds no deferred-peel backlog. The sweep that releases
+/// those rows only runs for a live `Stable` group, so the settle transaction
+/// that writes the tombstone owes their retirement — silently: the row leaves
+/// the retry lifecycle, it is not refused.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn disband_settle_retires_deferred_peel_rows_without_refusal() {
+    let (mut alice, storage, _peeler, clock, group_id, deferred, catchup) =
+        alice_disbanding_with_future_epoch_deferred_row().await;
+
+    for commit in catchup {
+        alice.ingest(commit).await.unwrap();
+    }
+    let prepared = alice.advance_convergence(&group_id).await.unwrap();
+    let pending = match prepared.as_slice() {
+        [SendResult::GroupEvolution { pending, .. }] => *pending,
+        other => panic!("expected one prepared disband commit, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    for _ in 0..3 {
+        alice.advance_convergence(&group_id).await.unwrap();
+        clock.advance_ms(1_000);
+    }
+    assert!(
+        matches!(
+            alice.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::Disbanded(_))
+        ),
+        "disband did not settle within the bounded convergence passes"
+    );
+    alice.drain_events();
+
+    assert!(
+        storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty(),
+        "the settled tombstone must leave no deferred-peel row holding account \
+         byte budget and row slots nothing can ever release"
+    );
+    assert_eq!(
+        storage.get_message(&deferred.id).unwrap().state,
+        MessageState::Failed,
+        "the retired row leaves the retry lifecycle"
+    );
+
+    // Past the residence deadline the row would have been refused had it
+    // survived; a terminal group must go quiet instead.
+    clock.advance_ms(cgka_engine::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS * 2);
+    alice.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        !alice
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::TransportObjectResourceRefused { .. })),
+        "retiring a terminal group's backlog must be silent"
     );
 }
