@@ -26,6 +26,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- MarmotKit `accountUnreadSummary()` now follows the Unread chat-list eligibility:
+  pending invitations, archived chats, and departed or departing groups do not
+  contribute to account attention. Muted active chats still count; manual unread
+  reminders add conversation attention without inventing message or mention counts.
+  Existing binding layouts are unchanged; invitation badges remain a separate source.
+
 - Account KeyPackage listing now exposes one current relay event per addressable
   slot. `wn keys list` follows that current-slot inventory; `wn keys delete-all
   --confirm` still publishes deletions for every observed relay event, including

@@ -207,6 +207,8 @@ impl AccountManager {
         self.app
             .account_home()
             .set_account_signed_out(&account.label, true)?;
+        // Reaping may wait or fail before cache-drop emits its reset signal.
+        self.app.presentation_signals.catalog_changed();
         if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
             self.start_tracked_worker_reap(
                 &account.account_id_hex,

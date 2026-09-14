@@ -3089,3 +3089,48 @@ async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
     second.accounts().cancel_onboarding(&id).await.unwrap();
     second.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn recovery_sign_out_refreshes_attention_before_worker_reap_finishes() {
+    let (dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    let mut attention = runtime.subscribe_account_attention().await.unwrap();
+    assert_eq!(attention.snapshot.accounts.len(), 1);
+    std::fs::write(
+        dir.path()
+            .join("accounts")
+            .join(&id)
+            .join("onboarding-cancelled.json"),
+        b"unsupported evidence",
+    )
+    .unwrap();
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let mut recovery = Box::pin(manager.recover_onboarding(&id, true));
+    assert!(futures::poll!(&mut recovery).is_pending());
+    hold.wait_until_entered().await;
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    // Cache-drop emits an account reset only AFTER reaping. Sign-out must
+    // invalidate the catalog now, even if that later cleanup fails or stalls.
+    let removed = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = attention.recv().await.unwrap().unwrap();
+            if snapshot.accounts.is_empty() {
+                break;
+            }
+        }
+    })
+    .await;
+    hold.release.notify_one();
+    recovery.await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+    removed.expect("signed-out account must disappear before worker cleanup finishes");
+}
