@@ -345,18 +345,24 @@ where
         let mut lines = BufReader::new(stdout).lines();
         let mut child_status = None;
         let mut post_exit_deadline = None;
+        // Preserve exit polling and its backoff while stdout is active.
+        let child_exit = wait_for_child_and_cleanup(&mut child, &mut process_group);
+        tokio::pin!(child_exit);
         loop {
+            // Buffered lines may complete without touching the I/O driver.
+            // Keep timers and other tasks live even under continuous output.
+            tokio::task::consume_budget().await;
             let line = tokio::select! {
                 biased;
                 _ = sleep_until(post_exit_deadline.unwrap_or(total_deadline)), if post_exit_deadline.is_some() => break,
-                line = lines.next_line() => Some(line),
-                status = wait_for_child_and_cleanup(&mut child, &mut process_group), if child_status.is_none() => {
+                status = &mut child_exit, if child_status.is_none() => {
                     child_status = Some(status.map_err(HarnessError::from)?);
                     post_exit_deadline = Some(Instant::now() + POST_EXIT_DRAIN_TIMEOUT);
                     // The pipe can still contain final events even when its readiness
                     // notification loses the race to exit observation. Drain to EOF.
                     continue;
                 },
+                line = lines.next_line() => Some(line),
                 _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
                         tx.send(RunnerEvent::LivenessUnknown)
@@ -432,8 +438,7 @@ where
         let completion = async {
             let status = match child_status {
                 Some(status) => status,
-                None => wait_for_child_and_cleanup(&mut child, &mut process_group)
-                    .await.map_err(HarnessError::from)?,
+                None => (&mut child_exit).await.map_err(HarnessError::from)?,
             };
             let drain_deadline = post_exit_deadline
                 .unwrap_or_else(|| Instant::now() + POST_EXIT_DRAIN_TIMEOUT);

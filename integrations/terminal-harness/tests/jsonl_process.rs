@@ -440,6 +440,65 @@ exit 23
 }
 
 #[tokio::test]
+async fn continuous_descendant_stdout_does_not_starve_leader_exit() {
+    let _permit = process_test_permit().await;
+    for padding in [0, 4096] {
+        let root = tempfile::tempdir().unwrap();
+        let script = executable_script(
+            root.path(),
+            "continuous-stdout-backend",
+            r#"#!/usr/bin/env python3
+import os, sys, time
+print('{"type":"session","id":"continuous-output"}', flush=True)
+pid = os.fork()
+if pid == 0:
+    while True:
+        os.write(1, (b'{"type":"progress","padding":"' + b'x' * int(sys.argv[1]) + b'"}\n') * 16)
+with open('descendant.pid', 'w') as pid_file:
+    pid_file.write(str(pid))
+time.sleep(0.2)
+os._exit(23)
+"#,
+        );
+        let (tx, _rx) = mpsc::channel(2);
+        let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+        spec.args.push(padding.to_string());
+        spec.total_timeout = Duration::from_secs(5);
+        spec.idle_timeout = Duration::from_secs(5);
+        let mut progress_events = 0;
+        let result = run_jsonl_process(spec, tx, |line| {
+            let event = parse_event(line)?;
+            if matches!(event, ParsedEvent::Ignored) {
+                progress_events += 1;
+                // Keep stdout buffered and ready across select iterations, even
+                // on a host that schedules the writer infrequently.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok::<_, serde_json::Error>(event)
+        })
+        .await;
+        let pid = fs::read_to_string(root.path().join("descendant.pid")).unwrap();
+        let exited = wait_for_process_exit(pid.trim()).await;
+        if !exited {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid.trim()])
+                .status();
+        }
+        assert!(exited, "continuous stdout writer survived leader exit");
+        let outcome = result.expect("leader exit must be observed before the total timeout");
+        assert_eq!(outcome.exit_code, Some(23));
+        assert_eq!(
+            outcome.observed_session.as_deref(),
+            Some("continuous-output")
+        );
+        assert!(
+            progress_events > 0,
+            "fixture did not exercise continuous stdout"
+        );
+    }
+}
+
+#[tokio::test]
 async fn exited_leader_with_inherited_stderr_is_cleaned_up() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();
