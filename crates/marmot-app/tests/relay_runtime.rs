@@ -10782,9 +10782,8 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
-/// mdk#1451: startup replay uses one live FIFO. A read may be served during
-/// deferred Welcome fanout only when no earlier mutation remains; otherwise it
-/// waits and observes that mutation's result.
+/// mdk#1803: snapshot reads bypass queued mutations during Welcome fanout.
+/// After the queued mutation completes, fresh reads observe its result.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanout() {
@@ -10875,14 +10874,23 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
     let read_runtime = runtime.clone();
     let read_alice_id = alice_id.clone();
     let read_group_id = group_id.clone();
-    let mut read = tokio::spawn(async move {
+    let read = tokio::spawn(async move {
         read_runtime
             .group_members(&read_alice_id, &read_group_id)
             .await
     });
+    let members = timeout(Duration::from_secs(2), read)
+        .await
+        .expect("snapshot read must bypass the startup-deferred remove")
+        .expect("read task should not panic")
+        .expect("snapshot members should remain readable");
     assert!(
-        timeout(Duration::from_secs(2), &mut read).await.is_err(),
-        "live read must not bypass the earlier startup-deferred remove"
+        members.iter().any(|member| member.member_id_hex == bob_id),
+        "snapshot must retain the member whose removal is still queued"
+    );
+    assert!(
+        !remove.is_finished(),
+        "removal must wait for Welcome fanout"
     );
 
     let mut events = runtime.subscribe();
@@ -10892,11 +10900,13 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
         .expect("deferred remove should run after Welcome fanout")
         .expect("deferred remove task should not panic")
         .expect("deferred remove should succeed");
-    let members = timeout(Duration::from_secs(5), read)
-        .await
-        .expect("read should run after the earlier deferred remove")
-        .expect("read task should not panic")
-        .expect("group members should remain readable");
+    let members = timeout(
+        Duration::from_secs(5),
+        runtime.group_members(&alice_id, &group_id),
+    )
+    .await
+    .expect("read should run after the earlier deferred remove")
+    .expect("group members should remain readable");
     assert!(
         members.iter().all(|member| member.member_id_hex != bob_id),
         "read must observe the earlier startup-deferred remove"

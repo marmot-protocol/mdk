@@ -1166,7 +1166,7 @@ async fn run_app_runtime_account_worker(
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
-                // Mutations and reads behind them retain worker FIFO order.
+                // Mutations retain worker FIFO order; reads use the snapshot.
                 let read_snapshot = capture_group_read_snapshot(
                     &client,
                     &events,
