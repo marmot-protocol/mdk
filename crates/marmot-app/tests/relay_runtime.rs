@@ -10502,6 +10502,20 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     .await
     .expect("same-account post-create projection reads must not queue behind Welcome fanout")
     .expect("founder membership should be readable while Welcome is blocked");
+    timeout(Duration::from_secs(2), async {
+        while runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .group_create_subscription_refresh
+            .successes
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("subscription registration must finish while Welcome publication is blocked");
     let alice_group = app
         .groups(&alice.account.label)
         .unwrap()

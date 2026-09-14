@@ -19,11 +19,15 @@ use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
-use cgka_traits::{EngineError, GroupId, MessageId, SecretBytes, TransportEndpoint};
+use cgka_traits::{
+    EngineError, GroupId, MessageId, SecretBytes, TransportAdapter, TransportEndpoint,
+    TransportGroupSync,
+};
 #[cfg(test)]
 use futures::StreamExt;
 use marmot_account::{
     AccountError, CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
+    TransportRoutingPolicy,
 };
 use marmot_forensics::AuditEventContext;
 use nostr::NostrSigner;
@@ -1395,19 +1399,6 @@ impl AppClient {
             .create_group_with_options_and_optional_telemetry(name, member_refs, options, None)
             .await?;
         self.drive_unpublished_welcome_delivery(None).await;
-        // Direct `AppClient` callers do not have the managed account worker to
-        // refresh subscriptions after its response. Preserve that API's
-        // historical readiness guarantee; the managed runtime uses the
-        // telemetry-aware entry point below and performs this step after
-        // replying so it stays off the user-visible latency boundary.
-        if let Err(error) = self.sync_runtime_groups().await {
-            tracing::warn!(
-                target: "marmot_app::client",
-                method = "create_group",
-                error_kind = error.privacy_safe_kind(),
-                "confirmed group creation could not refresh subscriptions immediately"
-            );
-        }
         Ok(created.group_id)
     }
 
@@ -5613,6 +5604,24 @@ impl AppClient {
         Ok(())
     }
 
+    /// Warm the encrypted-media epoch-secret cache around a subscription sync,
+    /// recording the aggregate pass shape so idle steady-state passes are
+    /// provably free of authoritative (`MlsGroup::load`) re-checks (mdk#1380).
+    fn warm_encrypted_media_epoch_secrets(&mut self, phase: &'static str) {
+        let stats = self.cache_current_encrypted_media_epoch_secrets();
+        tracing::debug!(
+            target: "marmot_app::media",
+            method = "warm_encrypted_media_epoch_secrets",
+            phase,
+            groups_considered = stats.groups_considered,
+            skipped_unchanged_epoch = stats.skipped_unchanged_epoch,
+            authoritative_checks = stats.authoritative_checks,
+            warmed = stats.warmed,
+            failures = stats.failures,
+            "encrypted media epoch-secret warm pass"
+        );
+    }
+
     /// Publish Welcome obligations stashed at the canonical create/invite
     /// boundary. Managed workers call this after replying; direct AppClient
     /// callers still await it so existing tests keep a complete delivery path.
@@ -5628,21 +5637,58 @@ impl AppClient {
                 effects,
                 welcome_intents,
             } => {
-                let welcome_publish_started_at = Instant::now();
-                let publish_result = self
-                    .runtime
-                    .publish_prepared_session_effects_with_audit_context(
-                        effects,
-                        work.audit_context.clone(),
-                    )
-                    .await
-                    .map_err(AppError::from);
-                record_app_performance(
-                    telemetry,
-                    AppPerformanceOperation::GroupCreateWelcomePublish,
-                    welcome_publish_started_at.elapsed(),
-                    publish_result.is_ok(),
-                );
+                // The canonical group already populated routing. Its REQs and
+                // founding Welcome publication can progress independently.
+                let adapter = self.adapter.clone();
+                let sync = TransportGroupSync {
+                    account_id: adapter.account_id().clone(),
+                    group_subscriptions: self.routing.group_subscriptions(),
+                    since: self.subscription_rebuild_since(),
+                };
+                self.pending_runtime_group_subscription_refresh = true;
+                let register = async {
+                    let started = Instant::now();
+                    let result = adapter
+                        .sync_account_groups(sync)
+                        .await
+                        .map_err(AppError::from);
+                    record_app_performance(
+                        telemetry,
+                        AppPerformanceOperation::GroupCreateSubscriptionRefresh,
+                        started.elapsed(),
+                        result.is_ok(),
+                    );
+                    result
+                };
+                let publish = async {
+                    let started = Instant::now();
+                    let result = self
+                        .runtime
+                        .publish_prepared_session_effects_with_audit_context(
+                            effects,
+                            work.audit_context.clone(),
+                        )
+                        .await
+                        .map_err(AppError::from);
+                    record_app_performance(
+                        telemetry,
+                        AppPerformanceOperation::GroupCreateWelcomePublish,
+                        started.elapsed(),
+                        result.is_ok(),
+                    );
+                    result
+                };
+                let (publish_result, registered) = tokio::join!(publish, register);
+                self.pending_runtime_group_subscription_refresh = registered.is_err();
+                match registered {
+                    Ok(()) => self.warm_encrypted_media_epoch_secrets("post_subscription_sync"),
+                    Err(error) => tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "create_group_subscription_refresh",
+                        error_kind = error.privacy_safe_kind(),
+                        "confirmed group creation could not refresh subscriptions immediately"
+                    ),
+                }
                 let effects = recover_post_canonical_result(
                     "publish_prepared_founding_group",
                     publish_result,
