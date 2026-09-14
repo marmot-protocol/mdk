@@ -2,6 +2,7 @@ import asyncio
 from contextlib import suppress
 import importlib.util
 import json
+import logging
 import sys
 import tempfile
 import types
@@ -916,21 +917,52 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
     async def test_chat_info_uses_marmot_group_metadata(self):
+        calls = []
+
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                calls.append((account_id_hex, group_id_hex))
+                return {
+                    "type": "group_info",
+                    "account_id_hex": account_id_hex,
+                    "group_id_hex": group_id_hex,
+                    "member_count": 3,
+                    "is_direct": False,
+                    "subject": "  Café ☕  ",
+                }
+
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),
-            client=object(),
+            client=FakeClient(),
         )
 
-        info = await adapter.get_chat_info("22" * 32)
+        info = await adapter.get_chat_info("0x" + "22" * 32)
 
         self.assertEqual(
             info,
             {
-                "name": "Marmot 222222222222",
+                "name": "Café ☕",
                 "type": "group",
                 "id": "22" * 32,
             },
         )
+        self.assertEqual(calls, [("11" * 32, "22" * 32)])
+
+    async def test_chat_info_rejects_invalid_group_hex(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=object(),
+        )
+        with self.assertRaisesRegex(
+            self.adapter_module.AgentControlError,
+            "chat_id must be hexadecimal",
+        ):
+            await adapter.get_chat_info("not-hex")
+        with self.assertRaisesRegex(
+            self.adapter_module.AgentControlError,
+            "chat_id must not be empty",
+        ):
+            await adapter.get_chat_info("")
 
     async def test_invalid_explicit_account_hex_is_rejected(self):
         with self.assertRaisesRegex(
@@ -5643,18 +5675,31 @@ class GroupActivationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mention_pattern_triggers_turn(self):
         class FakeClient:
-            async def group_info(self, account_id_hex, group_id_hex):
-                raise AssertionError("group_info should not run when mention pattern matches")
+            def __init__(self):
+                self.group_info_calls = []
 
+            async def group_info(self, account_id_hex, group_id_hex):
+                self.group_info_calls.append((account_id_hex, group_id_hex))
+                return {
+                    "type": "group_info",
+                    "account_id_hex": account_id_hex,
+                    "group_id_hex": group_id_hex,
+                    "member_count": 3,
+                    "is_direct": False,
+                    "subject": "Named Room",
+                }
+
+        client = FakeClient()
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(
                 extra={
                     "account_id_hex": "11" * 32,
                     "group_activation": "mention",
                     "mention_patterns": ["marvin"],
+                    "profile_name_onboarding": False,
                 }
             ),
-            client=FakeClient(),
+            client=client,
         )
         adapter.handle_message = unittest.mock.AsyncMock()
 
@@ -5669,6 +5714,13 @@ class GroupActivationTests(unittest.IsolatedAsyncioTestCase):
         }
         await adapter._dispatch_inbound_message(event)
         adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.await_args.args[0]
+        self.assertEqual(dispatched.source.chat_name, "Named Room")
+        self.assertEqual(dispatched.source.chat_id, "22" * 32)
+        self.assertEqual(dispatched.source.user_id, "44" * 32)
+        # Activation still short-circuits (a 3-member group would otherwise skip).
+        # The later display lookup is the legitimate group_info call.
+        self.assertEqual(client.group_info_calls, [("11" * 32, "22" * 32)])
 
 
 class ConfigResolutionTests(unittest.TestCase):
@@ -6052,6 +6104,612 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await queue.join()
+
+
+class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
+    ACCOUNT = "11" * 32
+    ACCOUNT_B = "aa" * 32
+    GROUP_16 = "ab" * 16
+    GROUP_LONG = "cd" * 32
+    PREFIX = "aabbccddeeff"
+    GROUP_PREFIX_A = PREFIX + "11" * 10
+    GROUP_PREFIX_B = PREFIX + "22" * 10
+    SENDER = "44" * 32
+    MESSAGE = "33" * 32
+
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
+        self.server = None
+
+    async def asyncTearDown(self):
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+        self.tempdir.cleanup()
+
+    async def start_server(self, handler):
+        self.server = await asyncio.start_unix_server(handler, path=self.socket_path)
+
+    def make_adapter(self, client, extra=None):
+        payload = {
+            "account_id_hex": self.ACCOUNT,
+            "profile_name_onboarding": False,
+        }
+        if extra:
+            payload.update(extra)
+        return self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=payload),
+            client=client,
+        )
+
+    def real_client_adapter(self, extra=None):
+        return self.make_adapter(
+            self.adapter_module.MarmotAgentControlClient(self.socket_path),
+            extra=extra,
+        )
+
+    def capture_logs(self):
+        records = []
+        handler = logging.Handler()
+        handler.setLevel(logging.DEBUG)
+        handler.emit = lambda record: records.append(record.getMessage())
+        logger = self.adapter_module.logger
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.DEBUG)
+        return records, handler, previous
+
+    def stop_logs(self, handler, previous):
+        logger = self.adapter_module.logger
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    def fallback(self, group_id_hex):
+        return f"Marmot {group_id_hex[:12]}"
+
+    def group_info_payload(self, account_id_hex, group_id_hex, subject, **kwargs):
+        payload = {
+            "type": kwargs.get("type", "group_info"),
+            "account_id_hex": account_id_hex,
+            "group_id_hex": group_id_hex,
+            "member_count": kwargs.get("member_count", 3),
+            "is_direct": kwargs.get("is_direct", False),
+        }
+        if not kwargs.get("omit_subject"):
+            payload["subject"] = subject
+        return payload
+
+    async def test_invalid_subjects_and_envelopes_use_exact_fallback(self):
+        cases = [
+            None,
+            "",
+            "   ",
+            12,
+            {"name": "nested"},
+        ]
+        class FakeClient:
+            def __init__(self, subject):
+                self.subject = subject
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return self.group_info_payload(
+                    account_id_hex, group_id_hex, self.subject
+                )
+
+        FakeClient.group_info_payload = self.group_info_payload
+        for subject in cases:
+            adapter = self.make_adapter(FakeClient(subject))
+            info = await adapter.get_chat_info(self.GROUP_16)
+            self.assertEqual(info["name"], self.fallback(self.GROUP_16), subject)
+            self.assertEqual(info["type"], "group")
+            self.assertEqual(info["id"], self.GROUP_16)
+
+        class BadShapeClient:
+            def __init__(self, response):
+                self.response = response
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return self.response
+
+        for response in (
+            ["group_info"],
+            {"type": "account_list", "account_id_hex": self.ACCOUNT, "group_id_hex": self.GROUP_16, "subject": "Nope"},
+            {"account_id_hex": self.ACCOUNT, "group_id_hex": self.GROUP_16, "subject": "Nope"},
+            self.group_info_payload(self.ACCOUNT_B, self.GROUP_16, "Wrong account"),
+            self.group_info_payload(self.ACCOUNT, self.GROUP_LONG, "Wrong group"),
+            self.group_info_payload(self.ACCOUNT, self.GROUP_16, "Named", type="final_sent"),
+        ):
+            info = await self.make_adapter(BadShapeClient(response)).get_chat_info(self.GROUP_16)
+            self.assertEqual(info["name"], self.fallback(self.GROUP_16), response)
+
+    async def test_real_client_decodes_named_and_invalid_control_replies(self):
+        requests = []
+        script = [
+            self.group_info_payload(self.ACCOUNT, self.GROUP_16, "  Socket Name  "),
+            b"{not-json\n",
+            {
+                "marmot_agent_control": "wrong.protocol",
+                "type": "group_info",
+                "account_id_hex": self.ACCOUNT,
+                "group_id_hex": self.GROUP_16,
+                "subject": "Leaked",
+            },
+            {
+                "marmot_agent_control": "marmot.agent-control.v2",
+                "type": "error",
+                "code": "unknown_group",
+                "message": f"missing account={self.ACCOUNT} group={self.GROUP_16} subject=SecretName",
+            },
+        ]
+
+        async def socket_handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            reply = script.pop(0)
+            if isinstance(reply, bytes):
+                writer.write(reply)
+                await writer.drain()
+            else:
+                reply = dict(reply)
+                reply.setdefault("id", request["id"])
+                reply.setdefault("marmot_agent_control", "marmot.agent-control.v2")
+                await write_json_line(writer, reply)
+            writer.close()
+
+        names = []
+        logs, log_handler, previous = self.capture_logs()
+        try:
+            await self.start_server(socket_handler)
+            adapter = self.real_client_adapter()
+            for _ in range(4):
+                names.append((await adapter.get_chat_info(self.GROUP_16))["name"])
+        finally:
+            self.stop_logs(log_handler, previous)
+
+        self.assertEqual(
+            names,
+            [
+                "Socket Name",
+                self.fallback(self.GROUP_16),
+                self.fallback(self.GROUP_16),
+                self.fallback(self.GROUP_16),
+            ],
+        )
+        self.assertEqual(
+            [(item["type"], item["account_id_hex"], item["group_id_hex"]) for item in requests],
+            [("group_info", self.ACCOUNT, self.GROUP_16)] * 4,
+        )
+        joined = "\n".join(logs)
+        self.assertNotIn(self.ACCOUNT, joined)
+        self.assertNotIn(self.GROUP_16, joined)
+        self.assertNotIn("SecretName", joined)
+        self.assertNotIn("Leaked", joined)
+
+    async def test_account_selection_and_timeouts(self):
+        class SoleClient:
+            async def account_list(self):
+                return {
+                    "type": "account_list",
+                    "accounts": [
+                        {"account_id_hex": self_outer.ACCOUNT_B, "local_signing": False},
+                        {"account_id_hex": self_outer.ACCOUNT, "local_signing": True},
+                    ],
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                self.called_as = account_id_hex
+                return self_outer.group_info_payload(account_id_hex, group_id_hex, "Sole")
+
+        self_outer = self
+        sole = SoleClient()
+        adapter = self.make_adapter(sole, extra={"account_id_hex": None})
+        adapter.account_id_hex = None
+        info = await adapter.get_chat_info(self.GROUP_LONG)
+        self.assertEqual(info["name"], "Sole")
+        self.assertEqual(info["id"], self.GROUP_LONG)
+        self.assertEqual(sole.called_as, self.ACCOUNT)
+
+        class EmptyClient:
+            async def account_list(self):
+                return {"type": "account_list", "accounts": []}
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                raise AssertionError("group_info must not run without an account")
+
+        empty_adapter = self.make_adapter(EmptyClient(), extra={"account_id_hex": None})
+        empty_adapter.account_id_hex = None
+        info = await empty_adapter.get_chat_info(self.GROUP_16)
+        self.assertEqual(info["name"], self.fallback(self.GROUP_16))
+
+        class AmbiguousClient:
+            async def account_list(self):
+                return {
+                    "type": "account_list",
+                    "accounts": [
+                        {"account_id_hex": self_outer.ACCOUNT, "local_signing": True},
+                        {"account_id_hex": self_outer.ACCOUNT_B, "local_signing": True},
+                    ],
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                raise AssertionError("group_info must not run when accounts are ambiguous")
+
+        adapter = self.make_adapter(AmbiguousClient(), extra={"account_id_hex": None})
+        adapter.account_id_hex = None
+        info = await adapter.get_chat_info(self.GROUP_16)
+        self.assertEqual(info["name"], self.fallback(self.GROUP_16))
+
+        class StallAccount:
+            async def account_list(self):
+                await asyncio.sleep(3600)
+                return {"type": "account_list", "accounts": []}
+
+        with unittest.mock.patch.object(self.adapter_module, "CHAT_INFO_TIMEOUT_S", 0.05):
+            adapter = self.make_adapter(StallAccount(), extra={"account_id_hex": None})
+            adapter.account_id_hex = None
+            info = await adapter.get_chat_info(self.GROUP_16)
+        self.assertEqual(info["name"], self.fallback(self.GROUP_16))
+
+        class StallControl:
+            async def group_info(self, account_id_hex, group_id_hex):
+                await asyncio.sleep(3600)
+                return {}
+
+        with unittest.mock.patch.object(self.adapter_module, "CHAT_INFO_TIMEOUT_S", 0.05):
+            info = await self.make_adapter(StallControl()).get_chat_info(self.GROUP_16)
+        self.assertEqual(info["name"], self.fallback(self.GROUP_16))
+
+    async def test_cancellation_propagates_and_lookup_cleans_up(self):
+        class FakeClient:
+            def __init__(self):
+                self.cancelled = False
+                self.started = asyncio.Event()
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                self.started.set()
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+
+        client = FakeClient()
+        adapter = self.make_adapter(client)
+        task = asyncio.create_task(adapter.get_chat_info(self.GROUP_16))
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        self.assertTrue(client.cancelled)
+
+    async def test_same_adapter_refreshes_current_name_each_lookup(self):
+        subjects = ["Alpha", "Beta", "   ", "error", "Gamma"]
+
+        class FakeClient:
+            def __init__(self):
+                self.step = 0
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                value = subjects[self.step]
+                self.step += 1
+                if value == "error":
+                    raise self_outer.adapter_module.AgentControlError(
+                        f"control failed account={account_id_hex} group={group_id_hex} subject=Secret",
+                        code="boom",
+                    )
+                return self_outer.group_info_payload(account_id_hex, group_id_hex, value)
+
+        self_outer = self
+        adapter = self.make_adapter(FakeClient())
+        names = [ (await adapter.get_chat_info(self.GROUP_16))["name"] for _ in subjects ]
+        self.assertEqual(
+            names,
+            ["Alpha", "Beta", self.fallback(self.GROUP_16), self.fallback(self.GROUP_16), "Gamma"],
+        )
+
+    async def test_interleaved_groups_accounts_and_duplicate_subjects(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                names = {
+                    (self_outer.ACCOUNT, self_outer.GROUP_PREFIX_A): "Shared Title",
+                    (self_outer.ACCOUNT, self_outer.GROUP_PREFIX_B): "Shared Title",
+                    (self_outer.ACCOUNT_B, self_outer.GROUP_PREFIX_A): "Other Account",
+                    (self_outer.ACCOUNT, self_outer.GROUP_16): "Short Id",
+                    (self_outer.ACCOUNT, self_outer.GROUP_LONG): "Long Id",
+                }
+                return self_outer.group_info_payload(
+                    account_id_hex,
+                    group_id_hex,
+                    names[(account_id_hex, group_id_hex)],
+                )
+
+        self_outer = self
+        adapter = self.make_adapter(FakeClient())
+        first = await adapter.get_chat_info(self.GROUP_PREFIX_A)
+        second = await adapter.get_chat_info(self.GROUP_PREFIX_B)
+        short = await adapter.get_chat_info(self.GROUP_16)
+        long = await adapter.get_chat_info(self.GROUP_LONG)
+        other = await adapter._resolve_chat_name(
+            self.GROUP_PREFIX_A,
+            account_id_hex=self.ACCOUNT_B,
+        )
+        self.assertEqual(first["name"], "Shared Title")
+        self.assertEqual(first["id"], self.GROUP_PREFIX_A)
+        self.assertEqual(second["name"], "Shared Title")
+        self.assertEqual(second["id"], self.GROUP_PREFIX_B)
+        self.assertEqual(short["name"], "Short Id")
+        self.assertEqual(short["id"], self.GROUP_16)
+        self.assertEqual(long["name"], "Long Id")
+        self.assertEqual(long["id"], self.GROUP_LONG)
+        self.assertEqual(other, "Other Account")
+        self.assertEqual(self.GROUP_PREFIX_A[:12], self.GROUP_PREFIX_B[:12])
+        self.assertNotEqual(self.GROUP_PREFIX_A, self.GROUP_PREFIX_B)
+
+    async def test_activated_inbound_uses_current_name_without_changing_targets(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return self_outer.group_info_payload(
+                    account_id_hex,
+                    group_id_hex,
+                    "Inbound Room",
+                    member_count=2,
+                    is_direct=True,
+                )
+
+            async def timeline_list(self, *args, **kwargs):
+                raise self_outer.adapter_module.AgentControlError("no history", code="x")
+
+        self_outer = self
+        adapter = self.make_adapter(FakeClient())
+        adapter.handle_message = unittest.mock.AsyncMock()
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP_16,
+            "message_id_hex": self.MESSAGE,
+            "sender_account_id_hex": self.SENDER,
+            "sender_display_name": "Alice",
+            "text": "hello",
+            "mentions_self": False,
+        }
+        await adapter._dispatch_inbound_message(event)
+        dispatched = adapter.handle_message.await_args.args[0]
+        self.assertEqual(dispatched.source.chat_name, "Inbound Room")
+        self.assertEqual(dispatched.source.chat_id, self.GROUP_16)
+        self.assertEqual(dispatched.source.user_id, self.SENDER)
+        self.assertEqual(dispatched.source.user_name, "Alice")
+        self.assertEqual(dispatched.source.message_id, self.MESSAGE)
+        self.assertEqual(dispatched.message_id, self.MESSAGE)
+
+    async def test_named_two_member_group_keeps_effective_dm_activation(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return self_outer.group_info_payload(
+                    account_id_hex,
+                    group_id_hex,
+                    "Direct Name",
+                    member_count=2,
+                    is_direct=True,
+                )
+
+        self_outer = self
+        adapter = self.make_adapter(
+            FakeClient(),
+            extra={"group_activation": "mention"},
+        )
+        adapter.handle_message = unittest.mock.AsyncMock()
+        await adapter._dispatch_inbound_message(
+            {
+                "type": "inbound_message",
+                "account_id_hex": self.ACCOUNT,
+                "group_id_hex": self.GROUP_16,
+                "message_id_hex": self.MESSAGE,
+                "sender_account_id_hex": self.SENDER,
+                "text": "unaddressed",
+                "mentions_self": False,
+            }
+        )
+        adapter.handle_message.assert_called_once()
+        self.assertEqual(
+            adapter.handle_message.await_args.args[0].source.chat_name,
+            "Direct Name",
+        )
+
+    async def test_rename_event_stays_quiet_and_unaddressed_multiparty_stays_skipped(self):
+        class FakeClient:
+            def __init__(self):
+                self.group_info_calls = []
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                self.group_info_calls.append((account_id_hex, group_id_hex))
+                return self_outer.group_info_payload(
+                    account_id_hex,
+                    group_id_hex,
+                    "Should Not Matter",
+                    member_count=3,
+                    is_direct=False,
+                )
+
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                yield {
+                    "type": "group_state_changed",
+                    "account_id_hex": self_outer.ACCOUNT,
+                    "group_id_hex": self_outer.GROUP_16,
+                    "change": "group_renamed",
+                    "detail": "Crew",
+                }
+
+        self_outer = self
+        client = FakeClient()
+        adapter = self.make_adapter(client, extra={"group_activation": "mention"})
+        adapter.handle_message = unittest.mock.AsyncMock()
+        await adapter._consume_inbound_once(drain=True)
+        adapter.handle_message.assert_not_called()
+        self.assertEqual(client.group_info_calls, [])
+
+        await adapter._dispatch_inbound_message(
+            {
+                "type": "inbound_message",
+                "account_id_hex": self.ACCOUNT,
+                "group_id_hex": self.GROUP_16,
+                "message_id_hex": self.MESSAGE,
+                "sender_account_id_hex": self.SENDER,
+                "text": "hello everyone",
+                "mentions_self": False,
+            }
+        )
+        adapter.handle_message.assert_not_called()
+        self.assertEqual(client.group_info_calls, [(self.ACCOUNT, self.GROUP_16)])
+
+    async def test_inbound_fifo_and_cross_group_concurrency_keep_current_names(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return self_outer.group_info_payload(
+                    account_id_hex,
+                    group_id_hex,
+                    f"Name {group_id_hex[:4]}",
+                )
+
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield wire_event(event)
+
+        self_outer = self
+        group_a = self.GROUP_PREFIX_A
+        group_b = self.GROUP_PREFIX_B
+        events = [
+            {
+                "type": "inbound_message",
+                "account_id_hex": self.ACCOUNT,
+                "group_id_hex": group_a,
+                "message_id_hex": "01" * 32,
+                "sender_account_id_hex": self.SENDER,
+                "text": "first-a",
+                "mentions_self": True,
+            },
+            {
+                "type": "inbound_message",
+                "account_id_hex": self.ACCOUNT,
+                "group_id_hex": group_a,
+                "message_id_hex": "02" * 32,
+                "sender_account_id_hex": self.SENDER,
+                "text": "second-a",
+                "mentions_self": True,
+            },
+            {
+                "type": "inbound_message",
+                "account_id_hex": self.ACCOUNT,
+                "group_id_hex": group_b,
+                "message_id_hex": "03" * 32,
+                "sender_account_id_hex": self.SENDER,
+                "text": "b",
+                "mentions_self": True,
+            },
+        ]
+        adapter = self.make_adapter(FakeClient())
+        order = []
+
+        async def handle_message(event):
+            order.append((event.text, event.source.chat_id, event.source.chat_name))
+            if event.text == "first-a":
+                await asyncio.sleep(0.05)
+
+        adapter.handle_message = handle_message
+        await adapter._consume_inbound_once(drain=True)
+        self.assertEqual(
+            [item[0] for item in order if item[1] == group_a],
+            ["first-a", "second-a"],
+        )
+        self.assertIn(("b", group_b, f"Name {group_b[:4]}"), order)
+        self.assertEqual(order[0][2], f"Name {group_a[:4]}")
+
+    async def test_display_and_cleanup_logs_do_not_leak_identifiers(self):
+        secret_subject = "SecretSubject"
+        secret_account = self.ACCOUNT
+        secret_group = self.GROUP_16
+
+        class FakeClient:
+            async def account_list(self):
+                raise self_outer.adapter_module.AgentControlError(
+                    f"account boom {secret_account} {secret_group} subject={secret_subject}",
+                    code="no_accounts",
+                )
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                raise self_outer.adapter_module.AgentControlError(
+                    f"control boom {account_id_hex} {group_id_hex} subject={secret_subject}",
+                    code="unknown_group",
+                )
+
+        self_outer = self
+        logs, handler, previous = self.capture_logs()
+        try:
+            adapter = self.make_adapter(FakeClient(), extra={"account_id_hex": None})
+            adapter.account_id_hex = None
+            info = await adapter.get_chat_info(secret_group)
+            self.assertEqual(info["name"], self.fallback(secret_group))
+            adapter = self.make_adapter(FakeClient())
+            info = await adapter.get_chat_info(secret_group)
+            self.assertEqual(info["name"], self.fallback(secret_group))
+        finally:
+            self.stop_logs(handler, previous)
+        joined = "\n".join(logs)
+        self.assertNotIn(secret_account, joined)
+        self.assertNotIn(secret_group, joined)
+        self.assertNotIn(secret_subject, joined)
+
+        async def socket_handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "group_info",
+                    "account_id_hex": self.ACCOUNT,
+                    "group_id_hex": self.GROUP_16,
+                    "member_count": 3,
+                    "is_direct": False,
+                    "subject": "Visible",
+                },
+            )
+            writer.close()
+
+        await self.start_server(socket_handler)
+        real_open = self.adapter_module.asyncio.open_unix_connection
+
+        async def open_broken(*args, **kwargs):
+            reader, writer = await real_open(*args, **kwargs)
+
+            async def boom():
+                raise RuntimeError(
+                    f"close failed account={secret_account} group={secret_group} subject={secret_subject}"
+                )
+
+            writer.wait_closed = boom
+            return reader, writer
+
+        logs, log_handler, previous = self.capture_logs()
+        try:
+            with unittest.mock.patch.object(
+                self.adapter_module.asyncio,
+                "open_unix_connection",
+                open_broken,
+            ):
+                info = await self.real_client_adapter().get_chat_info(self.GROUP_16)
+            self.assertEqual(info["name"], "Visible")
+        finally:
+            self.stop_logs(log_handler, previous)
+        joined = "\n".join(logs)
+        self.assertTrue(any("error while closing Marmot socket writer" in line for line in logs))
+        self.assertNotIn(secret_account, joined)
+        self.assertNotIn(secret_group, joined)
+        self.assertNotIn(secret_subject, joined)
+        self.assertNotIn("close failed", joined)
 
 
 if __name__ == "__main__":

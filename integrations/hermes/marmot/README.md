@@ -7,6 +7,14 @@ Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
 
+Chat display names come from the current Marmot group name on each
+`get_chat_info` and activated inbound lookup. A nonempty `group_info.subject`
+is used after trimming; otherwise Hermes falls back to
+`Marmot <first 12 hex characters of the group id>`. These lookups are not
+cached, so a rename, a cleared name, or a recovered projection appears on the
+next metadata read. Display enrichment never changes routing ids, activation
+policy, or send/reply targets.
+
 For each activated inbound turn, the plugin asks `wn-agent` for a bounded recent
 materialized chat window and supplies Hermes with durable message ids, senders,
 timestamps, reply links, current reaction summaries, and
