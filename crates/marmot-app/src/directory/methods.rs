@@ -1750,8 +1750,10 @@ impl MarmotApp {
 
     fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
         self.account_home()
-            .account(account_id_hex)
-            .ok()
+            .accounts()
+            .ok()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex)
             .map(|account| UserDirectoryLocalAccount {
                 label: account.label,
                 local_signing: account.local_signing,

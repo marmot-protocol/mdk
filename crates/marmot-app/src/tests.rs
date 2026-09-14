@@ -21810,3 +21810,18 @@ async fn runtime_forget_group_local_body() {
     assert!(!runtime.forget_group_local("alice", &group).await.unwrap());
     runtime.shutdown().await;
 }
+#[test]
+fn legacy_directory_account_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.remember_directory_user_with_reason(&account.account_id_hex, "test")
+        .unwrap();
+    let entry = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.local_account.unwrap().label, "alice");
+}
