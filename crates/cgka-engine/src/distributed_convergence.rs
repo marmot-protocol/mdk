@@ -2654,9 +2654,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_engine() -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
+        test_engine_with_storage(storage_sqlite::SqliteAccountStorage::in_memory().unwrap())
+    }
+
+    pub(crate) fn test_engine_with_storage(
+        storage: storage_sqlite::SqliteAccountStorage,
+    ) -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
         let key = signing_key();
         let identity = key.verifying_key().to_bytes().to_vec();
-        crate::EngineBuilder::new(storage_sqlite::SqliteAccountStorage::in_memory().unwrap())
+        crate::EngineBuilder::new(storage)
             .legacy_compatibility_profile()
             .identity(identity)
             .account_identity_proof_signer(Arc::new(TestProofSigner(key)))

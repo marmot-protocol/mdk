@@ -18,6 +18,8 @@ Local map for engine source modules. The crate-level map in `../AGENTS.md` has t
 - `openmls_projection/tests/candidate_replay.rs` holds forked-graph fixtures, replay restoration/parity checks and
   paired measurements. It retains the `candidate_branch_peel_halt_tests` module name so existing test filters work.
   Encrypted-database process-kill checks remain in `../tests/crash_recovery_sqlite.rs`.
+- `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan
+  measurement and a test-only visited-row counter; keep aggregate measurements separate from app acceptance.
 - `snapshot_guard.rs` owns panic-safe snapshot rollback/release for replay and peel probes.
 - No Nostr types in this crate.
 

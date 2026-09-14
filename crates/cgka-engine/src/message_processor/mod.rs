@@ -9,6 +9,9 @@
 //! OpenMLS failures.
 
 mod application_replay;
+#[cfg(test)]
+#[path = "tests/application_replay.rs"]
+mod application_replay_tests;
 mod ingest;
 mod send;
 mod store;

@@ -69,6 +69,9 @@ impl<S: StorageProvider> Engine<S> {
             // clipping discovery to the replay horizon would strand those rows.
             EpochId(0),
             &mut |record| {
+                #[cfg(test)]
+                super::application_replay_tests::SCANNED_ROWS
+                    .with(|count| count.set(count.get() + 1));
                 if let Some(message) = Self::canonical_application_from_record(&record, tip) {
                     messages.push(message);
                 }

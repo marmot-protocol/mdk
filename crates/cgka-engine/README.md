@@ -180,3 +180,38 @@ input disposition, and pending app output commit in one storage transaction. Cra
 retries an untouched input or recovers its durable app
 output. Encrypted SQLite process-kill tests cover both sides of that commit and acknowledgement followed
 by another restart. It never reopens a processed or terminally invalidated input.
+
+### Negative application-discovery scan measurement
+
+The stopping visitor bounds the number of returned application candidates, but a negative query still
+reads and decodes all retained pending non-application records. Do not start this scan at the retained
+anchor: a newly arrived below-anchor application still needs its terminal invalidation.
+
+Run the focused encrypted-file measurement with:
+
+```sh
+cargo test -p cgka-engine --release --locked \
+  --config profile.release.package.cgka-engine.debug-assertions=true \
+  --lib measure_negative_application_discovery_prefix -- --ignored --nocapture
+```
+
+The engine-only debug-assertion override exposes the legacy fixture builder in this optimized test build;
+it is not a production app campaign. The synthetic fixture copies one valid commit into distinct pending
+ledger rows, takes ten negative-query samples per size, then adds a previously unseen old application
+and verifies its `BeyondAnchor` disposition even with an expired/zero-row drain allowance. It does not
+model distinct legitimate commit histories, network behavior or app end-to-end latency.
+
+A local run on 2026-09-14 used 593-byte stored payloads:
+
+| Pending commit rows | Decoded rows per negative query | Mean query time | Late-arrival drain time |
+| --- | --- | --- | --- |
+| 0 | 0 | 0.025 ms | 0.225 ms |
+| 100 | 100 | 0.271 ms | 0.698 ms |
+| 1,000 | 1,000 | 2.402 ms | 5.084 ms |
+| 10,000 | 10,000 | 33.178 ms | 66.962 ms |
+
+These are diagnostic samples, not thresholds or a claim that this explains the approximately 31-second
+app recovery observation. The negative scan remains performance work: evaluate a content-kind index or
+invalidation-safe classifier/cache separately, preserving late arrivals, payload replacement, restart,
+foreign-connection writes and terminal dispositions. The late-arrival drain visits `2 * rows + 1`
+records because it discovers the candidate and then checks for remaining pending work.
