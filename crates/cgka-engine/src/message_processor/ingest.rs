@@ -67,9 +67,11 @@ pub(crate) struct DeferredPeelSweep<'a> {
     past_contexts: Option<&'a PastPeelContextCache>,
 }
 
-/// Secret-bearing, single-group cache owned by one bounded sweep, never persisted.
-/// The caller stops the sweep if canonical context changes. Inactive snapshots
-/// are cached as None; failures are not cached and can be retried normally.
+/// Secret-bearing, single-group cache owned by one deferred-peel candidate
+/// generation, never persisted. Each entry derives from one immutable retained
+/// anchor, so it outlives a bounded slice; the owning generation is dropped
+/// whenever canonical context changes. Inactive snapshots are cached as None;
+/// failures are not cached and can be retried normally.
 #[derive(Default)]
 pub(super) struct PastPeelContextCache {
     contexts: Mutex<HashMap<String, Option<Arc<PastPeelContext>>>>,

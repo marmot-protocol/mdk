@@ -1509,15 +1509,16 @@ pub(crate) fn recover_interrupted_rewind_guard<S: StorageProvider>(
     // live state that has since advanced past it — the same durable rollback
     // this recovery exists to prevent. Restoring first, or treating the release
     // as best-effort, opens that door.
-    let released_nested = nested
-        .iter()
-        .filter(|(_, name)| name != restore)
-        .try_fold(0_u64, |count, (_, name)| {
-            storage
-                .release_group_snapshot(group_id, name)
-                .map(|()| count + 1)
-                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
-        })?;
+    let released_nested =
+        nested
+            .iter()
+            .filter(|(_, name)| name != restore)
+            .try_fold(0_u64, |count, (_, name)| {
+                storage
+                    .release_group_snapshot(group_id, name)
+                    .map(|()| count + 1)
+                    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
+            })?;
     if released_nested > 0 {
         tracing::debug!(
             target: "cgka_engine::openmls_projection",

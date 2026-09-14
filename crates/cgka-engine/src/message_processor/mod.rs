@@ -254,6 +254,31 @@ struct DeferredPeelCandidateCacheEntry {
     /// ever gains proposal-dependent state, this cache key must gain the same
     /// dependency.
     peel: Arc<crate::openmls_projection::CandidateBranchPeel>,
+    /// Historical peel contexts, cached beside the candidate contexts because
+    /// they answer the same question for the same generation. Deriving one
+    /// costs a durable rewind of live group state, which a long backlog would
+    /// otherwise pay per retained anchor per bounded slice.
+    ///
+    /// Surviving a slice rests on a narrower invariant than the key above
+    /// states. `context_fingerprint` covers anchor NAMES, never anchor
+    /// content, and `create_group_state_snapshot` is INSERT OR REPLACE — so an
+    /// anchor can be rewritten under an unchanged name. Two facts make that
+    /// safe here, and both must hold for this cache to stay correct:
+    ///
+    /// - Every rewrite of an anchor whose epoch is already in the past happens
+    ///   inside a canonical apply that selected a tip, and that same apply
+    ///   calls `invalidate_deferred_peel_candidate_cache`, dropping this whole
+    ///   entry along with these contexts.
+    /// - The one anchor refresh not gated on a selected tip
+    ///   (`openmls_projection::apply_openmls_canonicalization_result`, the
+    ///   `apply_start_epoch == current_epoch` arm) only ever rewrites the
+    ///   CURRENT-epoch anchor, which is never a peel source:
+    ///   `try_peel_group_message_from_available_snapshots` skips every
+    ///   snapshot whose `source_epoch >= current_epoch`.
+    ///
+    /// Do not close the gap by folding anchor content into the fingerprint —
+    /// that reads every anchor blob on every fingerprint.
+    past_contexts: Arc<crate::message_processor::ingest::PastPeelContextCache>,
 }
 
 struct DeferredPeelCandidateEnumerationFailure {
@@ -2070,10 +2095,11 @@ impl<S: StorageProvider> Engine<S> {
                 cached.context_fingerprint == fingerprint
                     && cached.durable_generation_fingerprint == durable_generation_fingerprint
             })
-            .map(|cached| Arc::clone(&cached.peel));
-        let (peel, candidate_cache_hit) = if let Some(cached) = cached {
+            .map(|cached| (Arc::clone(&cached.peel), Arc::clone(&cached.past_contexts)));
+        let (peel, past_contexts, candidate_cache_hit) = if let Some((peel, past_contexts)) = cached
+        {
             self.engine_metrics.note_deferred_peel_candidate_cache_hit();
-            (cached, true)
+            (peel, past_contexts, true)
         } else {
             self.invalidate_deferred_peel_candidate_cache(group_id);
             self.engine_metrics
@@ -2139,6 +2165,8 @@ impl<S: StorageProvider> Engine<S> {
                 })?;
             let cached_generation_fingerprint = Some(fingerprint);
             let enumerated = Arc::new(enumerated);
+            let past_contexts =
+                Arc::new(crate::message_processor::ingest::PastPeelContextCache::default());
             self.deferred_peel
                 .entry(group_id.clone())
                 .or_default()
@@ -2146,8 +2174,9 @@ impl<S: StorageProvider> Engine<S> {
                 context_fingerprint: fingerprint,
                 durable_generation_fingerprint: cached_generation_fingerprint,
                 peel: Arc::clone(&enumerated),
+                past_contexts: Arc::clone(&past_contexts),
             });
-            (enumerated, false)
+            (enumerated, past_contexts, false)
         };
         tracing::debug!(
             target: "cgka_engine::message_processor",
@@ -2155,7 +2184,6 @@ impl<S: StorageProvider> Engine<S> {
             cache_hit = candidate_cache_hit,
             "deferred-peel candidate cache lookup"
         );
-        let past_contexts = crate::message_processor::ingest::PastPeelContextCache::default();
         let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
             .with_past_contexts(&past_contexts);
         let preparation_ms = sweep_started.elapsed().as_millis() as u64;
@@ -2618,6 +2646,12 @@ impl<S: StorageProvider> Engine<S> {
     /// commit graph the sweep's candidate branch contexts are derived from.
     /// While all three are unchanged, re-peeling a deferred row is guaranteed
     /// wasted work.
+    ///
+    /// Anchors enter this by NAME, not by content — reading every anchor blob
+    /// per fingerprint would cost more than the peels it saves. What makes a
+    /// name sufficient is documented at
+    /// `DeferredPeelCandidateCacheEntry::past_contexts`, whose cached contexts
+    /// are the consumer that depends on it; change one and re-read the other.
     fn deferred_peel_context_fingerprint(
         &mut self,
         group_id: &GroupId,
