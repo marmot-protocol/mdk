@@ -6825,6 +6825,15 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 claim = await call(store.claim, first["message_id_hex"])
                 original = getattr(store, operation_name)
                 unavailable = True
+                delivered = asyncio.Event()
+                original_handle = adapter.handle_message
+
+                async def observe_delivery(message):
+                    await original_handle(message)
+                    if len(adapter.events) == 2:
+                        delivered.set()
+
+                adapter.handle_message = observe_delivery
 
                 def fault(*args, **kwargs):
                     if unavailable:
@@ -6845,10 +6854,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                         unavailable = False
                         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
                         adapter._inbound_spool_wakeup.set()
-                        for _ in range(100):
-                            if len(adapter.events) == 2:
-                                break
-                            await asyncio.sleep(0.01)
+                        # The production retry loop polls once per second. Wait
+                        # for delivery, not a 1-second polling budget that races
+                        # that timer on a faster CI runner.
+                        await asyncio.wait_for(delivered.wait(), timeout=5)
                         await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
                     self.assertEqual(["first", "second"], [message.text for message in adapter.events])
                     self.assertEqual({}, adapter._inbound_dispatch_dispositions)
