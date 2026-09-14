@@ -2534,6 +2534,17 @@ impl<S: StorageProvider> Engine<S> {
                 self.note_peel_deferred_row_retired(record);
                 Ok(true)
             }
+            Ok(Outcome(IngestOutcome::LocalState {
+                state: LocalIngestState::Removed,
+            })) => {
+                // Same rule as `replay_buffered_messages`: refused before any
+                // peel with nothing written, so the row keeps `PeelDeferred`
+                // rather than becoming a `Processed` graph input. Defense in
+                // depth: the sweep's production door refuses a terminal group,
+                // and the sites that set `removed` retire the deferred backlog
+                // (and its cap slots) in the same transaction.
+                Ok(false)
+            }
             Ok(Outcome(
                 IngestOutcome::Stale { .. }
                 | IngestOutcome::Ignored { .. }
@@ -2543,12 +2554,11 @@ impl<S: StorageProvider> Engine<S> {
             )) => {
                 // Terminal stale classifications are still successful
                 // reclassifications of this raw deferred row. Retire it only
-                // while it is still awaiting retry: the reachable case is
-                // `SelfEvicted`, where re-ingesting the deferred row against a
-                // now-inactive group makes ingest persist it `Failed`
-                // (ingest.rs). Relabeling that evicted-on row `Processed` would
-                // sweep it back into canonicalization, so re-read the row and
-                // never clobber ingest's terminal verdict.
+                // while it is still awaiting retry: ingest may have committed a
+                // terminal state to this same row during the call and that
+                // verdict is authoritative, so re-read the row rather than
+                // trusting the pre-ingest snapshot. Our own eviction is handled
+                // by the arm above and never reaches here.
                 if self.raw_transport_row_awaiting_retry(&record.id)? {
                     self.update_stored_message_state(&record.id, MessageState::Processed)?;
                 }
@@ -3253,27 +3263,45 @@ impl<S: StorageProvider> Engine<S> {
                     // welcome may create the group, so terminalizing it here would
                     // drop a recoverable message.
                 }
+                Ok(IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed,
+                }) => {
+                    // Refused on the removed record before any peel: ingest wrote
+                    // nothing, so the row is exactly as retained. Leave it and
+                    // stop — the record is terminal, so every row behind this one
+                    // gets the same refusal.
+                    //
+                    // Never relabel it `Processed`: that is an OpenMLS graph
+                    // input state (`OPENMLS_GRAPH_INPUT_STATES`), so a
+                    // never-applied commit would score as canonical evidence, and
+                    // it is outside `unresolved_commit_state`, so the re-join
+                    // sweep would not clean it up. Retained is also the useful
+                    // state: a commit published after our removal is the "raced
+                    // ahead of the re-add Welcome" case, and this replay runs
+                    // again from `do_join_welcome`. Nothing spins on it meanwhile
+                    // (the convergence and outbound doors refuse a terminal
+                    // copy), and a `PeelDeferred` row's cap slot was already
+                    // returned when the removal retired the deferred backlog.
+                    break;
+                }
                 Ok(_) => {
                     // Terminal reclassification of the raw wrapper: the content-
                     // derived row now carries the real verdict — applied
                     // (`Processed`), a same-epoch fork the incumbent won
                     // (`AlreadyAtEpoch`, content row `EpochInvalidated`), a
-                    // duplicate (`Ignored { category: Duplicate }`), our own echo
-                    // (`Ignored { category: OwnEcho }`), or our own eviction
-                    // (`LocalState { state: Removed }`). Retire the raw wrapper so
-                    // it leaves the retry lifecycle instead of being re-peeled on
-                    // every subsequent publish-cycle replay — but ONLY while it
-                    // is still awaiting retry. `record.state` is the pre-ingest
-                    // snapshot; `ingest_group_message` may have already committed
-                    // a terminal state to this same row during the call. The
-                    // reachable removal case is a buffered peer commit that evicts
-                    // our leaf: the next buffered row hits `!is_active`, which
-                    // persists that row `Failed` (ingest.rs). That
-                    // ingest-committed verdict is authoritative — relabeling an
-                    // evicted-on row `Processed` would sweep it back into
-                    // canonicalization (`openmls_projection` /
-                    // `distributed_convergence` select on `Processed`). Re-read the
-                    // row and retire only a state ingest left awaiting retry.
+                    // duplicate (`Ignored { category: Duplicate }`), or our own
+                    // echo (`Ignored { category: OwnEcho }`). Retire the raw
+                    // wrapper so it leaves the retry lifecycle instead of being
+                    // re-peeled on every subsequent publish-cycle replay — but
+                    // ONLY while it is still awaiting retry. `record.state` is
+                    // the pre-ingest snapshot; `ingest_group_message` may have
+                    // already committed a terminal state to this same row
+                    // during the call, and that ingest-committed verdict is
+                    // authoritative. Our own eviction does NOT arrive here: it
+                    // has its own arm above, which keeps the row retained
+                    // rather than sweeping a never-applied message back into
+                    // canonicalization. Re-read the row and retire only a state
+                    // ingest left awaiting retry.
                     if self.raw_transport_row_awaiting_retry(&record.id)? {
                         self.update_stored_message_state(&record.id, MessageState::Processed)?;
                     }

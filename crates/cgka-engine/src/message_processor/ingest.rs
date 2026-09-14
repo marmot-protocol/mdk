@@ -378,6 +378,39 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // A copy already marked removed refuses group traffic on the durable
+        // record alone — before hydration and before the OpenMLS load — so
+        // continued relay traffic for a group this device left costs neither a
+        // ledger row nor an epoch load. The `!is_active()` arm below is only
+        // reached before the marker exists: it realizes the removal, writes
+        // it, and from then on this gate answers.
+        //
+        // Deliberately no durable trace: no ledger row and no ingress dedup
+        // marker. A removed device is routinely re-added by an admin, and
+        // commits published between that Welcome and its delivery can arrive
+        // before it. Keeping the id out of the seen cache — exactly as the
+        // unknown-group arm below does for #740 — lets relay redelivery after
+        // the late Welcome process instead of classifying as `Duplicate`. (The
+        // disband tombstone gate above writes a marker because a disband is
+        // permanent; a removal is not.)
+        //
+        // A row already retained when this fires therefore keeps its retained
+        // state, because nothing here touches it. The two seams that retire a
+        // replayed row — `replay_buffered_messages` and
+        // `reingest_deferred_peel_row` — handle `Removed` explicitly for that
+        // reason: their catch-alls would stamp an untouched row `Processed`,
+        // making a never-applied message a canonicalization input that the
+        // re-join sweep does not clean up.
+        if self
+            .stored_group_record(&group_id)?
+            .is_some_and(|group| group.removed)
+        {
+            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+            return reported(IngestOutcome::LocalState {
+                state: LocalIngestState::Removed,
+            });
+        }
+
         // mdk#1161: an inbound message for a seeded-but-unhydrated group runs
         // that group's full hydration first, so the peel below sees validated
         // live state. A hydration failure quarantines the group and the
