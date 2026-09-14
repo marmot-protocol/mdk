@@ -2105,7 +2105,8 @@ fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .accepting = false;
 
-    manager.spawn_invite_catch_up();
+    let (command, _receiver) = mpsc::channel(1);
+    manager.spawn_invite_catch_up(command);
 
     assert!(
         manager
