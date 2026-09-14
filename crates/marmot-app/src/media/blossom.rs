@@ -31,12 +31,12 @@ const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// A candidate that cannot resolve, connect, return headers, and yield its first
 /// body bytes within this bound gives the next ordered locator a chance. The
-/// longer transfer deadline and read-idle timeout still govern an active body,
-/// so a peer that continuously trickles bytes can occupy the transfer deadline.
+/// candidate transfer deadline and read-idle timeout govern an active body.
 const BLOSSOM_CANDIDATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reusing a pinned client inside this lease amortizes DNS and TLS setup without
 /// turning one resolution result into a process-lifetime routing decision.
 const BLOSSOM_ADDRESS_LEASE: Duration = Duration::from_secs(60);
+const BLOSSOM_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const BLOSSOM_ORIGIN_CACHE_LIMIT: usize = 32;
 const BLOSSOM_REDIRECT_LIMIT: usize = 5;
 /// Largest encrypted media blob this implementation will upload or download.
@@ -620,7 +620,9 @@ where
     R: FnMut(&Url, &str) -> Result<Url, AppError>,
 {
     let mut redirects = 0_usize;
+    let mut retried = false;
     let startup_deadline = startup_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let retry_deadline = startup_deadline.unwrap_or(deadline).min(deadline);
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -710,6 +712,14 @@ where
                     response_headers_started,
                     false,
                 );
+                if error.is_connect() && !retried {
+                    retried = true;
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + BLOSSOM_RETRY_BACKOFF).min(retry_deadline),
+                    )
+                    .await;
+                    continue;
+                }
                 return Err(reqwest_blob_error(error));
             }
             Err(_) => {
@@ -723,6 +733,15 @@ where
             }
         };
         let status = response.status();
+        if status.is_server_error() && !retried {
+            retried = true;
+            drop(response);
+            tokio::time::sleep_until(
+                (tokio::time::Instant::now() + BLOSSOM_RETRY_BACKOFF).min(retry_deadline),
+            )
+            .await;
+            continue;
+        }
         if status.is_success() {
             let first_byte_deadline = startup_deadline
                 .map(|startup_deadline| startup_deadline.min(deadline))

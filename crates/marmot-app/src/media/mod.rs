@@ -1137,11 +1137,16 @@ async fn fetch_encrypted_media_blob_with_observer(
                 "media download timed out".into(),
             ));
         }
+        let now = tokio::time::Instant::now();
+        // ponytail: split the remaining budget evenly; size-based budgets need
+        // a trusted expected ciphertext length that references do not carry.
+        let candidate_budget =
+            download_deadline.saturating_duration_since(now) / (candidate_count - index) as u32;
         let fetched = blossom::fetch_blossom_blob_with_observer_until(
             &candidate,
             transport,
             telemetry,
-            download_deadline,
+            now + candidate_budget,
         )
         .await;
         match fetched {
