@@ -1974,6 +1974,7 @@ fn app_error_kind(error: &AppError) -> &'static str {
         AppError::GroupRemoved(_) => "group_removed",
         AppError::GroupDisbanding(_) => "group_disbanding",
         AppError::GroupInviteNotPending => "group_invite_not_pending",
+        AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
         AppError::MissingKeyPackage(_) => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         _ => "app_runtime_operation",
@@ -2009,6 +2010,7 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
+        AppError::MessageDraftRevisionConflict => SubjectFailureCategory::ExpectedRefusal,
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
@@ -2291,6 +2293,11 @@ mod tests {
             assert_ne!(resource.code, denied.code);
         }
         assert_ne!(environment.code, denied.code);
+
+        let conflict = app_error(AppError::MessageDraftRevisionConflict);
+        assert_eq!(conflict.category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(conflict.code, "app_runtime_operation_failed");
+        assert!(conflict.message.contains("message_draft_revision_conflict"));
 
         let refusal = app_error(AppError::GroupInviteNotPending);
         assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);

@@ -426,8 +426,6 @@ impl AccountDeviceSession {
         })
     }
 
-    /// Stage timings captured by [`Self::open`]; durations and aggregate
-    /// counts only, safe for fixed-bucket telemetry.
     /// Forward the host's post-commit storage wakeup to the actual engine
     /// connection. Projection policy and subscription ownership stay in the host.
     #[doc(hidden)]
@@ -438,6 +436,8 @@ impl AccountDeviceSession {
         self.storage.set_message_draft_commit_observer(observer);
     }
 
+    /// Stage timings captured by [`Self::open`]; durations and aggregate
+    /// counts only, safe for fixed-bucket telemetry.
     pub fn open_timings(&self) -> &SessionOpenTimings {
         &self.open_timings
     }

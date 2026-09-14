@@ -24,7 +24,8 @@ for draft and attachment mutations, including legacy writes and same-timestamp e
 store epoch, group and counter. Delete/recreate cannot reuse a token; counter exhaustion fails the write. Tokens
 are opaque Rust values, with no serialization or native wire contract yet. Copying a database copies its scope.
 
-Conditional save/clear rejects a stale token without changing the draft. A successful mutation returns a fresh
+Conditional save/clear rejects a stale token with `MessageDraftRevisionConflict` without changing the draft.
+Malformed input remains a separate error; absent groups consistently return `UnknownGroup` at the app boundary. A successful mutation returns a fresh
 selected snapshot. Empty composers still have revisions, so an old empty snapshot cannot overwrite a later draft.
 
 ## Send acceptance and recovery
@@ -51,8 +52,8 @@ worker continues under that worker even if its waiting caller disappears, as wit
 App save/clear and legacy mutations emit post-commit draft wakeups. Acceptance installs its observer on the actual
 engine writer, which uses a separate SQLite handle from app projection reads, and emits after the durable handoff
 but before waiting on relay delivery. The observer carries only account/group routing information; consumers reload
-the durable revision. Storage callers enclosing acceptance in their own transaction own notification after that
-outer commit. The raw broadcast receiver may lag; subscribe-before-read and reload-on-lag are required. M4 will
+the durable revision. Nested acceptance defers its wakeup until the owning transaction commits; rollback, panic
+and failed commit discard pending wakeups. Callbacks run after releasing transaction ownership. The raw broadcast receiver may lag; subscribe-before-read and reload-on-lag are required. M4 will
 integrate this with live conversation window reset/eviction handling. M5 owns native bindings.
 
 ## Validation
@@ -61,5 +62,6 @@ Storage tests cover migration preservation/rollback, legacy and conditional muta
 stale/cross-store tokens, delete/recreate, counter exhaustion, read-only queries, keyed bytes, nested handoff failure,
 outer rollback, SQLCipher reopen, queued acceptance and replay. VM-step comparisons use 200 versus 20,000 unrelated
 drafts and 1 KiB versus 8 MiB selected attachment bytes. App tests exercise a relay barrier to verify acceptance and
-notification before network completion, cancellation, edits during submission, and runtime command forwarding.
+notification before network completion, cancellation, edits during submission, validated media replies, typed
+conflicts, missing groups and runtime command forwarding.
 These establish storage and lifecycle behavior; they are not native device latency measurements.

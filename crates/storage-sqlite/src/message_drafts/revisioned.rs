@@ -7,16 +7,19 @@ pub struct MessageDraftRevision {
     group_id_hex: String,
     revision: i64,
 }
+
 impl MessageDraftRevision {
     pub fn group_id_hex(&self) -> &str {
         &self.group_id_hex
     }
 }
+
 #[derive(Clone)]
 pub struct SelectedMessageDraft {
     pub revision: MessageDraftRevision,
     pub draft: Option<SelectedMessageDraftContent>,
 }
+
 #[derive(Clone, PartialEq)]
 pub struct SelectedMessageDraftAttachment {
     pub id: String,
@@ -28,6 +31,7 @@ pub struct SelectedMessageDraftAttachment {
     pub duration_seconds: Option<f64>,
     pub waveform_samples: Vec<f64>,
 }
+
 #[derive(Clone, PartialEq)]
 pub struct SelectedMessageDraftContent {
     pub group_id_hex: String,
@@ -37,6 +41,7 @@ pub struct SelectedMessageDraftContent {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
+
 #[derive(Debug, thiserror::Error)]
 pub enum MessageDraftRevisionError {
     #[error("message draft revision no longer matches")]
@@ -44,6 +49,7 @@ pub enum MessageDraftRevisionError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
+
 impl SqliteAccountStorage {
     /// One read snapshot, keyed by group; never hydrates attachment plaintext.
     pub fn selected_message_draft(&self, group: &str) -> StorageResult<SelectedMessageDraft> {
@@ -93,7 +99,112 @@ impl SqliteAccountStorage {
             Ok(selected_tx(&conn, &expected.group_id_hex)?)
         })
     }
+
+    /// Hydrate only the requested attachment, guarded by the selected revision.
+    pub fn message_draft_attachment_if_revision(
+        &self,
+        expected: &MessageDraftRevision,
+        attachment_id: &str,
+    ) -> Result<Option<Vec<u8>>, MessageDraftRevisionError> {
+        let conn = self.lock()?;
+        let owned = if conn.is_autocommit() {
+            Some(conn.unchecked_transaction().storage()?)
+        } else {
+            None
+        };
+        check_revision_tx(&conn, expected)?;
+        let bytes = conn
+            .query_row_cached(
+                "SELECT plaintext FROM message_draft_attachments
+            WHERE group_id_hex = ?1 AND attachment_id = ?2",
+                params![expected.group_id_hex, attachment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        if let Some(tx) = owned {
+            tx.commit().storage()?;
+        }
+        Ok(bytes)
+    }
+
+    /// Install the app owner's coalesced wakeup. The callback must not panic.
+    /// Nested writes defer notification until the outer transaction commits.
+    #[doc(hidden)]
+    pub fn set_message_draft_commit_observer(&self, observer: MessageDraftCommitObserver) {
+        *self
+            .draft_commit_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(observer);
+    }
+    pub(crate) fn notify_message_draft_committed(&self, group: &str) {
+        let observer = self
+            .draft_commit_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            let group = group.to_owned();
+            self.connection.after_commit(move || observer(&group));
+        }
+    }
+    /// Bind one submitted revision to the exact outgoing event. This is not
+    /// acceptance and retains draft bytes. Only the existing outbox write can
+    /// consume this binding, in the same transaction as accepting its payload.
+    #[doc(hidden)]
+    pub fn stage_message_draft_submission(
+        &self,
+        expected: &MessageDraftRevision,
+        app_event_id: &str,
+        payload: &[u8],
+    ) -> Result<(), MessageDraftRevisionError> {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(payload);
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            check_revision_tx(&conn, expected)?;
+            let present: bool = conn.query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM message_drafts WHERE group_id_hex = ?1)",
+                [&expected.group_id_hex],
+                |row| row.get(0),
+            ).storage()?;
+            if !present {
+                return Err(MessageDraftRevisionError::Conflict);
+            }
+            conn.execute_cached(
+                "INSERT INTO message_draft_submissions(group_id_hex, revision, app_event_id, payload_hash)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(group_id_hex) DO UPDATE SET
+                 revision=excluded.revision, app_event_id=excluded.app_event_id, payload_hash=excluded.payload_hash",
+                params![expected.group_id_hex, expected.revision, app_event_id, &hash[..]],
+            ).storage()?;
+            Ok(())
+        })
+    }
+    #[doc(hidden)]
+    pub fn cancel_message_draft_submission(
+        &self,
+        expected: &MessageDraftRevision,
+    ) -> StorageResult<()> {
+        let conn = self.lock()?;
+        let epoch: Vec<u8> = conn
+            .query_row_cached(
+                "SELECT store_epoch FROM chat_presentation_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .storage()?;
+        if epoch != expected.store_epoch {
+            return Ok(());
+        }
+        conn.execute_cached(
+            "DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND revision = ?2",
+            params![expected.group_id_hex, expected.revision],
+        )
+        .storage()?;
+        Ok(())
+    }
 }
+
 fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevision> {
     conn.query_row_cached(
         "SELECT m.store_epoch, r.revision FROM message_draft_revisions r
@@ -111,6 +222,7 @@ fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevi
     .storage()?
     .ok_or(StorageError::NotFound)
 }
+
 fn check_revision_tx(
     conn: &Connection,
     expected: &MessageDraftRevision,
@@ -120,6 +232,7 @@ fn check_revision_tx(
     }
     Ok(())
 }
+
 fn selected_tx(conn: &Connection, group: &str) -> StorageResult<SelectedMessageDraft> {
     let revision = revision_tx(conn, group)?;
     let mut draft = conn
@@ -145,6 +258,7 @@ fn selected_tx(conn: &Connection, group: &str) -> StorageResult<SelectedMessageD
     }
     Ok(SelectedMessageDraft { revision, draft })
 }
+
 fn selected_attachments_tx(
     conn: &Connection,
     group: &str,
@@ -188,110 +302,9 @@ fn selected_attachments_tx(
     })
     .collect()
 }
-impl SqliteAccountStorage {
-    /// Hydrate only the requested attachment, guarded by the selected revision.
-    pub fn message_draft_attachment_if_revision(
-        &self,
-        expected: &MessageDraftRevision,
-        attachment_id: &str,
-    ) -> Result<Option<Vec<u8>>, MessageDraftRevisionError> {
-        let conn = self.lock()?;
-        let owned = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        check_revision_tx(&conn, expected)?;
-        let bytes = conn
-            .query_row_cached(
-                "SELECT plaintext FROM message_draft_attachments
-            WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                params![expected.group_id_hex, attachment_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()?;
-        if let Some(tx) = owned {
-            tx.commit().storage()?;
-        }
-        Ok(bytes)
-    }
-}
 
 /// Post-commit wakeup only; consumers reload the durable selected revision.
 pub type MessageDraftCommitObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
-
-impl SqliteAccountStorage {
-    /// Install the app owner's coalesced wakeup. The callback must not panic.
-    /// Nested transaction callers own notification after their outer commit.
-    #[doc(hidden)]
-    pub fn set_message_draft_commit_observer(&self, observer: MessageDraftCommitObserver) {
-        *self
-            .draft_commit_observer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(observer);
-    }
-    pub(crate) fn notify_message_draft_committed(&self, group: &str) {
-        if self.connection.is_current_thread_transaction_owner() {
-            return;
-        }
-        let observer = self
-            .draft_commit_observer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if let Some(observer) = observer {
-            observer(group);
-        }
-    }
-    /// Bind one submitted revision to the exact outgoing event. This is not
-    /// acceptance and retains draft bytes. Only the existing outbox write can
-    /// consume this binding, in the same transaction as accepting its payload.
-    #[doc(hidden)]
-    pub fn stage_message_draft_submission(
-        &self,
-        expected: &MessageDraftRevision,
-        app_event_id: &str,
-        payload: &[u8],
-    ) -> Result<(), MessageDraftRevisionError> {
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(payload);
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            check_revision_tx(&conn, expected)?;
-            let present: bool = conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM message_drafts WHERE group_id_hex = ?1)", [&expected.group_id_hex], |r| r.get(0)).storage()?;
-            if !present { return Err(MessageDraftRevisionError::Conflict); }
-            conn.execute_cached("INSERT INTO message_draft_submissions(group_id_hex, revision, app_event_id, payload_hash)
-                VALUES (?1, ?2, ?3, ?4) ON CONFLICT(group_id_hex) DO UPDATE SET
-                revision=excluded.revision, app_event_id=excluded.app_event_id, payload_hash=excluded.payload_hash",
-                params![expected.group_id_hex, expected.revision, app_event_id, &hash[..]]).storage()?;
-            Ok(())
-        })
-    }
-    #[doc(hidden)]
-    pub fn cancel_message_draft_submission(
-        &self,
-        expected: &MessageDraftRevision,
-    ) -> StorageResult<()> {
-        let conn = self.lock()?;
-        let epoch: Vec<u8> = conn
-            .query_row_cached(
-                "SELECT store_epoch FROM chat_presentation_meta WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .storage()?;
-        if epoch != expected.store_epoch {
-            return Ok(());
-        }
-        conn.execute_cached(
-            "DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND revision = ?2",
-            params![expected.group_id_hex, expected.revision],
-        )
-        .storage()?;
-        Ok(())
-    }
-}
 
 pub(crate) enum DraftAcceptance<'a> {
     Payload(&'a [u8]),
@@ -313,21 +326,63 @@ pub(crate) fn accept_submission_tx(
         ),
         DraftAcceptance::Event(id) => ("app_event_id", rusqlite::types::Value::Text(id.to_owned())),
     };
-    let revision: Option<i64> = conn.query_row_cached(&format!(
-        "SELECT revision FROM message_draft_submissions WHERE group_id_hex = ?1 AND {field} = ?2"),
-        params![group, value], |r| r.get(0)).optional().storage()?;
+    let revision: Option<i64> = conn
+        .query_row_cached(
+            &format!(
+                "SELECT revision FROM message_draft_submissions
+                  WHERE group_id_hex = ?1 AND {field} = ?2"
+            ),
+            params![group, value],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
     let Some(revision) = revision else {
         return Ok(false);
     };
-    let changed = conn.execute_cached("DELETE FROM message_drafts WHERE group_id_hex = ?1
-        AND EXISTS(SELECT 1 FROM message_draft_revisions WHERE group_id_hex = ?1 AND revision = ?2)",
-        params![group, revision]).storage()? > 0;
+    let changed = conn.execute_cached(
+        "DELETE FROM message_drafts WHERE group_id_hex = ?1
+         AND EXISTS(SELECT 1 FROM message_draft_revisions WHERE group_id_hex = ?1 AND revision = ?2)",
+        params![group, revision],
+    ).storage()? > 0;
     conn.execute_cached(
         "DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND revision = ?2",
         params![group, revision],
     )
     .storage()?;
     Ok(changed)
+}
+
+impl std::fmt::Debug for MessageDraftRevision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageDraftRevision")
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for SelectedMessageDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedMessageDraft")
+            .field("revision", &self.revision)
+            .field("draft", &self.draft)
+            .finish()
+    }
+}
+impl std::fmt::Debug for SelectedMessageDraftContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedMessageDraftContent")
+            .field("content_len", &self.content.len())
+            .field("attachment_count", &self.media_attachments.len())
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for SelectedMessageDraftAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedMessageDraftAttachment")
+            .field("plaintext_size", &self.plaintext_size)
+            .field("waveform_sample_count", &self.waveform_samples.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

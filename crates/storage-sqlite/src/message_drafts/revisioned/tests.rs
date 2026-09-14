@@ -118,7 +118,10 @@ fn conditional_mutations_reject_stale_cross_store_and_failed_attachment_edits() 
             )
             .is_err()
     );
-    assert!(store.selected_message_draft(GROUP).unwrap().revision == first.revision);
+    assert_eq!(
+        store.selected_message_draft(GROUP).unwrap().revision,
+        first.revision
+    );
     let empty = store
         .clear_message_draft_if_revision(&first.revision)
         .unwrap();
@@ -205,7 +208,10 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
         Err(StorageError::Backend("rollback".into()))
     });
     assert!(result.is_err());
-    assert!(store.selected_message_draft(GROUP).unwrap().revision == selected.revision);
+    assert_eq!(
+        store.selected_message_draft(GROUP).unwrap().revision,
+        selected.revision
+    );
     assert!(
         store
             .list_queued_outbound_intents(&queued(b"payload").group_id)
@@ -232,7 +238,11 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
         .execute_batch("DROP TRIGGER fail_clear")
         .unwrap();
     store
-        .put_queued_outbound_intent(&queued(b"payload"))
+        .with_transaction::<_, StorageError, _>(|s| {
+            s.put_queued_outbound_intent(&queued(b"payload"))?;
+            assert_eq!(notifications.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
         .unwrap();
     assert!(store.selected_message_draft(GROUP).unwrap().draft.is_none());
     assert_eq!(notifications.load(Ordering::SeqCst), 1);
@@ -265,12 +275,18 @@ fn mismatched_acceptance_cancellation_and_late_acceptance_keep_newer_drafts() {
     store
         .put_queued_outbound_intent(&queued(b"different"))
         .unwrap();
-    assert!(store.selected_message_draft(GROUP).unwrap().revision == old.revision);
+    assert_eq!(
+        store.selected_message_draft(GROUP).unwrap().revision,
+        old.revision
+    );
     store
         .cancel_message_draft_submission(&old.revision)
         .unwrap();
     store.put_queued_outbound_intent(&queued(b"old")).unwrap();
-    assert!(store.selected_message_draft(GROUP).unwrap().revision == old.revision);
+    assert_eq!(
+        store.selected_message_draft(GROUP).unwrap().revision,
+        old.revision
+    );
     store
         .stage_message_draft_submission(&old.revision, "event", b"old")
         .unwrap();
@@ -278,7 +294,10 @@ fn mismatched_acceptance_cancellation_and_late_acceptance_keep_newer_drafts() {
         .save_message_draft_if_revision(&old.revision, "new", None, &[])
         .unwrap();
     store.put_queued_outbound_intent(&queued(b"old")).unwrap();
-    assert!(store.selected_message_draft(GROUP).unwrap().revision == new.revision);
+    assert_eq!(
+        store.selected_message_draft(GROUP).unwrap().revision,
+        new.revision
+    );
 }
 #[test]
 fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
@@ -359,6 +378,80 @@ fn revision_exhaustion_fails_without_reusing_tokens_or_changing_draft() {
             .is_err()
     );
     let after = store.selected_message_draft(GROUP).unwrap();
-    assert!(before.revision == after.revision);
+    assert_eq!(before.revision, after.revision);
     assert_eq!(after.draft.unwrap().content, "before");
+}
+
+#[test]
+fn deferred_wakeups_follow_commit_and_never_leak_from_failed_transactions() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let register = |s: &SqliteAccountStorage| {
+        let reads = s.clone();
+        let observed = observed.clone();
+        s.connection.after_commit(move || {
+            assert!(reads.lock().unwrap().is_autocommit());
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+    };
+    store
+        .with_transaction::<_, StorageError, _>(|s| {
+            register(s);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: StorageResult<()> = store.with_transaction(|s| {
+            register(s);
+            panic!("rollback");
+        });
+    }));
+    assert!(panic.is_err());
+    store.lock().unwrap().execute_batch("CREATE TABLE wake_parent (id INTEGER PRIMARY KEY);
+        CREATE TABLE wake_child (id INTEGER REFERENCES wake_parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
+    let failed_commit: StorageResult<()> = store.with_transaction(|s| {
+        s.lock()?
+            .execute("INSERT INTO wake_child VALUES (1)", [])
+            .storage()?;
+        register(s);
+        Ok(())
+    });
+    assert!(failed_commit.is_err());
+    store
+        .with_transaction::<_, StorageError, _>(|_| Ok(()))
+        .unwrap();
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn selected_draft_debug_redacts_content_identities_and_media_metadata() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    let mut media = attachment();
+    media.id = "private-attachment-id".into();
+    media.file_name = "private-file-name".into();
+    store
+        .save_message_draft(GROUP, "private-content", Some(&"ab".repeat(32)), &[media])
+        .unwrap();
+    let selected = store.selected_message_draft(GROUP).unwrap();
+    let debug = format!(
+        "{selected:?} {:?}",
+        selected.draft.as_ref().unwrap().media_attachments
+    );
+    assert!(debug.contains("revision"));
+    assert!(debug.contains("attachment_count"));
+    for private in [
+        GROUP,
+        "private-content",
+        &"ab".repeat(32),
+        "private-attachment-id",
+        "private-file-name",
+    ] {
+        assert!(!debug.contains(private));
+    }
 }

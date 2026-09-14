@@ -44,7 +44,9 @@ use crate::media::{
     is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
     upload_group_image, upload_prepared_group_image,
 };
-use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
+use crate::messages::{
+    AppMessageIntent, build_inner_event, build_inner_event_with_media_reply, encode_inner_event,
+};
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
@@ -3640,18 +3642,15 @@ impl AppClient {
                 .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
             _ => None,
         };
-        let mut event = build_inner_event(&intent, &sender, unix_now_seconds())?;
-        if let Some((_, Some(reply))) = &draft {
-            event.tags.push(vec!["e".into(), reply.clone()]);
-            event.tags.push(vec!["q".into(), reply.clone()]);
-            event = MarmotInnerEvent::new(
-                event.pubkey,
-                event.created_at,
-                event.kind,
-                event.tags,
-                event.content,
-            );
-        }
+        let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
+            Some(reply) => build_inner_event_with_media_reply(
+                &intent,
+                &sender,
+                unix_now_seconds(),
+                Some(reply),
+            )?,
+            None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+        };
         let payload = encode_inner_event(&event)?;
         let _draft_guard = if let Some((revision, _)) = draft {
             let storage = self.app.draft_storage(&self.state.label)?;
@@ -3660,7 +3659,7 @@ impl AppClient {
             );
             storage
                 .stage_message_draft_submission(&revision, &event.id, &payload)
-                .map_err(crate::drafts::revision_error)?;
+                .map_err(|error| crate::drafts::revision_error(error, revision.group_id_hex()))?;
             Some(crate::drafts::DraftSubmissionGuard { storage, revision })
         } else {
             None
@@ -4151,9 +4150,7 @@ impl AppClient {
             .app
             .selected_message_draft(&self.state.label, &hex::encode(group.as_slice()))?;
         if selected.revision != revision {
-            return Err(AppError::InvalidMessageDraft(
-                "draft revision no longer matches".into(),
-            ));
+            return Err(AppError::MessageDraftRevisionConflict);
         }
         let draft = selected
             .draft

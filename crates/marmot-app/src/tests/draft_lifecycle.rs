@@ -39,10 +39,16 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
         .unwrap();
     let newer = app.selected_message_draft("alice", &hex).unwrap();
     drop(sending);
-    assert!(app.selected_message_draft("alice", &hex).unwrap().revision == newer.revision);
+    assert_eq!(
+        app.selected_message_draft("alice", &hex).unwrap().revision,
+        newer.revision
+    );
     relay.release_publish();
     client.retry_group_convergence(&group).await.unwrap();
-    assert!(app.selected_message_draft("alice", &hex).unwrap().revision == newer.revision);
+    assert_eq!(
+        app.selected_message_draft("alice", &hex).unwrap().revision,
+        newer.revision
+    );
 }
 
 #[tokio::test]
@@ -100,7 +106,7 @@ async fn editing_after_submission_preserves_the_newer_draft_and_sends_captured_c
         client
             .send_message_draft(&group, old.revision, vec![])
             .await,
-        Err(AppError::InvalidMessageDraft(_))
+        Err(AppError::MessageDraftRevisionConflict)
     ));
     assert!(matches!(
         changes.try_recv(),
@@ -206,8 +212,22 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
             .await,
         Err(AppError::MediaReferenceStaleEpoch { .. })
     ));
-    assert!(app.selected_message_draft("alice", &hex).unwrap().revision == selected.revision);
+    assert_eq!(
+        app.selected_message_draft("alice", &hex).unwrap().revision,
+        selected.revision
+    );
     reference.source_epoch = epoch;
+    let invalid = crate::messages::build_inner_event_with_media_reply(
+        &AppMessageIntent::Media {
+            attachments: vec![reference.clone()],
+            caption: Some("caption".into()),
+        },
+        &"aa".repeat(32),
+        1,
+        Some("  "),
+    )
+    .unwrap_err();
+    assert_eq!(invalid.privacy_safe_kind(), "invalid_app_message_payload");
     client
         .send_message_draft(&group, selected.revision, vec![reference])
         .await
@@ -231,4 +251,46 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
     );
     assert!(message.tags.contains(&vec!["e".into(), reply.clone()]));
     assert!(message.tags.contains(&vec!["q".into(), reply]));
+}
+
+#[tokio::test]
+async fn draft_conflict_and_missing_group_have_distinct_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://draft.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("draft", &[]).await.unwrap();
+    let hex = hex::encode(group.as_slice());
+    let initial = app.selected_message_draft("alice", &hex).unwrap();
+    app.save_message_draft("alice", &hex, "edit", None, vec![])
+        .unwrap();
+    let error = app
+        .clear_message_draft_if_revision("alice", &initial.revision)
+        .err()
+        .unwrap();
+    assert_eq!(error.privacy_safe_kind(), "message_draft_revision_conflict");
+    let error = app
+        .selected_message_draft("alice", "missing")
+        .err()
+        .unwrap();
+    assert!(matches!(error, AppError::UnknownGroup(_)));
+    app.draft_storage("alice")
+        .unwrap()
+        .delete_local_group_data(&hex)
+        .unwrap();
+    assert!(matches!(
+        app.save_message_draft_if_revision("alice", &initial.revision, "", None, vec![]),
+        Err(AppError::UnknownGroup(_))
+    ));
+    assert!(matches!(
+        app.clear_message_draft_if_revision("alice", &initial.revision),
+        Err(AppError::UnknownGroup(_))
+    ));
+    assert!(matches!(
+        app.message_draft_attachment_if_revision("alice", &initial.revision, "missing"),
+        Err(AppError::UnknownGroup(_))
+    ));
 }

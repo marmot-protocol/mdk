@@ -201,14 +201,35 @@ pub struct MessageDraftInvalidation {
     pub group_id_hex: String,
 }
 
-pub(crate) fn revision_error(error: storage_sqlite::MessageDraftRevisionError) -> AppError {
+pub(crate) fn revision_error(
+    error: storage_sqlite::MessageDraftRevisionError,
+    group: &str,
+) -> AppError {
     match error {
         storage_sqlite::MessageDraftRevisionError::Conflict => {
-            AppError::InvalidMessageDraft("draft revision no longer matches".into())
+            AppError::MessageDraftRevisionConflict
         }
-        storage_sqlite::MessageDraftRevisionError::Storage(error) => error.into(),
+        storage_sqlite::MessageDraftRevisionError::Storage(error) => {
+            draft_storage_error(error, group)
+        }
     }
 }
+
+fn draft_storage_error(error: StorageError, group: &str) -> AppError {
+    match error {
+        StorageError::NotFound => AppError::UnknownGroup(group.to_owned()),
+        error => error.into(),
+    }
+}
+
+impl fmt::Debug for MessageDraftInvalidation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MessageDraftInvalidation")
+            .finish_non_exhaustive()
+    }
+}
+
 impl MarmotApp {
     pub(crate) fn draft_storage(
         &self,
@@ -245,16 +266,16 @@ impl MarmotApp {
     ) -> Result<Option<Vec<u8>>, AppError> {
         self.draft_storage(account)?
             .message_draft_attachment_if_revision(revision, attachment)
-            .map_err(revision_error)
+            .map_err(|error| revision_error(error, revision.group_id_hex()))
     }
     pub fn selected_message_draft(
         &self,
         account_ref: &str,
         group: &str,
     ) -> Result<SelectedMessageDraft, AppError> {
-        Ok(self
-            .draft_storage(account_ref)?
-            .selected_message_draft(group)?)
+        self.draft_storage(account_ref)?
+            .selected_message_draft(group)
+            .map_err(|error| draft_storage_error(error, group))
     }
     pub fn save_message_draft_if_revision(
         &self,
@@ -269,7 +290,7 @@ impl MarmotApp {
         let attachments = attachments.into_iter().map(Into::into).collect::<Vec<_>>();
         let result = storage
             .save_message_draft_if_revision(expected, content, reply, &attachments)
-            .map_err(revision_error)?;
+            .map_err(|error| revision_error(error, expected.group_id_hex()))?;
         self.notify_draft_changed(account_ref, expected.group_id_hex());
         Ok(result)
     }
@@ -281,7 +302,7 @@ impl MarmotApp {
         let result = self
             .draft_storage(account_ref)?
             .clear_message_draft_if_revision(expected)
-            .map_err(revision_error)?;
+            .map_err(|error| revision_error(error, expected.group_id_hex()))?;
         self.notify_draft_changed(account_ref, expected.group_id_hex());
         Ok(result)
     }
