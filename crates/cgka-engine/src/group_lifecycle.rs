@@ -1170,9 +1170,19 @@ impl<S: StorageProvider> Engine<S> {
 
             let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
             let mut confirmation_token = None;
-            let (local_state_is_stale, repaired_unrecoverable) = match storage.get_group(&group_id)
-            {
-                Ok(group) => {
+            // The discarded local copy's record, read once: the join needs its
+            // membership and `unrecoverable` flag here, and its `removed` flag
+            // and epoch in the post-commit tail.
+            let discarded = match storage.get_group(&group_id) {
+                Ok(group) => Some(group),
+                Err(cgka_traits::storage::StorageError::NotFound) if consent.is_some() => {
+                    return Err(rejoin_confirmation_required());
+                }
+                Err(cgka_traits::storage::StorageError::NotFound) => None,
+                Err(error) => return Err(EngineError::Storage(error)),
+            };
+            let (local_state_is_stale, repaired_unrecoverable) = match discarded.as_ref() {
+                Some(group) => {
                     let self_is_recorded_member = group
                         .members
                         .iter()
@@ -1210,11 +1220,7 @@ impl<S: StorageProvider> Engine<S> {
                     // failure, so clearing the live rows remains tentative.
                     (true, group.unrecoverable)
                 }
-                Err(cgka_traits::storage::StorageError::NotFound) if consent.is_some() => {
-                    return Err(rejoin_confirmation_required());
-                }
-                Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
-                Err(error) => return Err(EngineError::Storage(error)),
+                None => (false, false),
             };
             if local_state_is_stale
                 && let Some(state) = self.epoch_manager.state(&group_id)
@@ -1477,12 +1483,19 @@ impl<S: StorageProvider> Engine<S> {
             // restores the consumed KeyPackage and every staged join row.
             self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
 
+            // The eviction era's refused rows are re-opened AFTER this
+            // transaction commits; hand the tail the floor it needs.
+            let reopen_refused_rows_at_or_above = discarded
+                .filter(|group| group.removed)
+                .map(|group| group.epoch);
+
             Ok::<_, EngineError>((
                 group_id,
                 mls_group,
                 welcome_sender_id,
                 repaired_unrecoverable,
                 superseded,
+                reopen_refused_rows_at_or_above,
             ))
         });
         if let Some(candidate) = pending_rejoin {
@@ -1530,7 +1543,14 @@ impl<S: StorageProvider> Engine<S> {
                     })?;
             }
         }
-        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) = result?;
+        let (
+            group_id,
+            mls_group,
+            welcome_sender_id,
+            repaired_unrecoverable,
+            superseded,
+            reopen_refused_rows_at_or_above,
+        ) = result?;
 
         // #740: index this joined group's transport routing id for O(1) inbound
         // resolution (see `Engine::transport_group_id_index`).
@@ -1659,6 +1679,36 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
 
+        if let Some(floor) = reopen_refused_rows_at_or_above {
+            // Best-effort, deliberately: the join above has already committed,
+            // and this repair's failure mode is the status quo — the rows stay
+            // `Failed`, exactly as they were before the re-join. Failing the
+            // join here would undo a completed, authenticated repair over an
+            // opportunistic sweep.
+            match crate::openmls_projection::reopen_rows_refused_by_the_removed_copy(
+                &self.storage,
+                &group_id,
+                floor,
+            ) {
+                // Privacy-safe: aggregate counts only, no ids
+                // (observability.md).
+                Ok(repair) if repair.reopened > 0 || repair.released > 0 => tracing::info!(
+                    target: "cgka_engine::group_lifecycle",
+                    method = "do_join_welcome",
+                    reopened = repair.reopened,
+                    released = repair.released,
+                    "repaired rows refused while removed: re-opened for the join's \
+                     replay, released the rest for redelivery"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    target: "cgka_engine::group_lifecycle",
+                    method = "do_join_welcome",
+                    "could not repair rows refused while removed; the unrepaired \
+                     ones stay refused"
+                ),
+            }
+        }
         self.replay_buffered_messages(&group_id).await?;
         Ok(group_id)
     }

@@ -18,7 +18,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
-use cgka_traits::storage::MessageStorage;
+use cgka_traits::storage::{GroupStorage, MessageStorage};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use std::collections::HashMap;
@@ -399,4 +399,150 @@ fn is_commit(mls_bytes: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// A re-opened eviction-era row the device can no longer peel enters the
+/// deferred-peel lifecycle instead of sitting `Retryable` forever.
+///
+/// The re-join repair re-opens the raw transport rows the eviction era refused
+/// (`openmls_projection::reopen_rows_refused_by_the_removed_copy`) so the
+/// join's own replay can process them. Under the pass-through `MockPeeler`
+/// every such row peels, which hides the real production shape: the wrapper is
+/// sealed under the sender's per-epoch exporter secret, and a message published
+/// while this device was removed was sealed under an epoch state the
+/// replacement copy never entered. That peel cannot succeed. The row must then
+/// land in the bounded deferred-peel lifecycle — which has a residence deadline
+/// that eventually retires it — and must never be left retained with nothing
+/// able to move it. The group must also stay live: an unreadable eviction-era
+/// row is not evidence of anything.
+#[tokio::test]
+async fn a_reopened_row_this_copy_can_no_longer_peel_lands_in_the_deferred_peel_lifecycle() {
+    let mut alice = build_client(b"sealed-alice-evict");
+    let (mut bob, bob_storage) = build_client_with_storage(b"sealed-bob-evict");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "sealed-evict".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("unexpected create result: {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+
+    // Alice removes bob and he realizes it.
+    let removal = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("unexpected remove result: {other:?}"),
+    };
+    bob.ingest(route(removal, &group_id)).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+    bob.drain_events();
+
+    // The group keeps committing while bob is gone. This one is sealed under
+    // an epoch state his replacement copy will never hold.
+    let era_commit = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("unexpected self-update result: {other:?}"),
+    };
+    let routed_era = route(era_commit, &group_id);
+
+    // A pre-#1840 build recorded it `Failed`; that row is what this device
+    // wakes up holding.
+    let refused_at = bob_storage.get_group(&group_id).unwrap().epoch;
+    bob_storage
+        .put_message(&cgka_traits::message::MessageRecord {
+            id: routed_era.id.clone(),
+            group_id: group_id.clone(),
+            epoch: refused_at,
+            state: MessageState::Failed,
+            payload: StoredMessagePayload::raw_transport(routed_era.clone())
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+
+    // The admin re-adds bob and he joins.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let rejoin_welcome = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("unexpected invite result: {other:?}"),
+    };
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    let events = bob.drain_events();
+
+    let state = bob_storage.get_message(&routed_era.id).unwrap().state;
+    assert_eq!(
+        state,
+        MessageState::PeelDeferred,
+        "an unpeelable re-opened row must leave `Retryable` for the bounded \
+         deferred-peel lifecycle, whose residence deadline eventually retires it"
+    );
+    assert!(
+        !bob_storage.get_group(&group_id).unwrap().unrecoverable,
+        "an unreadable eviction-era row is evidence of nothing and must not halt the group"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupUnrecoverable { .. }
+        )),
+        "got {events:?}"
+    );
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap(),
+        "the re-joined copy is live at the group's epoch"
+    );
 }
