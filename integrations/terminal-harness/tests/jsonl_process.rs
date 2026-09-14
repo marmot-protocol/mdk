@@ -427,15 +427,183 @@ exit 23
     let started = std::time::Instant::now();
     let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
     let background_pid = std::fs::read_to_string(root.path().join("background.pid")).unwrap();
-    let _ = std::process::Command::new("kill")
-        .arg(background_pid.trim())
-        .status();
+    assert!(
+        wait_for_process_exit(background_pid.trim()).await,
+        "descendant survived its leader's nonzero exit"
+    );
 
     assert_eq!(outcome.exit_code, Some(23));
     assert_eq!(outcome.observed_session.as_deref(), Some("immediate-exit"));
     assert_eq!(outcome.stderr, "inherited-stderr");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn continuous_descendant_stdout_does_not_starve_leader_exit() {
+    let _permit = process_test_permit().await;
+    for padding in [0, 4096] {
+        let root = tempfile::tempdir().unwrap();
+        let script = executable_script(
+            root.path(),
+            "continuous-stdout-backend",
+            r#"#!/usr/bin/env python3
+import os, sys, time
+print('{"type":"session","id":"continuous-output"}', flush=True)
+pid = os.fork()
+if pid == 0:
+    while True:
+        os.write(1, (b'{"type":"progress","padding":"' + b'x' * int(sys.argv[1]) + b'"}\n') * 16)
+with open('descendant.pid', 'w') as pid_file:
+    pid_file.write(str(pid))
+time.sleep(0.2)
+os._exit(23)
+"#,
+        );
+        let (tx, _rx) = mpsc::channel(2);
+        let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+        spec.args.push(padding.to_string());
+        spec.total_timeout = Duration::from_secs(5);
+        spec.idle_timeout = Duration::from_secs(5);
+        let mut progress_events = 0;
+        let result = run_jsonl_process(spec, tx, |line| {
+            let event = parse_event(line)?;
+            if matches!(event, ParsedEvent::Ignored) {
+                progress_events += 1;
+                // Keep stdout buffered and ready across select iterations, even
+                // on a host that schedules the writer infrequently.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok::<_, serde_json::Error>(event)
+        })
+        .await;
+        let pid = fs::read_to_string(root.path().join("descendant.pid")).unwrap();
+        let exited = wait_for_process_exit(pid.trim()).await;
+        if !exited {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid.trim()])
+                .status();
+        }
+        assert!(exited, "continuous stdout writer survived leader exit");
+        let outcome = result.expect("leader exit must be observed before the total timeout");
+        assert_eq!(outcome.exit_code, Some(23));
+        assert_eq!(
+            outcome.observed_session.as_deref(),
+            Some("continuous-output")
+        );
+        assert!(
+            progress_events > 0,
+            "fixture did not exercise continuous stdout"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exited_leader_with_inherited_stderr_is_cleaned_up() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "inherited-stderr-backend",
+        r#"#!/bin/sh
+exec 1>&-
+sleep 30 &
+printf '%s' "$!" > background.pid
+exit 23
+"#,
+    );
+    let (tx, _rx) = mpsc::channel(2);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.total_timeout = Duration::from_secs(2);
+    let outcome = run_jsonl_process(spec, tx, parse_event).await;
+    let pid = fs::read_to_string(root.path().join("background.pid")).unwrap();
+    assert!(
+        wait_for_process_exit(pid.trim()).await,
+        "stderr holder survived"
+    );
+    assert_eq!(outcome.unwrap().exit_code, Some(23));
+}
+
+#[tokio::test]
+async fn successful_leader_does_not_leave_detached_tools_in_its_group() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "successful-leader-backend",
+        r#"#!/bin/sh
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s' "$!" > background.pid
+printf '%s\n' '{"type":"text","text":"done"}'
+exit 0
+"#,
+    );
+    let (tx, mut rx) = mpsc::channel(2);
+    let outcome = run_jsonl_process(
+        process_spec(&script, root.path(), PromptTransport::Stdin(String::new())),
+        tx,
+        parse_event,
+    )
+    .await
+    .unwrap();
+    let pid = fs::read_to_string(root.path().join("background.pid")).unwrap();
+    assert!(
+        wait_for_process_exit(pid.trim()).await,
+        "tool survived successful exit"
+    );
+    assert_eq!(outcome.exit_code, Some(0));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::Text("done".to_owned())));
+}
+
+#[tokio::test]
+async fn escaped_pipe_holders_do_not_stall_completed_turns() {
+    let _permit = process_test_permit().await;
+    for retain_stdout in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let script = executable_script(
+            root.path(),
+            "escaped-pipe-backend",
+            &format!(
+                r#"#!/usr/bin/env python3
+import os, time
+read_fd, write_fd = os.pipe()
+if os.fork() == 0:
+    os.close(read_fd)
+    os.setsid()
+    if not {retain_stdout}:
+        os.close(1)
+    with open('escaped.pid', 'w') as pid_file:
+        pid_file.write(str(os.getpid()))
+    os.write(write_fd, b'ready')
+    os.close(write_fd)
+    time.sleep(30)
+    os._exit(0)
+os.close(write_fd)
+os.read(read_fd, 5)
+os.close(read_fd)
+print('{{"type":"text","text":"completed"}}', flush=True)
+os._exit(0)
+"#,
+                retain_stdout = if retain_stdout { "True" } else { "False" }
+            ),
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+        spec.total_timeout = Duration::from_secs(5);
+        let result = run_jsonl_process(spec, tx, parse_event).await;
+        // This fixture deliberately leaves the owned group. The test owns and
+        // cleans that separate process regardless of the assertion outcome.
+        let pid = fs::read_to_string(root.path().join("escaped.pid")).unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status();
+        assert!(wait_for_process_exit(pid.trim()).await);
+        assert_eq!(result.unwrap().exit_code, Some(0));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("completed".to_owned()))
+        );
+    }
 }
 
 #[tokio::test]
@@ -511,6 +679,138 @@ exec sleep 30
         !output.status.success(),
         "child process {pid} was not reaped"
     );
+}
+
+#[tokio::test]
+async fn timeout_terminates_descendant_processes() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let pid_path = root.path().join("descendant.pid");
+    let script = executable_script(
+        root.path(),
+        "descendant-backend",
+        r#"#!/bin/sh
+sleep 30 &
+printf '%s' "$!" > "$1"
+wait
+"#,
+    );
+    let (tx, _rx) = mpsc::channel(1);
+    let mut spec = process_spec(
+        &script,
+        root.path(),
+        PromptTransport::DelimitedArgument {
+            delimiter: "--",
+            prompt: "prompt".to_owned(),
+        },
+    );
+    spec.args = vec![pid_path.to_string_lossy().into_owned()];
+    spec.total_timeout = Duration::from_secs(2);
+    spec.idle_timeout = Duration::from_secs(5);
+
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+    assert!(matches!(
+        failure.error,
+        marmot_terminal_harness::HarnessError::BackendTimedOut
+    ));
+
+    let pid = fs::read_to_string(pid_path).unwrap();
+    let exited = wait_for_process_exit(pid.trim()).await;
+    let active = !exited;
+    if active {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status();
+    }
+    assert!(!active, "descendant process {pid} survived backend cleanup");
+}
+
+#[tokio::test]
+async fn cancellation_terminates_descendant_processes() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let pid_path = root.path().join("descendant.pid");
+    let script = executable_script(
+        root.path(),
+        "cancellation-descendant-backend",
+        &format!(
+            "#!/bin/sh\n: > {}\nsleep 0.1\nsleep 30 &\necho $! > {}\nwait\n",
+            pid_path.display(),
+            pid_path.display()
+        ),
+    );
+    let (tx, _rx) = mpsc::channel(2);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.total_timeout = Duration::from_secs(30);
+    spec.idle_timeout = Duration::from_secs(30);
+
+    let task = tokio::spawn(async move { run_jsonl_process(spec, tx, parse_event).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .is_none_or(|pid| pid == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("descendant pid was written");
+    task.abort();
+    let _ = task.await;
+
+    let pid = fs::read_to_string(pid_path).unwrap();
+    assert!(
+        pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0),
+        "test fixture did not publish a positive descendant pid"
+    );
+    assert!(
+        wait_for_process_exit(pid.trim()).await,
+        "descendant process survived cancellation cleanup"
+    );
+}
+
+async fn wait_for_process_exit(pid: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while process_is_active(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn process_is_active(pid: &str) -> bool {
+    let exists = std::process::Command::new("kill")
+        .args(["-0", pid])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !exists {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+            .and_then(|rest| rest.chars().next());
+        state != Some('Z')
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", pid])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                output
+                    .stdout
+                    .into_iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+            })
+            .is_some_and(|state| state != b'Z')
+    }
 }
 
 #[test]

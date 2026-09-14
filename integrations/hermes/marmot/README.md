@@ -72,6 +72,79 @@ general delivery idempotency. `InboundSpool.snapshot()` provides aggregate state
 counts for direct spool inspection; it is not wired into the readiness probe.
 Payloads and identifiers are never logged.
 
+### Quiet ambient continuity
+
+`message_deleted`, edit/reaction mutations, and `group_state_changed` facts
+never invoke `handle_message` or trigger an agent turn. The adapter records
+coarse facts in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
+`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches explicitly marked untrusted context
+to the next real inbound message that passes activation. Within the same live
+adapter, a bounded memory cache retains useful mutation targets, replacement
+text, reaction content, and rename details. After restart, context falls back
+to the allowlisted fact kind. These details never enter the ambient database.
+
+Admission rejection preserves pending facts. A host exception or cancellation
+releases its claimed snapshot; a normal `handle_message` return accepts that
+snapshot. Commit and acknowledgement are attempted independently, and the
+existing retry loop retries failed retirement or release operations. Claims
+prevent overlapping dispatches from attaching the same facts. Retirement only
+touches the accepted snapshot, preserving concurrent observations when capacity
+allows. Ambient database work runs on the journal worker, outside the host event
+loop. A storage failure never reclassifies an accepted real inbound turn.
+
+Durable rows contain SHA-256 routing/dedupe keys, allowlisted fact kinds,
+ordering/expiry metadata, and local claim ownership tokens. They contain no
+message or rename text, raw account/group/message identifiers, pubkeys, relay
+URLs, authentication tokens, or stream capabilities. Database, lock, and WAL
+files are private; symlink paths are refused. Acknowledged hashes remain as
+bounded replay tombstones. Dedupe only lasts while the hash is retained: after
+age expiry or capacity eviction, replay can surface an accepted fact again.
+The default shared per-group window holds 16 entries, including pending facts
+and tombstones; it is not an exactly-once ledger. Pending facts, active claims, and tombstones share
+hard per-group and aggregate group, event-count, logical-byte, and age limits.
+Unclaimed entries are evicted deterministically; active claims are protected.
+If protected claims fill a limit, a new observation can be refused. There is
+no extra snapshot allowance. The live detail cache has its own byte ceiling
+equal to the configured state-byte limit; dropping detail retains the coarse
+fact.
+
+Modern connectors supply an opaque `event_id_hex` for each group-change
+occurrence, identical in live delivery and durable replay. Its hash deduplicates
+replays, including after acknowledgement, while distinct changes of the same
+kind remain separate. Older connectors omit this optional field; a bounded
+process-local group/change-kind window suppresses their repeated observations
+before they consume durable capacity. This preserves the earlier legacy
+behavior: distinct same-kind legacy changes may also be suppressed until that
+key leaves the window. Restart clears the legacy window, so it cannot provide
+cross-process occurrence dedupe. Modern connectors do not use this fallback.
+
+An exclusive lock ensures one process owns the store. Restart recovers abandoned
+unaccepted claims and retires durably committed accepted claims. A graceful
+reconnect of the same adapter also preserves acceptance remembered in memory
+when both retirement writes failed. If the process dies after host acceptance
+but before either write succeeds, acceptance cannot be recovered and context may
+replay. The acceptance boundary is Hermes's normal `handle_message` return;
+it does not prove that an agent response completed or reached a recipient.
+
+Optional ambient storage can fail independently of the required real-message
+journal. A coarse restart fact is only a history-change hint: it cannot identify
+a deleted message or establish a rename target. Fetch targeted or older history
+when detail matters. Automatic history is best-effort and returns at most 20
+messages before the triggering message's cursor; a missing or limited page does
+not prove that older context is current. Earlier branch-install ambient schemas
+remain readable.
+
+Ambient acknowledgement consumes optional context at host acceptance even while
+the real-message journal remains `unresolved`. That journal does not automatically
+replay unknown outcomes. Any later external retry does not restore context whose
+ambient claim has already been retired.
+
+The byte setting is a logical row budget. The physical database page ceiling
+adds 64 KiB for schema pages and eight times the logical budget for indexes,
+fragmentation, claim metadata, and temporary acknowledgement overlap; WAL files
+are checkpointed separately. These are distinct limits. Generation fencing and
+connect-failure cleanup are required so late work cannot reopen a closed store.
+
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
 id or the latest inbound message and accept arbitrary non-blank, control-free

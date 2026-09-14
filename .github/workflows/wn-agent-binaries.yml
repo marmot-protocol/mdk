@@ -12,6 +12,8 @@ on:
       - integrations/hermes/tests/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
+      - scripts/install-claude-marmot.sh
+      - integrations/claude/marmot/**
       - scripts/install-codex-marmot.sh
       - integrations/codex/marmot/**
       - scripts/install-opencode-marmot.sh
@@ -106,6 +108,12 @@ jobs:
       - name: Smoke test wn-agent
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
 
+      - name: Build wn-claude
+        run: cargo build --locked --release -p wn-claude --bin wn-claude --target "${{ matrix.rust_target }}"
+
+      - name: Smoke test wn-claude
+        run: ./target/${{ matrix.rust_target }}/release/wn-claude --help
+
       - name: Build wn-codex
         run: cargo build --locked --release -p wn-codex --bin wn-codex --target "${{ matrix.rust_target }}"
 
@@ -128,7 +136,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for binary in wn-agent wn-codex wn-opencode wn-pi; do
+          for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi; do
             ./scripts/package-binary-bundle.sh \
               "$binary" \
               "${{ matrix.target }}" \
@@ -140,6 +148,13 @@ jobs:
         with:
           name: wn-agent-${{ matrix.target }}
           path: dist/wn-agent-${{ matrix.target }}/*
+          if-no-files-found: error
+
+      - name: Upload wn-claude bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wn-claude-${{ matrix.target }}
+          path: dist/wn-claude-${{ matrix.target }}/*
           if-no-files-found: error
 
       - name: Upload wn-codex bundle
@@ -209,6 +224,7 @@ jobs:
           cp integrations/hermes/marmot/__init__.py "$bundle_dir/"
           cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
           cp integrations/hermes/marmot/agent_control.py "$bundle_dir/"
+          cp integrations/hermes/marmot/ambient_context.py "$bundle_dir/"
           cp integrations/hermes/marmot/inbound_spool.py "$bundle_dir/"
           cp integrations/hermes/marmot/README.md "$bundle_dir/"
           cp scripts/hermes_marmot_configure_gateway.py "$bundle_dir/configure_gateway.py"
@@ -225,6 +241,7 @@ jobs:
               "__init__.py",
               "adapter.py",
               "agent_control.py",
+              "ambient_context.py",
               "inbound_spool.py",
               "configure_gateway.py",
               "README.md",
@@ -237,6 +254,7 @@ jobs:
             cd "$stage_parent"
             tar -czf "$asset" "hermes-marmot-plugin"
           )
+          python3 integrations/hermes/tests/marmot/verify_packaged_plugin.py "$asset"
           shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
           mkdir -p dist/hermes-marmot-plugin
           cp "$asset" "$asset.sha256" dist/hermes-marmot-plugin/
@@ -442,11 +460,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/codex-linux dist/codex-linux-arm dist/codex-darwin dist/codex-darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/claude-linux dist/claude-linux-arm dist/claude-darwin dist/claude-darwin-intel dist/codex-linux dist/codex-linux-arm dist/codex-darwin dist/codex-darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-aarch64 --dir dist/linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-aarch64 --dir dist/darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-x86_64 --dir dist/darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-claude-linux-x86_64 --dir dist/claude-linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-claude-linux-aarch64 --dir dist/claude-linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-claude-darwin-aarch64 --dir dist/claude-darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-claude-darwin-x86_64 --dir dist/claude-darwin-intel
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-linux-x86_64 --dir dist/codex-linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-linux-aarch64 --dir dist/codex-linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-codex-darwin-aarch64 --dir dist/codex-darwin
@@ -489,7 +511,7 @@ jobs:
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
           chmod 0755 dist/install/install-openclaw-marmot.sh
-          for harness in codex opencode pi; do
+          for harness in claude codex opencode pi; do
             awk -v harness="$harness" \
               'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=" harness; next } { print }' \
               scripts/install-terminal-harness-marmot.sh | \
@@ -548,6 +570,8 @@ jobs:
           install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
           # OpenClaw gateway
           install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Claude Code terminal harness
+          install_verified "\$base_url/install-claude-marmot.sh" "\$base_url/install-claude-marmot.sh.sha256"
           # Codex terminal harness
           install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
           # OpenCode terminal harness
@@ -587,6 +611,8 @@ jobs:
           install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
           # OpenClaw gateway
           install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Claude Code terminal harness
+          install_verified "\$base_url/install-claude-marmot.sh" "\$base_url/install-claude-marmot.sh.sha256"
           # Codex terminal harness
           install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
           # OpenCode terminal harness
@@ -597,6 +623,7 @@ jobs:
 
           Assets:
           - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
+          - \`wn-claude-<platform>-$version.tar.gz\`: Claude Code harness binary bundle.
           - \`wn-codex-<platform>-$version.tar.gz\`: Codex harness binary bundle.
           - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
           - \`wn-pi-<platform>-$version.tar.gz\`: Pi harness binary bundle.
@@ -604,6 +631,7 @@ jobs:
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
           - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
+          - \`install-claude-marmot.sh\`: installer for testers with Claude Code already installed.
           - \`install-codex-marmot.sh\`: installer for testers with Codex already installed.
           - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
           - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
@@ -620,6 +648,14 @@ jobs:
             dist/darwin/wn-agent-darwin-aarch64-"$version".tar.gz.sha256
             dist/darwin-intel/wn-agent-darwin-x86_64-"$version".tar.gz
             dist/darwin-intel/wn-agent-darwin-x86_64-"$version".tar.gz.sha256
+            dist/claude-linux/wn-claude-linux-x86_64-"$version".tar.gz
+            dist/claude-linux/wn-claude-linux-x86_64-"$version".tar.gz.sha256
+            dist/claude-linux-arm/wn-claude-linux-aarch64-"$version".tar.gz
+            dist/claude-linux-arm/wn-claude-linux-aarch64-"$version".tar.gz.sha256
+            dist/claude-darwin/wn-claude-darwin-aarch64-"$version".tar.gz
+            dist/claude-darwin/wn-claude-darwin-aarch64-"$version".tar.gz.sha256
+            dist/claude-darwin-intel/wn-claude-darwin-x86_64-"$version".tar.gz
+            dist/claude-darwin-intel/wn-claude-darwin-x86_64-"$version".tar.gz.sha256
             dist/codex-linux/wn-codex-linux-x86_64-"$version".tar.gz
             dist/codex-linux/wn-codex-linux-x86_64-"$version".tar.gz.sha256
             dist/codex-linux-arm/wn-codex-linux-aarch64-"$version".tar.gz
@@ -652,6 +688,8 @@ jobs:
             dist/install/install-hermes-marmot.sh.sha256
             dist/install/install-openclaw-marmot.sh
             dist/install/install-openclaw-marmot.sh.sha256
+            dist/install/install-claude-marmot.sh
+            dist/install/install-claude-marmot.sh.sha256
             dist/install/install-codex-marmot.sh
             dist/install/install-codex-marmot.sh.sha256
             dist/install/install-opencode-marmot.sh
@@ -754,6 +792,8 @@ jobs:
           install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
           # OpenClaw gateway
           install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Claude Code terminal harness
+          install_verified "\$base_url/install-claude-marmot.sh" "\$base_url/install-claude-marmot.sh.sha256"
           # Codex terminal harness
           install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
           # OpenCode terminal harness
@@ -780,6 +820,8 @@ jobs:
             dist/install/install-hermes-marmot.sh.sha256
             dist/install/install-openclaw-marmot.sh
             dist/install/install-openclaw-marmot.sh.sha256
+            dist/install/install-claude-marmot.sh
+            dist/install/install-claude-marmot.sh.sha256
             dist/install/install-codex-marmot.sh
             dist/install/install-codex-marmot.sh.sha256
             dist/install/install-opencode-marmot.sh

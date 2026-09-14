@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-kind="${1:?usage: test_installer.sh codex|pi|opencode}"
+# The suite verifies the installer's default and explicit profile behavior, so
+# do not inherit an operator-selected profile from the test runner.
+unset MARMOT_HARNESS_EXECUTION_PROFILE
+
+kind="${1:?usage: test_installer.sh claude|codex|pi|opencode}"
 case "$kind" in
+    claude)
+        env_prefix="WN_CLAUDE"
+        display_name="Claude Code"
+        default_home="$HOME/.marmot-agents/claude"
+        agent_service="wn-agent-claude.service"
+        agent_launchd="org.marmot.wn-agent.claude"
+        agent_label="claude-harness-agent"
+        ;;
     codex)
         env_prefix="WN_CODEX"
         display_name="Codex"

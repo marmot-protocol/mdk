@@ -46,7 +46,7 @@ if release_guide.count(f'base_url="{base_url}"') != 1:
         file=sys.stderr,
     )
     raise SystemExit(1)
-quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "codex": 2, "opencode": 1, "pi": 1}
+quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "claude": 1, "codex": 2, "opencode": 1, "pi": 1}
 for connector, quickstart_expected in quickstart_expected_calls.items():
     installer = f"install-{connector}-marmot.sh"
     call = f'install_verified "$base_url/{installer}"'
@@ -70,7 +70,7 @@ if rg -n 'releases/download/wn-agent-latest/install-' "${active_paths[@]}"; then
 fi
 
 stale_versioned_urls="$(
-    rg -n -o 'wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(hermes|openclaw|codex|opencode|pi)-marmot\.sh' \
+    rg -n -o 'wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot\.sh' \
         "${active_paths[@]}" |
         grep -F -v "wn-agent-v${workspace_version}/" || true
 )"

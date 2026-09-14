@@ -236,7 +236,8 @@ GitHub-generated source archives are the downloadable artifacts.
 
 Use this for the White Noise agent connector entry point. The release publishes `wn-agent` binaries for supported
 platforms plus adapter/harness install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, the OpenClaw
-Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-codex` harness +
+Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-claude` harness +
+`install-claude-marmot.sh`, the `wn-codex` harness +
 `install-codex-marmot.sh`, the `wn-opencode` harness +
 `install-opencode-marmot.sh`, and the `wn-pi` harness + `install-pi-marmot.sh`.
 
@@ -255,12 +256,14 @@ Before a WN Agent release, run the normal preflight plus:
 ```sh
 cargo test -p agent-connector
 cargo test -p marmot-terminal-harness
+cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
 sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
 bash scripts/install-hermes-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --allow-user "$sender_hex"
 bash scripts/install-openclaw-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex"
+bash scripts/install-claude-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --claude-bin /bin/echo
 bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
@@ -304,6 +307,14 @@ The release job creates these assets:
 - `wn-agent-darwin-aarch64-<version>.tar.gz.sha256`
 - `wn-agent-darwin-x86_64-<version>.tar.gz`
 - `wn-agent-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-claude-linux-x86_64-<version>.tar.gz`
+- `wn-claude-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-claude-linux-aarch64-<version>.tar.gz`
+- `wn-claude-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-claude-darwin-aarch64-<version>.tar.gz`
+- `wn-claude-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-claude-darwin-x86_64-<version>.tar.gz`
+- `wn-claude-darwin-x86_64-<version>.tar.gz.sha256`
 - `wn-codex-linux-x86_64-<version>.tar.gz`
 - `wn-codex-linux-x86_64-<version>.tar.gz.sha256`
 - `wn-codex-linux-aarch64-<version>.tar.gz`
@@ -336,6 +347,8 @@ The release job creates these assets:
 - `install-hermes-marmot.sh.sha256`
 - `install-openclaw-marmot.sh`
 - `install-openclaw-marmot.sh.sha256`
+- `install-claude-marmot.sh`
+- `install-claude-marmot.sh.sha256`
 - `install-codex-marmot.sh`
 - `install-codex-marmot.sh.sha256`
 - `install-opencode-marmot.sh`
@@ -381,6 +394,8 @@ install_verified() (
 install_verified "$base_url/install-hermes-marmot.sh" "$base_url/install-hermes-marmot.sh.sha256"
 # OpenClaw gateway
 install_verified "$base_url/install-openclaw-marmot.sh" "$base_url/install-openclaw-marmot.sh.sha256"
+# Claude Code terminal harness
+install_verified "$base_url/install-claude-marmot.sh" "$base_url/install-claude-marmot.sh.sha256"
 # Codex terminal harness
 install_verified "$base_url/install-codex-marmot.sh" "$base_url/install-codex-marmot.sh.sha256"
 # OpenCode terminal harness
@@ -398,7 +413,7 @@ plugin or harness binary, start same-user services where supported, bootstrap or
 Marmot agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
 `--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
 partial/manual install. Terminal-harness installers also accept the matching
-`--no-start-wn-codex` or `--no-start-wn-pi` option.
+`--no-start-wn-claude`, `--no-start-wn-codex`, or `--no-start-wn-pi` option.
 
 ## MarmotKit Binding Release
 

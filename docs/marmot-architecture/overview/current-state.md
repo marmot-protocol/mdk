@@ -19,6 +19,11 @@ status: overview
 
 # Current State — Implementations & Spec
 
+C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
+snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
+return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
+[bounded conversation opening](../further-context/conversation-opening.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
@@ -169,7 +174,7 @@ every message surface, and custom kinds materialize as standalone timeline rows 
 update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token) are rejected on
 the custom send path, so apps cannot forge protocol events.
 
-The Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
+The Claude Code, Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
 `autonomous`, and `unrestricted` execution intent while retaining
 backend-specific approval and sandbox semantics. Unrestricted installs require
 explicit acknowledgement and an external OS-user, container, or VM boundary;

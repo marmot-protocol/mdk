@@ -1,7 +1,7 @@
 ---
 title: "Terminal Harness Execution Profiles"
 created: 2026-08-19
-updated: 2026-08-19
+updated: 2026-09-13
 tags: [marmot, overview, terminal-harness, permissions, sandbox]
 status: overview
 ---
@@ -11,7 +11,7 @@ status: overview
 Marmot terminal harnesses accept remote prompts from explicitly allowed
 senders, then invoke a local coding-agent backend. A shared profile expresses
 operator intent while backend adapters preserve the real differences between
-Pi, OpenCode, and Codex.
+Claude Code, Pi, OpenCode, and Codex.
 
 ## Shared Intent
 
@@ -30,13 +30,15 @@ permissions, process sandboxing, and network policy are different controls.
 
 | Backend | Approval mapping | Isolation mapping | Version failure behavior |
 | --- | --- | --- | --- |
+| Claude Code | `autonomous` uses `--permission-mode acceptEdits`; `unrestricted` uses `--dangerously-skip-permissions` | No built-in OS sandbox | Startup rejects versions older than 2.1.0 or an unrecognized version response |
 | Pi | Non-interactive execution is natively approval-free for every profile | No built-in OS sandbox | No profile-specific CLI feature is required |
 | OpenCode | `autonomous` uses `--auto`; `unrestricted` adds a process-local allow-all permission overlay | Logical permissions only; no OS sandbox | An unsupported `--auto` fails the invocation; no successful reply is sent |
 | Codex | `autonomous` sets `approval_policy="never"`; `unrestricted` bypasses approvals | Configured sandbox/network survive `autonomous`; `unrestricted` bypasses the sandbox | An unsupported invocation-local config override or flag fails the invocation; no successful reply is sent |
 
 The OpenCode overlay exists only in the child process environment. The Codex
-override exists only in that invocation. Connector setup never rewrites global
-Pi, OpenCode, or Codex configuration.
+override and Claude Code permission mode exist only in that invocation.
+Connector setup never rewrites global Claude Code, Pi, OpenCode, or Codex
+configuration.
 
 ## Installer Contract
 

@@ -1,3 +1,10 @@
+mod opening;
+pub use opening::{
+    ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
+    ConversationOpenQuery, ConversationOpenReadState, ConversationOpenSnapshot,
+    ConversationOpenTarget,
+};
+
 use crate::connection::CachedSql;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -1380,23 +1387,7 @@ impl SqliteAccountStorage {
                 cursor_message_id_hex,
             )?);
         }
-        let (sql, params) = timeline_query_sql(&query, &pagination, canonical_group_order)?;
-        let rows = {
-            let _span = tracing::debug_span!(
-                target: "storage_sqlite::timeline",
-                "timeline_select",
-                method = "message_timeline"
-            )
-            .entered();
-            let mut stmt = conn.prepare_cached(&sql).storage()?;
-            stmt.query_map(
-                rusqlite::params_from_iter(params.iter()),
-                timeline_record_from_row,
-            )
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?
-        };
+        let rows = select_timeline_rows_tx(&conn, &query, &pagination, canonical_group_order)?;
         let has_extra = rows.len() > pagination.limit;
         let mut messages = rows.into_iter().take(pagination.limit).collect::<Vec<_>>();
         let (has_more_before, has_more_after) = match pagination.direction {
@@ -2994,6 +2985,28 @@ fn timeline_records_by_ids_tx(
     messages.sort_by(|left, right| left.canonical_order_key().cmp(&right.canonical_order_key()));
     attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
+}
+
+// Shared bounded row selection; callers own the transaction and hydrate only
+// the final window's reply previews.
+fn select_timeline_rows_tx(
+    conn: &Connection,
+    query: &TimelineMessageQuery,
+    pagination: &ValidatedPagination,
+    canonical_group_order: bool,
+) -> StorageResult<Vec<TimelineMessageRecord>> {
+    let (sql, params) = timeline_query_sql(query, pagination, canonical_group_order)?;
+    let _span = tracing::debug_span!(
+        target: "storage_sqlite::timeline",
+        "timeline_select",
+        method = "message_timeline"
+    )
+    .entered();
+    let mut stmt = conn.prepare_cached(&sql).storage()?;
+    stmt.query_map(params_from_iter(params.iter()), timeline_record_from_row)
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
 }
 
 fn timeline_order_cursor_tx(

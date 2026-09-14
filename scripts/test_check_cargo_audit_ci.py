@@ -109,7 +109,7 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
             "  terminal-harness-installers: # annotated boundary\n",
             1,
         ).replace("run: cargo --locked audit", "run: echo audit-disabled", 1)
-        marker = "      - name: Test Codex, Pi, and OpenCode installers\n"
+        marker = "      - name: Test Claude Code, Codex, Pi, and OpenCode installers\n"
         self.assertIn(marker, workflow)
         workflow = workflow.replace(
             marker,

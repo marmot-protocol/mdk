@@ -49,6 +49,7 @@ The canonical protocol specification lives in
 | Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
 | `wn-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
 | Host integrations / connector coexistence | `integrations/AGENTS.md` |
+| Claude Code terminal harness | `integrations/claude/marmot/AGENTS.md` |
 | Codex terminal harness | `integrations/codex/marmot/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
@@ -130,7 +131,7 @@ just test
 just install-example-sha256-gate
 ```
 
-The install-example gate renders all five installer `--help` surfaces and checks
+The install-example gate renders all six installer `--help` surfaces and checks
 release guidance plus workflow-generated notes for download, sibling `.sha256`
 verification (`shasum` or `sha256sum`), then local execution. It also rejects
 new download-to-shell examples in tracked Markdown, shell, and workflow files.

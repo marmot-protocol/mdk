@@ -372,9 +372,11 @@ async fn control_event_projects_group_rename_as_group_state_changed() {
         },
     });
 
+    let expected_occurrence = runtime_replay_dedup_key(&event);
     let Some(AgentControlEvent::GroupStateChanged {
         account_id_hex,
         group_id_hex,
+        event_id_hex,
         change,
         detail,
     }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
@@ -385,6 +387,8 @@ async fn control_event_projects_group_rename_as_group_state_changed() {
     assert_eq!(group_id_hex, "22".repeat(32));
     assert_eq!(change, "group_renamed");
     assert_eq!(detail, Some("Team".to_owned()));
+    assert_eq!(event_id_hex.as_ref().map(String::len), Some(64));
+    assert_eq!(event_id_hex, expected_occurrence);
     runtime.shutdown().await;
 }
 
@@ -4687,6 +4691,7 @@ async fn inbound_message_event_from_record_projects_group_system_row() {
         AgentControlEvent::GroupStateChanged {
             account_id_hex: "acct".to_owned(),
             group_id_hex: "bb".to_owned(),
+            event_id_hex: Some("ee".to_owned()),
             change: "group_renamed".to_owned(),
             detail: Some("Team".to_owned()),
         }

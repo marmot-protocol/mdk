@@ -95,7 +95,7 @@ Written to be readable in 5 minutes each, shareable as a package.
     suspension rules that release WAL and root-lease file locks.
 
 - **Doc:** [`overview/terminal-harness-execution-profiles.md`](./overview/terminal-harness-execution-profiles.md)
-  - **What it covers:** Typed execution intent across Pi, OpenCode, and Codex; backend mappings, installer
+  - **What it covers:** Typed execution intent across Claude Code, Pi, OpenCode, and Codex; backend mappings, installer
     acknowledgement, and the remote-execution containment boundary.
 
 - **Doc:** [`overview/multi-step-state-changes.md`](./overview/multi-step-state-changes.md)
@@ -198,6 +198,9 @@ These are longer working documents. Go here when you need depth, not orientation
     `IdentityRemove` design space.
 
 ### Current state — facts and analysis
+
+- **Doc:** [`further-context/conversation-opening.md`](./further-context/conversation-opening.md)
+  - **What it covers:** C5 M1 bounded storage opening, canonical anchors, read-state readiness and later screen inputs.
 
 - **Doc:** [`further-context/chat-projections-native.md`](./further-context/chat-projections-native.md)
   - **What it covers:** C4 native list-window and account-attention contracts, ownership, validation and client handoff.

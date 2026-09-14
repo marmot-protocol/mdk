@@ -24,6 +24,7 @@ members = [
     "crates/marmot-c",
     "crates/cli",
     "integrations/terminal-harness",
+    "integrations/claude/marmot",
     "integrations/codex/marmot",
     "integrations/opencode/marmot",
     "integrations/pi/marmot",
@@ -97,7 +98,7 @@ zeroize = "1"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 # Already in the graph through quinn's platform-verifier feature; direct dep so
 # the broker can build ALPN-carrying rustls client configs with platform trust.
 rustls-platform-verifier = "0.6"
@@ -111,6 +112,7 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 prost = "0.14"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "cache", "trace"] }
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 # test
 proptest = "1"

@@ -11,6 +11,10 @@ consumer is still released atomically from this repository. The `v2` schema is
 stable after this change: any later breaking wire change must introduce a new
 protocol label or explicit negotiation rather than silently changing `v2`.
 
+`group_state_changed` includes an optional `event_id_hex`: the opaque durable
+occurrence id shared by live events and storage replay. Older connectors omit
+it. A change kind or timestamp alone is not a safe deduplication key.
+
 Version 2 is intentionally incompatible with version 1. A successful `StreamBegin` returns a random 32-byte
 `stream_capability` encoded as 64 lowercase hex characters. Every later append, status, progress, finalize, or cancel
 request for that stream must present the capability. Treat it as an in-memory bearer secret: never persist or log it.

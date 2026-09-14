@@ -93,6 +93,23 @@ install_verified "$base_url/install.sh"
             gate.documented_surface_errors(mutated, installers),
         )
 
+    def test_quickstart_requires_a_verified_claude_installer_call(self) -> None:
+        installers = gate.DOCUMENTED_INSTALL_CALLS["integrations/README.md"]
+        self.assertEqual(installers["install-claude-marmot.sh"], 1)
+        quickstart = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(gate.documented_surface_errors(quickstart, installers), [])
+        mutated = quickstart.replace(
+            '"$base_url/install-claude-marmot.sh.sha256"',
+            '"$base_url/install-claude-marmot.sh.sig"',
+            1,
+        )
+        self.assertIn(
+            "expected at least 1 companion checksums for install-claude-marmot.sh",
+            gate.documented_surface_errors(mutated, installers),
+        )
+
     def test_same_shell_notice_regression_is_rejected(self) -> None:
         readme = (Path(__file__).resolve().parents[1] / "integrations/hermes/marmot/README.md").read_text(
             encoding="utf-8"

@@ -27,6 +27,12 @@ The crate is split around storage concerns:
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
   tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
+## Conversation opening
+
+`conversation_open` composes a bounded canonical timeline page with retained read state in one read-only snapshot.
+It supports first-unread/latest opening and scoped anchor recovery; dirty projections return `ReadStateNotReady`
+for the existing owner to refresh. See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
+
 ## Migrations
 
 Account/session schema changes go through Rust migrations. The runner and ordered registry live in

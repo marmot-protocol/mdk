@@ -218,6 +218,12 @@ openclaw-host-compat-test:
 openclaw-dev-script-test:
     integrations/openclaw/marmot/test/dev-scripts.sh
 
+claude-installer-test:
+    integrations/claude/marmot/tests/test_installer.sh
+
+claude-dev-e2e-connector:
+    cargo test -p wn-claude --test e2e_connector -- --ignored --nocapture
+
 codex-installer-test:
     integrations/codex/marmot/tests/test_installer.sh
 

@@ -149,9 +149,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test Codex, Pi, and OpenCode installers
+      - name: Test Claude Code, Codex, Pi, and OpenCode installers
         run: |
           set -euo pipefail
+          integrations/terminal-harness/tests/test_installer.sh claude
           integrations/terminal-harness/tests/test_installer.sh codex
           integrations/terminal-harness/tests/test_installer.sh pi
           integrations/terminal-harness/tests/test_installer.sh opencode
