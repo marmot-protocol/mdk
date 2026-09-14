@@ -16,6 +16,34 @@ SPEC.loader.exec_module(campaign)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_generated_only_selects_all_72_cases_without_fixed_diagnostics(self):
+        args = campaign.parse_args(["unused", "--generated-only", "--seeds", "7", "--jobs", "1"])
+        executables = {"cgka-conformance-campaign": "campaign"}
+        tasks = campaign.make_plan(args, executables, {"ignored-binary": [campaign.RACE_DIAGNOSTIC]})
+        self.assertEqual(sum(task["cases"] for task in tasks), 72)
+        self.assertEqual(len(tasks), 11)
+        self.assertTrue(all(task["kind"] == "generated" and task["seed"] == 7 for task in tasks))
+        self.assertTrue(all("--allow-weak-oracle" not in task["command"] for task in tasks))
+
+    def test_generated_only_build_skips_compatibility_and_test_binaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "bin").mkdir()
+            def fake_build(command, directory, _env, _timeout):
+                self.assertEqual(command, campaign.build_commands()[0])
+                messages = []
+                for name in ["cgka-conformance-campaign", "cgka-conformance-node"]:
+                    artifact = directory / name
+                    artifact.write_text(name)
+                    messages.append({"reason": "compiler-artifact", "target": {"name": name},
+                                     "executable": str(artifact), "features": []})
+                (directory / "output.log").write_text("\n".join(map(json.dumps, messages)))
+                return {"exit_code": 0}
+            with patch.object(campaign, "run_command", side_effect=fake_build) as run:
+                executables = campaign.build(root, {}, generated_only=True)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(set(executables), {"cgka-conformance-campaign", "cgka-conformance-node"})
+
     def test_cleanup_failure_preserves_result_and_fails_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -114,11 +114,13 @@ PR CI runs `just simulator-smoke` (ordinary simulator tests and four selected pr
 and the Python campaign-contract tests. It does **not** execute the full 72-case app catalog.
 The nightly workflow runs the broader simulator lane and two separate production-policy
 1,024-message app recovery journeys. The weekly hardening lane runs broader engine/container
-campaigns. Neither scheduled workflow currently invokes the full app-stack catalog.
+campaigns. Its separate app-catalog job runs the generated canary selection followed by all 72
+seed-7 catalog cases with eight-way participant catch-up, one family at a time, and uploaded evidence.
+It uses `--generated-only` to exclude fixed journeys and the separately classified invite/rename
+diagnostic. It runs weekly or by manual workflow dispatch, never on PR events.
 
-Keep the full 72-case app run in an explicit or scheduled assurance lane, rather than adding it to
-PR smoke. Weekly is the intended starting cadence; wiring that catalog into a scheduled job remains
-separate work. Focused saved-input regressions and harness tests are the PR gate for timing fixes.
+Focused saved-input regressions and harness tests remain the PR gate for timing fixes. Weekly
+workflow execution is a separate result from the verified local catalog run.
 
 ## Recorded validation and remaining gates
 

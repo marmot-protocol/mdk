@@ -77,6 +77,8 @@ def parse_args(argv=None):
     parser.add_argument("--rounds", type=positive, default=1,
                         help="repeat the complete selection with new sockets and keys")
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--generated-only", action="store_true",
+                        help="run only the generated catalog, excluding fixed journeys and diagnostics")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="record a WIP patch and untracked file hashes for local validation")
     parser.add_argument("--plan-only", action="store_true", help="print selection without building or writing")
@@ -175,14 +177,14 @@ def build_profiles():
     }
 
 
-def build(root, env):
+def build(root, env, generated_only=False):
     executables = {}
     selected_targets = (
         {"cgka-conformance-campaign", "cgka-conformance-node"},
         set(TEST_BINARIES) - {"process_orchestrator"},
         {"process_orchestrator"},
     )
-    for index, command in enumerate(build_commands()):
+    for index, command in enumerate(build_commands()[:1] if generated_only else build_commands()):
         directory = root / f"build-{index}"
         directory.mkdir(mode=0o700)
         write_json(directory / "command.json", command)
@@ -208,7 +210,7 @@ def build(root, env):
                 shutil.copyfile(source, destination)
                 destination.chmod(0o700)
                 executables[name] = str(destination)
-    required = set(TEST_BINARIES) | {"cgka-conformance-campaign", "cgka-conformance-node"}
+    required = (set() if generated_only else set(TEST_BINARIES)) | {"cgka-conformance-campaign", "cgka-conformance-node"}
     if set(executables) != required:
         raise RuntimeError(f"missing build artifacts: {required - set(executables)}")
     return executables
@@ -233,7 +235,7 @@ def make_plan(args, executables, inventory):
                               "kind": "generated", "family": family, "seed": seed,
                               "cases": cases, "case_timeout": timeout,
                               "timeout": cases * timeout + 120})
-        for binary, names in inventory.items():
+        for binary, names in ({} if getattr(args, "generated_only", False) else inventory).items():
             for name in names:
                 if binary == "process_orchestrator" and name not in APP_ROUTE_TESTS:
                     continue
@@ -336,7 +338,7 @@ def main(argv=None):
     args = parse_args(argv)
     if args.plan_only:
         print(json.dumps({"mode": args.mode, "seeds": args.seeds, "rounds": args.rounds,
-                          "families": FAMILIES, "test_binaries": TEST_BINARIES,
+                          "families": FAMILIES, "test_binaries": [] if args.generated_only else TEST_BINARIES,
                           "scope": "fresh app stacks per case; real local relay; production timing"}, indent=2))
         return 0
     os.umask(0o077)
@@ -352,7 +354,7 @@ def main(argv=None):
     write_json(root / "source.json", before)
     env = dict(os.environ, RUST_MIN_STACK="4194304", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="false",
                CARGO_INCREMENTAL="0")
-    executables = build(root, env)
+    executables = build(root, env, args.generated_only)
     after = source_state()
     if before != after:
         raise RuntimeError("source changed during build; this evidence root cannot be used")
@@ -361,9 +363,9 @@ def main(argv=None):
         "rustc": subprocess.check_output(["rustc", "--version", "--verbose"], text=True),
         "production_policy": True, **build_profiles(),
     })
-    inventory = {name: test_names(executables[name], env) for name in TEST_BINARIES}
+    inventory = {} if args.generated_only else {name: test_names(executables[name], env) for name in TEST_BINARIES}
     selected = {name for names in inventory.values() for name in names}
-    if not (CANARY_TESTS | APP_ROUTE_TESTS | {RACE_DIAGNOSTIC}) <= selected:
+    if not args.generated_only and not (CANARY_TESTS | APP_ROUTE_TESTS | {RACE_DIAGNOSTIC}) <= selected:
         raise RuntimeError("maintained campaign test selection drifted")
     phases = [("canary", make_plan(argparse.Namespace(**dict(vars(args), mode="canary", rounds=1)), executables, inventory))]
     if args.mode == "full":

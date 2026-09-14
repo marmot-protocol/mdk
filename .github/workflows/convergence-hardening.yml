@@ -241,3 +241,46 @@ jobs:
             target/cgka-hardening-lane-evidence
           if-no-files-found: warn
           retention-days: ${{ inputs.lane == 'release_hardening' && 180 || 60 }}
+
+  app-catalog:
+    name: Weekly public app catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MDK_APP_CATCH_UP_PARALLELISM: "8"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: app-catalog
+
+      - name: Run generated canaries and all 72 seed-7 cases
+        timeout-minutes: 150
+        run: |
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          python3 scripts/app_stack_campaign.py target/app-weekly-catalog \
+            --generated-only --mode full --seeds 7 --jobs 1
+
+      - name: Upload app catalog evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: app-catalog-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/app-weekly-catalog
+            !target/app-weekly-catalog/bin
+            !target/app-weekly-catalog/**/tmp
+          if-no-files-found: warn
+          retention-days: 30

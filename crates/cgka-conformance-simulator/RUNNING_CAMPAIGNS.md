@@ -444,6 +444,9 @@ automatically tune production constants.
 Use `just app-stack-campaign target/app-stack-run-1 --mode canary` for the launch gate, or omit `--mode canary`
 to run that gate followed by every public catalog arm and fixed journey. The default full matrix uses seeds
 7, 42 and 17001 with two workers; `--seeds`, `--rounds` and `--jobs 1|2` control the bounded selection.
+Use `--generated-only --seeds 7 --jobs 1` for the weekly catalog selection (generated canaries,
+then all 72 cases; no fixed journeys or diagnostics). The separate app-catalog job in
+`convergence-hardening.yml` uses that command and retains evidence even on failure.
 See [APP_PATH_COVERAGE.md](APP_PATH_COVERAGE.md#unified-public-app-campaign) for production-policy builds,
 ignored-test selection, WIP provenance, outcome interpretation and the fresh-stack versus sustained-runtime boundary.
 
