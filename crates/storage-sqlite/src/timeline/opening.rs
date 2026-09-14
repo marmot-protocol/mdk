@@ -39,6 +39,9 @@ impl Default for ConversationOpenQuery {
     }
 }
 /// Raw retained read state. These are not C4 account-attention totals.
+/// This narrow projection deliberately avoids `chat_list_row_tx` and its
+/// account-wide leave/disband scans. Keep opening bounded when integrating
+/// the keyed group/header reads from #1793.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConversationOpenReadState {
     pub initialized: bool,
@@ -108,7 +111,7 @@ impl SqliteAccountStorage {
     }
 }
 
-fn read_state_tx(
+fn opening_read_state_tx(
     conn: &Connection,
     group: &str,
 ) -> Result<ConversationOpenReadState, ConversationOpenError> {
@@ -123,30 +126,46 @@ fn read_state_tx(
     if !ready {
         return Err(ConversationOpenError::ReadStateNotReady);
     }
-    let state = conn.query_row_cached(
+    // Readiness uses durable membership and structural marker agreement, never
+    // independently sampled wall-clock timestamps (which can move backwards).
+    const READ_STATE_SQL: &str =
         "SELECT s.group_id_hex IS NOT NULL, s.last_read_message_id_hex, s.last_read_timeline_at,
                 COALESCE(s.manually_marked_unread, 0), r.unread_count, r.unread_mention_count,
                 r.first_unread_message_id_hex,
                 r.last_read_message_id_hex IS s.last_read_message_id_hex
                 AND r.last_read_timeline_at IS s.last_read_timeline_at
                 AND r.manually_marked_unread = COALESCE(s.manually_marked_unread, 0)
-                AND r.updated_at >= COALESCE(s.updated_at, 0)
          FROM chat_list_rows r LEFT JOIN conversation_read_state s USING(group_id_hex)
-         WHERE r.group_id_hex = ?1",
-        [group], |row| Ok((
-            row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<i64>>(2)?,
-            row.get::<_, bool>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, bool>(7)?
-        ))).optional().storage()?;
+         WHERE r.group_id_hex = ?1";
+    let state = conn
+        .query_row_cached(READ_STATE_SQL, [group], |row| {
+            Ok((
+                row.get::<_, bool>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, bool>(7)?,
+            ))
+        })
+        .optional()
+        .storage()?;
     let Some((initialized, last_id, last_at, manual, count, mentions, first_id, aligned)) = state
     else {
         return Err(ConversationOpenError::ReadStateNotReady);
     };
     // The indexed unread membership is maintained with the counters. This keyed
     // check detects incomplete composition without counting/scanning that set.
-    let indexed_first: Option<String> = conn.query_row_cached(
+    const FIRST_UNREAD_SQL: &str =
         "SELECT message_id_hex FROM chat_list_unread_messages WHERE group_id_hex = ?1
-         ORDER BY timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, message_id_hex LIMIT 1",
-        [group], |row| row.get(0)).optional().storage()?;
+         ORDER BY timeline_order_class, timeline_order_primary, timeline_order_phase,
+                  timeline_order_at, message_id_hex LIMIT 1";
+    let indexed_first: Option<String> = conn
+        .query_row_cached(FIRST_UNREAD_SQL, [group], |row| row.get(0))
+        .optional()
+        .storage()?;
     if !aligned
         || first_id != indexed_first
         || (count > 0) != first_id.is_some()
@@ -191,7 +210,7 @@ fn opening_tx(
     {
         return Err(ConversationOpenError::AnchorScopeMismatch);
     }
-    let read_state = read_state_tx(conn, group)?;
+    let read_state = opening_read_state_tx(conn, group)?;
     let mut outcome = ConversationOpenAnchorOutcome::Latest { index: 0 };
     let key = match query.target {
         ConversationOpenTarget::Automatic

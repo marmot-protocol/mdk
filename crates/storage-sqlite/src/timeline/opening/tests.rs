@@ -80,6 +80,46 @@ fn opening_uses_first_unread_in_canonical_order_without_changing_read_state() {
     assert!(!opened.page.has_more_before && !opened.page.has_more_after);
 }
 
+#[test]
+fn coherent_read_state_does_not_depend_on_wall_clock_order() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    add(&store, "read", 1, 1);
+    add(&store, "unread", 2, 2);
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "read", &no_mentions)
+        .unwrap();
+    // A backwards wall-clock adjustment between source/projection timestamps
+    // must not invalidate structurally identical durable read markers.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_list_rows SET updated_at = 0 WHERE group_id_hex = ?1",
+            [GROUP],
+        )
+        .unwrap();
+    let snapshot = open(&store, ConversationOpenTarget::Automatic, 50);
+    assert_eq!(snapshot.read_state.unread_count, 1);
+    assert_eq!(
+        snapshot.anchor,
+        ConversationOpenAnchorOutcome::FirstUnread { index: 1 }
+    );
+    // A real source/projection marker mismatch must still fail closed.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE conversation_read_state SET manually_marked_unread = 1 WHERE group_id_hex = ?1",
+            [GROUP],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.conversation_open(GROUP, ConversationOpenQuery::default()),
+        Err(ConversationOpenError::ReadStateNotReady)
+    ));
+}
+
 fn open(
     store: &SqliteAccountStorage,
     target: ConversationOpenTarget,
