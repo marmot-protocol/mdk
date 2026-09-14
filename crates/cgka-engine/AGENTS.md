@@ -161,7 +161,7 @@ realises. Read those rustdocs as the source of truth — this table is just an i
     `candidate_branch_peel` (whether the graph is contested, plus candidate branch tips captured as owned peel
     contexts)
   - **Submodules:** `openmls_projection/resumable.rs` owns shared candidate search and slice continuations;
-    `openmls_projection/candidate_replay_tests.rs` owns forked-graph, restoration, parity and measurement fixtures.
+    `openmls_projection/tests/candidate_replay.rs` owns forked-graph, restoration, parity and measurement fixtures.
     Process-kill coverage remains in `tests/crash_recovery_sqlite.rs`.
 
 - **Module:** `update_group_data.rs`

@@ -4730,5 +4730,5 @@ mod checkpoint_prefix_tests {
 /// apart is pinned separately, over constructed values, in
 /// `message_processor::ingest`.
 #[cfg(test)]
-#[path = "openmls_projection/candidate_replay_tests.rs"]
+#[path = "openmls_projection/tests/candidate_replay.rs"]
 mod candidate_branch_peel_halt_tests;
