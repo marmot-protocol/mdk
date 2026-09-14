@@ -1010,24 +1010,6 @@ impl AppClient {
         Ok(false)
     }
 
-    /// Warm the encrypted-media epoch-secret cache around a subscription sync,
-    /// recording the aggregate pass shape so idle steady-state passes are
-    /// provably free of authoritative (`MlsGroup::load`) re-checks (mdk#1380).
-    fn warm_encrypted_media_epoch_secrets(&mut self, phase: &'static str) {
-        let stats = self.cache_current_encrypted_media_epoch_secrets();
-        tracing::debug!(
-            target: "marmot_app::media",
-            method = "warm_encrypted_media_epoch_secrets",
-            phase,
-            groups_considered = stats.groups_considered,
-            skipped_unchanged_epoch = stats.skipped_unchanged_epoch,
-            authoritative_checks = stats.authoritative_checks,
-            warmed = stats.warmed,
-            failures = stats.failures,
-            "encrypted media epoch-secret warm pass"
-        );
-    }
-
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
         self.pending_runtime_group_subscription_refresh
     }
