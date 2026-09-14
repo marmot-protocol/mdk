@@ -3969,7 +3969,7 @@ fn put_disband_tombstone_for(store: &SqliteAccountStorage, group_id_hex: &str) {
 }
 
 #[test]
-fn account_unread_total_counts_pending_invite_as_attention_only() {
+fn account_unread_total_suppresses_pending_invite_attention() {
     let mut pending = group();
     pending.pending_confirmation = true;
     let store = setup_store_with_group(pending);
@@ -3979,9 +3979,9 @@ fn account_unread_total_counts_pending_invite_as_attention_only() {
 
     let total = store.account_unread_total().unwrap();
     assert_eq!(total.unread_count, 0);
-    assert_eq!(total.unread_conversations, 1);
-    assert_eq!(total.attention_only_conversations, 1);
-    assert!(total.has_unread());
+    assert_eq!(total.unread_conversations, 0);
+    assert_eq!(total.attention_only_conversations, 0);
+    assert!(!total.has_unread());
 }
 
 #[test]
@@ -3998,15 +3998,15 @@ fn account_unread_total_does_not_double_count_unread_plus_manual() {
 }
 
 #[test]
-fn account_unread_total_does_not_double_count_unread_plus_pending() {
+fn account_unread_total_suppresses_pending_invite_with_unread_messages() {
     let mut pending = group();
     pending.pending_confirmation = true;
     let store = setup_store_with_group(pending);
     materialize_one_unread(&store, GROUP);
 
     let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 1);
-    assert_eq!(total.unread_conversations, 1);
+    assert_eq!(total.unread_count, 0);
+    assert_eq!(total.unread_conversations, 0);
     assert_eq!(total.attention_only_conversations, 0);
 }
 
@@ -4030,11 +4030,9 @@ fn account_unread_total_excludes_archived_attention_only_rows() {
 
 #[test]
 fn account_unread_total_suppresses_left_removed_and_disbanded_attention() {
-    let mut pending = group();
-    pending.pending_confirmation = true;
-    let store = setup_store_with_group(pending);
+    let store = setup_store_with_group(group());
     store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
         .unwrap();
     assert_eq!(
         store
@@ -4099,8 +4097,8 @@ fn account_unread_total_sums_distinct_attention_only_rows() {
 
     let total = store.account_unread_total().unwrap();
     assert_eq!(total.unread_count, 0);
-    assert_eq!(total.unread_conversations, 2);
-    assert_eq!(total.attention_only_conversations, 2);
+    assert_eq!(total.unread_conversations, 1);
+    assert_eq!(total.attention_only_conversations, 1);
     assert!(total.has_unread());
 }
 
@@ -4574,4 +4572,34 @@ fn pinned_order_survives_encrypted_database_reopen() {
         pinned,
         vec![("33".to_owned(), Some(0)), ("11".to_owned(), Some(1))]
     );
+}
+
+#[test]
+fn account_attention_missing_base_rows_are_explicit_and_acceptance_reveals_retained_counts() {
+    let mut pending = group();
+    pending.pending_confirmation = true;
+    let store = setup_store_with_group(pending.clone());
+    assert!(matches!(
+        store.account_attention_total(),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+    materialize_one_unread(&store, GROUP);
+    assert!(!store.account_attention_total().unwrap().has_unread());
+    let raw = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(raw.unread_count, 1);
+    pending.pending_confirmation = false;
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![pending],
+                ..Default::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let total = store.account_attention_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
 }

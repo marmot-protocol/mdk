@@ -588,6 +588,11 @@ c-header:
 c-smoke:
     ./crates/marmot-c/c-smoke.sh
 
+# Generate host bindings and run chat-screen DTO round trips (swift or kotlin).
+# Requires swiftc, or kotlinc with MDK_KOTLIN_CLASSPATH containing its dependencies.
+uniffi-projections-smoke language="swift":
+    ./crates/marmot-uniffi/chat-projections-smoke.sh {{quote(language)}}
+
 # Keep the C ABI covering the same marmot-uniffi command surface Swift and
 # Kotlin get; deliberate omissions live in the script's allowlist.
 c-parity-gate:

@@ -1172,6 +1172,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamPublisher(_) => "read_marker_failed:agent_stream_publisher",
+        AppError::AgentStreamFinishMismatch => "read_marker_failed:agent_stream_finish_mismatch",
+        AppError::AgentStreamSendFailed(_) => "read_marker_failed:agent_stream_send_failed",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {
             "read_marker_failed:agent_stream_start_not_confirmed"
@@ -1207,6 +1209,12 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:invalid_agent_text_stream_policy"
         }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
+        AppError::MediaReferenceStaleEpoch { .. } => {
+            "read_marker_failed:media_reference_stale_epoch"
+        }
+        AppError::MediaReferenceEpochUnsettled { .. } => {
+            "read_marker_failed:media_reference_epoch_unsettled"
+        }
         AppError::MediaAttachmentRejected(_) => "read_marker_failed:media_attachment_rejected",
         AppError::MediaUnfetchable(_) => "read_marker_failed:media_unfetchable",
         AppError::MediaDownloadFailed(_) => "read_marker_failed:media_download_failed",

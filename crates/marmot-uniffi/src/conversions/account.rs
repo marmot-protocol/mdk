@@ -1,9 +1,9 @@
 //! Account summary, send summary, key-package, and user-profile FFI conversions.
 
 use marmot_app::{
-    AccountKeyPackageRecord, AccountSetupReadiness, AccountUnread, GroupLeaveFailure,
-    LocalCleanupReport, RelayFailure, SendSummary, SignOutOutcome, UserProfileMetadata,
-    WipeOutcome,
+    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountSetupReadiness, AccountUnread,
+    GroupLeaveFailure, LocalCleanupReport, RelayFailure, SendSummary, SignOutOutcome,
+    UserProfileMetadata, WipeOutcome,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -51,18 +51,18 @@ pub struct IdentityCreationResultFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountUnreadFfi {
     pub account_id_hex: String,
-    /// Total unread messages across all unarchived conversations.
+    /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations that require badge attention:
-    /// unread messages, a manual-unread reminder, or a pending invitation.
+    /// Number of eligible conversations with unread messages or a manual reminder.
+    /// Pending invitations and queued departures are excluded.
     pub unread_conversations: u64,
     /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread or pending confirmation. A row that already has
+    /// manually marked unread. A row that already has
     /// unread messages is omitted so hosts can compute
     /// `unread_count + attention_only_conversations` without overlap.
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder or pending invitation with no unread messages.
+    /// manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 
@@ -160,6 +160,38 @@ impl From<AccountKeyPackageRecord> for AccountKeyPackageFfi {
             source_relays: value.source_relays,
             local: value.local,
             relay: value.relay,
+        }
+    }
+}
+
+/// Observed relay history for an account's kind-30443 KeyPackage events.
+///
+/// This is not another Published inventory: it includes current and
+/// superseded events from one validated fetch window. `is_current` is the
+/// winner only among those observed valid events.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AccountKeyPackageRelayEventFfi {
+    pub account_id_hex: String,
+    pub key_package_id: String,
+    pub key_package_ref_hex: String,
+    pub event_id_hex: String,
+    pub created_at: u64,
+    pub key_package_bytes: u64,
+    pub source_relays: Vec<String>,
+    pub is_current: bool,
+}
+
+impl From<AccountKeyPackageRelayEvent> for AccountKeyPackageRelayEventFfi {
+    fn from(value: AccountKeyPackageRelayEvent) -> Self {
+        Self {
+            account_id_hex: value.account_id_hex,
+            key_package_id: value.key_package_id,
+            key_package_ref_hex: value.key_package_ref_hex,
+            event_id_hex: value.key_package_event_id,
+            created_at: value.created_at,
+            key_package_bytes: value.key_package_bytes as u64,
+            source_relays: value.source_relays,
+            is_current: value.is_current,
         }
     }
 }
@@ -385,6 +417,55 @@ mod tests {
             "a retained send must stay distinguishable across the boundary; got {:?}",
             ffi.accept_disposition
         );
+    }
+
+    #[test]
+    fn relay_history_preserves_ids_slot_ref_flags_and_relays() {
+        let ffi = AccountKeyPackageRelayEventFfi::from(AccountKeyPackageRelayEvent {
+            account_id_hex: "aa".repeat(32),
+            key_package_id: "stable-slot".into(),
+            key_package_ref_hex: "bb".repeat(32),
+            key_package_event_id: "cc".repeat(32),
+            created_at: 42,
+            key_package_bytes: 99,
+            source_relays: vec!["wss://a.example".into(), "wss://b.example".into()],
+            is_current: false,
+        });
+
+        assert_eq!(ffi.account_id_hex, "aa".repeat(32));
+        assert_eq!(ffi.key_package_id, "stable-slot");
+        assert_eq!(ffi.key_package_ref_hex, "bb".repeat(32));
+        assert_eq!(ffi.event_id_hex, "cc".repeat(32));
+        assert_eq!(ffi.created_at, 42);
+        assert_eq!(ffi.key_package_bytes, 99);
+        assert_eq!(
+            ffi.source_relays,
+            vec!["wss://a.example".to_owned(), "wss://b.example".to_owned()]
+        );
+        assert!(!ffi.is_current);
+    }
+
+    #[test]
+    fn existing_key_package_record_layout_is_unchanged() {
+        let ffi = AccountKeyPackageFfi::from(AccountKeyPackageRecord {
+            account_label: Some("device".into()),
+            account_id_hex: "aa".repeat(32),
+            key_package_id: "stable-slot".into(),
+            key_package_ref_hex: "bb".repeat(32),
+            key_package_event_id: "cc".repeat(32),
+            published_at: 7,
+            key_package_bytes: 64,
+            source_relays: vec!["wss://relay.example".into()],
+            local: true,
+            relay: true,
+        });
+
+        assert_eq!(ffi.account_ref.as_deref(), Some("device"));
+        assert_eq!(ffi.event_id_hex, "cc".repeat(32));
+        assert_eq!(ffi.published_at, 7);
+        assert_eq!(ffi.key_package_bytes, 64);
+        assert!(ffi.local);
+        assert!(ffi.relay);
     }
 
     #[test]

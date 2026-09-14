@@ -11,6 +11,70 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
+  commands and independent live account-attention summaries across Swift/Kotlin and C.
+  Existing list/read APIs and C record layouts remain; new typed window errors append
+  status codes 73–77. Regenerate bindings and use matching libraries.
+
+- `wn messages edit <group-hex> <message-id> <text>` publishes a kind-1009 edit through the runtime's
+  `edit_message`. The target must be a locally projected message authored by the selected account; a foreign target
+  fails with `not_message_author` and an unknown id with `unknown_message` before anything is published. The JSON
+  response is a send result plus `target_message_id` and `kind`. Kind 1009 stays reserved on `messages send-event`.
+- `wn groups retention <group-hex> [--set <duration>]` shows or sets the disappearing-message policy through
+  `update_message_retention` (`0`/`off` disables explicitly; bare seconds or `s`/`m`/`h`/`d`/`w` suffixes), and
+  `wn groups create --retention <duration>` makes the policy part of the founding commit via
+  `create_group_with_options`. `messages list` rows carry an additive `retention` object and timeline rows carry
+  `retention_seconds` / `retention_expires_at` so the delivering epoch's policy stays visible per message.
+- `wn messages sweep-expired` runs the engine-owned retention sweep for the selected account on the current wall
+  clock and reports `now_ms`, totals, and a per-group `groups` array with a snake_case `status`.
+- Disband lifecycle: `wn groups enable-disbanding`, `wn groups disband --confirm`, `wn groups disband-status`,
+  and `wn groups acknowledge-disband-failure`. `disband-status` reports a one-word `state` (`not_enabled`,
+  `enabled`, `pending`, `converging`, `failed`, `disbanded`, or `unknown` when the MLS state could not be read and
+  nothing positive was observed) alongside `lifecycle_state`, `disbanding`,
+  `disbanded`, `disband_request`, `disbanding_blockers`, `unrecoverable`, and `self_membership`. A returned disband
+  request is durable local intent; the terminal commit is prepared by the runtime convergence pass (a running `wnd`
+  or `messages retry <group-hex>`). `wn groups management <group-hex>` mirrors the MarmotKit management state.
+- Recovery: `wn groups recovery-status`, `wn groups confirm-rejoin <welcome-id> --local-state-token <hex>
+  --confirm`, `wn groups decline-rejoin`, `wn groups quarantined`, and `wn groups retry-hydrate`. Rejoin consent
+  is bound to the exact reviewed offer id and token; ordinary invite acceptance never stands in for it.
+- `wn groups delete-local <group-hex> --confirm` deletes only this device's local group data through
+  `delete_group_local`, distinct from leaving, disbanding, and archiving.
+- Encrypted group images: `wn groups set-image`, `wn groups clear-image`, `wn groups download-image`, and
+  `wn groups create --image <path> [--image-media-type <mime>]`. Their JSON reports a redacted `image` summary
+  (`present`, `image_hash_hex`, `media_type`) and never the image key, upload secret, or key-bearing `data_hex`.
+- `wn groups add-members ... --admin <member>` (and legacy `wn group invite --admin`) grants admin to an invitee in
+  the same invite commit via `invite_members_with_initial_admins`; a non-invitee admin fails with
+  `initial_admin_not_invited`. Invite results carry an additive `initial_admins` list.
+- `wn groups pending-welcomes` lists undelivered Welcomes from `pending_welcome_deliveries` and
+  `wn groups redeliver-welcome <message-id>` re-publishes one without re-committing.
+- `wn media upload` accepts several files and `--send` publishes them as one ordered kind-9 message.
+  `wn media send <group-hex> <attachment> [...]` sends already-uploaded references (the `media` JSON object from
+  upload/list output, or the plaintext SHA-256 of a projected attachment) through `send_media_attachments`,
+  preserving order. A reference from an earlier epoch is refused with `media_reference_stale_epoch`
+  (`source_epoch`, `current_epoch`) instead of publishing ciphertext recipients could not decrypt. A plaintext hash
+  resolves to the newest projected reference carrying it (`media send` and `media download`), so after the same file
+  is uploaded and sent again under the new epoch, the hash form sends that copy instead of re-binding the stale one.
+  The pre-check is the early answer; the binding one is an epoch pin the runtime puts on the send, which the engine
+  enforces at encryption time (see Changed).
+  `wn media set-endpoints <group-hex> <url> [...]` replaces the group's encrypted-media default blob endpoints
+  through `replace_encrypted_media_blob_endpoints`.
+- `wn media download --output` and `wn groups download-image --output` accept an existing directory as well as a
+  file path. Relative file arguments to `media upload`, `media download --output`, `groups set-image`,
+  `groups create --image`, and `groups download-image --output` resolve against the caller's working directory
+  before execution, so commands forwarded to a running `wnd` read and write the caller's files rather than the
+  daemon's. A bare output file name (empty parent directory) now writes correctly instead of failing on Unix.
+- `wn groups update <group-hex> [--name] [--description]` is the canonical plural spelling of the legacy
+  `wn group update`; both now require at least one field at parse time. `wn tui` `/chat describe` and
+  `/chat rename` use it.
+- Typed JSON error codes for the new surface: `group_disbanding`, `disbanding_not_enabled`,
+  `disbanding_unsupported_members`, `leave_already_requested`, `group_invite_not_pending`,
+  `invalid_encrypted_media`, `invalid_app_message_payload`, `invalid_retention_duration`, `unknown_message`,
+  `not_message_author`, `empty_group_image`, `group_image_absent`, `invalid_rejoin_token`, `invalid_welcome_id`,
+  and `initial_admin_not_invited`.
+- `account_key_package_relay_events` / Swift and Kotlin `accountKeyPackageRelayEvents` /
+  `marmot_account_key_package_relay_events` return observed kind-30443 relay history for
+  one account, including superseded same-slot events, so hosts can delete a specific
+  event without targeting the current winner.
 - Runtime `forget_group_local` and Swift/Kotlin `forgetGroupLocal` for recovery from an
   unusable local group copy: erase chat history and MLS state, cancel group work, and
   wait for a fresh authenticated Welcome. Invitations must be created strictly after
@@ -29,6 +93,53 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- MarmotKit `accountUnreadSummary()` now follows the Unread chat-list eligibility:
+  pending invitations, archived chats, and departed or departing groups do not
+  contribute to account attention. Muted active chats still count; manual unread
+  reminders add conversation attention without inventing message or mention counts.
+  Existing binding layouts are unchanged; invitation badges remain a separate source.
+
+- The runtime's `send_media_attachments` (MarmotKit and `wn media send`) refuses a media reference whose
+  `source_epoch` differs from the group's current epoch with the new typed `AppError::MediaReferenceStaleEpoch`
+  (`source_epoch`, `current_epoch`), which MarmotKit surfaces as `InvalidMediaReference` and `wn` as
+  `media_reference_stale_epoch` with both epochs, whether the CLI pre-check or the account worker caught it. The
+  `imeta` tag carries no epoch, so recipients derive the media key from the delivering message's epoch; a stale
+  reference would have published fine and then failed to decrypt everywhere. Upload the file again after a commit
+  advances the group.
+- Media sends are pinned to the reference's epoch all the way into the engine: `SendIntent::AppMessage` gained an
+  optional `expected_epoch`, which the engine checks against the loaded MLS state immediately before encryption —
+  after any retained peer commits the send folded first — and which keeps the message out of the durable retention
+  queue while the group's epoch is unsettled (a staged local publish awaiting its outcome, or convergence input not
+  yet applied). Previously the epoch comparison ran once at the runtime boundary, and the engine could then
+  legitimately advance the epoch or park the message and encrypt the unchanged `imeta` payload at a later epoch,
+  publishing an attachment no recipient could decrypt. A fold reports `media_reference_stale_epoch` with both epochs;
+  an unsettled epoch reports the new `media_reference_epoch_unsettled` (`source_epoch`; sync and retry, or upload
+  again if the epoch advanced). Both surface as `InvalidMediaReference` in MarmotKit. The pin also covers
+  `wn media upload --send`, whose upload and send straddle an HTTP round-trip. Unpinned messages keep today's
+  retention and drain-time re-encryption. Persisted intents without the field deserialize as unpinned.
+- `wn messages delete` help now describes what the handler does: it publishes an authenticated kind-5 delete
+  tombstone to the group, which is a group-visible deletion request rather than a local-view change or secure
+  erasure.
+- `wn messages retry <group-hex> [event-id]` documents its real contract: it retries durable pending work for the
+  whole group through `retry_group_convergence` and never re-encrypts fresh plaintext. The event id is now optional
+  and only echoed as `target_event_id` (`null` when omitted); `retry_scope` stays `group_convergence`.
+- Group JSON (`groups show`, `groups list`, `chats` rows, and the `groups subscribe-state` feed) gains additive
+  `message_retention`, `disbanding`, `disbanded`, `disband_request`, `unrecoverable`, `self_membership`
+  (`member`/`left`/`removed`), and `leave_requested_at_ms` keys. The `mls` object gains additive `protocol_profile`,
+  `lifecycle_state`, `unrecoverable`, `disbanding_enabled`, `disbanding`, `disbanding_blockers`, and
+  `disband_request` keys. Other existing keys are unchanged.
+- **Breaking (JSON):** the `image` object in group JSON (`groups show`/`list`, `group(s) create`, `chats` rows, and
+  the daemon `group_state` feed) is now the redacted summary `{component_id, component, present, image_hash_hex,
+  media_type}`. It no longer carries `image_key_hex`, `image_nonce_hex`, `image_upload_key_hex`, or the key-bearing
+  `data_hex`, because `wn` can now populate those capability keys through `groups set-image` and
+  `groups create --image` (mdk#1253). No `wn`, `wn tui`, or `wnd` consumer read them; use `groups download-image`
+  for the decrypted image.
+- The README documents canonical MLS group ids versus 32-byte Nostr routing ids, and relay publication versus
+  durable completion, for the group and message surfaces.
+- Account KeyPackage listing now exposes one current relay event per addressable
+  slot. `wn keys list` follows that current-slot inventory; `wn keys delete-all
+  --confirm` still publishes deletions for every observed relay event, including
+  superseded same-slot members. Sign-out and wipe use the same all-event cleanup.
 - Account storage advances through migrations 70–71. Back up before upgrading;
   downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
   Keep native libraries and generated bindings on matching versions.
@@ -86,6 +197,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
+  directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran
+  the wn-home directory helper against that directory and chmod-ed it to `0700`, removing other users' access to a
+  shared `0755` directory (or failing outright in a directory owned by someone else, such as `/tmp`). Downloads now
+  leave existing directories exactly as found, create only missing directories privately, and still write the
+  plaintext file `0600`. Covered by a unit test on the writer and the CLI end-to-end default, bare, and directory
+  output downloads, which assert the parent's mode is unchanged.
 - Foreground recovery services commands between group passes without starving due
   convergence under a busy command queue; unchanged group subscriptions stay in place.
 - Unchanged push registrations retain their gossip progress.

@@ -34,6 +34,9 @@ optional_env:
   - name: MARMOT_DEBOUNCE_MS
     description: "Optional inbound debounce window in ms; coalesces rapid same-sender/group messages into one turn (0 or absent = disabled)"
     password: false
+  - name: MARMOT_INBOUND_SPOOL_PATH
+    description: "Private SQLite journal for accepted inbound obligations; defaults to $MARMOT_HOME/hermes/inbound-spool-v1.sqlite3"
+    password: false
   - name: MARMOT_GROUP_ACTIVATION
     description: "Multi-party group reply policy: mention (default) or always"
     password: false

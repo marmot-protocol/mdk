@@ -635,6 +635,33 @@ pub(crate) fn group_is_terminal(runtime: &AppRuntime, group_id: &GroupId) -> boo
         .is_ok_and(|group| group.is_terminal())
 }
 
+/// Translate the engine's refusal of an epoch-pinned application message
+/// into the media-boundary error the caller expects. Only media sends pin an
+/// epoch, so the engine variants never reach a host for any other intent.
+fn pinned_media_send_error(
+    expected_epoch: Option<cgka_traits::types::EpochId>,
+    error: AppError,
+) -> AppError {
+    use cgka_traits::error::EngineError;
+    if expected_epoch.is_none() {
+        return error;
+    }
+    match error.as_engine_error() {
+        Some(EngineError::AppMessageEpochMismatch { expected, current }) => {
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch: expected.0,
+                current_epoch: current.0,
+            }
+        }
+        Some(EngineError::AppMessageEpochUnsettled { expected }) => {
+            AppError::MediaReferenceEpochUnsettled {
+                source_epoch: expected.0,
+            }
+        }
+        _ => error,
+    }
+}
+
 fn record_app_performance(
     telemetry: Option<&AppPerformanceTelemetry>,
     operation: AppPerformanceOperation,
@@ -3069,7 +3096,8 @@ impl AppClient {
             .find(|group| group.group_id_hex == group_id_hex)
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         *group = authoritative;
-        self.set_group_invite_confirmation(group_id, false, false)
+        let archived = group.archived;
+        self.set_group_invite_confirmation(group_id, false, archived)
     }
 
     pub async fn decline_group_invite(
@@ -3582,6 +3610,20 @@ impl AppClient {
             }
             other => other,
         };
+        // An encrypted-media reference is bound to the epoch that produced its
+        // ciphertext: the wire `imeta` tag carries no epoch, so every recipient
+        // derives the media key from the epoch of the message that delivers
+        // the tag. Pin the send to that epoch. The engine then refuses to
+        // retain the message while the group's epoch is unsettled and refuses
+        // to encrypt it if convergence moves the epoch during the send, instead
+        // of publishing an attachment nobody can decrypt. Callers have already
+        // checked that every attachment shares one epoch.
+        let expected_epoch = match &intent {
+            AppMessageIntent::Media { attachments, .. } => attachments
+                .first()
+                .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
+            _ => None,
+        };
         let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
         let payload = encode_inner_event(&event)?;
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -3598,6 +3640,7 @@ impl AppClient {
                 let send_intent = SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload,
+                    expected_epoch,
                 };
                 // Thread the human-action context through the engine so the
                 // send's audit rows carry `human_action`, matching
@@ -3612,7 +3655,10 @@ impl AppClient {
                 }
                 .map_err(AppError::from)
             }
-            Err(error) if error.is_account_not_active() => {
+            // The inactive-account queue carries no epoch pin, so an
+            // epoch-bound payload cannot take it: it would drain under
+            // whatever epoch the group has by then.
+            Err(error) if error.is_account_not_active() && expected_epoch.is_none() => {
                 let context = audit_context.clone().unwrap_or_default();
                 self.runtime
                     .queue_app_message_with_audit_context(group_id.clone(), payload, context)
@@ -3620,7 +3666,8 @@ impl AppClient {
                     .map_err(AppError::from)
             }
             Err(error) => Err(error),
-        };
+        }
+        .map_err(|error| pinned_media_send_error(expected_epoch, error));
         // The publish-status gate is applied separately from obtaining the
         // effects: even when the outbound publish hard-fails, the engine may
         // already have folded retained peer commits into this send, and those
@@ -4054,6 +4101,26 @@ impl AppClient {
                 &policy.allowed_locator_kinds,
                 self.app.allow_loopback_blob_endpoints(),
             )?;
+        }
+        // The `imeta` tag carries no epoch: a recipient derives the media
+        // secret from the epoch of the message that delivers the tag. A
+        // structurally valid reference whose ciphertext was produced under an
+        // earlier epoch would publish successfully and then fail to decrypt for
+        // every recipient, so refuse it here, before publication, and ask for
+        // a fresh upload. This is the early, typed answer; the binding check is
+        // the epoch pin `send_app_event` puts on the send intent, which the
+        // engine enforces at encryption time after any convergence it folds
+        // into the send, and which keeps the message out of the retention
+        // queue while the epoch is unsettled.
+        let (sending_epoch, _) = self.encrypted_media_secret(group_id)?;
+        if let Some(stale) = attachments
+            .iter()
+            .find(|attachment| attachment.source_epoch != sending_epoch)
+        {
+            return Err(AppError::MediaReferenceStaleEpoch {
+                source_epoch: stale.source_epoch,
+                current_epoch: sending_epoch,
+            });
         }
         let (_event, summary) = self
             .send_app_event(

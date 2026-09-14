@@ -129,7 +129,7 @@ struct Envelope {
     format: u32,
     value: StoredChatPresentation,
 }
-fn nonnegative(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+pub(crate) fn nonnegative(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(column)?;
     value
         .try_into()
@@ -147,7 +147,7 @@ fn decode_envelope(bytes: &[u8]) -> StorageResult<Envelope> {
     Ok(envelope)
 }
 // Preserve the absence of usable evidence while a fallback is dirty.
-fn decode_retained(bytes: &[u8], dirty: bool) -> StorageResult<StoredChatPresentation> {
+pub(crate) fn decode_retained(bytes: &[u8], dirty: bool) -> StorageResult<StoredChatPresentation> {
     let mut value = decode_envelope(bytes)?.value;
     if dirty && value.presentation.resolution == PresentationResolution::Cached {
         value.presentation.resolution = PresentationResolution::LastKnown;

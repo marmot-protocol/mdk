@@ -227,6 +227,15 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
+    /// Finalize the server-owned transcript, checking only the acknowledged text.
+    StreamFinish {
+        stream_id_hex: String,
+        stream_capability: String,
+        final_text: String,
+        /// Stable retry key, bound to this stream, capability, and final text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+    },
     /// Finalize an active preview stream into the durable final message.
     ///
     /// If `final_text`, `transcript_hash_hex`, or `chunk_count` do not match
@@ -809,6 +818,10 @@ pub enum AgentControlEvent {
     GroupStateChanged {
         account_id_hex: String,
         group_id_hex: String,
+        /// Opaque durable occurrence id, identical for live delivery and replay.
+        /// Absent on older connectors; consumers must not dedupe by change kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id_hex: Option<String>,
         /// Coarse change kind: `"member_added"`, `"member_removed"`,
         /// `"member_left"`, `"admin_added"`, `"admin_removed"`,
         /// `"group_renamed"`, `"group_avatar_changed"`, or
@@ -1251,6 +1264,7 @@ mod tests {
         let renamed = AgentControlEvent::GroupStateChanged {
             account_id_hex: "aa".repeat(32),
             group_id_hex: "cc".repeat(32),
+            event_id_hex: Some("dd".repeat(32)),
             change: "group_renamed".to_owned(),
             detail: Some("Team".to_owned()),
         };
@@ -1258,12 +1272,14 @@ mod tests {
         assert_eq!(value["type"], "group_state_changed");
         assert_eq!(value["change"], "group_renamed");
         assert_eq!(value["detail"], "Team");
+        assert_eq!(value["event_id_hex"], "dd".repeat(32));
         let back: AgentControlEvent = serde_json::from_value(value).unwrap();
         assert_eq!(back, renamed);
 
         let member_added = AgentControlEvent::GroupStateChanged {
             account_id_hex: "aa".repeat(32),
             group_id_hex: "cc".repeat(32),
+            event_id_hex: None,
             change: "member_added".to_owned(),
             detail: None,
         };
@@ -1500,6 +1516,15 @@ mod tests {
                     idempotency_key: None,
                 },
                 "stream_progress",
+            ),
+            (
+                AgentControlRequest::StreamFinish {
+                    stream_id_hex: stream(),
+                    stream_capability: capability(),
+                    final_text: "hello".to_owned(),
+                    idempotency_key: Some("stream-finish-1".to_owned()),
+                },
+                "stream_finish",
             ),
             (
                 AgentControlRequest::StreamFinalize {

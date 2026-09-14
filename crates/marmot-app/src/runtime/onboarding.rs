@@ -927,6 +927,7 @@ impl AccountManager {
             &checkpoint.snapshot.account_id_hex,
             &serde_json::to_vec(checkpoint)?,
         )?;
+        self.app.presentation_signals.catalog_changed();
         tracing::debug!(target: "marmot_app::onboarding", method = "save_onboarding",
             ready = checkpoint.snapshot.ready, cancellation_pending = checkpoint.snapshot.cancellation_pending,
             passed_count = checkpoint.snapshot.steps.iter().filter(|s| s.status == OnboardingStatus::Passed).count(),

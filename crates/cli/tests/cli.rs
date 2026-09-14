@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
@@ -15,7 +16,8 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
 };
 use nostr::nips::nip19::ToBech32;
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::builder::{PolicyResult, RelayBuilder, WritePolicy};
+use nostr_relay_builder::{LocalRelay, MockRelay};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, QuicBrokerServer};
@@ -25,12 +27,127 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
-    _relay: MockRelay,
+    _relay: TestRelayHandle,
     url: String,
+}
+
+#[allow(dead_code)]
+enum TestRelayHandle {
+    Mock(MockRelay),
+    Local(LocalRelay),
+}
+
+#[derive(Default)]
+struct RecordingKind5State {
+    rejected_targets: BTreeSet<String>,
+    attempts: Vec<(String, String, bool)>,
+}
+
+#[derive(Clone)]
+struct RecordingKind5WritePolicy {
+    relay: &'static str,
+    state: Arc<Mutex<RecordingKind5State>>,
+}
+
+impl RecordingKind5WritePolicy {
+    fn pair() -> (Self, Self) {
+        let state = Arc::new(Mutex::new(RecordingKind5State::default()));
+        (
+            Self {
+                relay: "current",
+                state: state.clone(),
+            },
+            Self {
+                relay: "lagging",
+                state,
+            },
+        )
+    }
+
+    fn reject_target(&self, event_id: &str) {
+        self.state
+            .lock()
+            .expect("kind5 policy")
+            .rejected_targets
+            .insert(event_id.to_owned());
+    }
+
+    fn attempt_count(&self) -> usize {
+        self.state.lock().expect("kind5 policy").attempts.len()
+    }
+
+    fn attempts_since(&self, baseline_len: usize) -> Vec<(String, String, bool)> {
+        self.state
+            .lock()
+            .expect("kind5 policy")
+            .attempts
+            .iter()
+            .skip(baseline_len)
+            .cloned()
+            .collect()
+    }
+}
+
+impl fmt::Debug for RecordingKind5WritePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordingKind5WritePolicy")
+            .field("relay", &self.relay)
+            .finish()
+    }
+}
+
+impl WritePolicy for RecordingKind5WritePolicy {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a std::net::SocketAddr,
+    ) -> nostr_relay_builder::prelude::BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind.as_u16() != 5 {
+                return PolicyResult::Accept;
+            }
+            let targets = kind5_event_targets(event);
+            let mut state = self.state.lock().expect("kind5 policy");
+            let reject = targets
+                .iter()
+                .any(|target| state.rejected_targets.contains(target));
+            for target in targets {
+                state
+                    .attempts
+                    .push((self.relay.to_owned(), target, !reject));
+            }
+            if reject {
+                PolicyResult::Reject("superseded kind-5 target rejected".to_owned())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+fn kind5_event_targets(event: &nostr::Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let slice = tag.as_slice();
+            (slice.first().map(String::as_str) == Some("e"))
+                .then(|| slice.get(1).cloned())
+                .flatten()
+        })
+        .collect()
 }
 
 impl TestRelay {
     fn new() -> Self {
+        Self::from_mock()
+    }
+
+    fn with_write_policy(policy: impl WritePolicy + 'static) -> Self {
+        Self::from_local_builder(RelayBuilder::default().write_policy(policy))
+    }
+
+    fn from_mock() -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
         let mut last_error = None;
         let relay = (0..8)
@@ -47,9 +164,33 @@ impl TestRelay {
         let url = runtime.block_on(relay.url()).to_string();
         Self {
             _runtime: runtime,
-            _relay: relay,
+            _relay: TestRelayHandle::Mock(relay),
             url,
         }
+    }
+
+    fn from_local_builder(builder: RelayBuilder) -> Self {
+        let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
+        let relay = LocalRelay::new(builder);
+        let mut last_error = None;
+        for attempt in 0..8 {
+            match runtime.block_on(relay.run()) {
+                Ok(()) => {
+                    let url = runtime.block_on(relay.url()).to_string();
+                    return Self {
+                        _runtime: runtime,
+                        _relay: TestRelayHandle::Local(relay),
+                        url,
+                    };
+                }
+                Err(err) => {
+                    eprintln!("local relay startup attempt {} failed: {err}", attempt + 1);
+                    last_error = Some(err);
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+        panic!("local relay should start: {last_error:?}");
     }
 
     fn url(&self) -> &str {
@@ -57,19 +198,50 @@ impl TestRelay {
     }
 
     fn event_count(&self, kind: u16) -> usize {
+        self.fetch_events(nostr::Filter::new().kind(nostr::Kind::Custom(kind)))
+            .len()
+    }
+
+    fn fetch_events(&self, filter: nostr::Filter) -> Vec<nostr::Event> {
         self._runtime.block_on(async {
             let client = nostr_sdk::Client::default();
             client.add_relay(&self.url).await.expect("add mock relay");
             client.connect().await;
             client
-                .fetch_events(
-                    nostr::Filter::new().kind(nostr::Kind::Custom(kind)),
-                    Duration::from_secs(2),
-                )
+                .fetch_events(filter, Duration::from_secs(2))
                 .await
                 .expect("query mock relay")
-                .len()
+                .into_iter()
+                .collect()
         })
+    }
+
+    fn key_package_events(&self, author_hex: &str) -> Vec<nostr::Event> {
+        let author = nostr::PublicKey::from_hex(author_hex).expect("account pubkey");
+        self.fetch_events(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30_443))
+                .author(author),
+        )
+    }
+
+    fn send_event(&self, event: &nostr::Event) {
+        self._runtime.block_on(async {
+            let client = nostr_sdk::Client::default();
+            client.add_relay(&self.url).await.expect("add mock relay");
+            client.connect().await;
+            client
+                .send_event_to([&self.url], event)
+                .await
+                .expect("republish event to mock relay");
+        });
+    }
+
+    fn kind5_targets(&self) -> Vec<String> {
+        self.fetch_events(nostr::Filter::new().kind(nostr::Kind::EventDeletion))
+            .into_iter()
+            .flat_map(|event| kind5_event_targets(&event))
+            .collect()
     }
 }
 
@@ -417,6 +589,25 @@ fn try_run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Result<V
     Ok(value["result"].clone())
 }
 
+/// Run `wn --json` with the process working directory set to `dir`, for
+/// commands whose relative file arguments must resolve against the caller.
+fn run_json_in_dir(home: &std::path::Path, dir: &std::path::Path, args: &[&str]) -> Value {
+    let output = wn(home)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("wn command should start");
+    assert!(
+        output.status.success(),
+        "wn failed\ndir={}\nargs={args:?}\n{}",
+        dir.display(),
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    value["result"].clone()
+}
+
 fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
     let output = wn_with_relay(home, relay)
         .args(args)
@@ -759,6 +950,64 @@ fn whitenoise_command_surface_names_are_present() {
             "wn groups --help should expose invite command {expected}"
         );
     }
+    for expected in [
+        "update",
+        "retention",
+        "enable-disbanding",
+        "disband",
+        "disband-status",
+        "acknowledge-disband-failure",
+        "management",
+        "recovery-status",
+        "confirm-rejoin",
+        "decline-rejoin",
+        "quarantined",
+        "retry-hydrate",
+        "delete-local",
+        "set-image",
+        "clear-image",
+        "download-image",
+        "pending-welcomes",
+        "redeliver-welcome",
+    ] {
+        assert!(
+            groups_help.contains(expected),
+            "wn groups --help should expose runtime parity command {expected}"
+        );
+    }
+
+    let messages_help = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .args(["messages", "--help"])
+        .output()
+        .expect("messages help should run");
+    assert!(
+        messages_help.status.success(),
+        "{}",
+        command_output_summary(&messages_help)
+    );
+    let messages_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&messages_help.stdout),
+        String::from_utf8_lossy(&messages_help.stderr)
+    );
+    for (command, description) in [
+        ("edit", "Edit one of your own messages"),
+        ("delete", "Publish an authenticated delete tombstone"),
+        ("retry", "Retry pending group convergence"),
+        (
+            "sweep-expired",
+            "Run the disappearing-message retention sweep",
+        ),
+    ] {
+        assert!(
+            messages_help.contains(command),
+            "wn messages --help should expose {command}"
+        );
+        assert!(
+            messages_help.contains(description),
+            "wn messages --help should describe {command} as: {description}"
+        );
+    }
 
     let chats_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["chats", "--help"])
@@ -795,7 +1044,7 @@ fn whitenoise_command_surface_names_are_present() {
         String::from_utf8_lossy(&media_help.stdout),
         String::from_utf8_lossy(&media_help.stderr)
     );
-    for command in ["upload", "download", "list"] {
+    for command in ["upload", "download", "list", "send", "set-endpoints"] {
         assert!(
             media_help.contains(command),
             "media help should expose real {command}"
@@ -2076,6 +2325,120 @@ fn media_upload_and_download_round_trip_through_blossom() {
         std::fs::read(&output_path).expect("downloaded file"),
         plaintext
     );
+
+    // A bare `--output` file name has an empty parent directory; it must land
+    // in the caller's working directory, not fail before the file is opened.
+    let bare_dir = home.path().join("bare-output");
+    std::fs::create_dir_all(&bare_dir).expect("bare output dir");
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&bare_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("shared output dir mode");
+    }
+    let bare = run_json_in_dir(
+        home.path(),
+        &bare_dir,
+        &[
+            "--account",
+            &bob,
+            "media",
+            "download",
+            group_id,
+            &file_hash,
+            "--output",
+            "bare-note.txt",
+        ],
+    );
+    assert_eq!(
+        std::fs::read(bare_dir.join("bare-note.txt")).expect("bare download"),
+        plaintext
+    );
+    assert!(
+        bare["output_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("bare-note.txt")),
+        "{bare}"
+    );
+    // A directory `--output` receives the attachment's own file name.
+    let dir_out = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "media",
+            "download",
+            group_id,
+            &file_hash,
+            "--output",
+            bare_dir.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(
+        std::fs::read(bare_dir.join("note.txt")).expect("directory download"),
+        plaintext
+    );
+    assert!(
+        dir_out["output_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("note.txt")),
+        "{dir_out}"
+    );
+    // The destination is the caller's directory, not wn's: two downloads into
+    // a shared 0755 directory must not tighten it to 0700. Only the plaintext
+    // file itself is private.
+    #[cfg(unix)]
+    {
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode(&bare_dir),
+            0o755,
+            "an existing --output directory keeps its mode"
+        );
+        assert_eq!(mode(&bare_dir.join("bare-note.txt")), 0o600);
+        assert_eq!(mode(&bare_dir.join("note.txt")), 0o600);
+    }
+    // Without `--output` the file lands in the caller's current directory,
+    // which is likewise left exactly as found.
+    let default_dir = home.path().join("default-output");
+    std::fs::create_dir_all(&default_dir).expect("default output dir");
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&default_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("shared cwd mode");
+    }
+    let defaulted = run_json_in_dir(
+        home.path(),
+        &default_dir,
+        &["--account", &bob, "media", "download", group_id, &file_hash],
+    );
+    assert_eq!(
+        std::fs::read(default_dir.join("note.txt")).expect("default download"),
+        plaintext
+    );
+    assert!(
+        defaulted["output_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("note.txt")),
+        "{defaulted}"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&default_dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the caller's working directory keeps its mode"
+        );
+    }
 }
 
 #[test]
@@ -2898,6 +3261,42 @@ fn keys_list_reports_published_key_package() {
 }
 
 #[test]
+fn keys_list_after_rotate_keeps_one_current_row() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let account_id = create_account(home.path());
+    run_json(home.path(), &["--account", &account_id, "keys", "publish"]);
+    run_json(home.path(), &["--account", &account_id, "keys", "rotate"]);
+
+    let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
+    let keys = listed["keys"].as_array().expect("keys array");
+    let relay_rows = keys
+        .iter()
+        .filter(|key| key["relay"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relay_rows.len(),
+        1,
+        "rotate must keep one current relay inventory row"
+    );
+    assert!(
+        relay_rows[0]["key_package_event_id"]
+            .as_str()
+            .is_some_and(|event_id| !event_id.is_empty())
+    );
+
+    let delete_all = run_json(
+        home.path(),
+        &["--account", &account_id, "keys", "delete-all", "--confirm"],
+    );
+    assert!(
+        delete_all["deleted_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_eq!(delete_all["failed_count"], 0);
+}
+
+#[test]
 fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = TestRelay::new();
@@ -2947,6 +3346,274 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
     );
     assert_eq!(delete_all["failed"], serde_json::json!([]));
     assert_eq!(delete_all["failed_count"], 0);
+}
+
+#[test]
+fn keys_delete_all_attempts_current_and_superseded_same_slot_events() {
+    let (current_policy, lagging_policy) = RecordingKind5WritePolicy::pair();
+    let current = TestRelay::with_write_policy(current_policy.clone());
+    let lagging = TestRelay::with_write_policy(lagging_policy.clone());
+    let home = tempfile::tempdir().expect("tempdir");
+    let account_id = create_account_with_real_relay(home.path(), current.url());
+
+    let listed = run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "list"],
+    );
+    let older_id = listed["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .find(|key| key["relay"] == true)
+        .expect("startup relay-visible key package")["key_package_event_id"]
+        .as_str()
+        .expect("older event id")
+        .to_owned();
+    let older_events = current.key_package_events(&account_id);
+    let older_event = older_events
+        .iter()
+        .find(|event| event.id.to_hex() == older_id)
+        .expect("current relay still holds the older event")
+        .clone();
+    lagging.send_event(&older_event);
+
+    run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "rotate"],
+    );
+    // Evict the superseded event from the current relay only. The lagging copy
+    // remains so delete-all can still observe both IDs while the current
+    // listing has a single winner.
+    run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "delete", &older_id],
+    );
+    run_json_with_relay(
+        home.path(),
+        current.url(),
+        &[
+            "--account",
+            &account_id,
+            "relays",
+            "add",
+            lagging.url(),
+            "--type",
+            "nip65",
+        ],
+    );
+
+    let listed = run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "list"],
+    );
+    let keys = listed["keys"].as_array().expect("keys array");
+    let relay_rows = keys
+        .iter()
+        .filter(|key| key["relay"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relay_rows.len(),
+        1,
+        "Published listing must keep one current same-slot row"
+    );
+    let newer_id = relay_rows[0]["key_package_event_id"]
+        .as_str()
+        .expect("newer event id")
+        .to_owned();
+    assert_ne!(
+        newer_id, older_id,
+        "rotate must mint a distinct current event id"
+    );
+    let local_only_ids = keys
+        .iter()
+        .filter(|key| key["relay"] != true)
+        .filter_map(|key| key["key_package_event_id"].as_str())
+        .filter(|event_id| event_id.is_empty() || (*event_id != older_id && *event_id != newer_id))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        current
+            .key_package_events(&account_id)
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([newer_id.clone()]),
+        "current relay must keep only the rotated winner after the superseded id is evicted"
+    );
+    assert_eq!(
+        lagging
+            .key_package_events(&account_id)
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([older_id.clone()]),
+        "lagging relay must keep the superseded same-slot event"
+    );
+    let history = {
+        let app = MarmotApp::with_relays(
+            home.path(),
+            vec![current.url().to_owned(), lagging.url().to_owned()],
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("history runtime");
+        runtime
+            .block_on(app.account_key_package_relay_events(
+                &account_id,
+                vec![
+                    TransportEndpoint(current.url().to_owned()),
+                    TransportEndpoint(lagging.url().to_owned()),
+                ],
+            ))
+            .expect("observe current and superseded relay history")
+    };
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.key_package_event_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([older_id.as_str(), newer_id.as_str()]),
+        "history must expose both same-slot event ids"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| event.is_current)
+            .map(|event| event.key_package_event_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([newer_id.as_str()]),
+        "only the rotated winner is current in the observed window"
+    );
+
+    // Reject the superseded id on every deletion endpoint after setup so a
+    // later current-relay ACK cannot hide the required failed-event case.
+    current_policy.reject_target(&older_id);
+    let baseline_attempts = current_policy.attempt_count();
+
+    let unconfirmed = run_json_error_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "delete-all"],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+    assert_eq!(unconfirmed["flag"], "--confirm");
+    assert_eq!(
+        current_policy.attempt_count(),
+        baseline_attempts,
+        "confirmation must fail before any delete-all publication"
+    );
+
+    let delete_all = run_json_with_relay(
+        home.path(),
+        current.url(),
+        &["--account", &account_id, "keys", "delete-all", "--confirm"],
+    );
+    let deleted_ids = delete_all["deleted"]
+        .as_array()
+        .expect("deleted array")
+        .iter()
+        .map(|row| {
+            row["event_id"]
+                .as_str()
+                .expect("deleted event id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let failed_ids = delete_all["failed"]
+        .as_array()
+        .expect("failed array")
+        .iter()
+        .map(|row| {
+            row["event_id"]
+                .as_str()
+                .expect("failed event id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let attempted_ids = deleted_ids
+        .iter()
+        .chain(failed_ids.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        attempted_ids,
+        BTreeSet::from([older_id.clone(), newer_id.clone()]),
+        "delete-all must attempt the current and superseded ids exactly once: {delete_all}"
+    );
+    assert_eq!(
+        deleted_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([newer_id.clone()]),
+        "the current winner must be the only successful delete-all target: {delete_all}"
+    );
+    assert_eq!(
+        failed_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([older_id.clone()]),
+        "the superseded id must be reported failed, not falsely successful: {delete_all}"
+    );
+    assert_eq!(
+        deleted_ids.len(),
+        1,
+        "exactly one deleted event: {delete_all}"
+    );
+    assert_eq!(
+        failed_ids.len(),
+        1,
+        "exactly one failed event: {delete_all}"
+    );
+    assert_eq!(delete_all["deleted_count"], 1);
+    assert_eq!(delete_all["failed_count"], 1);
+    assert!(
+        delete_all["failed"][0]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "failed-event attribution must include a nonempty error: {delete_all}"
+    );
+    assert!(
+        delete_all["accepted_relays"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    for local_only_id in &local_only_ids {
+        assert!(
+            !deleted_ids.contains(local_only_id) && !failed_ids.contains(local_only_id),
+            "local-only rows must not become delete-all targets"
+        );
+    }
+
+    let fresh_attempts = current_policy.attempts_since(baseline_attempts);
+    let fresh_targets = fresh_attempts
+        .iter()
+        .map(|(_, target, _)| target.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fresh_targets,
+        BTreeSet::from([older_id.clone(), newer_id.clone()]),
+        "delete-all must publish both ids after the pre-delete-all baseline"
+    );
+    assert!(
+        fresh_attempts
+            .iter()
+            .any(|(relay, target, accepted)| relay == "current"
+                && target == &newer_id
+                && *accepted),
+        "the current target must be accepted on its supplied endpoint"
+    );
+    assert!(
+        fresh_attempts
+            .iter()
+            .any(|(_, target, accepted)| target == &older_id && !*accepted),
+        "the superseded target must be rejected on a supplied deletion endpoint"
+    );
+    assert!(
+        current
+            .kind5_targets()
+            .iter()
+            .any(|target| target == &newer_id),
+        "the accepted current deletion must be stored on the current relay"
+    );
 }
 
 #[test]
@@ -5617,6 +6284,8 @@ fn daemon_executes_cli_commands_over_socket() {
         // Daemon tests drive an in-process `MockRelay` at loopback; production
         // rejects non-public relay hosts unless this dev gate is set.
         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        // The forwarded media upload below targets a loopback Blossom server.
+        .env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1")
         .spawn()
         .expect("wnd should start");
 
@@ -5641,6 +6310,105 @@ fn daemon_executes_cli_commands_over_socket() {
             .as_str()
             .unwrap()
             .starts_with("npub1")
+    );
+    let account_id = value["result"]["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    // Runtime-hosted inspection commands execute through the forwarded `wnd`
+    // path with the selected account preserved.
+    for (args, key) in [
+        (["groups", "quarantined"], "quarantined"),
+        (["groups", "pending-welcomes"], "pending_welcome_deliveries"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--json")
+            .args(["--account", &account_id])
+            .args(args)
+            .output()
+            .expect("wn should start");
+        assert!(
+            output.status.success(),
+            "wn {args:?} failed\n{}",
+            command_output_summary(&output)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["result"]["account_id"], account_id);
+        assert_eq!(value["result"][key], serde_json::json!([]));
+    }
+
+    // A forwarded command runs inside `wnd`, whose working directory is this
+    // test process's, not the caller's. Relative file arguments must still
+    // mean the caller's files: run the client from an unrelated directory
+    // holding `note.txt` and upload through the daemon.
+    let blossom = TestBlossom::new();
+    let created = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args([
+            "--account",
+            &account_id,
+            "groups",
+            "create",
+            "forwarded-media",
+        ])
+        .output()
+        .expect("wn should start");
+    assert!(
+        created.status.success(),
+        "group create over socket failed\n{}",
+        command_output_summary(&created)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).expect("stdout should be JSON");
+    let group_id = created["result"]["group_id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+    let caller_dir = tempfile::tempdir().expect("caller dir");
+    std::fs::write(
+        caller_dir.path().join("note.txt"),
+        b"forwarded from the caller directory",
+    )
+    .expect("write caller file");
+    let upload = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .current_dir(caller_dir.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args([
+            "--account",
+            &account_id,
+            "media",
+            "upload",
+            &group_id,
+            "note.txt",
+            "--server",
+            blossom.url(),
+        ])
+        .output()
+        .expect("wn should start");
+    assert!(
+        upload.status.success(),
+        "forwarded media upload failed\n{}",
+        command_output_summary(&upload)
+    );
+    let upload: Value = serde_json::from_slice(&upload.stdout).expect("stdout should be JSON");
+    assert_eq!(upload["ok"], true, "{upload}");
+    assert_eq!(
+        upload["result"]["attachments"][0]["media"]["file_name"],
+        "note.txt"
+    );
+    assert!(
+        std::fs::read_dir(std::env::current_dir().expect("cwd"))
+            .expect("cwd listing")
+            .filter_map(Result::ok)
+            .all(|entry| entry.file_name() != "note.txt"),
+        "the daemon must not have looked for note.txt in its own directory"
     );
 
     stop_daemon(&socket, &mut child);
@@ -7598,4 +8366,1107 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     assert!(message.contains('\u{1b}'));
     assert!(message.contains('\u{7}'));
     assert!(message.contains('\u{202e}'));
+}
+
+// ---------------------------------------------------------------------------
+// Runtime parity: message edits, retention, disbanding, recovery, media (#1788)
+// ---------------------------------------------------------------------------
+
+/// Poll `sync` then `predicate(command output)` until it holds or the bounded
+/// deadline passes. Returns the last command output that satisfied the check.
+fn poll_after_sync_until(
+    home: &std::path::Path,
+    account: &str,
+    args: &[&str],
+    timeout: Duration,
+    mut predicate: impl FnMut(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let _ = try_run_json(home, &["--account", account, "sync"]);
+        let mut full = vec!["--account", account];
+        full.extend_from_slice(args);
+        match try_run_json(home, &full) {
+            Ok(value) if predicate(&value) => return value,
+            Ok(value) => last = value,
+            Err(_) => {}
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> never satisfied {args:?}; {}",
+        json_value_summary("last", &last)
+    );
+}
+
+#[test]
+fn messages_edit_publishes_replacement_and_enforces_local_authorship() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "edits", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "orignal",
+            "text",
+        ],
+    );
+    let target_message_id = sent["message_ids"][0].as_str().expect("message id");
+    sync_until_message(home.path(), test_relay_url(), &bob, "orignal text");
+
+    // Authorship is enforced before anything is published: Bob cannot edit
+    // Alice's message, and an unknown target is rejected rather than sent.
+    let foreign = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "edit",
+            group_id,
+            target_message_id,
+            "hijacked",
+        ],
+    );
+    assert_eq!(foreign["code"], "not_message_author");
+    assert_eq!(foreign["target_message_id"], target_message_id);
+    let unknown_id = "ab".repeat(32);
+    let unknown = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "edit",
+            group_id,
+            &unknown_id,
+            "nothing",
+        ],
+    );
+    assert_eq!(unknown["code"], "unknown_message");
+
+    let edited = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "edit",
+            group_id,
+            target_message_id,
+            "original",
+            "--text",
+        ],
+    );
+    assert_eq!(edited["target_message_id"], target_message_id);
+    assert_eq!(edited["published"], 1);
+    assert_eq!(edited["kind"], 1009);
+    let edit_message_id = edited["message_ids"][0]
+        .as_str()
+        .expect("edit message id")
+        .to_owned();
+
+    // The edit is an inner kind-1009 event: `e` references the target and the
+    // content is the replacement text (hyphen-leading tokens are literal text).
+    let edit_sync =
+        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 1009, target_message_id);
+    let edit = first_message_with_kind_and_target(&edit_sync, 1009, target_message_id)
+        .expect("edit message");
+    assert_eq!(edit["plaintext"], "original --text");
+    assert_eq!(edit["message_id"], edit_message_id);
+    assert_eq!(edit["from"], alice);
+
+    // The materialized timeline carries the edit row, so edited state is
+    // visible to timeline consumers as well as the raw message list.
+    let timeline = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "timeline", "list", group_id],
+    );
+    let timeline_edit = timeline["messages"]
+        .as_array()
+        .expect("timeline rows")
+        .iter()
+        .find(|row| row["kind"] == 1009 && message_e_tag(row) == Some(target_message_id))
+        .expect("timeline edit row");
+    assert_eq!(timeline_edit["plaintext"], "original --text");
+
+    // Kind 1009 stays reserved on the custom-event path.
+    let reserved = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send-event",
+            group_id,
+            "1009",
+            "forged",
+        ],
+    );
+    assert_eq!(reserved["code"], "reserved_app_event_kind");
+
+    // `messages retry` is a group-scoped convergence retry; the event id is
+    // optional context and never scopes the action.
+    let retry = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "retry", group_id],
+    );
+    assert_eq!(retry["retry_scope"], "group_convergence");
+    assert_eq!(retry["group_id"], group_id);
+    assert_eq!(retry["target_event_id"], Value::Null);
+}
+
+#[test]
+fn groups_retention_is_inspectable_settable_and_founding() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "create",
+            "ephemeral",
+            &bob,
+            "--retention",
+            "1h",
+        ],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    assert_eq!(
+        created["message_retention"]["disappearing_message_secs"],
+        3600
+    );
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let shown = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "retention", group_id],
+    );
+    assert_eq!(shown["group_id"], group_id);
+    assert_eq!(shown["disappearing_message_secs"], 3600);
+    assert_eq!(shown["enabled"], true);
+    assert_eq!(
+        shown["message_retention"]["component"],
+        "marmot.group.message-retention.v1"
+    );
+
+    // A message sent under the founding policy carries that policy durably.
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "expires",
+            "later",
+        ],
+    );
+    let message_id = sent["message_ids"][0].as_str().expect("message id");
+    let listed = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "list", group_id],
+    );
+    let message = listed["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == message_id)
+        .expect("sent message");
+    assert_eq!(message["retention"]["retention_seconds"], 3600);
+    assert!(message["retention"]["expires_at"].as_u64().is_some());
+
+    // Only admins change the policy, and the duration must parse.
+    let denied = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "retention",
+            group_id,
+            "--set",
+            "1d",
+        ],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+    let invalid = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "retention",
+            group_id,
+            "--set",
+            "soon",
+        ],
+    );
+    assert_eq!(invalid["code"], "invalid_retention_duration");
+
+    // Explicit zero disables retention through a real component update.
+    let disabled = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "retention",
+            group_id,
+            "--set",
+            "0",
+        ],
+    );
+    assert_eq!(disabled["disappearing_message_secs"], 0);
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["published"], 1);
+
+    // Bob observes the new policy, while the older message keeps the policy
+    // of the epoch that delivered it.
+    sync_until_message(home.path(), test_relay_url(), &bob, "expires later");
+    let bob_policy = poll_after_sync_until(
+        home.path(),
+        &bob,
+        &["groups", "retention", group_id],
+        POLL_TIMEOUT,
+        |value| value["disappearing_message_secs"] == 0,
+    );
+    assert_eq!(bob_policy["enabled"], false);
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "list", group_id],
+    );
+    let bob_message = bob_messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == message_id)
+        .expect("received message");
+    assert_eq!(bob_message["retention"]["retention_seconds"], 3600);
+
+    let sent_after = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "send", group_id, "stays"],
+    );
+    let after_id = sent_after["message_ids"][0].as_str().expect("message id");
+    sync_until_message(home.path(), test_relay_url(), &bob, "stays");
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "list", group_id],
+    );
+    let bob_after = bob_messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == after_id)
+        .expect("received message");
+    assert_eq!(
+        bob_after["retention"]["retention_seconds"]
+            .as_u64()
+            .unwrap_or(0),
+        0
+    );
+
+    // The sweep runs on the production clock and reports per-group outcomes.
+    let sweep = run_json(
+        home.path(),
+        &["--account", &alice, "messages", "sweep-expired"],
+    );
+    assert!(sweep["now_ms"].as_u64().is_some());
+    assert!(sweep["groups"].is_array());
+    assert_eq!(sweep["pruned_messages"], 0);
+}
+
+#[test]
+fn groups_disband_lifecycle_exposes_pending_and_terminal_state() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "farewell", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let status = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "disband-status", group_id],
+    );
+    assert_eq!(status["group_id"], group_id);
+    assert_eq!(status["lifecycle_state"], "stable");
+    assert_eq!(status["disbanding"], false);
+    assert_eq!(status["disbanded"], false);
+    assert_eq!(status["disband_request"], Value::Null);
+
+    // Non-admins can neither enable disbanding nor disband.
+    let denied = run_json_error(
+        home.path(),
+        &["--account", &bob, "groups", "enable-disbanding", group_id],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+    let denied = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "disband",
+            group_id,
+            "--confirm",
+        ],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+
+    let enabled = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "enable-disbanding", group_id],
+    );
+    assert_eq!(enabled["disbanding_enabled"], true);
+    assert_eq!(enabled["group_id"], group_id);
+
+    // Disbanding is irreversible and requires explicit confirmation.
+    let unconfirmed = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "disband", group_id],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+
+    let requested = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "disband",
+            group_id,
+            "--confirm",
+        ],
+    );
+    // The response echoes the durable request that was recorded, while
+    // `state` is the freshest observation at return time. The runtime's
+    // post-request catch-up may already have published the terminal commit,
+    // so the request is `pending` and the state is `pending` or `disbanded`.
+    assert!(
+        requested["disband_request"]["pending"]["requested_at_ms"]
+            .as_u64()
+            .is_some(),
+        "{requested}"
+    );
+    assert!(
+        ["pending", "disbanded"].contains(&requested["state"].as_str().unwrap_or("")),
+        "{requested}"
+    );
+
+    // Every `wn` invocation is a fresh process and runtime, so this read is
+    // also the restart case: the durable outcome survived the process that
+    // recorded the request. Either way the group is gated: a pending request
+    // blocks ordinary outbound work, and a terminal copy refuses it.
+    let after_request = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "disband-status", group_id],
+    );
+    assert!(
+        ["pending", "disbanded"].contains(&after_request["state"].as_str().unwrap_or("")),
+        "{after_request}"
+    );
+    if after_request["state"] == "pending" {
+        assert_eq!(after_request["disbanding"], true);
+        assert_eq!(after_request["disbanded"], false);
+    } else {
+        assert_eq!(after_request["disbanded"], true);
+    }
+    let blocked = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "too",
+            "late",
+        ],
+    );
+    assert_eq!(blocked["code"], "group_disbanding");
+
+    // Driving the group's convergence pass publishes the terminal commit.
+    let deadline = Instant::now() + POLL_TIMEOUT * 3;
+    let terminal = loop {
+        let _ = try_run_json(
+            home.path(),
+            &["--account", &alice, "messages", "retry", group_id],
+        );
+        let status = run_json(
+            home.path(),
+            &["--account", &alice, "groups", "disband-status", group_id],
+        );
+        if status["disbanded"] == true {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disband never reached terminal state; {}",
+            json_value_summary("last_status", &status)
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    assert_eq!(terminal["state"], "disbanded");
+    assert_eq!(terminal["lifecycle_state"], "disbanded");
+    assert_eq!(terminal["disband_request"], Value::Null);
+
+    // The other member observes the end of the group from their own copy
+    // through ordinary sync. The terminal commit removes every other leaf, so
+    // today a removed member's engine records its own removal
+    // (`self_membership: removed`) rather than the Disbanded lifecycle; the
+    // status surface reports both so scripts can tell either apart from a
+    // live group. A returned request was never proof of this observation.
+    let bob_end = poll_after_sync_until(
+        home.path(),
+        &bob,
+        &["groups", "disband-status", group_id],
+        POLL_TIMEOUT * 3,
+        |value| value["disbanded"] == true || value["self_membership"] == "removed",
+    );
+    assert!(
+        bob_end["disbanded"] == true || bob_end["self_membership"] == "removed",
+        "{bob_end}"
+    );
+    let bob_blocked = run_json_error(
+        home.path(),
+        &["--account", &bob, "messages", "send", group_id, "gone"],
+    );
+    assert!(
+        ["group_disbanding", "group_removed"].contains(&bob_blocked["code"].as_str().unwrap_or("")),
+        "{bob_blocked}"
+    );
+
+    // Acknowledging a failure is a no-op when no failed request exists.
+    let acknowledged = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "acknowledge-disband-failure",
+            group_id,
+        ],
+    );
+    assert_eq!(acknowledged["acknowledged"], false);
+}
+
+#[test]
+fn groups_update_is_canonical_and_legacy_group_update_still_works() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let alice = create_account(home.path());
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "docs"],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+
+    let described = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "update",
+            group_id,
+            "--description",
+            "canonical description",
+        ],
+    );
+    assert_eq!(
+        described["group"]["profile"]["description"],
+        "canonical description"
+    );
+    assert_eq!(described["group"]["profile"]["name"], "docs");
+    assert_eq!(described["published"], 1);
+
+    let both = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "update",
+            group_id,
+            "--name",
+            "docs-2",
+            "--description",
+            "second",
+        ],
+    );
+    assert_eq!(both["group"]["profile"]["name"], "docs-2");
+    assert_eq!(both["group"]["profile"]["description"], "second");
+
+    let legacy = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "group",
+            "update",
+            group_id,
+            "--description",
+            "legacy",
+        ],
+    );
+    assert_eq!(legacy["group"]["profile"]["description"], "legacy");
+
+    assert_eq!(
+        run_json_error(
+            home.path(),
+            &["--account", &alice, "groups", "update", group_id]
+        )["code"],
+        "usage"
+    );
+}
+
+#[test]
+fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_contracts() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "recovery", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let recovery = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "recovery-status", group_id],
+    );
+    assert_eq!(recovery["group_id"], group_id);
+    assert_eq!(recovery["automatic_recovery_failed"], false);
+    assert_eq!(recovery["pending_reinvites"], 0);
+    assert_eq!(recovery["failed_reinvites"], 0);
+    assert_eq!(recovery["rejoin_invitations"], serde_json::json!([]));
+
+    let quarantined = run_json(home.path(), &["--account", &alice, "groups", "quarantined"]);
+    assert_eq!(quarantined["quarantined"], serde_json::json!([]));
+    let not_quarantined = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "retry-hydrate", group_id],
+    );
+    assert_eq!(not_quarantined["code"], "unknown_group");
+
+    // Rejoin consent is branch-bound: it needs the exact offer id and token
+    // from a reviewed recovery snapshot plus an explicit confirmation.
+    let welcome_id = "cd".repeat(32);
+    let token = "ef".repeat(32);
+    let unconfirmed = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "confirm-rejoin",
+            &welcome_id,
+            "--local-state-token",
+            &token,
+        ],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+    let bad_token = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "confirm-rejoin",
+            &welcome_id,
+            "--local-state-token",
+            "zz",
+            "--confirm",
+        ],
+    );
+    assert_eq!(bad_token["code"], "invalid_rejoin_token");
+    let declined = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "decline-rejoin", &welcome_id],
+    );
+    assert!(declined["code"].is_string());
+
+    // Create/invite already drained their Welcomes, so nothing is pending;
+    // re-delivering an unknown Welcome is a typed error, not a silent success.
+    let pending = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "pending-welcomes"],
+    );
+    assert_eq!(pending["pending_welcome_deliveries"], serde_json::json!([]));
+    let redeliver = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "redeliver-welcome",
+            &welcome_id,
+        ],
+    );
+    assert!(redeliver["code"].is_string());
+
+    let alice_management = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "management", group_id],
+    );
+    assert_eq!(alice_management["is_self_admin"], true);
+    assert_eq!(alice_management["is_last_admin"], true);
+    assert_eq!(alice_management["can_invite"], true);
+    assert_eq!(alice_management["can_leave"], false);
+    assert_eq!(alice_management["requires_self_demote_before_leave"], true);
+    assert_eq!(alice_management["lifecycle_state"], "stable");
+    assert_eq!(alice_management["disbanding"], false);
+    assert_eq!(
+        alice_management["member_actions"]
+            .as_array()
+            .expect("member actions")
+            .len(),
+        2
+    );
+    let bob_management = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "management", group_id],
+    );
+    assert_eq!(bob_management["is_self_admin"], false);
+    assert_eq!(bob_management["can_invite"], false);
+    assert_eq!(bob_management["can_leave"], true);
+    assert_eq!(bob_management["can_disband"], false);
+}
+
+#[test]
+fn groups_delete_local_removes_the_local_copy_without_leaving() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "local-only", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let unconfirmed = run_json_error(
+        home.path(),
+        &["--account", &bob, "groups", "delete-local", group_id],
+    );
+    assert_eq!(unconfirmed["code"], "confirmation_required");
+
+    let deleted = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "delete-local",
+            group_id,
+            "--confirm",
+        ],
+    );
+    assert_eq!(deleted["group_id"], group_id);
+    assert_eq!(deleted["deleted"], true);
+    let bob_groups = run_json(home.path(), &["--account", &bob, "groups", "list"]);
+    assert!(
+        !bob_groups["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .any(|group| group["group_id"] == group_id)
+    );
+
+    // No MLS leave was sent: Alice still sees Bob in the roster.
+    let members = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "members", group_id],
+    );
+    assert_eq!(member_accounts(&members), sorted_accounts([&alice, &bob]));
+}
+
+#[test]
+fn groups_image_commands_clear_validate_and_redact_capability_keys() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let alice = create_account(home.path());
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "pictures"],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+
+    let empty_path = home.path().join("empty.png");
+    std::fs::write(&empty_path, b"").expect("write empty image");
+    let empty = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-image",
+            group_id,
+            empty_path.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(empty["code"], "empty_group_image");
+
+    let absent = run_json_error(
+        home.path(),
+        &["--account", &alice, "groups", "download-image", group_id],
+    );
+    assert_eq!(absent["code"], "group_image_absent");
+
+    let cleared = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "clear-image", group_id],
+    );
+    assert_eq!(cleared["group_id"], group_id);
+    assert_eq!(cleared["image"]["present"], false);
+    // Every surface that renders the image component uses the redacted
+    // summary: the image commands, the create response, and the shared group
+    // JSON behind `groups show` / `groups list` / `chats`. Uploading a real
+    // image needs the public Blossom server, so the sentinel-key coverage that
+    // proves populated keys stay out of the output lives in the crate unit
+    // test `group_json_surfaces_redact_image_capability_keys`.
+    let shown = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "show", group_id],
+    );
+    for value in [
+        &cleared["image"],
+        &created["image"],
+        &shown["group"]["image"],
+    ] {
+        for secret in [
+            "image_key_hex",
+            "image_upload_key_hex",
+            "image_nonce_hex",
+            "data_hex",
+        ] {
+            assert!(
+                value.get(secret).is_none(),
+                "image output must not carry {secret}: {value}"
+            );
+        }
+        assert!(value.get("present").is_some());
+        assert!(value.get("image_hash_hex").is_some());
+    }
+}
+
+#[test]
+fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoch() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let blossom = TestBlossom::new();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "albums", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let first_path = home.path().join("first.txt");
+    let second_path = home.path().join("second.txt");
+    std::fs::write(&first_path, b"first attachment").expect("write first");
+    std::fs::write(&second_path, b"second attachment").expect("write second");
+    let upload = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "upload",
+            group_id,
+            first_path.to_str().expect("utf-8 path"),
+            second_path.to_str().expect("utf-8 path"),
+            "--server",
+            blossom.url(),
+        ],
+    );
+    let attachments = upload["attachments"].as_array().expect("attachments");
+    assert_eq!(attachments.len(), 2);
+    assert_eq!(upload["sent"], Value::Null);
+    let first_reference = attachments[0]["media"].to_string();
+    let second_reference = attachments[1]["media"].to_string();
+    let source_epoch = attachments[0]["media"]["source_epoch"]
+        .as_u64()
+        .expect("source epoch");
+    let first_hash = attachments[0]["media"]["plaintext_sha256"]
+        .as_str()
+        .expect("plaintext hash")
+        .to_owned();
+
+    // Already-uploaded references are sent as one ordered message.
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &first_reference,
+            &second_reference,
+            "--message",
+            "two files",
+        ],
+    );
+    assert_eq!(sent["published"], 1);
+    assert_eq!(sent["attachments"].as_array().expect("sent refs").len(), 2);
+    let message_id = sent["message_ids"][0].as_str().expect("message id");
+
+    let listed = poll_after_sync_until(
+        home.path(),
+        &bob,
+        &["media", "list", group_id],
+        POLL_TIMEOUT,
+        |value| {
+            value["media"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .filter(|row| row["message_id"] == message_id)
+                    .count()
+                    == 2
+            })
+        },
+    );
+    let rows = listed["media"]
+        .as_array()
+        .expect("media rows")
+        .iter()
+        .filter(|row| row["message_id"] == message_id)
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0]["attachment_index"], 0);
+    assert_eq!(rows[0]["file_name"], "first.txt");
+    assert_eq!(rows[0]["caption"], "two files");
+    assert_eq!(rows[0]["source_epoch"], source_epoch);
+    assert_eq!(rows[1]["attachment_index"], 1);
+    assert_eq!(rows[1]["file_name"], "second.txt");
+    assert_eq!(rows[1]["source_epoch"], source_epoch);
+
+    // A projected attachment can be re-sent by plaintext hash while the group
+    // is still in the epoch that encrypted it.
+    let forwarded = run_json(
+        home.path(),
+        &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(forwarded["published"], 1);
+    assert_eq!(forwarded["attachments"][0]["plaintext_sha256"], first_hash);
+
+    // The `imeta` tag carries no epoch: recipients derive the media key from
+    // the delivering message's epoch. Once a commit advances the group, a
+    // reference encrypted under the old epoch must be refused, not published
+    // as undecryptable ciphertext. Both input forms are covered.
+    let renamed = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "rename",
+            group_id,
+            "albums-2",
+        ],
+    );
+    assert_eq!(renamed["published"], 1);
+    let stale_by_hash = run_json_error(
+        home.path(),
+        &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(stale_by_hash["code"], "media_reference_stale_epoch");
+    assert_eq!(stale_by_hash["source_epoch"], source_epoch);
+    assert_eq!(stale_by_hash["current_epoch"], source_epoch + 1);
+    let stale_by_json = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &second_reference,
+        ],
+    );
+    assert_eq!(stale_by_json["code"], "media_reference_stale_epoch");
+    // Nothing was published for either refusal: Bob's projection still holds
+    // exactly the two media messages from before the rename.
+    let _ = try_run_json(home.path(), &["--account", &bob, "sync"]);
+    let after = run_json(home.path(), &["--account", &bob, "media", "list", group_id]);
+    let media_message_ids = after["media"]
+        .as_array()
+        .expect("media rows")
+        .iter()
+        .filter_map(|row| row["message_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(media_message_ids.len(), 2, "{after}");
+
+    // The documented repair: upload the same file again at the current epoch
+    // and send that reference. Only projected messages are visible to the hash
+    // lookup, so the fresh upload goes out by its `media` JSON object first.
+    let reupload = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "upload",
+            group_id,
+            first_path.to_str().expect("utf-8 path"),
+            "--server",
+            blossom.url(),
+        ],
+    );
+    let reuploaded = &reupload["attachments"][0]["media"];
+    assert_eq!(reuploaded["plaintext_sha256"], first_hash);
+    assert_eq!(reuploaded["source_epoch"], source_epoch + 1);
+    let repaired = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &reuploaded.to_string(),
+        ],
+    );
+    assert_eq!(repaired["published"], 1);
+    assert_eq!(repaired["attachments"][0]["source_epoch"], source_epoch + 1);
+    // The plaintext hash is content-addressed, so the projection now holds
+    // both the epoch-N and the epoch-N+1 reference for this file. Sending by
+    // hash must bind the newest one; a first-match (oldest-first) lookup would
+    // refuse the repaired file forever.
+    let forwarded_again = run_json(
+        home.path(),
+        &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(forwarded_again["published"], 1);
+    assert_eq!(
+        forwarded_again["attachments"][0]["plaintext_sha256"],
+        first_hash
+    );
+    assert_eq!(
+        forwarded_again["attachments"][0]["source_epoch"],
+        source_epoch + 1
+    );
+
+    // Endpoint policy is signed group state: admins replace it, others cannot.
+    let denied = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "media",
+            "set-endpoints",
+            group_id,
+            blossom.url(),
+        ],
+    );
+    assert_eq!(denied["code"], "not_group_admin");
+    let replaced = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "set-endpoints",
+            group_id,
+            blossom.url(),
+        ],
+    );
+    assert_eq!(replaced["published"], 1);
+    let endpoints = replaced["encrypted_media"]["default_blob_endpoints"]
+        .as_array()
+        .expect("endpoints");
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0]["locator_kind"], "blossom-v1");
+    assert!(
+        endpoints[0]["base_url"]
+            .as_str()
+            .is_some_and(|url| url.trim_end_matches('/') == blossom.url().trim_end_matches('/'))
+    );
+}
+
+#[test]
+fn groups_add_members_can_assign_initial_admins_in_one_commit() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    let carol = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    run_json(home.path(), &["--account", &carol, "keys", "publish"]);
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "staff", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+
+    // An initial admin must be one of the invitees.
+    let not_invited = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "add-members",
+            group_id,
+            &carol,
+            "--admin",
+            &bob,
+        ],
+    );
+    assert_eq!(not_invited["code"], "initial_admin_not_invited");
+
+    let added = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "add-members",
+            group_id,
+            &carol,
+            "--admin",
+            &carol,
+        ],
+    );
+    assert_eq!(added["published"], 1);
+    assert_eq!(added["initial_admins"], serde_json::json!([carol]));
+    let admins = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "admins", group_id],
+    );
+    assert_eq!(admin_accounts(&admins), sorted_accounts([&alice, &carol]));
 }

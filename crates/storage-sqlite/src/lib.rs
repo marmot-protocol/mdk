@@ -17,6 +17,8 @@ mod migrations;
 mod openmls_storage;
 mod pending_welcome_delivery;
 mod prepared_group_image_upload;
+#[cfg(test)]
+mod query_work_test_support;
 mod recovery_health;
 mod shared;
 mod storage;
@@ -32,9 +34,11 @@ pub use account_projection::{
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use chat_list::{
-    AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
-    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,
-    ChatPinState, ExistingDirectConversation, select_reusable_direct_conversation,
+    AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
+    ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
+    ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
+    ChatListRow, ChatListView, ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
+    ExistingDirectConversation, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
     CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,

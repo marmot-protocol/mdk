@@ -320,8 +320,29 @@ fn account_home_accounts_skips_unreadable_records() {
 
     assert_eq!(home.accounts().unwrap(), vec![good]);
     assert!(matches!(
+        home.accounts_strict(),
+        Err(AccountHomeError::Json(_))
+    ));
+    assert!(matches!(
         home.account(&corrupted.label),
         Err(AccountHomeError::Json(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_catalog_does_not_treat_a_metadata_probe_error_as_an_empty_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    // A symlink loop deterministically fails metadata probing, including under root.
+    std::os::unix::fs::symlink("accounts", dir.path().join("accounts")).unwrap();
+    assert!(
+        home.accounts().unwrap().is_empty(),
+        "legacy best-effort behavior"
+    );
+    assert!(matches!(
+        home.accounts_strict(),
+        Err(AccountHomeError::Io(_))
     ));
 }
 

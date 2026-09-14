@@ -2231,6 +2231,7 @@ impl HarnessClient {
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
                 payload,
+                expected_epoch: None,
             })
             .await
             .expect("send app");
@@ -2300,6 +2301,7 @@ impl HarnessClient {
             .send(SendIntent::AppMessage {
                 group_id: gid.clone(),
                 payload,
+                expected_epoch: None,
             })
             .await?;
         match res {

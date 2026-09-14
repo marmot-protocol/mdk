@@ -575,8 +575,9 @@ impl AppRuntimeHarness {
     }
 
     /// Drive public catch-up/timer work until all named participants expose
-    /// one shared, stable protocol commitment and no pending projection.
-    /// Quiescence is intentionally defined without engine-private counters.
+    /// one shared protocol commitment and no pending projection throughout
+    /// the configured settlement window. This observes public stability, not
+    /// engine-private quiescence; journeys must still assert their end state.
     pub async fn await_observable_settlement(
         &mut self,
         clients: &[String],
@@ -584,6 +585,11 @@ impl AppRuntimeHarness {
     ) -> Result<Vec<AppRuntimeObservationV1>, SubjectError> {
         let deadline = tokio::time::Instant::now() + max_wait;
         let mut previous_commitments: Option<Vec<String>> = None;
+        let mut stable_since = tokio::time::Instant::now();
+        let quiet_window = Duration::from_millis(
+            self.settlement_quiescence_ms
+                .unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS),
+        );
         loop {
             self.catch_up(clients).await?;
             let observations = self.observations(clients).await?;
@@ -597,8 +603,14 @@ impl AppRuntimeHarness {
             let projections_settled = observations
                 .iter()
                 .all(|observation| !observation.application.pending_confirmation);
-            if shared && projections_settled && previous_commitments.as_ref() == Some(&commitments)
+            // Fast catch-up can return twice before the protocol settlement
+            // timer fires. Require unchanged public state for its full window.
+            if !shared
+                || !projections_settled
+                || previous_commitments.as_ref() != Some(&commitments)
             {
+                stable_since = tokio::time::Instant::now();
+            } else if stable_since.elapsed() >= quiet_window {
                 return Ok(observations);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2009,6 +2021,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RelayDirectory(_)
         | AppError::Publish(_)
         | AppError::BlobStore(_)
+        | AppError::AgentStreamSendFailed(_)
         | AppError::MediaUploadTimedOut
         | AppError::MediaDownloadFailed(_)
         | AppError::AuditLogUpload(_)
@@ -2031,6 +2044,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)
         | AppError::InvalidEncryptedMedia(_)
+        | AppError::MediaReferenceStaleEpoch { .. }
+        | AppError::MediaReferenceEpochUnsettled { .. }
         | AppError::MediaAttachmentRejected(_)
         | AppError::MediaUnfetchable(_)
         | AppError::UnsafeMediaFetch(_)
@@ -2048,6 +2063,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)
+        | AppError::AgentStreamFinishMismatch
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
         | AppError::AgentStreamUnsupportedRoute
@@ -2268,6 +2284,7 @@ mod tests {
             AppError::RuntimeBusy,
             AppError::AccountWorkerResponseTimedOut,
             AppError::ChatPresentationNotReady,
+            AppError::AgentStreamSendFailed(Box::new(AppError::Publish(marker.into()))),
         ] {
             let resource = app_error(failure);
             assert_eq!(resource.category, SubjectFailureCategory::Resource);

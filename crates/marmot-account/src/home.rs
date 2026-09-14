@@ -862,8 +862,31 @@ impl AccountHome {
     }
 
     pub fn accounts(&self) -> AccountHomeResult<Vec<AccountSummary>> {
+        self.read_accounts(false)
+    }
+
+    /// List the complete account catalog or report a read error. Unlike `accounts`,
+    /// this never hides an account whose record cannot be read or decoded.
+    /// Metadata-probe errors also propagate: an inaccessible directory is not an
+    /// empty catalog. This holds the shared mutation lock across enumeration to
+    /// serialize with guarded mutations through this `AccountHome`.
+    /// The legacy `accounts` method retains its unlocked, best-effort behavior.
+    pub fn accounts_strict(&self) -> AccountHomeResult<Vec<AccountSummary>> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.read_accounts(true)
+    }
+
+    fn read_accounts(&self, strict: bool) -> AccountHomeResult<Vec<AccountSummary>> {
         let dir = self.accounts_dir();
-        if !dir.exists() {
+        let exists = if strict {
+            dir.try_exists()?
+        } else {
+            dir.exists()
+        };
+        if !exists {
             return Ok(Vec::new());
         }
 
@@ -871,9 +894,15 @@ impl AccountHome {
         let mut skipped_unreadable_records = 0usize;
         for entry in fs::read_dir(dir)? {
             let path = entry?.path().join(ACCOUNT_RECORD_FILE);
-            if path.exists() {
+            let exists = if strict {
+                path.try_exists()?
+            } else {
+                path.exists()
+            };
+            if exists {
                 match read_json(path) {
                     Ok(account) => accounts.push(account),
+                    Err(error) if strict => return Err(error),
                     Err(_) => skipped_unreadable_records += 1,
                 }
             }

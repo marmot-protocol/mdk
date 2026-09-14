@@ -35,6 +35,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello through the nostr stack"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -450,6 +451,7 @@ async fn send_app_message(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(sender, payload),
+            expected_epoch: None,
         })
         .await
         .unwrap();

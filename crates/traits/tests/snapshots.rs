@@ -601,6 +601,7 @@ fn snapshot_send_intents() {
         SendIntent::AppMessage {
             group_id: gid(),
             payload: b"hello".to_vec(),
+            expected_epoch: None,
         }
     );
     insta::assert_json_snapshot!(

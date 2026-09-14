@@ -273,10 +273,26 @@ pub enum MarmotKitError {
     /// may have completed, so refresh authoritative state before retrying.
     #[error("marmot account worker response timed out; operation completion is unknown")]
     AccountWorkerResponseTimedOut,
+    #[error("chat window requests require 1 to 100 rows")]
+    ChatWindowInvalidLimit,
+    #[error("chat window changed; use the latest sequence")]
+    ChatWindowStale,
+    #[error("visible anchor must belong to the retained window")]
+    ChatWindowAnchorOutside,
+    #[error("chat window is closed; reopen it")]
+    ChatWindowClosed,
+    #[error("chat window query failed: {details}")]
+    ChatWindowQuery { details: String },
 }
 
 impl From<AppError> for MarmotKitError {
     fn from(value: AppError) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&AppError> for MarmotKitError {
+    fn from(value: &AppError) -> Self {
         if let Some(err) = value.as_engine_error() {
             return Self::from_engine_error(err);
         }
@@ -291,10 +307,14 @@ impl From<AppError> for MarmotKitError {
                 Self::InvalidProductObservation
             }
             AppError::AccountHome(AccountHomeError::UnknownAccount(account_ref)) => {
-                Self::UnknownAccount { account_ref }
+                Self::UnknownAccount {
+                    account_ref: account_ref.clone(),
+                }
             }
             AppError::AccountHome(AccountHomeError::AccountExists(account)) => {
-                Self::DuplicateIdentity { account }
+                Self::DuplicateIdentity {
+                    account: account.clone(),
+                }
             }
             // #543: reveal_nsec must surface its required failure modes as typed
             // FFI errors, not the untyped `Runtime` bucket, so a key-backup
@@ -303,14 +323,14 @@ impl From<AppError> for MarmotKitError {
             //
             // No raw key is loaded for this account (public-only / watch-only,
             // or the secret was never imported).
-            AppError::AccountHome(ref err @ AccountHomeError::SecretNotFound(_)) => {
+            AppError::AccountHome(err @ AccountHomeError::SecretNotFound(_)) => {
                 Self::SecretNotFound {
                     details: err.to_string(),
                 }
             }
             // The platform keystore is locked / uninitialized / unavailable.
             AppError::AccountHome(
-                ref err @ (AccountHomeError::SecretStoreNotInitialized(_)
+                err @ (AccountHomeError::SecretStoreNotInitialized(_)
                 | AccountHomeError::SecretStoreUnavailable(_)
                 | AccountHomeError::SecretStore(_)),
             ) => Self::KeystoreUnavailable {
@@ -318,21 +338,27 @@ impl From<AppError> for MarmotKitError {
             },
             AppError::AccountHome(AccountHomeError::EmptyPassphrase) => Self::EmptyPassphrase,
             AppError::AccountHome(AccountHomeError::EncryptedSecretExport(details)) => {
-                Self::EncryptionFailed { details }
+                Self::EncryptionFailed {
+                    details: details.clone(),
+                }
             }
             // A filesystem IO error reading the key, appending the reveal audit
             // entry, or persisting the key-security byte — surfaced either
             // directly at the app layer or wrapped in an AccountHomeError.
-            AppError::Io(ref err) => Self::Io {
+            AppError::Io(err) => Self::Io {
                 details: err.to_string(),
             },
-            AppError::AccountHome(ref err @ AccountHomeError::Io(_)) => Self::Io {
+            AppError::AccountHome(err @ AccountHomeError::Io(_)) => Self::Io {
                 details: err.to_string(),
             },
-            AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup {
+                group_id_hex: group_id_hex.clone(),
+            },
             AppError::GroupInviteNotPending => Self::GroupInviteNotPending,
             AppError::CreatedGroupProjectionUnavailable(group_id_hex) => {
-                Self::CreatedGroupProjectionUnavailable { group_id_hex }
+                Self::CreatedGroupProjectionUnavailable {
+                    group_id_hex: group_id_hex.clone(),
+                }
             }
             AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
                 max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
@@ -342,26 +368,54 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
             },
-            AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
-            AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
-            AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved { group_id_hex },
-            AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
+            AppError::InvalidChatPin(details) => Self::InvalidChatPin {
+                details: details.clone(),
+            },
+            AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding {
+                group_id_hex: group_id_hex.clone(),
+            },
+            AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved {
+                group_id_hex: group_id_hex.clone(),
+            },
+            AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft {
+                details: details.clone(),
+            },
             // Encrypted-media validation failures are always media-boundary
             // errors; map them to the typed variant so send/upload/download
             // agree with build/parse even when a call site uses `?`/`From`.
-            AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference { details },
+            AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference {
+                details: details.clone(),
+            },
+            stale @ AppError::MediaReferenceStaleEpoch { .. } => Self::InvalidMediaReference {
+                details: stale.to_string(),
+            },
+            unsettled @ AppError::MediaReferenceEpochUnsettled { .. } => {
+                Self::InvalidMediaReference {
+                    details: unsettled.to_string(),
+                }
+            }
             AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
                 kind: rejection.kind.into(),
-                details: rejection.detail,
+                details: rejection.detail.clone(),
             },
-            AppError::MediaUnfetchable(details) => Self::MediaUnfetchable { details },
-            AppError::MediaDownloadFailed(details) => Self::MediaDownloadFailed { details },
-            AppError::UnsafeMediaFetch(details) => Self::InvalidMediaReference { details },
+            AppError::MediaUnfetchable(details) => Self::MediaUnfetchable {
+                details: details.clone(),
+            },
+            AppError::MediaDownloadFailed(details) => Self::MediaDownloadFailed {
+                details: details.clone(),
+            },
+            AppError::UnsafeMediaFetch(details) => Self::InvalidMediaReference {
+                details: details.clone(),
+            },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
-            AppError::MissingKeyPackage(account) => Self::MissingKeyPackage { account },
-            AppError::MissingMemberInboxRoute(account) => Self::MissingMemberInboxRoute { account },
+            AppError::MissingKeyPackage(account) => Self::MissingKeyPackage {
+                account: account.clone(),
+            },
+            AppError::MissingMemberInboxRoute(account) => Self::MissingMemberInboxRoute {
+                account: account.clone(),
+            },
             AppError::InvalidPublicKey => Self::InvalidIdentity {
                 details: "invalid nostr public key".into(),
             },
@@ -371,8 +425,12 @@ impl From<AppError> for MarmotKitError {
             AppError::IdentityKeyMismatch => Self::InvalidIdentity {
                 details: "public identity does not match the imported private key".into(),
             },
-            AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent { details },
-            AppError::Publish(details) => Self::Publish { details },
+            AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent {
+                details: details.clone(),
+            },
+            AppError::Publish(details) => Self::Publish {
+                details: details.clone(),
+            },
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeBusy => Self::RuntimeBusy,
@@ -395,18 +453,18 @@ impl From<AppError> for MarmotKitError {
             // the app layer (not only wrapped in an EngineError). Classify it
             // as the typed transient variant here too, so Android never sees
             // transient contention as an untyped fatal Runtime error.
-            AppError::Storage(ref storage_err) if storage_err.is_transient() => Self::StorageBusy {
+            AppError::Storage(storage_err) if storage_err.is_transient() => Self::StorageBusy {
                 details: storage_err.to_string(),
             },
             // A store closed for suspension is an orderly end state, not a
             // fault. Give it its own variant so hosts can drop the result
             // silently instead of surfacing an error while backgrounding.
-            AppError::Storage(ref storage_err) if storage_err.is_closed() => Self::StorageClosed {
+            AppError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
                 details: storage_err.to_string(),
             },
-            AppError::ExternalSignerUnavailable(account) => {
-                Self::ExternalSignerUnavailable { account }
-            }
+            AppError::ExternalSignerUnavailable(account) => Self::ExternalSignerUnavailable {
+                account: account.clone(),
+            },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
             other => Self::Runtime {
@@ -903,5 +961,67 @@ mod tests {
             ),
             "NIP-49 encryption failures must map to EncryptionFailed without duplicating the AccountHomeError prefix, got {ffi:?}"
         );
+    }
+}
+
+impl From<marmot_app::ChatListWindowError> for MarmotKitError {
+    fn from(v: marmot_app::ChatListWindowError) -> Self {
+        use marmot_app::ChatListWindowError as E;
+        match v {
+            E::InvalidLimit => Self::ChatWindowInvalidLimit,
+            E::StaleWindow => Self::ChatWindowStale,
+            E::AnchorOutsideWindow => Self::ChatWindowAnchorOutside,
+            E::Closed => Self::ChatWindowClosed,
+            E::App(e) => Self::from(e.as_ref()),
+            E::Query(e) => Self::ChatWindowQuery {
+                details: e.to_string(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod screen_error_tests {
+    use super::*;
+    #[test]
+    fn shared_screen_errors_preserve_retry_and_close_classification() {
+        use marmot_app::ChatListWindowError as W;
+        use std::sync::Arc;
+        assert!(matches!(
+            MarmotKitError::from(W::InvalidLimit),
+            MarmotKitError::ChatWindowInvalidLimit
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::StaleWindow),
+            MarmotKitError::ChatWindowStale
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::AnchorOutsideWindow),
+            MarmotKitError::ChatWindowAnchorOutside
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::Closed),
+            MarmotKitError::ChatWindowClosed
+        ));
+        let error = Arc::new(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+            "busy".into(),
+        )));
+        assert!(matches!(
+            MarmotKitError::from(W::App(error.clone())),
+            MarmotKitError::StorageBusy { .. }
+        ));
+        assert!(matches!(
+            MarmotKitError::from(error.as_ref()),
+            MarmotKitError::StorageBusy { .. }
+        ));
+        let error = Arc::new(AppError::RuntimeStopping);
+        assert!(matches!(
+            MarmotKitError::from(W::App(error.clone())),
+            MarmotKitError::RuntimeStopping
+        ));
+        assert!(matches!(
+            MarmotKitError::from(error.as_ref()),
+            MarmotKitError::RuntimeStopping
+        ));
     }
 }

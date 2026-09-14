@@ -1221,6 +1221,7 @@ async fn post_eviction_app_message(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -1408,6 +1409,7 @@ async fn send_after_realized_eviction_is_rejected_terminally() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -1444,6 +1446,7 @@ fn queue_app_message_intent(
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(engine, b"queued before removal"),
+                expected_epoch: None,
             },
             created_at_ms: 1,
             reissue_attempts: 0,
@@ -2530,7 +2533,11 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
     );
     let payload = app_payload_for(&carol, b"original state remains usable");
     carol
-        .send(SendIntent::AppMessage { group_id, payload })
+        .send(SendIntent::AppMessage {
+            group_id,
+            payload,
+            expected_epoch: None,
+        })
         .await
         .expect("failed replacement must leave the original live group usable");
 }
@@ -3116,6 +3123,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"should not send after leave"),
+            expected_epoch: None,
         })
         .await
         .unwrap_err();
@@ -3167,6 +3175,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice, b"wait for auto confirm"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3270,6 +3279,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked before restart"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3284,6 +3294,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked after restart"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3335,6 +3346,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"blocked while leave is current"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3392,6 +3404,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&bob, b"still blocked after stale self-remove"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3572,6 +3585,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"hello before selfremove commit"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -3593,6 +3607,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"hello after observing a proposal"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -3614,6 +3629,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&carol, b"after confirm"),
+            expected_epoch: None,
         })
         .await
         .unwrap();

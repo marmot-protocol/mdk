@@ -1063,7 +1063,11 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
     ) -> Result<SendResult, EngineError> {
         self.accept_send_with_audit_context(
-            SendIntent::AppMessage { group_id, payload },
+            SendIntent::AppMessage {
+                group_id,
+                payload,
+                expected_epoch: None,
+            },
             context,
             SendAcceptance::QueueAppMessage,
         )
@@ -1093,7 +1097,10 @@ impl<S: StorageProvider> Engine<S> {
         let result = match acceptance {
             SendAcceptance::Prepare => self.do_send(intent).await,
             SendAcceptance::QueueAppMessage => {
-                let SendIntent::AppMessage { group_id, payload } = intent else {
+                let SendIntent::AppMessage {
+                    group_id, payload, ..
+                } = intent
+                else {
                     unreachable!("queue app-message acceptance constructs an AppMessage intent")
                 };
                 self.do_queue_app_message(group_id, payload)
@@ -1715,13 +1722,14 @@ impl<S: StorageProvider> Engine<S> {
         // exporter-bearing candidate contexts from the prior projection are
         // stale even when the durable fingerprint later compares equal.
         self.invalidate_deferred_peel_candidate_cache(group_id);
-        // A convergence rewind probe — the pass's, or the deferred-peel sweep's
-        // candidate-branch enumeration — durably rewinds the group while it
-        // explores historical candidates. Process termination cannot run the
-        // in-process rollback guard, so restore its pre-probe live snapshot
-        // before loading any MLS or Marmot state — including the group record
-        // read below, whose epoch seeds the epoch manager.
-        crate::openmls_projection::recover_interrupted_rewind_probe(&self.storage, group_id)
+        // Every site that reads historical state — the convergence pass, the
+        // deferred-peel sweep, past-epoch peel and retention lookups, the
+        // hydrate self-remove probe, candidate replay — durably mutates the
+        // live group behind a rollback guard. Process termination cannot run
+        // that guard, so restore whichever window `RewindSite` classifies as
+        // interrupted before loading any MLS or Marmot state — including the
+        // group record read below, whose epoch seeds the epoch manager.
+        crate::openmls_projection::recover_interrupted_rewind_guard(&self.storage, group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
@@ -2412,11 +2420,11 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update(group_id.as_slice());
             hasher.update(record.id.as_slice());
             let digest = hasher.finalize();
-            let probe_snapshot = format!("hydrate-selfremove-probe-{}", hex::encode(&digest[..8]));
             let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
                 &self.storage,
                 group_id.clone(),
-                probe_snapshot,
+                crate::snapshot_guard::RewindSite::HydrateSelfRemove,
+                &hex::encode(&digest[..8]),
             )?;
             let processed = mls_group.process_message(provider, protocol);
             guard.commit()?;

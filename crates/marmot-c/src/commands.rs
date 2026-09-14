@@ -24,9 +24,10 @@ use crate::MarmotStatus;
 use crate::memory::{CFree, boxed, owned_c_string, required_str, str_array};
 use crate::status::status_from_error;
 use crate::types::account::{
-    MarmotAccountKeyPackageList, MarmotAccountSetupReadiness, MarmotAccountSummary,
-    MarmotAccountSummaryList, MarmotAccountUnreadList, MarmotIdentityCreationResult,
-    MarmotSendSummary, MarmotSignOutOutcome, MarmotUserProfileMetadata, MarmotWipeOutcome,
+    MarmotAccountKeyPackageList, MarmotAccountKeyPackageRelayEventList,
+    MarmotAccountSetupReadiness, MarmotAccountSummary, MarmotAccountSummaryList,
+    MarmotAccountUnreadList, MarmotIdentityCreationResult, MarmotSendSummary, MarmotSignOutOutcome,
+    MarmotUserProfileMetadata, MarmotWipeOutcome,
 };
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
@@ -577,9 +578,13 @@ c_cmd! {
     /// `marmot_string_list_free`.
     sync fn marmot_account_inbox_relays(account_ref: str) -> rec(MarmotStringList) = account_inbox_relays;
 
-    /// Local + relay-published KeyPackages for the account. Free with
-    /// `marmot_account_key_package_list_free`.
+    /// Local + current-slot relay-published KeyPackages for the account. Free
+    /// with `marmot_account_key_package_list_free`.
     async fn marmot_account_key_packages(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageList) = account_key_packages;
+
+    /// Observed relay KeyPackage history, including superseded events. Free
+    /// with `marmot_account_key_package_relay_event_list_free`.
+    async fn marmot_account_key_package_relay_events(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageRelayEventList) = account_key_package_relay_events;
 
     /// Publish a fresh KeyPackage. Writes the accepting-relay count.
     async fn marmot_publish_new_key_package(account_ref: str) -> scalar(u64) = publish_new_key_package;
@@ -2757,11 +2762,31 @@ pub unsafe extern "C" fn marmot_set_product_analytics_activity(
 #[cfg(test)]
 mod identity_pointer_tests {
     use super::{
-        marmot_account_id_hex, marmot_default_profile_pseudonym, marmot_random_profile_pseudonym,
+        marmot_account_id_hex, marmot_account_key_package_relay_events,
+        marmot_default_profile_pseudonym, marmot_random_profile_pseudonym,
     };
     use crate::MarmotStatus;
     use std::ffi::CString;
     use std::ptr;
+
+    #[test]
+    fn account_key_package_relay_events_rejects_null_out_before_work() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                marmot_account_key_package_relay_events(
+                    ptr::null(),
+                    account.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            MarmotStatus::NullPointer
+        );
+    }
 
     #[test]
     fn identity_wrappers_reject_null_out_before_work() {

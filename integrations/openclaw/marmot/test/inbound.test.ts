@@ -44,6 +44,133 @@ function makeClient(firstBatch: AgentControlEvent[]): {
 }
 
 describe("MarmotInboundBridge", () => {
+  it("retries an overload rejection without admitting an in-flight duplicate", async () => {
+    const id = HEX32("d7");
+    let releaseAdmission!: () => void;
+    const admissionGate = new Promise<void>((resolve) => {
+      releaseAdmission = resolve;
+    });
+    let calls = 0;
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(id);
+        yield inboundMessage(id);
+        releaseAdmission();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        yield inboundMessage(id);
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onMessage: async () => {
+        calls += 1;
+        if (calls === 1) {
+          await admissionGate;
+          return { admission: "overloaded", completion: Promise.resolve("overloaded" as const) };
+        }
+        return { admission: "admitted", completion: Promise.resolve("dispatched" as const) };
+      },
+    });
+
+    await bridge.run(controller.signal);
+
+    expect(calls).toBe(2);
+  });
+
+  it("keeps queued and running message ids reserved beyond the recent-id window", async () => {
+    const firstId = HEX32("d8");
+    let release!: () => void;
+    const completion = new Promise<"dispatched">((resolve) => {
+      release = () => resolve("dispatched");
+    });
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(firstId);
+        yield inboundMessage(HEX32("d9"));
+        yield inboundMessage(firstId);
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const seen: string[] = [];
+    const bridge = new MarmotInboundBridge(client, {
+      dedupeWindow: 1,
+      reconnectDelayMs: 1,
+      onMessage: (message) => {
+        seen.push(message.messageIdHex);
+        if (message.messageIdHex === firstId) {
+          return { admission: "admitted", completion };
+        }
+        return { admission: "admitted", completion: Promise.resolve("dispatched" as const) };
+      },
+    });
+
+    await bridge.run(controller.signal);
+    release();
+    await completion;
+
+    expect(seen).toEqual([firstId, HEX32("d9")]);
+  });
+
+  it("retains coalesced and onboarding-intercepted messages in completed dedupe", async () => {
+    const id = HEX32("da");
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(id);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        yield inboundMessage(id);
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    let calls = 0;
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onMessage: () => {
+        calls += 1;
+        return {
+          admission: "coalesced",
+          completion: Promise.resolve("onboarding_intercepted" as const),
+        };
+      },
+    });
+
+    await bridge.run(controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls).toBe(1);
+  });
+
+  it("reports local submission failure without reporting a transport drop", async () => {
+    const id = HEX32("db");
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(id);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const submissionErrors: unknown[] = [];
+    const transportErrors: unknown[] = [];
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onMessage: async () => {
+        throw new Error("local queue failure");
+      },
+      onSubmissionError: (error) => submissionErrors.push(error),
+      onError: (error) => transportErrors.push(error),
+    });
+
+    await bridge.run(controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(submissionErrors).toHaveLength(1);
+    expect(transportErrors).toHaveLength(0);
+  });
+
   it("delivers inbound messages, dedupes by id, and surfaces resync", async () => {
     const resync: AgentControlEvent = {
       type: "resync_required",

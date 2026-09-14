@@ -9,6 +9,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
+  commands and independent live account-attention summaries across Swift/Kotlin and C.
+  Existing list/read APIs and C record layouts remain; new typed window errors append
+  status codes 73–77. Regenerate bindings and use matching libraries.
+
+- `MarmotAccountKeyPackageRelayEvent`, `MarmotAccountKeyPackageRelayEventList`,
+  `marmot_account_key_package_relay_events`, and
+  `marmot_account_key_package_relay_event_list_free` for observed KeyPackage
+  relay history, including superseded same-slot events. Existing
+  `MarmotAccountKeyPackage` layout is unchanged.
 - `marmot_forget_group_local` deletes local chat and MLS state without publishing a leave,
   stops group work, and permits a fresh authenticated invitation to rejoin. Rebuild with
   matching headers/libraries; hosts must clear their own media caches and close group views.
@@ -23,6 +33,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED` (72), appended after the existing codes.
 
 ### Changed
+
+- `marmot_account_unread_summary` now uses the Unread list's eligibility for all
+  `MarmotAccountUnread` fields (`unread_count`, `unread_conversations`,
+  `attention_only_conversations`, and `has_unread`). Pending invitations and
+  departed or departing groups, including durably queued leave/disband requests,
+  no longer contribute; archived chats remain excluded. Muted active chats and
+  manual-only reminders still contribute. Struct layouts are unchanged. Hosts
+  that display invitation badges must derive those separately from invitation state.
 
 - Account storage advances through migrations 70–71 for local group reset boundaries.
   Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in

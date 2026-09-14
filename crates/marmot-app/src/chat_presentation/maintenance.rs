@@ -15,12 +15,21 @@ pub(crate) fn prepare_batch(
     shared: &SqliteSharedStorage,
     local: &str,
 ) -> Result<bool, AppError> {
+    let initialized = prepare_base_rows(account, local)?;
+    Ok(maintain(account, shared, local)? || initialized)
+}
+
+/// Initialize one bounded batch without preparing unrelated selected values.
+pub(crate) fn prepare_base_rows(
+    account: &SqliteAccountStorage,
+    local: &str,
+) -> Result<bool, AppError> {
     let classifier = crate::MarmotApp::chat_list_mention_classifier(local);
     let mut initialized = false;
     for group in account.pending_chat_presentation_rows()? {
         initialized |= account.initialize_chat_presentation_row(local, &group, &classifier)?;
     }
-    Ok(maintain(account, shared, local)? || initialized)
+    Ok(initialized)
 }
 
 fn prepare(
@@ -182,5 +191,26 @@ fn commit_progress(
     }
     Ok(advanced)
 }
+
+/// Prepare only missing selections required by a bounded screen window. This does
+/// not advance the account-wide catch-up checkpoint or wait for unrelated rows.
+pub(crate) fn prepare_window(
+    account: &SqliteAccountStorage,
+    shared: &SqliteSharedStorage,
+    local: &str,
+    groups: &[String],
+) -> Result<(), AppError> {
+    let epoch = shared.directory_presentation_version()?.store_epoch;
+    for group in groups {
+        let Some(input) = account.chat_presentation_input(group)? else {
+            continue;
+        };
+        for (input, selected) in prepare(shared, local, &epoch, vec![input])? {
+            account.store_chat_presentation(&input, &selected)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

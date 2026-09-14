@@ -757,6 +757,7 @@ async fn publish_app_events(
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(sender, payload_label(seed, message_index).as_bytes()),
+                expected_epoch: None,
             })
             .await
             .unwrap();

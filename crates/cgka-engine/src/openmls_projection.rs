@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
+use crate::snapshot_guard::RewindSite;
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::group::{Member, ProtocolProfile};
@@ -847,14 +848,18 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
-    let snapshot = replay_snapshot_name(group_id, messages);
     // RAII: on any unwind path (panic during replay, early error)
     // Drop rolls back + releases. On the happy path we explicitly
     // commit at the end. Pre-validated own-commit rollforwards inside the
     // replay land within this guard, so they are unwound with everything
     // else.
-    let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let guard = SnapshotRollbackGuard::create_group_state(
+        storage,
+        group_id.clone(),
+        RewindSite::Replay,
+        &replay_snapshot_suffix(group_id, messages),
+    )
+    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let result = process_openmls_messages_inner(
         storage,
@@ -1412,9 +1417,13 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
 
-    let live_snapshot = retained_anchor_probe_snapshot_name(group_id, work.replay_start_epoch);
-    let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), live_snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let guard = SnapshotRollbackGuard::create_group_state(
+        storage,
+        group_id.clone(),
+        RewindSite::RetainedAnchorPass,
+        &rewind_probe_snapshot_suffix(group_id, work.replay_start_epoch),
+    )
+    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
     let result = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
@@ -1437,46 +1446,103 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     result
 }
 
-/// Recover the live state captured before a rewind probe that was interrupted
-/// by process termination.
+/// Recover the live state captured before a [`SnapshotRollbackGuard`] window
+/// that process termination cut short.
 ///
-/// Two rewinds take this shape — the convergence pass's rewind to the retained
-/// anchor and the deferred-peel sweep's rewind to enumerate candidate branches.
-/// Each creates its probe snapshot before the durable rollback, so a surviving
-/// snapshot of either kind always holds the newer live state that must win on
-/// the next open.
+/// Every site that temporarily mutates live group state does so behind a guard,
+/// and each guard captures the live image before its mutation. A surviving
+/// guard snapshot therefore always holds the newer state that must win on the
+/// next open — restoring it is what keeps a device from adopting the historical
+/// epoch it was merely reading.
 ///
-/// More than one probe snapshot is not expected: convergence for a group is
-/// serialized, the two rewinds never nest, and hydrate runs before new work. If
-/// storage contains several, fail closed instead of guessing which live state
-/// is newest.
-pub(crate) fn recover_interrupted_rewind_probe<S: StorageProvider>(
+/// The recognized set is [`RewindSite`], the same closed enumeration the guards
+/// name themselves from, so no site can exist that this cannot classify.
+///
+/// A crash inside a replay window nested in a pass or sweep window strands two
+/// snapshots. They are not ambiguous: the inner image was taken of state the
+/// outer one already captured, so the outermost guard is restored and the
+/// nested one released. A lone nested snapshot is itself the outermost window
+/// — replay also runs on its own — so it is restored. Two outermost guards
+/// genuinely are ambiguous — work on a group is serialized and hydrate runs
+/// before new work, so there is no way to tell which live state is newer — and
+/// fail closed.
+///
+/// [`SnapshotRollbackGuard`]: crate::snapshot_guard::SnapshotRollbackGuard
+pub(crate) fn recover_interrupted_rewind_guard<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
 ) -> Result<(), OpenMlsProjectionError> {
-    let probes = storage
+    let mut outermost = Vec::new();
+    let mut nested = Vec::new();
+    for name in storage
         .list_group_snapshots(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-        .into_iter()
-        .filter(|name| is_rewind_probe_snapshot(name))
-        .collect::<Vec<_>>();
-
-    let Some(snapshot) = probes.first() else {
-        return Ok(());
-    };
-    if probes.len() != 1 {
-        return Err(OpenMlsProjectionError::Snapshot(
-            "multiple interrupted rewind probes".into(),
-        ));
+    {
+        match RewindSite::classify(&name) {
+            Some(site) if site.may_nest_inside_another_guard() => nested.push((site, name)),
+            Some(site) => outermost.push((site, name)),
+            None => {}
+        }
     }
 
-    // Deliberately recover the complete pre-probe image. A surviving probe
-    // snapshot may have been created by an older binary before guards became
+    let (site, restore) = match (outermost.as_slice(), nested.as_slice()) {
+        ([], []) => return Ok(()),
+        ([outer], _) => outer,
+        ([], [inner]) => inner,
+        _ => {
+            tracing::warn!(
+                target: "cgka_engine::openmls_projection",
+                method = "recover_interrupted_rewind_guard",
+                outermost = outermost.len() as u64,
+                nested = nested.len() as u64,
+                "refusing to guess which interrupted rewind holds the newer live state"
+            );
+            return Err(OpenMlsProjectionError::Snapshot(
+                "multiple interrupted rewind guards".into(),
+            ));
+        }
+    };
+
+    // Release the nested rows BEFORE restoring, and fail closed if a release
+    // fails. A nested row left behind is not inert: the next open would see it
+    // alone, classify it as the outermost window, and restore its image over
+    // live state that has since advanced past it — the same durable rollback
+    // this recovery exists to prevent. Restoring first, or treating the release
+    // as best-effort, opens that door.
+    let released_nested =
+        nested
+            .iter()
+            .filter(|(_, name)| name != restore)
+            .try_fold(0_u64, |count, (_, name)| {
+                storage
+                    .release_group_snapshot(group_id, name)
+                    .map(|()| count + 1)
+                    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
+            })?;
+    if released_nested > 0 {
+        tracing::debug!(
+            target: "cgka_engine::openmls_projection",
+            method = "recover_interrupted_rewind_guard",
+            released_nested,
+            "released nested rewind snapshots contained by the restored window"
+        );
+    }
+
+    // Deliberately recover the complete pre-guard image. A surviving snapshot
+    // may have been created by an older binary before guards became
     // state-scoped. If that binary also rewound through a legacy full retained
-    // anchor, the probe snapshot is the only durable copy of the newer live
+    // anchor, the guard snapshot is the only durable copy of the newer live
     // message ledger and outbound queue. State-only recovery would leave the
     // historical work rows stranded after upgrade.
-    rollback_and_release_group_snapshot(storage, group_id, snapshot)
+    rollback_and_release_group_snapshot(storage, group_id, restore)?;
+    tracing::info!(
+        target: "cgka_engine::openmls_projection",
+        method = "recover_interrupted_rewind_guard",
+        ?site,
+        released_nested,
+        "restored the live state captured before an interrupted rewind"
+    );
+    Ok(())
 }
 
 /// Whether the pass may reuse the candidates the BFS already materialized instead
@@ -1786,20 +1852,20 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
         .map(CandidateBranchPeel::contested_over);
     }
 
-    // Same rewind shape as the pass: probe-snapshot the live state, roll back
-    // to the retained anchor, enumerate, then restore. The guard restores on
-    // every path, and an interrupted probe is recovered by
-    // `recover_interrupted_rewind_probe` exactly as the pass's is — under this
-    // sweep's own probe name, so two interrupted probes stay distinguishable.
-    let probe_snapshot = candidate_branch_probe_snapshot_name(group_id, inputs.replay_start_epoch);
-    let guard =
-        SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), probe_snapshot)
-            .map_err(|error| {
-                CandidateBranchPeelFailure::new(
-                    OpenMlsProjectionError::Snapshot(format!("{error:?}")),
-                    0,
-                )
-            })?;
+    // Same rewind shape as the pass: snapshot the live state, roll back to the
+    // retained anchor, enumerate, then restore. The guard restores on every
+    // path, and an interrupted rewind is recovered by
+    // `recover_interrupted_rewind_guard` exactly as the pass's is — under this
+    // sweep's own site, so two interrupted rewinds stay distinguishable.
+    let guard = SnapshotRollbackGuard::create_group_state(
+        storage,
+        group_id.clone(),
+        RewindSite::CandidateBranchSweep,
+        &rewind_probe_snapshot_suffix(group_id, inputs.replay_start_epoch),
+    )
+    .map_err(|error| {
+        CandidateBranchPeelFailure::new(OpenMlsProjectionError::Snapshot(format!("{error:?}")), 0)
+    })?;
     let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
     let contexts = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
         Ok(()) => {
@@ -2041,9 +2107,13 @@ fn candidate_path_peel_context<S: StorageProvider>(
     };
     budget.consume()?;
 
-    let snapshot = replay_snapshot_name(group_id, &replay_path.messages);
-    let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let guard = SnapshotRollbackGuard::create_group_state(
+        storage,
+        group_id.clone(),
+        RewindSite::Replay,
+        &replay_snapshot_suffix(group_id, &replay_path.messages),
+    )
+    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     let captured = capture_candidate_tip_context(
         storage,
         group_id,
@@ -4125,48 +4195,29 @@ pub(crate) fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64
     name.strip_prefix("openmls-retained-anchor-")?.parse().ok()
 }
 
-fn retained_anchor_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String {
-    rewind_probe_snapshot_name(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX, group_id, epoch)
-}
-
-/// Probe name for the deferred-peel sweep's rewind.
+/// Suffix for a rewind onto the retained anchor at `epoch`.
 ///
-/// Deliberately distinct from the pass's probe name. Both rewinds capture the
-/// same live state at the same `(group, epoch)`, so a shared name hashes to the
-/// same string — and `create_group_snapshot` is INSERT OR REPLACE, so a second
-/// interrupted probe would overwrite the first instead of leaving two rows for
-/// `recover_interrupted_rewind_probe` to fail closed on. Distinct prefixes keep
-/// that detector armed.
-fn candidate_branch_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String {
-    rewind_probe_snapshot_name(CANDIDATE_BRANCH_PROBE_SNAPSHOT_PREFIX, group_id, epoch)
-}
-
-fn rewind_probe_snapshot_name(prefix: &str, group_id: &GroupId, epoch: u64) -> String {
+/// The pass and the deferred-peel sweep capture the same live state at the same
+/// `(group, epoch)`, so they share this suffix and are separated only by their
+/// [`RewindSite`](crate::snapshot_guard::RewindSite) prefix. That separation is
+/// load-bearing: `create_group_snapshot` is INSERT OR REPLACE, so one shared
+/// name would collapse two interrupted rewinds into a single row instead of
+/// leaving the pair that `recover_interrupted_rewind_guard` fails closed on.
+fn rewind_probe_snapshot_suffix(group_id: &GroupId, epoch: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(group_id.as_slice());
     hasher.update(epoch.to_be_bytes());
-    let digest = hasher.finalize();
-    format!("{prefix}{}", hex::encode(&digest[..8]))
+    hex::encode(&hasher.finalize()[..8])
 }
 
-const RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX: &str = "openmls-retained-probe-";
-const CANDIDATE_BRANCH_PROBE_SNAPSHOT_PREFIX: &str = "openmls-branch-probe-";
-
-/// Whether `name` is a rewind probe of either kind.
-fn is_rewind_probe_snapshot(name: &str) -> bool {
-    name.starts_with(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX)
-        || name.starts_with(CANDIDATE_BRANCH_PROBE_SNAPSHOT_PREFIX)
-}
-
-fn replay_snapshot_name(group_id: &GroupId, messages: &[TransportMessage]) -> String {
+fn replay_snapshot_suffix(group_id: &GroupId, messages: &[TransportMessage]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(group_id.as_slice());
     for message in messages {
         hasher.update(message.id.as_slice());
         hasher.update(message.payload.as_slice());
     }
-    let digest = hasher.finalize();
-    format!("openmls-probe-{}", hex::encode(&digest[..8]))
+    hex::encode(&hasher.finalize()[..8])
 }
 
 fn apply_snapshot_name(group_id: &GroupId, result: &CanonicalizationResult) -> String {

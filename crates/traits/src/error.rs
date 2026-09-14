@@ -124,6 +124,28 @@ pub enum EngineError {
     #[error("invalid KeyPackage capabilities: recipient must generate a new conforming KeyPackage")]
     InvalidKeyPackageCapabilities { member: MemberId },
 
+    /// An application message pinned to `expected` (see
+    /// [`SendIntent::AppMessage::expected_epoch`](crate::engine::SendIntent))
+    /// reached encryption after the group had already advanced to `current`:
+    /// the send folded retained peer commits first. Nothing was prepared or
+    /// published. Routine input for epoch-bound payloads such as
+    /// encrypted-media references, not an engine bug: the caller re-derives
+    /// the payload for the current epoch (re-uploads the media).
+    #[error("application message pinned to epoch {expected} but the group is at epoch {current}")]
+    AppMessageEpochMismatch { expected: EpochId, current: EpochId },
+
+    /// An application message pinned to `expected` arrived while the group's
+    /// epoch is unsettled: a publication this client staged still awaits its
+    /// outcome, or retained convergence input is not yet applied. Ordinary
+    /// messages are retained and encrypted at drain time under whatever epoch
+    /// the group lands on; a pinned message cannot be, so it is refused
+    /// instead of queued. Nothing was persisted. Retry once the group settles
+    /// and, if the epoch moved, re-derive the payload.
+    #[error(
+        "application message pinned to epoch {expected} refused while the group epoch is unsettled"
+    )]
+    AppMessageEpochUnsettled { expected: EpochId },
+
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.
     /// Recoverable same-epoch commit races roll back and replay internally.
@@ -240,6 +262,8 @@ impl EngineError {
             EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
             EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
             EngineError::InvalidKeyPackageCapabilities { .. } => "invalid_key_package_capabilities",
+            EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
+            EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
             EngineError::GroupUnrecoverableRepairRequired { .. } => {

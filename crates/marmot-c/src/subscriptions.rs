@@ -1305,3 +1305,6 @@ pub unsafe extern "C" fn marmot_presented_chat_list_subscription_free(
 ) {
     crate::memory::free_guard(|| unsafe { free_plain(sub) });
 }
+
+mod chat_window;
+pub use chat_window::*;

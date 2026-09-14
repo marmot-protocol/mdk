@@ -40,6 +40,10 @@ those relay-list events from supplied bootstrap relays and store discovered user
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
 KeyPackage ref separately; normal publish reuses only a cached current-profile last-resort package, while explicit
 rotate, a legacy cache entry, or lifetime-policy rejection creates a new current-profile package under the same slot.
+Account inventory listing (`account_key_package_records` / `account_key_packages`) exposes one current relay
+event per addressable slot in the validated fetch window. `account_key_package_relay_events` returns that
+window's current and superseded public events so a client can delete a superseded event id without targeting
+the current winner or inventing a second Published row.
 
 Account open performs the strict profile cutover before transport processing: the encrypted session transactionally
 retires every locally stored legacy KeyPackage private bundle, then the app best-effort deletes cached and

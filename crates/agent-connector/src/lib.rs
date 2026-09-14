@@ -13,7 +13,6 @@ mod maintenance;
 mod media_roots;
 mod media_temp;
 mod messaging;
-mod quic;
 mod reconcile_telemetry;
 mod socket;
 mod stream;
@@ -74,7 +73,6 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 /// Whole-operation deadline for control-socket I/O and request-scoped name
 /// resolution. A peer cannot reset it by trickling bytes or partial progress.

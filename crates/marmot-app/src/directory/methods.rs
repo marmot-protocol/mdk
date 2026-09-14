@@ -1512,6 +1512,10 @@ impl MarmotApp {
             return Ok(());
         }
         shared_storage.put_public_directory_user(&public_entry)?;
+        let _ = self
+            .presentation_signals
+            .profile_updates
+            .send(entry.account_id_hex.clone());
         self.presentation_signals.wake();
         for cache in caches {
             cache.put_with_reason(&entry, reason)?;
@@ -1651,6 +1655,10 @@ impl MarmotApp {
         for entry in &entries {
             shared_storage.put_public_directory_user(&public_directory_user_record(entry)?)?;
             // Each row commits independently; a later import error must not hide this work.
+            let _ = self
+                .presentation_signals
+                .profile_updates
+                .send(entry.account_id_hex.clone());
             self.presentation_signals.wake();
         }
         for cache in caches {

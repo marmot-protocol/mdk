@@ -6824,6 +6824,10 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     bob.sync().await.unwrap();
     carol.sync().await.unwrap();
 
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
+    carol.accept_group_invite(&group_id).unwrap();
+
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // Establish a read baseline on existing history for bob and carol, then send
@@ -6924,6 +6928,9 @@ async fn local_leave_suppresses_account_unread_total() {
     let mut alice = app.client("alice").await.unwrap();
     let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
     bob.sync().await.unwrap();
+
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
 
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -7112,6 +7119,9 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
     let group_id = alice.create_group("backfill", &["bob"]).await.unwrap();
     bob.sync().await.unwrap();
 
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
+
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // Establish a read baseline, then send a strictly-later unread message.
@@ -7186,6 +7196,9 @@ async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
     let mut alice = app.client("alice").await.unwrap();
     let group_id = alice.create_group("markers", &["bob"]).await.unwrap();
     bob.sync().await.unwrap();
+
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let bob_row = || {
@@ -7713,6 +7726,9 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
+    // A reference is only sendable in the epoch that encrypted it; the
+    // synthetic references below claim the group's live epoch.
+    let media_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
     bob.send_media_attachments(
         &group_id,
         vec![
@@ -7727,7 +7743,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
                 version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
+                source_epoch: media_epoch,
                 dim: Some("800x600".to_owned()),
                 thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
             },
@@ -7742,7 +7758,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "audio.ogg".to_owned(),
                 media_type: "audio/ogg".to_owned(),
                 version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
+                source_epoch: media_epoch,
                 dim: None,
                 thumbhash: None,
             },
@@ -10782,9 +10798,8 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
-/// mdk#1451: startup replay uses one live FIFO. A read may be served during
-/// deferred Welcome fanout only when no earlier mutation remains; otherwise it
-/// waits and observes that mutation's result.
+/// mdk#1803: snapshot reads bypass queued mutations during Welcome fanout.
+/// After the queued mutation completes, fresh reads observe its result.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanout() {
@@ -10875,14 +10890,23 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
     let read_runtime = runtime.clone();
     let read_alice_id = alice_id.clone();
     let read_group_id = group_id.clone();
-    let mut read = tokio::spawn(async move {
+    let read = tokio::spawn(async move {
         read_runtime
             .group_members(&read_alice_id, &read_group_id)
             .await
     });
+    let members = timeout(Duration::from_secs(1), read)
+        .await
+        .expect("snapshot read must bypass the startup-deferred remove")
+        .expect("read task should not panic")
+        .expect("snapshot members should remain readable");
     assert!(
-        timeout(Duration::from_secs(2), &mut read).await.is_err(),
-        "live read must not bypass the earlier startup-deferred remove"
+        members.iter().any(|member| member.member_id_hex == bob_id),
+        "snapshot must retain the member whose removal is still queued"
+    );
+    assert!(
+        !remove.is_finished(),
+        "removal must wait for Welcome fanout"
     );
 
     let mut events = runtime.subscribe();
@@ -10892,11 +10916,13 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
         .expect("deferred remove should run after Welcome fanout")
         .expect("deferred remove task should not panic")
         .expect("deferred remove should succeed");
-    let members = timeout(Duration::from_secs(5), read)
-        .await
-        .expect("read should run after the earlier deferred remove")
-        .expect("read task should not panic")
-        .expect("group members should remain readable");
+    let members = timeout(
+        Duration::from_secs(5),
+        runtime.group_members(&alice_id, &group_id),
+    )
+    .await
+    .expect("read should run after the earlier deferred remove")
+    .expect("group members should remain readable");
     assert!(
         members.iter().all(|member| member.member_id_hex != bob_id),
         "read must observe the earlier startup-deferred remove"

@@ -1858,6 +1858,29 @@ impl SqliteAccountStorage {
             > 0)
     }
 
+    /// Apply an authoritative self-arrival. A departed conversation returns to Chats
+    /// even if it was archived before leaving. Ordinary member activity preserves archive.
+    /// Returns whether this transitioned an existing departed projection back to Member.
+    pub fn restore_group_self_membership(&self, group_id_hex: &str) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let departed = matches!(
+                self.group_self_membership(group_id_hex)?,
+                Some(SelfMembership::Left | SelfMembership::Removed)
+            );
+            if departed {
+                self.lock()?
+                    .execute_cached(
+                        "UPDATE account_groups SET archived=0 WHERE group_id_hex=?1",
+                        [group_id_hex],
+                    )
+                    .storage()?;
+            }
+            // Preserve push-share admission and every existing membership side effect.
+            self.set_group_self_membership(group_id_hex, SelfMembership::Member)?;
+            Ok(departed)
+        })
+    }
+
     /// Record the local account's own membership in `group_id_hex` so the
     /// chat list and removed-group-suppressed unread aggregate reflect whether
     /// the account is still in the group and, if not, how it left. `Left` and

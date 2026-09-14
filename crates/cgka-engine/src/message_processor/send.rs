@@ -96,8 +96,13 @@ impl<S: StorageProvider> Engine<S> {
         let retained_intent = recording.as_ref().map(|_| intent.clone());
         let source_epoch = group.as_ref().map(|group| group.epoch).unwrap_or_default();
         let result = match intent {
-            SendIntent::AppMessage { group_id, payload } => {
-                self.do_send_app_message(group_id, payload).await
+            SendIntent::AppMessage {
+                group_id,
+                payload,
+                expected_epoch,
+            } => {
+                self.do_send_app_message(group_id, payload, expected_epoch)
+                    .await
             }
             SendIntent::Invite {
                 group_id,
@@ -889,6 +894,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
+        expected_epoch: Option<EpochId>,
     ) -> Result<SendResult, EngineError> {
         // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
@@ -908,9 +914,24 @@ impl<S: StorageProvider> Engine<S> {
             .take_mls_group(&group_id)?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
+        // The authoritative epoch is the loaded MLS state, read at the last
+        // moment before encryption. `do_send` may have folded retained peer
+        // commits into this send on the way here, so a payload pinned to the
+        // epoch the caller saw can legitimately no longer be encrypted under
+        // it. Nothing has been written yet; hand the untouched group back.
+        let source_epoch = EpochId(mls_group.epoch().as_u64());
+        if let Some(expected) = expected_epoch
+            && expected != source_epoch
+        {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::AppMessageEpochMismatch {
+                expected,
+                current: source_epoch,
+            });
+        }
+
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
-        let source_epoch = EpochId(mls_group.epoch().as_u64());
         let own_application_stamp = OwnApplicationConvergenceStamp {
             sender: self.identity.self_id().clone(),
             source_epoch_authenticator: hex::encode(mls_group.epoch_authenticator().as_slice()),

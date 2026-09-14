@@ -49,6 +49,10 @@ const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
 /// The durable cursor starts the next pass after the last attempted route.
 const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 
+// ponytail: EOSE crosses a separate router task; retain a short quiet window
+// until delivery and EOSE can share an ordered receive lane.
+const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
+
 // One ingest or convergence pass can release several previously retained events.
 // Their durable identities belong to the events, not to the triggering envelope.
 fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback: &str) -> String {
@@ -2024,7 +2028,21 @@ impl AppClient {
                 wait = wait.min(quantum.saturating_sub(drain_started.elapsed()));
             }
             first_wait = false;
-            let delivery = match timeout(wait, self.adapter.receive_account_delivery()).await {
+            let receive = async {
+                if !matches!(completion, DrainCompletion::Quiescence) {
+                    return self.adapter.receive_account_delivery().await;
+                }
+                loop {
+                    match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
+                        Ok(result) => return result,
+                        Err(_) if self.adapter.account_subscription_eose().await.complete() => {
+                            return Ok(None);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            };
+            let delivery = match timeout(wait, receive).await {
                 Ok(Ok(Some(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)))) => {
                     delivery
                 }
@@ -4442,7 +4460,7 @@ impl AppClient {
     ///
     /// Returns whether the event forces a transport-route refresh.
     pub(crate) fn observe_event_projection_effects(
-        &self,
+        &mut self,
         event: &cgka_traits::engine::GroupEvent,
         local_account_id_hex: &str,
         summary: &mut SyncSummary,
@@ -4524,11 +4542,25 @@ impl AppClient {
         // `Left`, which is the intended mdk#1746 behavior on a re-add.
         if let Some(group_id) = self_arrival_group(event, local_account_id_hex) {
             let group_id_hex = hex::encode(group_id.as_slice());
-            self.app.set_group_self_membership(
-                &self.state.label,
-                &group_id_hex,
-                SelfMembership::Member,
-            )?;
+            let restored = self
+                .app
+                .account_storage(&self.state.label)?
+                .restore_group_self_membership(&group_id_hex)?;
+            if restored {
+                // Keep the worker's next projection save aligned with the same durable
+                // arrival; otherwise its old archive intent would undo this transition.
+                if let Some(group) = self
+                    .state
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.group_id_hex == group_id_hex)
+                {
+                    group.archived = false;
+                    group.self_membership = SelfMembership::Member;
+                }
+                self.mark_group_projection_dirty(group_id);
+            }
+            self.app.presentation_signals.wake();
         }
         Ok(routes_dirty)
     }
@@ -5350,6 +5382,7 @@ mod tests {
                 .send(cgka_traits::engine::SendIntent::AppMessage {
                     group_id: group_id.clone(),
                     payload: payload.clone(),
+                    expected_epoch: None,
                 })
                 .await
                 .unwrap();
@@ -6460,6 +6493,48 @@ mod tests {
             DrainVerdict::EoseTimeout,
             "EOSE on every logical subscription is insufficient while another relay remains uncovered"
         );
+    }
+
+    #[tokio::test]
+    async fn eose_shortens_quiet_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.sync_runtime_groups().await.unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        client
+            .drain_sdk_relay(
+                &mut DrainCounts::default(),
+                super::DrainCompletion::Quiescence,
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= crate::SDK_FIRST_SYNC_WAIT);
+        assert!(started.elapsed() <= crate::SDK_FIRST_SYNC_WAIT + Duration::from_millis(1));
+        for subscription in relay.accepted_subscriptions() {
+            for endpoint in subscription.endpoints() {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                    .await;
+            }
+        }
+        assert!(client.adapter.account_subscription_eose().await.complete());
+        let started = tokio::time::Instant::now();
+        client
+            .drain_sdk_relay(
+                &mut DrainCounts::default(),
+                super::DrainCompletion::Quiescence,
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
+        assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
 
     #[test]

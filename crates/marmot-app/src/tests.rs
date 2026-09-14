@@ -1,3 +1,4 @@
+mod key_package_inventory;
 mod message_journeys;
 
 use super::*;
@@ -560,29 +561,39 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let endpoint_events = self.events_by_endpoint.lock().unwrap();
-        let events = if endpoint_events.is_empty() {
-            self.events.lock().unwrap().clone()
-        } else {
+        let matches_query = |event: &NostrTransportEvent| {
             request
-                .endpoints
+                .queries
                 .iter()
-                .filter_map(|endpoint| endpoint_events.get(&endpoint.0))
-                .flatten()
-                .cloned()
-                .collect()
+                .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
         };
-        Ok(events
-            .into_iter()
-            .filter(|event| {
-                request
-                    .queries
-                    .iter()
-                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
-            })
-            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
-                endpoints: request.endpoints.clone(),
-                event,
+        let endpoint_events = self.events_by_endpoint.lock().unwrap();
+        if endpoint_events.is_empty() {
+            return Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches_query(event))
+                .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                    endpoints: request.endpoints.clone(),
+                    event: event.clone(),
+                })
+                .collect());
+        }
+        Ok(request
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                endpoint_events
+                    .get(&endpoint.0)
+                    .into_iter()
+                    .flatten()
+                    .filter(|event| matches_query(event))
+                    .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                        endpoints: vec![endpoint.clone()],
+                        event: event.clone(),
+                    })
             })
             .collect())
     }
@@ -4922,6 +4933,177 @@ fn locally_queued_send_survives_runtime_restart_and_failed_reactivation() {
 }
 
 #[test]
+fn media_send_refuses_references_encrypted_under_another_epoch() {
+    run_composed_app_runtime_test(
+        "media-send-stale-epoch",
+        media_send_refuses_stale_epoch_body,
+    );
+}
+
+async fn media_send_refuses_stale_epoch_body() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("media", &[]).await.unwrap();
+    let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+
+    // The tag has no epoch field, so a recipient would derive the key for the
+    // sending epoch and fail to decrypt ciphertext produced one epoch earlier.
+    let stale = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x33_u8; 32]),
+        plaintext_sha256: hex::encode([0x11_u8; 32]),
+        nonce_hex: hex::encode([0x22_u8; 12]),
+        file_name: "a.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: current_epoch + 1,
+        dim: None,
+        thumbhash: None,
+    };
+    let error = client
+        .send_media_attachments(&group_id, vec![stale], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } if source_epoch == current_epoch + 1 && current_epoch == client
+                .group_mls_state(&group_id)
+                .unwrap()
+                .epoch
+        ),
+        "{error:?}"
+    );
+    assert!(
+        app.messages("alice").unwrap().is_empty(),
+        "a refused stale reference must publish nothing"
+    );
+}
+
+#[test]
+fn media_send_pins_the_engine_to_the_reference_epoch() {
+    run_composed_app_runtime_test("media-send-epoch-pin", media_send_epoch_pin_body);
+}
+
+async fn media_send_epoch_pin_body() {
+    // The pre-check in `send_media_attachments` is the early answer; the pin
+    // on the send intent is the binding one. Drive `send_app_event` directly —
+    // the path `media upload --send` takes after its HTTP round-trip — with a
+    // reference from another epoch, so only the engine can refuse it. Its
+    // typed refusal must come back as the media-boundary error naming both
+    // epochs, the optimistic local row must be retracted, and nothing may be
+    // published.
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("media", &[]).await.unwrap();
+    let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    let published_before = relay.published_event_ids().len();
+
+    let pinned_elsewhere = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x44_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x44_u8; 32]),
+        plaintext_sha256: hex::encode([0x12_u8; 32]),
+        nonce_hex: hex::encode([0x23_u8; 12]),
+        file_name: "b.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: current_epoch + 1,
+        dim: None,
+        thumbhash: None,
+    };
+    let error = client
+        .send_app_event(
+            &group_id,
+            AppMessageIntent::Media {
+                attachments: vec![pinned_elsewhere],
+                caption: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch: at,
+            } if source_epoch == current_epoch + 1 && at == current_epoch
+        ),
+        "the engine's pin refusal must surface as the media error, got {error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused pinned send must reach the relay with nothing"
+    );
+    // The optimistic local row is retracted the same way as any failed
+    // publish: invalidated in place, never left looking sent.
+    let rows = app.messages("alice").unwrap();
+    assert!(
+        rows.iter().all(|row| row.invalidated),
+        "the optimistic row must be retracted, got {rows:?}"
+    );
+    assert_eq!(
+        client.group_mls_state(&group_id).unwrap().epoch,
+        current_epoch,
+        "the refusal must not disturb the group"
+    );
+
+    // A reference from the current epoch still goes out through the same path,
+    // proving the pin is the reference's epoch and not a blanket refusal.
+    let current = MediaAttachmentReference {
+        source_epoch: current_epoch,
+        ..MediaAttachmentReference {
+            locators: vec![MediaLocator {
+                kind: "blossom-v1".to_owned(),
+                value: format!("https://media.example/{}.bin", hex::encode([0x55_u8; 32])),
+            }],
+            ciphertext_sha256: hex::encode([0x55_u8; 32]),
+            plaintext_sha256: hex::encode([0x13_u8; 32]),
+            nonce_hex: hex::encode([0x24_u8; 12]),
+            file_name: "c.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            version: "encrypted-media-v2".to_owned(),
+            source_epoch: 0,
+            dim: None,
+            thumbhash: None,
+        }
+    };
+    let (_, summary) = client
+        .send_app_event(
+            &group_id,
+            AppMessageIntent::Media {
+                attachments: vec![current],
+                caption: None,
+            },
+        )
+        .await
+        .expect("a current-epoch reference sends");
+    assert_eq!(summary.published, 1, "{summary:?}");
+    assert_eq!(relay.published_event_ids().len(), published_before + 1);
+}
+
+#[test]
 fn pending_disband_is_projected_and_blocks_optimistic_application_messages() {
     run_composed_app_runtime_test(
         "pending-disband-composer-gate",
@@ -8036,6 +8218,32 @@ async fn fresh_key_package_for_account(
     }
     let mut session = AccountDeviceSession::open(config).unwrap();
     session.fresh_key_package().await.unwrap()
+}
+
+pub(crate) fn write_key_package_cache(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    key_package_id: &str,
+    key_package_ref_hex: &str,
+    key_package_event_id: &str,
+) {
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: key_package_id.to_owned(),
+            key_package_ref_hex: key_package_ref_hex.to_owned(),
+            key_package_event_id: key_package_event_id.to_owned(),
+            published_at: 1,
+            key_package_hex: "00".into(),
+        },
+    )
+    .unwrap();
+}
+
+pub(crate) fn key_package_cache_exists(app: &MarmotApp, label: &str) -> bool {
+    app.key_package_record_path(label).exists()
 }
 
 /// Seed the explicit kind-10050 state normally established by account setup.
@@ -16295,6 +16503,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -16378,6 +16587,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             .send(cgka_traits::engine::SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: historical_payload.clone(),
+                expected_epoch: None,
             })
             .await
             .unwrap();
@@ -16400,6 +16610,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             .send(cgka_traits::engine::SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: fresh_payload.clone(),
+                expected_epoch: None,
             })
             .await
             .unwrap();
@@ -16482,6 +16693,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -16563,6 +16775,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
         .send(cgka_traits::engine::SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: fresh_payload.clone(),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -20039,7 +20252,7 @@ fn pending_group_invites_skips_malformed_rows() {
 #[test]
 fn account_unread_summary_includes_badge_attention_without_session_load() {
     // mdk#1460: one cheap summary must return unread totals plus
-    // attention-only rows (pending invites / manual unread) for accounts that
+    // attention-only rows (manual unread, excluding pending invites) for accounts that
     // have never been started.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -20144,8 +20357,8 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
         .find(|summary| summary.account_id_hex == alice.account_id_hex)
         .expect("seeded account");
     assert_eq!(summary.unread_count, 1);
-    assert_eq!(summary.unread_conversations, 3);
-    assert_eq!(summary.attention_only_conversations, 2);
+    assert_eq!(summary.unread_conversations, 2);
+    assert_eq!(summary.attention_only_conversations, 1);
     assert!(summary.has_unread);
 }
 

@@ -956,7 +956,7 @@ impl AppGroupRecord {
             GroupConfirmationProjection::Preserve => {}
             GroupConfirmationProjection::Accepted => {
                 self.pending_confirmation = false;
-                self.archived = false;
+                // Acceptance preserves explicit archive intent. Restore is a separate command.
             }
             GroupConfirmationProjection::Welcome {
                 explicitly_confirmed,
@@ -977,7 +977,12 @@ impl AppGroupRecord {
                     return;
                 }
                 self.pending_confirmation = !explicitly_confirmed;
-                self.archived = false;
+                // Only the engine's successful consented rejoin clears archive.
+                // Offers and ordinary invitation acceptance preserve explicit archive intent;
+                // the replay guard above prevents an old join from undoing a later archive.
+                if explicitly_confirmed {
+                    self.archived = false;
+                }
                 self.via_welcome_message_id_hex = Some(via_welcome_message_id_hex);
                 self.welcomer_account_id_hex = welcomer_account_id_hex;
             }
@@ -2515,10 +2520,9 @@ mod confirmation_state_tests {
         );
     }
 
-    // A re-invite after the user declined (pending=false, archived=true) must
-    // also re-surface the group as a fresh pending invite.
+    // A new invitation is pending but does not restore explicit archive intent.
     #[test]
-    fn reinvite_after_decline_resurfaces_as_pending() {
+    fn reinvite_after_decline_preserves_archive_until_supported_rejoin() {
         let mut record = test_record();
         record.apply_confirmation_state(pending("welcome-1", None));
 
@@ -2528,7 +2532,7 @@ mod confirmation_state_tests {
 
         record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
         assert!(record.pending_confirmation);
-        assert!(!record.archived);
+        assert!(record.archived);
         assert_eq!(
             record.via_welcome_message_id_hex.as_deref(),
             Some("welcome-2")
@@ -2537,6 +2541,27 @@ mod confirmation_state_tests {
             record.welcomer_account_id_hex.as_deref(),
             Some("welcomer-2")
         );
+    }
+
+    #[test]
+    fn acceptance_preserves_archive_and_consented_rejoin_restores_once() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("old", None));
+        record.archived = true;
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(record.archived);
+        assert!(!record.pending_confirmation);
+        let rejoin = GroupConfirmationProjection::Welcome {
+            explicitly_confirmed: true,
+            via_welcome_message_id_hex: "new".into(),
+            welcomer_account_id_hex: None,
+        };
+        record.apply_confirmation_state(rejoin.clone());
+        assert!(!record.archived);
+        assert!(!record.pending_confirmation);
+        record.archived = true;
+        record.apply_confirmation_state(rejoin);
+        assert!(record.archived, "replayed join cannot undo a later archive");
     }
 
     // A true replay (same welcome id on an already-resolved group) must NOT
