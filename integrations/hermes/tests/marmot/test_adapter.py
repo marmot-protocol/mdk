@@ -6787,6 +6787,111 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.text for item in adapter.events], ["durable"])
         await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
+    async def test_capacity_deferrals_do_not_exhaust_dispatch_failure_retries(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        call = adapter._inbound_spool_call
+        store = adapter._inbound_spool
+        await call(store.record, event)
+        try:
+            for reason in ("queue_full", "shutdown_before_queue_admission", "dispatch_cancelled_before_handoff"):
+                for _ in self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S:
+                    await call(store.claim, event["message_id_hex"], ignore_backoff=True)
+                    await call(store.defer, event["message_id_hex"], delay_s=0.01, reason=reason)
+            adapter._should_run_turn = unittest.mock.AsyncMock(side_effect=OSError("temporary RPC failure"))
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await adapter._inbound_queue.join()
+            record = await call(store.get, event["message_id_hex"])
+            self.assertEqual("pending", record.state)
+            adapter._should_run_turn = unittest.mock.AsyncMock(return_value=True)
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await adapter._inbound_queue.join()
+            self.assertEqual(["durable"], [message.text for message in adapter.events])
+        finally:
+            await adapter.disconnect()
+
+    async def test_failed_dispatch_disposition_retries_without_restart(self):
+        for operation_name, post_commit in (("get", False), ("defer", False), ("defer", True)):
+            with self.subTest(operation=operation_name, post_commit=post_commit):
+                adapter = self.make_adapter(extra={"group_activation": "always"})
+                await adapter._ensure_inbound_spool_open()
+                call = adapter._inbound_spool_call
+                store = adapter._inbound_spool
+                first = self.adapter_module._normalize_inbound_message_event(self.make_event(text="first"))
+                second = self.adapter_module._normalize_inbound_message_event(self.make_event(message_id="55", text="second"))
+                await call(store.record, first)
+                await call(store.record, second)
+                claim = await call(store.claim, first["message_id_hex"])
+                original = getattr(store, operation_name)
+                unavailable = True
+
+                def fault(*args, **kwargs):
+                    if unavailable:
+                        if post_commit:
+                            original(*args, **kwargs)
+                        raise self.adapter_module.sqlite3.OperationalError("synthetic disposition storage failure")
+                    return original(*args, **kwargs)
+
+                setattr(store, operation_name, fault)
+                adapter._should_run_turn = unittest.mock.AsyncMock(side_effect=OSError("temporary RPC failure"))
+                retry = None
+                try:
+                    with unittest.mock.patch.object(self.adapter_module, "INBOUND_SPOOL_RETRY_BACKOFF_S", (0.01, 0.01)):
+                        await adapter._dispatch_inbound_message(claim.event, spool_message_id=claim.message_id)
+                        self.assertIn(claim.message_id, adapter._inbound_dispatch_dispositions)
+                        self.assertFalse(await adapter._try_admit_spooled(claim.message_id, ignore_backoff=True))
+                        adapter._should_run_turn = unittest.mock.AsyncMock(return_value=True)
+                        unavailable = False
+                        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+                        adapter._inbound_spool_wakeup.set()
+                        for _ in range(100):
+                            if len(adapter.events) == 2:
+                                break
+                            await asyncio.sleep(0.01)
+                        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+                    self.assertEqual(["first", "second"], [message.text for message in adapter.events])
+                    self.assertEqual({}, adapter._inbound_dispatch_dispositions)
+                    self.assertEqual(1, (await call(store.get, claim.message_id)).dispatch_attempts)
+                finally:
+                    unavailable = False
+                    if retry is not None:
+                        retry.cancel()
+                        await asyncio.gather(retry, return_exceptions=True)
+                    await adapter.disconnect()
+
+    async def test_handoff_disposition_storage_failure_never_replays_host(self):
+        for post_commit in (False, True):
+            with self.subTest(post_commit=post_commit):
+                adapter = self.make_adapter(extra={"group_activation": "always"})
+                store = adapter._inbound_spool
+                original = store.transition
+                unavailable = True
+
+                def fault(message_id, state, disposition):
+                    if unavailable and state == "unresolved":
+                        if post_commit:
+                            original(message_id, state, disposition)
+                        raise self.adapter_module.sqlite3.OperationalError("synthetic terminal storage failure")
+                    return original(message_id, state, disposition)
+
+                store.transition = fault
+                try:
+                    await adapter._handle_control_event(self.make_event())
+                    await adapter._inbound_queue.join()
+                    self.assertEqual(["durable"], [message.text for message in adapter.events])
+                    unavailable = False
+                    await adapter._retry_inbound_dispatch_dispositions()
+                    await adapter._admit_due_spooled()
+                    await adapter._inbound_queue.join()
+                    record = await adapter._inbound_spool_call(store.get, "33" * 32)
+                    self.assertEqual("unresolved", record.state)
+                    self.assertEqual({}, adapter._inbound_dispatch_dispositions)
+                    self.assertEqual(["durable"], [message.text for message in adapter.events])
+                finally:
+                    unavailable = False
+                    await adapter.disconnect()
+
     async def test_mention_policy_skip_is_explicit_terminal_disposition(self):
         class MultiPartyClient:
             async def group_info(self, account_id_hex, group_id_hex):

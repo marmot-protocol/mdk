@@ -47,6 +47,37 @@ def wait_for(path: Path, timeout: float = 5.0):
 
 
 class InboundSpoolTests(unittest.TestCase):
+    def test_schema_one_migration_preserves_obligations_and_separates_retry_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "private" / "spool.sqlite3"
+            store = spool.InboundSpool(path)
+            store.open()
+            store.record(event(1))
+            message_id = event(1)["message_id_hex"]
+            store.claim(message_id)
+            store.defer(message_id, delay_s=0.01, reason="queue_full")
+            store.close()
+            # Recreate the previous version's events table and version marker.
+            with sqlite3.connect(path) as db:
+                db.execute("ALTER TABLE events DROP COLUMN dispatch_attempts")
+                db.execute("PRAGMA user_version=1")
+            store.open()
+            try:
+                record = store.get(message_id)
+                self.assertEqual("pending", record.state)
+                self.assertEqual(event(1), record.event)
+                self.assertEqual(1, record.attempts)
+                self.assertEqual(0, record.dispatch_attempts)
+                store.claim(message_id, ignore_backoff=True)
+                store.defer(message_id, delay_s=0.01, reason="dispatch_failed_before_handoff", dispatch_failure=True)
+                store.close()
+                store.open()
+                record = store.get(message_id)
+                self.assertEqual(2, record.attempts)
+                self.assertEqual(1, record.dispatch_attempts)
+            finally:
+                store.close()
+
     def test_record_reopen_and_private_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "private" / "spool.sqlite3"

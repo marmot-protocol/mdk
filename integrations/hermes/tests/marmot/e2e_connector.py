@@ -80,10 +80,12 @@ async def wait_for_connector(
     client,
     proc: asyncio.subprocess.Process,
     stderr_tail: bytearray,
+    stderr_task: asyncio.Task[None],
 ) -> None:
     deadline = asyncio.get_running_loop().time() + CONNECTOR_START_TIMEOUT_SECONDS
     while asyncio.get_running_loop().time() < deadline:
         if proc.returncode is not None:
+            await stderr_task
             raise RuntimeError(
                 "wn-agent exited before socket was ready:\n"
                 f"{decode_stream_tail(stderr_tail)}"
@@ -176,7 +178,7 @@ async def run() -> None:
         adapter = None
         try:
             client = module.MarmotAgentControlClient(socket_path, request_timeout=5.0)
-            await wait_for_connector(socket_path, client, proc, stderr_tail)
+            await wait_for_connector(socket_path, client, proc, stderr_tail, stderr_task)
 
             config = PlatformConfig(
                 enabled=True,

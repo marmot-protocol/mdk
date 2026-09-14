@@ -1411,6 +1411,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Durable debounce rows are intentionally hidden from due(), so the
         # ordinary spool retry loop cannot recover them without this handle.
         self._debounce_release_pending: Dict[str, str] = {}
+        # A failed disposition must remain retryable even when its row is
+        # claimed/handed and therefore invisible to due(). Fence re-admission
+        # until its persisted state has been checked after any write error.
+        self._inbound_dispatch_dispositions: Dict[str, int] = {}
+        self._inbound_disposition_lock = asyncio.Lock()
         # Set true once the current subscription yields/acks (healthy); used by
         # the reconnect-backoff loop to reset its attempt counter.
         self._inbound_established = False
@@ -1515,6 +1520,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         finally:
             self._debounce_release_pending.clear()
         await self._inbound_queue.cancel_all()
+        await self._retry_inbound_dispatch_dispositions()
         await self._cancel_all_streams("adapter disconnect")
         self._pending_ambient_context.clear()
         self._last_inbound_message_ids.clear()
@@ -1522,6 +1528,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         await self._inbound_spool_call(self._inbound_spool.close, graceful=True)
+        self._inbound_dispatch_dispositions.clear()
         executor, self._inbound_spool_executor = self._inbound_spool_executor, None
         if executor is not None:
             await asyncio.to_thread(executor.shutdown, True)
@@ -2791,6 +2798,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._inbound_spool_wakeup.clear()
             if not self._inbound_spool_admission_enabled:
                 continue
+            await self._retry_inbound_dispatch_dispositions()
             try:
                 await self._retry_pending_debounce_releases()
             except Exception:
@@ -2828,7 +2836,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 logger.error("Marmot inbound spool admission failed", exc_info=True)
 
     async def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
-        if not self._inbound_spool_admission_enabled:
+        if not self._inbound_spool_admission_enabled or message_id_hex in self._inbound_dispatch_dispositions:
             return False
         generation = self._inbound_spool.generation
         try:
@@ -2966,6 +2974,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         detached_ambient: list[str] = []
         group_id_hex = ""
         spool_state = "claimed" if spool_message_id else None
+        spool_generation = self._inbound_spool.generation
         try:
             group_id_hex = event["group_id_hex"]
             sender_account_id_hex = event["sender_account_id_hex"]
@@ -3149,32 +3158,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             raise
         except Exception:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
-            if spool_message_id and spool_state == "claimed":
-                record = await self._inbound_spool_call(self._inbound_spool.get, spool_message_id)
-                attempts = record.attempts if record is not None else 0
-                if attempts >= len(INBOUND_SPOOL_RETRY_BACKOFF_S):
-                    await self._inbound_spool_call(
-                        self._inbound_spool.transition,
-                        spool_message_id,
-                        "failed",
-                        "pre_handoff_retry_exhausted",
-                    )
-                    spool_state = "failed"
-                else:
-                    await self._inbound_spool_call(
-                        self._inbound_spool.defer,
-                        spool_message_id,
-                        delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[attempts],
-                        reason="dispatch_failed_before_handoff",
-                    )
-            elif spool_message_id and spool_state == "handed":
-                await self._inbound_spool_call(
-                    self._inbound_spool.transition,
-                    spool_message_id,
-                    "unresolved",
-                    "host_handoff_outcome_unknown",
-                )
-                spool_state = "unresolved"
+            if spool_message_id:
+                self._inbound_dispatch_dispositions[spool_message_id] = spool_generation
+                await self._retry_inbound_dispatch_dispositions()
             # A failed turn in one group must not tear down the dispatcher or the queue; log
             # privacy-safely (no ids/payloads) and let other groups keep flowing.
             logger.warning("Marmot inbound dispatch failed", exc_info=True)
@@ -3182,6 +3168,38 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if spool_message_id:
                 await self._admit_due_spooled()
                 self._inbound_spool_wakeup.set()
+
+    async def _retry_inbound_dispatch_dispositions(self) -> None:
+        async with self._inbound_disposition_lock:
+            for message_id, generation in tuple(self._inbound_dispatch_dispositions.items()):
+                if generation != self._inbound_spool.generation:
+                    self._inbound_dispatch_dispositions.pop(message_id, None)
+                    continue
+                try:
+                    # Inspect durable state: transition/defer may have committed
+                    # before checkpoint or permission verification reported an error.
+                    record = await self._inbound_spool_call(self._inbound_spool.get, message_id)
+                    if record is not None and record.state == "claimed":
+                        if record.dispatch_attempts >= len(INBOUND_SPOOL_RETRY_BACKOFF_S):
+                            await self._inbound_spool_call(
+                                self._inbound_spool.transition, message_id,
+                                "failed", "pre_handoff_retry_exhausted",
+                            )
+                        else:
+                            await self._inbound_spool_call(
+                                self._inbound_spool.defer, message_id,
+                                delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[record.dispatch_attempts],
+                                reason="dispatch_failed_before_handoff", dispatch_failure=True,
+                            )
+                    elif record is not None and record.state == "handed":
+                        await self._inbound_spool_call(
+                            self._inbound_spool.transition, message_id,
+                            "unresolved", "host_handoff_outcome_unknown",
+                        )
+                except (InboundSpoolError, OSError, sqlite3.Error) as exc:
+                    logger.error("Marmot inbound disposition persistence failed (%s)", type(exc).__name__)
+                    continue
+                self._inbound_dispatch_dispositions.pop(message_id, None)
 
     async def _should_run_turn(self, event: Dict[str, Any]) -> bool:
         if self.group_activation == "always":

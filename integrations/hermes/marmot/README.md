@@ -51,14 +51,18 @@ Unknown outcomes share bounded terminal retention with intentional skips and
 exhausted retries: by default, journal admission prunes entries older than
 seven days and retains at most 8192 terminal entries. This is an operational
 recovery window, not a permanent completion ledger. Pending prompts are never
-evicted by that retention policy. Pre-handoff dispatch failures use the bounded
-retry ladder and then move to `failed`, allowing later same-group work to
-proceed. Shutdown fences admission, cancels and joins debounce producers, and
+evicted by that retention policy. Pre-handoff dispatch failures use their own
+bounded retry budget, separate from capacity and shutdown deferrals, and then
+move to `failed`, allowing later same-group work to proceed. Failed disposition
+writes remain fenced from dispatch until the spool retry loop confirms their
+durable state. Existing version-1 spools migrate in place while preserving
+obligations. Shutdown fences admission, cancels and joins debounce producers, and
 then drains the keyed queue before closing the spool. This slice closes the
 queue/debounce crash windows without
 claiming exactly-once external tool effects, complete session lineage, or
-general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state
-counts only; payloads and identifiers are never logged.
+general delivery idempotency. `InboundSpool.snapshot()` provides aggregate state
+counts for direct spool inspection; it is not wired into the readiness probe.
+Payloads and identifiers are never logged.
 
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
