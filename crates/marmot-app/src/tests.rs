@@ -21811,7 +21811,7 @@ async fn runtime_forget_group_local_body() {
     runtime.shutdown().await;
 }
 #[test]
-fn legacy_directory_account_label() {
+fn legacy_directory_label() {
     let dir = tempfile::tempdir().unwrap();
     let account = marmot_account::AccountHome::open(dir.path())
         .create_account("alice")
