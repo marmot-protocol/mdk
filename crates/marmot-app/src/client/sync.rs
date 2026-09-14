@@ -1324,7 +1324,7 @@ impl AppClient {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
-        let display_names = self.app.display_names_by_id()?;
+        let display_names = self.display_names_for_events(&effects.events)?;
         let source_received_at = unix_now_seconds();
         // Hydration replays a stored group's `GroupDisbanded` once ever
         // (`restore_disband_tombstone`), as the belt-and-braces reconciler for a
@@ -1499,7 +1499,6 @@ impl AppClient {
         if effects.events.is_empty() {
             return Ok(());
         }
-        let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         // Synthetic source identity: these events have no single inbound
         // transport message (see `drain_pending_session_events`).
@@ -1508,7 +1507,6 @@ impl AppClient {
         let routes_dirty = self
             .observe_account_device_effects(
                 effects,
-                &display_names,
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
@@ -1642,16 +1640,10 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, AppError> {
         let cursor_before_secs = self.state.last_transport_timestamp;
-        let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let ingested = Self::ingest_delivery(
-            self.transport_receipts()?,
-            delivery,
-            &display_names,
-            &mut summary,
-        )
-        .await?;
+        let ingested =
+            Self::ingest_delivery(self.transport_receipts()?, delivery, &mut summary).await?;
         if self.adapter.pending_delivery_overflow().is_some() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -2104,15 +2096,6 @@ impl AppClient {
         counts: &mut DrainCounts,
         completion: DrainCompletion,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
-        // These are local app-state reads before the relay receive loop. They
-        // are not failures of the account-worker command boundary.
-        let display_names = self.app.display_names_by_id().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::Unknown,
-            )
-        })?;
         let mut summary = SyncSummary::default();
         let mut first_wait = true;
         // Forensic drain accounting: wall-clock span, deliveries actually
@@ -2289,28 +2272,22 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
-            let ingested = match Self::ingest_delivery(
-                receipts,
-                *delivery,
-                &display_names,
-                &mut delivery_summary,
-            )
-            .await
-            {
-                Ok(ingested) => ingested,
-                Err(error) => {
-                    return Err(self
-                        .finish_failed_sync_drain(
-                            summary,
-                            routes_dirty,
-                            counts.clone(),
-                            StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
-                            drain_started,
-                            cursor_before_secs,
-                        )
-                        .await);
-                }
-            };
+            let ingested =
+                match Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await {
+                    Ok(ingested) => ingested,
+                    Err(error) => {
+                        return Err(self
+                            .finish_failed_sync_drain(
+                                summary,
+                                routes_dirty,
+                                counts.clone(),
+                                StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
+                                drain_started,
+                                cursor_before_secs,
+                            )
+                            .await);
+                    }
+                };
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);
             }
@@ -2590,7 +2567,6 @@ impl AppClient {
     async fn ingest_delivery(
         receipts: super::receipts::SynchronizedTransportReceipts<'_>,
         delivery: cgka_traits::TransportDelivery,
-        display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
         let client = receipts.into_client();
@@ -2709,7 +2685,6 @@ impl AppClient {
         let routes_dirty = match client
             .observe_account_device_effects(
                 &effects.effects,
-                display_names,
                 summary,
                 &source_message_id_hex,
                 source_received_at,
@@ -4345,7 +4320,6 @@ impl AppClient {
             });
         self.refresh_group(group_id);
 
-        let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
         summary.projection_updates.extend(failed_updates);
@@ -4354,7 +4328,6 @@ impl AppClient {
         let routes_dirty = self
             .observe_account_device_effects(
                 effects,
-                &display_names,
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
@@ -4804,14 +4777,30 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
+    fn display_names_for_events(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+    ) -> Result<HashMap<String, String>, AppError> {
+        let senders = events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::MessageReceived { sender, .. } => {
+                    Some(hex::encode(sender.as_slice()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.app.display_names_for_account_ids(&senders)
+    }
+
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
-        display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
     ) -> Result<bool, AppError> {
+        let display_names = self.display_names_for_events(&effects.events)?;
         self.note_superseded_intent_reports(effects);
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
@@ -4867,7 +4856,7 @@ impl AppClient {
                 .transpose()?;
             if let Some(message) = observe_event(
                 &mut self.state,
-                display_names,
+                &display_names,
                 summary,
                 event,
                 group_projection.as_ref(),
@@ -5676,7 +5665,6 @@ mod tests {
                     client
                         .observe_account_device_effects(
                             &effects,
-                            &app.display_names_by_id().unwrap(),
                             &mut SyncSummary::default(),
                             &sources["released message 2"],
                             unix_now_seconds(),
@@ -6774,6 +6762,46 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
+    }
+
+    #[tokio::test]
+    async fn idle_drain_skips_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&storage_sqlite::PublicDirectoryUserRecord {
+                account_id_hex: "ab".repeat(32),
+                npub: String::new(),
+                profile_json: Some("{".into()),
+                relay_lists_json: serde_json::to_string(&crate::AccountRelayListStatus::empty())
+                    .unwrap(),
+                key_package_json: None,
+                event_id_hex: None,
+                event_kind: None,
+                event_created_at: None,
+                follows: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            app.directory_entries().is_err(),
+            "unrelated profile is corrupt"
+        );
+        tokio::time::pause();
+        let (summary, verdict) = client
+            .drain_sdk_relay(
+                &mut DrainCounts::default(),
+                super::DrainCompletion::Quiescence,
+            )
+            .await
+            .unwrap();
+        assert!(summary.messages.is_empty());
+        assert_eq!(verdict, DrainVerdict::Complete);
     }
 
     #[test]

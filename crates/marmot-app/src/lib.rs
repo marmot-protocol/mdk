@@ -4631,17 +4631,6 @@ impl MarmotApp {
             .collect())
     }
 
-    fn display_names_by_id(&self) -> Result<HashMap<String, String>, AppError> {
-        let mut names = self.profiles_by_id()?;
-        for entry in self.directory_entries()? {
-            let Some(name) = display_name_for_profile(entry.profile.as_ref()) else {
-                continue;
-            };
-            names.insert(entry.account_id_hex, name);
-        }
-        Ok(names)
-    }
-
     fn display_names_for_account_ids(
         &self,
         account_id_hexes: &[String],
