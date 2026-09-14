@@ -421,6 +421,28 @@ fn build_cross_route_with_schedule(
             clients: clients.clone(),
         },
     ];
+    if !strict_engine_tail {
+        // EOSE only completes a relay drain; the app can still be settling the
+        // root commit. Establish the witness's epoch before sending or partitioning.
+        let witness = steps.iter().position(|step| matches!(step,
+            ScenarioStep::InGroup { action, .. } if matches!(action.as_ref(),
+                ScenarioStep::SendAppMessage { payload, .. } if payload == "zeta-branch-witness"
+            )
+        )).expect("cross-route witness action");
+        steps.insert(
+            witness,
+            ScenarioStep::Assert {
+                assertion: crate::ScenarioAssertionV2::Eventually {
+                    predicate: crate::ScenarioPredicateV2::ClientState {
+                        client: "yankee".into(),
+                        epoch: Some(4),
+                        member_count: Some(4),
+                    },
+                    max_iterations: 100,
+                },
+            },
+        );
+    }
     if let Some(permutation) = restart_permutation {
         insert_restart_permutation(&mut steps, permutation, &clients);
     }
@@ -691,6 +713,61 @@ pub fn validate_cross_route_public_process_report(
             "process execution did not preserve the canonical schedule: {report:#?}"
         ));
     }
+    let assertions = schedule
+        .actions
+        .iter()
+        .filter_map(|action| match &action.step {
+            ScenarioStep::Assert { assertion } => {
+                Some((action.schedule.source_step_index, assertion))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if assertions.len() != report.assertion_observations.len()
+        || assertions.iter().zip(&report.assertion_observations).any(
+            |((index, assertion), observed)| {
+                let crate::ScenarioAssertionV2::Eventually {
+                    predicate:
+                        crate::ScenarioPredicateV2::ClientState {
+                            client,
+                            epoch,
+                            member_count,
+                        },
+                    max_iterations,
+                } = assertion
+                else {
+                    return true;
+                };
+                observed.step_index != *index
+                    || &observed.assertion != *assertion
+                    || !observed.passed
+                    || observed.samples == 0
+                    || observed.samples.saturating_sub(1) > *max_iterations
+                    || observed.elapsed_virtual_ms != 0
+                    || observed
+                        .final_actual
+                        .get("client")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(client.as_str())
+                    || epoch.is_some_and(|expected| {
+                        observed
+                            .final_actual
+                            .get("epoch")
+                            .and_then(serde_json::Value::as_u64)
+                            != Some(expected)
+                    })
+                    || member_count.is_some_and(|expected| {
+                        observed
+                            .final_actual
+                            .get("member_count")
+                            .and_then(serde_json::Value::as_u64)
+                            != Some(expected as u64)
+                    })
+            },
+        )
+    {
+        return Err("process execution is missing valid public state assertion evidence".into());
+    }
     let expected_digest = canonical_scenario_ir_sha256(spec).map_err(|error| error.to_string())?;
     if report.executed_scenario_ir_sha256.as_deref() != Some(expected_digest.as_str()) {
         return Err(format!(
@@ -944,14 +1021,14 @@ mod tests {
             ("after-promote-alpha-accepted", ("zeta", 6)),
             ("after-promote-yankee-accepted", ("zeta", 10)),
             ("after-zeta-root-accepted", ("zeta", 18)),
-            ("after-branch-witness-sent", ("yankee", 21)),
-            ("after-alpha-root-accepted", ("alpha", 27)),
-            ("after-alpha-root-ingested-by-zeta", ("zeta", 30)),
-            ("after-zeta-child-accepted", ("yankee", 37)),
-            ("after-repair-zeta", ("zeta", 45)),
-            ("after-repair-alpha", ("alpha", 45)),
-            ("after-repair-yankee", ("yankee", 45)),
-            ("after-repair-observer", ("observer", 45)),
+            ("after-branch-witness-sent", ("yankee", 22)),
+            ("after-alpha-root-accepted", ("alpha", 28)),
+            ("after-alpha-root-ingested-by-zeta", ("zeta", 31)),
+            ("after-zeta-child-accepted", ("yankee", 38)),
+            ("after-repair-zeta", ("zeta", 46)),
+            ("after-repair-alpha", ("alpha", 46)),
+            ("after-repair-yankee", ("yankee", 46)),
+            ("after-repair-observer", ("observer", 46)),
         ]
         .into_iter()
         .collect::<BTreeMap<_, _>>();

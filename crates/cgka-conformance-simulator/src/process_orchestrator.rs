@@ -222,6 +222,8 @@ pub struct ProcessScenarioReportV1 {
     pub canonical_schedule: Vec<ScenarioActionScheduleV2>,
     pub actions: Vec<ProcessActionResultV1>,
     pub observations: Vec<NodeObservationV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
     pub lifecycle: Vec<ProcessLifecycleEventV1>,
     pub failure_capsules: Vec<PathBuf>,
     pub completed: bool,
@@ -566,6 +568,7 @@ impl ProcessOrchestrator {
             canonical_schedule: schedule,
             actions: Vec::new(),
             observations: Vec::new(),
+            assertion_observations: Vec::new(),
             lifecycle: Vec::new(),
             failure_capsules: Vec::new(),
             completed: false,
@@ -1052,6 +1055,63 @@ impl ProcessOrchestrator {
                     .collect::<Vec<_>>();
                 self.catch_up(&labels, action_id, false).await?;
                 Ok((labels, ProcessActionStatusV1::Completed))
+            }
+            ScenarioStep::Assert { assertion } => {
+                // Preflight admits only exactly/eventually ClientState here. Do not
+                // advertise the broader private-state or virtual-time assertion API.
+                let (predicate, max_iterations) = match assertion {
+                    crate::ScenarioAssertionV2::Exactly { predicate } => (predicate, 0),
+                    crate::ScenarioAssertionV2::Eventually {
+                        predicate,
+                        max_iterations,
+                    } => (predicate, *max_iterations),
+                    _ => unreachable!("assertion rejected by process capability preflight"),
+                };
+                let crate::ScenarioPredicateV2::ClientState {
+                    client,
+                    epoch,
+                    member_count,
+                } = predicate
+                else {
+                    unreachable!("predicate rejected by process capability preflight")
+                };
+                let labels = vec![client.clone()];
+                for iteration in 0..=max_iterations {
+                    let observations = self.observe(&labels, action_id).await?;
+                    let actual = &observations[0].protocol;
+                    let passed = epoch.is_none_or(|expected| actual.epoch == expected)
+                        && member_count.is_none_or(|expected| actual.member_count == expected);
+                    if passed || iteration == max_iterations {
+                        report
+                            .assertion_observations
+                            .push(crate::ScenarioAssertionObservationV2 {
+                                step_index: action.schedule.source_step_index,
+                                assertion: assertion.clone(),
+                                passed,
+                                samples: iteration + 1,
+                                elapsed_virtual_ms: 0,
+                                final_actual: serde_json::json!({
+                                    "client": client,
+                                    "epoch": actual.epoch,
+                                    "member_count": actual.member_count,
+                                }),
+                            });
+                        if passed {
+                            return Ok((labels, ProcessActionStatusV1::Completed));
+                        }
+                        return Err((Some(client.clone()), NodeErrorV1 {
+                            code: "scenario_assertion_failed".into(),
+                            category: SubjectFailureCategory::Protocol,
+                            retryable: false,
+                            message: "public client state did not match within the declared assertion budget".into(),
+                        }));
+                    }
+                    // Match the shared Eventually driver: each round wakes every
+                    // running scenario participant, including peers needed for repair.
+                    let running = self.running_labels();
+                    self.catch_up(&running, action_id, false).await?;
+                }
+                unreachable!("bounded assertion always returns its final sample")
             }
             ScenarioStep::SyncRelayHistory { clients, sync } => {
                 let clients = clients
@@ -1872,6 +1932,7 @@ fn process_subject_descriptor(owns_relay_control: bool) -> SubjectDescriptor {
         SubjectCapability::ApplicationMessaging,
         SubjectCapability::TransportDelivery,
         SubjectCapability::EventObservation,
+        SubjectCapability::ClientStateAssertion,
         SubjectCapability::AdminPolicyObservation,
         SubjectCapability::CrashReopen,
         SubjectCapability::OutboundPublication,
@@ -2051,6 +2112,7 @@ mod tests {
             canonical_schedule: Vec::new(),
             actions: Vec::new(),
             observations: Vec::new(),
+            assertion_observations: Vec::new(),
             lifecycle: Vec::new(),
             failure_capsules: Vec::new(),
             completed: true,

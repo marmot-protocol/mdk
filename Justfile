@@ -324,12 +324,12 @@ conformance-slow:
     cargo nextest run -p cgka-conformance-simulator --features conformance-slow
 
 # Fast PR feedback: ordinary simulator coverage without dedicated verification
-# binaries or the generated multi-minute reliability batches. Keep two
-# production-shaped process canaries in PR CI; the complete serialized process
-# suite runs in the nightly lane below.
+# binaries or the generated multi-minute reliability batches. Keep baseline
+# process canaries and both cross-route regressions in PR CI; the complete
+# serialized process suite runs in the nightly lane below.
 simulator-smoke:
     cargo nextest run -p cgka-conformance-simulator --locked --profile ci -E '{{simulator-smoke-filter}}'
-    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci -E 'test(=engine_app_runtime_and_process_adapters_reach_equivalent_public_state) | test(=process_kill_disconnect_reconnect_and_restart_agree_with_uninterrupted_execution)'
+    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci -E 'test(=engine_app_runtime_and_process_adapters_reach_equivalent_public_state) | test(=process_kill_disconnect_reconnect_and_restart_agree_with_uninterrupted_execution) | test(=four_party_cross_route_recovery_app_runtime_matches_unified_route) | test(=four_party_cross_route_recovery_processes_match_unified_route)'
 
 # Complete generic simulator coverage for the nightly lane. Dedicated
 # adversarial and independent-verification binaries run in later recipes.

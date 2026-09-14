@@ -106,6 +106,7 @@ impl ReferenceModelSubject {
                     SubjectCapability::OutboundPublication,
                     SubjectCapability::StructuralProgress,
                     SubjectCapability::AssertionEvaluation,
+                    SubjectCapability::ClientStateAssertion,
                 ]),
             },
             clients: participants,

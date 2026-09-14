@@ -125,6 +125,17 @@ does not drain the event window that a later `observe` action records. Predicate
 the exact-observation capability during compilation, so a semantic-only adapter rejects the complete schedule before
 action zero.
 
+The process adapter supports `exactly` and `eventually` with `client_state` through the narrow
+`client_state_assertion` capability. It reads the public epoch/member count, samples once before ticking,
+and performs at most the declared number of catch-up rounds across running participants. An exhausted
+assertion stops the scenario with a failure capsule; `assertion_observations` records the predicate,
+source step, sample count and final public state separately from ordinary checkpoints. Virtual-time and
+private-state assertions remain subject to their separate capability checks before launch.
+
+The public cross-route scenario uses this bounded assertion before sending its branch witness: Yankee
+must have epoch 4 and four members before the scenario partitions the participants. Relay EOSE alone
+does not establish that state because app convergence can continue after a relay drain ends.
+
 ## Initial adapters
 
 `EngineHarnessSubject` executes the IR against the real in-process OpenMLS/SQLite/Nostr-peeler stack.

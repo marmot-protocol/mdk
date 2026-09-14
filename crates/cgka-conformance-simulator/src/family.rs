@@ -491,7 +491,7 @@ pub fn generate_cross_route_restart_permutation_case(
     push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name: "cross-route-restart-permutations/v1".into(),
-        generator_version: "1".into(),
+        generator_version: "2".into(),
         seed,
         case_index,
         workload_profile: None,

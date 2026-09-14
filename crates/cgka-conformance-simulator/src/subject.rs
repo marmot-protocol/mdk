@@ -56,6 +56,8 @@ pub enum SubjectCapability {
     ProcessLifecycle,
     StorageFaultInjection,
     AssertionEvaluation,
+    /// Exactly/eventually predicates over a client's public epoch and member count.
+    ClientStateAssertion,
     PublicGroupStateObservation,
     MultiGroup,
     RetainedRelayHistory,
@@ -86,6 +88,7 @@ impl SubjectCapability {
             Self::ProcessLifecycle => "process_lifecycle",
             Self::StorageFaultInjection => "storage_fault_injection",
             Self::AssertionEvaluation => "assertion_evaluation",
+            Self::ClientStateAssertion => "client_state_assertion",
             Self::PublicGroupStateObservation => "public_group_state_observation",
             Self::MultiGroup => "multi_group",
             Self::RetainedRelayHistory => "retained_relay_history",
@@ -616,14 +619,26 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             | crate::ScenarioAssertionV2::Never { predicate, .. } => Some(predicate),
             crate::ScenarioAssertionV2::Resource { .. } => None,
         };
+        let evaluation = if matches!(
+            assertion,
+            crate::ScenarioAssertionV2::Exactly {
+                predicate: crate::ScenarioPredicateV2::ClientState { .. }
+            } | crate::ScenarioAssertionV2::Eventually {
+                predicate: crate::ScenarioPredicateV2::ClientState { .. },
+                ..
+            }
+        ) {
+            SubjectCapability::ClientStateAssertion
+        } else {
+            SubjectCapability::AssertionEvaluation
+        };
         let mut capabilities = match assertion {
             crate::ScenarioAssertionV2::Exactly { .. } => {
-                vec![SubjectCapability::AssertionEvaluation]
+                vec![evaluation]
             }
-            crate::ScenarioAssertionV2::Eventually { .. } => vec![
-                SubjectCapability::AssertionEvaluation,
-                SubjectCapability::TransportDelivery,
-            ],
+            crate::ScenarioAssertionV2::Eventually { .. } => {
+                vec![evaluation, SubjectCapability::TransportDelivery]
+            }
             crate::ScenarioAssertionV2::Within { .. }
             | crate::ScenarioAssertionV2::Never { .. } => vec![
                 SubjectCapability::AssertionEvaluation,
@@ -976,6 +991,7 @@ impl EngineHarnessSubject {
             SubjectCapability::WhiteBoxTransportPartition,
             SubjectCapability::SemanticTransportFaults,
             SubjectCapability::AssertionEvaluation,
+            SubjectCapability::ClientStateAssertion,
             SubjectCapability::MultiGroup,
         ]);
         Ok(Self {

@@ -1309,6 +1309,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::TransportDelivery,
                 SubjectCapability::EventObservation,
                 SubjectCapability::AssertionEvaluation,
+                SubjectCapability::ClientStateAssertion,
                 SubjectCapability::PublicGroupStateObservation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,

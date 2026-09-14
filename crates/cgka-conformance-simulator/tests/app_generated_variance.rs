@@ -280,3 +280,29 @@ async fn seeded_recovery_schedule_survives_real_process_kills() {
         .retain(|event| event.event != "killed");
     assert!(validate_cross_route_public_process_report(&case.scenario, &missing_kill).is_err());
 }
+
+#[test]
+fn cross_route_generators_version_the_pre_witness_state_wait() {
+    use cgka_conformance_simulator::{ScenarioAssertionV2, ScenarioPredicateV2};
+    for family in [
+        "cross-route-restart-permutations/v1",
+        "public-app-recovery-schedules/v1",
+    ] {
+        for seed in [7, 42, 17001] {
+            for case_index in 0..12 {
+                let case = generate_family_case(family, seed, case_index).unwrap();
+                assert_eq!(case.generator_version, "2");
+                let compiled = compile_scenario(&case.scenario).unwrap();
+                let witness = compiled.actions.iter().position(|action| matches!(
+                    &action.step, ScenarioStep::SendAppMessage { payload, .. } if payload == "zeta-branch-witness"
+                )).unwrap();
+                assert!(matches!(&compiled.actions[witness - 1].step,
+                    ScenarioStep::Assert { assertion: ScenarioAssertionV2::Eventually {
+                        predicate: ScenarioPredicateV2::ClientState { client, epoch: Some(4), member_count: Some(4) },
+                        max_iterations: 100,
+                    }} if client == "yankee"
+                ));
+            }
+        }
+    }
+}

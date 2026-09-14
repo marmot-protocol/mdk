@@ -69,7 +69,9 @@ Git commit; require a clean build and retain the exact source revision plus comm
 - **Module:** `src/cross_route_scenario.rs`
   - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The
     engine-capable form adds exact state and active decryptability; app-runtime, process, container, and VM adapters
-    reuse the public form and must not privately reconstruct its action schedule or terminal assertions.
+    reuse the public form and must not privately reconstruct its action schedule or terminal assertions. The public
+    branch-witness boundary uses a bounded `Eventually(ClientState)` assertion; preserve its process-report evidence
+    and publication correlation checks instead of relying on relay drain timing.
 
 - **Module:** `src/scenario_input_ledger.rs`
   - **Role:** Simulator-owned per-client commit, proposal, and application-input accounting. Joins stable scenario

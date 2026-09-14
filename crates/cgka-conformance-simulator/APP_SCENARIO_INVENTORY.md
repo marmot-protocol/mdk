@@ -24,7 +24,13 @@ process adapter and its process-kill canary. Neither route injects a kill inside
 control. It is not the default acceptance route. Engine scenarios remain engine scenarios.
 The older `ProcessOrchestrator` also uses the shared relay child for locally owned relays;
 its separate versioned node protocol retains its existing capability checks. External
-container/VM relays remain owned by those runners. No assertion is removed to fit an adapter.
+container/VM relays remain owned by those runners. Both adapters execute the canonical cross-route
+public-state wait before the branch witness; the process report retains bounded assertion evidence.
+No assertion is removed to fit an adapter. Both cross-route recovery regressions run in `just simulator-smoke`.
+
+`cross-route-restart-permutations/v1` and `public-app-recovery-schedules/v1` now use generator version 2,
+which includes that wait. Saved version-1 inputs keep their original action schedule when replayed;
+regenerate these families for a new catalog campaign instead of relabeling old inputs.
 
 The private stdio protocol is versioned and bounded (32 MiB/frame, 120 seconds/request).
 The parent verifies the helper's timing-policy feature mode. Normal close waits for child

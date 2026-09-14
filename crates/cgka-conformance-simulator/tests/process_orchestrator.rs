@@ -997,6 +997,20 @@ async fn four_party_cross_route_recovery_processes_match_unified_route() {
     validate_four_party_cross_route_process_report(&spec, &report)
         .unwrap_or_else(|error| panic!("four-process cross-route recovery failed: {error}"));
 
+    assert_eq!(report.assertion_observations.len(), 1);
+    for invalid in 0..4 {
+        let mut missing_wait = report.clone();
+        match invalid {
+            0 => missing_wait.assertion_observations.clear(),
+            1 => missing_wait.assertion_observations[0].passed = false,
+            2 => missing_wait.assertion_observations[0].samples = 102,
+            _ => missing_wait.assertion_observations[0].final_actual["epoch"] = 3.into(),
+        }
+        let error =
+            validate_four_party_cross_route_process_report(&spec, &missing_wait).unwrap_err();
+        assert!(error.contains("public state assertion evidence"), "{error}");
+    }
+
     let mut malformed = report.clone();
     malformed.observations[1].participant = malformed.observations[0].participant.clone();
     let error = validate_four_party_cross_route_process_report(&spec, &malformed).unwrap_err();
@@ -1429,4 +1443,98 @@ fn process_cli_failure_report_keeps_capsules_after_exit() {
         "action_id={} code={}",
         capsule.action_id, capsule.code
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_client_state_assertion_exhaustion_stops_before_next_action() {
+    use cgka_conformance_simulator::{ScenarioAssertionV2, ScenarioPredicateV2};
+    let mut spec = process_scenario("bounded-client-state-assertion", false);
+    spec.steps.truncate(3);
+    spec.steps.push(ScenarioStep::Assert {
+        assertion: ScenarioAssertionV2::Exactly {
+            predicate: ScenarioPredicateV2::ClientState {
+                client: "alice".into(),
+                epoch: None,
+                member_count: Some(2),
+            },
+        },
+    });
+    spec.steps.push(ScenarioStep::Assert {
+        assertion: ScenarioAssertionV2::Eventually {
+            predicate: ScenarioPredicateV2::ClientState {
+                client: "alice".into(),
+                epoch: Some(u64::MAX),
+                member_count: Some(2),
+            },
+            max_iterations: 2,
+        },
+    });
+    spec.steps.push(ScenarioStep::DeliverAll);
+    let artifacts = tempfile::tempdir().unwrap();
+    let mut orchestrator = ProcessOrchestrator::launch(
+        env!("CARGO_BIN_EXE_cgka-conformance-node"),
+        &spec,
+        artifacts.path(),
+    )
+    .await
+    .unwrap();
+    let report = orchestrator.run().await.unwrap();
+    orchestrator.shutdown().await;
+    assert!(!report.completed);
+    assert_eq!(report.actions.len(), 5);
+    assert_eq!(
+        report.actions.last().unwrap().status,
+        ProcessActionStatusV1::Failed
+    );
+    assert_eq!(report.assertion_observations.len(), 2);
+    assert!(report.assertion_observations[0].passed);
+    assert_eq!(report.assertion_observations[0].samples, 1);
+    assert!(!report.assertion_observations[1].passed);
+    assert_eq!(report.assertion_observations[1].samples, 3);
+    assert_eq!(report.failure_capsules.len(), 1);
+    let capsule: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report.failure_capsules[0]).unwrap()).unwrap();
+    assert_eq!(capsule["code"], "scenario_assertion_failed");
+}
+
+#[tokio::test]
+async fn unsupported_process_assertions_fail_before_launch() {
+    use cgka_conformance_simulator::{ScenarioAssertionV2, ScenarioPredicateV2};
+    let predicates = [
+        ScenarioAssertionV2::Exactly {
+            predicate: ScenarioPredicateV2::NoPendingWork {
+                clients: vec!["alice".into()],
+            },
+        },
+        ScenarioAssertionV2::Within {
+            predicate: ScenarioPredicateV2::ClientState {
+                client: "alice".into(),
+                epoch: Some(1),
+                member_count: None,
+            },
+            timeout_ms: 100,
+            poll_interval_ms: 10,
+        },
+    ];
+    for assertion in predicates {
+        let mut spec = process_scenario("unsupported-process-assertion", false);
+        spec.steps.push(ScenarioStep::Assert { assertion });
+        let artifacts = tempfile::tempdir().unwrap();
+        let error = match ProcessOrchestrator::launch(
+            env!("CARGO_BIN_EXE_cgka-conformance-node"),
+            &spec,
+            artifacts.path(),
+        )
+        .await
+        {
+            Ok(mut orchestrator) => {
+                orchestrator.shutdown().await;
+                panic!("unsupported assertion launched processes");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "process_capability_preflight");
+        assert!(error.message.contains("required by assert"), "{error}");
+        assert_eq!(std::fs::read_dir(artifacts.path()).unwrap().count(), 0);
+    }
 }
