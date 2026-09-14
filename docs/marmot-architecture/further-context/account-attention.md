@@ -31,7 +31,9 @@ Each signed-in local or external-signing account has either:
 An unreadable account catalog produces an error for the subscription as a whole,
 with a retained retry obligation. It never silently removes an unreadable account
 record. Signed-out and deleted accounts are removed after catalog reconciliation;
-new and reactivated accounts appear even without a running worker.
+new and reactivated accounts appear even without a running worker. Catalog reads
+hold the shared `AccountHome` mutation lock; metadata-probe errors
+also propagate rather than treating an inaccessible catalog as an empty one.
 
 `recv()` is cancellation-safe. Dropping the subscription ends its actor. Runtime
 shutdown or terminal storage close ends delivery. A reopened subscription receives
@@ -73,9 +75,12 @@ account; catalog-only changes do not reread unchanged ready accounts.
 
 Queued notifications coalesce before reads; notifications arriving during a read
 remain queued. Broadcast lag triggers a fresh aggregate reconciliation. Unavailable
-accounts retry on a one-second clock without new traffic, including while other
-accounts are active. Catalog failures retain all aggregate refresh obligations.
-Ready accounts are not polled on that clock. Mute deadlines need no timer because
+accounts retry without new traffic, with independent exponential delays from one
+second up to 30 seconds. Successful base-row preparation and relevant external
+invalidations reset that account's delay; unrelated account traffic does not.
+Catalog failures back off separately and retain all aggregate refresh obligations.
+A per-account retry reads only that account: it does not enumerate the catalog.
+Ready accounts are not polled. Mute deadlines need no timer because
 mute does not change attention eligibility.
 
 ## Compatibility and evidence

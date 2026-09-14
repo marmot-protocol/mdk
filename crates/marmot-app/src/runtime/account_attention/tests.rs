@@ -532,3 +532,127 @@ async fn message_and_mention_totals_change_while_unread_membership_stays_true() 
     assert_eq!(total.unread_conversations, 1);
     f.runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn retry_does_not_reenumerate_unrelated_account_records() {
+    let f = Fixture::new();
+    let storage = f.seed(&f.alice, 1, true);
+    f.runtime
+        .set_chat_manually_unread("alice", "0000", true)
+        .unwrap();
+    let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
+    storage.close().unwrap();
+    f.signal(&f.alice);
+    assert!(matches!(
+        state(&next(&mut sub).await, &f.alice.account_id_hex),
+        AccountAttentionState::Unavailable(AccountAttentionUnavailable::ReadFailed)
+    ));
+    // A corrupt, unrelated record would make an unnecessary catalog scan fail.
+    let path = f
+        .app()
+        .account_home()
+        .account_dir("bob")
+        .join("account.json");
+    let original = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"{").unwrap();
+    f.app().account_storages.lock().unwrap().remove("alice");
+    let recovered = next(&mut sub).await;
+    assert!(ready(&recovered, &f.alice.account_id_hex).has_unread());
+    // The catalog still fails explicitly when its own invalidation arrives.
+    f.app().presentation_signals.catalog_changed();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    std::fs::write(&path, original).unwrap();
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_presentation_label_discovers_account_without_catalog_notification() {
+    let f = Fixture::new();
+    let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
+    let catalog_signal = f.app().presentation_signals.subscribe_catalog();
+    let carol = f.app().account_home().create_account("carol").unwrap();
+    let store = f.seed(&carol, 1, true);
+    store
+        .set_chat_manually_unread(&carol.account_id_hex, "0000", true, &|_, _| false)
+        .unwrap();
+    assert!(!catalog_signal.has_changed().unwrap());
+    assert!(
+        f.app()
+            .presentation_signals
+            .updates
+            .send(PresentationInvalidation {
+                account_label: carol.label.clone(),
+                version: store.chat_presentation_version().unwrap(),
+            })
+            .is_ok()
+    );
+    let added = next(&mut sub).await;
+    assert!(ready(&added, &carol.account_id_hex).has_unread());
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn teardown_after_catalog_read_is_a_transition_and_can_recover_without_new_catalog() {
+    let f = Fixture::new();
+    let known = catalog(&f.runtime.accounts).await.unwrap();
+    let account = known[&f.alice.account_id_hex].clone();
+    assert!(!account.resetting);
+    f.runtime
+        .accounts
+        .set_account_tearing_down(&f.alice.account_id_hex, true);
+    let during = read_accounts(&f.runtime.accounts, vec![account.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        during.states[&f.alice.account_id_hex],
+        AccountAttentionState::Unavailable(AccountAttentionUnavailable::Resetting)
+    );
+    let captured_during =
+        catalog(&f.runtime.accounts).await.unwrap()[&f.alice.account_id_hex].clone();
+    f.runtime
+        .accounts
+        .set_account_tearing_down(&f.alice.account_id_hex, false);
+    let after = read_accounts(&f.runtime.accounts, vec![captured_during])
+        .await
+        .unwrap();
+    assert!(matches!(
+        after.states[&f.alice.account_id_hex],
+        AccountAttentionState::Ready(_)
+    ));
+    f.app()
+        .account_home()
+        .set_account_signed_out("alice", true)
+        .unwrap();
+    let signed_out = read_accounts(&f.runtime.accounts, vec![account])
+        .await
+        .unwrap();
+    assert_eq!(
+        signed_out.states[&f.alice.account_id_hex],
+        AccountAttentionState::Unavailable(AccountAttentionUnavailable::Resetting)
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_retry_backoff_is_capped_and_progress_resets_it() {
+    let mut retry = None;
+    for seconds in [1, 2, 4, 8, 16, 30, 30] {
+        let scheduled = Retry::next(retry.as_ref(), false);
+        assert_eq!(
+            scheduled.at - tokio::time::Instant::now(),
+            Duration::from_secs(seconds)
+        );
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        retry = Some(scheduled);
+    }
+    let progressing = Retry::next(retry.as_ref(), true);
+    assert_eq!(
+        progressing.at - tokio::time::Instant::now(),
+        Duration::from_secs(1)
+    );
+}

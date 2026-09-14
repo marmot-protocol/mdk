@@ -867,6 +867,10 @@ impl AccountHome {
 
     /// List the complete account catalog or report a read error. Unlike `accounts`,
     /// this never hides an account whose record cannot be read or decoded.
+    /// Metadata-probe errors also propagate: an inaccessible directory is not an
+    /// empty catalog. This holds the shared mutation lock across enumeration to
+    /// serialize with guarded mutations through this `AccountHome`.
+    /// The legacy `accounts` method retains its unlocked, best-effort behavior.
     pub fn accounts_strict(&self) -> AccountHomeResult<Vec<AccountSummary>> {
         let _guard = self
             .mutation_lock

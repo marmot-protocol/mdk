@@ -29,6 +29,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `marmot_account_unread_summary` now uses the Unread list's eligibility for all
+  `MarmotAccountUnread` fields (`unread_count`, `unread_conversations`,
+  `attention_only_conversations`, and `has_unread`). Pending invitations and
+  departed or departing groups, including durably queued leave/disband requests,
+  no longer contribute; archived chats remain excluded. Muted active chats and
+  manual-only reminders still contribute. Struct layouts are unchanged. Hosts
+  that display invitation badges must derive those separately from invitation state.
+
 - Account storage advances through migrations 70–71 for local group reset boundaries.
   Back up before upgrading; downgrade is unsupported. See the cohort upgrade notes in
   [the CLI changelog](../cli/CHANGELOG.md#unreleased).

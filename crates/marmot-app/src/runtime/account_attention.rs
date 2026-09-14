@@ -9,6 +9,7 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 pub use storage_sqlite::AccountAttentionTotal;
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountAttentionUnavailable {
@@ -110,51 +111,76 @@ async fn catalog(manager: &AccountManager) -> Result<Catalog, AppError> {
     })
     .await
 }
+struct AccountReads {
+    states: States,
+    progressed: BTreeSet<String>,
+}
 async fn read_accounts(
     manager: &AccountManager,
     accounts: Vec<Account>,
-) -> Result<States, AppError> {
+) -> Result<AccountReads, AppError> {
     let manager = manager.clone();
     blocking_app_task(move || {
-        let mut values = States::new();
+        let mut values = AccountReads {
+            states: States::new(),
+            progressed: BTreeSet::new(),
+        };
         for account in accounts {
             ensure_open(&manager)?;
-            let state = if account.resetting {
-                AccountAttentionState::Unavailable(AccountAttentionUnavailable::Resetting)
-            } else {
-                let read = || -> Result<AccountAttentionTotal, AppError> {
-                    let app = &manager.app;
-                    let current = app.account_home().account(&account.summary.label)?;
-                    if current != account.summary
-                        || manager.account_is_tearing_down(&current.account_id_hex)
-                    {
-                        return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
-                    }
-                    if !manager.onboarding_worker_allowed(&current.label)? {
-                        return Err(AppError::ChatPresentationNotReady);
-                    }
-                    app.ensure_account_state(&current.label)?;
-                    let storage = app.account_storage(&current.label)?;
-                    // One bounded upgrade/import batch. No selected presentation,
-                    // full-list warm, timeline DTOs, MLS session or network needed.
-                    crate::chat_presentation::maintenance::prepare_base_rows(
-                        &storage,
-                        &current.account_id_hex,
-                    )?;
-                    Ok(storage.account_attention_total()?)
-                };
-                match read() {
-                    Ok(total) => AccountAttentionState::Ready(total),
-                    Err(
-                        AppError::ChatPresentationNotReady
-                        | AppError::Storage(cgka_traits::storage::StorageError::NotFound),
-                    ) => AccountAttentionState::Unavailable(AccountAttentionUnavailable::Preparing),
-                    Err(_) => {
-                        AccountAttentionState::Unavailable(AccountAttentionUnavailable::ReadFailed)
-                    }
+            let mut progressed = false;
+            let mut read = || -> Result<AccountAttentionState, AppError> {
+                let app = &manager.app;
+                // Use live teardown state, including when it changes after the catalog read.
+                if manager.account_is_tearing_down(&account.summary.account_id_hex) {
+                    return Ok(AccountAttentionState::Unavailable(
+                        AccountAttentionUnavailable::Resetting,
+                    ));
+                }
+                let current = app.account_home().account(&account.summary.label)?;
+                if current != account.summary {
+                    return Ok(AccountAttentionState::Unavailable(
+                        AccountAttentionUnavailable::Resetting,
+                    ));
+                }
+                if !manager.onboarding_worker_allowed(&current.label)? {
+                    return Err(AppError::ChatPresentationNotReady);
+                }
+                app.ensure_account_state(&current.label)?;
+                let storage = app.account_storage(&current.label)?;
+                // One bounded upgrade/import batch. No selected presentation,
+                // full-list warm, timeline DTOs, MLS session or network needed.
+                progressed = crate::chat_presentation::maintenance::prepare_base_rows(
+                    &storage,
+                    &current.account_id_hex,
+                )?;
+                Ok(AccountAttentionState::Ready(
+                    storage.account_attention_total()?,
+                ))
+            };
+            let state = match read() {
+                Ok(state) => state,
+                Err(
+                    AppError::ChatPresentationNotReady
+                    | AppError::Storage(cgka_traits::storage::StorageError::NotFound),
+                ) => AccountAttentionState::Unavailable(AccountAttentionUnavailable::Preparing),
+                Err(AppError::AccountHome(marmot_account::AccountHomeError::UnknownAccount(_))) => {
+                    AccountAttentionState::Unavailable(AccountAttentionUnavailable::Resetting)
+                }
+                Err(_) => {
+                    AccountAttentionState::Unavailable(AccountAttentionUnavailable::ReadFailed)
                 }
             };
-            values.insert(account.summary.account_id_hex, state);
+            let state = if manager.account_is_tearing_down(&account.summary.account_id_hex) {
+                AccountAttentionState::Unavailable(AccountAttentionUnavailable::Resetting)
+            } else {
+                state
+            };
+            if progressed {
+                values
+                    .progressed
+                    .insert(account.summary.account_id_hex.clone());
+            }
+            values.states.insert(account.summary.account_id_hex, state);
         }
         Ok(values)
     })
@@ -193,7 +219,7 @@ impl MarmotAppRuntime {
             _ = wait_for_runtime_shutdown(&mut stopping) => return Err(AppError::RuntimeStopping),
             initial = async {
                 let accounts = catalog(&self.accounts).await?;
-                let states = read_accounts(&self.accounts, accounts.values().cloned().collect()).await?;
+                let states = read_accounts(&self.accounts, accounts.values().cloned().collect()).await?.states;
                 Ok::<_, AppError>((accounts, states))
             } => initial?,
         };
@@ -240,10 +266,13 @@ impl Dirty {
         }
     }
     fn label(&mut self, label: &str, known: &Catalog) {
-        for (id, account) in known {
-            if account.summary.label == label {
-                self.accounts.insert(id.clone());
-            }
+        if let Some((id, _)) = known
+            .iter()
+            .find(|(_, account)| account.summary.label == label)
+        {
+            self.accounts.insert(id.clone());
+        } else {
+            self.catalog = true;
         }
     }
     fn event(&mut self, event: MarmotAppEvent, known: &Catalog) {
@@ -312,6 +341,26 @@ impl Sources {
         }
     }
 }
+/// Retry policy for this local projection, independent for each unavailable account.
+struct Retry {
+    at: Instant,
+    delay: Duration,
+}
+impl Retry {
+    fn next(previous: Option<&Self>, progress_or_invalidation: bool) -> Self {
+        let delay = if progress_or_invalidation {
+            Duration::from_secs(1)
+        } else {
+            previous.map_or(Duration::from_secs(1), |r| {
+                (r.delay * 2).min(Duration::from_secs(30))
+            })
+        };
+        Self {
+            at: Instant::now() + delay,
+            delay,
+        }
+    }
+}
 async fn run(
     manager: AccountManager,
     mut known: Catalog,
@@ -321,29 +370,32 @@ async fn run(
     mut stopping: watch::Receiver<bool>,
     updates: watch::Sender<Result<AccountAttentionSnapshot, Arc<AppError>>>,
 ) {
-    let mut failed = false;
-    // A fixed retry clock cannot be postponed indefinitely by unrelated traffic.
-    let retry_period = Duration::from_secs(1);
-    let mut retries =
-        tokio::time::interval_at(tokio::time::Instant::now() + retry_period, retry_period);
-    retries.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut refresh_retry: Option<Retry> = None;
+    let mut retries: BTreeMap<_, _> = states
+        .iter()
+        .filter(|(_, state)| matches!(state, AccountAttentionState::Unavailable(_)))
+        .map(|(id, _)| (id.clone(), Retry::next(None, false)))
+        .collect();
     loop {
         if ensure_open(&manager).is_err() {
             return;
         }
-        let retry = failed
-            || states
-                .values()
-                .any(|s| matches!(s, AccountAttentionState::Unavailable(_)));
+        // Global read failure must recover the catalog first. Otherwise only due
+        // accounts are retried; neither healthy accounts nor the catalog are polled.
+        let deadline = refresh_retry
+            .as_ref()
+            .map(|r| r.at)
+            .or_else(|| retries.values().map(|r| r.at).min());
         let mut dirty = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
             _ = updates.closed() => return,
-            _ = retries.tick(), if retry => Dirty {
-                catalog: true,
-                accounts: states.iter().filter(|(_,s)| matches!(s, AccountAttentionState::Unavailable(_))).map(|(id,_)| id.clone()).collect(),
-                ..Default::default()
-            },
+            _ = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => Dirty::default(),
             dirty = sources.wait(&known) => dirty,
         };
         tokio::select! {
@@ -352,9 +404,26 @@ async fn run(
             _ = updates.closed() => return,
             _ = tokio::time::sleep(Duration::from_millis(10)) => {},
         }
-        dirty.all |= failed;
-        dirty.catalog |= failed;
         sources.drain(&mut dirty, &known);
+        let invalidated_catalog = dirty.catalog;
+        let invalidated_all = dirty.all;
+        let invalidated_accounts = dirty.accounts.clone();
+        if let Some(retry) = &refresh_retry {
+            if !dirty.catalog && retry.at > Instant::now() {
+                // Full recovery below retains all invalidations received while
+                // the catalog is unavailable, without retrying on unrelated traffic.
+                continue;
+            }
+            dirty.catalog = true;
+            dirty.all = true;
+        } else {
+            dirty.accounts.extend(
+                retries
+                    .iter()
+                    .filter(|(_, r)| r.at <= Instant::now())
+                    .map(|(id, _)| id.clone()),
+            );
+        }
         let refresh = async {
             if dirty.catalog {
                 let next = catalog(&manager).await?;
@@ -366,6 +435,7 @@ async fn run(
                     }
                 }
                 states.retain(|id, _| next.contains_key(id));
+                retries.retain(|id, _| next.contains_key(id));
                 known = next;
             }
             let accounts = known
@@ -373,7 +443,19 @@ async fn run(
                 .filter(|(id, _)| dirty.all || dirty.accounts.contains(*id))
                 .map(|(_, a)| a.clone())
                 .collect();
-            states.extend(read_accounts(&manager, accounts).await?);
+            let read = read_accounts(&manager, accounts).await?;
+            for (id, state) in &read.states {
+                if matches!(state, AccountAttentionState::Ready(_)) {
+                    retries.remove(id);
+                } else {
+                    let reset = read.progressed.contains(id)
+                        || invalidated_catalog
+                        || invalidated_all
+                        || invalidated_accounts.contains(id);
+                    retries.insert(id.clone(), Retry::next(retries.get(id), reset));
+                }
+            }
+            states.extend(read.states);
             Ok::<_, AppError>(())
         };
         let result = tokio::select! {
@@ -385,7 +467,7 @@ async fn run(
         match result {
             Ok(()) => {
                 let accounts = entries(&states);
-                if failed || accounts != current.accounts {
+                if refresh_retry.is_some() || accounts != current.accounts {
                     current.accounts = accounts;
                     current.sequence = current
                         .sequence
@@ -393,14 +475,14 @@ async fn run(
                         .expect("summary sequence exhausted");
                     let _ = updates.send_replace(Ok(current.clone()));
                 }
-                failed = false;
+                refresh_retry = None;
             }
             Err(AppError::RuntimeStopping) => return,
             Err(error) => {
-                if !failed {
+                if refresh_retry.is_none() {
                     let _ = updates.send_replace(Err(Arc::new(error)));
                 }
-                failed = true;
+                refresh_retry = Some(Retry::next(refresh_retry.as_ref(), invalidated_catalog));
             }
         }
     }
