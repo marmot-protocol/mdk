@@ -20,6 +20,7 @@ pub(crate) struct RelayFaultProxy {
     commands: mpsc::UnboundedSender<Command>,
     task: JoinHandle<()>,
     rejected: Arc<AtomicU64>,
+    active: Arc<AtomicU64>,
 }
 
 struct ActiveConnection(Arc<AtomicU64>);
@@ -51,6 +52,7 @@ impl RelayFaultProxy {
         let address = listener.local_addr()?;
         let (commands, mut receiver) = mpsc::unbounded_channel();
         let active = Arc::new(AtomicU64::new(0));
+        let active_task = active.clone();
         let rejected = Arc::new(AtomicU64::new(0));
         let rejected_task = rejected.clone();
         let task = tokio::spawn(async move {
@@ -62,7 +64,7 @@ impl RelayFaultProxy {
                     command = receiver.recv() => {
                         let Some(Command::SetAvailable(next, reply)) = command else { break };
                         available = next;
-                        let closed = if available { 0 } else { active.load(Ordering::SeqCst) };
+                        let closed = if available { 0 } else { active_task.load(Ordering::SeqCst) };
                         if !available {
                             sessions.abort_all();
                             while sessions.join_next().await.is_some() {}
@@ -76,7 +78,7 @@ impl RelayFaultProxy {
                             rejected_task.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
-                        let active = active.clone();
+                        let active = active_task.clone();
                         sessions.spawn(async move {
                             // The exact harness-owned address is pinned above; no DNS or external dial.
                             let Ok(Ok(mut upstream)) = tokio::time::timeout(
@@ -97,6 +99,7 @@ impl RelayFaultProxy {
             commands,
             task,
             rejected,
+            active,
         })
     }
 
@@ -117,6 +120,29 @@ impl RelayFaultProxy {
     /// Returns the number of established connections actually cut and new
     /// connections rejected during the outage. Participants remain running.
     pub(crate) async fn interrupt(&self, duration: Duration) -> io::Result<(u64, u64)> {
+        self.interrupt_when_connected(duration, Duration::from_secs(15))
+            .await
+    }
+
+    async fn interrupt_when_connected(
+        &self,
+        duration: Duration,
+        readiness_timeout: Duration,
+    ) -> io::Result<(u64, u64)> {
+        // Consecutive scripted faults can arrive before the SDK's reconnect retry.
+        // Wait for an actual upstream-connected socket, without driving participant
+        // state or shortening production retry timers. No connection means the
+        // caller still receives zero cuts and refuses the unexercised stimulus.
+        if tokio::time::timeout(readiness_timeout, async {
+            while self.active.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            return Ok((0, 0));
+        }
         let restore = RestoreAvailability(self.commands.clone());
         let before = self.rejected.load(Ordering::SeqCst);
         let closed = self.set_available(false).await?;
@@ -140,6 +166,69 @@ impl Drop for RelayFaultProxy {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn interruption_waits_for_a_reconnecting_socket_before_cutting_it() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = RelayFaultProxy::start(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let interruption = proxy.interrupt(Duration::from_millis(20));
+        tokio::pin!(interruption);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut interruption)
+                .await
+                .is_err()
+        );
+        let mut client = TcpStream::connect(proxy.address).await.unwrap();
+        let (_upstream, _) = listener.accept().await.unwrap();
+        let (closed, rejected) = tokio::time::timeout(Duration::from_secs(1), interruption)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((closed, rejected), (1, 0));
+        assert!(client.read_u8().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_connection_refuses_within_deadline_without_starting_an_outage() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = RelayFaultProxy::start(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let cuts = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.interrupt_when_connected(Duration::from_secs(30), Duration::from_millis(50)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cuts, (0, 0));
+        let mut client = TcpStream::connect(proxy.address).await.unwrap();
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        client.write_all(b"a").await.unwrap();
+        assert_eq!(upstream.read_u8().await.unwrap(), b'a');
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_a_connection_leaves_relay_available() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = RelayFaultProxy::start(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                proxy.interrupt(Duration::from_secs(30)),
+            )
+            .await
+            .is_err()
+        );
+        let mut client = TcpStream::connect(proxy.address).await.unwrap();
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        client.write_all(b"a").await.unwrap();
+        assert_eq!(upstream.read_u8().await.unwrap(), b'a');
+    }
 
     #[tokio::test]
     async fn interruption_closes_live_sockets_and_restores_new_connections() {

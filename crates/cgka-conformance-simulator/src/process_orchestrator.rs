@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nostr_relay_builder::LocalRelay;
+use crate::app_runtime::process_relay::RelayBackend;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -20,8 +20,7 @@ use crate::node_protocol::{
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::relay_control::{
-    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation, RelayControl,
-    RelayControlError,
+    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation,
 };
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
@@ -94,27 +93,32 @@ pub trait ProcessRelayControl: Send + Sync {
 }
 
 struct LocalProcessRelayControl {
-    control: RelayControl,
+    control: RelayBackend,
     action_events: Mutex<RelayActionEvents>,
 }
 
 impl LocalProcessRelayControl {
-    fn new() -> Self {
-        Self {
-            control: RelayControl::new(),
-            action_events: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    fn relay_builder(&self) -> nostr_relay_builder::RelayBuilder {
-        self.control.relay_builder()
+    async fn new() -> Result<(Self, String), ProcessOrchestratorError> {
+        let (control, _proxy, _relay, url) = RelayBackend::start(true)
+            .await
+            .map_err(|e| ProcessOrchestratorError::new(e.code, e.message))?;
+        Ok((
+            Self {
+                control,
+                action_events: Mutex::new(BTreeMap::new()),
+            },
+            url,
+        ))
     }
 }
 
 #[async_trait::async_trait]
 impl ProcessRelayControl for LocalProcessRelayControl {
     async fn publication_cursor(&self) -> Result<usize, ProcessRelayControlError> {
-        Ok(self.control.publication_cursor().await)
+        self.control
+            .publication_cursor()
+            .await
+            .map_err(process_relay_control_error_value)
     }
 
     async fn wait_for_action_events(
@@ -275,7 +279,6 @@ pub struct ProcessOrchestrator {
     run_root: tempfile::TempDir,
     artifact_directory: PathBuf,
     compiled: CompiledScenarioV2,
-    _relays: BTreeMap<String, LocalRelay>,
     relay_controls: BTreeMap<String, Arc<dyn ProcessRelayControl>>,
     relay_urls: BTreeMap<String, String>,
     nodes: BTreeMap<String, NodeProcess>,
@@ -385,7 +388,6 @@ impl ProcessOrchestrator {
                 .map(|relay| relay.id.clone())
                 .collect()
         };
-        let mut relays = BTreeMap::new();
         let mut relay_controls = BTreeMap::<String, Arc<dyn ProcessRelayControl>>::new();
         let relay_urls = if let Some(relay_urls) = external_relay_urls {
             let expected = relay_labels
@@ -425,12 +427,9 @@ impl ProcessOrchestrator {
             }
             let mut relay_urls = BTreeMap::new();
             for label in relay_labels {
-                let relay_control = Arc::new(LocalProcessRelayControl::new());
-                let relay = LocalRelay::new(relay_control.relay_builder());
-                relay.run().await.map_err(environment_error)?;
-                relay_urls.insert(label.clone(), relay.url().await.to_string());
-                relays.insert(label.clone(), relay);
-                relay_controls.insert(label, relay_control);
+                let (relay_control, url) = LocalProcessRelayControl::new().await?;
+                relay_urls.insert(label.clone(), url);
+                relay_controls.insert(label, Arc::new(relay_control));
             }
             relay_urls
         };
@@ -460,7 +459,6 @@ impl ProcessOrchestrator {
             run_root,
             artifact_directory,
             compiled,
-            _relays: relays,
             relay_controls,
             relay_urls,
             nodes: BTreeMap::new(),
@@ -616,6 +614,7 @@ impl ProcessOrchestrator {
                 let _ = kill_process_group(&mut node.child).await;
             }
         }
+        self.relay_controls.clear();
     }
 
     fn record_accepted_publication(&mut self, client: &str, publication: &str) {
@@ -1939,10 +1938,10 @@ fn environment_error(error: impl fmt::Display) -> ProcessOrchestratorError {
     ProcessOrchestratorError::new("process_environment", error.to_string())
 }
 
-fn process_relay_control_error_value(error: RelayControlError) -> ProcessRelayControlError {
+fn process_relay_control_error_value(error: crate::SubjectError) -> ProcessRelayControlError {
     ProcessRelayControlError {
-        code: error.code.into(),
-        message: error.message.into(),
+        code: error.code,
+        message: error.message,
     }
 }
 

@@ -158,7 +158,7 @@ These are the scenarios another implementation should be able to load from JSON 
   `four_party_cross_route_recovery_containers_match_unified_route`; promotion to a portable saved input still requires
   an adapter-neutral representation of reversible retained-event staging.
 - Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
-  `MarmotAppRuntime` commands and projections either in-process or in four isolated child processes. Every participant
+  `MarmotAppRuntime` commands and projections in isolated participant processes. Every participant
   has a separate encrypted SQLite root and uses a real runner-owned local Nostr relay.
 - Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
   The harness reversibly hides Zeta's root from whole-relay queries before Alpha reconnects and authors its competing
@@ -1206,7 +1206,7 @@ names and payload values, require at least 100 distinct operation sequences per 
 prefix/replay stability, all four population sizes and capability preflight. Older family generators
 remain unchanged so their saved inputs retain their original meaning. New APIs do not add arbitrary
 packet reordering, separate relay histories, process crashes inside database writes, or virtual time
-to the in-process app adapter. Transport interruptions currently affect the shared relay as a whole.
+to the public app adapter. Transport interruptions currently affect the shared relay as a whole.
 
 ### `public-app-large-group/v1`
 
@@ -1249,6 +1249,29 @@ A 200-member app case is deliberately outside this initial catalog.
 Large-app generator version 2 adds a verified exclusion-period delivery checkpoint before re-inviting
 the removed member. Version 1 could submit a queued message before re-invitation but publish it after
 re-entry, making its exclusion-history expectation ambiguous. Saved version-1 inputs remain replayable.
-Set `MDK_SCENARIO_PROGRESS=1` to print action numbers/types during long runs; logs omit payloads and
-participant identities. Canary failure reports are saved before bounded cleanup, and extra oracle
+Set `MDK_SCENARIO_PROGRESS=1` to trace action numbers/types during long runs; the large-group canary
+installs the progress subscriber automatically. Other runners must enable the
+`cgka_conformance_simulator::progress=debug` tracing target. Logs omit payloads and participant
+identities. `MDK_REPLAY_SLICE_DIAGNOSTICS=1` adds aggregate reconstruction slice timing and history-drain
+verdicts, delivery counts, and end-of-stored-events coverage to the canary. It does not change policy or deadlines.
+Canary failure reports are saved before bounded cleanup, and extra oracle
 mutation queries are performed only after successful workloads.
+Set `MDK_RETAIN_FAILED_APP_FIXTURE=1` to retain stopped synthetic app roots on failure. After successful cleanup,
+`retained-fixture/manifest.json` names the retained private roots and `relay-publications.json` preserves admitted
+relay events. These artifacts and roots contain sensitive replay material; keep them private, never commit them,
+and use copies for subsequent diagnosis. Retention does not claim a checkpoint taken before the failed action.
+
+`app_history_repair_diagnostic::large_app_history_prefix_diagnostic` is an ignored diagnostic target.
+Set `MDK_APP_DIAGNOSTIC_INPUT` to the saved case-4 generated input, `MDK_SCENARIO_PROGRESS=1`, and
+`MDK_APP_JOURNEY_ARTIFACTS` to a nonexistent directory. It executes unchanged actions 0–254 and their
+assertions, then retains stopped roots and relay publications on either outcome. It preserves both the original
+input and selected prefix; it omits the unexecuted suffix's final oracles and must not count as a family pass.
+The same target's ignored `retained_history_repair_diagnostic` reopens one private marked root copy against
+the retained relay publication history at its original loopback port. Set `MDK_RETAINED_APP_ROOT` to the copy
+and `MDK_RETAINED_RELAY_FIXTURE` to the retained-fixture directory; the original relay must be stopped.
+It records up to three repair attempts in the copy's `history-repair-attempts.json`. Success proves a new
+attempt can finish after restart, not that the original repair or full scenario succeeded.
+
+The ignored `diagnose_retained_app_replay` test can reopen one stopped synthetic app fixture for a short reconstruction
+observation. Set `MDK_RETAINED_APP_ROOT` to a private copy containing the `replay-diagnostic-fixture` marker. It uses
+normal runtime policy and a new local relay; it mutates that copy and is diagnostic evidence, not a full scenario pass.

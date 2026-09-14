@@ -828,6 +828,7 @@ mod tests {
                 step_count: 0,
                 storage_backend: "in-memory-sqlite".into(),
                 subject: None,
+                execution_layout: None,
                 generated: None,
                 fixture: None,
                 input_provenance: None,

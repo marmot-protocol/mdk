@@ -275,6 +275,11 @@ pub struct SubjectOutboundArtifact {
 pub trait ConvergenceSubject: Send {
     fn descriptor(&self) -> SubjectDescriptor;
 
+    /// Local execution receipt; it is not part of the protocol oracle.
+    fn execution_layout(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     fn database_bytes(&self) -> Option<u64> {
         None
     }

@@ -312,7 +312,7 @@ async fn run_app_runtime_adapter(
         .into_iter()
         .map(|observation| (observation.participant.clone(), observation))
         .collect::<BTreeMap<_, _>>();
-    app.shutdown().await;
+    app.shutdown().await.expect("app shutdown");
     (app_report, app_observations)
 }
 

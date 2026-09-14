@@ -427,6 +427,8 @@ pub struct ScenarioReportMetadata {
     pub storage_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<SubjectDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_layout: Option<serde_json::Value>,
     pub generated: Option<GeneratedScenarioMetadata>,
     pub fixture: Option<VectorFixtureMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1353,7 +1355,13 @@ async fn run_scenario_report_inner(
         let step = &action.step;
         // Opt-in harness diagnostics contain only schedule metadata, never payloads or identities.
         if std::env::var_os("MDK_SCENARIO_PROGRESS").is_some() {
-            eprintln!("scenario action {step_index}: {}", step.kind());
+            tracing::debug!(
+                target: "cgka_conformance_simulator::progress",
+                method = "run_scenario",
+                step_index,
+                step_kind = step.kind(),
+                "scenario action"
+            );
         }
         let step_result = if let Some(group) = action.scenario_group.as_deref() {
             subject
@@ -1505,6 +1513,7 @@ async fn run_scenario_report_inner(
             step_count: compiled.actions.len(),
             storage_backend: descriptor.storage_backend.clone(),
             subject: Some(descriptor),
+            execution_layout: subject.execution_layout(),
             generated: None,
             fixture,
             input_provenance: None,

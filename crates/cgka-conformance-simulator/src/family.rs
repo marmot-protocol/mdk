@@ -842,7 +842,7 @@ pub(crate) async fn run_generated_case_report_with_capture_on_subject_before_min
                 &mut subject,
             )
             .await;
-            subject.shutdown().await;
+            subject.shutdown().await.map_err(subject_setup_error)?;
             (
                 result?,
                 ScenarioFailureCaptureV1 {
@@ -1238,7 +1238,7 @@ async fn run_generated_scenario(
                 &mut app,
             )
             .await;
-            app.shutdown().await;
+            app.shutdown().await.map_err(subject_setup_error)?;
             result
         }
     }

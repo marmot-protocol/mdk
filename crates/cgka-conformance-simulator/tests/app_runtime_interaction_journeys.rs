@@ -979,9 +979,9 @@ async fn leave_with_several_remaining(
     expect_timeline(subject, "main", &expected, out, "before.json").await?;
 
     subject.select_scenario_group("main", false)?;
-    let admitted_before_leave = subject.relay_admitted_events().await;
+    let admitted_before_leave = subject.relay_admitted_events().await?;
     subject.leave("leave-david", "david").await?;
-    let admitted_after_leave = subject.relay_admitted_events().await;
+    let admitted_after_leave = subject.relay_admitted_events().await?;
     let remaining = labels(&["alice", "bob", "carol"]);
     // The survivors' runtimes learn the proposal from their live subscriptions;
     // the engine schedules the auto-commit within 50 ms. Poll slowly so the
@@ -1006,7 +1006,7 @@ async fn leave_with_several_remaining(
                 "seconds_since_leave": left_at.elapsed().as_secs(),
                 "admitted_before_leave": admitted_before_leave,
                 "admitted_after_leave": admitted_after_leave,
-                "admitted_now": subject.relay_admitted_events().await,
+                "admitted_now": subject.relay_admitted_events().await?,
                 "survivors": observations,
                 "leaver": leaver,
             }),
@@ -1191,6 +1191,12 @@ async fn check(journey: Journey) {
         _ => AppRuntimeHarness::new_with_pinned_settlement(&clients).await,
     }
     .expect("public runtime setup");
+    save(
+        artifacts.path(),
+        "execution-layout.json",
+        &subject.process_layout(),
+    )
+    .unwrap();
     let exercise = async {
         match journey {
             Journey::TwoGroups => two_groups(&mut subject, artifacts.path()).await,
@@ -1227,7 +1233,7 @@ async fn check(journey: Journey) {
             close_errors.push(error.to_string());
         }
     }
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     drop(subject);
     save(
         artifacts.path(),

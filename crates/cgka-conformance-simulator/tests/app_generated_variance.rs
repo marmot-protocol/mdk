@@ -34,7 +34,7 @@ fn operation_order(case: &GeneratedScenarioCase) -> Vec<String> {
 async fn seeded_app_schedules_change_operations_and_preflight_without_private_capabilities() {
     let mut subject = AppRuntimeHarness::new(&[]).await.unwrap();
     let descriptor = subject.descriptor();
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     for family in FAMILIES {
         let mut schedules = BTreeSet::new();
         let mut populations = BTreeSet::new();

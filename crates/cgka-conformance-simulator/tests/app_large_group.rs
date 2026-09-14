@@ -7,10 +7,80 @@ use cgka_conformance_simulator::{
 };
 
 #[tokio::test]
+async fn retained_diagnostic_fixture_survives_harness_drop_privately() {
+    let mut subject = AppRuntimeHarness::new(&["alice".to_owned()]).await.unwrap();
+    subject.shutdown().await.expect("app shutdown");
+    let output = tempfile::tempdir().unwrap();
+    let fixture = output.path().join("fixture");
+    subject
+        .retain_stopped_diagnostic_fixture(&fixture)
+        .await
+        .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("manifest.json")).unwrap()).unwrap();
+    let root = std::path::Path::new(manifest["roots"]["alice"].as_str().unwrap());
+    assert!(root.is_dir());
+    assert!(std::fs::read_dir(root).unwrap().next().is_some());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in [&fixture, root] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        for file in ["manifest.json", "relay-publications.json"] {
+            assert_eq!(
+                std::fs::metadata(fixture.join(file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Diagnostic only: the supplied root must be a private COPY of a stopped
+/// synthetic app fixture. This does not substitute for the full scale oracle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "inspect retained fixture via MDK_RETAINED_APP_ROOT; requires copy marker"]
+async fn diagnose_retained_app_replay() {
+    let root = std::path::PathBuf::from(std::env::var_os("MDK_RETAINED_APP_ROOT").unwrap());
+    assert!(root.join("replay-diagnostic-fixture").is_file());
+    tracing_subscriber::fmt()
+        .with_env_filter("off,cgka_engine::replay_slice=debug")
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .unwrap();
+    let relay = nostr_relay_builder::LocalRelay::new(Default::default());
+    relay.run().await.unwrap();
+    let app = marmot_app::MarmotApp::with_relay_and_config(
+        &root,
+        relay.url().await.to_string(),
+        marmot_app::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = marmot_app::MarmotAppRuntime::new(app);
+    runtime.start().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        runtime.shutdown_and_close(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
 async fn large_app_catalog_is_replayable_and_checks_every_participant() {
     let mut subject = AppRuntimeHarness::new(&[]).await.unwrap();
     let descriptor = subject.descriptor();
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     for seed in [7, 42, 100003] {
         for index in 0..6 {
             let case = generate_family_case(PUBLIC_APP_LARGE_GROUP_FAMILY, seed, index).unwrap();
@@ -112,6 +182,19 @@ fn whole_history_assertion_requires_v3_and_known_client() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full app scale canary; release, MDK_LARGE_APP_CASE=0..5, unique MDK_APP_JOURNEY_ARTIFACTS"]
 async fn large_group_app_canary() {
+    let replay_diagnostics = std::env::var("MDK_REPLAY_SLICE_DIAGNOSTICS").as_deref() == Ok("1");
+    if replay_diagnostics || std::env::var_os("MDK_SCENARIO_PROGRESS").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(if replay_diagnostics {
+                "off,cgka_engine::replay_slice=debug,cgka_conformance_simulator::progress=debug,marmot_app::history_repair=debug"
+            } else {
+                "off,cgka_conformance_simulator::progress=debug"
+            })
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init()
+            .expect("install aggregate replay diagnostics");
+    }
     let index = std::env::var("MDK_LARGE_APP_CASE")
         .unwrap_or_else(|_| "0".into())
         .parse::<u64>()
@@ -160,7 +243,12 @@ async fn large_group_app_canary() {
     // caused the failure. Preserve its closed failure classifications before cleanup.
     fs_private::write_private(
         &artifacts.join("performance-before-cleanup.json"),
-        &serde_json::to_vec_pretty(&subject.performance_snapshots()).unwrap(),
+        &serde_json::to_vec_pretty(
+            &subject
+                .performance_snapshots()
+                .expect("performance snapshots"),
+        )
+        .unwrap(),
     )
     .unwrap();
     // Check the actual one-snapshot predicate as well as the final trace oracle.
@@ -199,10 +287,20 @@ async fn large_group_app_canary() {
     eprintln!("large app cleanup started");
     let cleanup =
         tokio::time::timeout(std::time::Duration::from_secs(60), subject.shutdown()).await;
-    drop(subject);
+    if !clean
+        && matches!(&cleanup, Ok(Ok(())))
+        && std::env::var_os("MDK_RETAIN_FAILED_APP_FIXTURE").is_some()
+    {
+        subject
+            .retain_stopped_diagnostic_fixture(&artifacts.join("retained-fixture"))
+            .await
+            .expect("retain failed app fixture");
+    } else {
+        drop(subject);
+    }
     eprintln!(
         "large app cleanup finished; within budget: {}",
-        cleanup.is_ok()
+        matches!(&cleanup, Ok(Ok(())))
     );
     let report = result.expect("large app deadline").unwrap();
     assert!(
@@ -225,7 +323,10 @@ async fn large_group_app_canary() {
         "{:?}",
         report.oracle
     );
-    assert!(cleanup.is_ok(), "large app cleanup exceeded 60 seconds");
+    assert!(
+        matches!(&cleanup, Ok(Ok(()))),
+        "large app cleanup exceeded 60 seconds"
+    );
     assert!(predicate_checks[0].as_ref().unwrap().matched);
     assert!(!predicate_checks[1].as_ref().unwrap().matched);
     assert!(!predicate_checks[2].as_ref().unwrap().matched);

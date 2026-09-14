@@ -79,7 +79,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // Obtain the actual adapter descriptor. No participants or workload execute.
     let mut subject = AppRuntimeHarness::new(&[]).await?;
     let descriptor = subject.descriptor();
-    subject.shutdown().await;
+    subject.shutdown().await?;
     drop(subject);
     let mut rows = Vec::new();
     for &(family, cases) in FAMILIES {

@@ -559,7 +559,7 @@ just app-stack-campaign target/app-stack-full-1
 just app-stack-campaign target/app-stack-repeat-1 --seeds 7 42 17001 --rounds 3 --jobs 2
 ```
 
-The full matrix runs 162 generated cases per round (seven six-case catalogs and the twelve-case cross-route catalog,
+The full matrix runs 216 generated cases per round (ten six-case catalogs and the twelve-case cross-route catalog,
 across three seeds), plus all tests in `app_runtime_adapter`, `app_runtime_journeys`,
 `app_runtime_interaction_journeys`, and `public_app_families`. Ignored tests are explicitly selected, including both
 1,024-message backlogs, production-timing manual self-update and strict invitation recovery. The app cross-route
@@ -568,8 +568,8 @@ separate optimized build enabling debug compatibility only in `cgka-engine` and 
 the app side retains pinned production timing without test-policy overrides. Its build exception is recorded in
 `build.json`. All generated campaigns and other app tests use the ordinary release build with debug assertions off.
 `--rounds` repeats that regression in
-individually isolated processes instead of hiding twenty trials inside one test result. Separate participant-process,
-container and external-relay campaigns remain separate execution layers.
+individually isolated processes instead of hiding twenty trials inside one test result. App participants and the
+local relay run in separate processes. Container and external-relay campaigns remain separate execution layers.
 
 Every generated case retains its original strict public oracle and the existing campaign runner's input/report
 integrity checks. Fixed tests run exactly once per selected task, under an outer deadline, with retained output and
@@ -635,7 +635,13 @@ separately. See [the family contract and selected-case command](SCENARIOS.md#pub
 The explicit large-group canary saves `performance-before-cleanup.json` from the public runtime
 telemetry, including closed sync failure stages and causes, before attempting teardown. This read
 does not queue another command behind a stalled account worker. `MDK_SCENARIO_PROGRESS=1` adds
-participant ordinals and elapsed times for catch-up and shutdown calls. The report's broad
+structured progress tracing with participant ordinals and elapsed times for catch-up and shutdown calls;
+the canary installs its subscriber automatically. `MDK_REPLAY_SLICE_DIAGNOSTICS=1` also records aggregate
+probe counts and slice durations. The report's broad
 `account_catch_up` resource category alone does not distinguish a worker timeout from a sync error;
 inspect the saved telemetry before assigning a cause. These diagnostics do not change runtime
 policy, scenario inputs, or the semantic oracle.
+
+## Default app execution layout
+
+All `AppRuntimeHarness` acceptance constructors now launch one participant process per encrypted account-device root and a separate real relay process. The action and assertion API is shared with the explicit `new_in_process_stress` diagnostic. See [the app scenario inventory](APP_SCENARIO_INVENTORY.md) for catalog counts, lifecycle semantics, helper builds and evidence receipts.

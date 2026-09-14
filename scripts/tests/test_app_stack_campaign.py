@@ -23,6 +23,7 @@ class CampaignTests(unittest.TestCase):
                     "command": ["test-binary"], "timeout": 1200}
 
             def fake_run(_command, directory, env, _timeout):
+                self.assertEqual(env["MDK_APP_PROCESS_NODE"], str(root / "bin" / "cgka-conformance-node"))
                 self.assertEqual(env["MDK_SCENARIO_NODE_BIN"], str(root / "bin" / "cgka-conformance-node"))
                 (directory / "output.log").write_text("test result: ok. 1 passed; 0 failed; 0 ignored;")
                 return {"exit_code": 0, "timed_out": False}

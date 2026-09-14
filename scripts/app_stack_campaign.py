@@ -279,6 +279,7 @@ def execute(task, root, env):
     scratch = directory / "tmp"
     scratch.mkdir(mode=0o700)
     task_env = dict(env, MDK_APP_JOURNEY_ARTIFACTS=str(directory / "journeys"), TMPDIR=str(scratch))
+    task_env["MDK_APP_PROCESS_NODE"] = str(root / "bin" / "cgka-conformance-node")
     if task.get("binary") == "app_generated_variance":
         task_env["MDK_SCENARIO_NODE_BIN"] = str(root / "bin" / "cgka-conformance-node")
     if task["kind"] == "generated":

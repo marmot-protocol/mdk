@@ -17,8 +17,8 @@ scenario language itself, see [`SCENARIO_IR.md`](SCENARIO_IR.md). The complete s
 | --- | --- | --- | --- |
 | Fixed vectors | `cgka-conformance-simulator-report --vectors ...` | Stable, reviewable semantic regressions | Broad generated coverage |
 | In-process report | `cgka-conformance-simulator-report --family ...` | Fast strict scenario execution and saved reports | OS process isolation or real sockets |
-| Isolated case worker | `cgka-conformance-campaign` | One child per case, timeout/reaping, OS CPU/RSS/write measurements | One OS process per participant |
-| App-runtime adapter | report replay with `--adapter app-runtime` | Production-shaped app/session/projection behavior in one process | Participant process or host isolation |
+| Isolated case worker | `cgka-conformance-campaign` | One child per case, timeout/reaping, OS CPU/RSS/write measurements | Participant isolation for engine cases |
+| App-runtime adapter | report replay with `--adapter app-runtime` | Public app/session/projection behavior, one process per participant and separate real relay | Separate hosts or CPU reservations |
 | Process adapter | `cgka-conformance-process` | One account-device per child process, private SQLCipher roots, restart | Separate kernels or real network namespaces |
 | Container runner | `cgka-distributed-campaign` / ignored container tests | One participant per container, real sockets, isolated OCI network, network faults | A distinct kernel, block device, or VM host |
 | VM driver | distributed manifest with VM backend | External host lifecycle, kernel/filesystem/block-device isolation | More semantic coverage by itself |
@@ -37,7 +37,8 @@ sample, not exhaustive coverage. Both families retain production timing and use 
 budget. Start with a small sample and inspect `stimulus_observations`, not just the exit status.
 
 ```sh
-cargo build --release --locked -p cgka-conformance-simulator --bin cgka-conformance-campaign
+cargo build --release --locked -p cgka-conformance-simulator \
+  --bin cgka-conformance-campaign --bin cgka-conformance-simulator-report --bin cgka-conformance-node
 RUST_MIN_STACK=4194304 target/release/cgka-conformance-campaign \
   --family public-app-stateful-recovery/v1 --seed 7 --cases 1 \
   --storage file --case-timeout-secs 900 --out target/app-stateful-canary-1
@@ -53,6 +54,29 @@ command submission, not that MLS commits necessarily forked at the same epoch. E
 and known cross-route branch construction provide separate checks. Do not reinterpret orderly app
 reopens as abrupt process crashes. The process canary exercises real kills at scenario action
 boundaries; it does not inject a kill halfway through a storage transaction.
+
+Before cutting relay sockets, the app harness waits up to 15 seconds for an established upstream
+connection. This lets consecutive interruptions wait for the production transport's reconnect retry;
+the requested outage duration starts only after readiness. The harness does not shorten retry timers
+or drive participant state to create readiness. If no connection appears, or it disappears before the
+cut, the existing zero-cut refusal remains a failure. Cancellation during readiness leaves the relay
+available, and cancellation during an outage restores availability.
+
+For an app failure that needs stopped databases and relay history, explicitly run the ignored
+`saved_app_recovery_diagnostic` test in `app_history_repair_diagnostic`. Set
+`MDK_APP_DIAGNOSTIC_INPUT` to the exact saved input, `MDK_APP_JOURNEY_ARTIFACTS` to a fresh private
+output path, and `MDK_APP_PROCESS_NODE` to a frozen matching node binary. The diagnostic preserves
+the scenario and its expectations, then captures public state and a stopped private fixture.
+Optionally set `MDK_APP_DIAGNOSTIC_RECOVERY_CLIENT` to probe a failing run with a 30-second wait,
+another full-history repair, and reopen plus repair. These probes follow the original report and
+never change its verdict. A successful diagnostic test means evidence capture succeeded; check
+`result.json`'s `scenario_passed` and `report.json` for the actual scenario result. Retained fixtures
+contain sensitive state and must remain owner-only and uncommitted.
+
+```sh
+cargo test --release --locked -p cgka-conformance-simulator \
+  --test app_history_repair_diagnostic saved_app_recovery_diagnostic -- --ignored --exact
+```
 
 To recheck retained process evidence without executing its workload again, build
 `cgka-conformance-process` and run:
@@ -422,3 +446,5 @@ to run that gate followed by every public catalog arm and fixed journey. The def
 7, 42 and 17001 with two workers; `--seeds`, `--rounds` and `--jobs 1|2` control the bounded selection.
 See [APP_PATH_COVERAGE.md](APP_PATH_COVERAGE.md#unified-public-app-campaign) for production-policy builds,
 ignored-test selection, WIP provenance, outcome interpretation and the fresh-stack versus sustained-runtime boundary.
+
+The [public app inventory](APP_SCENARIO_INVENTORY.md) describes the default participant-process layout, matching node-helper build, and explicit shared-runtime stress control.

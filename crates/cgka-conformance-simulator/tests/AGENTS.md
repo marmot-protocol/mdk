@@ -7,6 +7,11 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 ## Files
 
+- **File:** `app_history_repair_diagnostic.rs`
+  - **Owns:** Explicit saved-input prefix diagnosis through large-app action 254, aggregate drain verdicts,
+    exact saved app recovery capture with optional post-failure probes, and retained private fixtures.
+    Prefix success or successful diagnostic capture is not full-family acceptance; inspect the saved report verdict.
+
 - **File:** `app_large_group.rs`
   - **Owns:** Public 10/20/50-member bulk/staged family contracts, whole-history assertion validation,
     exclusion-delivery-before-reinvitation regression, and explicit production-policy scale canaries.

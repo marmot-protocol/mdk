@@ -23,7 +23,7 @@ const PRESSURE_FAMILIES: [&str; 2] = [PUBLIC_APP_ADMIN_CHURN_FAMILY, PUBLIC_APP_
 async fn public_catalog_is_replayable_and_preflights_without_private_capabilities() {
     let mut subject = AppRuntimeHarness::new(&[]).await.unwrap();
     let descriptor = subject.descriptor();
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     let mut without_public_state = descriptor.clone();
     without_public_state
         .capabilities
@@ -364,7 +364,7 @@ async fn strict_canary(family: &str, case_index: u64) {
         payload: "never-sent".into(),
         count: 1,
     });
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     drop(subject); // Release all runtime/storage work before any assertion unwinds.
     let report = result
         .expect("public canary exceeded its wall-clock budget")

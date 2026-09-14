@@ -512,6 +512,12 @@ async fn check(journey: Journey) {
     let mut subject = AppRuntimeHarness::new(&clients)
         .await
         .expect("public runtime setup");
+    save(
+        artifacts.path(),
+        "execution-layout.json",
+        &subject.process_layout(),
+    )
+    .unwrap();
     let mut recovery_progress = RecoveryProgress {
         phase: "setup",
         ..RecoveryProgress::default()
@@ -554,7 +560,7 @@ async fn check(journey: Journey) {
             close_errors.push(error.to_string());
         }
     }
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     drop(subject);
     save(
         artifacts.path(),
