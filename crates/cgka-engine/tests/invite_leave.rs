@@ -4170,3 +4170,64 @@ async fn removal_realized_mid_replay_leaves_later_buffered_rows_retained() {
         "the refused row keeps its retry slot so a re-join replay can process it"
     );
 }
+
+/// Realizing the removal must not write a ledger row for the message that
+/// realized it.
+///
+/// The record gate (#1840) refuses every later post-removal message with no
+/// durable trace, precisely so relay redelivery after a re-add Welcome is not
+/// classified `Duplicate`. The realizing arm is the FIRST post-removal message
+/// on a copy the marker has not reached yet, and it is the one most likely to
+/// be a commit racing ahead of that Welcome — so it owes the same rule. A
+/// `Failed` row here is not replayable (`replay_buffered_messages` admits only
+/// `Created | Retryable | PeelDeferred`) and answers `Duplicate` on
+/// redelivery, so the message would be lost to this device for good.
+#[tokio::test]
+async fn realizing_the_removal_writes_no_ledger_row_for_the_realizing_message() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-realize-no-row").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // The silent-eviction shape: OpenMLS records the eviction, the durable
+    // record does not. The next message reaches the realizing arm.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    record.members = vec![cgka_traits::group::Member {
+        id: bob.self_id(),
+        credential: bob.self_id().as_slice().to_vec(),
+    }];
+    bob_storage.put_group(&record).unwrap();
+
+    let rows_before = bob_storage
+        .list_messages(&group_id, cgka_traits::EpochId(0))
+        .unwrap()
+        .len();
+
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"realizing").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
+            }
+        ),
+        "the realizing message still classifies Removed; got {outcome:?}"
+    );
+    assert!(
+        bob_storage.get_group(&group_id).unwrap().removed,
+        "the realization obligation is unchanged: the copy is marked removed"
+    );
+    assert_eq!(
+        bob_storage
+            .list_messages(&group_id, cgka_traits::EpochId(0))
+            .unwrap()
+            .len(),
+        rows_before,
+        "the message that realized the removal must leave no durable trace, so \
+         redelivery after a re-add Welcome is not answered as a duplicate"
+    );
+}

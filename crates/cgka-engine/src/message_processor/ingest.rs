@@ -511,9 +511,21 @@ impl<S: StorageProvider> Engine<S> {
             // already done (member-departure.md), instead of classifying
             // as ordinary stale traffic while the group still presents as
             // active.
-            self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Failed)?;
+            //
+            // Same rule as the record gate above, for the same reason: this is
+            // the FIRST post-removal message on a copy the marker has not
+            // reached yet, and the likeliest shape for it is a commit racing
+            // ahead of a re-add Welcome. A `Failed` row here is unreachable by
+            // `replay_buffered_messages` (`Created | Retryable | PeelDeferred`
+            // only) and answers `Duplicate` on redelivery, so the message would
+            // be lost to this device for good. Write nothing, keep the id out
+            // of the in-memory seen cache, and leave an already-retained row
+            // exactly as retained — the `Removed` arms in
+            // `replay_buffered_messages` and `reingest_deferred_peel_row` keep
+            // it that way.
             self.realize_self_eviction(&group_id, current_epoch)?;
             self.return_unmodified_mls_group(&group_id, mls_group);
+            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
             return reported(IngestOutcome::LocalState {
                 state: LocalIngestState::Removed,
             });
@@ -1205,6 +1217,21 @@ impl<S: StorageProvider> Engine<S> {
                 // above classifies this first; this arm keeps the
                 // realization obligation attached to the authenticated
                 // OpenMLS signal itself.
+                //
+                // It does NOT follow that gate's "write no row on our own
+                // removal" rule, because here the row is already written:
+                // `persist_openmls_wire_message_with_processed_transport_id`
+                // committed the content row and marked the raw transport id
+                // processed before `process_message` ran, so redelivery answers
+                // `Duplicate` off that id whatever state this row carries.
+                // Writing nothing would buy the message nothing.
+                //
+                // Defense in depth, so the state it does write is the
+                // conservative one: `process_message` raises this error only
+                // from `unprotect_message`'s `is_active()` check, on the same
+                // in-memory group the gate above already passed. Should it fire
+                // anyway, the content row stays `Failed` — and a later re-join's
+                // re-open, which takes raw transport rows only, leaves it there.
                 self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                 self.realize_self_eviction(&group_id, current_epoch)?;
                 return reported(IngestOutcome::LocalState {

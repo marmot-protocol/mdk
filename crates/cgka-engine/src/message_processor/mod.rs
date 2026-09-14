@@ -2632,9 +2632,10 @@ impl<S: StorageProvider> Engine<S> {
             Ok(Outcome(IngestOutcome::LocalState {
                 state: LocalIngestState::Removed,
             })) => {
-                // Same rule as `replay_buffered_messages`: refused before any
-                // peel with nothing written, so the row keeps `PeelDeferred`
-                // rather than becoming a `Processed` graph input. Defense in
+                // Same rule as `replay_buffered_messages`: refused on our own
+                // removal before any peel, with nothing written by either the
+                // record gate or the realizing arm, so the row keeps
+                // `PeelDeferred` rather than becoming a `Processed` graph input. Defense in
                 // depth: the sweep's production door refuses a terminal group,
                 // and the sites that set `removed` retire the deferred backlog
                 // (and its cap slots) in the same transaction.
@@ -3378,10 +3379,11 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,
                 }) => {
-                    // Refused on the removed record before any peel: ingest wrote
-                    // nothing, so the row is exactly as retained. Leave it and
-                    // stop — the record is terminal, so every row behind this one
-                    // gets the same refusal.
+                    // Refused on our own removal before any peel — either on the
+                    // durable record or by the realizing arm that writes that
+                    // marker. Neither writes a row, so this one is exactly as
+                    // retained. Leave it and stop: the record is terminal from
+                    // here, so every row behind this one gets the same refusal.
                     //
                     // Never relabel it `Processed`: that is an OpenMLS graph
                     // input state (`OPENMLS_GRAPH_INPUT_STATES`), so a
