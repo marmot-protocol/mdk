@@ -30,3 +30,5 @@ pub mod onboarding;
 pub mod product_analytics;
 
 pub mod presentation;
+
+pub mod chat_window;

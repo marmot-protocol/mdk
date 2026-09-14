@@ -149,6 +149,11 @@ enum MarmotStatus
    * Fetch, integrity, or decryption failed after a locator was selected.
    */
   MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED = 72,
+  MARMOT_STATUS_CHAT_WINDOW_INVALID_LIMIT = 73,
+  MARMOT_STATUS_CHAT_WINDOW_STALE = 74,
+  MARMOT_STATUS_CHAT_WINDOW_ANCHOR_OUTSIDE = 75,
+  MARMOT_STATUS_CHAT_WINDOW_CLOSED = 76,
+  MARMOT_STATUS_CHAT_WINDOW_QUERY = 77,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -698,6 +703,24 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_REMOVED,
 } MarmotChatListUpdateTrigger;
 
+typedef enum MarmotChatListView {
+  MARMOT_CHAT_LIST_VIEW_CHATS,
+  MARMOT_CHAT_LIST_VIEW_UNREAD,
+  MARMOT_CHAT_LIST_VIEW_ARCHIVED,
+  MARMOT_CHAT_LIST_VIEW_LEFT,
+} MarmotChatListView;
+
+typedef enum MarmotAccountAttentionUnavailable {
+  MARMOT_ACCOUNT_ATTENTION_UNAVAILABLE_PREPARING,
+  MARMOT_ACCOUNT_ATTENTION_UNAVAILABLE_READ_FAILED,
+  MARMOT_ACCOUNT_ATTENTION_UNAVAILABLE_RESETTING,
+} MarmotAccountAttentionUnavailable;
+
+typedef enum MarmotChatListPageDirection {
+  MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
+  MARMOT_CHAT_LIST_PAGE_DIRECTION_BACKWARD,
+} MarmotChatListPageDirection;
+
 /**
  * Relay endpoint policy used by `marmot_client_new_with_options`.
  */
@@ -836,6 +859,11 @@ typedef enum MarmotHostPerformanceOutcome {
 } MarmotHostPerformanceOutcome;
 
 /**
+ * Free before its client. Concurrent next and commands are supported; never free during a call.
+ */
+typedef struct MarmotAccountAttentionSubscription MarmotAccountAttentionSubscription;
+
+/**
  * Single live stream. Free before its creating `MarmotClient`; never free
  * concurrently with an in-flight call on this handle.
  */
@@ -855,6 +883,11 @@ typedef struct MarmotAgentStreamSubscription MarmotAgentStreamSubscription;
  * including row removals (`next_update`).
  */
 typedef struct MarmotChatListSubscription MarmotChatListSubscription;
+
+/**
+ * Free before its client. Concurrent next and commands are supported; never free during a call.
+ */
+typedef struct MarmotChatListWindowSubscription MarmotChatListWindowSubscription;
 
 /**
  * Opaque handle to one account's chats list: an initial snapshot of
@@ -4262,6 +4295,82 @@ typedef struct MarmotPresentedChatListUpdate {
   uint64_t sequence;
   struct MarmotPresentedChatListSnapshot snapshot;
 } MarmotPresentedChatListUpdate;
+
+typedef enum MarmotChatListAnchorOutcome_Tag {
+  MARMOT_CHAT_LIST_ANCHOR_OUTCOME_TOP,
+  MARMOT_CHAT_LIST_ANCHOR_OUTCOME_RETAINED,
+  MARMOT_CHAT_LIST_ANCHOR_OUTCOME_RECOVERED,
+  MARMOT_CHAT_LIST_ANCHOR_OUTCOME_RESET,
+} MarmotChatListAnchorOutcome_Tag;
+
+typedef struct MarmotChatListAnchorOutcome_Retained_Body {
+  char *group_id_hex;
+  uint32_t index;
+} MarmotChatListAnchorOutcome_Retained_Body;
+
+typedef struct MarmotChatListAnchorOutcome_Recovered_Body {
+  char *group_id_hex;
+  uint32_t index;
+} MarmotChatListAnchorOutcome_Recovered_Body;
+
+typedef struct MarmotChatListAnchorOutcome {
+  MarmotChatListAnchorOutcome_Tag tag;
+  union {
+    MarmotChatListAnchorOutcome_Retained_Body RETAINED;
+    MarmotChatListAnchorOutcome_Recovered_Body RECOVERED;
+  };
+} MarmotChatListAnchorOutcome;
+
+typedef struct MarmotChatListWindowSnapshot {
+  char *subscription_generation;
+  uint64_t sequence;
+  enum MarmotChatListView view;
+  struct MarmotPresentedChatRow *rows;
+  uintptr_t rows_len;
+  bool has_more_before;
+  bool has_more_after;
+  struct MarmotChatListAnchorOutcome anchor;
+} MarmotChatListWindowSnapshot;
+
+typedef struct MarmotAccountAttentionTotal {
+  uint64_t unread_count;
+  uint64_t unread_mention_count;
+  uint64_t unread_conversations;
+  uint64_t attention_only_conversations;
+} MarmotAccountAttentionTotal;
+
+typedef enum MarmotAccountAttentionState_Tag {
+  MARMOT_ACCOUNT_ATTENTION_STATE_READY,
+  MARMOT_ACCOUNT_ATTENTION_STATE_UNAVAILABLE,
+} MarmotAccountAttentionState_Tag;
+
+typedef struct MarmotAccountAttentionState_Ready_Body {
+  struct MarmotAccountAttentionTotal total;
+} MarmotAccountAttentionState_Ready_Body;
+
+typedef struct MarmotAccountAttentionState_Unavailable_Body {
+  enum MarmotAccountAttentionUnavailable reason;
+} MarmotAccountAttentionState_Unavailable_Body;
+
+typedef struct MarmotAccountAttentionState {
+  MarmotAccountAttentionState_Tag tag;
+  union {
+    MarmotAccountAttentionState_Ready_Body READY;
+    MarmotAccountAttentionState_Unavailable_Body UNAVAILABLE;
+  };
+} MarmotAccountAttentionState;
+
+typedef struct MarmotAccountAttentionEntry {
+  char *account_id_hex;
+  struct MarmotAccountAttentionState state;
+} MarmotAccountAttentionEntry;
+
+typedef struct MarmotAccountAttentionSnapshot {
+  char *subscription_generation;
+  uint64_t sequence;
+  struct MarmotAccountAttentionEntry *accounts;
+  uintptr_t accounts_len;
+} MarmotAccountAttentionSnapshot;
 
 #ifdef __cplusplus
 extern "C" {
@@ -8257,6 +8366,112 @@ MarmotStatus marmot_presented_chat_list_subscription_next(const struct MarmotPre
 void marmot_presented_chat_list_subscription_free(struct MarmotPresentedChatListSubscription *sub);
 
 /**
+ * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
+ * # Safety
+ * sub must be live and out writable.
+ */
+MarmotStatus marmot_chat_list_window_subscription_snapshot(const struct MarmotChatListWindowSubscription *sub,
+                                                           struct MarmotChatListWindowSnapshot **out);
+
+/**
+ * Receive a complete replacement. Zero timeout waits indefinitely. Timeout/error/closed leaves
+ * out NULL. Timeout does not consume an update. Free results with the matching snapshot_free.
+ * # Safety
+ * sub must remain live throughout the call; out must be writable. Use one receiver per handle.
+ */
+MarmotStatus marmot_chat_list_window_subscription_next(const struct MarmotChatListWindowSubscription *sub,
+                                                       uint32_t timeout_ms,
+                                                       struct MarmotChatListWindowSnapshot **out);
+
+/**
+ * Cancel and free. NULL is a no-op; does not free previously returned snapshots.
+ * # Safety
+ * sub must be NULL or a library-owned handle with no active calls.
+ */
+void marmot_chat_list_window_subscription_free(struct MarmotChatListWindowSubscription *sub);
+
+/**
+ * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
+ * # Safety
+ * sub must be live and out writable.
+ */
+MarmotStatus marmot_account_attention_subscription_snapshot(const struct MarmotAccountAttentionSubscription *sub,
+                                                            struct MarmotAccountAttentionSnapshot **out);
+
+/**
+ * Receive a complete replacement. Zero timeout waits indefinitely. Timeout/error/closed leaves
+ * out NULL. Timeout does not consume an update. Free results with the matching snapshot_free.
+ * # Safety
+ * sub must remain live throughout the call; out must be writable. Use one receiver per handle.
+ */
+MarmotStatus marmot_account_attention_subscription_next(const struct MarmotAccountAttentionSubscription *sub,
+                                                        uint32_t timeout_ms,
+                                                        struct MarmotAccountAttentionSnapshot **out);
+
+/**
+ * Cancel and free. NULL is a no-op; does not free previously returned snapshots.
+ * # Safety
+ * sub must be NULL or a library-owned handle with no active calls.
+ */
+void marmot_account_attention_subscription_free(struct MarmotAccountAttentionSubscription *sub);
+
+/**
+ * Open one account/view. A NULL initial_rows uses 50; otherwise requires 1–100.
+ * View is a MarmotChatListView discriminant. Take snapshot once, then receive replacements.
+ * # Safety
+ * client/string must be valid; initial_rows must be NULL or readable, out_sub writable.
+ */
+MarmotStatus marmot_open_chat_list_window(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          uint32_t view,
+                                          const uint32_t *initial_rows,
+                                          struct MarmotChatListWindowSubscription **out_sub);
+
+/**
+ * Open independent signed-in account summaries; requires no active chat-list handle.
+ * # Safety
+ * client must be valid; out_sub writable.
+ */
+MarmotStatus marmot_subscribe_account_attention(const struct MarmotClient *client,
+                                                struct MarmotAccountAttentionSubscription **out_sub);
+
+/**
+ * Apply a window command against the installed sequence, returning a complete replacement.
+ * May run while next waits. Stale sequence returns CHAT_WINDOW_STALE; refresh before retrying.
+ * The same completion also arrives through next; deduplicate by generation/sequence.
+ * # Safety
+ * sub must be live, any input string valid, and out writable. Never free during a call.
+ */
+MarmotStatus marmot_chat_list_window_subscription_page(const struct MarmotChatListWindowSubscription *sub,
+                                                       uint64_t sequence,
+                                                       uint32_t direction,
+                                                       uint32_t count,
+                                                       struct MarmotChatListWindowSnapshot **out);
+
+/**
+ * Apply a window command against the installed sequence, returning a complete replacement.
+ * May run while next waits. Stale sequence returns CHAT_WINDOW_STALE; refresh before retrying.
+ * The same completion also arrives through next; deduplicate by generation/sequence.
+ * # Safety
+ * sub must be live, any input string valid, and out writable. Never free during a call.
+ */
+MarmotStatus marmot_chat_list_window_subscription_set_visible_anchor(const struct MarmotChatListWindowSubscription *sub,
+                                                                     uint64_t sequence,
+                                                                     const char *group_id_hex,
+                                                                     struct MarmotChatListWindowSnapshot **out);
+
+/**
+ * Apply a window command against the installed sequence, returning a complete replacement.
+ * May run while next waits. Stale sequence returns CHAT_WINDOW_STALE; refresh before retrying.
+ * The same completion also arrives through next; deduplicate by generation/sequence.
+ * # Safety
+ * sub must be live, any input string valid, and out writable. Never free during a call.
+ */
+MarmotStatus marmot_chat_list_window_subscription_return_to_top(const struct MarmotChatListWindowSubscription *sub,
+                                                                uint64_t sequence,
+                                                                struct MarmotChatListWindowSnapshot **out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -9136,6 +9351,26 @@ void marmot_presented_chat_list_snapshot_free(struct MarmotPresentedChatListSnap
  * this library.
  */
 void marmot_presented_chat_list_update_free(struct MarmotPresentedChatListUpdate *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_list_window_snapshot_free(struct MarmotChatListWindowSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_account_attention_snapshot_free(struct MarmotAccountAttentionSnapshot *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

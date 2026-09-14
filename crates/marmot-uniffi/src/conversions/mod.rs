@@ -743,3 +743,6 @@ mod tests {
 
 mod presentation;
 pub use presentation::*;
+
+mod chat_window;
+pub use chat_window::*;

@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-07
+updated: 2026-09-14
 tags: [marmot, architecture, index]
 ---
 
@@ -198,6 +198,9 @@ These are longer working documents. Go here when you need depth, not orientation
     `IdentityRemove` design space.
 
 ### Current state — facts and analysis
+
+- **Doc:** [`further-context/chat-projections-native.md`](./further-context/chat-projections-native.md)
+  - **What it covers:** C4 native list-window and account-attention contracts, ownership, validation and client handoff.
 
 - **Doc:** [`further-context/chat-projection-inventory.md`](./further-context/chat-projection-inventory.md)
   - **What it covers:** Source-pinned inventory of chat-list, timeline, group, identity, and subscription projections;

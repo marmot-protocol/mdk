@@ -34,3 +34,5 @@ pub use onboarding::OnboardingSubscription;
 mod product_analytics;
 
 mod presentation;
+
+mod chat_window;

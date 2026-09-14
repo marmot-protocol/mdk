@@ -394,6 +394,13 @@ impl Marmot {
 
 pub use subscriptions::PresentedChatListSubscription;
 
+pub use conversions::{
+    AccountAttentionEntryFfi, AccountAttentionSnapshotFfi, AccountAttentionStateFfi,
+    AccountAttentionTotalFfi, AccountAttentionUnavailableFfi, ChatListAnchorOutcomeFfi,
+    ChatListPageDirectionFfi, ChatListViewFfi, ChatListWindowSnapshotFfi,
+};
+pub use subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -479,3 +479,6 @@ impl PresentedChatListSubscription {
         Ok(self.inner.lock().await.recv().await?.map(Into::into))
     }
 }
+
+mod chat_window;
+pub use chat_window::{AccountAttentionSubscription, ChatListWindowSubscription};

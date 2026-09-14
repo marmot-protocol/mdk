@@ -111,6 +111,11 @@ pub enum MarmotStatus {
     MediaUnfetchable = 71,
     /// Fetch, integrity, or decryption failed after a locator was selected.
     MediaDownloadFailed = 72,
+    ChatWindowInvalidLimit = 73,
+    ChatWindowStale = 74,
+    ChatWindowAnchorOutside = 75,
+    ChatWindowClosed = 76,
+    ChatWindowQuery = 77,
 }
 
 thread_local! {
@@ -131,6 +136,11 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
+        MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
+        MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
+        MarmotKitError::ChatWindowClosed => MarmotStatus::ChatWindowClosed,
+        MarmotKitError::ChatWindowQuery { .. } => MarmotStatus::ChatWindowQuery,
         MarmotKitError::ConsentRequired => MarmotStatus::ConsentRequired,
         MarmotKitError::InvalidProductAnalyticsConfiguration => {
             MarmotStatus::InvalidProductAnalyticsConfiguration
@@ -233,6 +243,13 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::ChatWindowInvalidLimit,
+            MarmotKitError::ChatWindowStale,
+            MarmotKitError::ChatWindowAnchorOutside,
+            MarmotKitError::ChatWindowClosed,
+            MarmotKitError::ChatWindowQuery {
+                details: "query".into(),
+            },
             MarmotKitError::ConsentRequired,
             MarmotKitError::InvalidProductAnalyticsConfiguration,
             MarmotKitError::InvalidProductObservation,
@@ -382,7 +399,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            63,
+            68,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         let mut seen = std::collections::BTreeSet::new();

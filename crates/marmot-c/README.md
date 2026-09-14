@@ -173,3 +173,9 @@ pump: hosts drive next on their own worker and decide how to retry errors. Timeo
 Free each result with `marmot_presented_chat_list_update_free` and the handle with
 `marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
 for version ordering, localization, readiness, and account-switch behavior.
+
+## Bounded chat screens
+
+C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
+See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
+for paging, sequence handling, cancellation, C ownership, and compatibility.
