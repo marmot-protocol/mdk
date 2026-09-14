@@ -560,7 +560,9 @@ async fn check(journey: Journey) {
             close_errors.push(error.to_string());
         }
     }
-    subject.shutdown().await.expect("app shutdown");
+    if let Err(error) = subject.shutdown().await {
+        close_errors.push(format!("shutdown: {error}"));
+    }
     drop(subject);
     save(
         artifacts.path(),
@@ -571,7 +573,10 @@ async fn check(journey: Journey) {
         }),
     )
     .unwrap();
-    if result.is_err() || std::env::var_os("MDK_APP_JOURNEY_ARTIFACTS").is_some() {
+    if result.is_err()
+        || !close_errors.is_empty()
+        || std::env::var_os("MDK_APP_JOURNEY_ARTIFACTS").is_some()
+    {
         eprintln!("public journey evidence: {}", artifacts.keep().display());
     }
     assert!(

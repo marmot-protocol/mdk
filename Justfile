@@ -1,7 +1,7 @@
 set shell := ["bash", "-cu"]
 
 diagnostics-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,marmot-c/otlp-export,wn-cli/otlp-export,agent-connector/otlp-export,marmot-app/product-analytics-export,marmot-uniffi/product-analytics-export,marmot-c/product-analytics-export,wn-cli/product-analytics-export,agent-connector/product-analytics-export"
-test-features := "wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks"
+test-features := "wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks"
 simulator-dedicated-filter := "not binary(adversarial_reliability_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate) and not binary(process_orchestrator)"
 simulator-smoke-filter := simulator-dedicated-filter + " and not (binary(canonical_scenarios) & (test(=convergence_chaos_family_generates_specs_with_semantic_expectations) | test(=convergence_chaos_family_seed_changes_scenarios) | test(=convergence_e2e_delivery_family_runs_generated_variants) | test(=bounded_convergence_pressure_family_settles_every_seeded_permutation)))"
 

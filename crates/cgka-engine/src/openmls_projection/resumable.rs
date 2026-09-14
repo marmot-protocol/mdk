@@ -399,6 +399,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
             group_changed = previous.source.group != source.group,
             snapshots_changed = previous.source.snapshots != source.snapshots,
             generation_changed = previous.source.write_generation != source.write_generation,
+            fingerprint_changed = previous.source.replay_fingerprint != source.replay_fingerprint,
             pass_changed = previous.pass_generation != pass_generation,
             policy_changed = previous.policy != policy,
             "candidate continuation validation"
@@ -602,6 +603,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
             group_changed = previous.source.group != source.group,
             snapshots_changed = previous.source.snapshots != source.snapshots,
             generation_changed = previous.source.write_generation != source.write_generation,
+            fingerprint_changed = previous.source.replay_fingerprint != source.replay_fingerprint,
             "candidate continuation validation"
         );
     }

@@ -1192,7 +1192,7 @@ restores service. App runtimes remain alive. A zero-connection interruption is e
 running-runtime counts and every concurrent caller's acceptance/refusal. Report validation rejects
 missing stimulus evidence as well as wrong public outcomes.
 
-`public-app-recovery-schedules/v1` (generator version 1) preserves the four-party unequal-history and
+`public-app-recovery-schedules/v1` (generator version 2) preserves the four-party unequal-history and
 competing-branch contract while combining 2–4 reviewed additional restart boundaries with seeded
 recipient request/wakeup ordering and history-repair waves. It uses the same exact expected final
 profile, membership, administrator set and five-message multiset as the cross-route regression.

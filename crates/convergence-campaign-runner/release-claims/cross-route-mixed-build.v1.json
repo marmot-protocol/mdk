@@ -3,7 +3,7 @@
   "lane": "release_hardening",
   "campaign_id": "cross-route-mixed-build-v1",
   "scenario_name": "cross-route-app-runtime-recovery/v1",
-  "canonical_ir_sha256": "1d416034df130ffeb7490c29c5ef9620ed0dce5a53aaf62bc00a2db74104dcc6",
+  "canonical_ir_sha256": "d470621118cad847587c42f0cef8cb67960f094f9a9ddb7c273c0aa02db156e0",
   "assurance_claim": "At the recorded source revision, the exact four-party canonical cross-route scenario completed through a mixed-build container run using the source revision and one exact ancestor build; the validated public process report reached one stable protocol and application projection, and the complete scheduled lane stayed within its reviewed resource and flake budgets.",
   "covered_decision_routes": [
     "ordinary_ingest",

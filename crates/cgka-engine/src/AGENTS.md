@@ -24,4 +24,5 @@ Local map for engine source modules. The crate-level map in `../AGENTS.md` has t
 
 ```sh
 cargo test -p cgka-engine
+cargo test -p cgka-engine --locked --features test-policy-overrides --lib resumable_public_background_advance_retains_progress_until_complete
 ```

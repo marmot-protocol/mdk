@@ -2209,6 +2209,8 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     Ok(search.finish())
 }
 
+// Frozen pre-continuation BFS: deliberately independent of CandidateSearch to
+// detect changes in probe order and deduplication, not just slice-size parity.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_stored_openmls_candidate_paths_reference<S: StorageProvider>(

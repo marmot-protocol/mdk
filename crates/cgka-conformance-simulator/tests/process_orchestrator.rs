@@ -1501,6 +1501,11 @@ async fn process_client_state_assertion_exhaustion_stops_before_next_action() {
 async fn unsupported_process_assertions_fail_before_launch() {
     use cgka_conformance_simulator::{ScenarioAssertionV2, ScenarioPredicateV2};
     let predicates = [
+        ScenarioAssertionV2::Resource {
+            metric: cgka_conformance_simulator::ScenarioResourceMetric::RunnableWork,
+            comparison: cgka_conformance_simulator::ScenarioComparison::Equal,
+            value: 0,
+        },
         ScenarioAssertionV2::Exactly {
             predicate: ScenarioPredicateV2::NoPendingWork {
                 clients: vec!["alice".into()],

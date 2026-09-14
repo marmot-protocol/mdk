@@ -2038,16 +2038,11 @@ impl<S: StorageProvider> Engine<S> {
         let has_convergence_inputs = self
             .has_unresolved_convergence_inputs_in_records(group_id, &group, &stored_message_records)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        let mut has_canonical_applications = false;
-        for record in &stored_message_records {
-            if !group.is_terminal()
-                && !group.unrecoverable
-                && Self::canonical_application_from_record(record, group.epoch.0).is_some()
-            {
-                has_canonical_applications = true;
-                break;
-            }
-        }
+        let has_canonical_applications = !group.is_terminal()
+            && !group.unrecoverable
+            && stored_message_records.iter().any(|record| {
+                Self::canonical_application_from_record(record, group.epoch.0).is_some()
+            });
         let has_deferred_peels = stored_message_records
             .iter()
             .any(|record| record.state == MessageState::PeelDeferred);

@@ -1648,12 +1648,11 @@ impl<S: StorageProvider> Engine<S> {
         false
     }
 
-    /// Runtime work signal, including canonical applications left after a
-    /// frozen pass. Unlike the internal convergence gate, application backlog
-    /// does not block sending or require another branch-selection pass.
+    /// Branch-ambiguity safety gate shared with outbound admission. Canonical
+    /// application backlog is independent background work, reported through
+    /// `prepare_convergence_cutoff_delay_ms` and the hydration wake queue.
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        Ok(self.has_unresolved_convergence_inputs(group_id)?
-            || self.has_pending_canonical_applications(group_id)?)
+        self.has_unresolved_convergence_inputs(group_id)
     }
 
     /// Milliseconds until the earliest scheduled SelfRemove auto-commit for

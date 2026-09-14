@@ -1964,6 +1964,26 @@ fn preflight_process_compiled_scenario(
 ) -> Result<(), crate::ScenarioRunError> {
     let mut process_compiled = compiled.clone();
     for action in &mut process_compiled.actions {
+        if let ScenarioStep::Assert { assertion } = &action.step
+            && !matches!(
+                assertion,
+                crate::ScenarioAssertionV2::Exactly {
+                    predicate: crate::ScenarioPredicateV2::ClientState { .. }
+                } | crate::ScenarioAssertionV2::Eventually {
+                    predicate: crate::ScenarioPredicateV2::ClientState { .. },
+                    ..
+                }
+            )
+        {
+            return Err(crate::ScenarioRunError {
+                step_index: Some(action.schedule.source_step_index),
+                kind: "unsupported_subject_capability".into(),
+                category: SubjectFailureCategory::Environment,
+                message:
+                    "subject marmot_app_process does not support the evaluation required by assert"
+                        .into(),
+            });
+        }
         if matches!(action.step, ScenarioStep::AwaitQuiescence { .. }) {
             action
                 .schedule

@@ -1,7 +1,7 @@
 ---
 title: "Convergence Reliability And Simulation Plan"
 created: 2026-07-30
-updated: 2026-09-12
+updated: 2026-09-14
 tags: [marmot, cgka, convergence, simulation, verification, reliability]
 status: working-plan
 ---
@@ -285,7 +285,7 @@ Categories:
 | E10 | `MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS` | 8 branch states | resource | Bounds the candidate branch states materialized as peel contexts so a settled contested pass can read traffic sealed under a branch this device has not adopted | Peel failure stays silence; recovered bytes are ordinary convergence input that the next pass authenticates through OpenMLS replay before they can influence selection | intended no | Contested-fork branch-relative peel test and the sealed-transport engine suite |
 | E11 | `FOREGROUND_DEFERRED_PEEL_BUDGET_MS` | 250 ms | resource, scheduler | Gives current-fingerprint deferred input one bounded opportunity ahead of every queued intent, after required authenticated convergence | Exhaustion durably queues the original intent as `AcceptedPending`; no wire bytes are prepared; authenticated-convergence time is excluded; elapsed deferred work and overrun are observable | intended no | Notify-gated 47/64-row tests, zero-wire assertion, monotonic timing metrics, and benchmark matrix |
 | E12 | `MAX_FOREGROUND_DEFERRED_ROWS` | 4 row attempts | resource, scheduler | Bounds deferred-row attempts per outbound preflight independently of peeler speed | Unattempted current-fingerprint rows remain durable and resume from the oldest uncompleted row after restart; unchanged historical rows stay behind queued work | intended no | Four-attempt boundary, restart-resume, same-fingerprint fairness, and 47/64-row backlog tests |
-| E13 | `BACKGROUND_CONVERGENCE_BUDGET_MS`, `BACKGROUND_CONVERGENCE_REPLAY_PROBES_PER_SLICE` | 500 ms; 32 probes per reconstruction slice | scheduler | Bounds live/background work cooperatively across sweeps, candidate probes and canonical application processing, sharing E4's 64-row allowance; explicit-time harness calls keep synchronous replay | Restore live state before yielding; retain memory-only search progress with the cumulative E7 budget; restart from durable frozen inputs after loss of scratch work; no retention extension or partial selection | intended no | Background row/time/restart tests, sliced-versus-original replay parity, process-kill recovery, and strict public app recovery |
+| E13 | `BACKGROUND_CONVERGENCE_BUDGET_MS`, `BACKGROUND_CONVERGENCE_REPLAY_PROBES_PER_SLICE` | 500 ms; 32 probes per reconstruction slice | scheduler | Bounds live/background work cooperatively across sweeps, candidate probes and canonical application processing, sharing E4's 64-row allowance; explicit-time harness calls keep synchronous replay | Restore live state before yielding; retain memory-only search progress with the cumulative E5/E6 replay budgets; restart from durable frozen inputs after loss of scratch work; no retention extension or partial selection | intended no | Background row/time/restart tests, sliced-versus-original replay parity, process-kill recovery, and strict public app recovery |
 
 #### App scheduler and input-recovery bounds
 

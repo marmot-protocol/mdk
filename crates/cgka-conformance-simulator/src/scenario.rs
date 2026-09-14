@@ -1572,7 +1572,12 @@ fn scenario_initial_admins(
             spec.steps
                 .iter()
                 .skip(create_step_index + 1)
-                .any(|step| admin_gated_actor(step).is_some_and(|actor| actor == invitee.as_str()))
+                .any(|step| match step {
+                    ScenarioStep::RaceGroupProfiles { updates } => {
+                        updates.iter().any(|update| update.client == **invitee)
+                    }
+                    _ => admin_gated_actor(step).is_some_and(|actor| actor == invitee.as_str()),
+                })
         })
         .cloned()
         .collect()
@@ -1682,6 +1687,39 @@ mod tests {
     use crate::{SubjectCapability, SubjectSendApplication};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn inferred_admins_include_every_profile_race_caller() {
+        let spec = ScenarioSpec {
+            name: "race admin inference".into(),
+            spec_version: "3".into(),
+            clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            topology: Default::default(),
+            steps: vec![
+                ScenarioStep::Barrier {
+                    name: "create boundary".into(),
+                },
+                ScenarioStep::RaceGroupProfiles {
+                    updates: vec![
+                        crate::ScenarioProfileUpdate {
+                            client: "bob".into(),
+                            name: Some("name".into()),
+                            description: None,
+                        },
+                        crate::ScenarioProfileUpdate {
+                            client: "carol".into(),
+                            name: None,
+                            description: Some("description".into()),
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(
+            scenario_initial_admins(&spec, 0, &["bob".into(), "carol".into()]),
+            vec!["bob", "carol"]
+        );
+    }
 
     struct RecordingSubject {
         descriptor: SubjectDescriptor,

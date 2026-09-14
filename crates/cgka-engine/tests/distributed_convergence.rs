@@ -11099,7 +11099,7 @@ async fn canonical_application_backlog_resumes_after_restart_in_bounded_turns_wi
     let mut carol = build_client_with_storage(b"carol", storage.clone());
     carol.hydrate_all_stored_groups().unwrap();
     assert!(carol.drain_pending_convergence_groups().contains(&group));
-    assert!(carol.has_pending_convergence_inputs(&group).unwrap());
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
     assert_eq!(
         carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
         Some(0)
@@ -11145,7 +11145,11 @@ async fn canonical_application_backlog_resumes_after_restart_in_bounded_turns_wi
             .count(),
         64
     );
-    assert!(carol.has_pending_convergence_inputs(&group).unwrap());
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
     assert!(
         carol
             .advance_convergence_inputs_until_settled(&group, 3_000_000)
@@ -11201,7 +11205,11 @@ async fn canonical_application_drain_waits_for_future_epoch_and_rejects_unreadab
     // is known here; the app must authenticate under the actual canonical keys.
     let _ = alice_rename_commit(&mut carol, &group, "carol branch").await;
     carol.drain_events();
-    assert!(carol.has_pending_convergence_inputs(&group).unwrap());
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
     assert!(
         carol
             .advance_convergence_inputs_until_settled(&group, 3_000_000)
@@ -11321,18 +11329,76 @@ async fn canonical_application_work_excludes_terminal_and_unknown_groups() {
     carol
         .buffer_openmls_convergence_message_at(&group, app, 1_000)
         .unwrap();
-    assert!(carol.has_pending_convergence_inputs(&group).unwrap());
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
     let mut record = storage.get_group(&group).unwrap();
     record.removed = true;
     storage.put_group(&record).unwrap();
     assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
     record.removed = false;
     record.unrecoverable = true;
     storage.put_group(&record).unwrap();
     assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
     assert!(
         !carol
             .has_pending_convergence_inputs(&GroupId::new(b"unknown".to_vec()))
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn canonical_application_backlog_survives_an_epoch_advancing_send() {
+    let (mut alice, _) = build_client(b"alice");
+    let (mut carol, storage) = build_client(b"carol");
+    let group =
+        create_reservation_test_group(&mut alice, &mut carol, "backlog and self update").await;
+    let app = send_app(&mut alice, &group, b"before self update".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group, app.clone(), 1_000)
+        .unwrap();
+    carol.drain_events();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    let before = carol.epoch(&group).unwrap();
+    let (_, pending) = evolution(
+        carol
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    carol.confirm_published(pending).await.unwrap();
+    assert_eq!(carol.epoch(&group).unwrap(), EpochId(before.0 + 1));
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group, 3_000_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        storage.get_message(&content_id(&app)).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(carol.drain_events().iter().filter(|event| matches!(event,
+        GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"before self update"
+    )).count(), 1);
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
     );
 }

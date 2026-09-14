@@ -99,13 +99,16 @@ fn v3_schema_adds_post_v2_actions_without_rewriting_v2() {
         .iter()
         .filter_map(|variant| variant["properties"]["type"]["const"].as_str())
         .collect::<BTreeSet<_>>();
-    let mut v3_declared_kinds = v3_schema["$defs"]["step"]["oneOf"]
+    let mut v3_declared_kinds = BTreeSet::new();
+    for variant in v3_schema["$defs"]["step"]["oneOf"]
         .as_array()
         .expect("v3 step variants")
-        .iter()
-        .filter_map(|variant| variant["properties"]["type"]["const"].as_str())
-        .collect::<BTreeSet<_>>();
-    for definition in v3_schema["$defs"].as_object().unwrap().values() {
+    {
+        let definition = variant["$ref"]
+            .as_str()
+            .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            .map(|name| &v3_schema["$defs"][name])
+            .unwrap_or(variant);
         if let Some(kind) = definition["properties"]["type"]["const"].as_str() {
             v3_declared_kinds.insert(kind);
         }

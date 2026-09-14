@@ -16,6 +16,20 @@ SPEC.loader.exec_module(campaign)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_cleanup_failure_preserves_result_and_fails_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = {"id": "cleanup-failure", "kind": "test", "command": ["test-binary"], "timeout": 10}
+            def fake_run(_command, directory, _env, _timeout):
+                (directory / "output.log").write_text("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                return {"exit_code": 0, "timed_out": False}
+            with patch.object(campaign, "run_command", side_effect=fake_run), patch.object(campaign.shutil, "rmtree", side_effect=OSError("injected cleanup failure")):
+                result = campaign.execute(task, root, {})
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["exit_code"], 0)
+            self.assertIn("scratch cleanup failed", result["evidence_errors"][0])
+            self.assertEqual(json.loads((root / task["id"] / "result.json").read_text()), result)
+
     def test_process_canary_uses_the_preserved_production_node(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

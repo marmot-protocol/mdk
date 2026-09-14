@@ -58,7 +58,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let tip = group.epoch.0;
         let mut messages = Vec::new();
-        for record in self.storage.list_messages_in_states(
+        self.storage.visit_messages_in_states(
             group_id,
             &[
                 MessageState::Created,
@@ -66,14 +66,13 @@ impl<S: StorageProvider> Engine<S> {
                 MessageState::ConvergenceDeferred,
             ],
             EpochId(0),
-        )? {
-            if let Some(message) = Self::canonical_application_from_record(&record, tip) {
-                messages.push(message);
-                if messages.len() == limit {
-                    break;
+            &mut |record| {
+                if let Some(message) = Self::canonical_application_from_record(&record, tip) {
+                    messages.push(message);
                 }
-            }
-        }
+                messages.len() < limit
+            },
+        )?;
         Ok(messages)
     }
 
@@ -114,19 +113,27 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(execution, DeferredPeelExecution::Foreground(_)) {
             return Ok(AdvanceConvergenceStatus::Settled);
         }
-        for message in self.pending_canonical_applications(group_id, execution.row_limit())? {
+        let messages = self.pending_canonical_applications(group_id, execution.row_limit())?;
+        if messages.is_empty() {
+            return Ok(if self.has_pending_canonical_applications(group_id)? {
+                AdvanceConvergenceStatus::Pending
+            } else {
+                AdvanceConvergenceStatus::Settled
+            });
+        }
+        let tip = self.storage.get_group(group_id)?.epoch.0;
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(replay_error)?;
+        let profile = ReplayProfilePolicy {
+            reject_legacy_group_additions: self.new_protocol_profile
+                == cgka_traits::group::ProtocolProfile::Current,
+        };
+        for message in messages {
             if execution.exhausted() {
                 break;
             }
             execution.consume_row();
-            let tip = self.storage.get_group(group_id)?.epoch.0;
-            let policy = self
-                .convergence_policy_for_group(group_id)
-                .map_err(replay_error)?;
-            let profile = ReplayProfilePolicy {
-                reject_legacy_group_additions: self.new_protocol_profile
-                    == cgka_traits::group::ProtocolProfile::Current,
-            };
             let source_epoch = project_mls_message(&message.payload)
                 .map_err(replay_error)?
                 .source_epoch

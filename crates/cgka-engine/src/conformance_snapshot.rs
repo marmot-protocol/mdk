@@ -582,6 +582,7 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
             false
         } else {
             engine.has_pending_convergence_inputs(group_id)?
+                || engine.has_pending_canonical_applications(group_id)?
         }),
         queued_outbound_intents: engine.storage.list_queued_outbound_intents(group_id)?.len(),
         stored_created_messages,

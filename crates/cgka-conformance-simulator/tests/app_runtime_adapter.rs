@@ -607,14 +607,25 @@ async fn dropping_app_harness_reaps_children_even_without_explicit_shutdown() {
 #[cfg(unix)]
 #[test]
 fn relay_child_exits_when_its_coordinator_is_killed() {
+    for shell in ["/bin/sh", "/bin/dash"] {
+        if std::path::Path::new(shell).exists() {
+            assert_relay_child_exits_when_its_coordinator_is_killed(shell);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_relay_child_exits_when_its_coordinator_is_killed(shell: &str) {
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
     let script = r#"export MDK_APP_PROCESS_PARENT_PID=$$
-"$1" --app-harness relay <&0 &
+# Preserve the pipe before dash applies /dev/null to an asynchronous command.
+exec 3<&0
+"$1" --app-harness relay <&3 3<&- &
 printf '%s\n' "$!"
 wait
 "#;
-    let mut owner = Command::new("/bin/sh")
+    let mut owner = Command::new(shell)
         .args([
             "-c",
             script,

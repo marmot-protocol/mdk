@@ -158,14 +158,15 @@ A frozen convergence batch can advance one epoch beyond its admission ceiling. A
 applications at that new tip remain durable input, even when no commit can open another pass.
 Background advancement drains these inputs against the stable canonical state after convergence and
 deferred peeling finish. It shares the existing 64-row allowance and cooperative 500 ms background
-budget; a started MLS operation completes before yielding. Input discovery uses the existing
-state-filtered storage enumeration, so the row allowance bounds processing rather than the scan.
+budget; a started MLS operation completes before yielding. Input discovery streams state-filtered
+storage rows and stops once it has enough matches; classification may still scan a nonmatching prefix.
 
 This is scheduling work, not branch ambiguity: it does not open a convergence pass, gate a foreground
 send, or consume the completed pass's queued-intent fairness slot. Remaining work recreates a scheduling
-edge, including after hydration; `has_pending_convergence_inputs` includes it and
-`prepare_convergence_cutoff_delay_ms` reports it ready. An advance may report branch settlement while
-application work remains for another turn. Future-epoch input waits for canonical state to advance.
+edge, including after hydration; `prepare_convergence_cutoff_delay_ms` reports it ready independently
+of `has_pending_convergence_inputs`, which retains its branch-ambiguity safety-gate meaning. An advance
+may report branch settlement while application work remains for another turn. Future-epoch input waits
+for canonical state to advance.
 
 The drain uses the same OpenMLS sender/payload validation and source-state retention decision as
 canonical replay. Direct ingestion and replay attribute applications using the authenticated source-epoch

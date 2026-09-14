@@ -285,13 +285,17 @@ def execute(task, root, env):
     if task["kind"] == "generated":
         command += ["--out", str(directory / "cases")]
     write_json(directory / "command.json", command)
+    cleanup_error = None
     try:
         result = dict(task, **run_command(command, directory, task_env, task["timeout"]))
         result["command"] = command
     finally:
         # The parent/group has been reaped before removing participant stores.
         # Reports and journey evidence are siblings, never inside this scratch root.
-        shutil.rmtree(scratch)
+        try:
+            shutil.rmtree(scratch)
+        except OSError as error:
+            cleanup_error = str(error)
     errors = []
     if task["kind"] == "generated":
         try:
@@ -303,6 +307,8 @@ def execute(task, root, env):
         output = (directory / "output.log").read_text(errors="replace")
         if not re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", output):
             errors.append("exact test did not execute once")
+    if cleanup_error is not None:
+        errors.append(f"scratch cleanup failed: {cleanup_error}")
     result["evidence_errors"] = errors
     result["passed"] = result["exit_code"] == 0 and not result["timed_out"] and not errors
     if task.get("diagnostic") and not result["passed"]:
