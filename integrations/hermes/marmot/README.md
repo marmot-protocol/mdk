@@ -40,11 +40,21 @@ closed and preserves the existing state for operator recovery.
 
 Hermes does not yet expose a typed durable turn-start or finality callback. The
 adapter therefore records `handed` immediately before calling the host and
-`completed` after the host returns normally. If the process dies while the host
-call is in flight, the next owner marks the remaining `handed` obligation
-`unresolved` and does not replay it blindly into a possibly recovering Hermes
-turn. Pre-handoff dispatch failures use the bounded retry ladder and then move
-to `failed`, allowing later same-group work to proceed. This slice closes the
+`unresolved` after even a normal return: Hermes may only have buffered the
+message or started background processing. If the process dies during that
+handoff, the next owner also marks the remaining `handed` obligation
+`unresolved`. These unknown outcomes are never automatically replayed into a
+possibly recovering Hermes turn. The schema reserves `completed` for a future
+proven finality boundary; the adapter does not currently produce it.
+
+Unknown outcomes share bounded terminal retention with intentional skips and
+exhausted retries: by default, journal admission prunes entries older than
+seven days and retains at most 8192 terminal entries. This is an operational
+recovery window, not a permanent completion ledger. Pending prompts are never
+evicted by that retention policy. Pre-handoff dispatch failures use the bounded
+retry ladder and then move to `failed`, allowing later same-group work to
+proceed. Shutdown fences admission, cancels and joins debounce producers, and
+then drains the keyed queue before closing the spool. This slice closes the
 queue/debounce crash windows without
 claiming exactly-once external tool effects, complete session lineage, or
 general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state

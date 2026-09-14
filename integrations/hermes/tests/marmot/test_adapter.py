@@ -5211,10 +5211,12 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 client=unittest.mock.AsyncMock(),
             )
-            private_error = OSError(f"stat failed for {image}")
+            private_error = OSError(f"open failed for {image}")
 
             with (
-                unittest.mock.patch.object(self.adapter_module.Path, "stat", side_effect=private_error),
+                unittest.mock.patch.object(
+                    self.adapter_module, "open_outbound_media_source", side_effect=private_error
+                ),
                 unittest.mock.patch.object(self.adapter_module.logger, "debug") as debug_log,
                 self.assertRaises(self.adapter_module.AgentControlError) as raised,
             ):
@@ -7124,6 +7126,133 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await adapter._inbound_spool_call(adapter._inbound_spool.close)
+
+    async def test_shutdown_fence_releases_a_claim_completed_after_admission_started(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        await adapter._inbound_spool_call(adapter._inbound_spool.record, event)
+        claimed = asyncio.Event()
+        release = asyncio.Event()
+        original_call = adapter._inbound_spool_call
+
+        async def pause_claim(operation, *args, **kwargs):
+            result = await original_call(operation, *args, **kwargs)
+            if operation == adapter._inbound_spool.claim:
+                claimed.set()
+                await release.wait()
+            return result
+
+        adapter._inbound_spool_call = pause_claim
+        admission = asyncio.create_task(adapter._try_admit_spooled(event["message_id_hex"]))
+        try:
+            await asyncio.wait_for(claimed.wait(), timeout=1)
+            adapter._inbound_spool_admission_enabled = False
+            release.set()
+            self.assertFalse(await asyncio.wait_for(admission, timeout=1))
+            self.assertEqual(set(), adapter._inbound_queue._pending)
+            record = await original_call(adapter._inbound_spool.get, event["message_id_hex"])
+            self.assertEqual("pending", record.state)
+            adapter._inbound_spool_admission_enabled = True
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            self.assertEqual(["durable"], [message.text for message in adapter.events])
+        finally:
+            release.set()
+            await asyncio.gather(admission, return_exceptions=True)
+            await adapter.disconnect()
+
+    async def test_reopened_spool_rejects_a_previous_generation_claim_result(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        await adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        await adapter._inbound_spool_call(adapter._inbound_spool.record, event)
+        claimed = asyncio.Event()
+        release = asyncio.Event()
+        original_call = adapter._inbound_spool_call
+
+        async def pause_claim(operation, *args, **kwargs):
+            result = await original_call(operation, *args, **kwargs)
+            if operation == adapter._inbound_spool.claim:
+                claimed.set()
+                await release.wait()
+            return result
+
+        adapter._inbound_spool_call = pause_claim
+        admission = asyncio.create_task(adapter._try_admit_spooled(event["message_id_hex"]))
+        try:
+            await asyncio.wait_for(claimed.wait(), timeout=1)
+            generation = adapter._inbound_spool.generation
+            await original_call(adapter._inbound_spool.close, graceful=False)
+            await original_call(adapter._inbound_spool.open)
+            self.assertGreater(adapter._inbound_spool.generation, generation)
+            release.set()
+            self.assertFalse(await asyncio.wait_for(admission, timeout=1))
+            self.assertEqual(set(), adapter._inbound_queue._pending)
+            record = await original_call(adapter._inbound_spool.get, event["message_id_hex"])
+            self.assertEqual("pending", record.state)
+            await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            self.assertEqual(["durable"], [message.text for message in adapter.events])
+        finally:
+            release.set()
+            await asyncio.gather(admission, return_exceptions=True)
+            await adapter.disconnect()
+
+    async def test_disconnect_joins_a_debounce_flush_waiting_for_claim(self):
+        adapter = self.make_adapter(extra={"group_activation": "always", "debounce_ms": 1})
+        claimed = asyncio.Event()
+        cancelling_producers = asyncio.Event()
+        release = asyncio.Event()
+        original_call = adapter._inbound_spool_call
+        original_cancel_debounce = adapter._cancel_debounce_tasks
+        original_cancel_queue = adapter._inbound_queue.cancel_all
+        producer = None
+        producer_done_at_queue_cancel = []
+
+        async def pause_claim(operation, *args, **kwargs):
+            nonlocal producer
+            result = await original_call(operation, *args, **kwargs)
+            if operation == adapter._inbound_spool.claim:
+                producer = asyncio.current_task()
+                claimed.set()
+                await release.wait()
+            return result
+
+        async def cancel_debounce():
+            cancelling_producers.set()
+            await original_cancel_debounce()
+
+        async def cancel_queue():
+            producer_done_at_queue_cancel.append(producer.done())
+            await original_cancel_queue()
+
+        adapter._inbound_spool_call = pause_claim
+        adapter._cancel_debounce_tasks = cancel_debounce
+        adapter._inbound_queue.cancel_all = cancel_queue
+        shutdown = None
+        try:
+            await adapter._handle_control_event(self.make_event())
+            await asyncio.wait_for(claimed.wait(), timeout=1)
+            shutdown = asyncio.create_task(adapter.disconnect())
+            await asyncio.wait_for(cancelling_producers.wait(), timeout=1)
+            release.set()
+            await asyncio.wait_for(shutdown, timeout=1)
+            self.assertEqual([True], producer_done_at_queue_cancel)
+            self.assertTrue(producer.done())
+            self.assertEqual([], adapter.events)
+            self.assertEqual(set(), adapter._inbound_queue._pending)
+            self.assertFalse(adapter._inbound_spool.is_open)
+            await original_call(adapter._inbound_spool.open)
+            record = await original_call(adapter._inbound_spool.get, "33" * 32)
+            self.assertEqual("pending", record.state)
+        finally:
+            release.set()
+            await asyncio.gather(
+                *(task for task in (shutdown, producer) if task is not None),
+                return_exceptions=True,
+            )
+            await adapter.disconnect()
 
     async def test_post_commit_claim_verification_error_retries_once_and_preserves_fifo(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})

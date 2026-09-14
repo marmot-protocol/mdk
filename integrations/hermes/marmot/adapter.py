@@ -1404,6 +1404,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # bursts into one turn. Disabled when debounce_ms <= 0.
         self._debounce_pending: Dict[str, list[Dict[str, Any]]] = {}
         self._debounce_tasks: Dict[str, asyncio.Task] = {}
+        # A timer leaves the keyed map when flushing starts, but remains a
+        # producer until its asynchronous journal/claim work has settled.
+        self._debounce_producers: set[asyncio.Task] = set()
         # Failed compensating releases must remain discoverable in-process.
         # Durable debounce rows are intentionally hidden from due(), so the
         # ordinary spool retry loop cannot recover them without this handle.
@@ -1526,12 +1529,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     async def _cancel_debounce_tasks(self) -> None:
         try:
-            for task in self._debounce_tasks.values():
+            producers = tuple(self._debounce_producers)
+            for task in producers:
                 if not task.done():
                     task.cancel()
+            await asyncio.gather(*producers, return_exceptions=True)
             for items in self._debounce_pending.values():
                 await self._release_debounce_items(items, reason="debounce_cancelled")
         finally:
+            self._debounce_producers.clear()
             self._debounce_tasks.clear()
             self._debounce_pending.clear()
             self._pending_inbound_ids.clear()
@@ -2824,6 +2830,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
         if not self._inbound_spool_admission_enabled:
             return False
+        generation = self._inbound_spool.generation
         try:
             record = await self._inbound_spool_call(
                 self._inbound_spool.claim,
@@ -2831,6 +2838,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 ignore_backoff=ignore_backoff,
             )
         except StaleClaim:
+            return False
+        if generation != self._inbound_spool.generation:
+            # The new owner has already recovered the old generation's claims.
+            return False
+        if not self._inbound_spool_admission_enabled:
+            await self._inbound_spool_call(
+                self._inbound_spool.defer,
+                record.message_id,
+                delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
+                reason="shutdown_before_queue_admission",
+            )
             return False
         try:
             task = self._inbound_queue.enqueue(
@@ -3255,7 +3273,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._debounce_tasks[key] = loop.create_task(self._debounce_flush_after(key))
+        task = loop.create_task(self._debounce_flush_after(key))
+        self._debounce_tasks[key] = task
+        self._debounce_producers.add(task)
+        task.add_done_callback(self._debounce_producers.discard)
 
     async def _debounce_flush_after(self, key: str) -> None:
         try:
