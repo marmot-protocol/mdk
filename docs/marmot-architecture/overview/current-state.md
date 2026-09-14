@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-13
+updated: 2026-09-14
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,12 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
+It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
+required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
+archive; successful rejoin restores departed conversations. Independent attention summaries and native window
+bindings remain C4 M3/M4. See [bounded live chat-list windows](../further-context/chat-list-windows.md).
 
 Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
 it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined

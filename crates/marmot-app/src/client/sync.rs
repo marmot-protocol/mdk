@@ -4442,7 +4442,7 @@ impl AppClient {
     ///
     /// Returns whether the event forces a transport-route refresh.
     pub(crate) fn observe_event_projection_effects(
-        &self,
+        &mut self,
         event: &cgka_traits::engine::GroupEvent,
         local_account_id_hex: &str,
         summary: &mut SyncSummary,
@@ -4524,11 +4524,25 @@ impl AppClient {
         // `Left`, which is the intended mdk#1746 behavior on a re-add.
         if let Some(group_id) = self_arrival_group(event, local_account_id_hex) {
             let group_id_hex = hex::encode(group_id.as_slice());
-            self.app.set_group_self_membership(
-                &self.state.label,
-                &group_id_hex,
-                SelfMembership::Member,
-            )?;
+            let restored = self
+                .app
+                .account_storage(&self.state.label)?
+                .restore_group_self_membership(&group_id_hex)?;
+            if restored {
+                // Keep the worker's next projection save aligned with the same durable
+                // arrival; otherwise its old archive intent would undo this transition.
+                if let Some(group) = self
+                    .state
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.group_id_hex == group_id_hex)
+                {
+                    group.archived = false;
+                    group.self_membership = SelfMembership::Member;
+                }
+                self.mark_group_projection_dirty(group_id);
+            }
+            self.app.presentation_signals.wake();
         }
         Ok(routes_dirty)
     }

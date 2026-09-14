@@ -135,7 +135,12 @@ pub use runtime::{
     SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
     default_directory_discovery_relays,
 };
-pub use runtime::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
+pub use runtime::{
+    CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
+    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
+    RuntimePresentedChatListSubscription,
+};
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
     ChatPinState, ChatPresentationVersion, ConversationPresentation, PresentationResolution,
@@ -5060,7 +5065,10 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()
-            .map(|(_, storage)| storage)
+            .map(|(label, storage)| {
+                let _ = self.presentation_signals.account_resets.send(label);
+                storage
+            })
             .collect::<Vec<_>>();
         let directory_caches = self
             .directory_caches
@@ -5694,6 +5702,11 @@ impl MarmotApp {
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
+        // Close live bounded windows before a label can bind to another store.
+        let _ = self
+            .presentation_signals
+            .account_resets
+            .send(label.to_owned());
         if let Ok(account) = self.account_home().account(label) {
             self.account_publish_clients
                 .lock()

@@ -1025,3 +1025,181 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
     assert_eq!(current.rows[0].group_id_hex, "02");
     assert_eq!(current.rows[0].pinned_position, Some(0));
 }
+
+fn window_query(
+    limit: usize,
+    anchors: &[&str],
+    before_anchor: usize,
+) -> crate::ChatListWindowQuery {
+    crate::ChatListWindowQuery {
+        view: ChatListView::Chats,
+        limit,
+        anchors: anchors.iter().map(|s| (*s).into()).collect(),
+        before_anchor,
+    }
+}
+fn prepare_window_fixture(store: &SqliteAccountStorage, id: &str) {
+    use crate::{
+        ConversationPresentation, PresentationResolution, PresentationSource, PresentationText,
+        SelectedAvatar, StoredChatPresentation,
+    };
+    let input = store.chat_presentation_input(id).unwrap().unwrap();
+    store
+        .store_chat_presentation(
+            &input,
+            &StoredChatPresentation {
+                presentation: ConversationPresentation {
+                    title: PresentationText::Literal("Fixture".into()),
+                    avatar: SelectedAvatar::Placeholder {
+                        stable_seed: "fixture".into(),
+                        source: PresentationSource::GroupFallback,
+                    },
+                    title_source: PresentationSource::Group,
+                    avatar_source: PresentationSource::GroupFallback,
+                    peer_id: None,
+                    resolution: PresentationResolution::Cached,
+                },
+                profile_version: None,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn window_read_shares_one_snapshot_and_limits_only_required_selected_preparation() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for i in 0..250 {
+        seed(&store, &format!("{i:04x}"), false, "member", 1, false);
+    }
+    prepare_window_fixture(&store, "0000");
+    let read = store
+        .read_chat_list_window(window_query(2, &[], 0))
+        .unwrap();
+    assert!(read.snapshot.is_none());
+    assert_eq!(read.pending_presentations, ["0001"]);
+    prepare_window_fixture(&store, "0001");
+    let read = store
+        .read_chat_list_window(window_query(2, &[], 0))
+        .unwrap();
+    assert_eq!(read.snapshot.unwrap().rows.len(), 2);
+    assert!(read.pending_presentations.is_empty());
+    assert_eq!(ids(&read.page), ["0000", "0001"]);
+    // Fallback anchors are resolved in the same snapshot as both sides of the window.
+    let read = store
+        .read_chat_list_window(window_query(200, &["ffff", "007d"], 50))
+        .unwrap();
+    assert_eq!(read.anchor.as_deref(), Some("007d"));
+    assert_eq!(read.page.rows.len(), 200);
+    assert_eq!(
+        read.page.rows[75].group_id_hex, "007d",
+        "end fill retains the anchor while using available capacity"
+    );
+    assert!(!read.page.has_more_after);
+    assert!(read.page.has_more_before);
+    let reset = store
+        .read_chat_list_window(window_query(20, &["ffff"], 4))
+        .unwrap();
+    assert!(reset.anchor.is_none());
+    assert_eq!(reset.page.rows[0].group_id_hex, "0000");
+}
+
+#[test]
+fn bounded_window_composes_with_caller_transaction_and_rolls_back_as_one_unit() {
+    use cgka_traits::storage::{StorageError, StorageProvider};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for i in 0..20 {
+        let id = format!("{i:04x}");
+        seed(&store, &id, false, "member", 1, false);
+        prepare_window_fixture(&store, &id);
+    }
+    let result: Result<(), StorageError> = store.with_transaction(|s| {
+        s.lock()?
+            .execute(
+                "UPDATE account_groups SET archived=1 WHERE group_id_hex='0004'",
+                [],
+            )
+            .storage()?;
+        let read = s
+            .read_chat_list_window(window_query(10, &["0004", "0005"], 4))
+            .unwrap();
+        assert_eq!(read.anchor.as_deref(), Some("0005"));
+        assert_eq!(read.snapshot.unwrap().rows[4].row.group_id_hex, "0005");
+        Err(StorageError::NotFound)
+    });
+    assert!(result.is_err());
+    let read = store
+        .read_chat_list_window(window_query(10, &["0004"], 4))
+        .unwrap();
+    assert_eq!(read.anchor.as_deref(), Some("0004"));
+}
+
+#[test]
+fn ready_window_sql_work_is_bounded_across_account_and_history_sizes() {
+    use crate::query_work_test_support::measure;
+    let mut measurements = Vec::new();
+    for count in [20, 100, 200, 4096] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        for i in 0..count {
+            let id = format!("{i:04x}");
+            seed(&store, &id, false, "member", 1, false);
+            prepare_window_fixture(&store, &id);
+        }
+        // Real retained app-event history in a visible conversation must not be hydrated by this read.
+        store.lock().unwrap().execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5000) INSERT INTO app_events(group_id_hex, message_id_hex, direction, sender, plaintext, kind, tags_json, recorded_at, received_at) SELECT '0000', printf('%064x',x), 'received', 'sender', 'retained history', 9, '[]', x, x FROM n;").unwrap();
+        let (read, steps) = measure(&store, || {
+            store
+                .read_chat_list_window(window_query(20, &[], 0))
+                .unwrap()
+        });
+        assert_eq!(read.snapshot.unwrap().rows.len(), 20);
+        assert!(
+            steps < 6500,
+            "20-row window: {steps} SQL steps for {count} conversations"
+        );
+        measurements.push(steps);
+        if count >= 200 {
+            let (read, steps) = measure(&store, || {
+                store
+                    .read_chat_list_window(window_query(200, &["0096"], 150))
+                    .unwrap()
+            });
+            assert_eq!(read.snapshot.unwrap().rows.len(), 200);
+            assert!(
+                steps < 60000,
+                "200-row window: {steps} SQL steps for {count} conversations"
+            );
+        }
+    }
+    assert!(
+        measurements.iter().max().unwrap() - measurements.iter().min().unwrap() < 500,
+        "work should depend on window size: {measurements:?}"
+    );
+}
+
+#[test]
+fn authoritative_self_arrival_restores_departed_archive_once_and_preserves_ordinary_archive() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "01", true, "left", 4, false);
+    seed(&store, "02", true, "removed", 3, false);
+    seed(&store, "03", true, "member", 2, true);
+    for id in ["01", "02"] {
+        assert!(store.restore_group_self_membership(id).unwrap());
+        assert_eq!(
+            store.group_self_membership(id).unwrap(),
+            Some(crate::SelfMembership::Member)
+        );
+    }
+    assert!(!store.restore_group_self_membership("03").unwrap());
+    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01", "02"]);
+    assert_eq!(ids(&page(&store, ChatListView::Archived)), ["03"]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET archived=1 WHERE group_id_hex='01'",
+            [],
+        )
+        .unwrap();
+    assert!(!store.restore_group_self_membership("01").unwrap());
+    assert_eq!(ids(&page(&store, ChatListView::Archived)), ["01", "03"]);
+}

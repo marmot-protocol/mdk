@@ -182,5 +182,26 @@ fn commit_progress(
     }
     Ok(advanced)
 }
+
+/// Prepare only missing selections required by a bounded screen window. This does
+/// not advance the account-wide catch-up checkpoint or wait for unrelated rows.
+pub(crate) fn prepare_window(
+    account: &SqliteAccountStorage,
+    shared: &SqliteSharedStorage,
+    local: &str,
+    groups: &[String],
+) -> Result<(), AppError> {
+    let epoch = shared.directory_presentation_version()?.store_epoch;
+    for group in groups {
+        let Some(input) = account.chat_presentation_input(group)? else {
+            continue;
+        };
+        for (input, selected) in prepare(shared, local, &epoch, vec![input])? {
+            account.store_chat_presentation(&input, &selected)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

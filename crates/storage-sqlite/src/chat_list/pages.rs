@@ -61,7 +61,7 @@ const KEY_COLUMNS: &str = "list_pin_section, list_pin_order, list_activity_order
 const REVERSE: &str =
     "list_pin_section DESC, list_pin_order DESC, list_activity_order DESC, group_id_hex DESC";
 impl ChatListView {
-    fn predicate(self) -> &'static str {
+    pub(super) fn predicate(self) -> &'static str {
         match self {
             Self::Chats => "list_scope = 0",
             Self::Unread => "list_scope = 0 AND list_unread = 1",
@@ -157,6 +157,10 @@ pub struct ChatListPage {
 pub enum ChatListPageError {
     #[error("chat page limit must be between 1 and 100")]
     InvalidLimit,
+    #[error(
+        "chat window requires 1 to 200 rows, at most 200 anchors, and an anchor position within the window"
+    )]
+    InvalidWindowQuery,
     #[error("chat cursor belongs to a different account store or view")]
     CursorMismatch,
     #[error("chat list ordering or membership changed; refresh the window")]
@@ -207,7 +211,7 @@ impl SqliteAccountStorage {
     }
     fn read_chat_list_page(
         &self,
-        mut query: ChatListPageQuery,
+        query: ChatListPageQuery,
         anchor: Option<&str>,
     ) -> Result<ChatListPage, ChatListPageError> {
         if !(1..=100).contains(&query.limit) {
@@ -219,20 +223,34 @@ impl SqliteAccountStorage {
         } else {
             None
         };
-        let tx: &Connection = &conn;
-        let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row_cached(
+        let page = read_page_tx(&conn, query, anchor)?;
+        if let Some(tx) = owned_tx {
+            tx.commit().storage()?;
+        }
+        Ok(page)
+    }
+}
+
+// The caller holds the connection guard and owns the snapshot. Runtime-window
+// reads compose multiple seeks here without releasing it between boundaries.
+pub(super) fn read_page_tx(
+    tx: &Connection,
+    mut query: ChatListPageQuery,
+    anchor: Option<&str>,
+) -> Result<ChatListPage, ChatListPageError> {
+    let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row_cached(
             "SELECT p.store_epoch, n.revision FROM chat_presentation_meta p, chat_list_navigation_meta n WHERE p.id = 1 AND n.id = 1",
             [], |r|Ok((r.get(0)?, r.get(1)?))).storage()?;
-        if let Some(cursor) = &query.cursor {
-            if cursor.store_epoch != store_epoch || cursor.view != query.view {
-                return Err(ChatListPageError::CursorMismatch);
-            }
-            if cursor.revision != revision {
-                return Err(ChatListPageError::StaleCursor);
-            }
+    if let Some(cursor) = &query.cursor {
+        if cursor.store_epoch != store_epoch || cursor.view != query.view {
+            return Err(ChatListPageError::CursorMismatch);
         }
-        if let Some(group) = anchor {
-            let key = tx
+        if cursor.revision != revision {
+            return Err(ChatListPageError::StaleCursor);
+        }
+    }
+    if let Some(group) = anchor {
+        let key = tx
                 .query_row_cached(
                     &format!(
                         "SELECT {KEY_COLUMNS} FROM chat_list_rows WHERE lower(group_id_hex) = lower(?1) AND {}",
@@ -251,85 +269,81 @@ impl SqliteAccountStorage {
                 .optional()
                 .storage()?
                 .ok_or(ChatListPageError::AnchorUnavailable)?;
-            query.cursor = Some(ChatListCursor {
-                store_epoch: store_epoch.clone(),
-                revision,
-                view: query.view,
-                key,
-            });
-        }
-        let relation = query
-            .cursor
-            .as_ref()
-            .map(|_| match (query.direction, anchor.is_some()) {
-                (ChatListPageDirection::Forward, true) => ">=",
-                (ChatListPageDirection::Forward, false) => ">",
-                (ChatListPageDirection::Backward, true) => "<=",
-                (ChatListPageDirection::Backward, false) => "<",
-            });
-        let mut parameters = query
-            .cursor
-            .as_ref()
-            .map(|c| key_params(&c.key))
-            .unwrap_or_default();
-        parameters.push((query.limit as i64).into());
-        let mut statement = tx
-            .prepare_cached(&navigation_sql(
-                query.view,
-                relation,
-                query.direction,
-                false,
-            ))
-            .storage()?;
-        let mut keys = statement
-            .query_map(params_from_iter(parameters), |r| {
-                Ok(SortKey {
-                    section: r.get(0)?,
-                    pin: r.get(1)?,
-                    activity: r.get(2)?,
-                    group: r.get(3)?,
-                })
-            })
-            .storage()?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .storage()?;
-        drop(statement);
-        if query.direction == ChatListPageDirection::Backward {
-            keys.reverse();
-        }
-        let cursor = |key: &SortKey| ChatListCursor {
+        query.cursor = Some(ChatListCursor {
             store_epoch: store_epoch.clone(),
             revision,
             view: query.view,
-            key: key.clone(),
-        };
-        let first = keys.first().map(&cursor);
-        let last = keys.last().map(cursor);
-        let (has_more_before, has_more_after) = match (keys.first(), keys.last()) {
-            (Some(first), Some(last)) => (
-                has_rows(tx, query.view, first, "<")?,
-                has_rows(tx, query.view, last, ">")?,
-            ),
-            _ => match &query.cursor {
-                Some(c) if query.direction == ChatListPageDirection::Forward => {
-                    (has_rows(tx, query.view, &c.key, "<=")?, false)
-                }
-                Some(c) => (false, has_rows(tx, query.view, &c.key, ">=")?),
-                None => (false, false),
-            },
-        };
-        let rows = page_rows(tx, &keys)?;
-        if let Some(tx) = owned_tx {
-            tx.commit().storage()?;
-        }
-        Ok(ChatListPage {
-            rows,
-            first,
-            last,
-            has_more_before,
-            has_more_after,
-        })
+            key,
+        });
     }
+    let relation = query
+        .cursor
+        .as_ref()
+        .map(|_| match (query.direction, anchor.is_some()) {
+            (ChatListPageDirection::Forward, true) => ">=",
+            (ChatListPageDirection::Forward, false) => ">",
+            (ChatListPageDirection::Backward, true) => "<=",
+            (ChatListPageDirection::Backward, false) => "<",
+        });
+    let mut parameters = query
+        .cursor
+        .as_ref()
+        .map(|c| key_params(&c.key))
+        .unwrap_or_default();
+    parameters.push((query.limit as i64).into());
+    let mut statement = tx
+        .prepare_cached(&navigation_sql(
+            query.view,
+            relation,
+            query.direction,
+            false,
+        ))
+        .storage()?;
+    let mut keys = statement
+        .query_map(params_from_iter(parameters), |r| {
+            Ok(SortKey {
+                section: r.get(0)?,
+                pin: r.get(1)?,
+                activity: r.get(2)?,
+                group: r.get(3)?,
+            })
+        })
+        .storage()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .storage()?;
+    drop(statement);
+    if query.direction == ChatListPageDirection::Backward {
+        keys.reverse();
+    }
+    let cursor = |key: &SortKey| ChatListCursor {
+        store_epoch: store_epoch.clone(),
+        revision,
+        view: query.view,
+        key: key.clone(),
+    };
+    let first = keys.first().map(&cursor);
+    let last = keys.last().map(cursor);
+    let (has_more_before, has_more_after) = match (keys.first(), keys.last()) {
+        (Some(first), Some(last)) => (
+            has_rows(tx, query.view, first, "<")?,
+            has_rows(tx, query.view, last, ">")?,
+        ),
+        _ => match &query.cursor {
+            Some(c) if query.direction == ChatListPageDirection::Forward => {
+                (has_rows(tx, query.view, &c.key, "<=")?, false)
+            }
+            Some(c) => (false, has_rows(tx, query.view, &c.key, ">=")?),
+            None => (false, false),
+        },
+    };
+    let rows = page_rows(tx, &keys)?;
+    Ok(ChatListPage {
+        rows,
+        first,
+        last,
+        has_more_before,
+        has_more_after,
+    })
 }
 
 fn page_rows_sql() -> String {

@@ -3069,7 +3069,8 @@ impl AppClient {
             .find(|group| group.group_id_hex == group_id_hex)
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         *group = authoritative;
-        self.set_group_invite_confirmation(group_id, false, false)
+        let archived = group.archived;
+        self.set_group_invite_confirmation(group_id, false, archived)
     }
 
     pub async fn decline_group_invite(

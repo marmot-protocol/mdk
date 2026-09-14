@@ -1,4 +1,5 @@
 mod pages;
+mod window;
 use crate::account_projection::chat_mute_is_effective;
 use crate::connection::CachedSql;
 use crate::storage::disband_requests::{
@@ -24,6 +25,7 @@ pub use pages::{
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+pub use window::{ChatListWindowQuery, ChatListWindowRead};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListQuery {
