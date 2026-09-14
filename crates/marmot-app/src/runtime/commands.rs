@@ -115,7 +115,7 @@ impl AccountManager {
             manager
                 .shared
                 .app_performance_telemetry()
-                .record_sync_result(
+                .record_classified_result(
                     AppPerformanceOperation::AccountCatchUp,
                     started_at.elapsed(),
                     result
@@ -1034,14 +1034,21 @@ impl AccountManager {
                 })
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
-            local_account_worker_response(response).await
+            account_worker_response(response).await
         }
         .await;
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::GroupAcceptInvite,
-            started_at.elapsed(),
-            result.is_ok(),
-        );
+        self.shared
+            .app_performance_telemetry()
+            .record_classified_result(
+                AppPerformanceOperation::GroupAcceptInvite,
+                started_at.elapsed(),
+                result.as_ref().err().map(|error| {
+                    crate::SyncFailureClassification::new(
+                        crate::SyncFailureStage::AccountWorker,
+                        error.sync_error_class(),
+                    )
+                }),
+            );
         result
     }
 
@@ -1988,6 +1995,68 @@ impl AccountManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_waits_past_local_limit() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+        let manager = runtime.accounts();
+        let (commands, mut received) = mpsc::channel(1);
+        let (shutdown, stopped) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) =
+                received.recv().await
+            else {
+                panic!("expected invite acceptance");
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+            respond
+                .send(Err(AppError::InvalidAppMessagePayload(
+                    "test protocol failure".into(),
+                )))
+                .unwrap();
+            let _ = stopped.await;
+        });
+        manager.workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
+                handle,
+                commands,
+                shutdown,
+            },
+        );
+        let error = manager
+            .accept_group_invite(&account.label, &GroupId::new([1; 16]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::InvalidAppMessagePayload(_)),
+            "{error}"
+        );
+        let recorded = manager
+            .shared
+            .app_performance_telemetry()
+            .snapshot()
+            .group_accept_invite;
+        assert_eq!(recorded.attempts, 1);
+        assert_eq!(
+            recorded.failure_classifications[0]
+                .classification
+                .error_class,
+            crate::SyncErrorClass::Protocol
+        );
+        runtime.shutdown().await;
+    }
 
     #[tokio::test]
     async fn catch_up_uses_mutation_worker() {
