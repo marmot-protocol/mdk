@@ -27,6 +27,16 @@ The crate is split around storage concerns:
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
   tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
+## Replay-state validation
+
+`group_replay_state_fingerprint` captures a consistent read of the same live canonical/OpenMLS state as a
+state-scoped snapshot, plus all retained snapshot/checkpoint bytes and checkpoint epochs. It excludes live message,
+outbound, and app-projection rows; the engine validates its frozen inputs separately. The fingerprint stays in engine
+memory and must never be logged or persisted. No schema migration or durable counter is needed.
+
+This lets resumable reconstruction distinguish actual state changes from unrelated writes through another app
+connection. The older `mls_write_generation` contract remains unchanged for cached `MlsGroup` objects.
+
 ## Migrations
 
 Account/session schema changes go through Rust migrations. The runner and ordered registry live in

@@ -941,6 +941,24 @@ pub trait StorageProvider:
         None
     }
 
+    /// Optional cryptographic content fingerprint for resumable group replay.
+    /// Covers live canonical/OpenMLS state (including secret ratchets), member
+    /// validation/capabilities/policy, and every retained snapshot/checkpoint
+    /// that replay can restore. Capture must be a consistent read. Mutable
+    /// message/outbound/app-projection rows are excluded: callers separately
+    /// validate their exact frozen inputs and pass identity.
+    ///
+    /// Unlike `mls_write_generation`, unchanged content may retain this value
+    /// across no-op restores or unrelated writes through another connection.
+    /// `None` leaves callers using strict generation invalidation. This is
+    /// memory-only, secret-derived validation material: never log or persist it.
+    fn group_replay_state_fingerprint(
+        &self,
+        _group_id: &GroupId,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        Ok(None)
+    }
+
     /// Optional account-device maintenance store.
     ///
     /// This is accessor composition for the same reason as `mls_storage()`:

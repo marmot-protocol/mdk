@@ -195,7 +195,8 @@ impl<S: StorageProvider> Engine<S> {
     /// This is intentionally a command, not a diagnostic query: when eligible
     /// retained input exists it may open a pass, discard one left behind by an
     /// advanced tip, consume a dormant fairness slot, or persist restart deadline
-    /// rebasing before returning the delay.
+    /// rebasing before returning the delay. Runnable canonical applications
+    /// report `Some(0)` without opening a pass or gating outbound work.
     pub fn prepare_convergence_cutoff_delay_ms(
         &mut self,
         group_id: &GroupId,
@@ -219,6 +220,12 @@ impl<S: StorageProvider> Engine<S> {
                 Some(pass.cutoff_monotonic_ms().saturating_sub(now.monotonic_ms))
             }
             Some(pass) if pass.is_active() => Some(0),
+            _ if self
+                .has_pending_canonical_applications(group_id)
+                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))? =>
+            {
+                Some(0)
+            }
             _ => None,
         })
     }
@@ -1055,13 +1062,31 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
-        self.converge_stored_openmls_messages_with_time(group_id, self.convergence_now())
+        self.converge_stored_openmls_messages_with_deadline(
+            group_id,
+            self.convergence_now(),
+            Some(
+                web_time::Instant::now()
+                    + std::time::Duration::from_millis(
+                        crate::message_processor::BACKGROUND_CONVERGENCE_BUDGET_MS,
+                    ),
+            ),
+        )
     }
 
     pub(crate) fn converge_stored_openmls_messages_with_time(
         &mut self,
         group_id: &GroupId,
         now: ConvergenceTime,
+    ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        self.converge_stored_openmls_messages_with_deadline(group_id, now, None)
+    }
+
+    pub(crate) fn converge_stored_openmls_messages_with_deadline(
+        &mut self,
+        group_id: &GroupId,
+        now: ConvergenceTime,
+        deadline: Option<web_time::Instant>,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
         let now_ms = now.monotonic_ms;
         // A convergence pass over a seeded-but-unhydrated group promotes it
@@ -1292,39 +1317,69 @@ impl<S: StorageProvider> Engine<S> {
             .iter()
             .map(|member| member.message_id.clone())
             .collect();
-        let result = canonicalize_stored_openmls_messages_with_profile_policy(
-            &self.storage,
-            group_id,
-            state,
-            vec![],
-            policy,
-            now_ms,
-            StoredCanonicalizationOptions {
-                replay_profile: replay_profile_policy,
-                admitted_message_ids: Some(&admitted_message_ids),
-                shared_seen_message_ids: Some(shared_seen_message_ids),
-                admit_app_witnesses: {
-                    #[cfg(feature = "test-policy-overrides")]
-                    {
-                        self.admit_app_witnesses
-                    }
-                    #[cfg(not(feature = "test-policy-overrides"))]
-                    {
-                        true
-                    }
-                },
-                replay_probe_budget_override: {
-                    #[cfg(feature = "test-policy-overrides")]
-                    {
-                        self.replay_probe_budget_override
-                    }
-                    #[cfg(not(feature = "test-policy-overrides"))]
-                    {
-                        None
-                    }
-                },
+        let options = StoredCanonicalizationOptions {
+            replay_profile: replay_profile_policy,
+            admitted_message_ids: Some(&admitted_message_ids),
+            shared_seen_message_ids: Some(shared_seen_message_ids),
+            admit_app_witnesses: {
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    self.admit_app_witnesses
+                }
+                #[cfg(not(feature = "test-policy-overrides"))]
+                {
+                    true
+                }
             },
-        )?;
+            replay_probe_budget_override: {
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    self.replay_probe_budget_override
+                }
+                #[cfg(not(feature = "test-policy-overrides"))]
+                {
+                    None
+                }
+            },
+        };
+        let result = if let Some(deadline) = deadline {
+            let mut continuation = self.canonical_replays.remove(group_id);
+            let result = crate::openmls_projection::canonicalize_stored_slice(
+                &self.storage,
+                group_id,
+                state,
+                vec![],
+                policy,
+                now_ms,
+                options,
+                pass.generation,
+                &mut continuation,
+                &mut crate::openmls_projection::ReplaySlice::new(
+                    deadline,
+                    self.replay_slice_probe_limit,
+                ),
+            )?;
+            if let Some(continuation) = continuation {
+                self.canonical_replays
+                    .insert(group_id.clone(), continuation);
+            }
+            let Some(result) = result else {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(waiting_result(previous_tip.0));
+            };
+            result
+        } else {
+            self.canonical_replays.remove(group_id);
+            canonicalize_stored_openmls_messages_with_profile_policy(
+                &self.storage,
+                group_id,
+                state,
+                vec![],
+                policy,
+                now_ms,
+                options,
+            )?
+        };
         let mut result = result;
         #[cfg(feature = "test-conformance-snapshot")]
         {
@@ -1618,6 +1673,12 @@ impl<S: StorageProvider> Engine<S> {
         // it normally.
         self.valid_proposal_groups.remove(group_id);
         self.remember_canonicalization_result_messages(&result);
+        if self
+            .has_pending_canonical_applications(group_id)
+            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+        {
+            self.schedule_pending_convergence_group(group_id);
+        }
         Ok(result)
     }
 
@@ -1878,7 +1939,7 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    fn application_replay_events(
+    pub(crate) fn application_replay_events(
         group_id: &GroupId,
         observations: &[OpenMlsReplayObservation],
     ) -> Result<Vec<GroupEvent>, OpenMlsProjectionError> {

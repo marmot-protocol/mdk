@@ -1106,6 +1106,13 @@ impl StorageProvider for SqliteAccountStorage {
         Some(self)
     }
 
+    fn group_replay_state_fingerprint(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        crate::storage::snapshots::replay_fingerprint(self, group_id).map(Some)
+    }
+
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,

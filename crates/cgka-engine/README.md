@@ -109,6 +109,32 @@ the simulator's 50-member public app canary measures the separate effect under r
 The optimized unit-test command retains engine debug assertions because existing legacy-profile test
 helpers require them. Production app measurements should use the normal release build without that override.
 
+## Resumable candidate reconstruction
+
+Live convergence and background deferred peeling retain candidate-search progress between calls.
+Each evaluator slice admits at most 32 probes and observes the caller's cooperative time budget;
+a started probe always finishes. Both the probe transaction and any outer historical rewind restore
+live state before the evaluator returns pending work. Selection and input dispositions are published
+only after the complete search and application-witness replay finish.
+
+Scratch progress is memory-only and tied to the exact inputs, group state, retained snapshots,
+policy and frozen pass generation. SQLCipher also fingerprints the live canonical/OpenMLS state and
+all retained snapshots/checkpoints, so unrelated app writes through another database connection do
+not discard progress. Other tracking backends use strict MLS-write-generation equality. Invalidation
+or restart discards scratch work while durable input remains available. Backends without mutation-generation tracking
+use the synchronous evaluator. Explicit-time convergence entry points and foreground preflight
+retain their existing execution semantics.
+
+```sh
+cargo test --locked -p cgka-engine --features test-policy-overrides,test-conformance-snapshot --lib resumable_
+cargo test --locked -p cgka-engine --features test-crash-hooks,test-policy-overrides --test crash_recovery_sqlite
+cargo test --locked --release -p cgka-engine --config 'profile.release.package.cgka-engine.debug-assertions=true' --lib candidate_reconstruction_measurement -- --ignored --nocapture
+```
+
+The isolated measurement varies group size, fork width, and history depth. It records complete-search
+time, probe counts, repeated message inputs, and maximum probe/slice duration, comparing sliced and
+uninterrupted results without a timing pass/fail threshold.
+
 ## Reading order for a new contributor
 
 1. Target architecture: `../../docs/marmot-architecture/overview/target-architecture.md`
@@ -125,3 +151,27 @@ For the Marmot app-component model now used by new groups, see
 
 `0.9.0`, single internal consumer, not semver-stable. For current readiness and open production work, start with
 [`../../docs/marmot-architecture/overview/current-state.md`](../../docs/marmot-architecture/overview/current-state.md).
+
+## Buffered application handoff
+
+A frozen convergence batch can advance one epoch beyond its admission ceiling. Already-unwrapped
+applications at that new tip remain durable input, even when no commit can open another pass.
+Background advancement drains these inputs against the stable canonical state after convergence and
+deferred peeling finish. It shares the existing 64-row allowance and cooperative 500 ms background
+budget; a started MLS operation completes before yielding. Input discovery uses the existing
+state-filtered storage enumeration, so the row allowance bounds processing rather than the scan.
+
+This is scheduling work, not branch ambiguity: it does not open a convergence pass, gate a foreground
+send, or consume the completed pass's queued-intent fairness slot. Remaining work recreates a scheduling
+edge, including after hydration; `has_pending_convergence_inputs` includes it and
+`prepare_convergence_cutoff_delay_ms` reports it ready. An advance may report branch settlement while
+application work remains for another turn. Future-epoch input waits for canonical state to advance.
+
+The drain uses the same OpenMLS sender/payload validation and source-state retention decision as
+canonical replay. Direct ingestion and replay attribute applications using the authenticated source-epoch
+credential carried by OpenMLS, so a later removal or reuse of that member's leaf cannot erase or substitute
+the original author. The inner app author must still match that credential. Ratchet writes, the terminal
+input disposition, and pending app output commit in one storage transaction. Crash recovery therefore
+retries an untouched input or recovers its durable app
+output. Encrypted SQLite process-kill tests cover both sides of that commit and acknowledgement followed
+by another restart. It never reopens a processed or terminally invalidated input.

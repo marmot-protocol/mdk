@@ -61,7 +61,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     foreground budgets, and background work/time budgets with restart and eventual-completion checks.
 
 - **File:** `distributed_convergence.rs`
-  - **Owns:** Stored-message convergence, stale classification, and retained-anchor behavior
+  - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical
+    application handoff after catch-up (horizon boundary, restart, bounded turns, and independent send gate).
+
+- **File:** `distributed_convergence/historical_application_sender.rs`
+  - **Owns:** Source-epoch application attribution after removal, replacement leaf reuse, and rejoin; direct
+    ingestion and buffered replay after restart, duplicate suppression, and forged replacement-author rejection.
 
 - **File:** `convergence_policy_pin.rs`
   - **Owns:** Default-build pinned v1 policy rejection (mdk#970). Run
@@ -106,6 +111,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     live state and releases convergence snapshots. Candidate replay kills after temporary processing and restoration
     also verify exact pre-probe group state, epoch authenticator, snapshots, input ledger and queued work before
     hydration, both standalone and inside an outer transaction.
+    Resumable selection and peeling also kill after historical rewind and after a restored slice; reopening must
+    recover live state and queued work, discard scratch progress, and select the same winning branch.
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh

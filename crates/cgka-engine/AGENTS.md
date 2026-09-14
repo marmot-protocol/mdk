@@ -158,6 +158,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay and
     `candidate_branch_peel` (whether the graph is contested, plus candidate branch tips captured as owned peel
     contexts)
+  - **Submodules:** `openmls_projection/resumable.rs` owns shared candidate search and slice continuations;
+    `openmls_projection/candidate_replay_tests.rs` owns forked-graph, restoration, parity and measurement fixtures.
+    Process-kill coverage remains in `tests/crash_recovery_sqlite.rs`.
 
 - **Module:** `update_group_data.rs`
   - **Owns:** `SendIntent::UpdateGroupData` — stages an `AppDataUpdate` commit for `marmot.group.profile.v1`
@@ -391,6 +394,23 @@ when canonical/candidate context is invalidated; never persist this secret-beari
 Tests: `tests/deferred_peel_lifecycle.rs` covers host budget yield, explicit-time row determinism, restart and eventual
 completion. Readiness queries all deferred rows using the storage state filter; never hide unattempted rows by
 limiting readiness to an already-attempted prefix.
+After selection and deferred peeling settle, `message_processor/application_replay.rs` spends the same remaining
+background allowance on retained canonical applications. Its scheduling signal is independent of branch ambiguity:
+no app-only pass, foreground gate, or loss of queued-intent fairness. Hydration re-arms the work from durable rows;
+MLS ratchet writes, disposition, and pending app output are atomic. Future input waits for canonical advancement.
+
+
+Candidate reconstruction shares `openmls_projection/resumable.rs` between selection and branch peeling.
+Its memory-only frontier and materialization cursor retain cumulative replay-budget accounting across slices;
+the 32-probe scheduling allowance is not a new selection cap or exhaustion verdict. Restore the outer retained-anchor
+guard as well as the inner transaction before returning pending work. Never expose a partial candidate set.
+Reuse requires exact graph/group/snapshot/policy/pass identity. SQLCipher supplies a consistent content fingerprint
+covering live canonical/OpenMLS state and retained snapshots/checkpoints, avoiding false invalidation by unrelated
+second-connection app writes. Other tracking backends require strict MLS-write-generation equality; untracked
+backends use synchronous evaluation. Never log or persist replay fingerprints, and keep the separate cached-MlsGroup
+generation contract unchanged. Direct live ingest also uses bounded reconstruction, while explicit-time
+convergence and foreground preflight keep their existing semantics. Restart discards scratch work and resumes
+from durable inputs. The original BFS remains a test-only differential reference.
 
 **Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
 not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical
@@ -408,10 +428,12 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   this is also the fork-resolution seam — same-epoch rivals are adjudicated inside the convergence pass). Every
   sender-authentication, admin/identity-proof, app-payload, and component-retention check MUST run identically on
   both, through the *same* shared helper — never a seam-local re-implementation. Shared chokepoints:
-  `identity::member_id_of_sender` (MLS `Sender` → validated `MemberId`) and
+  `identity::member_id_of_processed_message` (authenticated application credential → source-epoch `MemberId`;
+  proposals/commits retain the current-tree lookup through `identity::member_id_of_sender`) and
   `app_payload::validate_app_payload_for_sender` (payload + `&MemberId` → validated `MarmotAppEvent`; rejects an empty
-  id). An application message whose sender cannot resolve to a validated member id is never surfaced as
-  `MessageReceived` and never accepted into canonical state on any seam (direct: `Failed`; replay: `Ignored` →
+  id). Never resolve a historical application's author against the current member leaf: removal or leaf reuse
+  can erase or substitute that identity. An application message whose sender cannot resolve to a validated member
+  id is never surfaced as `MessageReceived` and never accepted into canonical state on any seam (direct: `Failed`; replay: `Ignored` →
   terminal disposition). Fork-resolution paths fail closed with typed errors — never `unreachable!`/`panic!` — on
   attacker-influenced input. When you add a guard to one seam, add it to the shared
   helper (or both seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).

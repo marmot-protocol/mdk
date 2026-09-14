@@ -323,6 +323,10 @@ pub struct Engine<S: StorageProvider> {
     /// cached row-count/cap bookkeeping. Correctness-critical completion and
     /// residence bookkeeping lives durably on each MessageRecord.
     pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
+    /// Memory-only progress. No snapshot guard or transaction survives a slice.
+    pub(crate) canonical_replays: HashMap<GroupId, crate::openmls_projection::CanonicalReplay>,
+    pub(crate) peel_replays: HashMap<GroupId, crate::openmls_projection::PeelReplay>,
+    pub(crate) replay_slice_probe_limit: usize,
     /// Account-wide half of the deferred-peel byte budget. Reconstructed from
     /// durable rows on the first capacity-sensitive ingest and maintained with
     /// the per-group cache afterwards.
@@ -641,6 +645,10 @@ impl<S: StorageProvider> EngineBuilder<S> {
             transport_group_id_index: HashMap::new(),
             seen_message_ids_hex_cache: None,
             deferred_peel: HashMap::new(),
+            canonical_replays: HashMap::new(),
+            peel_replays: HashMap::new(),
+            replay_slice_probe_limit:
+                crate::message_processor::BACKGROUND_CONVERGENCE_REPLAY_PROBES_PER_SLICE,
             deferred_peel_account: crate::message_processor::DeferredPeelAccountState::default(),
             deferred_peel_row_limit,
             deferred_peel_group_byte_limit,
@@ -660,6 +668,12 @@ impl<S: StorageProvider> Engine<S> {
     #[cfg(feature = "test-policy-overrides")]
     pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
         self.replay_probe_budget_override = limit;
+    }
+
+    /// Exercise scheduling boundaries without changing the cumulative replay ceiling.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_replay_slice_probe_limit_for_tests(&mut self, limit: usize) {
+        self.replay_slice_probe_limit = limit.max(1);
     }
 
     /// Change deferred-peel resource budgets for a running policy campaign
@@ -2024,6 +2038,16 @@ impl<S: StorageProvider> Engine<S> {
         let has_convergence_inputs = self
             .has_unresolved_convergence_inputs_in_records(group_id, &group, &stored_message_records)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        let mut has_canonical_applications = false;
+        for record in &stored_message_records {
+            if !group.is_terminal()
+                && !group.unrecoverable
+                && Self::canonical_application_from_record(record, group.epoch.0).is_some()
+            {
+                has_canonical_applications = true;
+                break;
+            }
+        }
         let has_deferred_peels = stored_message_records
             .iter()
             .any(|record| record.state == MessageState::PeelDeferred);
@@ -2123,6 +2147,7 @@ impl<S: StorageProvider> Engine<S> {
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         if has_queued_intents
             || has_convergence_inputs
+            || has_canonical_applications
             || has_deferred_peels
             || restored_self_remove_work
             || has_pending_disband
