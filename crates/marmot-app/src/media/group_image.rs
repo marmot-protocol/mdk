@@ -142,6 +142,7 @@ pub(crate) async fn upload_group_image(
     plaintext: &[u8],
     media_type: &str,
     server: Option<&str>,
+    transport: &BlossomHttpTransport,
 ) -> Result<GroupImageUpload, AppError> {
     let prepared = prepare_group_image_upload(plaintext, media_type)?;
     upload_prepared_group_image(
@@ -150,6 +151,7 @@ pub(crate) async fn upload_group_image(
         prepared.upload_secret,
         server,
         false,
+        transport,
     )
     .await?;
     Ok(GroupImageUpload {
@@ -207,7 +209,13 @@ pub(crate) async fn upload_prepared_group_image(
     upload_secret: Zeroizing<Vec<u8>>,
     server: Option<&str>,
     allow_loopback_http: bool,
+    transport: &BlossomHttpTransport,
 ) -> Result<(), AppError> {
+    let transport = if allow_loopback_http {
+        transport.clone()
+    } else {
+        transport.with_loopback_disabled()
+    };
     let secret = nostr::SecretKey::from_slice(&upload_secret)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid group image upload key".into()))?;
     let upload_keys = nostr::Keys::new(secret);
@@ -217,7 +225,7 @@ pub(crate) async fn upload_prepared_group_image(
         Bytes::from(encrypted_blob),
         image_hash_hex,
         &upload_keys,
-        allow_loopback_http,
+        &transport,
     )
     .await?;
     Ok(())
@@ -282,8 +290,8 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     use super::{
-        MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, prepare_group_image_upload,
-        upload_prepared_group_image, validate_group_image_input,
+        BlossomHttpTransport, MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION,
+        prepare_group_image_upload, upload_prepared_group_image, validate_group_image_input,
     };
 
     fn png(width: u32, height: u32) -> Vec<u8> {
@@ -431,6 +439,7 @@ mod tests {
             prepared.upload_secret.clone(),
             Some(&url),
             true,
+            &BlossomHttpTransport::new(true),
         )
         .await;
         assert!(first.is_err());
@@ -440,6 +449,7 @@ mod tests {
             prepared.upload_secret,
             Some(&url),
             true,
+            &BlossomHttpTransport::new(true),
         )
         .await
         .unwrap();
@@ -475,6 +485,7 @@ mod tests {
                 prepared.upload_secret,
                 Some(&upload_url),
                 true,
+                &BlossomHttpTransport::new(true),
             )
             .await
         });

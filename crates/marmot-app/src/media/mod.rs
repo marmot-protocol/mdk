@@ -233,7 +233,7 @@ pub(crate) async fn upload_profile_image_with_policy(
         Bytes::copy_from_slice(image),
         &hash_hex,
         signer,
-        allow_loopback_http,
+        &BlossomHttpTransport::new(allow_loopback_http),
         &media_type,
         Some(extension),
     )
@@ -682,6 +682,7 @@ pub(crate) async fn upload_encrypted_media(
     media_secret: &[u8],
     signer: &dyn NostrSigner,
     policy: MediaOperationPolicy<'_>,
+    transport: &BlossomHttpTransport,
 ) -> Result<MediaUploadResult, AppError> {
     if request.attachments.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -712,6 +713,7 @@ pub(crate) async fn upload_encrypted_media(
                 signer,
                 &upload_servers,
                 policy,
+                transport,
             )
             .await?,
         );
@@ -752,6 +754,7 @@ async fn upload_encrypted_media_attachment(
     signer: &dyn NostrSigner,
     upload_servers: &[String],
     policy: MediaOperationPolicy<'_>,
+    transport: &BlossomHttpTransport,
 ) -> Result<MediaUploadAttachmentResult, AppError> {
     if request.plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -793,7 +796,7 @@ async fn upload_encrypted_media_attachment(
         Bytes::from(encrypted),
         &ciphertext_sha256,
         signer,
-        policy.allow_loopback_http,
+        transport,
     )
     .await?;
     let reference = MediaAttachmentReference {
@@ -841,7 +844,7 @@ async fn upload_blossom_blob_with_fallback(
     encrypted: Bytes,
     encrypted_hash_hex: &str,
     signer: &dyn NostrSigner,
-    allow_loopback_http: bool,
+    transport: &BlossomHttpTransport,
 ) -> Result<String, AppError> {
     let mut failures = Vec::new();
     let mut timed_out = false;
@@ -851,7 +854,7 @@ async fn upload_blossom_blob_with_fallback(
             encrypted.clone(),
             encrypted_hash_hex,
             signer,
-            allow_loopback_http,
+            transport,
         )
         .await
         {

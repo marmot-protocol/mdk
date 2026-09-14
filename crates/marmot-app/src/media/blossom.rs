@@ -49,15 +49,22 @@ pub const MAX_ENCRYPTED_MEDIA_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) type DnsResolver =
     Arc<dyn Fn(String, u16) -> BoxFuture<'static, Result<Vec<SocketAddr>, AppError>> + Send + Sync>;
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum MediaHttpKind {
+    Download,
+    Upload,
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct MediaOrigin {
     scheme: String,
     host: String,
     port: u16,
+    kind: MediaHttpKind,
 }
 
 impl MediaOrigin {
-    fn from_url(url: &Url) -> Result<Self, AppError> {
+    fn from_url(url: &Url, kind: MediaHttpKind) -> Result<Self, AppError> {
         let host = url
             .host_str()
             .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a host".into()))?
@@ -69,12 +76,14 @@ impl MediaOrigin {
             scheme: url.scheme().to_owned(),
             host,
             port,
+            kind,
         })
     }
 }
 
 struct CachedMediaClient {
     client: reqwest::Client,
+    pin: Option<(String, Vec<SocketAddr>)>,
     expires_at: Instant,
 }
 
@@ -88,12 +97,11 @@ struct BlossomHttpTransportInner {
     resolver: DnsResolver,
 }
 
-/// Per-account HTTP setup shared by compatible Blossom downloads.
+/// Per-account HTTP setup shared by compatible Blossom transfers.
 ///
 /// Every cached client is bound to one exact origin and one vetted address set.
-/// Expiry creates a fresh client generation, forcing DNS resolution, vetting,
-/// and pinning again before any later request can use the origin. A rehomed
-/// origin can therefore retain a failing stale pin only until the lease ends.
+/// Expiry repeats DNS resolution and vetting. An unchanged address set keeps
+/// its connection pool; a changed set creates a new pinned client.
 #[derive(Clone)]
 pub(crate) struct BlossomHttpTransport {
     inner: Arc<BlossomHttpTransportInner>,
@@ -101,6 +109,7 @@ pub(crate) struct BlossomHttpTransport {
     address_lease: Duration,
     candidate_startup_timeout: Duration,
     transfer_timeout: Duration,
+    kind: MediaHttpKind,
 }
 
 impl BlossomHttpTransport {
@@ -134,6 +143,7 @@ impl BlossomHttpTransport {
             address_lease,
             candidate_startup_timeout,
             transfer_timeout,
+            kind: MediaHttpKind::Download,
         }
     }
 
@@ -194,7 +204,7 @@ impl BlossomHttpTransport {
     pub(super) async fn client_for_url(&self, url: &Url) -> Result<reqwest::Client, AppError> {
         validate_blossom_fetch_url(url, self.allow_loopback_http)
             .map_err(|err| AppError::UnsafeMediaFetch(format!("unsafe Blossom URL: {err}")))?;
-        let origin = MediaOrigin::from_url(url)?;
+        let origin = MediaOrigin::from_url(url, self.kind)?;
         let generation = {
             let now = Instant::now();
             let mut origins = self
@@ -230,11 +240,26 @@ impl BlossomHttpTransport {
         let allow_loopback = url.scheme() == "http"
             && self.allow_loopback_http
             && url.host().map(is_loopback_host).unwrap_or(false);
-        let pin = resolve_media_host_with(url, allow_loopback, &self.inner.resolver).await?;
-        let client = build_pinned_media_http_client(pin)?;
+        let mut pin = resolve_media_host_with(url, allow_loopback, &self.inner.resolver).await?;
+        if let Some((_, addresses)) = &mut pin {
+            addresses.sort_unstable();
+            addresses.dedup();
+        }
+        let expires_at = Instant::now() + self.address_lease;
+        if let Some(cached) = generation.as_mut()
+            && cached.pin == pin
+        {
+            cached.expires_at = expires_at;
+            return Ok(cached.client.clone());
+        }
+        let client = match self.kind {
+            MediaHttpKind::Download => build_pinned_media_http_client(pin.clone())?,
+            MediaHttpKind::Upload => build_pinned_media_upload_client(pin.clone())?,
+        };
         *generation = Some(CachedMediaClient {
             client: client.clone(),
-            expires_at: now + self.address_lease,
+            pin,
+            expires_at,
         });
         Ok(client)
     }
@@ -245,11 +270,8 @@ impl BlossomHttpTransport {
         // The stricter view may share the pool because client_for_url validates
         // its own loopback policy before consulting a cached generation.
         Self {
-            inner: self.inner.clone(),
             allow_loopback_http: false,
-            address_lease: self.address_lease,
-            candidate_startup_timeout: self.candidate_startup_timeout,
-            transfer_timeout: self.transfer_timeout,
+            ..self.clone()
         }
     }
 
@@ -283,14 +305,14 @@ pub(crate) async fn upload_blossom_blob(
     blob: Bytes,
     blob_hash_hex: &str,
     signer: &dyn NostrSigner,
-    allow_loopback_http: bool,
+    transport: &BlossomHttpTransport,
 ) -> Result<String, AppError> {
     upload_blossom_blob_with_content_type(
         server,
         blob,
         blob_hash_hex,
         signer,
-        allow_loopback_http,
+        transport,
         BLOSSOM_UPLOAD_CONTENT_TYPE,
         None,
     )
@@ -302,13 +324,17 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     blob: Bytes,
     blob_hash_hex: &str,
     signer: &dyn NostrSigner,
-    allow_loopback_http: bool,
+    transport: &BlossomHttpTransport,
     content_type: &str,
     fallback_extension: Option<&str>,
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
     let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
-    let client = media_http_upload_client_for_url(&upload_url, allow_loopback_http).await?;
+    let upload_transport = BlossomHttpTransport {
+        kind: MediaHttpKind::Upload,
+        ..transport.clone()
+    };
+    let client = upload_transport.client_for_url(&upload_url).await?;
     let response = client
         .put(upload_url.clone())
         .timeout(MEDIA_BLOB_TRANSFER_TIMEOUT)
@@ -853,14 +879,7 @@ async fn media_http_client_for_url(
     build_pinned_media_http_client(pin)
 }
 
-async fn media_http_upload_client_for_url(
-    url: &Url,
-    allow_loopback_http: bool,
-) -> Result<reqwest::Client, AppError> {
-    let pin = resolve_pinned_media_host_for_url(url, allow_loopback_http).await?;
-    build_pinned_media_upload_client(pin)
-}
-
+#[cfg(test)]
 async fn resolve_pinned_media_host_for_url(
     url: &Url,
     allow_loopback_http: bool,
@@ -870,7 +889,7 @@ async fn resolve_pinned_media_host_for_url(
     let allow_loopback = url.scheme() == "http"
         && allow_loopback_http
         && url.host().map(is_loopback_host).unwrap_or(false);
-    resolve_media_host(url, allow_loopback).await
+    resolve_media_host_with(url, allow_loopback, &system_dns_resolver()).await
 }
 
 fn build_pinned_media_http_client(
@@ -918,13 +937,6 @@ pub(super) fn build_pinned_media_http_client_with_proxy_for_test(
     let proxy = reqwest::Proxy::all(proxy_url)
         .map_err(|_| AppError::BlobStore("failed to configure test HTTP proxy".into()))?;
     build_pinned_media_http_client_from_builder(reqwest::Client::builder().proxy(proxy), pin, true)
-}
-
-async fn resolve_media_host(
-    url: &Url,
-    allow_loopback: bool,
-) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
-    resolve_media_host_with(url, allow_loopback, &system_dns_resolver()).await
 }
 
 async fn resolve_media_host_with(

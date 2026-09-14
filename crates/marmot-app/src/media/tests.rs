@@ -698,6 +698,7 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("second Blossom endpoint should absorb first endpoint failure");
@@ -731,6 +732,7 @@ async fn blossom_fallback_reuses_the_identical_encrypted_body() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("second Blossom endpoint should accept the retry body");
@@ -751,7 +753,7 @@ async fn blossom_upload_allows_response_gap_longer_than_read_timeout() {
         encrypted.clone(),
         &encrypted_hash,
         &signing_keys(),
-        true,
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("a bounded upload may wait more than the response read timeout while sending");
@@ -772,7 +774,7 @@ async fn blossom_upload_allows_continuous_slow_body_ingest() {
         encrypted.clone(),
         &encrypted_hash,
         &signing_keys(),
-        true,
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("continuous request-body progress may exceed the response read timeout");
@@ -807,6 +809,7 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("payload above the previous limit should upload");
@@ -842,6 +845,7 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
         &secret,
         &signing_keys(),
         operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("fixture upload should succeed");
@@ -894,6 +898,7 @@ async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .unwrap();
@@ -903,6 +908,7 @@ async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .unwrap();
@@ -930,7 +936,7 @@ async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
         bytes::Bytes::from_static(encrypted),
         &encrypted_hash,
         &signing_keys(),
-        true,
+        &BlossomHttpTransport::new(true),
     )
     .await
     .unwrap_err();
@@ -1064,6 +1070,7 @@ async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("all failing endpoints should aggregate their failures");
@@ -1101,6 +1108,7 @@ async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason(
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -1133,6 +1141,7 @@ async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -1165,6 +1174,7 @@ async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -1195,6 +1205,7 @@ async fn upload_encrypted_media_drops_uuid_rejection_reason() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -1222,6 +1233,7 @@ async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -1259,6 +1271,7 @@ async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
         &secret,
         &keys,
         operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect_err("explicit override must remain a single-server bypass");
@@ -1777,6 +1790,42 @@ fn blob_reference_for_servers(body: &[u8], servers: &[String]) -> MediaAttachmen
         })
         .collect();
     reference
+}
+
+#[tokio::test]
+async fn renewed_lease_keeps_pool() {
+    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
+    let url = format!("{server_url}/{}.bin", valid_hash());
+    for _ in 0..2 {
+        assert_eq!(
+            fetch_blossom_blob_with_transport(&url, &transport)
+                .await
+                .unwrap(),
+            b"hello"
+        );
+    }
+    server.await.unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn uploads_reuse_renewed_pool() {
+    let (url, accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
+    let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
+    for _ in 0..2 {
+        upload_blossom_blob(
+            &url,
+            Bytes::new(),
+            &valid_hash(),
+            &signing_keys(),
+            &transport,
+        )
+        .await
+        .unwrap();
+    }
+    server.await.unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -2638,6 +2687,7 @@ async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
         &secret,
         &signing_keys(),
         operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
     )
     .await
     .expect("fixture upload should succeed");

@@ -135,6 +135,7 @@ pub(crate) struct EncryptedMediaUploadHttp {
     default_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
     allow_loopback_http: bool,
+    transport: BlossomHttpTransport,
 }
 
 impl EncryptedMediaUploadHttp {
@@ -150,6 +151,7 @@ impl EncryptedMediaUploadHttp {
                 allowed_locator_kinds: &self.allowed_locator_kinds,
                 allow_loopback_http: self.allow_loopback_http,
             },
+            &self.transport,
         )
         .await
     }
@@ -204,6 +206,7 @@ pub(crate) struct PreparedGroupImageUploadHttp {
     upload_secret: Zeroizing<Vec<u8>>,
     server: Option<String>,
     allow_loopback_http: bool,
+    transport: BlossomHttpTransport,
 }
 
 impl PreparedGroupImageUploadHttp {
@@ -214,6 +217,7 @@ impl PreparedGroupImageUploadHttp {
             self.upload_secret,
             self.server.as_deref(),
             self.allow_loopback_http,
+            &self.transport,
         )
         .await
     }
@@ -1321,6 +1325,7 @@ impl AppClient {
                 upload_secret: Zeroizing::new(upload_secret),
                 server,
                 allow_loopback_http,
+                transport: self.blossom_http_transport.clone(),
             },
         ))
     }
@@ -1610,9 +1615,13 @@ impl AppClient {
                     Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
                         let data = match image {
                             InitialGroupImageSource::Inline(image) => {
-                                let upload =
-                                    upload_group_image(&image.plaintext, &image.media_type, None)
-                                        .await?;
+                                let upload = upload_group_image(
+                                    &image.plaintext,
+                                    &image.media_type,
+                                    None,
+                                    &self.blossom_http_transport,
+                                )
+                                .await?;
                                 let input = AppGroupImageInput::from(upload);
                                 hex::decode(AppGroupImageComponent::new(input).data_hex)?
                             }
@@ -4346,6 +4355,7 @@ impl AppClient {
                 default_endpoints,
                 allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
+                transport: self.blossom_http_transport.clone(),
             },
             EncryptedMediaUploadFinish {
                 group_id: group_id.clone(),
@@ -4479,7 +4489,9 @@ impl AppClient {
         let input = if plaintext.is_empty() {
             AppGroupImageInput::default()
         } else {
-            let upload = upload_group_image(&plaintext, media_type, None).await?;
+            let upload =
+                upload_group_image(&plaintext, media_type, None, &self.blossom_http_transport)
+                    .await?;
             AppGroupImageInput::from(upload)
         };
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
