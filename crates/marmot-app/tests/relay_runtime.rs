@@ -6824,6 +6824,10 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     bob.sync().await.unwrap();
     carol.sync().await.unwrap();
 
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
+    carol.accept_group_invite(&group_id).unwrap();
+
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // Establish a read baseline on existing history for bob and carol, then send
@@ -6924,6 +6928,9 @@ async fn local_leave_suppresses_account_unread_total() {
     let mut alice = app.client("alice").await.unwrap();
     let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
     bob.sync().await.unwrap();
+
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
 
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -7112,6 +7119,9 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
     let group_id = alice.create_group("backfill", &["bob"]).await.unwrap();
     bob.sync().await.unwrap();
 
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
+
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // Establish a read baseline, then send a strictly-later unread message.
@@ -7186,6 +7196,9 @@ async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
     let mut alice = app.client("alice").await.unwrap();
     let group_id = alice.create_group("markers", &["bob"]).await.unwrap();
     bob.sync().await.unwrap();
+
+    // Account attention excludes invitations until explicitly accepted.
+    bob.accept_group_invite(&group_id).unwrap();
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let bob_row = || {
