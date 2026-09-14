@@ -93,6 +93,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- On Unix, `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` terminate remaining
+  processes in the backend's process group when a turn ends, including successful
+  turns, as well as on timeout or cancellation. Background dev servers started by
+  the backend in that group no longer survive the turn; run long-lived services
+  under a separate supervisor. Output draining after backend exit is limited to
+  two seconds so inherited pipe handles cannot stall a completed turn.
 - MarmotKit `accountUnreadSummary()` now follows the Unread chat-list eligibility:
   pending invitations, archived chats, and departed or departing groups do not
   contribute to account attention. Muted active chats still count; manual unread
