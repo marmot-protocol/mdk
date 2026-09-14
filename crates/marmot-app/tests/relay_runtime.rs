@@ -10879,7 +10879,7 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
             .group_members(&read_alice_id, &read_group_id)
             .await
     });
-    let members = timeout(Duration::from_secs(2), read)
+    let members = timeout(Duration::from_secs(1), read)
         .await
         .expect("snapshot read must bypass the startup-deferred remove")
         .expect("read task should not panic")
