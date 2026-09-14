@@ -1395,6 +1395,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._store_generation_enabled = True
         self._ambient_outcomes: Dict[str, tuple[str, bool]] = {}
         self._ambient_outcome_lock = asyncio.Lock()
+        # Legacy group changes have no occurrence identity. Preserve the old
+        # bounded, process-local same-kind suppression for those frames only.
+        self._recent_legacy_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
         self._inbound_spool_retry_task: Optional[asyncio.Task] = None
         self._inbound_spool_wakeup = asyncio.Event()
         # Disconnect fences durable admission before cancelling any producer or
@@ -1545,15 +1548,42 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return True
         except Exception as exc:
             self._inbound_spool_admission_enabled = False
-            await self._stop_inbound_tasks()
             self._store_generation_enabled = False
-            await self._ambient_context_call(self._ambient_context.disable_generation)
-            await self._inbound_spool_call(self._inbound_spool.close, graceful=True)
             logger.error("Failed to connect Marmot adapter: %s", exc)
             set_fatal = getattr(self, "_set_fatal_error", None)
             if callable(set_fatal):
                 set_fatal("marmot_connect_failed", str(exc), retryable=True)
+            await self._cleanup_failed_connect()
             return False
+
+    async def _cleanup_failed_connect(self) -> None:
+        try:
+            await self._stop_inbound_tasks()
+        except Exception as exc:
+            logger.error("Marmot failed-connect task cleanup failed (%s)", type(exc).__name__)
+        for operation in (
+            self._ambient_context.disable_generation,
+            self._inbound_spool.close,
+        ):
+            try:
+                if (self._inbound_spool_executor is None
+                        and not self._ambient_context.is_open
+                        and not self._inbound_spool.is_open):
+                    # Early connection failure: these are in-memory no-ops.
+                    # Do not create a journal worker just to close empty stores.
+                    operation()
+                else:
+                    await self._inbound_spool_call(operation)
+            except Exception as exc:
+                # Each close still runs when a preceding cleanup fails. Keep
+                # the original retryable connection failure as the outcome.
+                logger.error("Marmot failed-connect store cleanup failed (%s)", type(exc).__name__)
+        executor, self._inbound_spool_executor = self._inbound_spool_executor, None
+        if executor is not None:
+            try:
+                await asyncio.to_thread(executor.shutdown, True)
+            except Exception as exc:
+                logger.error("Marmot failed-connect worker cleanup failed (%s)", type(exc).__name__)
 
     def _enable_store_generation(self) -> None:
         self._store_generation_enabled = True
@@ -3512,9 +3542,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         account_id_hex = str(event.get("account_id_hex") or self.account_id_hex or "")
         if account_id_hex and group_id_hex:
             self._activation_cache.invalidate(account_id_hex, group_id_hex)
-        # Legacy connectors expose no occurrence id. Preserve each observation
-        # rather than treating distinct same-kind changes as one forever.
-        event_identity = str(event.get("event_id_hex") or uuid.uuid4().hex)
+        event_identity = str(event.get("event_id_hex") or "")
+        if not event_identity:
+            legacy_key = f"{account_id_hex}:{group_id_hex}:{change}"
+            if legacy_key in self._recent_legacy_ambient_keys:
+                return
+            self._recent_legacy_ambient_keys.add(legacy_key)
+            # This key only identifies the first observation in this process,
+            # not a durable occurrence. Suppress replay bursts before admission.
+            event_identity = uuid.uuid4().hex
         context_key = f"marmot:group_state_changed:{group_id_hex}:{change}:{event_identity}"
         allowed_changes = {
             "member_added", "member_removed", "member_left", "admin_added",

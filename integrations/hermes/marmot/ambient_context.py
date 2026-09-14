@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 # Preserve stores created by earlier installs of this PR branch.
 SCHEMA_VERSION = 3
+_PHYSICAL_SCHEMA_ALLOWANCE_BYTES = 64 * 1024
+# The 128 KiB regression filled SQLite at 66,800 logical bytes (~2x).
+# Use 8x to also cover claim growth, temporary tombstone overlap, and sparse
+# index pages. Keep the small-budget lifecycle regression when changing schema.
+_PHYSICAL_OVERHEAD_FACTOR = 8
 _ALLOWED_KINDS = frozenset(
     {
         "message_deleted",
@@ -73,7 +78,9 @@ class AmbientContextStore:
     same snapshot. A clean close releases claims; a replacement process can
     reclaim an abruptly abandoned claim only after acquiring the exclusive
     lock. Acknowledged event hashes remain as bounded tombstones so connector
-    replay cannot requeue an already accepted fact.
+    replay cannot requeue an accepted fact while its tombstone is retained.
+    After bounded retention evicts or expires that hash, replay may surface it
+    again; this is not permanent exactly-once delivery.
     """
 
     def __init__(
@@ -144,7 +151,7 @@ class AmbientContextStore:
             # The configured budget counts logical rows. Reserve physical room
             # for schema/index pages, claim metadata, fragmentation, and the
             # temporary facts+tombstones overlap during acknowledgement.
-            physical_budget = 64 * 1024 + 8 * self.max_state_bytes
+            physical_budget = _PHYSICAL_SCHEMA_ALLOWANCE_BYTES + _PHYSICAL_OVERHEAD_FACTOR * self.max_state_bytes
             db.execute(f"PRAGMA max_page_count={(physical_budget + page_size - 1) // page_size}")
             result = db.execute("PRAGMA quick_check").fetchone()
             if result is None or result[0] != "ok":
@@ -221,8 +228,8 @@ class AmbientContextStore:
         self._generation_enabled = True
 
     def disable_generation(self) -> None:
-        self.close()
         self._generation_enabled = False
+        self.close()
 
     def remember_accepted(self, token: str) -> None:
         """Keep acceptance known across storage faults and graceful reconnects."""
@@ -277,7 +284,7 @@ class AmbientContextStore:
             raise AmbientContextError("ambient fact commit failed") from exc
 
     def pending(self, group_id: str, *, now: float | None = None) -> list[AmbientFact]:
-        """Return retained facts for diagnostics, including an active claim."""
+        """Test-only inspection of retained facts, including an active claim."""
         self.open()
         db = self._require_db()
         at = time.time() if now is None else float(now)
@@ -409,7 +416,7 @@ class AmbientContextStore:
             raise AmbientContextError("ambient claim release failed") from exc
 
     def stats(self) -> dict[str, int]:
-        """Return privacy-safe bounded-state counters for diagnostics and tests."""
+        """Test-only aggregate inspection; not used by runtime/readiness probes."""
         self.open()
         db = self._require_db()
         groups = self._group_count()

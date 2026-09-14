@@ -143,6 +143,20 @@ os._exit(0)
             self.assertFalse(store.record("group", "accepted", "message_deleted"))
             store.close()
 
+    def test_tombstone_eviction_ends_replay_dedupe_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(Path(directory).resolve() / "ambient.sqlite3",
+                                        max_events_per_group=2)
+            store.record("group", "accepted", "message_deleted")
+            claim = store.claim("group")
+            store.acknowledge("group", claim.token)
+            self.assertFalse(store.record("group", "accepted", "message_deleted"))
+            store.record("group", "newer-1", "message_edited")
+            store.record("group", "newer-2", "reaction_added")
+            self.assertTrue(store.record("group", "accepted", "message_deleted"))
+            self.assertLessEqual(store.stats()["events"], 2)
+            store.close()
+
     def test_acknowledged_event_stays_deduped_across_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / "private" / "ambient.sqlite3"

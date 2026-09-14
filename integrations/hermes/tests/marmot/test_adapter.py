@@ -1468,6 +1468,53 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await adapter.disconnect()
 
+    async def test_connect_failure_survives_each_cleanup_error_and_stops_worker(self):
+        for operation in ("tasks", "ambient", "spool"):
+            with self.subTest(operation=operation):
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}), client=object()
+                )
+                await adapter._ensure_inbound_spool_open()
+                await adapter._ambient_context_call(adapter._ambient_context.open)
+                executor = adapter._inbound_spool_executor
+                adapter._ensure_account_id = unittest.mock.AsyncMock(side_effect=OSError("original connection failure"))
+                adapter._set_fatal_error = unittest.mock.Mock()
+                if operation == "tasks":
+                    target, name = adapter, "_stop_inbound_tasks"
+                    fault = unittest.mock.AsyncMock(side_effect=RuntimeError("task cleanup failure"))
+                else:
+                    target, name = ((adapter._ambient_context, "_close_lock") if operation == "ambient"
+                                    else (adapter._inbound_spool, "close"))
+                    original = getattr(target, name)
+                    def fault(*args, **kwargs):
+                        original(*args, **kwargs)
+                        raise OSError("close cleanup failure")
+                try:
+                    with unittest.mock.patch.object(target, name, fault):
+                        self.assertFalse(await adapter.connect(is_reconnect=True))
+                    adapter._set_fatal_error.assert_called_once_with(
+                        "marmot_connect_failed", "original connection failure", retryable=True)
+                    self.assertFalse(adapter._inbound_spool.is_open)
+                    self.assertFalse(adapter._ambient_context.is_open)
+                    self.assertFalse(adapter._ambient_context._generation_enabled)
+                    self.assertIsNone(adapter._inbound_spool_executor)
+                    self.assertTrue(all(not thread.is_alive() for thread in executor._threads))
+                finally:
+                    await adapter.disconnect()
+
+    async def test_early_connect_failure_does_not_create_journal_worker(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}), client=object()
+        )
+        adapter._ensure_account_id = unittest.mock.AsyncMock(side_effect=OSError("unavailable"))
+        adapter._set_fatal_error = unittest.mock.Mock()
+        with unittest.mock.patch.object(self.adapter_module, "ThreadPoolExecutor") as executor:
+            self.assertFalse(await adapter.connect())
+            executor.assert_not_called()
+        self.assertIsNone(adapter._inbound_spool_executor)
+        self.assertFalse(adapter._ambient_context._generation_enabled)
+        adapter._set_fatal_error.assert_called_once_with("marmot_connect_failed", "unavailable", retryable=True)
+
     async def test_ambient_open_failure_degrades_without_blocking_real_inbound(self):
         inbound = wire_event(
             {
@@ -7144,12 +7191,45 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter._handle_control_event(change("bb" * 32))
             facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
             self.assertEqual(len(facts), 1)
-            # Older connectors have no occurrence identity. Preserve each
-            # observation instead of suppressing this kind for the full TTL.
+            # Legacy frames use bounded process-local suppression; modern
+            # occurrences above remain distinct by their canonical ids.
             await adapter._handle_control_event(change())
             await adapter._handle_control_event(change())
             facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
-            self.assertEqual(len(facts), 3)
+            self.assertEqual(len(facts), 2)
+        finally:
+            await adapter.disconnect()
+
+    async def test_legacy_replay_burst_does_not_evict_distinct_ambient_facts(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        group = "22" * 32
+        try:
+            await adapter._ambient_context_call(adapter._ambient_context.record,
+                                                group, "distinct-deletion", "message_deleted")
+            event = {"type": "group_state_changed", "account_id_hex": "11" * 32,
+                     "group_id_hex": group, "change": "group_renamed", "detail": "Crew"}
+            for _ in range(64):
+                await adapter._handle_control_event(event)
+            facts = await adapter._ambient_context_call(adapter._ambient_context.pending, group)
+            self.assertEqual([fact.kind for fact in facts], ["message_deleted", "group_state:group_renamed"])
+            self.assertEqual(adapter.events, [])
+        finally:
+            await adapter.disconnect()
+
+    async def test_restart_hint_survives_failed_automatic_history_lookup(self):
+        client = unittest.mock.Mock()
+        client.timeline_list = unittest.mock.AsyncMock(side_effect=OSError("history unavailable"))
+        adapter = self.make_adapter(extra={"group_activation": "always"}, client=client)
+        try:
+            await adapter._ambient_context_call(adapter._ambient_context.record,
+                                                "22" * 32, "deletion", "message_deleted")
+            await adapter._ambient_context_call(adapter._ambient_context.close)
+            await adapter._handle_control_event(self.make_event())
+            await adapter._inbound_queue.join()
+            self.assertEqual(len(adapter.events), 1)
+            self.assertIn('"type":"message_deleted"', adapter.events[0].channel_context)
+            client.timeline_list.assert_awaited_once()
+            self.assertEqual(client.timeline_list.call_args.kwargs["limit"], 20)
         finally:
             await adapter.disconnect()
 
