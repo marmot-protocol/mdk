@@ -203,6 +203,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Hermes Marmot install/reconfigure now pins `display.platforms.marmot.cleanup_progress: false` so a
+  pre-existing global Hermes cleanup policy cannot delete durable kind-1202 tool-operation history after
+  a successful turn. Automatic progress cleanup is unsupported; explicit `delete_marmot_message` is
+  unchanged. Covered by helper/CLI configuration tests and a pinned-Hermes turn-boundary probe.
+
 - `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
   directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran
   the wn-home directory helper against that directory and chmod-ed it to `0700`, removing other users' access to a

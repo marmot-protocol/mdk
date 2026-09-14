@@ -548,6 +548,18 @@ HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=1 \
 just hermes-phone-test-up
 ```
 
+Install and reconfigure always write an explicit Marmot platform override
+`display.platforms.marmot.cleanup_progress: false`. Hermes otherwise inherits a
+global `cleanup_progress: true` when the platform key is missing, and would then
+treat tool-progress `SendResult` handles as temporary bubbles. Marmot tool
+progress is durable kind-1202 agent-operation history, so automatic cleanup is
+not a supported opt-in. A stale Marmot `true` (or a string/null leftover) is
+repaired on the next install or helper run. Global and other-platform display
+settings are left unchanged. Default tool progress stays `off`; enabling
+retained progress (`tool_progress=all` / `new` / `verbose`) does not enable
+cleanup. Explicit `delete_marmot_message` against an exact durable event id is
+unchanged.
+
 The bootstrap command prints the agent account hex, `npub`, `nprofile`, relay hints, QUIC preview candidate, and QR
 code. The QR payload is the `nprofile`; QUIC preview candidates are printed for diagnostics and are still announced by
 Hermes in the first agent-stream start message. Run logs in another terminal while testing from the phone:

@@ -752,11 +752,21 @@ def main() -> int:
 
         busy_session = _exercise_busy_session_process_death(hermes_source, home)
 
+        probe_dir = Path(__file__).resolve().parent
+        if str(probe_dir) not in sys.path:
+            sys.path.insert(0, str(probe_dir))
+        from progress_cleanup_probe import run as run_progress_cleanup_probe
+
+        progress_cleanup = run_progress_cleanup_probe(
+            adapter_module,
+            home / "progress-cleanup",
+        )
+
         print(
             "real-hermes plugin install/discovery/media passed "
             f"(hermes_source={hermes_source}, mdk_ref={resolved_ref}, "
             f"source_install_mode={source_install_mode}, media_calls={media_calls}, "
-            f"busy_session={busy_session})"
+            f"busy_session={busy_session}, progress_cleanup={progress_cleanup})"
         )
     return 0
 

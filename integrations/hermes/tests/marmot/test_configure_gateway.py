@@ -142,6 +142,7 @@ class ConfigureGatewayTests(unittest.TestCase):
             )
 
             config = self.module.load_config(config_path)
+            config_text = config_path.read_text(encoding="utf-8")
 
         self.assertNotIn("streaming", config)
         self.assertTrue(config["platforms"]["marmot"]["enabled"])
@@ -159,6 +160,8 @@ class ConfigureGatewayTests(unittest.TestCase):
         self.assertFalse(marmot["interim_assistant_messages"])
         self.assertFalse(marmot["long_running_notifications"])
         self.assertFalse(marmot["busy_ack_detail"])
+        self.assertIs(marmot["cleanup_progress"], False)
+        self.assertIn("cleanup_progress: false", config_text)
 
     def test_preserves_unrelated_config_and_platforms(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -175,9 +178,11 @@ class ConfigureGatewayTests(unittest.TestCase):
                         "  edit_interval: 0.5",
                         "display:",
                         "  tool_progress: all",
+                        "  cleanup_progress: true",
                         "  platforms:",
                         "    telegram:",
                         "      tool_progress: verbose",
+                        "      cleanup_progress: true",
                         "platforms:",
                         "  telegram:",
                         "    extra:",
@@ -211,10 +216,12 @@ class ConfigureGatewayTests(unittest.TestCase):
         self.assertNotIn("transport", config["streaming"])
         self.assertEqual(config["streaming"]["edit_interval"], 0.5)
         self.assertEqual(config["display"]["tool_progress"], "all")
+        self.assertTrue(config["display"]["cleanup_progress"])
         self.assertEqual(
             config["display"]["platforms"]["telegram"]["tool_progress"],
             "verbose",
         )
+        self.assertTrue(config["display"]["platforms"]["telegram"]["cleanup_progress"])
         self.assertEqual(
             config["platforms"]["telegram"]["extra"]["bot_token_file"],
             "/secret/token",
@@ -230,6 +237,7 @@ class ConfigureGatewayTests(unittest.TestCase):
         self.assertTrue(marmot["interim_assistant_messages"])
         self.assertTrue(marmot["long_running_notifications"])
         self.assertTrue(marmot["busy_ack_detail"])
+        self.assertIs(marmot["cleanup_progress"], False)
 
     def test_rejects_invalid_bool(self):
         with self.assertRaises(ValueError):
@@ -301,6 +309,159 @@ class ConfigureGatewayTests(unittest.TestCase):
                     self.assertEqual(adapter.socket_path, str(socket_path))
         finally:
             restore_marmot_env(saved_env)
+
+
+def _quiet_display_kwargs():
+    return {
+        "platform": "marmot",
+        "streaming_enabled": False,
+        "streaming_transport": "off",
+        "tool_progress": "off",
+        "interim_assistant_messages": False,
+        "long_running_notifications": False,
+        "busy_ack_detail": False,
+    }
+
+
+class CleanupProgressConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+
+    def _write_seed(self, home: Path, body: str) -> Path:
+        config_path = home / "config.yaml"
+        config_path.write_text(body, encoding="utf-8")
+        return config_path
+
+    def _configure(self, home: Path, **overrides):
+        kwargs = _quiet_display_kwargs()
+        kwargs.update(overrides)
+        return self.module.configure_gateway_config(hermes_home=home, **kwargs)
+
+    def _assert_boolean_false_on_disk(self, config_path: Path):
+        text = config_path.read_text(encoding="utf-8")
+        self.assertRegex(
+            text,
+            r"(?ms)^display:\n(?:  .*\n)*  platforms:\n(?:    .*\n)*    marmot:\n(?:      .*\n)*      cleanup_progress: false\n",
+        )
+        marmot_block = text.split("    marmot:\n", 1)[1]
+        marmot_block = marmot_block.split("\nplatforms:\n", 1)[0]
+        self.assertRegex(marmot_block, r"(?m)^      cleanup_progress: false\s*$")
+        self.assertNotRegex(marmot_block, r"(?m)^      cleanup_progress: ['\"]")
+
+    def test_fresh_config_writes_explicit_boolean_false(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            config_path = self._configure(home)
+            config = self.module.load_config(config_path)
+            self.assertIs(config["display"]["platforms"]["marmot"]["cleanup_progress"], False)
+            self._assert_boolean_false_on_disk(config_path)
+            self.assertNotIn("cleanup_progress", config.get("display", {}))
+
+    def test_global_cleanup_true_does_not_change_unrelated_settings(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            self._write_seed(
+                home,
+                "\n".join(
+                    [
+                        "model: gpt-4o",
+                        "agent:",
+                        "  max_turns: 7",
+                        "display:",
+                        "  cleanup_progress: true",
+                        "  tool_progress: all",
+                        "  platforms:",
+                        "    slack:",
+                        "      cleanup_progress: false",
+                        "      tool_progress: verbose",
+                        "    telegram:",
+                        "      cleanup_progress: true",
+                        "",
+                    ]
+                ),
+            )
+            before = self.module.load_config(home / "config.yaml")
+            config_path = self._configure(home, tool_progress="off")
+            after = self.module.load_config(config_path)
+            self._assert_boolean_false_on_disk(config_path)
+
+        self.assertEqual(after["model"], before["model"])
+        self.assertEqual(after["agent"], before["agent"])
+        self.assertTrue(after["display"]["cleanup_progress"])
+        self.assertEqual(after["display"]["tool_progress"], "all")
+        self.assertFalse(after["display"]["platforms"]["slack"]["cleanup_progress"])
+        self.assertEqual(after["display"]["platforms"]["slack"]["tool_progress"], "verbose")
+        self.assertTrue(after["display"]["platforms"]["telegram"]["cleanup_progress"])
+        self.assertIs(after["display"]["platforms"]["marmot"]["cleanup_progress"], False)
+
+    def test_stale_marmot_cleanup_values_converge_to_false(self):
+        cases = (
+            "",
+            "      cleanup_progress: null\n",
+            "      cleanup_progress: true\n",
+            "      cleanup_progress: 'true'\n",
+            "      cleanup_progress: false\n",
+        )
+        for seed_line in cases:
+            with self.subTest(seed=seed_line or "absent"):
+                with tempfile.TemporaryDirectory() as tempdir:
+                    home = Path(tempdir)
+                    self._write_seed(
+                        home,
+                        "display:\n  platforms:\n    marmot:\n      tool_progress: all\n"
+                        + seed_line,
+                    )
+                    config_path = self._configure(home)
+                    config = self.module.load_config(config_path)
+                    self.assertIs(
+                        config["display"]["platforms"]["marmot"]["cleanup_progress"],
+                        False,
+                    )
+                    self._assert_boolean_false_on_disk(config_path)
+
+    def test_repeated_helper_and_cli_invocation_keeps_false(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            self._write_seed(
+                home,
+                "display:\n  cleanup_progress: true\n  platforms:\n    marmot:\n      cleanup_progress: true\n",
+            )
+            first = self._configure(home)
+            second = self._configure(home, tool_progress="all")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--home",
+                    str(home),
+                    "--tool-progress",
+                    "off",
+                    "--interim-messages",
+                    "0",
+                    "--long-running-notifications",
+                    "0",
+                    "--busy-ack-detail",
+                    "0",
+                    "--quiet",
+                    "--no-backup",
+                ],
+                capture_output=True,
+                text=True,
+                env=scrub_marmot_env(),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            for config_path in (first, second, home / "config.yaml"):
+                config = self.module.load_config(config_path)
+                self.assertIs(config["display"]["platforms"]["marmot"]["cleanup_progress"], False)
+                self.assertTrue(config["display"]["cleanup_progress"])
+                self._assert_boolean_false_on_disk(config_path)
+
+    def test_installer_uses_helper_and_does_not_project_cleanup_itself(self):
+        installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("hermes_marmot_configure_gateway.py", installer)
+        self.assertIn("configure_gateway_helper_path", installer)
+        self.assertNotRegex(installer, r"cleanup_progress")
+        self.assertIn("platform_config[\"cleanup_progress\"] = False", SCRIPT_PATH.read_text(encoding="utf-8"))
 
 
 class MarmotPlatformEnablementTests(unittest.TestCase):
