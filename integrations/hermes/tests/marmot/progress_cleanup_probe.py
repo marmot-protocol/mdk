@@ -12,8 +12,10 @@ recording fake control endpoint.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -32,6 +34,7 @@ PROTOCOL = "marmot.agent-control.v2"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HELPER_PATH = REPO_ROOT / "scripts" / "hermes_marmot_configure_gateway.py"
 TOOL_PROGRESS_PREFIX = "marmot-tool-progress:"
+SCHEDULED_WORK_TIMEOUT_S = 3.0
 
 
 def _load_helper():
@@ -51,17 +54,33 @@ def _hex_id(index: int) -> str:
     return f"{index:02x}" * 32
 
 
+def _operation_key(attempt: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(attempt.get("name") or ""),
+        str(attempt.get("preview") or ""),
+        str(attempt.get("status") or ""),
+    )
+
+
 class RecordingControlServer:
-    def __init__(self, socket_path: Path, *, fail_first_operation: bool = False):
+    def __init__(
+        self,
+        socket_path: Path,
+        *,
+        fail_operation_after: int | None = None,
+    ):
         self.socket_path = socket_path
         self.server: asyncio.AbstractServer | None = None
         self.requests: list[str] = []
         self.operation_sends = 0
         self.final_sends = 0
+        self.final_failures = 0
         self.wire_deletes = 0
         self.durable_operation_ids: list[str] = []
         self.delete_targets: list[str] = []
-        self.fail_first_operation = fail_first_operation
+        self.operation_attempts: list[dict[str, Any]] = []
+        self.fail_operation_after = fail_operation_after
+        self._operation_seen = 0
         self._operation_failures = 0
         self._next_id = 16
         self.fail_final = False
@@ -112,8 +131,20 @@ class RecordingControlServer:
     def _response_for(self, request: dict[str, Any], request_type: str) -> dict[str, Any]:
         request_id = request.get("id")
         if request_type == "send_agent_operation_event":
-            if self.fail_first_operation and self._operation_failures == 0:
+            self._operation_seen += 1
+            identity = {
+                "name": str(request.get("name") or ""),
+                "preview": str(request.get("preview") or ""),
+                "status": str(request.get("status") or ""),
+            }
+            should_fail = (
+                self.fail_operation_after is not None
+                and self._operation_seen > self.fail_operation_after
+                and self._operation_failures == 0
+            )
+            if should_fail:
                 self._operation_failures += 1
+                self.operation_attempts.append({**identity, "outcome": "failed"})
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
@@ -125,6 +156,7 @@ class RecordingControlServer:
             durable = self._alloc()
             self.operation_sends += 1
             self.durable_operation_ids.append(durable)
+            self.operation_attempts.append({**identity, "outcome": "accepted"})
             return {
                 "marmot_agent_control": PROTOCOL,
                 "id": request_id,
@@ -133,6 +165,7 @@ class RecordingControlServer:
             }
         if request_type == "send_final":
             if self.fail_final:
+                self.final_failures += 1
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
@@ -187,20 +220,29 @@ class DeterministicAIAgent:
         self.tool_progress_callback = None
         self.is_interrupted = False
         self.fail_turn = bool(kwargs.pop("_fail_turn", False))
+        self.stagger_after_first = bool(kwargs.pop("_stagger_after_first", False))
         self.tool_names = list(
             kwargs.pop("_tool_names", ("probe_alpha", "probe_beta", "probe_gamma"))
         )
+        self.last_result: dict[str, Any] | None = None
         self.created = True
         DeterministicAIAgent.instances.append(self)
 
     def run_conversation(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         callback = self.tool_progress_callback
         if callback is not None:
-            for name in self.tool_names:
-                callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
+            if self.stagger_after_first and len(self.tool_names) >= 2:
+                first, *rest = self.tool_names
+                callback("tool.started", first, preview=f"{first}-preview", args={"q": first})
+                time.sleep(2.0)
+                for name in rest:
+                    callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
+            else:
+                for name in self.tool_names:
+                    callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
         time.sleep(2.2)
         if self.fail_turn:
-            return {
+            self.last_result = {
                 "final_response": "",
                 "messages": [],
                 "api_calls": 1,
@@ -208,13 +250,15 @@ class DeterministicAIAgent:
                 "completed": False,
                 "failed": True,
             }
-        return {
+            return self.last_result
+        self.last_result = {
             "final_response": "probe-final-ok",
             "messages": [],
             "api_calls": 1,
             "tools": list(self.tool_names),
             "completed": True,
         }
+        return self.last_result
 
 
 def _quiet_helper_kwargs(home: Path, *, tool_progress: str = "off") -> dict[str, Any]:
@@ -283,6 +327,101 @@ def _wrap_delete(adapter, attempts: list[str]) -> None:
     adapter.delete_message = tracked
 
 
+@contextlib.contextmanager
+def _capture_safe_schedules(bucket: list[Any]):
+    import gateway.run as gateway_run
+    from agent import async_utils
+
+    originals = {
+        async_utils: async_utils.safe_schedule_threadsafe,
+        gateway_run: gateway_run.safe_schedule_threadsafe,
+    }
+
+    def tracked(coro, loop, **kwargs):
+        future = originals[async_utils](coro, loop, **kwargs)
+        if future is not None:
+            bucket.append(future)
+        return future
+
+    async_utils.safe_schedule_threadsafe = tracked
+    gateway_run.safe_schedule_threadsafe = tracked
+    try:
+        yield
+    finally:
+        async_utils.safe_schedule_threadsafe = originals[async_utils]
+        gateway_run.safe_schedule_threadsafe = originals[gateway_run]
+
+
+def _wrap_post_delivery_boundary(
+    adapter,
+    *,
+    callback_registrations: list[bool],
+    callback_invocations: list[bool],
+    pop_calls: list[bool],
+    scheduled: list[Any],
+) -> None:
+    original_register = adapter.register_post_delivery_callback
+    original_pop = adapter.pop_post_delivery_callback
+
+    def tracking_register(session_key, callback, *args, **kwargs):
+        callback_registrations.append(True)
+
+        def wrapped_callback(*cb_args, **cb_kwargs):
+            callback_invocations.append(True)
+            with _capture_safe_schedules(scheduled):
+                return callback(*cb_args, **cb_kwargs)
+
+        return original_register(session_key, wrapped_callback, *args, **kwargs)
+
+    def tracking_pop(*args, **kwargs):
+        popped = original_pop(*args, **kwargs)
+        pop_calls.append(popped is not None)
+        return popped
+
+    adapter.register_post_delivery_callback = tracking_register
+    adapter.pop_post_delivery_callback = tracking_pop
+
+
+async def _await_host_turn(adapter, *, timeout: float) -> None:
+    tasks: set[asyncio.Task] = set()
+    background = getattr(adapter, "_background_tasks", None)
+    if background:
+        tasks.update(task for task in background if isinstance(task, asyncio.Task) and not task.done())
+    session_tasks = getattr(adapter, "_session_tasks", None)
+    if isinstance(session_tasks, dict):
+        tasks.update(
+            task
+            for task in session_tasks.values()
+            if isinstance(task, asyncio.Task) and not task.done()
+        )
+    if not tasks:
+        raise AssertionError("handle_message returned without a host turn task")
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    if pending:
+        raise AssertionError("host turn task did not finish before timeout")
+
+
+async def _await_scheduled_work(scheduled: list[Any], *, timeout: float) -> None:
+    if not scheduled:
+        return
+    loop = asyncio.get_running_loop()
+    awaitables: list[Any] = []
+    for item in scheduled:
+        if asyncio.isfuture(item) or isinstance(item, asyncio.Task):
+            awaitables.append(item)
+        else:
+            awaitables.append(asyncio.wrap_future(item, loop=loop))
+    done, pending = await asyncio.wait(awaitables, timeout=timeout)
+    if pending:
+        for task in pending:
+            task.cancel()
+        raise AssertionError("scheduled post-delivery cleanup work did not finish before timeout")
+    for item in done:
+        exc = item.exception() if hasattr(item, "exception") else None
+        if exc is not None:
+            raise AssertionError("scheduled post-delivery cleanup work failed")
+
+
 def _build_event(SessionSource, MessageEvent, Platform):
     source = SessionSource(
         platform=Platform("marmot"),
@@ -300,19 +439,52 @@ def _build_event(SessionSource, MessageEvent, Platform):
     )
 
 
-async def _drain_scheduled_work(timeout: float = 3.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        await asyncio.sleep(0)
-        pending = [
-            task
-            for task in asyncio.all_tasks(loop)
-            if task is not asyncio.current_task() and not task.done()
-        ]
-        if not pending:
-            return
-        await asyncio.sleep(0.05)
+async def _dispatch_registered_delete() -> dict[str, Any]:
+    from tools.registry import registry
+
+    entry = registry.get_entry("delete_marmot_message")
+    if entry is None or not callable(getattr(entry, "handler", None)):
+        raise AssertionError("delete_marmot_message was not registered with Hermes")
+    raw = entry.handler(
+        {
+            "message_id": EXPLICIT_OPERATION_ID,
+            "target": f"marmot:{GROUP_ID_HEX}",
+        },
+        task_id="progress-cleanup-explicit-delete",
+        session_id="progress-cleanup-explicit-delete",
+    )
+    if inspect.isawaitable(raw):
+        raw = await raw
+    if not isinstance(raw, str):
+        raise AssertionError("registered delete_marmot_message returned a non-string result")
+    payload = json.loads(raw)
+    if not payload.get("ok"):
+        raise AssertionError("registered delete_marmot_message did not reach the adapter")
+    return payload
+
+
+def _fresh_persisted_gateway(hermes_home: Path, helper):
+    from gateway.config import Platform, load_gateway_config
+    from gateway.display_config import resolve_display_setting
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.plugins import discover_plugins
+    import gateway.run as gateway_run
+
+    os.environ["HERMES_HOME"] = str(hermes_home)
+    os.environ["HOME"] = str(hermes_home.parent)
+    persisted = helper.load_config(hermes_home / "config.yaml")
+    if resolve_display_setting(persisted, "marmot", "cleanup_progress") is not False:
+        raise AssertionError("reconfigured persisted cleanup_progress did not remain false")
+    discover_plugins(force=True)
+    loaded = load_gateway_config()
+    platform_config = loaded.platforms.get(Platform("marmot"))
+    if platform_config is None:
+        raise AssertionError("persisted gateway load missing marmot platform")
+    adapter = platform_registry.create_adapter("marmot", platform_config)
+    if adapter is None:
+        raise AssertionError("persisted gateway adapter factory returned no adapter")
+    runner = gateway_run.GatewayRunner(config=loaded)
+    return persisted, runner, adapter
 
 
 async def _run_gateway_turn(
@@ -321,11 +493,12 @@ async def _run_gateway_turn(
     adapter_module,
     grouping: str = "accumulate",
     tool_progress: str = "all",
-    fail_first_operation: bool = False,
+    fail_operation_after: int | None = None,
     fail_turn: bool = False,
     fail_final: bool = False,
     cleanup_override: bool | None = None,
     explicit_delete: bool = False,
+    stagger_after_first: bool = False,
 ) -> dict[str, Any]:
     helper = _load_helper()
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -338,15 +511,13 @@ async def _run_gateway_turn(
     marmot_display["tool_progress_grouping"] = grouping
     if cleanup_override is True:
         marmot_display["cleanup_progress"] = True
-    elif cleanup_override is False or cleanup_override is None:
-        marmot_display["cleanup_progress"] = False
     (hermes_home / "config.yaml").write_text(helper.dump_config(config), encoding="utf-8")
 
     os.environ["HERMES_HOME"] = str(hermes_home)
     os.environ["HOME"] = str(hermes_home.parent)
 
     socket_path = hermes_home / "marmot-agent" / "wn-agent.sock"
-    fake = RecordingControlServer(socket_path, fail_first_operation=fail_first_operation)
+    fake = RecordingControlServer(socket_path, fail_operation_after=fail_operation_after)
     fake.fail_final = fail_final
     await fake.start()
 
@@ -382,6 +553,17 @@ async def _run_gateway_turn(
     adapter_module._remember_live_adapter(adapter)
     delete_attempts: list[str] = []
     _wrap_delete(adapter, delete_attempts)
+    callback_registrations: list[bool] = []
+    callback_invocations: list[bool] = []
+    pop_calls: list[bool] = []
+    scheduled: list[Any] = []
+    _wrap_post_delivery_boundary(
+        adapter,
+        callback_registrations=callback_registrations,
+        callback_invocations=callback_invocations,
+        pop_calls=pop_calls,
+        scheduled=scheduled,
+    )
     send_ids: list[str] = []
     original_send = adapter.send
 
@@ -394,14 +576,18 @@ async def _run_gateway_turn(
     adapter.send = tracking_send
 
     DeterministicAIAgent.instances.clear()
-    create_kwargs = {"_fail_turn": fail_turn}
+    create_kwargs = {
+        "_fail_turn": fail_turn,
+        "_stagger_after_first": stagger_after_first,
+    }
 
     def agent_factory(*args, **kwargs):
         kwargs.update(create_kwargs)
         return DeterministicAIAgent(*args, **kwargs)
 
     runner = None
-    finally_ran = False
+    delivery_boundary_observed = False
+    scheduled_work_drained = False
     try:
         with mock.patch.object(run_agent, "AIAgent", agent_factory):
             runner = gateway_run.GatewayRunner(config=loaded)
@@ -413,19 +599,12 @@ async def _run_gateway_turn(
             adapter.set_message_handler(runner._handle_message)
             event = _build_event(SessionSource, MessageEvent, Platform)
             await asyncio.wait_for(adapter.handle_message(event), timeout=30.0)
-            finally_ran = True
-            await _drain_scheduled_work()
+            await _await_host_turn(adapter, timeout=30.0)
+            delivery_boundary_observed = bool(pop_calls)
+            await _await_scheduled_work(scheduled, timeout=SCHEDULED_WORK_TIMEOUT_S)
+            scheduled_work_drained = True
             if explicit_delete:
-                deleted = json.loads(
-                    await adapter_module._delete_marmot_message_tool(
-                        {
-                            "message_id": EXPLICIT_OPERATION_ID,
-                            "target": f"marmot:{GROUP_ID_HEX}",
-                        }
-                    )
-                )
-                if not deleted.get("ok"):
-                    raise AssertionError("explicit delete_marmot_message did not reach the adapter")
+                await _dispatch_registered_delete()
     finally:
         gateway_run._load_gateway_config = original_load_gateway_config
         if runner is not None:
@@ -439,10 +618,17 @@ async def _run_gateway_turn(
                     pass
         await fake.close()
 
+    agent_results = [
+        inst.last_result for inst in DeterministicAIAgent.instances if inst.last_result is not None
+    ]
+    agent_failed = any(bool(result.get("failed")) for result in agent_results)
     return {
-        "resolved_cleanup": bool(resolved_cleanup),
+        "resolved_cleanup": resolved_cleanup,
         "operation_sends": fake.operation_sends,
+        "operation_failures": fake._operation_failures,
+        "operation_attempts": list(fake.operation_attempts),
         "final_sends": fake.final_sends,
+        "final_failures": fake.final_failures,
         "wire_deletes": fake.wire_deletes,
         "delete_targets": list(fake.delete_targets),
         "durable_operation_ids": list(fake.durable_operation_ids),
@@ -450,17 +636,104 @@ async def _run_gateway_turn(
         "delete_attempts": list(delete_attempts),
         "request_types": list(fake.requests),
         "agent_constructed": bool(DeterministicAIAgent.instances),
-        "finally_ran": finally_ran,
+        "agent_failed": agent_failed,
+        "fail_turn_injected": fail_turn,
+        "fail_final_injected": fail_final,
+        "fail_operation_injected": fail_operation_after is not None,
+        "delivery_boundary_observed": delivery_boundary_observed,
+        "scheduled_work_drained": scheduled_work_drained,
+        "cleanup_callback_registered": bool(callback_registrations),
+        "cleanup_callback_invoked": bool(callback_invocations),
     }
 
 
 def _assert_no_automatic_deletes(result: dict[str, Any], *, label: str) -> None:
+    if result["delete_attempts"]:
+        raise AssertionError(f"{label}: automatic adapter delete attempts occurred")
     if result["wire_deletes"]:
         raise AssertionError(f"{label}: automatic wire deletes were issued")
     if any(target in result["durable_operation_ids"] for target in result["delete_targets"]):
         raise AssertionError(f"{label}: a kind-1202 durable id was targeted")
     if any(target.startswith(TOOL_PROGRESS_PREFIX) for target in result["delete_targets"]):
         raise AssertionError(f"{label}: a synthetic progress handle reached the wire")
+
+
+def _assert_retained_success(
+    result: dict[str, Any],
+    *,
+    label: str,
+    min_operations: int = 1,
+) -> None:
+    if result["resolved_cleanup"] is not False:
+        raise AssertionError(f"{label}: installed cleanup did not resolve false")
+    if result["operation_sends"] < min_operations:
+        raise AssertionError(f"{label}: missing acknowledged operation events")
+    if not result["logical_send_ids"]:
+        raise AssertionError(f"{label}: produced no SendResult handles")
+    if not result["durable_operation_ids"]:
+        raise AssertionError(f"{label}: produced no durable event ids")
+    if result["final_sends"] < 1:
+        raise AssertionError(f"{label}: expected final delivery did not succeed")
+    if not result["delivery_boundary_observed"]:
+        raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
+    if not result["scheduled_work_drained"]:
+        raise AssertionError(f"{label}: scheduled post-delivery work was not drained")
+    _assert_no_automatic_deletes(result, label=label)
+
+
+def _assert_failure_retention(
+    result: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    if result["resolved_cleanup"] is not False:
+        raise AssertionError(f"{label}: installed cleanup did not resolve false")
+    if result["operation_sends"] < 1:
+        raise AssertionError(f"{label}: lost acknowledged progress before the injected failure")
+    if not result["delivery_boundary_observed"]:
+        raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
+    if not result["scheduled_work_drained"]:
+        raise AssertionError(f"{label}: scheduled post-delivery work was not drained")
+    _assert_no_automatic_deletes(result, label=label)
+
+
+def _assert_partial_retry(result: dict[str, Any]) -> None:
+    _assert_failure_retention(result, label="retry")
+    attempts = result["operation_attempts"]
+    failed = [item for item in attempts if item["outcome"] == "failed"]
+    if not result["fail_operation_injected"] or not failed:
+        raise AssertionError("partial-send retry did not record an injected failure")
+    first_fail_idx = next(
+        index for index, item in enumerate(attempts) if item["outcome"] == "failed"
+    )
+    accepted_before = [
+        item for item in attempts[:first_fail_idx] if item["outcome"] == "accepted"
+    ]
+    if not accepted_before:
+        raise AssertionError("partial-send retry failed before any acknowledgement")
+    failed_key = _operation_key(attempts[first_fail_idx])
+    retried = [
+        item
+        for item in attempts[first_fail_idx + 1 :]
+        if item["outcome"] == "accepted" and _operation_key(item) == failed_key
+    ]
+    if not retried:
+        raise AssertionError("failed operation was not retried on the same logical surface")
+    accepted_key = _operation_key(accepted_before[0])
+    resent = [
+        item
+        for item in attempts[first_fail_idx:]
+        if item["outcome"] == "accepted" and _operation_key(item) == accepted_key
+    ]
+    if resent:
+        raise AssertionError("accepted operation was resent after the injected failure")
+    progress_ids = [
+        message_id
+        for message_id in result["logical_send_ids"]
+        if message_id.startswith(TOOL_PROGRESS_PREFIX)
+    ]
+    if len(set(progress_ids)) != 1:
+        raise AssertionError("partial-send retry used more than one logical progress surface")
 
 
 async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
@@ -475,27 +748,14 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         adapter_module=adapter_module,
         grouping="accumulate",
     )
-    if accumulate["operation_sends"] < 1:
-        raise AssertionError("accumulate turn sent no kind-1202 operation events")
-    if not accumulate["logical_send_ids"]:
-        raise AssertionError("accumulate turn produced no SendResult handles")
-    if not accumulate["durable_operation_ids"]:
-        raise AssertionError("accumulate turn produced no durable event ids")
-    if not accumulate["finally_ran"]:
-        raise AssertionError("accumulate turn did not reach the host delivery boundary")
-    _assert_no_automatic_deletes(accumulate, label="accumulate")
+    _assert_retained_success(accumulate, label="accumulate")
 
     separate = await _run_gateway_turn(
         hermes_home=hermes_home / "separate",
         adapter_module=adapter_module,
         grouping="separate",
     )
-    if separate["operation_sends"] < 2:
-        raise AssertionError(
-            "separate grouping did not emit multiple tool-operation sends "
-            f"(operations={separate['operation_sends']} logical={len(separate['logical_send_ids'])})"
-        )
-    _assert_no_automatic_deletes(separate, label="separate")
+    _assert_retained_success(separate, label="separate", min_operations=2)
 
     control = await _run_gateway_turn(
         hermes_home=hermes_home / "control",
@@ -503,6 +763,16 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         grouping="separate",
         cleanup_override=True,
     )
+    if control["resolved_cleanup"] is not True:
+        raise AssertionError("positive-control cleanup did not resolve true")
+    if not control["cleanup_callback_registered"]:
+        raise AssertionError("positive-control never registered a post-delivery cleanup callback")
+    if not control["cleanup_callback_invoked"]:
+        raise AssertionError("positive-control cleanup callback was never invoked")
+    if not control["delivery_boundary_observed"]:
+        raise AssertionError("positive-control did not observe the host delivery-finally boundary")
+    if not control["scheduled_work_drained"]:
+        raise AssertionError("positive-control scheduled cleanup work was not drained")
     if not control["delete_attempts"]:
         raise AssertionError("positive-control cleanup never reached adapter.delete_message")
     if control["wire_deletes"]:
@@ -515,27 +785,31 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         adapter_module=adapter_module,
         fail_turn=True,
     )
-    if not failed_turn["finally_ran"]:
-        raise AssertionError("failed-turn case did not observe the host callback boundary")
-    _assert_no_automatic_deletes(failed_turn, label="failed-turn")
+    if not failed_turn["fail_turn_injected"] or not failed_turn["agent_failed"]:
+        raise AssertionError("failed-turn host outcome was not a failed agent")
+    _assert_failure_retention(failed_turn, label="failed-turn")
 
     failed_final = await _run_gateway_turn(
         hermes_home=hermes_home / "failed-final",
         adapter_module=adapter_module,
         fail_final=True,
     )
-    if failed_final["operation_sends"] < 1:
-        raise AssertionError("failed-final case lost acknowledged progress")
-    _assert_no_automatic_deletes(failed_final, label="failed-final")
+    if not failed_final["fail_final_injected"] or failed_final["final_failures"] < 1:
+        raise AssertionError("failed-final did not observe a failed send_final")
+    if failed_final["final_sends"]:
+        raise AssertionError("failed-final unexpectedly acknowledged a final")
+    if failed_final["agent_failed"]:
+        raise AssertionError("failed-final unexpectedly marked the agent as failed")
+    _assert_failure_retention(failed_final, label="failed-final")
 
     retry = await _run_gateway_turn(
         hermes_home=hermes_home / "retry",
         adapter_module=adapter_module,
-        fail_first_operation=True,
+        grouping="accumulate",
+        fail_operation_after=1,
+        stagger_after_first=True,
     )
-    if retry["operation_sends"] < 1:
-        raise AssertionError("partial-send retry did not accept a later operation event")
-    _assert_no_automatic_deletes(retry, label="retry")
+    _assert_partial_retry(retry)
 
     restart_home = hermes_home / "restart"
     restart = await _run_gateway_turn(
@@ -543,28 +817,40 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         adapter_module=adapter_module,
     )
     helper.configure_gateway_config(**_quiet_helper_kwargs(restart_home, tool_progress="all"))
-    persisted = helper.load_config(restart_home / "config.yaml")
-    from gateway.display_config import resolve_display_setting
-
-    if resolve_display_setting(persisted, "marmot", "cleanup_progress") is not False:
-        raise AssertionError("reconfigured persisted cleanup_progress did not remain false")
-    fresh = adapter_module.MarmotPlatformAdapter(
-        type("Cfg", (), {"enabled": True, "extra": persisted["platforms"]["marmot"]["extra"]})()
-    )
-    if getattr(fresh, "_tool_progress_events", None):
-        if len(fresh._tool_progress_events) != 0:
+    _persisted, fresh_runner, fresh = _fresh_persisted_gateway(restart_home, helper)
+    try:
+        events = getattr(fresh, "_tool_progress_events", None)
+        if events and len(events) != 0:
             raise AssertionError("fresh adapter reconstructed in-memory synthetic cleanup targets")
-    _assert_no_automatic_deletes(restart, label="restart")
+    finally:
+        stop = getattr(fresh_runner, "stop", None)
+        if callable(stop):
+            try:
+                result = stop()
+                if asyncio.iscoroutine(result):
+                    await asyncio.wait_for(result, timeout=2.0)
+            except Exception:
+                pass
+    _assert_retained_success(restart, label="restart")
 
     explicit = await _run_gateway_turn(
         hermes_home=hermes_home / "explicit",
         adapter_module=adapter_module,
         explicit_delete=True,
     )
+    if explicit["resolved_cleanup"] is not False:
+        raise AssertionError("explicit-delete installed cleanup did not resolve false")
     if explicit["wire_deletes"] != 1:
         raise AssertionError("explicit delete did not issue exactly one control delete")
     if explicit["delete_targets"] != [EXPLICIT_OPERATION_ID]:
         raise AssertionError("explicit delete targeted an unexpected message")
+    extra_attempts = [
+        handle
+        for handle in explicit["delete_attempts"]
+        if handle != EXPLICIT_OPERATION_ID
+    ]
+    if extra_attempts:
+        raise AssertionError("explicit delete was accompanied by automatic cleanup attempts")
 
     return {
         "defaults_resolved_false": True,
@@ -572,7 +858,9 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         "separate_operations": separate["operation_sends"],
         "control_delete_attempts": len(control["delete_attempts"]),
         "failed_turn_operations": failed_turn["operation_sends"],
+        "failed_final_operations": failed_final["operation_sends"],
         "retry_operations": retry["operation_sends"],
+        "retry_failures": retry["operation_failures"],
         "explicit_deletes": explicit["wire_deletes"],
     }
 
