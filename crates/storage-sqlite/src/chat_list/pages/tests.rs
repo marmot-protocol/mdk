@@ -366,6 +366,88 @@ fn manual_unread_invite_acceptance_and_source_membership_change_are_immediate() 
 }
 
 #[test]
+fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
+    use cgka_traits::storage::StorageProvider;
+    for commit in [false, true] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        for id in ["01", "02", "03"] {
+            seed(&store, id, false, "member", 0, false);
+        }
+        let before = page(&store, ChatListView::Chats).first;
+        let result =
+            StorageProvider::with_transaction(&store, |store| -> Result<(), ChatListPageError> {
+                store
+                    .lock()?
+                    .execute(
+                        "UPDATE chat_list_rows SET activity_sort_at = 99 WHERE group_id_hex = '03'",
+                        [],
+                    )
+                    .storage()?;
+                let first = store.chat_list_page(query(
+                    ChatListView::Chats,
+                    1,
+                    ChatListPageDirection::Forward,
+                    None,
+                ))?;
+                assert_eq!(ids(&first), ["03"]);
+                let next = store.chat_list_page(query(
+                    ChatListView::Chats,
+                    1,
+                    ChatListPageDirection::Forward,
+                    first.last,
+                ))?;
+                assert_eq!(ids(&next), ["01"]);
+                let anchored = store.chat_list_page_from_anchor(
+                    ChatListView::Chats,
+                    "02",
+                    2,
+                    ChatListPageDirection::Backward,
+                )?;
+                assert_eq!(ids(&anchored), ["01", "02"]);
+                assert!(matches!(
+                    store.chat_list_page_from_anchor(
+                        ChatListView::Chats,
+                        "missing",
+                        2,
+                        ChatListPageDirection::Forward,
+                    ),
+                    Err(ChatListPageError::AnchorUnavailable)
+                ));
+                assert!(!store.lock()?.is_autocommit());
+                if commit {
+                    Ok(())
+                } else {
+                    Err(ChatListPageError::InvalidLimit)
+                }
+            });
+        assert_eq!(result.is_ok(), commit);
+        if !commit {
+            assert!(matches!(result, Err(ChatListPageError::InvalidLimit)));
+        }
+        assert!(store.lock().unwrap().is_autocommit());
+        assert_eq!(
+            ids(&page(&store, ChatListView::Chats)),
+            if commit {
+                vec!["03", "01", "02"]
+            } else {
+                vec!["01", "02", "03"]
+            }
+        );
+        let resumed = store.chat_list_page(query(
+            ChatListView::Chats,
+            1,
+            ChatListPageDirection::Forward,
+            before,
+        ));
+        if commit {
+            assert!(matches!(resumed, Err(ChatListPageError::StaleCursor)));
+        } else {
+            assert_eq!(ids(&resumed.unwrap()), ["02"]);
+        }
+    }
+}
+
+#[test]
 fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "01", false, "member", 1, false);

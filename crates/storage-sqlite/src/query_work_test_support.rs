@@ -8,6 +8,8 @@ use std::{cell::RefCell, collections::HashMap, sync::Mutex, time::Instant};
 
 pub(crate) static QUERY_MEASUREMENT: Mutex<()> = Mutex::new(());
 thread_local! {
+    // SQL text identifies sequential executions in these test workloads. Do not interleave
+    // two live statements with identical SQL: they would share a measurement baseline.
     static COUNTERS: RefCell<(i64, HashMap<String, i32>)> = RefCell::new((0, HashMap::new()));
 }
 fn trace(event: TraceEvent<'_>) {

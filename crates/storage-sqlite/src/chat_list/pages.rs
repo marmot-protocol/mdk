@@ -193,6 +193,7 @@ impl SqliteAccountStorage {
     }
     /// Read a raw storage page in one deferred transaction, without writes, preparation,
     /// network work, full-list hydration or unrelated lifecycle record decoding.
+    /// Inside a caller-owned transaction, reuse its snapshot and leave its boundary intact.
     /// Limits are 1..=100. With no cursor, Forward starts at the top and Backward at the end.
     /// Returned rows always follow display order. Any membership/order change conservatively
     /// invalidates existing cursors; runtime windows must refresh, never splice stale pages.
@@ -213,7 +214,12 @@ impl SqliteAccountStorage {
             return Err(ChatListPageError::InvalidLimit);
         }
         let conn = self.lock()?;
-        let tx = conn.unchecked_transaction().storage()?;
+        let owned_tx = if conn.is_autocommit() {
+            Some(conn.unchecked_transaction().storage()?)
+        } else {
+            None
+        };
+        let tx: &Connection = &conn;
         let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row_cached(
             "SELECT p.store_epoch, n.revision FROM chat_presentation_meta p, chat_list_navigation_meta n WHERE p.id = 1 AND n.id = 1",
             [], |r|Ok((r.get(0)?, r.get(1)?))).storage()?;
@@ -301,19 +307,21 @@ impl SqliteAccountStorage {
         let last = keys.last().map(cursor);
         let (has_more_before, has_more_after) = match (keys.first(), keys.last()) {
             (Some(first), Some(last)) => (
-                has_rows(&tx, query.view, first, "<")?,
-                has_rows(&tx, query.view, last, ">")?,
+                has_rows(tx, query.view, first, "<")?,
+                has_rows(tx, query.view, last, ">")?,
             ),
             _ => match &query.cursor {
                 Some(c) if query.direction == ChatListPageDirection::Forward => {
-                    (has_rows(&tx, query.view, &c.key, "<=")?, false)
+                    (has_rows(tx, query.view, &c.key, "<=")?, false)
                 }
-                Some(c) => (false, has_rows(&tx, query.view, &c.key, ">=")?),
+                Some(c) => (false, has_rows(tx, query.view, &c.key, ">=")?),
                 None => (false, false),
             },
         };
-        let rows = page_rows(&tx, &keys)?;
-        tx.commit().storage()?;
+        let rows = page_rows(tx, &keys)?;
+        if let Some(tx) = owned_tx {
+            tx.commit().storage()?;
+        }
         Ok(ChatListPage {
             rows,
             first,
