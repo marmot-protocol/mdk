@@ -10549,6 +10549,21 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 }
 
 #[test]
+fn roster_labels_keep_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.save_directory_entry(&test_directory_record(&alice.account_id_hex, "Alice", 1))
+        .unwrap();
+    let names = app.profiles_by_id().unwrap();
+    assert_eq!(names.len(), 2);
+    assert_eq!(names[&alice.account_id_hex], "Alice");
+    assert_eq!(names[&bob.account_id_hex], "bob");
+}
+
+#[test]
 fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

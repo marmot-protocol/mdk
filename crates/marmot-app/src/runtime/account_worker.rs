@@ -4353,7 +4353,6 @@ pub(super) fn group_roster_after_hydration(
         .runtime
         .session_mut()
         .ensure_group_hydrated(group_id)?;
-    client.reconcile_group_self_membership(group_id)?;
     client.group_roster_session(group_id)
 }
 

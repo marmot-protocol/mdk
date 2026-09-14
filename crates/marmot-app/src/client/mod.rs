@@ -1889,60 +1889,34 @@ impl AppClient {
             .find(|group| group.group_id_hex == group_id_hex)
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
-        self.overlay_storage_self_membership(&mut group_record)?;
         let profiles = self.app.profiles_by_id()?;
         let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        if let Some(membership) = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
+        {
+            group_record.self_membership = membership;
+            // Reconcile the legacy Member default using the roster already read.
+            let local_id = hex::encode(self.adapter.account_id().as_slice());
+            if membership == SelfMembership::Member
+                && !members
+                    .iter()
+                    .any(|member| member.member_id_hex == local_id)
+            {
+                self.app.set_group_self_membership(
+                    &self.state.label,
+                    &group_record.group_id_hex,
+                    SelfMembership::Removed,
+                )?;
+                group_record.self_membership = SelfMembership::Removed;
+            }
+        }
         let mls_state = self.group_mls_state_unchecked(group_id)?;
         Ok(crate::groups::AppGroupRosterSession {
             group_record,
             members,
             mls_state,
         })
-    }
-
-    fn overlay_storage_self_membership(
-        &self,
-        group_record: &mut AppGroupRecord,
-    ) -> Result<(), AppError> {
-        if let Some(membership) = self
-            .app
-            .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
-        {
-            group_record.self_membership = membership;
-        }
-        Ok(())
-    }
-
-    /// Reconcile a storage row still carrying the preserving `Member` default
-    /// against one hydrated engine roster. Used by on-demand startup reads so
-    /// they cannot expose a legacy migration default before the full hydration
-    /// pipeline finishes its once-only backfill.
-    pub(crate) fn reconcile_group_self_membership(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), AppError> {
-        let group_id_hex = hex::encode(group_id.as_slice());
-        if !matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Member)
-        ) {
-            return Ok(());
-        }
-        let local_account_id_hex = self
-            .app
-            .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
-        let members = self.runtime.members(group_id)?;
-        if local_account_removed_from_roster(&members, &local_account_id_hex) {
-            self.app.set_group_self_membership(
-                &self.state.label,
-                &group_id_hex,
-                SelfMembership::Removed,
-            )?;
-        }
-        Ok(())
     }
 
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {

@@ -1169,7 +1169,6 @@ fn generate_telemetry_install_id() -> String {
 
 #[derive(Clone)]
 struct AccountProfile {
-    label: String,
     account_id_hex: String,
     inbox_endpoints: Vec<String>,
 }
@@ -4615,11 +4614,13 @@ impl MarmotApp {
     }
 
     fn profiles_by_id(&self) -> Result<HashMap<String, String>, AppError> {
-        Ok(self
-            .profiles()?
+        let account_ids = self
+            .account_home()
+            .accounts()?
             .into_iter()
-            .map(|profile| (profile.account_id_hex, profile.label))
-            .collect())
+            .map(|account| account.account_id_hex)
+            .collect::<Vec<_>>();
+        self.display_names_for_account_ids(&account_ids)
     }
 
     pub(crate) fn local_account_labels_by_id(&self) -> Result<HashMap<String, String>, AppError> {
@@ -4969,19 +4970,12 @@ impl MarmotApp {
         let relay_lists = self
             .account_relay_list_status_for_account_id(&account.account_id_hex)
             .unwrap_or_else(|_| AccountRelayListStatus::empty());
-        let label = self
-            .directory_entry_for_account_id(&account.account_id_hex)
-            .ok()
-            .flatten()
-            .and_then(|entry| display_name_for_profile(entry.profile.as_ref()))
-            .unwrap_or(account.label.clone());
         AccountProfile {
             inbox_endpoints: self
                 .account_inbox_endpoints(&account.label, &relay_lists)
                 .into_iter()
                 .map(|endpoint| endpoint.0)
                 .collect(),
-            label,
             account_id_hex: account.account_id_hex,
         }
     }
