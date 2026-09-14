@@ -120,6 +120,12 @@ struct RelayNotificationForwarderHealthSnapshot {
     unexpected_exits: u64,
 }
 
+#[derive(PartialEq, Eq)]
+struct IncrementalActivation {
+    inbox_endpoints: Vec<TransportEndpoint>,
+    since: Timestamp,
+}
+
 #[derive(Clone)]
 pub struct MarmotRelayPlaneAccountAdapter {
     account_id: MemberId,
@@ -127,6 +133,7 @@ pub struct MarmotRelayPlaneAccountAdapter {
     publish_client: Arc<dyn NostrRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
+    incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
 }
 
 #[derive(Clone)]
@@ -700,6 +707,7 @@ impl MarmotRelayPlane {
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
+            incremental_activation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2062,12 +2070,31 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .relay_safety
             .sanitize_activation(activation)
             .map_err(TransportAdapterError::Subscription)?;
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .activate_account(activation)
-            .await
+        let incremental = activation.since.map(|since| IncrementalActivation {
+            inbox_endpoints: activation.inbox_endpoints.clone(),
+            since,
+        });
+        let mut previous = self.incremental_activation.lock().await;
+        let reuse = incremental.is_some()
+            && *previous == incremental
+            && self.account_subscription_eose().await.complete();
+        // Cancellation or failure must force the next call through activation's
+        // unconditional orphan-REQ cleanup. None always requests full history.
+        *previous = None;
+        let adapter = &self.relay_plane.inner.transport.adapter;
+        if reuse {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id: activation.account_id,
+                    group_subscriptions: activation.group_subscriptions,
+                    since: activation.since,
+                })
+                .await?;
+        } else {
+            adapter.activate_account(activation).await?;
+        }
+        *previous = incremental;
+        Ok(())
     }
 
     async fn sync_account_groups(
@@ -2095,6 +2122,8 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if account_id != &self.account_id {
             return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
         }
+        let mut activation = self.incremental_activation.lock().await;
+        *activation = None;
         account_deliveries_write(&self.relay_plane.inner.transport.account_deliveries)
             .remove(account_id);
         self.relay_plane

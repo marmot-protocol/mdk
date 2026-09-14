@@ -835,7 +835,6 @@ impl AppClient {
         &mut self,
         rebuild_since: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<(), AppError> {
-        self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
         self.runtime.sync_transport_groups(rebuild_since).await?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())

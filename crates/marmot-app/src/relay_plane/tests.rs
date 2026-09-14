@@ -870,6 +870,61 @@ async fn relay_telemetry_reflects_activation_through_the_plane() {
     assert_eq!(telemetry.delivery_spread.spread.sample_count(), 0);
 }
 
+#[tokio::test]
+async fn settled_activation_uses_diff() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let mut activation = TransportAccountActivation {
+        account_id: account,
+        inbox_endpoints: vec![endpoint.clone()],
+        group_subscriptions: Vec::new(),
+        since: Some(Timestamp(100)),
+    };
+    adapter.activate_account(activation.clone()).await.unwrap();
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    adapter.activate_account(activation.clone()).await.unwrap();
+    assert_eq!(relay.subscriptions.lock().unwrap().len(), 1);
+    assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
+    activation
+        .group_subscriptions
+        .push(TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xC3; 16]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: vec![endpoint.clone()],
+        });
+    adapter.activate_account(activation.clone()).await.unwrap();
+    assert_eq!(
+        relay.subscriptions.lock().unwrap().len(),
+        2,
+        "only the added route"
+    );
+    assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
+    activation.since = None;
+    for expected in [4, 6] {
+        let issued = relay.subscriptions.lock().unwrap().clone();
+        for subscription in issued {
+            plane
+                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                .await;
+        }
+        adapter.activate_account(activation.clone()).await.unwrap();
+        assert_eq!(
+            relay.subscriptions.lock().unwrap().len(),
+            expected,
+            "full replay must reissue"
+        );
+    }
+    plane.shutdown().await;
+}
+
 #[test]
 fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
     use transport_nostr_adapter::{HistogramBucket, RelayDeliveryStats, RelayLatencyStats};
