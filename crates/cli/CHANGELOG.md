@@ -46,7 +46,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   `wn media send <group-hex> <attachment> [...]` sends already-uploaded references (the `media` JSON object from
   upload/list output, or the plaintext SHA-256 of a projected attachment) through `send_media_attachments`,
   preserving order. A reference from an earlier epoch is refused with `media_reference_stale_epoch`
-  (`source_epoch`, `current_epoch`) instead of publishing ciphertext recipients could not decrypt.
+  (`source_epoch`, `current_epoch`) instead of publishing ciphertext recipients could not decrypt. A plaintext hash
+  resolves to the newest projected reference carrying it (`media send` and `media download`), so after the same file
+  is uploaded and sent again under the new epoch, the hash form sends that copy instead of re-binding the stale one.
   `wn media set-endpoints <group-hex> <url> [...]` replaces the group's encrypted-media default blob endpoints
   through `replace_encrypted_media_blob_endpoints`.
 - `wn media download --output` and `wn groups download-image --output` accept an existing directory as well as a

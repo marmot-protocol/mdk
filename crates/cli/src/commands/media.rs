@@ -445,14 +445,26 @@ fn media_attachment_for_hash(
     file_hash_hex: &str,
     allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, WnError> {
+    // The plaintext hash is content-addressed, so re-uploading a file after
+    // the group moved on is a second reference with the same hash and a newer
+    // `source_epoch`. Projection order is oldest-first; the newest reference
+    // is the one the sender can still deliver, and the one whose epoch a
+    // stale-epoch refusal should report. Ties keep the later row.
+    let mut newest: Option<MediaAttachmentReference> = None;
     for message in messages {
         for reference in media_attachments_from_message(&message, allow_loopback_http) {
-            if reference.plaintext_sha256 == file_hash_hex {
-                return Ok(reference);
+            if reference.plaintext_sha256 != file_hash_hex {
+                continue;
+            }
+            if newest
+                .as_ref()
+                .is_none_or(|current| reference.source_epoch >= current.source_epoch)
+            {
+                newest = Some(reference);
             }
         }
     }
-    Err(WnError::MediaAttachmentNotFound(file_hash_hex.to_owned()))
+    newest.ok_or_else(|| WnError::MediaAttachmentNotFound(file_hash_hex.to_owned()))
 }
 
 fn media_attachments_from_message(
@@ -669,6 +681,30 @@ mod tests {
         let later = media_attachment_for_hash(vec![message], &hex::encode([0x23; 32]), false)
             .expect("download lookup must reach the later valid sibling");
         assert_eq!(later.file_name, "also-ok.png");
+    }
+
+    #[test]
+    fn cli_media_hash_lookup_prefers_the_newest_epoch_for_a_re_uploaded_file() {
+        // Same plaintext hash uploaded under epoch 3, then again under epoch 5
+        // after the group advanced. Projection is oldest-first, so a
+        // first-match lookup would bind the reference the sender can no
+        // longer deliver.
+        let mut older = sample_message(vec![valid_cli_imeta_tag(0x11, "old.png")]);
+        older.source_epoch = Some(3);
+        let mut newer = sample_message(vec![valid_cli_imeta_tag(0x11, "new.png")]);
+        newer.source_epoch = Some(5);
+        let hash = hex::encode([0x12; 32]);
+
+        let chosen = media_attachment_for_hash(vec![older.clone(), newer.clone()], &hash, false)
+            .expect("hash lookup");
+        assert_eq!(chosen.source_epoch, 5);
+        assert_eq!(chosen.file_name, "new.png");
+
+        // Order-insensitive: the newest epoch still wins if projection order
+        // ever changes.
+        let chosen =
+            media_attachment_for_hash(vec![newer, older], &hash, false).expect("hash lookup");
+        assert_eq!(chosen.source_epoch, 5);
     }
 
     #[test]

@@ -473,7 +473,10 @@ group). The runtime re-validates every reference against the group's media profi
 reference can only be re-sent while the group is still in the epoch that encrypted it: the wire `imeta` tag carries
 no epoch, recipients derive the media key from the delivering message's epoch, and the runtime refuses a stale
 reference before publication. The CLI reports that as `media_reference_stale_epoch` with `source_epoch` and
-`current_epoch`; upload the file again with `media upload` after a commit has advanced the group.
+`current_epoch`; upload the file again with `media upload` after a commit has advanced the group and send that
+reference (`--send`, or its `media` object through `media send`). A plaintext hash given to `media send` or
+`media download` resolves to the newest projected reference carrying it, so once the re-upload has gone out the
+hash form sends the current-epoch copy rather than the stale one.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
 decrypts it, and writes the plaintext file. `--output` is a file path, or an existing directory that receives the
 attachment's own file name; without it the file lands in the caller's current directory.

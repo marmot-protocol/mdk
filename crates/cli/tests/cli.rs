@@ -8794,6 +8794,56 @@ fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoc
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(media_message_ids.len(), 2, "{after}");
 
+    // The documented repair: upload the same file again at the current epoch
+    // and send that reference. Only projected messages are visible to the hash
+    // lookup, so the fresh upload goes out by its `media` JSON object first.
+    let reupload = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "upload",
+            group_id,
+            first_path.to_str().expect("utf-8 path"),
+            "--server",
+            blossom.url(),
+        ],
+    );
+    let reuploaded = &reupload["attachments"][0]["media"];
+    assert_eq!(reuploaded["plaintext_sha256"], first_hash);
+    assert_eq!(reuploaded["source_epoch"], source_epoch + 1);
+    let repaired = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &reuploaded.to_string(),
+        ],
+    );
+    assert_eq!(repaired["published"], 1);
+    assert_eq!(repaired["attachments"][0]["source_epoch"], source_epoch + 1);
+    // The plaintext hash is content-addressed, so the projection now holds
+    // both the epoch-N and the epoch-N+1 reference for this file. Sending by
+    // hash must bind the newest one; a first-match (oldest-first) lookup would
+    // refuse the repaired file forever.
+    let forwarded_again = run_json(
+        home.path(),
+        &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(forwarded_again["published"], 1);
+    assert_eq!(
+        forwarded_again["attachments"][0]["plaintext_sha256"],
+        first_hash
+    );
+    assert_eq!(
+        forwarded_again["attachments"][0]["source_epoch"],
+        source_epoch + 1
+    );
+
     // Endpoint policy is signed group state: admins replace it, others cannot.
     let denied = run_json_error(
         home.path(),
