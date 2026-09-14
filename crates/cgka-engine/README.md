@@ -158,7 +158,8 @@ A frozen convergence batch can advance one epoch beyond its admission ceiling. A
 applications at that new tip remain durable input, even when no commit can open another pass.
 Background advancement drains these inputs against the stable canonical state after convergence and
 deferred peeling finish. It shares the existing 64-row allowance and cooperative 500 ms background
-budget; a started MLS operation completes before yielding. Input discovery streams state-filtered
+budget; a started MLS operation completes before yielding. Once the drain is reached, it processes
+at least one candidate even when discovery or earlier phases have spent that allowance. Input discovery streams state-filtered
 storage rows and stops once it has enough matches; classification may still scan a nonmatching prefix.
 
 This is scheduling work, not branch ambiguity: it does not open a convergence pass, gate a foreground
@@ -171,7 +172,10 @@ for canonical state to advance.
 The drain uses the same OpenMLS sender/payload validation and source-state retention decision as
 canonical replay. Direct ingestion and replay attribute applications using the authenticated source-epoch
 credential carried by OpenMLS, so a later removal or reuse of that member's leaf cannot erase or substitute
-the original author. The inner app author must still match that credential. Ratchet writes, the terminal
+the original author. A valid, retained application authored before removal can therefore still be
+delivered after the sender is removed; this does not authorize messages from that sender in a later
+epoch. Proposals and commits retain live-tree authorization. The inner app author must still match
+that credential. Ratchet writes, the terminal
 input disposition, and pending app output commit in one storage transaction. Crash recovery therefore
 retries an untouched input or recovers its durable app
 output. Encrypted SQLite process-kill tests cover both sides of that commit and acknowledgement followed

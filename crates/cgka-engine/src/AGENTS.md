@@ -14,6 +14,7 @@ Local map for engine source modules. The crate-level map in `../AGENTS.md` has t
 - `openmls_projection.rs` is the OpenMLS bytes/replay bridge for canonicalization.
 - `openmls_projection/resumable.rs` owns the shared candidate-search frontier and slice continuations. Restore live
   storage before yielding; cumulative probe limits and final selection semantics span the entire search.
+  Capture replay fingerprints only to validate or retain a continuation, after cheap uncontested checks.
 - `openmls_projection/tests/candidate_replay.rs` holds forked-graph fixtures, replay restoration/parity checks and
   paired measurements. It retains the `candidate_branch_peel_halt_tests` module name so existing test filters work.
   Encrypted-database process-kill checks remain in `../tests/crash_recovery_sqlite.rs`.

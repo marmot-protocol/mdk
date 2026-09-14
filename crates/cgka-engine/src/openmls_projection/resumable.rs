@@ -4,6 +4,11 @@ use super::*;
 use std::collections::VecDeque;
 use web_time::Instant;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static REPLAY_FINGERPRINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Scheduling allowance, independent of the cumulative anti-amplification budget.
 /// A started slice always finishes one probe even if preparation used its time.
 pub(crate) struct ReplaySlice {
@@ -290,8 +295,19 @@ impl ReplaySource {
             group: storage.get_group(group)?,
             snapshots: storage.list_group_snapshots(group)?,
             write_generation: storage.mls_write_generation(),
-            replay_fingerprint: storage.group_replay_state_fingerprint(group)?,
+            replay_fingerprint: None,
         })
+    }
+
+    fn capture_fingerprint<S: StorageProvider>(
+        &mut self,
+        storage: &S,
+        group: &GroupId,
+    ) -> Result<(), OpenMlsProjectionError> {
+        #[cfg(test)]
+        REPLAY_FINGERPRINT_READS.with(|reads| reads.set(reads.get() + 1));
+        self.replay_fingerprint = storage.group_replay_state_fingerprint(group)?;
+        Ok(())
     }
 }
 
@@ -385,13 +401,14 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
         )
         .map(Some);
     }
-    let source = ReplaySource::load(
+    let mut source = ReplaySource::load(
         storage,
         group,
         state.retained_anchor_epoch,
         options.admitted_message_ids,
     )?;
     if let Some(previous) = slot.as_ref() {
+        source.capture_fingerprint(storage, group)?;
         tracing::debug!(
             target: "cgka_engine::replay_slice",
             method = "canonicalize_stored_slice",
@@ -500,6 +517,11 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
     );
     match result {
         Ok(Some(false)) => {
+            // with_anchor has restored live state. Only a retained continuation
+            // needs this expensive content identity for the next slice.
+            if work.source.replay_fingerprint.is_none() {
+                work.source.capture_fingerprint(storage, group)?;
+            }
             work.source.write_generation = storage.mls_write_generation();
             *slot = Some(work);
             crate::test_crash_hooks::pause_if_requested("canonical-replay-slice-restored");
@@ -594,8 +616,13 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
         )
         .map(Some);
     }
-    let source = ReplaySource::load(storage, group, anchor, None).map_err(fail)?;
+    let mut source = ReplaySource::load(storage, group, anchor, None).map_err(fail)?;
+    if !commits_share_a_source_epoch(&source.graph.commit_messages) {
+        *slot = None;
+        return Ok(Some(CandidateBranchPeel::UNCONTESTED));
+    }
     if let Some(previous) = slot.as_ref() {
+        source.capture_fingerprint(storage, group).map_err(fail)?;
         tracing::debug!(
             target: "cgka_engine::replay_slice",
             method = "candidate_peel_slice",
@@ -607,10 +634,6 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
             fingerprint_changed = previous.source.replay_fingerprint != source.replay_fingerprint,
             "candidate continuation validation"
         );
-    }
-    if !commits_share_a_source_epoch(&source.graph.commit_messages) {
-        *slot = None;
-        return Ok(Some(CandidateBranchPeel::UNCONTESTED));
     }
     let mut work = match slot.take().filter(|w| {
         w.source == source
@@ -696,6 +719,11 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
     );
     match result {
         Ok(Some(false)) => {
+            if work.source.replay_fingerprint.is_none() {
+                work.source
+                    .capture_fingerprint(storage, group)
+                    .map_err(fail)?;
+            }
             work.source.write_generation = storage.mls_write_generation();
             *slot = Some(work);
             crate::test_crash_hooks::pause_if_requested("candidate-peel-slice-restored");

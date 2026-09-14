@@ -683,7 +683,8 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
         !expected.accepted_app_messages.is_empty(),
         "exercise application materialization and scoring"
     );
-    for limit in [1, 5, 32] {
+    for limit in [1, 5, 32, usize::MAX] {
+        super::resumable::REPLAY_FINGERPRINT_READS.with(|reads| reads.set(0));
         let mut slot = None;
         let mut slices = 0;
         loop {
@@ -717,7 +718,20 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
                 break;
             }
         }
-        assert!(slices > 1);
+        let reads = super::resumable::REPLAY_FINGERPRINT_READS.with(|reads| reads.get());
+        if limit == usize::MAX {
+            assert_eq!(slices, 1);
+            assert_eq!(
+                reads, 0,
+                "completed work does not need a continuation fingerprint"
+            );
+        } else {
+            assert!(slices > 1);
+            assert!(
+                reads > 0,
+                "retained progress must validate its source state"
+            );
+        }
     }
     let expected_peel = peel(&storage, &group_id, 64);
     let mut slot = None;
@@ -1515,5 +1529,28 @@ async fn a_deeper_branch_outranks_shallow_rivals_for_the_capped_contexts() {
         "a branch carried two commits deep holds traffic the one-commit \
          rivals cannot unseal, so filling the cap with rivals must not \
          evict it"
+    );
+}
+
+#[tokio::test]
+async fn uncontested_peel_skips_replay_state_fingerprint() {
+    let (_directory, storage, group_id, _) = encrypted_replay_graph_fixture(4, 1, 1).await;
+    super::resumable::REPLAY_FINGERPRINT_READS.with(|reads| reads.set(0));
+    let result = super::candidate_peel_slice(
+        &storage,
+        &group_id,
+        0,
+        64,
+        ReplayProfilePolicy::default(),
+        8,
+        &mut None,
+        &mut super::ReplaySlice::unlimited(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!result.contested);
+    assert_eq!(
+        super::resumable::REPLAY_FINGERPRINT_READS.with(|reads| reads.get()),
+        0
     );
 }

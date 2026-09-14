@@ -3567,6 +3567,92 @@ mod deferred_peel_accounting_tests {
         );
     }
 
+    #[tokio::test]
+    async fn canonical_application_drain_finishes_one_unit_after_time_or_rows_are_spent() {
+        use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+        use cgka_traits::engine::{CgkaEngine, CreateGroupRequest};
+        use cgka_traits::message::{MessageRecord, StoredMessagePayload};
+        use cgka_traits::storage::MessageStorage;
+        for rows_remaining in [0, 64] {
+            let mut engine = crate::distributed_convergence::tests::test_engine();
+            let (group_id, created) = engine
+                .create_group(CreateGroupRequest {
+                    name: "spent application allowance".into(),
+                    description: String::new(),
+                    members: vec![],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap();
+            if let SendResult::GroupCreated { pending, .. } = created {
+                engine.confirm_published(pending).await.unwrap();
+            }
+            let mut ids = Vec::new();
+            for index in 0..3 {
+                let payload = MarmotAppEvent::new(
+                    hex::encode(engine.self_id().as_slice()),
+                    1_700_000_000,
+                    MARMOT_APP_EVENT_KIND_CHAT,
+                    vec![],
+                    format!("unit-{index}"),
+                )
+                .encode()
+                .unwrap();
+                let SendResult::ApplicationMessage { mut msg, .. } = engine
+                    .send(SendIntent::AppMessage {
+                        expected_epoch: None,
+                        group_id: group_id.clone(),
+                        payload,
+                    })
+                    .await
+                    .unwrap()
+                else {
+                    panic!("application");
+                };
+                // Treat the ciphertext as inbound: an own sender ratchet cannot
+                // decrypt it. Each selected row must still become terminal.
+                let id = MessageId::new(vec![index + 0x80; 32]);
+                msg.id = id.clone();
+                engine
+                    .storage
+                    .put_message(&MessageRecord {
+                        id: id.clone(),
+                        group_id: group_id.clone(),
+                        epoch: engine.epoch(&group_id).unwrap(),
+                        state: MessageState::Created,
+                        payload: StoredMessagePayload::openmls_wire(msg).encode().unwrap(),
+                        deferred_peel: None,
+                    })
+                    .unwrap();
+                ids.push(id);
+            }
+            for remaining in (0..3).rev() {
+                let mut execution = DeferredPeelExecution::Background {
+                    deadline: Some(Instant::now()),
+                    rows_remaining,
+                };
+                engine
+                    .drain_canonical_applications(&group_id, &mut execution)
+                    .unwrap();
+                assert_eq!(
+                    ids.iter()
+                        .filter(|id| engine.storage.get_message(id).unwrap().state
+                            == MessageState::Created)
+                        .count(),
+                    remaining
+                );
+                assert_eq!(
+                    engine
+                        .has_pending_canonical_applications(&group_id)
+                        .unwrap(),
+                    remaining != 0
+                );
+            }
+        }
+    }
+
     #[test]
     fn capacity_check_does_not_consume_slot_before_persist() {
         let mut state = DeferredPeelGroupState::default();

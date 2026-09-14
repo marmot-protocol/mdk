@@ -65,6 +65,8 @@ impl<S: StorageProvider> Engine<S> {
                 MessageState::Retryable,
                 MessageState::ConvergenceDeferred,
             ],
+            // Below-anchor applications still require a terminal invalidation;
+            // clipping discovery to the replay horizon would strand those rows.
             EpochId(0),
             &mut |record| {
                 if let Some(message) = Self::canonical_application_from_record(&record, tip) {
@@ -113,13 +115,13 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(execution, DeferredPeelExecution::Foreground(_)) {
             return Ok(AdvanceConvergenceStatus::Settled);
         }
-        let messages = self.pending_canonical_applications(group_id, execution.row_limit())?;
+        // Discovery and earlier phases may already have spent the allowance.
+        // Admit one atomic application operation so a ready group cannot keep
+        // rearming without making progress. Subsequent operations stay bounded.
+        let messages =
+            self.pending_canonical_applications(group_id, execution.row_limit().max(1))?;
         if messages.is_empty() {
-            return Ok(if self.has_pending_canonical_applications(group_id)? {
-                AdvanceConvergenceStatus::Pending
-            } else {
-                AdvanceConvergenceStatus::Settled
-            });
+            return Ok(AdvanceConvergenceStatus::Settled);
         }
         let tip = self.storage.get_group(group_id)?.epoch.0;
         let policy = self
@@ -129,8 +131,8 @@ impl<S: StorageProvider> Engine<S> {
             reject_legacy_group_additions: self.new_protocol_profile
                 == cgka_traits::group::ProtocolProfile::Current,
         };
-        for message in messages {
-            if execution.exhausted() {
+        for (index, message) in messages.into_iter().enumerate() {
+            if index != 0 && execution.exhausted() {
                 break;
             }
             execution.consume_row();

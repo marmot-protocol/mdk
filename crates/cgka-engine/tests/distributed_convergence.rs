@@ -5228,10 +5228,20 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
 /// forever without this re-arm.
 #[tokio::test]
 async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window() {
-    let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    // Every participant below is advanced to explicit timestamps. Keep their
+    // admission clocks in that same domain even under a slow parallel test run.
     let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build_client_with_storage_and_clock(
+        b"alice",
+        SqliteAccountStorage::in_memory().unwrap(),
+        clock.clone(),
+    );
+    let mut bob = build_client_with_storage_and_clock(
+        b"bob",
+        SqliteAccountStorage::in_memory().unwrap(),
+        clock.clone(),
+    );
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
 
