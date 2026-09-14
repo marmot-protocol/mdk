@@ -1317,6 +1317,29 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn send_message_draft(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        revision: crate::MessageDraftRevision,
+        attachments: Vec<MediaAttachmentReference>,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SendMessageDraft {
+                group_id: group_id.clone(),
+                revision,
+                attachments,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.schedule_audit_log_tracker_update("send_message_draft");
+        Ok(summary)
+    }
+
     pub async fn send_message(
         &self,
         account_ref: &str,

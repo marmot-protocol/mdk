@@ -24,6 +24,10 @@ snapshot, first-unread/latest selection, and scoped anchor recovery after physic
 return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
 [bounded conversation opening](../further-context/conversation-opening.md).
 
+C5 M2 adds selected draft metadata, revision-checked mutations and a send handoff that clears the submitted
+revision atomically with existing outbox acceptance. Newer edits survive; attachment bytes remain keyed reads.
+See [revision-safe conversation drafts](../further-context/conversation-drafts.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves

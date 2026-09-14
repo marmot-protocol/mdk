@@ -153,6 +153,9 @@ use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+#[path = "migrations/0073_message_draft_revisions.rs"]
+mod migration_0073_message_draft_revisions;
+
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
@@ -519,6 +522,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 72,
         name: "0072_chat_list_pages",
         apply: migration_0072_chat_list_pages::apply,
+    },
+    Migration {
+        version: 73,
+        name: "0073_message_draft_revisions",
+        apply: migration_0073_message_draft_revisions::apply,
     },
 ];
 
@@ -1290,7 +1298,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 72,
+                found: 73,
                 latest_supported: 46,
             }
         ));
@@ -1346,7 +1354,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 72,
+                found: 73,
                 latest_supported: 46,
             }
         ));
@@ -1650,7 +1658,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 72,
+                found: 73,
                 latest_supported: 46,
             }
         ));

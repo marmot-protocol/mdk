@@ -294,6 +294,12 @@ pub(crate) enum AccountWorkerCommand {
         thumbhash: Option<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    SendMessageDraft {
+        group_id: GroupId,
+        revision: crate::MessageDraftRevision,
+        attachments: Vec<MediaAttachmentReference>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     SendMessage {
         enqueued_at: Instant,
         group_id: GroupId,
@@ -3743,6 +3749,30 @@ fn account_worker_command_future<'a>(
                     let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                 }
             }
+            true
+        }),
+        AccountWorkerCommand::SendMessageDraft {
+            group_id,
+            revision,
+            attachments,
+            respond,
+        } => Box::pin(async move {
+            let result = client
+                .send_message_draft_with_local_projection(
+                    &group_id,
+                    revision,
+                    attachments,
+                    |update| {
+                        publish_app_runtime_projection_update(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            update,
+                        );
+                    },
+                )
+                .await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
         AccountWorkerCommand::SendMessage {

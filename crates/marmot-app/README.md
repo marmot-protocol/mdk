@@ -32,6 +32,11 @@ The app runtime exposes those projections through account status, group listing/
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases
 directly.
 
+Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes and
+revision-bound sends. Post-commit invalidations let conversation owners reload the selected composer; durable
+outbox acceptance clears only the submitted revision. See the
+[draft lifecycle contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
+
 New-account bootstrap publishes the required NIP-65 kind `10002` and inbox kind `10050` relay-list events, a
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. KeyPackages are
 published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay list. Import flows

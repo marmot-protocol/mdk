@@ -33,6 +33,10 @@ The crate is split around storage concerns:
 It supports first-unread/latest opening and scoped anchor recovery; dirty projections return `ReadStateNotReady`
 for the existing owner to refresh. See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
 
+Selected composer reads and revision-checked mutations share the existing encrypted draft tables. Migration 0073
+tracks legacy writes too; queued/fanout acceptance clears only its submitted revision atomically. See the
+[draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
+
 ## Migrations
 
 Account/session schema changes go through Rust migrations. The runner and ordered registry live in

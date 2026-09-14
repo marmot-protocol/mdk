@@ -3525,6 +3525,20 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
+        self.send_app_event_with_draft_context(group_id, intent, on_local_projection, None)
+            .await
+    }
+
+    pub(crate) async fn send_app_event_with_draft_context<F>(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+        on_local_projection: F,
+        draft: Option<(crate::MessageDraftRevision, Option<String>)>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
         use crate::{ProductFamily as Family, ProductUnit};
         let (family, operation) = match &intent {
             AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
@@ -3553,6 +3567,7 @@ impl AppClient {
             group_id,
             intent,
             on_local_projection,
+            draft,
         ))
         .await;
         if let Some(observation) = observation {
@@ -3573,6 +3588,7 @@ impl AppClient {
         group_id: &GroupId,
         intent: AppMessageIntent,
         mut on_local_projection: F,
+        draft: Option<(crate::MessageDraftRevision, Option<String>)>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
         F: FnMut(crate::AppProjectionUpdate),
@@ -3624,8 +3640,32 @@ impl AppClient {
                 .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
             _ => None,
         };
-        let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
+        let mut event = build_inner_event(&intent, &sender, unix_now_seconds())?;
+        if let Some((_, Some(reply))) = &draft {
+            event.tags.push(vec!["e".into(), reply.clone()]);
+            event.tags.push(vec!["q".into(), reply.clone()]);
+            event = MarmotInnerEvent::new(
+                event.pubkey,
+                event.created_at,
+                event.kind,
+                event.tags,
+                event.content,
+            );
+        }
         let payload = encode_inner_event(&event)?;
+        let _draft_guard = if let Some((revision, _)) = draft {
+            let storage = self.app.draft_storage(&self.state.label)?;
+            self.runtime.session().set_message_draft_commit_observer(
+                self.app.draft_commit_observer(&self.state.label),
+            );
+            storage
+                .stage_message_draft_submission(&revision, &event.id, &payload)
+                .map_err(crate::drafts::revision_error)?;
+            Some(crate::drafts::DraftSubmissionGuard { storage, revision })
+        } else {
+            None
+        };
+
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
 
@@ -4084,18 +4124,92 @@ impl AppClient {
         Ok(summary)
     }
 
-    pub async fn send_media_attachments(
+    /// Submit exactly the selected composer revision. Media references must be
+    /// prepared in selected attachment order. Durable outbox acceptance clears
+    /// only that revision; a later delivery error does not restore the composer.
+    pub async fn send_message_draft(
+        &mut self,
+        group: &GroupId,
+        revision: crate::MessageDraftRevision,
+        attachments: Vec<MediaAttachmentReference>,
+    ) -> Result<SendSummary, AppError> {
+        self.send_message_draft_with_local_projection(group, revision, attachments, |_| {})
+            .await
+    }
+    pub(crate) async fn send_message_draft_with_local_projection<F>(
+        &mut self,
+        group: &GroupId,
+        revision: crate::MessageDraftRevision,
+        attachments: Vec<MediaAttachmentReference>,
+        on_projection: F,
+    ) -> Result<SendSummary, AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        self.ensure_group_application_messages_allowed(group)?;
+        let selected = self
+            .app
+            .selected_message_draft(&self.state.label, &hex::encode(group.as_slice()))?;
+        if selected.revision != revision {
+            return Err(AppError::InvalidMessageDraft(
+                "draft revision no longer matches".into(),
+            ));
+        }
+        let draft = selected
+            .draft
+            .ok_or_else(|| AppError::InvalidMessageDraft("draft is empty".into()))?;
+        if draft.media_attachments.len() != attachments.len() {
+            return Err(AppError::InvalidMessageDraft(
+                "every draft attachment requires a prepared media reference".into(),
+            ));
+        }
+        let (intent, media_reply) = if attachments.is_empty() {
+            match draft.reply_to_message_id_hex {
+                Some(target_message_id) => (
+                    AppMessageIntent::Reply {
+                        target_message_id,
+                        text: draft.content,
+                    },
+                    None,
+                ),
+                None => (
+                    AppMessageIntent::Chat {
+                        content: draft.content,
+                    },
+                    None,
+                ),
+            }
+        } else {
+            self.sync_runtime_groups().await?;
+            self.validate_draft_media_references(group, &attachments)?;
+            (
+                AppMessageIntent::Media {
+                    attachments,
+                    caption: Some(draft.content),
+                },
+                draft.reply_to_message_id_hex,
+            )
+        };
+        let (_, summary) = self
+            .send_app_event_with_draft_context(
+                group,
+                intent,
+                on_projection,
+                Some((revision, media_reply)),
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    fn validate_draft_media_references(
         &mut self,
         group_id: &GroupId,
-        attachments: Vec<MediaAttachmentReference>,
-        caption: Option<String>,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group_application_messages_allowed(group_id)?;
-        self.sync_runtime_groups().await?;
+        attachments: &[MediaAttachmentReference],
+    ) -> Result<(), AppError> {
         // Validate every outbound attachment against the group's exact,
         // profile-selected media version and locator policy.
         let policy = self.encrypted_media_policy_for_group(group_id)?;
-        for attachment in &attachments {
+        for attachment in attachments {
             attachment.validate_outbound(
                 policy.version,
                 &policy.allowed_locator_kinds,
@@ -4122,6 +4236,18 @@ impl AppClient {
                 current_epoch: sending_epoch,
             });
         }
+        Ok(())
+    }
+
+    pub async fn send_media_attachments(
+        &mut self,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group_application_messages_allowed(group_id)?;
+        self.sync_runtime_groups().await?;
+        self.validate_draft_media_references(group_id, &attachments)?;
         let (_event, summary) = self
             .send_app_event(
                 group_id,

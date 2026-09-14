@@ -180,7 +180,9 @@ pub use directory::{
     UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
-    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
+    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftInvalidation,
+    MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
+    SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
 pub use error::{AccountCatchUpFailure, AppError};
 pub use groups::{

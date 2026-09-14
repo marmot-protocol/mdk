@@ -189,11 +189,133 @@ impl From<StoredMessageDraftSummary> for MessageDraftSummary {
     }
 }
 
+pub use storage_sqlite::{
+    MessageDraftRevision, SelectedMessageDraft, SelectedMessageDraftAttachment,
+    SelectedMessageDraftContent,
+};
+
+/// Wakeup scoped to one account/group; reload the selected durable revision.
+#[derive(Clone)]
+pub struct MessageDraftInvalidation {
+    pub account_label: String,
+    pub group_id_hex: String,
+}
+
+pub(crate) fn revision_error(error: storage_sqlite::MessageDraftRevisionError) -> AppError {
+    match error {
+        storage_sqlite::MessageDraftRevisionError::Conflict => {
+            AppError::InvalidMessageDraft("draft revision no longer matches".into())
+        }
+        storage_sqlite::MessageDraftRevisionError::Storage(error) => error.into(),
+    }
+}
+impl MarmotApp {
+    pub(crate) fn draft_storage(
+        &self,
+        account_ref: &str,
+    ) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let storage = self.account_storage(&account.label)?;
+        Ok(storage)
+    }
+    pub(crate) fn draft_commit_observer(
+        &self,
+        account_label: &str,
+    ) -> storage_sqlite::MessageDraftCommitObserver {
+        let updates = self.presentation_signals.drafts.clone();
+        let account_label = account_label.to_owned();
+        std::sync::Arc::new(move |group| {
+            let _ = updates.send(MessageDraftInvalidation {
+                account_label: account_label.clone(),
+                group_id_hex: group.to_owned(),
+            });
+        })
+    }
+    pub fn subscribe_message_draft_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<MessageDraftInvalidation> {
+        self.presentation_signals.drafts.subscribe()
+    }
+    pub fn message_draft_attachment_if_revision(
+        &self,
+        account: &str,
+        revision: &MessageDraftRevision,
+        attachment: &str,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.draft_storage(account)?
+            .message_draft_attachment_if_revision(revision, attachment)
+            .map_err(revision_error)
+    }
+    pub fn selected_message_draft(
+        &self,
+        account_ref: &str,
+        group: &str,
+    ) -> Result<SelectedMessageDraft, AppError> {
+        Ok(self
+            .draft_storage(account_ref)?
+            .selected_message_draft(group)?)
+    }
+    pub fn save_message_draft_if_revision(
+        &self,
+        account_ref: &str,
+        expected: &MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: Vec<MessageDraftAttachment>,
+    ) -> Result<SelectedMessageDraft, AppError> {
+        validate_message_draft_attachments(&attachments)?;
+        let storage = self.draft_storage(account_ref)?;
+        let attachments = attachments.into_iter().map(Into::into).collect::<Vec<_>>();
+        let result = storage
+            .save_message_draft_if_revision(expected, content, reply, &attachments)
+            .map_err(revision_error)?;
+        self.notify_draft_changed(account_ref, expected.group_id_hex());
+        Ok(result)
+    }
+    pub fn clear_message_draft_if_revision(
+        &self,
+        account_ref: &str,
+        expected: &MessageDraftRevision,
+    ) -> Result<SelectedMessageDraft, AppError> {
+        let result = self
+            .draft_storage(account_ref)?
+            .clear_message_draft_if_revision(expected)
+            .map_err(revision_error)?;
+        self.notify_draft_changed(account_ref, expected.group_id_hex());
+        Ok(result)
+    }
+    fn notify_draft_changed(&self, account_ref: &str, group: &str) {
+        if let Ok(account) = self.account_home().account(account_ref) {
+            let _ = self
+                .presentation_signals
+                .drafts
+                .send(MessageDraftInvalidation {
+                    account_label: account.label,
+                    group_id_hex: group.to_owned(),
+                });
+        }
+    }
+}
+
+/// Cancellation only withdraws an unaccepted binding. Accepted payloads already
+/// belong to the engine outbox, independently of this future or its caller.
+pub(crate) struct DraftSubmissionGuard {
+    pub(crate) storage: storage_sqlite::SqliteAccountStorage,
+    pub(crate) revision: MessageDraftRevision,
+}
+impl Drop for DraftSubmissionGuard {
+    fn drop(&mut self) {
+        let _ = self.storage.cancel_message_draft_submission(&self.revision);
+    }
+}
+
 impl MarmotApp {
     /// List metadata-only composer drafts newest-first. Attachment plaintext is
     /// deliberately omitted; hydrate one selected composer with
-    /// [`MarmotApp::message_draft`]. Hosts are responsible for deleting empty or
-    /// sent drafts, while deleting a group cascades its remaining draft.
+    /// [`MarmotApp::message_draft`]. Legacy sends leave draft deletion to the host;
+    /// revision-bound sends clear on durable acceptance. Deleting a group
+    /// cascades its remaining draft.
     pub fn message_drafts(&self, account_ref: &str) -> Result<Vec<MessageDraftSummary>, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
@@ -245,7 +367,10 @@ impl MarmotApp {
             &attachments,
         );
         match result {
-            Ok(draft) => Ok(draft.into()),
+            Ok(draft) => {
+                self.notify_draft_changed(&account.label, group_id_hex);
+                Ok(draft.into())
+            }
             Err(StorageError::NotFound) => Err(AppError::UnknownGroup(group_id_hex.to_owned())),
             Err(error) => Err(error.into()),
         }
@@ -261,6 +386,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
             .delete_message_draft(group_id_hex)?;
+        self.notify_draft_changed(&account.label, group_id_hex);
         Ok(())
     }
 }

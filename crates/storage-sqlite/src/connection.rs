@@ -728,6 +728,8 @@ impl fmt::Debug for SqlCipherKey {
 
 #[derive(Clone)]
 pub struct SqliteAccountStorage {
+    pub(crate) draft_commit_observer:
+        Arc<Mutex<Option<crate::message_drafts::revisioned::MessageDraftCommitObserver>>>,
     migrations_applied: usize,
     migration_duration: Duration,
     pub(crate) connection: SharedConnection,
@@ -876,6 +878,7 @@ impl SqliteAccountStorage {
         Ok(Self {
             connection,
             openmls,
+            draft_commit_observer: Default::default(),
             migrations_applied,
             migration_duration,
         })

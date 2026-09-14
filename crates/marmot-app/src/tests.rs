@@ -1,3 +1,4 @@
+mod draft_lifecycle;
 mod key_package_inventory;
 mod message_journeys;
 
