@@ -626,6 +626,8 @@ def group_state_change_sentence(change: str, detail: Optional[str] = None) -> st
     if change == "group_renamed":
         trimmed = str(detail or "").strip()
         return f'The group was renamed to "{trimmed}".' if trimmed else "The group was renamed."
+    if change == "group_disbanded":
+        return "The group was disbanded."
     if change == "group_avatar_changed":
         return "The group avatar was changed."
     if change == "disappearing_timer_changed":
@@ -1543,15 +1545,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return True
         except Exception as exc:
             self._inbound_spool_admission_enabled = False
-            for attribute in ("_listener_task", "_inbound_spool_retry_task"):
-                task = getattr(self, attribute)
-                if task is not None:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    setattr(self, attribute, None)
+            await self._stop_inbound_tasks()
             self._store_generation_enabled = False
             await self._ambient_context_call(self._ambient_context.disable_generation)
             await self._inbound_spool_call(self._inbound_spool.close, graceful=True)
@@ -1579,25 +1573,25 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("Marmot welcomer allowlist sync failed", exc_info=True)
 
+    async def _stop_inbound_tasks(self) -> None:
+        tasks = [task for task in (self._listener_task, self._inbound_spool_retry_task)
+                 if task is not None]
+        self._listener_task = None
+        self._inbound_spool_retry_task = None
+        for task in tasks:
+            task.cancel()
+        # Retrieve already-failed tasks without allowing their old exception
+        # to bypass store closure and the connect failure result.
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(result, Exception):
+                logger.warning("Marmot inbound task failed before teardown (%s)", type(result).__name__)
+
     async def disconnect(self) -> None:
         # Fence every due-admission path before cancellation. A cancelled handed
         # task may make its FIFO successor eligible; shutdown must not enqueue a
         # task after KeyedAsyncQueue.cancel_all() has taken its snapshot.
         self._inbound_spool_admission_enabled = False
-        if self._listener_task is not None:
-            self._listener_task.cancel()
-            try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                pass
-            self._listener_task = None
-        if self._inbound_spool_retry_task is not None:
-            self._inbound_spool_retry_task.cancel()
-            try:
-                await self._inbound_spool_retry_task
-            except asyncio.CancelledError:
-                pass
-            self._inbound_spool_retry_task = None
+        await self._stop_inbound_tasks()
         # Stop debounce producers and release their durable rows before draining
         # the keyed queue. Its task finalizers can only wake the now-fenced spool.
         try:
@@ -3524,7 +3518,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         context_key = f"marmot:group_state_changed:{group_id_hex}:{change}:{event_identity}"
         allowed_changes = {
             "member_added", "member_removed", "member_left", "admin_added",
-            "admin_removed", "group_renamed", "group_avatar_changed",
+            "admin_removed", "group_renamed", "group_avatar_changed", "group_disbanded",
             "disappearing_timer_changed",
         }
         allowed_change = change if change in allowed_changes else "changed"

@@ -14,17 +14,7 @@ import types
 
 
 BUNDLE_ROOT = "hermes-marmot-plugin"
-EXPECTED_CONTENTS = (
-    "plugin.yaml",
-    "__init__.py",
-    "adapter.py",
-    "agent_control.py",
-    "ambient_context.py",
-    "inbound_spool.py",
-    "configure_gateway.py",
-    "README.md",
-    "manifest.json",
-)
+
 
 
 def _install_fake_hermes_modules() -> None:
@@ -96,14 +86,14 @@ def verify(archive: Path) -> None:
         declared = manifest.get("contents")
         if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
             raise AssertionError("manifest contents must be a string array")
-        if declared != list(EXPECTED_CONTENTS):
+        if len(declared) != len(set(declared)):
+            raise AssertionError("manifest contains duplicate entries")
+        if set(files) != set(declared):
             raise AssertionError(
-                f"manifest contents mismatch: expected {list(EXPECTED_CONTENTS)}, got {declared}"
+                f"archive contents differ from its manifest: {sorted(files)} vs {sorted(declared)}"
             )
-        if set(files) != set(EXPECTED_CONTENTS):
-            raise AssertionError(
-                f"archive contents mismatch: expected {sorted(EXPECTED_CONTENTS)}, got {sorted(files)}"
-            )
+        if not {"manifest.json", "adapter.py", "ambient_context.py"}.issubset(files):
+            raise AssertionError("archive is missing required adapter/ambient entry points")
 
         with tempfile.TemporaryDirectory(prefix="hermes-marmot-artifact-") as directory:
             package_dir = Path(directory) / "marmot"

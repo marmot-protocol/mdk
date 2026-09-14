@@ -112,6 +112,23 @@ but before either write succeeds, acceptance cannot be recovered and context may
 replay. The acceptance boundary is Hermes's normal `handle_message` return;
 it does not prove that an agent response completed or reached a recipient.
 
+The separate ambient database is deliberate failure isolation: optional context
+can become unavailable without preventing the real inbound journal from opening
+or changing its schema and recovery rules. This duplicates some file-safety and
+SQLite lifecycle code; consolidating that infrastructure is a later refactor.
+Unlike the real-message spool, which needs plaintext to replay a message, the
+ambient store deliberately avoids retaining additional mutation/rename content.
+A coarse restart fact is only a hint that group history changed; it cannot
+identify a deleted message or establish a rename target. Consumers should refresh
+history when detail matters, rather than infer a target. Earlier branch-install
+schemas remain readable to preserve any existing operator data.
+
+The byte setting is a logical row budget. The physical database page ceiling
+adds 64 KiB for schema pages and eight times the logical budget for indexes,
+fragmentation, claim metadata, and temporary acknowledgement overlap; WAL files
+are checkpointed separately. These are distinct limits. Generation fencing and
+connect-failure cleanup are required so late work cannot reopen a closed store.
+
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
 id or the latest inbound message and accept arbitrary non-blank, control-free

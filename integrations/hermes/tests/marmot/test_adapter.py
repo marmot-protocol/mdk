@@ -1442,6 +1442,32 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     await adapter.disconnect()
                 self.assertIsNone(adapter._listener_task)
 
+    async def test_failed_old_listener_cannot_bypass_connect_failure_cleanup(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}), client=object()
+        )
+        await adapter._ensure_inbound_spool_open()
+        await adapter._ambient_context_call(adapter._ambient_context.open)
+        async def failed_listener():
+            raise RuntimeError("old transport failure")
+        adapter._listener_task = asyncio.create_task(failed_listener())
+        await asyncio.sleep(0)
+        adapter._ensure_account_id = unittest.mock.AsyncMock(side_effect=OSError("connect failed"))
+        adapter._set_fatal_error = unittest.mock.Mock()
+        try:
+            self.assertFalse(await adapter.connect(is_reconnect=True))
+            self.assertIsNone(adapter._listener_task)
+            self.assertIsNone(adapter._inbound_spool_retry_task)
+            self.assertFalse(adapter._ambient_context.is_open)
+            self.assertFalse(adapter._inbound_spool.is_open)
+            adapter._set_fatal_error.assert_called_once_with("marmot_connect_failed", "connect failed", retryable=True)
+            # Closed connection also relinquished the exclusive ambient lock.
+            other = self.adapter_module.AmbientContextStore(adapter._ambient_context.path)
+            other.open()
+            other.close()
+        finally:
+            await adapter.disconnect()
+
     async def test_ambient_open_failure_degrades_without_blocking_real_inbound(self):
         inbound = wire_event(
             {

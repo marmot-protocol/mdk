@@ -1,7 +1,7 @@
 """Private durable quiet-context facts for the Hermes Marmot adapter.
 
 Only hashed routing/dedupe keys and a small allowlisted fact kind cross the
-process boundary. Message text, display names, pubkeys, tokens, and full Marmot
+process boundary. Message text, display names, pubkeys, authentication tokens, and full Marmot
 identifiers are never persisted here.
 """
 
@@ -10,14 +10,19 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import logging
 import os
 import sqlite3
 import stat
 import time
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
+# Preserve stores created by earlier installs of this PR branch.
 SCHEMA_VERSION = 3
 _ALLOWED_KINDS = frozenset(
     {
@@ -32,6 +37,7 @@ _ALLOWED_KINDS = frozenset(
         "group_state:admin_removed",
         "group_state:group_renamed",
         "group_state:group_avatar_changed",
+        "group_state:group_disbanded",
         "group_state:disappearing_timer_changed",
         "group_state:changed",
     }
@@ -95,6 +101,7 @@ class AmbientContextStore:
         # after restart consumers render the allowlisted kind instead.
         self._live_details: dict[int, str] = {}
         self._accepted_tokens: set[str] = set()
+        self._acceptance_lock = threading.Lock()
 
     def __del__(self) -> None:
         try:
@@ -134,15 +141,21 @@ class AmbientContextStore:
             self._lock_fd = lock_fd
             self._initialize_schema()
             page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
-            db.execute(f"PRAGMA max_page_count={max(4, self.max_state_bytes // page_size)}")
+            # The configured budget counts logical rows. Reserve physical room
+            # for schema/index pages, claim metadata, fragmentation, and the
+            # temporary facts+tombstones overlap during acknowledgement.
+            physical_budget = 64 * 1024 + 8 * self.max_state_bytes
+            db.execute(f"PRAGMA max_page_count={(physical_budget + page_size - 1) // page_size}")
             result = db.execute("PRAGMA quick_check").fetchone()
             if result is None or result[0] != "ok":
                 raise AmbientContextError("ambient context integrity check failed")
+            with self._acceptance_lock:
+                accepted_tokens = tuple(self._accepted_tokens)
             with db:
                 # A graceful reconnect of this same object may follow failed
                 # commit AND acknowledgement writes. Preserve its in-memory
                 # acceptance knowledge before normal abandoned-claim recovery.
-                for token in self._accepted_tokens:
+                for token in accepted_tokens:
                     db.execute("UPDATE facts SET committed=1 WHERE claim_token=? AND claim_owner=?",
                                (token, self.owner_id))
                 # A committed claim crossed the durable host-handoff boundary.
@@ -156,7 +169,8 @@ class AmbientContextStore:
                 )
                 self._gc(time.time())
                 self._enforce_all_bounds()
-            self._accepted_tokens.clear()
+            with self._acceptance_lock:
+                self._accepted_tokens.difference_update(accepted_tokens)
             self._checkpoint()
         except Exception as exc:
             lock_was_attached = self._lock_fd is not None
@@ -170,6 +184,8 @@ class AmbientContextStore:
     def close(self) -> None:
         db = self._db
         lock_fd = self._lock_fd
+        with self._acceptance_lock:
+            accepted_tokens = tuple(self._accepted_tokens)
         try:
             if db is not None:
                 try:
@@ -178,9 +194,9 @@ class AmbientContextStore:
                             db.execute(
                                 "UPDATE facts SET claim_owner=NULL,claim_token=NULL,claimed_at=NULL "
                                 "WHERE claim_owner=? AND committed=0 "
-                                + (f"AND claim_token NOT IN ({','.join('?' for _ in self._accepted_tokens)})"
-                                   if self._accepted_tokens else ""),
-                                (self.owner_id, *self._accepted_tokens),
+                                + (f"AND claim_token NOT IN ({','.join('?' for _ in accepted_tokens)})"
+                                   if accepted_tokens else ""),
+                                (self.owner_id, *accepted_tokens),
                             )
                             self._gc(time.time())
                             self._enforce_all_bounds()
@@ -211,7 +227,8 @@ class AmbientContextStore:
     def remember_accepted(self, token: str) -> None:
         """Keep acceptance known across storage faults and graceful reconnects."""
         if token:
-            self._accepted_tokens.add(token)
+            with self._acceptance_lock:
+                self._accepted_tokens.add(token)
 
     def record(
         self,
@@ -251,6 +268,8 @@ class AmbientContextStore:
             if retained is not None and live_text:
                 self._live_details[int(retained[0])] = live_text
                 self._trim_live_details()
+            if retained is None:
+                logger.warning("Marmot ambient observation refused at configured capacity")
             return retained is not None
         except AmbientContextError:
             raise
@@ -336,7 +355,8 @@ class AmbientContextStore:
                 self._gc(time.time())
                 self._enforce_all_bounds()
             self._checkpoint()
-            self._accepted_tokens.discard(token)
+            with self._acceptance_lock:
+                self._accepted_tokens.discard(token)
             return int(changed)
         except AmbientContextError:
             raise
@@ -547,28 +567,6 @@ class AmbientContextStore:
         db.execute("DELETE FROM seen WHERE group_key=?", (row[0],))
         return True
 
-    def _delete_oldest_group(self, table: str) -> bool:
-        db = self._require_db()
-        if table == "facts":
-            row = db.execute(
-                "SELECT group_key FROM facts candidate "
-                "WHERE NOT EXISTS (SELECT 1 FROM facts claimed "
-                "WHERE claimed.group_key=candidate.group_key "
-                "AND claimed.claim_token IS NOT NULL) "
-                "GROUP BY group_key ORDER BY min(observed_at),hex(group_key) LIMIT 1"
-            ).fetchone()
-        elif table == "seen":
-            row = db.execute(
-                "SELECT group_key FROM seen GROUP BY group_key "
-                "ORDER BY min(observed_at),hex(group_key) LIMIT 1"
-            ).fetchone()
-        else:
-            raise AmbientContextError("invalid ambient context table")
-        if row is None:
-            return False
-        db.execute(f"DELETE FROM {table} WHERE group_key=?", (row[0],))
-        return True
-
     def _table_logical_bytes(self, table: str) -> int:
         if table == "facts":
             expression = "length(group_key)+length(event_key)+length(kind)+88"
@@ -581,24 +579,8 @@ class AmbientContextStore:
         ).fetchone()
         return int(row[0])
 
-    def _table_group_count(self, table: str) -> int:
-        if table not in {"facts", "seen"}:
-            raise AmbientContextError("invalid ambient context table")
-        return int(
-            self._require_db().execute(
-                f"SELECT count(DISTINCT group_key) FROM {table}"
-            ).fetchone()[0]
-        )
-
     def _logical_bytes(self) -> int:
         return self._table_logical_bytes("facts") + self._table_logical_bytes("seen")
-
-    def _group_exists(self, group_key: bytes) -> bool:
-        return self._require_db().execute(
-            "SELECT 1 FROM facts WHERE group_key=? UNION ALL "
-            "SELECT 1 FROM seen WHERE group_key=? LIMIT 1",
-            (group_key, group_key),
-        ).fetchone() is not None
 
     def _group_count(self) -> int:
         return int(

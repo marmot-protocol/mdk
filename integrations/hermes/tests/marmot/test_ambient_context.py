@@ -74,6 +74,36 @@ os._exit(0)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
+    def test_small_byte_budget_evicts_and_retires_without_sqlite_full(self):
+        for limit in (4096, 128 * 1024):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                store = AmbientContextStore(Path(directory).resolve() / "ambient.sqlite3",
+                                            max_events=4096, max_events_per_group=4096,
+                                            max_state_bytes=limit)
+                try:
+                    # Exceed the logical bound with the event-count caps out
+                    # of the way, then grow claim metadata and tombstones.
+                    for index in range(limit // 160 + 32):
+                        store.record("group", str(index), "message_deleted")
+                    self.assertLessEqual(store.stats()["state_bytes"], limit)
+                    claim = store.claim("group")
+                    self.assertTrue(claim.facts)
+                    store.remember_accepted(claim.token)
+                    self.assertEqual(store.commit("group", claim.token), len(claim.facts))
+                    self.assertEqual(store.acknowledge("group", claim.token), len(claim.facts))
+                    self.assertEqual(store.pending("group"), [])
+                    self.assertLessEqual(store.path.stat().st_size, 64 * 1024 + 8 * limit)
+                finally:
+                    store.close()
+
+    def test_disband_kind_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(Path(directory).resolve() / "ambient.sqlite3")
+            store.record("group", "event", "group_state:group_disbanded")
+            store.close()
+            self.assertEqual(store.claim("group").facts[0].kind, "group_state:group_disbanded")
+            store.close()
+
     def test_live_details_never_persist_and_restart_falls_back_to_kind(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / "private" / "ambient.sqlite3"
