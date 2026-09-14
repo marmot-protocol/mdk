@@ -1732,7 +1732,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         message_id: Optional[str] = None,
     ) -> SendResult:
-        response = await stream.finalize(final_text)
+        try:
+            response = await stream.finalize(final_text)
+        except Exception as exc:
+            if is_retryable(exc):
+                # Keep the same stream and key: the durable send may have committed.
+                return SendResult(success=False, error=str(exc), retryable=True)
+            raise
         if message_id:
             self._active_streams.pop(message_id, None)
         self._forget_stream(chat_id, stream)

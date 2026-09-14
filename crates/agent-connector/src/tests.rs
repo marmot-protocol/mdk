@@ -3803,6 +3803,7 @@ async fn connector_finish_reuses_receipt() {
         .await
         .unwrap();
     let original = session.publisher.finish(None).await.unwrap();
+    drop(session);
     assert_eq!(connector.streams.sweep_idle(Duration::ZERO).await, 0);
     // A retry that disagrees with the frozen transcript is rejected and leaves
     // the session registered.
@@ -3817,10 +3818,11 @@ async fn connector_finish_reuses_receipt() {
     assert!(
         matches!(
             mismatch,
-            Err(ConnectorError::App(AppError::AgentStreamPublisher(_)))
+            Err(ConnectorError::App(AppError::AgentStreamFinishMismatch))
         ),
         "a retry disagreeing with the frozen transcript must be rejected"
     );
+    assert_eq!(mismatch.unwrap_err().code(), "stream_finalize_mismatch");
     assert!(
         connector.streams.get(&stream_id_norm).is_ok(),
         "a rejected retry must not drop the session"

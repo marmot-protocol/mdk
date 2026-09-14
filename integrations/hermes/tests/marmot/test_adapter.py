@@ -4746,6 +4746,51 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake_client.stream_finalizes[0][2])
         self.assertEqual(fake_client.stream_finalizes[1][2], fake_client.stream_finalizes[0][2])
 
+    async def test_finish_retains_retry_key(self):
+        module = self.adapter_module
+        for operation in ("send", "edit"):
+            with self.subTest(operation=operation):
+                client = unittest.mock.Mock()
+                client.stream_append = unittest.mock.AsyncMock(return_value={"type": "ack"})
+                client.stream_cancel = unittest.mock.AsyncMock()
+                client.send_final = unittest.mock.AsyncMock()
+                receipt = {"type": "stream_finalized", "message_ids_hex": ["77" * 32]}
+                client.stream_finish = unittest.mock.AsyncMock(side_effect=[
+                    module.AgentControlError("lost receipt", code="timeout", retryable=True),
+                    receipt,
+                ])
+                adapter = module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}), client=client,
+                )
+                stream = module.MarmotLiveStream(
+                    client=client, account_id_hex="11" * 32, group_id_hex="22" * 32,
+                    stream_id_hex="55" * 32, stream_capability="33" * 32,
+                    start_message_id_hex="66" * 32, parent_message_id_hex=None,
+                )
+                message_id = module._stream_message_id(stream.stream_id_hex)
+                adapter._active_streams[message_id] = stream
+                adapter._last_chat_stream["22" * 32] = stream
+                with unittest.mock.patch.object(module, "STREAM_FINALIZE_RETRY_BACKOFF_S", ()):
+                    if operation == "send":
+                        failed = await adapter.send("22" * 32, "hello")
+                    else:
+                        failed = await adapter.edit_message("22" * 32, message_id, "hello", finalize=True)
+                    self.assertFalse(failed.success)
+                    self.assertTrue(failed.retryable)
+                    self.assertIs(adapter._last_chat_stream["22" * 32], stream)
+                    self.assertIs(adapter._active_streams[message_id], stream)
+                    if operation == "send":
+                        retried = await adapter.send("22" * 32, "hello")
+                    else:
+                        retried = await adapter.edit_message("22" * 32, message_id, "hello", finalize=True)
+                self.assertTrue(retried.success)
+                self.assertEqual(retried.message_id, "77" * 32)
+                self.assertEqual(client.stream_finish.await_count, 2)
+                for call in client.stream_finish.await_args_list:
+                    self.assertEqual(call.kwargs["idempotency_key"], stream.finalize_idempotency_key)
+                client.stream_cancel.assert_not_awaited()
+                client.send_final.assert_not_awaited()
+
     async def test_finalize_rejection_falls_back_to_plain_send_final(self):
         adapter_module = self.adapter_module
 

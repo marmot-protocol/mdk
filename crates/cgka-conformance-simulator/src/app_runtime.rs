@@ -2009,6 +2009,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RelayDirectory(_)
         | AppError::Publish(_)
         | AppError::BlobStore(_)
+        | AppError::AgentStreamSendFailed(_)
         | AppError::MediaUploadTimedOut
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
@@ -2046,7 +2047,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)
         | AppError::AgentStreamFinishMismatch
-        | AppError::AgentStreamSendFailed(_)
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
         | AppError::AgentStreamUnsupportedRoute
@@ -2267,6 +2267,7 @@ mod tests {
             AppError::RuntimeBusy,
             AppError::AccountWorkerResponseTimedOut,
             AppError::ChatPresentationNotReady,
+            AppError::AgentStreamSendFailed(Box::new(AppError::Publish(marker.into()))),
         ] {
             let resource = app_error(failure);
             assert_eq!(resource.category, SubjectFailureCategory::Resource);
