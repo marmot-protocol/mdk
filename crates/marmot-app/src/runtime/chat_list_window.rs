@@ -26,6 +26,8 @@ pub enum ChatListWindowError {
     #[error("chat window is closed")]
     Closed,
     #[error(transparent)]
+    Query(Arc<storage_sqlite::ChatListPageError>),
+    #[error(transparent)]
     App(Arc<AppError>),
 }
 impl From<AppError> for ChatListWindowError {
@@ -223,7 +225,7 @@ impl MarmotAppRuntime {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => return Err(ChatListWindowError::Closed),
             _ = wait_for_account_reset(&mut resets, &reader.label) => return Err(ChatListWindowError::Closed),
-            read = reader.read(&position, &[]) => read?,
+            read = reader.initial_read(&position) => read?,
         };
         reader.store_epoch = read
             .snapshot
@@ -260,6 +262,24 @@ impl MarmotAppRuntime {
 }
 
 impl Reader {
+    async fn initial_read(
+        &self,
+        position: &Position,
+    ) -> Result<ChatListWindowRead, ChatListWindowError> {
+        loop {
+            match self.read(position, &[]).await {
+                Err(ChatListWindowError::App(error))
+                    if matches!(error.as_ref(), AppError::ChatPresentationNotReady) =>
+                {
+                    // Each attempt initializes at most one base-row batch. Yield
+                    // between batches; the caller owns cancellation/shutdown/reset.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn read(
         &self,
         position: &Position,
@@ -301,18 +321,15 @@ impl Reader {
             if !epoch.is_empty() && storage.chat_presentation_version()?.store_epoch != epoch {
                 return Err(AppError::RuntimeStopping);
             }
-            let read = || {
-                storage
-                    .read_chat_list_window(query.clone())
-                    .map_err(|error| match error {
-                        storage_sqlite::ChatListPageError::Storage(
-                            cgka_traits::storage::StorageError::NotFound,
-                        ) => AppError::ChatPresentationNotReady,
-                        storage_sqlite::ChatListPageError::Storage(error) => error.into(),
-                        _ => AppError::ChatPresentationNotReady,
-                    })
+            // Legacy/imported accounts can lack navigation rows entirely. Repair
+            // one bounded batch even without an active account worker; selected
+            // preparation below remains limited to the requested window.
+            crate::chat_presentation::maintenance::prepare_base_rows(&storage, &account_id)?;
+            let read = || storage.read_chat_list_window(query.clone());
+            let mut result = match read().inspect_err(|_| app.presentation_signals.wake()) {
+                Ok(result) => result,
+                Err(error) => return Ok(Err(error)),
             };
-            let mut result = read().inspect_err(|_| app.presentation_signals.wake())?;
             if result.snapshot.is_none() {
                 let prepared = crate::chat_presentation::maintenance::prepare_window(
                     &storage,
@@ -330,7 +347,10 @@ impl Reader {
                         version: storage.chat_presentation_version()?,
                     });
                 prepared?;
-                result = read()?;
+                result = match read() {
+                    Ok(result) => result,
+                    Err(error) => return Ok(Err(error)),
+                };
             }
             let Some(snapshot) = result.snapshot.as_mut() else {
                 return Err(AppError::ChatPresentationNotReady);
@@ -352,10 +372,16 @@ impl Reader {
                 }
                 selected.row = row;
             }
-            Ok(result)
+            Ok(Ok(result))
         })
-        .await
-        .map_err(Into::into)
+        .await?
+        .map_err(|error| match error {
+            storage_sqlite::ChatListPageError::Storage(
+                cgka_traits::storage::StorageError::NotFound,
+            ) => AppError::ChatPresentationNotReady.into(),
+            storage_sqlite::ChatListPageError::Storage(error) => AppError::Storage(error).into(),
+            error => ChatListWindowError::Query(Arc::new(error)),
+        })
     }
 }
 
@@ -432,7 +458,7 @@ impl Sources {
         loop {
             tokio::select! {
                 profile = self.profiles.recv() => match profile {
-                    Ok(profile) if rows.iter().any(|r|r.row.last_message.as_ref().is_some_and(|m|m.sender==profile)) => return,
+                    Ok(profile) if rows.iter().any(|r|r.row.last_message.as_ref().is_some_and(|m|m.sender.eq_ignore_ascii_case(&profile))) => return,
                     Err(_) => return,
                     _ => {},
                 },
@@ -626,8 +652,13 @@ async fn run(
                 if !failed {
                     let _ = updates.send_replace(Err(error.clone()));
                 }
+                let invalid_query = matches!(&error, ChatListWindowError::Query(_));
                 if let Some(command) = command {
                     let _ = command.reply.send(Err(error));
+                }
+                if invalid_query {
+                    // Internal query/cursor invariants cannot recover through retries.
+                    return;
                 }
                 dirty = true;
                 failed = true;

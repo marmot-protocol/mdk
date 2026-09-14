@@ -103,6 +103,8 @@ impl SqliteAccountStorage {
             )?,
         };
         // Near the end fill unused capacity from before the window, retaining the anchor.
+        // has_more_before excludes empty pages: a cursorless backward read would
+        // otherwise restart from the wrong end of the list.
         if page.rows.len() < query.limit && page.has_more_before {
             let mut before = read_page_tx(
                 &conn,

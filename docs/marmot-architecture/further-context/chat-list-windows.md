@@ -56,21 +56,38 @@ an unchanged window or reject otherwise current client commands; the next delive
 replacement carries current boundaries. SQL and row conversion work are bounded by
 the requested window and at most 200 fallback identities.
 
+Render titles and avatars from each row's **`presentation`**. This contains the
+selected peer/group identity and fallback tokens for client localization; clients
+must not rebuild
+those decisions from `row.name`, `row.avatar`, `row.member_count`, or
+`row.conversation_kind`. Those legacy metadata fields are retained for compatibility
+and can lag source updates; they are not the window's display contract. The selected
+presentation is maintained from current group/profile inputs independently of the
+legacy full-list stale flag.
+
 ## Preparation, failures and lifecycle policy
 
 Missing selected values are prepared only for the requested window using local
 cached evidence and the existing compare-and-store protection. Other selected
 backfill continues in the existing bounded account maintenance worker. Ready reads
 do not hydrate history or MLS groups or wait for the network. If legacy **base**
-chat rows are still missing, their ordering is not yet known: return explicit
-`ChatPresentationNotReady` and wake maintenance instead of returning a misleading
-partial or empty list. This is distinct from unrelated selected-presentation work,
-which does not block an otherwise ready window.
+chat rows are still missing, their ordering is not yet known. Each read initializes
+one bounded base-row batch locally, even without an account worker. Initial open
+retries preparation after yielding until those rows are ready, or the caller cancels,
+the account resets, or the runtime shuts down. Other initial read errors are returned.
+This one-time base initialization can scale with an imported account and its retained
+history; it never presents a misleading partial/empty list. Subsequent read failures
+remain explicit and retry inside the actor. This is distinct from unrelated
+selected-presentation work, which does not block an otherwise ready window.
 
 Invalidations are coalesced before a read. Those arriving during the read remain
 queued for the next refresh. Lag refreshes the current window. Local read/preparation
 failures surface explicitly and retain a one-second retry obligation without
-requiring a new event. Timed mute expiry refreshes only the retained window.
+requiring a new event. Internal query/cursor validation errors are terminal and retain
+their error classification. Losing a teardown signal closes the window conservatively:
+account cache eviction can preserve both account ID and durable store epoch, so a
+refresh alone cannot establish that its lifetime survived. Timed mute expiry
+refreshes only the retained window.
 
 Pending invitations and Left rows have effective unread/mention/manual-attention
 fields suppressed in this API; raw stored read intent and lower-level APIs remain

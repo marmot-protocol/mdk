@@ -349,7 +349,7 @@ pub(super) fn read_page_tx(
 fn page_rows_sql() -> String {
     // One bounded batch for row data and operation overlays. Keep expression indexes:
     // batching alone would still scan unrelated engine records without indexed joins.
-    // json_each supplies at most 100 keys; row order is restored from navigation below.
+    // json_each supplies at most 200 keys (100 for standalone pages); row order is restored from navigation below.
     format!(
         "{} row.list_pin_position,
             leave_request.record AS page_leave_record,

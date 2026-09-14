@@ -12,6 +12,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(count: usize) -> Self {
+        Self::with_base_rows(count, true)
+    }
+    fn with_base_rows(count: usize, prepared: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -74,9 +77,11 @@ impl Fixture {
                 120,
             )
             .unwrap();
-        store
-            .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
-            .unwrap();
+        if prepared {
+            store
+                .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
+                .unwrap();
+        }
         let runtime = MarmotAppRuntime::new(app.clone());
         Self {
             _dir: dir,
@@ -710,7 +715,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
     let version = f.store.chat_presentation_version().unwrap();
     f.app
         .save_directory_entry(&UserDirectoryRecord {
-            account_id_hex: sender,
+            account_id_hex: sender.clone(),
             npub: "fixture".into(),
             local_account: None,
             profile: Some(UserProfileMetadata {
@@ -740,6 +745,35 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
             .as_deref(),
         Some("New sender name")
     );
+    // Pin the invalidation boundary independently of the producer's current
+    // lowercase normalization, using a committed profile with no other wakeup.
+    let shared = f.app.shared_storage().unwrap();
+    let mut record = shared.public_directory_user(&sender).unwrap().unwrap();
+    record.profile_json = Some(
+        serde_json::to_string(&UserProfileMetadata {
+            display_name: Some("Case-insensitive update".into()),
+            created_at: 201,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    shared.put_public_directory_user(&record).unwrap();
+    let _ = f
+        .app
+        .presentation_signals
+        .profile_updates
+        .send(sender.to_uppercase());
+    let updated = next(&mut sub).await;
+    assert_eq!(
+        updated.rows[0]
+            .row
+            .last_message
+            .as_ref()
+            .unwrap()
+            .sender_display_name
+            .as_deref(),
+        Some("Case-insensitive update")
+    );
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -766,4 +800,218 @@ async fn outside_view_navigation_changes_do_not_invalidate_visible_window_sequen
     assert_eq!(current.sequence, 1);
     assert_eq!(current.rows, sub.snapshot.rows);
     f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn initial_open_repairs_multiple_base_batches_without_a_worker_or_full_list_warm() {
+    let f = Fixture::with_base_rows(120, false);
+    assert!(!f.store.pending_chat_presentation_rows().unwrap().is_empty());
+    let sub = tokio::time::timeout(
+        Duration::from_secs(10),
+        f.runtime
+            .open_chat_list_window("alice", ChatListView::Chats, Some(20)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(sub.snapshot.rows.len(), 20);
+    assert_eq!(ids(&sub.snapshot).first().copied(), Some("0000"));
+    assert!(sub.snapshot.has_more_after);
+    assert!(f.store.pending_chat_presentation_rows().unwrap().is_empty());
+    assert!(matches!(
+        f.store.chat_presentation("0014").unwrap(),
+        ChatPresentationRead::Pending
+    ));
+    assert!(f.app.chat_list_projection_warmed.lock().unwrap().is_empty());
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_window_query_is_distinct_from_readiness() {
+    let f = Fixture::new(20);
+    let reader = Reader {
+        app: f.app.clone(),
+        label: "alice".into(),
+        account_id: f.account_id.clone(),
+        store_epoch: vec![],
+        view: ChatListView::Chats,
+    };
+    let result = reader
+        .read(
+            &Position {
+                limit: 5,
+                before: 5,
+                anchor: None,
+            },
+            &[],
+        )
+        .await;
+    assert!(matches!(result, Err(ChatListWindowError::Query(error))
+        if matches!(error.as_ref(), storage_sqlite::ChatListPageError::InvalidWindowQuery)));
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_reset_signal_closes_window_even_when_the_durable_epoch_is_unchanged() {
+    let f = Fixture::new(20);
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    // Eviction of the same account database must end this handle, even when
+    // its signal is subsequently overwritten by unrelated account teardowns.
+    f.app.drop_account_caches("alice");
+    for i in 0..100 {
+        let _ = f
+            .app
+            .presentation_signals
+            .account_resets
+            .send(format!("other-{i}"));
+    }
+    assert_eq!(
+        f.app
+            .account_storage("alice")
+            .unwrap()
+            .chat_presentation_version()
+            .unwrap()
+            .store_epoch,
+        epoch
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_source_changes_refresh_selected_display_without_legacy_rebuild() {
+    let f = Fixture::new(20);
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    f.mutate("0000", |g| g.profile_name = "Renamed group".into());
+    crate::chat_presentation::maintenance::prepare_window(
+        &f.store,
+        &f.app.shared_storage().unwrap(),
+        &f.account_id,
+        &["0000".into()],
+    )
+    .unwrap();
+    f.signal();
+    let updated = next(&mut sub).await;
+    assert!(
+        matches!(&updated.rows[0].presentation.title, PresentationText::Literal(name) if name == "Renamed group")
+    );
+    assert!(f.app.chat_list_projection_warmed.lock().unwrap().is_empty());
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats() {
+    use crate::tests::{ScriptedPushRelayClient, remember_test_member_inbox};
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice
+        .create_group("Invite", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group)
+    );
+    let id = hex::encode(group.as_slice());
+    let first = app.group("bob", &id).unwrap().unwrap();
+    assert!(first.pending_confirmation);
+    bob_client.decline_group_invite(&group).await.unwrap();
+    let departed = app.group("bob", &id).unwrap().unwrap();
+    assert!(departed.archived);
+    assert_eq!(departed.self_membership, SelfMembership::Left);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut chats = runtime
+        .open_chat_list_window("bob", ChatListView::Chats, Some(5))
+        .await
+        .unwrap();
+    let mut left = runtime
+        .open_chat_list_window("bob", ChatListView::Left, Some(5))
+        .await
+        .unwrap();
+    assert!(chats.snapshot.rows.is_empty());
+    assert_eq!(ids(&left.snapshot), [id.as_str()]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !bob_client.runtime.group_record(&group).unwrap().removed {
+        alice.sync().await.unwrap();
+        alice.retry_group_convergence(&group).await.unwrap();
+        bob_client.sync().await.unwrap();
+        bob_client
+            .advance_convergence_after_runtime_sync(&group)
+            .await
+            .unwrap();
+        assert!(tokio::time::Instant::now() < deadline, "leave must settle");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bob_client.rotate_key_package().await.unwrap();
+    alice
+        .invite_members(&group, &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group)
+    );
+    let rejoined = app.group("bob", &id).unwrap().unwrap();
+    assert!(rejoined.pending_confirmation);
+    assert!(!rejoined.archived);
+    assert_eq!(rejoined.self_membership, SelfMembership::Member);
+    assert_ne!(
+        rejoined.via_welcome_message_id_hex,
+        first.via_welcome_message_id_hex
+    );
+    // Direct AppClient use has no runtime event relay; notify the already-open
+    // windows after the real engine and worker projection path has committed.
+    let _ = app
+        .presentation_signals
+        .updates
+        .send(PresentationInvalidation {
+            account_label: "bob".into(),
+            version: app
+                .account_storage("bob")
+                .unwrap()
+                .chat_presentation_version()
+                .unwrap(),
+        });
+    assert_eq!(ids(&next(&mut chats).await), [id.as_str()]);
+    assert!(next(&mut left).await.rows.is_empty());
+    runtime.shutdown_and_close().await.unwrap();
 }
