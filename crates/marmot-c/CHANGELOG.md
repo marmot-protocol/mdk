@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAccountKeyPackageRelayEvent`, `MarmotAccountKeyPackageRelayEventList`,
+  `marmot_account_key_package_relay_events`, and
+  `marmot_account_key_package_relay_event_list_free` for observed KeyPackage
+  relay history, including superseded same-slot events. Existing
+  `MarmotAccountKeyPackage` layout is unchanged.
 - `marmot_forget_group_local` deletes local chat and MLS state without publishing a leave,
   stops group work, and permits a fresh authenticated invitation to rejoin. Rebuild with
   matching headers/libraries; hosts must clear their own media caches and close group views.

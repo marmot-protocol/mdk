@@ -38,6 +38,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "stream_append": frozenset({"ack"}),
     "stream_status": frozenset({"ack"}),
     "stream_progress": frozenset({"ack"}),
+    "stream_finish": frozenset({"stream_finalized"}),
     "stream_finalize": frozenset({"stream_finalized"}),
     "stream_cancel": frozenset({"ack"}),
     "send_agent_activity": frozenset({"app_event_sent"}),
@@ -467,6 +468,22 @@ class MarmotAgentControlClient:
             },
             timeout=self.preview_request_timeout,
         )
+
+    async def stream_finish(
+        self,
+        stream_id_hex: str,
+        stream_capability: str,
+        final_text: str,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
+        return await self.request({
+            "type": "stream_finish",
+            "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
+            "stream_capability": _normalize_stream_capability(stream_capability),
+            "final_text": str(final_text or ""),
+            **({"idempotency_key": key} if key else {}),
+        })
 
     async def stream_finalize(
         self,

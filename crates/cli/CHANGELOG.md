@@ -66,6 +66,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   `invalid_encrypted_media`, `invalid_app_message_payload`, `invalid_retention_duration`, `unknown_message`,
   `not_message_author`, `empty_group_image`, `group_image_absent`, `invalid_rejoin_token`, `invalid_welcome_id`,
   and `initial_admin_not_invited`.
+- `account_key_package_relay_events` / Swift and Kotlin `accountKeyPackageRelayEvents` /
+  `marmot_account_key_package_relay_events` return observed kind-30443 relay history for
+  one account, including superseded same-slot events, so hosts can delete a specific
+  event without targeting the current winner.
 - Runtime `forget_group_local` and Swift/Kotlin `forgetGroupLocal` for recovery from an
   unusable local group copy: erase chat history and MLS state, cancel group work, and
   wait for a fresh authenticated Welcome. Invitations must be created strictly after
@@ -114,6 +118,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   for the decrypted image.
 - The README documents canonical MLS group ids versus 32-byte Nostr routing ids, and relay publication versus
   durable completion, for the group and message surfaces.
+- Account KeyPackage listing now exposes one current relay event per addressable
+  slot. `wn keys list` follows that current-slot inventory; `wn keys delete-all
+  --confirm` still publishes deletions for every observed relay event, including
+  superseded same-slot members. Sign-out and wipe use the same all-event cleanup.
 - Account storage advances through migrations 70–71. Back up before upgrading;
   downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
   Keep native libraries and generated bindings on matching versions.

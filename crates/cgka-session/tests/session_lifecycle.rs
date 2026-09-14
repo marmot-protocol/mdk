@@ -837,7 +837,27 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
             ..CanonicalizationPolicy::default()
         })
         .expect("convergence policy accepted");
-    let advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    // Background convergence is a cooperative quantum, not a drain-to-completion API.
+    // Under CI load it can adopt epoch 2 and exhaust its 500ms budget before draining
+    // the queued intent. Follow the scheduled continuation as the runtime worker does.
+    // Check the deadline between complete calls; never cancel a live MLS/storage step.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued outbound work did not publish within the convergence deadline"
+        );
+        if !advanced.publish.is_empty() {
+            break;
+        }
+        assert!(
+            advanced.pending_convergence.contains(&created.group_id),
+            "queued outbound work must publish or schedule another convergence quantum"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    }
 
     assert_eq!(carol.epoch(&created.group_id).unwrap(), EpochId(2));
     assert!(

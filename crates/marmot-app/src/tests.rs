@@ -1,3 +1,4 @@
+mod key_package_inventory;
 mod message_journeys;
 
 use super::*;
@@ -560,29 +561,39 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let endpoint_events = self.events_by_endpoint.lock().unwrap();
-        let events = if endpoint_events.is_empty() {
-            self.events.lock().unwrap().clone()
-        } else {
+        let matches_query = |event: &NostrTransportEvent| {
             request
-                .endpoints
+                .queries
                 .iter()
-                .filter_map(|endpoint| endpoint_events.get(&endpoint.0))
-                .flatten()
-                .cloned()
-                .collect()
+                .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
         };
-        Ok(events
-            .into_iter()
-            .filter(|event| {
-                request
-                    .queries
-                    .iter()
-                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
-            })
-            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
-                endpoints: request.endpoints.clone(),
-                event,
+        let endpoint_events = self.events_by_endpoint.lock().unwrap();
+        if endpoint_events.is_empty() {
+            return Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches_query(event))
+                .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                    endpoints: request.endpoints.clone(),
+                    event: event.clone(),
+                })
+                .collect());
+        }
+        Ok(request
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                endpoint_events
+                    .get(&endpoint.0)
+                    .into_iter()
+                    .flatten()
+                    .filter(|event| matches_query(event))
+                    .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                        endpoints: vec![endpoint.clone()],
+                        event: event.clone(),
+                    })
             })
             .collect())
     }
@@ -8207,6 +8218,32 @@ async fn fresh_key_package_for_account(
     }
     let mut session = AccountDeviceSession::open(config).unwrap();
     session.fresh_key_package().await.unwrap()
+}
+
+pub(crate) fn write_key_package_cache(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    key_package_id: &str,
+    key_package_ref_hex: &str,
+    key_package_event_id: &str,
+) {
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: key_package_id.to_owned(),
+            key_package_ref_hex: key_package_ref_hex.to_owned(),
+            key_package_event_id: key_package_event_id.to_owned(),
+            published_at: 1,
+            key_package_hex: "00".into(),
+        },
+    )
+    .unwrap();
+}
+
+pub(crate) fn key_package_cache_exists(app: &MarmotApp, label: &str) -> bool {
+    app.key_package_record_path(label).exists()
 }
 
 /// Seed the explicit kind-10050 state normally established by account setup.

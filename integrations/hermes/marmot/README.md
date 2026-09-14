@@ -93,6 +93,10 @@ pre-releases.
 
 Prerequisites:
 
+- The plugin and `wn-agent` are released as one cohort. Install both from the
+  same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
+  for older connectors. The former `stream_chunk_bytes` / `MARMOT_STREAM_CHUNK_BYTES`
+  setting is ignored; the connector now chunks live previews itself.
 - Hermes Agent **0.19.0 or newer** installed and working locally. The installer
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
@@ -596,7 +600,8 @@ not a disk-streaming or low-memory-mobile transfer mode.
   the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
   plain `send_final`.
-- Status records are included in the stream transcript hash and chunk count.
+- `stream_finish` sends the acknowledged final text. The shared Rust publisher
+  owns chunking and transcript hashing, including status and progress records.
 
 Run the shim tests with:
 

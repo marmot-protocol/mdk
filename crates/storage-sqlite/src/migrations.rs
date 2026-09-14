@@ -140,6 +140,8 @@ mod migration_0069_chat_readiness_index;
 mod migration_0070_forgotten_groups;
 #[path = "migrations/0071_group_reset_cutoff.rs"]
 mod migration_0071_group_reset_cutoff;
+#[path = "migrations/0072_chat_list_pages.rs"]
+mod migration_0072_chat_list_pages;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -512,6 +514,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 71,
         name: "0071_group_reset_cutoff",
         apply: migration_0071_group_reset_cutoff::apply,
+    },
+    Migration {
+        version: 72,
+        name: "0072_chat_list_pages",
+        apply: migration_0072_chat_list_pages::apply,
     },
 ];
 
@@ -1283,7 +1290,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 71,
+                found: 72,
                 latest_supported: 46,
             }
         ));
@@ -1339,7 +1346,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 71,
+                found: 72,
                 latest_supported: 46,
             }
         ));
@@ -1643,7 +1650,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 71,
+                found: 72,
                 latest_supported: 46,
             }
         ));

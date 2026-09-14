@@ -189,6 +189,7 @@ impl AgentConnector {
             | AgentControlRequest::InvitePolicyGet { .. } => Some("control_read"),
             AgentControlRequest::StreamBegin { .. }
             | AgentControlRequest::StreamFinalize { .. }
+            | AgentControlRequest::StreamFinish { .. }
             | AgentControlRequest::StreamCancel { .. } => Some("control_preview"),
             AgentControlRequest::SendFinal { .. }
             | AgentControlRequest::DeleteMessage { .. }
@@ -401,7 +402,8 @@ impl AgentConnector {
                 append_text,
                 idempotency_key,
             } => {
-                self.stream_append_response(
+                self.stream_record_response(
+                    marmot_app::AgentPublisherRecord::Text,
                     &stream_id_hex,
                     &stream_capability,
                     append_text,
@@ -415,7 +417,8 @@ impl AgentConnector {
                 status,
                 idempotency_key,
             } => {
-                self.stream_status_response(
+                self.stream_record_response(
+                    marmot_app::AgentPublisherRecord::Status,
                     &stream_id_hex,
                     &stream_capability,
                     status,
@@ -429,10 +432,25 @@ impl AgentConnector {
                 text,
                 idempotency_key,
             } => {
-                self.stream_progress_response(
+                self.stream_record_response(
+                    marmot_app::AgentPublisherRecord::Progress,
                     &stream_id_hex,
                     &stream_capability,
                     text,
+                    idempotency_key,
+                )
+                .await
+            }
+            AgentControlRequest::StreamFinish {
+                stream_id_hex,
+                stream_capability,
+                final_text,
+                idempotency_key,
+            } => {
+                self.stream_finish_response(
+                    &stream_id_hex,
+                    &stream_capability,
+                    final_text,
                     idempotency_key,
                 )
                 .await
@@ -459,7 +477,10 @@ impl AgentConnector {
                 stream_id_hex,
                 stream_capability,
                 ..
-            } => self.stream_cancel_response(&stream_id_hex, &stream_capability),
+            } => {
+                self.stream_cancel_response(&stream_id_hex, &stream_capability)
+                    .await
+            }
             AgentControlRequest::AccountCreate {
                 label,
                 publish_key_package,
