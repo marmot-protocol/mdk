@@ -989,6 +989,7 @@ async fn run_probe_child(database: &Path) {
             id: MessageId::new(QUEUED_INTENT_ID.to_vec()),
             group_id: group.clone(),
             intent: SendIntent::AppMessage {
+                expected_epoch: None,
                 group_id: group.clone(),
                 payload: app_payload_for(&carol, b"retained work"),
             },
@@ -1329,6 +1330,7 @@ async fn run_application_child(database: &Path) {
     let payload = app_payload_for(&alice, b"crash application");
     let sent = alice
         .send(SendIntent::AppMessage {
+            expected_epoch: None,
             group_id: group.clone(),
             payload,
         })

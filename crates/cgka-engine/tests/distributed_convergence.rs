@@ -11122,6 +11122,7 @@ async fn canonical_application_backlog_resumes_after_restart_in_bounded_turns_wi
         &group,
         b"send-during-application-drain",
         SendIntent::AppMessage {
+            expected_epoch: None,
             group_id: group.clone(),
             payload: app_payload_for(&carol, b"queued with backlog"),
         },

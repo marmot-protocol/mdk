@@ -657,6 +657,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
             id: MessageId::new(b"slice-retained-intent".to_vec()),
             group_id: group_id.clone(),
             intent: SendIntent::AppMessage {
+                expected_epoch: None,
                 group_id: group_id.clone(),
                 payload: b"retained".to_vec(),
             },
@@ -799,6 +800,7 @@ async fn resumable_public_background_advance_retains_progress_until_complete() {
                 id: MessageId::new(b"foreign-connection-work".to_vec()),
                 group_id: group_id.clone(),
                 intent: SendIntent::AppMessage {
+                    expected_epoch: None,
                     group_id: group_id.clone(),
                     payload: vec![0],
                 },
@@ -1140,6 +1142,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
         id: MessageId::new(b"retained-replay-work".to_vec()),
         group_id: group_id.clone(),
         intent: SendIntent::AppMessage {
+            expected_epoch: None,
             group_id: group_id.clone(),
             payload: b"retained".to_vec(),
         },

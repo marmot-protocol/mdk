@@ -35,12 +35,12 @@ Scenario report metadata records `execution_layout`; fixed journeys save
 `execution-layout.json`. Participant roots also contain a private `process.json` receipt.
 These are execution diagnostics, not protocol oracles.
 
-Catch-up remains serial by default. The experimental `MDK_APP_CATCH_UP_PARALLELISM=4`
+Catch-up remains serial by default. The opt-in `MDK_APP_CATCH_UP_PARALLELISM=8`
 switch runs distinct participants in bounded batches within one catch-up step; accepted values
 are 1–8 and `execution_layout.catch_up_parallelism` records the setting. Every started call in
 a batch is awaited before an ordinary app failure is returned. Scenario steps and assertions
-stay ordered, but participant interleaving changes. Treat this as an opt-in scheduling experiment
-until representative families and failure/cancellation paths have been validated.
+stay ordered, but participant interleaving changes. The seed-7 catalog evidence below uses 8;
+this does not change the default or establish exhaustive failure/cancellation coverage.
 
 ## Fixed journeys: 18 entrypoints
 

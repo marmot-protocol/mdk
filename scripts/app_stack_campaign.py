@@ -36,7 +36,7 @@ TEST_BINARIES = (
 )
 LEGACY_CONTROL_PACKAGES = ("cgka-engine", PACKAGE)
 # These tests exercise the app adapter together with its independent retained
-# engine control. Isolated participant-process/container campaigns stay separate.
+# engine control. Container and external-relay campaigns stay separate.
 APP_ROUTE_TESTS = {
     "four_party_cross_route_recovery_app_runtime_matches_unified_route",
 }
