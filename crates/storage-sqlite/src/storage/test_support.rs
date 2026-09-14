@@ -64,6 +64,7 @@ pub(crate) fn sample_queued_intent(id: MessageId, group_id: GroupId) -> QueuedOu
         intent: SendIntent::AppMessage {
             group_id,
             payload: b"queued".to_vec(),
+            expected_epoch: None,
         },
         created_at_ms: 42,
         reissue_attempts: 0,

@@ -60,10 +60,45 @@ pub(crate) fn private_parent_dir(path: &Path) -> Option<&Path> {
         .filter(|parent| !parent.as_os_str().is_empty())
 }
 
+/// Write a file inside the `wn` home layout. Every directory on the way to
+/// it is created if missing and tightened to `0700`: those directories are
+/// `wn`'s own, and their contents (databases, secrets, sockets, logs) must
+/// never be readable by other local users.
 pub(crate) fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     if let Some(parent) = private_parent_dir(path) {
         create_private_dir_all(parent)?;
     }
+    write_private_file_contents(path, bytes)
+}
+
+/// Write a caller-chosen output file — a decrypted download — with private
+/// mode, without touching directories that already exist. The destination is
+/// the caller's working directory or an `--output` directory of their
+/// choosing; a shared `0755` directory is theirs to keep shared, and one owned
+/// by another user cannot be chmod-ed at all. Only directories this call has
+/// to create are made `0700`; the file itself is always `0600`.
+pub(crate) fn write_private_output_file(
+    path: &Path,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    if let Some(parent) = private_parent_dir(path) {
+        create_missing_dirs_private(parent)?;
+    }
+    write_private_file_contents(path, bytes)
+}
+
+/// `create_dir_all` whose newly created directories are `0700`. Directories
+/// that already exist are left exactly as found: `DirBuilder::recursive` does
+/// not revisit them, so no existing mode is changed.
+fn create_missing_dirs_private(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, PRIVATE_DIR_MODE);
+    builder.create(path)
+}
+
+fn write_private_file_contents(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -2317,6 +2352,46 @@ mod tests {
         let nested = dir.path().join("nested").join("deep.bin");
         crate::write_private_file(&nested, b"ok").expect("nested path creates parents");
         assert!(nested.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_output_file_leaves_existing_directories_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+        // A download destination is the caller's directory, not wn's: a
+        // shared 0755 directory must stay 0755 after the file lands in it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let direct = shared.join("note.txt");
+        crate::write_private_output_file(&direct, b"ok").expect("download into existing dir");
+        assert_eq!(std::fs::read(&direct).unwrap(), b"ok");
+        assert_eq!(mode(&shared), 0o755, "existing parent must keep its mode");
+        assert_eq!(
+            mode(&direct),
+            0o600,
+            "the plaintext file itself stays private"
+        );
+
+        // Directories the download has to create are private; the existing
+        // ancestor above them is still untouched.
+        let nested = shared.join("a").join("b").join("note.txt");
+        crate::write_private_output_file(&nested, b"ok").expect("download creates missing dirs");
+        assert_eq!(mode(&shared), 0o755);
+        assert_eq!(mode(&shared.join("a")), 0o700);
+        assert_eq!(mode(&shared.join("a").join("b")), 0o700);
+        assert_eq!(mode(&nested), 0o600);
+
+        // The home-layout writer is the one that tightens: same shape, and the
+        // directory it created for the file is 0700.
+        let home_file = dir.path().join("home").join("state.json");
+        crate::write_private_file(&home_file, b"ok").expect("home write");
+        assert_eq!(mode(&dir.path().join("home")), 0o700);
     }
 
     #[test]

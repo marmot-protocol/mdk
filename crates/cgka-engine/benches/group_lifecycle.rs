@@ -650,7 +650,11 @@ fn bench_app_message_send(c: &mut Criterion) {
             || prepare_app_send(&rt),
             |(mut alice, group_id, payload)| {
                 let result = rt
-                    .block_on(alice.send(SendIntent::AppMessage { group_id, payload }))
+                    .block_on(alice.send(SendIntent::AppMessage {
+                        group_id,
+                        payload,
+                        expected_epoch: None,
+                    }))
                     .expect("app send succeeds");
                 assert!(matches!(result, SendResult::ApplicationMessage { .. }));
             },
@@ -875,6 +879,7 @@ fn assert_deferred_preflight_contract(
         .block_on(fixture.engine.send(SendIntent::AppMessage {
             group_id: fixture.group_id.clone(),
             payload,
+            expected_epoch: None,
         }))
         .expect("matrix probe send");
     if case.expects_queue() {
@@ -932,6 +937,7 @@ fn bench_deferred_outbound_preflight_matrix(c: &mut Criterion) {
                             rt.block_on(fixture.engine.send(SendIntent::AppMessage {
                                 group_id: fixture.group_id,
                                 payload,
+                                expected_epoch: None,
                             }))
                             .expect("matrix send")
                         },
@@ -964,6 +970,7 @@ fn prepare_app_ingest(
         .block_on(alice.send(SendIntent::AppMessage {
             group_id,
             payload: app_payload_for(&alice),
+            expected_epoch: None,
         }))
         .expect("app send succeeds");
     let SendResult::ApplicationMessage { msg, .. } = result else {

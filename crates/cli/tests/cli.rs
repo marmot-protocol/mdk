@@ -2158,6 +2158,11 @@ fn media_upload_and_download_round_trip_through_blossom() {
     // in the caller's working directory, not fail before the file is opened.
     let bare_dir = home.path().join("bare-output");
     std::fs::create_dir_all(&bare_dir).expect("bare output dir");
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&bare_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("shared output dir mode");
+    }
     let bare = run_json_in_dir(
         home.path(),
         &bare_dir,
@@ -2206,6 +2211,62 @@ fn media_upload_and_download_round_trip_through_blossom() {
             .is_some_and(|path| path.ends_with("note.txt")),
         "{dir_out}"
     );
+    // The destination is the caller's directory, not wn's: two downloads into
+    // a shared 0755 directory must not tighten it to 0700. Only the plaintext
+    // file itself is private.
+    #[cfg(unix)]
+    {
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode(&bare_dir),
+            0o755,
+            "an existing --output directory keeps its mode"
+        );
+        assert_eq!(mode(&bare_dir.join("bare-note.txt")), 0o600);
+        assert_eq!(mode(&bare_dir.join("note.txt")), 0o600);
+    }
+    // Without `--output` the file lands in the caller's current directory,
+    // which is likewise left exactly as found.
+    let default_dir = home.path().join("default-output");
+    std::fs::create_dir_all(&default_dir).expect("default output dir");
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&default_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("shared cwd mode");
+    }
+    let defaulted = run_json_in_dir(
+        home.path(),
+        &default_dir,
+        &["--account", &bob, "media", "download", group_id, &file_hash],
+    );
+    assert_eq!(
+        std::fs::read(default_dir.join("note.txt")).expect("default download"),
+        plaintext
+    );
+    assert!(
+        defaulted["output_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("note.txt")),
+        "{defaulted}"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&default_dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the caller's working directory keeps its mode"
+        );
+    }
 }
 
 #[test]

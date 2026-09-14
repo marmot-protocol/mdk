@@ -340,6 +340,7 @@ async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change(
         .send(SendIntent::AppMessage {
             group_id,
             payload: post_promotion_payload,
+            expected_epoch: None,
         })
         .await
         .expect("promotion preserves public session behavior");
@@ -396,6 +397,7 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&bob, b"invitee first message"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -473,6 +475,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello through session"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -537,6 +540,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&alice, b"hello after restart"),
+            expected_epoch: None,
         })
         .await
         .unwrap();
@@ -726,6 +730,7 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: app_payload_for(&bob, b"still leaving"),
+            expected_epoch: None,
         })
         .await;
     assert!(
@@ -818,6 +823,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
             payload: queued_payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();

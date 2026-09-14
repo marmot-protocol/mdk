@@ -476,10 +476,16 @@ reference before publication. The CLI reports that as `media_reference_stale_epo
 `current_epoch`; upload the file again with `media upload` after a commit has advanced the group and send that
 reference (`--send`, or its `media` object through `media send`). A plaintext hash given to `media send` or
 `media download` resolves to the newest projected reference carrying it, so once the re-upload has gone out the
-hash form sends the current-epoch copy rather than the stale one.
+hash form sends the current-epoch copy rather than the stale one. The send is pinned to the reference's epoch inside
+the engine as well: if the group's epoch moves during the send the result is the same `media_reference_stale_epoch`,
+and while the epoch is unsettled (a commit of yours still publishing, or peer commits not yet applied) the send is
+refused with `media_reference_epoch_unsettled` rather than queued, because a queued message would be encrypted under
+whatever epoch the group settles on. Sync and retry, or upload again if the epoch advanced.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
 decrypts it, and writes the plaintext file. `--output` is a file path, or an existing directory that receives the
-attachment's own file name; without it the file lands in the caller's current directory.
+attachment's own file name; without it the file lands in the caller's current directory. The plaintext file is
+written `0600`; directories that already exist keep their permissions, and only directories the download has to
+create are made private.
 
 File arguments are the caller's files. `media upload`, `media download --output`, `groups set-image`,
 `groups create --image`, and `groups download-image --output` resolve relative paths against the directory `wn` was

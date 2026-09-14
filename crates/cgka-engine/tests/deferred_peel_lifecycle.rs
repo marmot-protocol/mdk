@@ -516,6 +516,7 @@ async fn send_app(
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(engine, content),
+            expected_epoch: None,
         })
         .await
         .expect("send app");
@@ -1065,6 +1066,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "queued application"),
+                expected_epoch: None,
             })
             .await
             .unwrap();
@@ -1254,6 +1256,7 @@ async fn deferred_lifecycle_normalization_is_pending_not_budget_exhaustion() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "send after lifecycle normalization"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1313,6 +1316,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "later direct send"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1336,6 +1340,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "send after fresh row"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1390,6 +1395,7 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "restart queued"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),
@@ -1531,6 +1537,7 @@ async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload: app_payload_for(&carol, "queued during catch-up"),
+                expected_epoch: None,
             })
             .await
             .unwrap(),

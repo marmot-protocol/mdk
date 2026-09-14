@@ -1210,6 +1210,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::MediaReferenceStaleEpoch { .. } => {
             "read_marker_failed:media_reference_stale_epoch"
         }
+        AppError::MediaReferenceEpochUnsettled { .. } => {
+            "read_marker_failed:media_reference_epoch_unsettled"
+        }
         AppError::MediaAttachmentRejected(_) => "read_marker_failed:media_attachment_rejected",
         AppError::MediaUnfetchable(_) => "read_marker_failed:media_unfetchable",
         AppError::MediaDownloadFailed(_) => "read_marker_failed:media_download_failed",

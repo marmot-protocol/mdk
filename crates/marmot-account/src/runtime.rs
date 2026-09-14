@@ -5083,6 +5083,7 @@ mod tests {
         assert!(!supports_deferred_commit_publish(&SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: Vec::new(),
+            expected_epoch: None,
         }));
         assert!(!supports_deferred_commit_publish(&SendIntent::Leave {
             group_id: group_id.clone(),

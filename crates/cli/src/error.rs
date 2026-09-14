@@ -701,6 +701,17 @@ fn app_error_json(err: &AppError) -> Value {
                 "action": "wn media upload <group-hex> <file-path> [--send]",
             },
         }),
+        // Raised by the account worker when the group's epoch is mid-change: a
+        // commit this device staged awaits its publish outcome, or retained
+        // peer commits are not yet applied. Nothing was published.
+        AppError::MediaReferenceEpochUnsettled { source_epoch } => json!({
+            "code": "media_reference_epoch_unsettled",
+            "message": err.to_string(),
+            "source_epoch": source_epoch,
+            "repair": {
+                "action": "wn sync, then retry `wn media send`; if the group epoch advanced, `wn media upload <group-hex> <file-path> [--send]`",
+            },
+        }),
         AppError::InvalidAppMessagePayload(reason) => json!({
             "code": "invalid_app_message_payload",
             "message": err.to_string(),

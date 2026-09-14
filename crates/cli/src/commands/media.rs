@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::{
     CommandOutput, MediaCommand, WnError, ensure_local_signing, normalize_group_id_hex,
-    npub_for_account_id, resolve_account, terminal_safe_text, write_private_file,
+    npub_for_account_id, resolve_account, terminal_safe_text, write_private_output_file,
 };
 
 pub(crate) async fn media_command(
@@ -136,7 +136,7 @@ pub(crate) async fn media_command_with_runtime(
             let download = runtime
                 .download_media(&account.account_id_hex, &group_id, reference.clone())
                 .await?;
-            write_private_file(&output_path, &download.plaintext)?;
+            write_private_output_file(&output_path, &download.plaintext)?;
             Ok(CommandOutput {
                 plain: terminal_safe_text(&output_path.display().to_string()),
                 json: json!({

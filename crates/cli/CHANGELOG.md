@@ -49,6 +49,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   (`source_epoch`, `current_epoch`) instead of publishing ciphertext recipients could not decrypt. A plaintext hash
   resolves to the newest projected reference carrying it (`media send` and `media download`), so after the same file
   is uploaded and sent again under the new epoch, the hash form sends that copy instead of re-binding the stale one.
+  The pre-check is the early answer; the binding one is an epoch pin the runtime puts on the send, which the engine
+  enforces at encryption time (see Changed).
   `wn media set-endpoints <group-hex> <url> [...]` replaces the group's encrypted-media default blob endpoints
   through `replace_encrypted_media_blob_endpoints`.
 - `wn media download --output` and `wn groups download-image --output` accept an existing directory as well as a
@@ -82,6 +84,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   `imeta` tag carries no epoch, so recipients derive the media key from the delivering message's epoch; a stale
   reference would have published fine and then failed to decrypt everywhere. Upload the file again after a commit
   advances the group.
+- Media sends are pinned to the reference's epoch all the way into the engine: `SendIntent::AppMessage` gained an
+  optional `expected_epoch`, which the engine checks against the loaded MLS state immediately before encryption —
+  after any retained peer commits the send folded first — and which keeps the message out of the durable retention
+  queue while the group's epoch is unsettled (a staged local publish awaiting its outcome, or convergence input not
+  yet applied). Previously the epoch comparison ran once at the runtime boundary, and the engine could then
+  legitimately advance the epoch or park the message and encrypt the unchanged `imeta` payload at a later epoch,
+  publishing an attachment no recipient could decrypt. A fold reports `media_reference_stale_epoch` with both epochs;
+  an unsettled epoch reports the new `media_reference_epoch_unsettled` (`source_epoch`; sync and retry, or upload
+  again if the epoch advanced). Both surface as `InvalidMediaReference` in MarmotKit. The pin also covers
+  `wn media upload --send`, whose upload and send straddle an HTTP round-trip. Unpinned messages keep today's
+  retention and drain-time re-encryption. Persisted intents without the field deserialize as unpinned.
 - `wn messages delete` help now describes what the handler does: it publishes an authenticated kind-5 delete
   tombstone to the group, which is a group-visible deletion request rather than a local-view change or secure
   erasure.
@@ -158,6 +171,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
+  directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran
+  the wn-home directory helper against that directory and chmod-ed it to `0700`, removing other users' access to a
+  shared `0755` directory (or failing outright in a directory owned by someone else, such as `/tmp`). Downloads now
+  leave existing directories exactly as found, create only missing directories privately, and still write the
+  plaintext file `0600`. Covered by a unit test on the writer and the CLI end-to-end default, bare, and directory
+  output downloads, which assert the parent's mode is unchanged.
 - Foreground recovery services commands between group passes without starving due
   convergence under a busy command queue; unchanged group subscriptions stay in place.
 - Unchanged push registrations retain their gossip progress.

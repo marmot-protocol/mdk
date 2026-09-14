@@ -353,6 +353,11 @@ impl From<AppError> for MarmotKitError {
             stale @ AppError::MediaReferenceStaleEpoch { .. } => Self::InvalidMediaReference {
                 details: stale.to_string(),
             },
+            unsettled @ AppError::MediaReferenceEpochUnsettled { .. } => {
+                Self::InvalidMediaReference {
+                    details: unsettled.to_string(),
+                }
+            }
             AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
                 kind: rejection.kind.into(),
                 details: rejection.detail,

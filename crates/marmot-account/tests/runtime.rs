@@ -2286,6 +2286,7 @@ async fn post_join_rotation_does_not_block_application_send_and_returns_disposit
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload: app_payload_for(&alice_hex, b"send while rotation is pending"),
+            expected_epoch: None,
         })
         .await
         .expect("post-join maintenance must not block application sends");
@@ -3833,6 +3834,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
+            expected_epoch: None,
         })
         .await
         .unwrap();

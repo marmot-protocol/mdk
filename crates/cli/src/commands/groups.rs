@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use crate::{
     CommandOutput, GroupCommand, GroupsCommand, MaintenancePolicySetting, WnError,
     ensure_local_signing, group_json, group_list_plain, group_show_output, normalize_group_id_hex,
-    npub_for_account_id, parse_public_key, resolve_account, terminal_safe_text, write_private_file,
+    npub_for_account_id, parse_public_key, resolve_account, terminal_safe_text,
+    write_private_output_file,
 };
 
 async fn accept_group_invite_retrying_busy(
@@ -1165,7 +1166,7 @@ pub(crate) async fn groups_command_with_runtime(
                 Some(output) => PathBuf::from(output),
                 None => PathBuf::from(default_name),
             };
-            write_private_file(&output_path, &bytes)?;
+            write_private_output_file(&output_path, &bytes)?;
             Ok(CommandOutput {
                 plain: terminal_safe_text(&output_path.display().to_string()),
                 json: json!({
