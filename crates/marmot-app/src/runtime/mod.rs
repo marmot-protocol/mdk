@@ -64,7 +64,12 @@ mod agent_stream_watch;
 pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
+mod account_attention;
 mod audit_tracker;
+pub use account_attention::{
+    AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
+    AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
+};
 mod chat_list_window;
 mod commands;
 mod event_routing;
@@ -5453,6 +5458,8 @@ impl AccountManager {
         } else {
             accounts.remove(account_id_hex);
         }
+        drop(accounts);
+        self.app.presentation_signals.catalog_changed();
     }
 
     fn account_is_tearing_down(&self, account_id_hex: &str) -> bool {
@@ -5715,6 +5722,7 @@ impl AccountManager {
     }
 
     async fn reconcile_locked(&self) -> Result<(), AppError> {
+        self.app.presentation_signals.catalog_changed();
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
@@ -6147,6 +6155,7 @@ impl AccountManager {
             crate::ProductUnit::Attempt,
         );
         let result = self.create_or_import_account_unobserved(request).await;
+        self.app.presentation_signals.catalog_changed();
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
         }
@@ -6296,6 +6305,7 @@ impl AccountManager {
                         .app
                         .account_home()
                         .set_account_signed_out(&account.label, false)?;
+                    self.app.presentation_signals.catalog_changed();
                 }
                 let publication = self.publish_initial_key_package_for_account(&account).await;
                 match publication {
@@ -6350,6 +6360,7 @@ impl AccountManager {
                 .app
                 .account_home()
                 .set_account_signed_out(&account.label, false)?;
+            self.app.presentation_signals.catalog_changed();
         }
         self.reconcile().await?;
         self.app
@@ -6401,6 +6412,7 @@ impl AccountManager {
         let result = self
             .login_external_signer_unobserved(public_key, signer, request)
             .await;
+        self.app.presentation_signals.catalog_changed();
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
         }
@@ -6440,6 +6452,7 @@ impl AccountManager {
             .app
             .account_home()
             .add_external_signer_account(&public_key)?;
+        self.app.presentation_signals.catalog_changed();
         let reactivating_existing = account.signed_out;
         if let Err(err) = self
             .app
@@ -6509,6 +6522,7 @@ impl AccountManager {
                     .app
                     .account_home()
                     .set_account_signed_out(&account.label, false)?;
+                self.app.presentation_signals.catalog_changed();
             }
             self.app.account_home().set_account_setup_phase(
                 &account.label,
@@ -6557,6 +6571,7 @@ impl AccountManager {
                 .app
                 .account_home()
                 .set_account_signed_out(&account.label, false)?;
+            self.app.presentation_signals.catalog_changed();
         }
         self.reconcile().await?;
         self.app
@@ -7030,6 +7045,15 @@ impl AccountManager {
     }
 
     fn create_nostr_account_from_setup(
+        &self,
+        request: &AccountSetupRequest,
+    ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
+        let result = self.create_nostr_account_from_setup_inner(request);
+        self.app.presentation_signals.catalog_changed();
+        result
+    }
+
+    fn create_nostr_account_from_setup_inner(
         &self,
         request: &AccountSetupRequest,
     ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {

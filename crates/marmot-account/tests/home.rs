@@ -320,6 +320,10 @@ fn account_home_accounts_skips_unreadable_records() {
 
     assert_eq!(home.accounts().unwrap(), vec![good]);
     assert!(matches!(
+        home.accounts_strict(),
+        Err(AccountHomeError::Json(_))
+    ));
+    assert!(matches!(
         home.account(&corrupted.label),
         Err(AccountHomeError::Json(_))
     ));

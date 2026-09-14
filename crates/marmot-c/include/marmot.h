@@ -1018,16 +1018,16 @@ typedef struct MarmotAccountSummaryList {
 typedef struct MarmotAccountUnread {
   char *account_id_hex;
   /**
-   * Total unread messages across all unarchived conversations.
+   * Unread messages in eligible active, accepted, unarchived conversations.
    */
   uint64_t unread_count;
   /**
-   * Number of unarchived conversations that require badge attention.
+   * Number of eligible conversations that require badge attention.
    */
   uint64_t unread_conversations;
   /**
    * Conversations with badge attention solely from a manual-unread
-   * reminder or pending invitation (no unread messages).
+   * reminder (no unread messages). Pending invitations are excluded.
    */
   uint64_t attention_only_conversations;
   /**

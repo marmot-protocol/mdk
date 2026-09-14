@@ -20076,7 +20076,7 @@ fn pending_group_invites_skips_malformed_rows() {
 #[test]
 fn account_unread_summary_includes_badge_attention_without_session_load() {
     // mdk#1460: one cheap summary must return unread totals plus
-    // attention-only rows (pending invites / manual unread) for accounts that
+    // attention-only rows (manual unread, excluding pending invites) for accounts that
     // have never been started.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -20181,8 +20181,8 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
         .find(|summary| summary.account_id_hex == alice.account_id_hex)
         .expect("seeded account");
     assert_eq!(summary.unread_count, 1);
-    assert_eq!(summary.unread_conversations, 3);
-    assert_eq!(summary.attention_only_conversations, 2);
+    assert_eq!(summary.unread_conversations, 2);
+    assert_eq!(summary.attention_only_conversations, 1);
     assert!(summary.has_unread);
 }
 

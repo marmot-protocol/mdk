@@ -1,3 +1,4 @@
+mod attention;
 mod pages;
 mod window;
 use crate::account_projection::chat_mute_is_effective;
@@ -11,6 +12,7 @@ use crate::{
     SelfMembership, SqliteAccountStorage, SqliteResultExt, StoredAccountState, bool_i64,
     i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
+pub use attention::AccountAttentionTotal;
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED, GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -63,13 +65,13 @@ pub type MentionClassifier<'a> = dyn Fn(&str, &[Vec<String>]) -> bool + 'a;
 /// list would show.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountUnreadTotal {
-    /// Sum of `unread_count` across all unarchived conversations.
+    /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations that require badge attention:
-    /// unread messages, a manual-unread reminder, or a pending invitation.
+    /// Number of eligible conversations that require badge attention:
+    /// unread messages, or an independent manual-unread reminder.
     pub unread_conversations: u64,
     /// Unarchived conversations that contribute badge attention solely because
-    /// they are manually marked unread or pending confirmation. A row that
+    /// they are manually marked unread. A row that
     /// already has `unread_count > 0` is omitted so
     /// `unread_count + attention_only_conversations` is the application badge.
     pub attention_only_conversations: u64,
@@ -77,7 +79,7 @@ pub struct AccountUnreadTotal {
 
 impl AccountUnreadTotal {
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder or pending invitation with no unread incoming
+    /// manual-only reminder with no unread incoming
     /// messages.
     pub fn has_unread(&self) -> bool {
         self.unread_conversations > 0
@@ -616,59 +618,20 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Cheap unread aggregate over the materialized `chat_list_rows`
-    /// projection. Reads only the projection table (a single grouped
-    /// `COUNT`/`SUM`), so it does not materialize timelines or load a session.
-    /// Archived conversations are excluded. Groups the local account is no
-    /// longer in — `account_groups.self_membership` of `'left'` or `'removed'`
-    /// — are also excluded; unknown membership (`'member'`, the default, or no
-    /// matching `account_groups` row) preserves the unread count so uncertainty
-    /// never suppresses. Pending invitations and manual-only unread rows count
-    /// as badge attention; a row with unread messages is not counted again in
-    /// `attention_only_conversations`.
+    /// Unread aggregate over the same durable eligibility keys as `ChatListView::Unread`.
+    /// Excludes invitations, archived chats and departed or departing groups.
+    /// Manual-only reminders contribute attention without adding message counts.
+    /// This legacy getter assumes base rows are ready; `account_attention_total`
+    /// reports missing base rows explicitly. Neither getter materializes timelines.
     pub fn account_unread_total(&self) -> StorageResult<AccountUnreadTotal> {
-        let conn = self.lock()?;
-        conn.query_row_cached(
-            "SELECT COALESCE(SUM(row.unread_count), 0),
-                    COUNT(CASE
-                        WHEN row.unread_count > 0
-                          OR row.manually_marked_unread = 1
-                          OR row.pending_confirmation = 1
-                        THEN 1
-                    END),
-                    COUNT(CASE
-                        WHEN row.unread_count = 0
-                         AND (row.manually_marked_unread = 1
-                           OR row.pending_confirmation = 1)
-                        THEN 1
-                    END)
-             FROM chat_list_rows AS row
-             LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
-             WHERE row.archived = 0
-               AND COALESCE(ag.self_membership, 'member') NOT IN ('left', 'removed')
-               AND NOT EXISTS (
-                   SELECT 1 FROM cgka_disband_tombstones AS tomb
-                   WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
-               )",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .storage()
-        .and_then(
-            |(unread_count, unread_conversations, attention_only_conversations)| {
-                Ok(AccountUnreadTotal {
-                    unread_count: i64_to_u64(unread_count)?,
-                    unread_conversations: i64_to_u64(unread_conversations)?,
-                    attention_only_conversations: i64_to_u64(attention_only_conversations)?,
-                })
-            },
-        )
+        // Preserve this narrow method's legacy readiness behavior. The new
+        // screen summary rejects incomplete base rows explicitly.
+        let (_, total) = self.account_attention_totals_with_readiness()?;
+        Ok(AccountUnreadTotal {
+            unread_count: total.unread_count,
+            unread_conversations: total.unread_conversations,
+            attention_only_conversations: total.attention_only_conversations,
+        })
     }
 
     pub fn ensure_chat_list_rows(

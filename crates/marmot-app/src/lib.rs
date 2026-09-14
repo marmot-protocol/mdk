@@ -119,16 +119,18 @@ pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
-    AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult, AgentPublisher,
-    AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting, AgentStreamWatchOptions,
-    AgentTextStreamCryptoContext, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
-    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
-    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,
-    OnboardingOptions, OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot,
-    OnboardingStatus, OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
-    RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
-    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
-    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
+    AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
+    AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
+    AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
+    CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
+    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery,
+    OnboardingDevicePackage, OnboardingFinding, OnboardingIssue, OnboardingOptions,
+    OnboardingRepairProposal, OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus,
+    OnboardingStep, OnboardingStepState, OnboardingSubscription, RelayFailure,
+    RuntimeAccountAttentionSubscription, RuntimeAccountError, RuntimeAgentStreamMessage,
+    RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
+    RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
     RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
     RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
     RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
@@ -1094,19 +1096,19 @@ pub(crate) struct KeyPackageDeletionResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountUnread {
     pub account_id_hex: String,
-    /// Total unread messages across all unarchived conversations.
+    /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations that require badge attention:
-    /// unread messages, a manual-unread reminder, or a pending invitation.
+    /// Number of eligible conversations that require badge attention:
+    /// unread messages or an independent manual-unread reminder.
     pub unread_conversations: u64,
     /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread or pending confirmation. A row that already has
+    /// manually marked unread. A row that already has
     /// unread messages is omitted so hosts can compute
     /// `unread_count + attention_only_conversations` without overlap.
     #[serde(default)]
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder or pending invitation with no unread messages.
+    /// manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 
@@ -2556,8 +2558,8 @@ impl MarmotApp {
     /// materialized `chat_list_rows` projection (a single grouped
     /// `COUNT`/`SUM`), so this does not require switching into, or loading a
     /// full session/timeline for, any account — non-active accounts are
-    /// reported too. `attention_only_conversations` covers pending invitations
-    /// and manual-only unread rows without overlapping unread-message totals.
+    /// reported too. Pending invitations are excluded. `attention_only_conversations`
+    /// covers manual-only unread rows without overlapping unread-message totals.
     ///
     /// Only local-signing accounts are reported (matching `managed_accounts`).
     /// The chat-list projection is built from the on-disk store if missing;
@@ -5110,6 +5112,7 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;
 

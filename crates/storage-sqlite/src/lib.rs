@@ -34,10 +34,10 @@ pub use account_projection::{
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use chat_list::{
-    AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
-    ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview, ChatListPage,
-    ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery, ChatListRow,
-    ChatListView, ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
+    AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
+    ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
+    ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
+    ChatListRow, ChatListView, ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
     ExistingDirectConversation, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{

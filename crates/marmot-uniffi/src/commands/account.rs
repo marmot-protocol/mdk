@@ -40,10 +40,11 @@ impl Marmot {
     /// badge (mdk#461, mdk#1460). Each entry is read from that account's
     /// materialized chat-list projection, so this does not require switching
     /// into, or loading a full session/timeline for, any account — non-active
-    /// (not-`running`) accounts are reported too. Sign-capable local and
-    /// external-signer accounts are included, matching `list_accounts`.
-    /// `attention_only_conversations` covers pending invitations and
-    /// manual-only unread rows without overlapping unread-message totals.
+    /// (not-`running`) local-signing accounts are reported too. This legacy
+    /// getter omits accounts whose projection read fails.
+    /// `attention_only_conversations` covers manual-only unread rows without
+    /// overlapping unread-message totals. Pending invitations, archived chats
+    /// and departed or departing groups do not contribute attention.
     pub fn account_unread_summary(
         &self,
     ) -> Result<Vec<conversions::AccountUnreadFfi>, MarmotKitError> {

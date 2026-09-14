@@ -31,12 +31,12 @@ c_mirror! {
     MarmotAccountUnread from AccountUnreadFfi,
     list(MarmotAccountUnreadList, marmot_account_unread_list_free) {
         str account_id_hex,
-        /// Total unread messages across all unarchived conversations.
+        /// Unread messages in eligible active, accepted, unarchived conversations.
         copy unread_count: u64,
-        /// Number of unarchived conversations that require badge attention.
+        /// Number of eligible conversations that require badge attention.
         copy unread_conversations: u64,
         /// Conversations with badge attention solely from a manual-unread
-        /// reminder or pending invitation (no unread messages).
+        /// reminder (no unread messages). Pending invitations are excluded.
         copy attention_only_conversations: u64,
         /// Whether the account has any badge-worthy conversation.
         copy has_unread: bool,

@@ -22,8 +22,10 @@ status: overview
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
-archive; successful rejoin restores departed conversations. Independent attention summaries and native window
-bindings remain C4 M3/M4. See [bounded live chat-list windows](../further-context/chat-list-windows.md).
+archive; successful rejoin restores departed conversations. Independent live account attention reuses the Unread
+eligibility keys, reports unavailable accounts explicitly, and refreshes affected accounts without opening lists.
+Native bindings remain C4 M4. See [bounded live chat-list windows](../further-context/chat-list-windows.md)
+and [independent account attention](../further-context/account-attention.md).
 
 Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
 it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined

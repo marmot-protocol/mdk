@@ -13,6 +13,7 @@ pub(crate) struct PresentationSignals {
     /// Shared profile commits also affect preview sender names outside peer selection.
     pub(crate) profile_updates: broadcast::Sender<String>,
     wakeups: watch::Sender<()>,
+    catalog: watch::Sender<()>,
     pub(crate) updates: broadcast::Sender<PresentationInvalidation>,
 }
 impl Default for PresentationSignals {
@@ -21,11 +22,19 @@ impl Default for PresentationSignals {
             account_resets: broadcast::channel(64).0,
             profile_updates: broadcast::channel(64).0,
             wakeups: watch::channel(()).0,
+            catalog: watch::channel(()).0,
             updates: broadcast::channel(64).0,
         }
     }
 }
 impl PresentationSignals {
+    pub(crate) fn catalog_changed(&self) {
+        self.catalog.send_modify(|_| {});
+    }
+    pub(crate) fn subscribe_catalog(&self) -> watch::Receiver<()> {
+        self.catalog.subscribe()
+    }
+
     pub(crate) fn wake(&self) {
         self.wakeups.send_modify(|_| {});
     }

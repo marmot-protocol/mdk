@@ -1203,3 +1203,95 @@ fn authoritative_self_arrival_restores_departed_archive_once_and_preserves_ordin
     assert!(!store.restore_group_self_membership("01").unwrap());
     assert_eq!(ids(&page(&store, ChatListView::Archived)), ["01", "03"]);
 }
+
+#[test]
+fn account_attention_matches_unread_predicates_and_preserves_manual_and_mute_policy() {
+    for archived in [false, true] {
+        for pending in [false, true] {
+            for membership in ["member", "left", "removed"] {
+                for unread in [0, 3] {
+                    for manual in [false, true] {
+                        let store = SqliteAccountStorage::in_memory().unwrap();
+                        seed(&store, "01", archived, membership, unread, pending);
+                        store.lock().unwrap().execute("UPDATE chat_list_rows SET manually_marked_unread=?1 WHERE group_id_hex='01'", [manual]).unwrap();
+                        store.lock().unwrap().execute("UPDATE account_groups SET pending_confirmation=?1 WHERE group_id_hex='01'",[pending]).unwrap();
+                        store.lock().unwrap().execute("UPDATE chat_list_rows SET unread_mention_count=?1 WHERE group_id_hex='01'",[if unread>0 {2} else {0}]).unwrap();
+                        store
+                            .set_chat_muted("01", Some(crate::unix_now_ms() + 100000))
+                            .unwrap();
+                        let total = store.account_attention_total().unwrap();
+                        let rows = page(&store, ChatListView::Unread).rows;
+                        assert_eq!(total.unread_conversations, rows.len() as u64);
+                        let eligible = !archived
+                            && !pending
+                            && membership == "member"
+                            && (unread > 0 || manual);
+                        assert_eq!(total.has_unread(), eligible);
+                        assert_eq!(total.unread_count, if eligible { unread as u64 } else { 0 });
+                        assert_eq!(
+                            total.unread_mention_count,
+                            if eligible && unread > 0 { 2 } else { 0 }
+                        );
+                        assert_eq!(
+                            total.attention_only_conversations,
+                            u64::from(eligible && unread == 0)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn account_attention_tracks_queued_departure_cancellation_and_caller_rollback() {
+    use cgka_traits::storage::{StorageError, StorageProvider};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "01", false, "member", 3, false);
+    let group = engine_group(&store, "01");
+    let baseline = store.account_attention_total().unwrap();
+    let result = store.with_transaction(|s| -> Result<(), StorageError> {
+        s.put_leave_request(&LeaveRequest {
+            group_id: group.clone(),
+            requested_at_ms: 123,
+            last_proposed_epoch: None,
+        })?;
+        assert!(!s.account_attention_total()?.has_unread());
+        Err(StorageError::NotFound)
+    });
+    assert!(result.is_err());
+    assert_eq!(store.account_attention_total().unwrap(), baseline);
+    let mut request = DisbandRequest {
+        group_id: group.clone(),
+        requested_at_ms: 123,
+        status: DisbandRequestStatus::Pending,
+        last_prepared_epoch: None,
+    };
+    store.put_disband_request(&request).unwrap();
+    assert!(!store.account_attention_total().unwrap().has_unread());
+    request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
+    store.put_disband_request(&request).unwrap();
+    assert_eq!(store.account_attention_total().unwrap(), baseline);
+}
+
+#[test]
+fn account_attention_query_work_is_independent_of_retained_history_and_skips_quiet_rows() {
+    use crate::query_work_test_support::measure;
+    let mut work = vec![];
+    for count in [20, 4096] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.lock().unwrap().execute_batch(&format!("CREATE TEMP TABLE numbers(x INTEGER PRIMARY KEY);
+            WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{count}) INSERT INTO numbers SELECT x FROM n;
+            INSERT INTO account_groups(group_id_hex,endpoint,updated_at) SELECT printf('%032x',x),'',0 FROM numbers;
+            INSERT INTO chat_list_rows(group_id_hex,updated_at,unread_count) SELECT printf('%032x',x),0,CASE WHEN x<=2 THEN 3 ELSE 0 END FROM numbers;
+            WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+            INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+                SELECT printf('%032x',1),printf('%064x',x),'received','sender','large retained history',9,'[]',x,x FROM n;")).unwrap();
+        let (total, steps) = measure(&store, || store.account_attention_total().unwrap());
+        assert_eq!(total.unread_count, 6);
+        assert_eq!(total.unread_conversations, 2);
+        assert!(steps < 500, "summary must use unread index; steps={steps}");
+        work.push(steps);
+    }
+    assert!(work[0].abs_diff(work[1]) < 100);
+}

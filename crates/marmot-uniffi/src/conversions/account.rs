@@ -51,18 +51,18 @@ pub struct IdentityCreationResultFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountUnreadFfi {
     pub account_id_hex: String,
-    /// Total unread messages across all unarchived conversations.
+    /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
-    /// Number of unarchived conversations that require badge attention:
-    /// unread messages, a manual-unread reminder, or a pending invitation.
+    /// Number of eligible conversations with unread messages or a manual reminder.
+    /// Pending invitations and queued departures are excluded.
     pub unread_conversations: u64,
     /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread or pending confirmation. A row that already has
+    /// manually marked unread. A row that already has
     /// unread messages is omitted so hosts can compute
     /// `unread_count + attention_only_conversations` without overlap.
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder or pending invitation with no unread messages.
+    /// manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 
