@@ -7897,6 +7897,12 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         original_due = adapter._inbound_spool.due
         failed_once = asyncio.Event()
         loop = asyncio.get_running_loop()
+        handed_off = asyncio.Event()
+        original_handle = adapter.handle_message
+        async def observed_handle(message):
+            await original_handle(message)
+            handed_off.set()
+        adapter.handle_message = observed_handle
 
         def flaky_due(*, now=None):
             if not failed_once.is_set():
@@ -7910,19 +7916,20 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
         try:
             adapter._inbound_spool_wakeup.set()
-            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            await asyncio.wait_for(failed_once.wait(), timeout=5)
             self.assertFalse(retry.done())
             adapter._inbound_spool_wakeup.set()
-            for _ in range(150):
-                if adapter.events:
-                    break
-                await asyncio.sleep(0.01)
+            # Recovery intentionally sleeps one second after the injected
+            # fault, then performs durable admission and ambient lookup. Wait
+            # for the actual handoff instead of a 1.5-second polling budget.
+            await asyncio.wait_for(handed_off.wait(), timeout=5)
+            await adapter._inbound_queue.join()
             self.assertEqual([item.text for item in adapter.events], ["durable"])
             self.assertFalse(retry.done())
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+            await adapter.disconnect()
 
     async def test_cancel_after_handoff_preserves_cancellation_and_recovers_unresolved(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
