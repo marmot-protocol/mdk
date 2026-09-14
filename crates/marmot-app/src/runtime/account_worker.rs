@@ -1758,9 +1758,9 @@ async fn run_app_runtime_account_worker(
 
 /// Run a steady-state catch-up while preserving prompt read-only projection
 /// access. The sync future exclusively borrows the live client, so reads that
-/// arrive before another state-changing command are answered from a snapshot
-/// captured immediately before the sync. Once a non-read command is deferred,
-/// later reads remain behind it to preserve worker FIFO semantics.
+/// arrive during sync are answered from a snapshot captured immediately before
+/// it, including when mutations are deferred. Mutations retain FIFO order;
+/// reads observe pre-sync state until the window ends.
 /// Additional catch-up requests received before such a command coalesce onto
 /// the in-flight sync.
 struct AccountWorkerCatchUpContext<'a> {
@@ -1820,7 +1820,7 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
-            let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
+            let snapshot_reads_available = read_snapshot.is_some();
             match command {
                 AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
                     let snapshot = read_snapshot
@@ -2621,10 +2621,9 @@ fn capture_group_read_snapshot(
 }
 
 /// Serve safe snapshot reads while `work` exclusively borrows the live client.
-/// Mutations stay queued FIFO behind `work`; once a mutation is deferred,
-/// later reads wait with it. Worker-owned catch-up is remembered without
-/// poisoning those reads, because create/invite spawn it immediately after
-/// the caller-visible reply.
+/// Mutations stay queued FIFO behind `work`; reads continue observing the
+/// snapshot until it completes. Worker-owned catch-up runs afterward because
+/// create/invite spawn it immediately after the caller-visible reply.
 async fn serve_snapshot_reads_until<Fut>(
     read_snapshot: Option<crate::client::GroupReadSnapshot>,
     work: Fut,
@@ -2658,7 +2657,7 @@ where
         let Some(command) = command else {
             continue;
         };
-        let snapshot_reads_available = read_snapshot.is_some() && deferred.is_empty();
+        let snapshot_reads_available = read_snapshot.is_some();
         match command {
             AccountWorkerCommand::Members { group_id, respond } if snapshot_reads_available => {
                 let snapshot = read_snapshot
@@ -5252,6 +5251,59 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    #[tokio::test]
+    async fn reads_bypass_deferred_work() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = app.client("alice").await.unwrap();
+        let snapshot = client.group_read_snapshot().unwrap();
+        let (commands, mut receiver) = mpsc::channel(8);
+        let (respond, mut mutation) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
+            .unwrap();
+        let (respond, read) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        let (release, work) = oneshot::channel::<()>();
+        let mut pending = VecDeque::new();
+        let serve = serve_snapshot_reads_until(
+            Some(snapshot),
+            work,
+            &mut receiver,
+            &mut pending,
+            &app,
+            "alice",
+        );
+        let check = async {
+            assert!(
+                timeout(Duration::from_secs(1), read)
+                    .await
+                    .expect("snapshot read must finish while work is held")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                mutation.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(serve, check);
+        result.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::ConnectivityRestored { .. })
+        ));
     }
 
     #[tokio::test]
