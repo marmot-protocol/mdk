@@ -271,7 +271,7 @@ jobs:
         run: |
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           python3 scripts/app_stack_campaign.py target/app-weekly-catalog \
-            --generated-only --mode full --seeds 7 --jobs 1
+            --generated-only --mode full --seeds 7 --jobs 1 --budget-secs 8400
 
       - name: Upload app catalog evidence
         if: always()

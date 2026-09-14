@@ -79,6 +79,8 @@ def parse_args(argv=None):
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=2)
     parser.add_argument("--generated-only", action="store_true",
                         help="run only the generated catalog, excluding fixed journeys and diagnostics")
+    parser.add_argument("--budget-secs", type=positive,
+                        help="total build/run wall-clock budget; reserve external time for cleanup/upload")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="record a WIP patch and untracked file hashes for local validation")
     parser.add_argument("--plan-only", action="store_true", help="print selection without building or writing")
@@ -118,12 +120,21 @@ def source_state():
     }
 
 
+def remaining_timeout(timeout, deadline):
+    """Clamp a command allowance to the shared monotonic campaign deadline."""
+    return timeout if deadline is None else max(0, min(timeout, deadline - time.monotonic()))
+
+
 def run_command(command, root, env, timeout):
     """Reap a whole process group on timeout/interruption, including case workers."""
     started = time.monotonic()
     if STOPPING:
         raise RuntimeError("campaign interrupted")
     with (root / "output.log").open("wb") as log:
+        if timeout <= 0:
+            log.write(b"Not started: campaign deadline exhausted.\n")
+            return {"exit_code": None, "timed_out": True, "started": False,
+                    "not_run_reason": "campaign_deadline", "wall_seconds": 0}
         process = subprocess.Popen(command, cwd=REPO, env=env, stdout=log,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         ACTIVE[process.pid] = process
@@ -145,7 +156,7 @@ def run_command(command, root, env, timeout):
             raise
         finally:
             ACTIVE.pop(process.pid, None)
-    return {"exit_code": code, "timed_out": timed_out,
+    return {"exit_code": code, "timed_out": timed_out, "started": True,
             "wall_seconds": time.monotonic() - started}
 
 
@@ -177,7 +188,7 @@ def build_profiles():
     }
 
 
-def build(root, env, generated_only=False):
+def build(root, env, generated_only=False, deadline=None):
     executables = {}
     selected_targets = (
         {"cgka-conformance-campaign", "cgka-conformance-node"},
@@ -188,7 +199,8 @@ def build(root, env, generated_only=False):
         directory = root / f"build-{index}"
         directory.mkdir(mode=0o700)
         write_json(directory / "command.json", command)
-        result = run_command(command, directory, env, 1800)
+        result = run_command(command, directory, env, remaining_timeout(1800, deadline))
+        write_json(directory / "result.json", result)
         if result["exit_code"] != 0:
             raise RuntimeError(f"build failed: {directory / 'output.log'}")
         for line in (directory / "output.log").read_text().splitlines():
@@ -216,9 +228,9 @@ def build(root, env, generated_only=False):
     return executables
 
 
-def test_names(executable, env):
+def test_names(executable, env, deadline=None):
     output = subprocess.check_output([executable, "--list", "--format=terse"],
-                                     cwd=REPO, env=env, text=True, timeout=60)
+                                     cwd=REPO, env=env, text=True, timeout=remaining_timeout(60, deadline))
     names = [line.removesuffix(": test") for line in output.splitlines() if line.endswith(": test")]
     if not names:
         raise RuntimeError(f"no tests discovered in {executable}")
@@ -274,7 +286,7 @@ def inspect_generated(task, root):
     return errors
 
 
-def execute(task, root, env):
+def execute(task, root, env, deadline=None):
     directory = root / task["id"]
     directory.mkdir(mode=0o700, parents=True)
     command = list(task["command"])
@@ -289,7 +301,11 @@ def execute(task, root, env):
     write_json(directory / "command.json", command)
     cleanup_error = None
     try:
-        result = dict(task, **run_command(command, directory, task_env, task["timeout"]))
+        allowed = remaining_timeout(task["timeout"], deadline)
+        result = dict(task, **run_command(command, directory, task_env, allowed))
+        result["effective_timeout_seconds"] = allowed
+        if result["timed_out"]:
+            result["timeout_scope"] = "campaign" if allowed < task["timeout"] else "task"
         result["command"] = command
     finally:
         # The parent/group has been reaped before removing participant stores.
@@ -334,10 +350,56 @@ def execution_batches(tasks, jobs):
     return [(ordinary, jobs)] + [([task], 1) for task in exclusive]
 
 
+def record_not_run(task, root, reason):
+    """Retain planned selections without presenting unexecuted work as passes."""
+    directory = root / task["id"]
+    directory.mkdir(mode=0o700, parents=True)
+    result = dict(task, started=False, passed=False, exit_code=None,
+                  timed_out=False, not_run_reason=reason, wall_seconds=0)
+    write_json(directory / "result.json", result)
+    return result
+
+
+def run_phases(phases, tasks, root, env, jobs, deadline=None):
+    """Share one budget across workers and keep canary failure from widening."""
+    results = []
+
+    def save_summary():
+        write_json(root / "summary.json", {
+            "planned": len(tasks), "completed": sum(row.get("started", True) for row in results),
+            "reported": len(results),
+            "passed": len(results) == len(tasks) and all(row["passed"] for row in results),
+            "results": results,
+        })
+
+    try:
+        for _phase, phase_tasks in phases:
+            for batch, concurrency in execution_batches(phase_tasks, jobs):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [pool.submit(execute, task, root, env, deadline) for task in batch]
+                    for future in concurrent.futures.as_completed(futures):
+                        result = future.result()
+                        results.append(result)
+                        save_summary()
+                        print(f"{'PASS' if result['passed'] else 'FAIL'} {result['id']}", flush=True)
+            if any(not row["passed"] for row in results):
+                break  # Never widen a failing canary.
+        completed = {row["id"] for row in results}
+        reason = "campaign_deadline" if remaining_timeout(1, deadline) == 0 else "canary_failed"
+        for task in tasks:
+            if task["id"] not in completed:
+                results.append(record_not_run(task, root, reason))
+    finally:
+        save_summary()
+    return 0 if len(results) == len(tasks) and all(row["passed"] for row in results) else 1
+
+
 def main(argv=None):
     args = parse_args(argv)
+    deadline = None if args.budget_secs is None else time.monotonic() + args.budget_secs
     if args.plan_only:
         print(json.dumps({"mode": args.mode, "seeds": args.seeds, "rounds": args.rounds,
+                          "budget_seconds": args.budget_secs,
                           "families": FAMILIES, "test_binaries": [] if args.generated_only else TEST_BINARIES,
                           "scope": "fresh app stacks per case; real local relay; production timing"}, indent=2))
         return 0
@@ -354,7 +416,9 @@ def main(argv=None):
     write_json(root / "source.json", before)
     env = dict(os.environ, RUST_MIN_STACK="4194304", CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="false",
                CARGO_INCREMENTAL="0")
-    executables = build(root, env, args.generated_only)
+    write_json(root / "budget.json", {"budget_seconds": args.budget_secs,
+                                     "scope": "build, inventory and campaign execution; cleanup may overrun"})
+    executables = build(root, env, args.generated_only, deadline)
     after = source_state()
     if before != after:
         raise RuntimeError("source changed during build; this evidence root cannot be used")
@@ -363,7 +427,7 @@ def main(argv=None):
         "rustc": subprocess.check_output(["rustc", "--version", "--verbose"], text=True),
         "production_policy": True, **build_profiles(),
     })
-    inventory = {} if args.generated_only else {name: test_names(executables[name], env) for name in TEST_BINARIES}
+    inventory = {} if args.generated_only else {name: test_names(executables[name], env, deadline) for name in TEST_BINARIES}
     selected = {name for names in inventory.values() for name in names}
     if not args.generated_only and not (CANARY_TESTS | APP_ROUTE_TESTS | {RACE_DIAGNOSTIC}) <= selected:
         raise RuntimeError("maintained campaign test selection drifted")
@@ -379,26 +443,7 @@ def main(argv=None):
             task["phase"] = phase
             tasks.append(task)
     write_json(root / "plan.json", tasks)
-    results = []
-    try:
-        for _phase, phase_tasks in phases:
-            for batch, jobs in execution_batches(phase_tasks, args.jobs):
-                with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-                    futures = [pool.submit(execute, task, root, env) for task in batch]
-                    for future in concurrent.futures.as_completed(futures):
-                        result = future.result()
-                        results.append(result)
-                        write_json(root / "summary.json", {"planned": len(tasks), "completed": len(results),
-                                   "passed": all(row["passed"] for row in results) and len(results) == len(tasks),
-                                   "results": results})
-                        print(f"{'PASS' if result['passed'] else 'FAIL'} {result['id']}", flush=True)
-            if any(not row["passed"] for row in results):
-                break  # Preserve every canary result; never widen a failing canary.
-    finally:
-        write_json(root / "summary.json", {"planned": len(tasks), "completed": len(results),
-                   "passed": len(results) == len(tasks) and all(row["passed"] for row in results),
-                   "results": results})
-    return 0 if len(results) == len(tasks) and all(row["passed"] for row in results) else 1
+    return run_phases(phases, tasks, root, env, args.jobs, deadline)
 
 
 if __name__ == "__main__":

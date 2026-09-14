@@ -32,3 +32,7 @@ and `process_orchestrator.rs`. Keep the first sample immediate, later rounds at 
 and the total allowance `(max_iterations + 1)` seconds. Record elapsed/allowed wall time separately
 from virtual time. Engine subjects retain deterministic unpaced ticks. Test fast/slow polling,
 never-recovering and stalled subjects with paused Tokio time; do not relax predicate expectations.
+
+A process assertion may time out before its first RPC returns: preserve a failed report with zero
+completed samples and null actual state, plus the timeout capsule. Never fabricate a sample, extend the
+deadline to obtain one, or let the strict success oracle accept that diagnostic report.

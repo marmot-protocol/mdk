@@ -1126,7 +1126,7 @@ impl ProcessOrchestrator {
                     Ok((labels, ProcessActionStatusV1::Completed))
                 } else {
                     Err((Some(client.clone()), NodeErrorV1 {
-                        code: "scenario_assertion_failed".into(),
+                        code: if wait.expired() { "scenario_assertion_timeout" } else { "scenario_assertion_failed" }.into(),
                         category: SubjectFailureCategory::Protocol,
                         retryable: false,
                         message: "public client state did not match within the declared assertion budget".into(),
@@ -2140,6 +2140,100 @@ async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn first_observe_timeout_preserves_failed_report_and_reaps_node() {
+        use crate::{ScenarioAssertionV2, ScenarioPredicateV2};
+        let spec = ScenarioSpec {
+            name: "stalled-first-observe".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![
+                ScenarioStep::Assert {
+                    assertion: ScenarioAssertionV2::Eventually {
+                        predicate: ScenarioPredicateV2::ClientState {
+                            client: "alice".into(),
+                            epoch: Some(1),
+                            member_count: Some(1),
+                        },
+                        max_iterations: 1,
+                    },
+                },
+                ScenarioStep::DeliverAll,
+            ],
+        };
+        let artifacts = tempfile::tempdir().unwrap();
+        // A real owned process holds stdout open without answering the first RPC.
+        // Paused coordinator time makes both the assertion and shutdown bounded
+        // without waiting for the sleeper in wall time.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let node = NodeProcess {
+            participant: "alice".into(),
+            root: artifacts.path().join("node"),
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            next_request: 0,
+        };
+        let mut orchestrator = ProcessOrchestrator {
+            node_launch: ProcessNodeLaunchV1::executable(Path::new("/bin/sh")),
+            run_root: tempfile::tempdir().unwrap(),
+            artifact_directory: artifacts.path().to_path_buf(),
+            compiled: compile_scenario(&spec).unwrap(),
+            relay_controls: BTreeMap::new(),
+            relay_urls: BTreeMap::new(),
+            nodes: BTreeMap::from([("alice".into(), node)]),
+            account_ids: BTreeMap::new(),
+            processes: BTreeMap::new(),
+            process_relays: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            offline_observations: BTreeMap::new(),
+            lifecycle: Vec::new(),
+            input_provenance: None,
+            executed_scenario_ir_sha256: String::new(),
+            expected_outcomes: Vec::new(),
+            accepted_publications: BTreeMap::new(),
+        };
+        let report = orchestrator.run().await.unwrap();
+        let path = artifacts.path().join("report.json");
+        orchestrator.write_report_private(&report, &path).unwrap();
+        orchestrator.shutdown().await;
+        let saved: ProcessScenarioReportV1 =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved, report);
+        assert!(!saved.completed);
+        assert_eq!(saved.actions.len(), 1, "no action may follow the timeout");
+        assert_eq!(saved.actions[0].status, ProcessActionStatusV1::Failed);
+        let observed = &saved.assertion_observations[0];
+        assert!(!observed.passed);
+        assert_eq!(observed.samples, 0);
+        assert!(observed.final_actual.is_null());
+        assert_eq!(observed.wall_timeout_ms, Some(2_000));
+        assert_eq!(observed.elapsed_wall_ms, Some(2_000));
+        let capsule: NodeFailureCapsuleV1 =
+            serde_json::from_slice(&std::fs::read(&saved.failure_capsules[0]).unwrap()).unwrap();
+        assert_eq!(capsule.code, "scenario_assertion_timeout");
+        assert!(crate::validate_cross_route_public_process_report(&spec, &saved).is_err());
+        assert!(orchestrator.nodes.is_empty());
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 
     #[test]
     fn process_report_round_trip_preserves_canonical_schedule() {

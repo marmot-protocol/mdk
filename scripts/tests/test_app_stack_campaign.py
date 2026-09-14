@@ -171,7 +171,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(sum(len(batch) for batch, _ in batches), len(tasks))
 
     def test_invalid_resource_and_seed_arguments_are_rejected(self):
-        for args in (("--jobs", "3"), ("--rounds", "0"), ("--seeds", "-1"), ("--seeds", str(2**64))):
+        for args in (("--budget-secs", "0"), ("--jobs", "3"), ("--rounds", "0"), ("--seeds", "-1"), ("--seeds", str(2**64))):
             with self.subTest(args=args), patch("sys.stderr"), self.assertRaises(SystemExit):
                 campaign.parse_args(["unused", *args])
 
@@ -216,6 +216,53 @@ class CampaignTests(unittest.TestCase):
             subprocess.run([sys.executable, "-c", "import time; time.sleep(1.1)"], check=True)
             self.assertFalse(marker.exists())
 
+    def test_campaign_deadline_preserves_active_and_unstarted_receipts(self):
+        for jobs in [1, 2]:
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                marker = root / "escaped"
+                descendant = f"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).touch()"
+                program = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {descendant!r}]); print('started', flush=True); time.sleep(30)"
+                canaries = [{"id": f"canary/{i}", "kind": "test", "timeout": 30,
+                             "command": [sys.executable, "-c", program]} for i in range(3)]
+                matrix = [{"id": "matrix/0", "kind": "test", "timeout": 30,
+                           "command": [sys.executable, "-c", "raise RuntimeError('must not run')"]}]
+                tasks = canaries + matrix
+                with patch("builtins.print"):
+                    code = campaign.run_phases([("canary", canaries), ("matrix", matrix)],
+                                               tasks, root, dict(os.environ), jobs,
+                                               campaign.time.monotonic() + 0.4)
+                self.assertEqual(code, 1)
+                summary = json.loads((root / "summary.json").read_text())
+                self.assertFalse(summary["passed"])
+                self.assertEqual(summary["planned"], 4)
+                self.assertEqual(summary["reported"], 4)
+                self.assertEqual(summary["completed"], jobs)
+                results = {row["id"]: row for row in summary["results"]}
+                for task in tasks:
+                    row = results[task["id"]]
+                    self.assertEqual(json.loads((root / task["id"] / "result.json").read_text()), row)
+                    self.assertFalse(row["passed"])
+                    self.assertFalse((root / task["id"] / "tmp").exists())
+                    if row.get("started", True):
+                        self.assertTrue(row["timed_out"])
+                        self.assertEqual(row["timeout_scope"], "campaign")
+                        self.assertLess(row["effective_timeout_seconds"], 0.5)
+                    else:
+                        self.assertEqual(row["not_run_reason"], "campaign_deadline")
+                subprocess.run([sys.executable, "-c", "import time; time.sleep(1.1)"], check=True)
+                self.assertFalse(marker.exists(), "deadline must stop descendants too")
+
+    def test_expired_build_budget_writes_receipt_without_launching(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(campaign.subprocess, "Popen") as launch, self.assertRaises(RuntimeError):
+                campaign.build(root, {}, generated_only=True, deadline=campaign.time.monotonic() - 1)
+            launch.assert_not_called()
+            result = json.loads((root / "build-0/result.json").read_text())
+            self.assertFalse(result["started"])
+            self.assertTrue(result["timed_out"])
+
     def test_existing_evidence_root_is_never_reused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -233,7 +280,7 @@ class CampaignTests(unittest.TestCase):
             names = list(campaign.CANARY_TESTS | campaign.APP_ROUTE_TESTS | {campaign.RACE_DIAGNOSTIC})
             executed = []
 
-            def fail(task, _root, _env):
+            def fail(task, _root, _env, _deadline):
                 executed.append(task)
                 return dict(task, passed=False)
 

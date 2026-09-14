@@ -23,7 +23,9 @@ An executor accepts only canonical `ScenarioSpec` JSON. It compiles the entire d
 derives `declared_virtual_time_ms` as the sum of explicit `advance_time` deltas before every action, and preflights all
 adapter capabilities before executing action zero. A run report records that exact compiled schedule. Assertions and
 quiescence may advance the subject clock while an action executes, so the declared schedule is not described as the
-adapter's observed clock. Adapters do not interpret loops, concurrency, rates, or barriers.
+adapter's observed clock. Adapters do not interpret authoring loops, `parallel` blocks, rates, or barriers.
+Explicit canonical race actions define their own adapter execution semantics, including shared-barrier
+concurrent profile updates.
 
 Scenario IR v2's `update_group_data` action is the stable name-only operation. Scenario IR v3's
 `update_group_profile` action carries optional `name` and `description` fields and requires at least one of them. A
@@ -139,6 +141,14 @@ and performs at most the declared number of catch-up rounds across running parti
 assertion stops the scenario with a failure capsule; `assertion_observations` records the predicate,
 source step, sample count and final public state separately from ordinary checkpoints. Virtual-time and
 private-state assertions remain subject to their separate capability checks before launch.
+
+A wall-clock deadline can expire before the first process `Observe` RPC completes. Such a failed report
+records `samples: 0`, `final_actual: null`, `passed: false`, and the elapsed/allowed wall time; it never
+invents a public state. With earlier completed samples, `final_actual` retains the last observed state.
+The failure capsule uses `scenario_assertion_timeout` for an elapsed wall deadline and
+`scenario_assertion_failed` for a sampled mismatch that exhausts the iteration allowance. Both stop
+execution and retain the private failure report. The strict cross-route validator accepts only successful
+execution evidence, so it must reject these reports; rejection does not make the diagnostic report malformed.
 
 The public cross-route scenario uses this bounded assertion before sending its branch witness: Yankee
 must have epoch 4 and four members before the scenario partitions the participants. Relay EOSE alone
