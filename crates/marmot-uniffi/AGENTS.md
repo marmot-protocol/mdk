@@ -10,6 +10,7 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
   `package-macos-artifacts.sh`, `validate-ios-artifact.sh`, `validate-macos-artifact.sh`, `validate-swift-package.sh`,
   and `validate-swift-package-macos.sh`.
 - Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
+- Own `chat-projections-smoke.sh`, the host Swift/Kotlin chat-screen DTO round-trip check.
 - Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
 
@@ -61,6 +62,11 @@ OTLP export builds:
 ```sh
 cargo check -p marmot-uniffi --features otlp-export
 ```
+
+Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires `swiftc`) and
+`just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
+libraries, Android platform, annotations, and coroutines jars). These host checks do not replace release-artifact or
+device validation.
 
 Release-artifact checks (after `xcframework.sh`):
 
