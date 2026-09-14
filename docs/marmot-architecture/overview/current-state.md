@@ -19,6 +19,11 @@ status: overview
 
 # Current State — Implementations & Spec
 
+C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
+snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
+return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
+[bounded conversation opening](../further-context/conversation-opening.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves

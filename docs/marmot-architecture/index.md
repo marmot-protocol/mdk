@@ -199,6 +199,9 @@ These are longer working documents. Go here when you need depth, not orientation
 
 ### Current state — facts and analysis
 
+- **Doc:** [`further-context/conversation-opening.md`](./further-context/conversation-opening.md)
+  - **What it covers:** C5 M1 bounded storage opening, canonical anchors, read-state readiness and later screen inputs.
+
 - **Doc:** [`further-context/chat-projections-native.md`](./further-context/chat-projections-native.md)
   - **What it covers:** C4 native list-window and account-attention contracts, ownership, validation and client handoff.
 
