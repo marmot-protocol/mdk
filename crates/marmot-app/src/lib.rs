@@ -374,8 +374,10 @@ pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_sec
 /// never arrives.
 ///
 /// 30 s remains the conservative consecutive-silence ceiling, but an open
-/// production stream never spends it in one attempt: the 5 s execution quantum
-/// yields first and a later seam resubscribes. Production EOSE completion
+/// automatic recovery stream never spends it in one attempt: the 5 s execution quantum
+/// yields first and a later seam resubscribes. Explicit full-history repair instead
+/// continues the same activation across quanta under its own overall budget.
+/// Automatic EOSE completion
 /// therefore requires the gate to report within that quantum (or before an
 /// adapter-closed result). A worker-quantum yield is only a scheduling event:
 /// it paces a later resubscription but does not spend the EOSE-failure ordinal.

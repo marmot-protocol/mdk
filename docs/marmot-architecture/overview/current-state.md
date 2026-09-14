@@ -59,6 +59,11 @@ membership and permits fresh messages to recreate the chat. The Rust runtime, Un
 must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
 network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
 
+Explicit app full-history repair now retains one activation and strict endpoint EOSE coverage across checkpointed
+work quanta, with a 60-second cooperative overall budget and safe-boundary cancellation. Incomplete overflow
+recovery remains durable and generation-checked. Snapshot reads can run during the wait; mutations retain account
+FIFO ordering. This continuation does not isolate engine or network execution from the account worker.
+
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
 explicitly confirm replacing that MLS state; local message history remains. `group_recovery_status` exposes offers,
