@@ -324,10 +324,13 @@ impl MarmotApp {
 pub(crate) struct DraftSubmissionGuard {
     pub(crate) storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) revision: MessageDraftRevision,
+    pub(crate) app_event_id: String,
 }
 impl Drop for DraftSubmissionGuard {
     fn drop(&mut self) {
-        let _ = self.storage.cancel_message_draft_submission(&self.revision);
+        let _ = self
+            .storage
+            .cancel_message_draft_submission(&self.revision, &self.app_event_id);
     }
 }
 

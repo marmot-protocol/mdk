@@ -216,6 +216,22 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
         app.selected_message_draft("alice", &hex).unwrap().revision,
         selected.revision
     );
+    for (file_name, media_type) in [("wrong.png", "image/png"), ("a.png", "video/mp4")] {
+        let mut mismatched = reference.clone();
+        mismatched.source_epoch = epoch;
+        mismatched.file_name = file_name.into();
+        mismatched.media_type = media_type.into();
+        assert!(matches!(
+            client
+                .send_message_draft(&group, selected.revision.clone(), vec![mismatched])
+                .await,
+            Err(AppError::InvalidMessageDraft(_))
+        ));
+        assert_eq!(
+            app.selected_message_draft("alice", &hex).unwrap().revision,
+            selected.revision
+        );
+    }
     reference.source_epoch = epoch;
     let invalid = crate::messages::build_inner_event_with_media_reply(
         &AppMessageIntent::Media {

@@ -3660,7 +3660,11 @@ impl AppClient {
             storage
                 .stage_message_draft_submission(&revision, &event.id, &payload)
                 .map_err(|error| crate::drafts::revision_error(error, revision.group_id_hex()))?;
-            Some(crate::drafts::DraftSubmissionGuard { storage, revision })
+            Some(crate::drafts::DraftSubmissionGuard {
+                storage,
+                revision,
+                app_event_id: event.id.clone(),
+            })
         } else {
             None
         };
@@ -4158,6 +4162,18 @@ impl AppClient {
         if draft.media_attachments.len() != attachments.len() {
             return Err(AppError::InvalidMessageDraft(
                 "every draft attachment requires a prepared media reference".into(),
+            ));
+        }
+        if draft
+            .media_attachments
+            .iter()
+            .zip(&attachments)
+            .any(|(draft, prepared)| {
+                draft.file_name != prepared.file_name || draft.media_type != prepared.media_type
+            })
+        {
+            return Err(AppError::InvalidMessageDraft(
+                "prepared media metadata must match the selected draft attachment order".into(),
             ));
         }
         let (intent, media_reply) = if attachments.is_empty() {

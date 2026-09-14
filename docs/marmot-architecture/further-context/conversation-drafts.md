@@ -31,8 +31,10 @@ selected snapshot. Empty composers still have revisions, so an old empty snapsho
 ## Send acceptance and recovery
 
 `send_message_draft` captures the requested revision's text and reply target. For media, the caller supplies
-already-prepared references in selected attachment order, using the existing upload path. Missing references,
-stale revisions, and invalid media policy/epoch inputs fail before acceptance. M2 does not acquire or upload media.
+already-prepared references in selected attachment order, using the existing upload path. Each reference must match
+that position's filename and media type. This catches metadata/order mismatches, not different bytes with identical
+metadata: callers must still prepare from the selected revision's bytes and submit that original revision. Missing
+references, stale revisions, and invalid media policy/epoch inputs fail before acceptance. M2 does not upload media.
 
 The command stages a binding between the revision and the exact outgoing event/hash. That binding retains no
 payload bytes and is **not acceptance**. The existing queued intent or application fanout write consumes it and
@@ -44,7 +46,8 @@ Before acceptance, an error or cancellation leaves the draft. After acceptance, 
 retry and failure state, and cancellation or restart cannot revive the submitted composer. The legacy send result
 can still report a later delivery error after durable acceptance: callers must reload selected state and use the
 outgoing message's retry state, rather than restoring the composer just because the send returned an error.
-Dropping a direct client send cancels its unconsumed binding best-effort. A command already enqueued on an account
+Dropping a direct client send cancels its exact revision/event binding best-effort; an older event cannot unbind a
+replacement staged against the same draft revision. A command already enqueued on an account
 worker continues under that worker even if its waiting caller disappears, as with other runtime send commands.
 
 ## Changes and composition

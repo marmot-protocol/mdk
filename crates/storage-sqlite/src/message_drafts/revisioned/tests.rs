@@ -280,7 +280,7 @@ fn mismatched_acceptance_cancellation_and_late_acceptance_keep_newer_drafts() {
         old.revision
     );
     store
-        .cancel_message_draft_submission(&old.revision)
+        .cancel_message_draft_submission(&old.revision, "event")
         .unwrap();
     store.put_queued_outbound_intent(&queued(b"old")).unwrap();
     assert_eq!(
@@ -454,4 +454,25 @@ fn selected_draft_debug_redacts_content_identities_and_media_metadata() {
     ] {
         assert!(!debug.contains(private));
     }
+}
+
+#[test]
+fn cancelling_older_event_preserves_a_replacement_for_the_same_draft_revision() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    store.save_message_draft(GROUP, "draft", None, &[]).unwrap();
+    let selected = store.selected_message_draft(GROUP).unwrap();
+    store
+        .stage_message_draft_submission(&selected.revision, "first", b"first")
+        .unwrap();
+    store
+        .stage_message_draft_submission(&selected.revision, "replacement", b"replacement")
+        .unwrap();
+    store
+        .cancel_message_draft_submission(&selected.revision, "first")
+        .unwrap();
+    store
+        .put_queued_outbound_intent(&queued(b"replacement"))
+        .unwrap();
+    assert!(store.selected_message_draft(GROUP).unwrap().draft.is_none());
 }

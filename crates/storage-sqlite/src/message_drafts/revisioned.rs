@@ -184,6 +184,7 @@ impl SqliteAccountStorage {
     pub fn cancel_message_draft_submission(
         &self,
         expected: &MessageDraftRevision,
+        app_event_id: &str,
     ) -> StorageResult<()> {
         let conn = self.lock()?;
         let epoch: Vec<u8> = conn
@@ -197,8 +198,9 @@ impl SqliteAccountStorage {
             return Ok(());
         }
         conn.execute_cached(
-            "DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND revision = ?2",
-            params![expected.group_id_hex, expected.revision],
+            "DELETE FROM message_draft_submissions
+             WHERE group_id_hex = ?1 AND revision = ?2 AND app_event_id = ?3",
+            params![expected.group_id_hex, expected.revision, app_event_id],
         )
         .storage()?;
         Ok(())
