@@ -127,6 +127,141 @@ async fn run_connector_e2e_scenario(
     drop(agent);
 }
 
+/// Verifies durable reset replay across a real harness process restart.
+/// The debug agent records every final send, so the replay must actually
+/// receive the original acknowledgement again.
+pub async fn run_connector_reset_replay_e2e(
+    harness_name: &'static str,
+    display_name: &str,
+    state_file: &str,
+    spawn_harness: impl Fn(HarnessContext<'_>) -> SpawnedChild,
+) {
+    let temp = TempDir::new().expect("temp dir");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let home = temp.path().join("marmot-home");
+    let socket = temp.path().join("a.sock");
+    let state_path = temp.path().join(state_file);
+    let agent = ChildGuard::new(spawn_wn_agent(&home, &socket, temp.path()));
+    wait_for_agent(&socket).await;
+    let account = create_account(&socket, harness_name).await;
+    let spawn = || {
+        ChildGuard::new(spawn_harness(HarnessContext {
+            root: temp.path(),
+            socket: &socket,
+            account_id_hex: &account.account_id_hex,
+        }))
+    };
+    let harness = spawn();
+    let first_text = expected_reply_text();
+    inject_until_recorded_finals(
+        &socket,
+        &account.account_id_hex,
+        MESSAGE_ID_HEX,
+        INBOUND_TEXT,
+        &first_text,
+        harness_name,
+    )
+    .await;
+    let read_state = || {
+        let records: std::collections::HashMap<String, crate::store::SessionRecord> =
+            serde_json::from_slice(&fs::read(&state_path).ok()?).ok()?;
+        records.get(GROUP_ID_HEX).cloned()
+    };
+    // Final-send acknowledgement can precede the backend outcome's durable write.
+    let original = wait_for(
+        || async { read_state().filter(|record| !record.session_id.is_empty()) },
+        "initial durable session",
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let reset_id = "6666666666666666666666666666666666666666666666666666666666666666";
+    let reset_text = format!(
+        "[{harness_name}] Session reset. The next prompt will start a new {display_name} session in the preserved workdir."
+    );
+    let after_reset = format!("{first_text}{reset_text}");
+    inject_until_recorded_finals(
+        &socket,
+        &account.account_id_hex,
+        reset_id,
+        "/new",
+        &after_reset,
+        harness_name,
+    )
+    .await;
+    let reset = read_state().expect("durable reset precedes its acknowledgement");
+    assert!(reset.session_id.is_empty());
+    assert_eq!(reset.generation, original.generation + 1);
+    assert_eq!(reset.cwd, original.cwd);
+    assert_eq!(reset.reset_receipts.len(), 1);
+
+    // A distinct inbound message must now start a different backend session.
+    let before_restart = inject_until_recorded_finals(
+        &socket,
+        &account.account_id_hex,
+        RESUME_MESSAGE_ID_HEX,
+        INBOUND_TEXT,
+        &format!("{after_reset}{first_text}"),
+        harness_name,
+    )
+    .await;
+    let newer = wait_for(
+        || async { read_state().filter(|record| !record.session_id.is_empty()) },
+        "newer durable session",
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert!(!newer.session_id.is_empty());
+    assert_ne!(newer.session_id, original.session_id);
+    assert_eq!(newer.generation, reset.generation);
+
+    drop(harness);
+    let harness = spawn();
+    let replay_text = format!("{after_reset}{first_text}{reset_text}");
+    let replay_finals = inject_until_recorded_finals(
+        &socket,
+        &account.account_id_hex,
+        reset_id,
+        "/new",
+        &replay_text,
+        harness_name,
+    )
+    .await;
+    assert_final_sends(
+        &replay_finals[before_restart.len()..],
+        &account.account_id_hex,
+        reset_id,
+        &reset_text,
+        before_restart.len(),
+        1,
+    );
+    assert_eq!(
+        read_state().unwrap(),
+        newer,
+        "replayed reset changed the newer session"
+    );
+
+    let followup_id = "7777777777777777777777777777777777777777777777777777777777777777";
+    let resume_text = expected_resume_reply_text();
+    inject_until_recorded_finals(
+        &socket,
+        &account.account_id_hex,
+        followup_id,
+        RESUME_INBOUND_TEXT,
+        &format!("{replay_text}{resume_text}"),
+        harness_name,
+    )
+    .await;
+    assert_eq!(
+        read_state().unwrap(),
+        newer,
+        "follow-up did not resume the newer session"
+    );
+    drop(harness);
+    drop(agent);
+}
+
 /// Spawned child and its captured log paths.
 pub struct SpawnedChild {
     name: &'static str,

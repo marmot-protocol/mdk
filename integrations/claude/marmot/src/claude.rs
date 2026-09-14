@@ -1,13 +1,11 @@
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use marmot_terminal_harness::{
     ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
     IsolationSupport, Outcome, ParsedEvent, PromptTransport, Result, RunFailure, RunnerEvent,
-    process::{ProcessSpec, run_jsonl_process},
+    process::{ProcessSpec, bounded_command_output, run_jsonl_process},
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -252,45 +250,15 @@ fn validate_cli_version(bin: &str) -> Result<()> {
 }
 
 fn validate_cli_version_with_timeout(bin: &str, timeout: Duration) -> Result<()> {
-    let mut command = Command::new(bin);
-    command.arg("--version");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| HarnessError::BackendSpawn)?;
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                terminate_version_probe(&mut child);
-                return Err(HarnessError::BackendSpawn);
-            }
-            Err(_) => {
-                terminate_version_probe(&mut child);
-                return Err(HarnessError::BackendSpawn);
-            }
-        }
-    };
+    let (status, stdout) =
+        bounded_command_output(Command::new(bin).arg("--version"), timeout, 4096)
+            .map_err(|_| HarnessError::BackendSpawn)?;
     if !status.success() {
         return Err(HarnessError::Config(
             "Claude Code version check failed".to_owned(),
         ));
     }
-    let mut stdout = String::new();
-    child
-        .stdout
-        .take()
-        .ok_or(HarnessError::BackendSpawn)?
-        .read_to_string(&mut stdout)
-        .map_err(|_| HarnessError::BackendSpawn)?;
+    let stdout = String::from_utf8(stdout).map_err(|_| HarnessError::BackendSpawn)?;
     let version = parse_version(&stdout).ok_or_else(|| {
         HarnessError::Config("Claude Code returned an unsupported version string".to_owned())
     })?;
@@ -300,16 +268,6 @@ fn validate_cli_version_with_timeout(bin: &str, timeout: Duration) -> Result<()>
         ));
     }
     Ok(())
-}
-
-fn terminate_version_probe(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
@@ -331,6 +289,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::Path;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -575,17 +534,58 @@ mod tests {
         let started = Instant::now();
 
         let error =
-            validate_cli_version_with_timeout(script.to_str().unwrap(), Duration::from_millis(100))
+            validate_cli_version_with_timeout(script.to_str().unwrap(), Duration::from_secs(2))
                 .expect_err("hung version probe must fail within the configured timeout");
 
         assert!(matches!(error, HarnessError::BackendSpawn));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         let pid = fs::read_to_string(&pid_path).unwrap();
         let pid = pid.trim();
         assert!(
             wait_for_process_exit(pid),
             "version-probe descendant {pid} survived timeout"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_deadline_covers_inherited_stdout_after_leader_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("inherited-stdout");
+        let pid_path = root.path().join("descendant.pid");
+        write_executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > {}\nprintf '%s\\n' '2.1.270 (Claude Code)'\nexit 0\n",
+                pid_path.display()
+            ),
+        );
+        let started = Instant::now();
+        let result =
+            validate_cli_version_with_timeout(script.to_str().unwrap(), Duration::from_secs(2));
+        assert!(matches!(result, Err(HarnessError::BackendSpawn)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = fs::read_to_string(pid_path).unwrap();
+        assert!(
+            wait_for_process_exit(pid.trim()),
+            "stdout holder survived timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_rejects_excess_output_without_filling_the_pipe() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("verbose-version");
+        write_executable(
+            &script,
+            "#!/bin/sh\nwhile :; do printf '2.1.270 (Claude Code)'; done\n",
+        );
+        let started = Instant::now();
+        let result =
+            validate_cli_version_with_timeout(script.to_str().unwrap(), Duration::from_secs(2));
+        assert!(matches!(result, Err(HarnessError::BackendSpawn)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]

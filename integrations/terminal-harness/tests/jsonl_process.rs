@@ -427,15 +427,73 @@ exit 23
     let started = std::time::Instant::now();
     let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
     let background_pid = std::fs::read_to_string(root.path().join("background.pid")).unwrap();
-    let _ = std::process::Command::new("kill")
-        .arg(background_pid.trim())
-        .status();
+    assert!(
+        wait_for_process_exit(background_pid.trim()).await,
+        "descendant survived its leader's nonzero exit"
+    );
 
     assert_eq!(outcome.exit_code, Some(23));
     assert_eq!(outcome.observed_session.as_deref(), Some("immediate-exit"));
     assert_eq!(outcome.stderr, "inherited-stderr");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn exited_leader_with_inherited_stderr_is_cleaned_up() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "inherited-stderr-backend",
+        r#"#!/bin/sh
+exec 1>&-
+sleep 30 &
+printf '%s' "$!" > background.pid
+exit 23
+"#,
+    );
+    let (tx, _rx) = mpsc::channel(2);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.total_timeout = Duration::from_secs(2);
+    let outcome = run_jsonl_process(spec, tx, parse_event).await;
+    let pid = fs::read_to_string(root.path().join("background.pid")).unwrap();
+    assert!(
+        wait_for_process_exit(pid.trim()).await,
+        "stderr holder survived"
+    );
+    assert_eq!(outcome.unwrap().exit_code, Some(23));
+}
+
+#[tokio::test]
+async fn successful_leader_does_not_leave_detached_tools_in_its_group() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "successful-leader-backend",
+        r#"#!/bin/sh
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s' "$!" > background.pid
+printf '%s\n' '{"type":"text","text":"done"}'
+exit 0
+"#,
+    );
+    let (tx, mut rx) = mpsc::channel(2);
+    let outcome = run_jsonl_process(
+        process_spec(&script, root.path(), PromptTransport::Stdin(String::new())),
+        tx,
+        parse_event,
+    )
+    .await
+    .unwrap();
+    let pid = fs::read_to_string(root.path().join("background.pid")).unwrap();
+    assert!(
+        wait_for_process_exit(pid.trim()).await,
+        "tool survived successful exit"
+    );
+    assert_eq!(outcome.exit_code, Some(0));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::Text("done".to_owned())));
 }
 
 #[tokio::test]

@@ -155,6 +155,9 @@ cannot restore the old session.
 On Unix, every backend invocation runs in its own process group. Timeout,
 cancellation, and failure cleanup terminate the whole group before reaping the
 direct child so backend-spawned descendants cannot outlive an interrupted turn.
+Normal and nonzero leader exits also terminate remaining group members before
+reaping the leader. Exit observation retains the unreaped leader until this
+cleanup completes, preventing PID reuse from redirecting a later group signal.
 
 The stored goal is prepended to every prompt in its chat as one delimited block.
 That costs prompt tokens on every turn and, in exchange, survives session

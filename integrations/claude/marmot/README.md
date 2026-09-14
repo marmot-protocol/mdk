@@ -70,6 +70,10 @@ wn-claude --version
 claude --version
 ```
 
+The startup version probe has a five-second deadline covering both process exit
+and stdout EOF, with a 4 KiB output limit. Probe failure or timeout cleans up
+inherited-pipe descendants as well as the direct process.
+
 ## Manual Setup
 
 Install and authenticate Claude Code normally, then run an isolated `wn-agent`

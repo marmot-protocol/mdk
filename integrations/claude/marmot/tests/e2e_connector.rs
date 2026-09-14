@@ -6,13 +6,26 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use marmot_terminal_harness::test_support::{
-    HarnessContext, MAX_REPLY_BYTES, SENDER_ACCOUNT_ID_HEX, SpawnedChild, run_connector_resume_e2e,
+    HarnessContext, MAX_REPLY_BYTES, SENDER_ACCOUNT_ID_HEX, SpawnedChild,
+    run_connector_reset_replay_e2e, run_connector_resume_e2e,
 };
 
 #[tokio::test]
 #[ignore = "spawns real wn-agent and wn-claude processes"]
 async fn debug_inbound_reaches_fake_claude_and_records_chunked_finals() {
     run_connector_resume_e2e("wn-claude", spawn_wn_claude).await;
+}
+
+#[tokio::test]
+#[ignore = "spawns real wn-agent and wn-claude processes"]
+async fn reset_replay_after_restart_preserves_the_newer_claude_session() {
+    run_connector_reset_replay_e2e(
+        "wn-claude",
+        "Claude Code",
+        "wn-claude-state/sessions.json",
+        spawn_wn_claude,
+    )
+    .await;
 }
 
 fn spawn_wn_claude(context: HarnessContext<'_>) -> SpawnedChild {

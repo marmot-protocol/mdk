@@ -28,6 +28,32 @@ impl ProcessGroupGuard {
         }
     }
 
+    // Observe exit without reaping: the unreaped leader reserves its PID/PGID
+    // until we have signalled the group, even if every descendant exits first.
+    fn has_exited(&self) -> std::io::Result<bool> {
+        let pgid = self.pgid.expect("process group is still owned");
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pgid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    fn terminate(&self) {
+        if let Some(pgid) = self.pgid {
+            // The caller must not reap the leader until after this signal.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+
     fn disarm(&mut self) {
         self.pgid = None;
     }
@@ -70,10 +96,17 @@ impl ProcessGroupGuard {
     fn disarm(&mut self) {}
 }
 
-async fn wait_for_child_and_disarm(
+async fn wait_for_child_and_cleanup(
     child: &mut Child,
     process_group: &mut ProcessGroupGuard,
 ) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        while !process_group.has_exited()? {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        process_group.terminate();
+    }
     let status = child.wait().await?;
     process_group.disarm();
     Ok(status)
@@ -276,7 +309,7 @@ where
         PromptTransport::Stdin(prompt) => match child.stdin.take() {
             Some(stdin) => Some(write_stdin(stdin, prompt)),
             None => {
-                kill_and_reap(&mut child).await;
+                kill_and_reap(&mut child, &mut process_group).await;
                 return Err(spawn_failure());
             }
         },
@@ -285,14 +318,14 @@ where
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            cleanup_missing_pipe(&mut child, writer_task.as_mut()).await;
+            cleanup_missing_pipe(&mut child, &mut process_group, writer_task.as_mut()).await;
             return Err(spawn_failure());
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            cleanup_missing_pipe(&mut child, writer_task.as_mut()).await;
+            cleanup_missing_pipe(&mut child, &mut process_group, writer_task.as_mut()).await;
             return Err(spawn_failure());
         }
     };
@@ -307,12 +340,16 @@ where
 
     let lifecycle_result = timeout_at(total_deadline, async {
         let mut lines = BufReader::new(stdout).lines();
-        let child_status = loop {
+        let mut child_status = None;
+        loop {
             let line = tokio::select! {
                 biased;
                 line = lines.next_line() => Some(line),
-                status = wait_for_child_and_disarm(&mut child, &mut process_group) => {
-                    break Some(status.map_err(HarnessError::from)?)
+                status = wait_for_child_and_cleanup(&mut child, &mut process_group), if child_status.is_none() => {
+                    child_status = Some(status.map_err(HarnessError::from)?);
+                    // The pipe can still contain final events even when its readiness
+                    // notification loses the race to exit observation. Drain to EOF.
+                    continue;
                 },
                 _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
@@ -328,7 +365,7 @@ where
             let line = match line.expect("line branch returns a value") {
                 Err(_) => return Err(HarnessError::BackendStream),
                 Ok(Some(line)) => line,
-                Ok(None) => break None,
+                Ok(None) => break,
             };
             if !line.is_empty() {
                 match parse_event(&line) {
@@ -386,24 +423,6 @@ where
             idle_deadline = Instant::now() + idle_timeout;
         };
 
-        if let Some(status) = child_status {
-            if let Some(task) = writer_task.as_mut() {
-                task.abort();
-                let _ = task.await;
-            }
-            stderr_task.abort();
-            let _ = (&mut stderr_task).await;
-            let stderr = stderr_snapshot.lock().await.clone();
-            return Ok(Outcome {
-                observed_session: observed_session.clone(),
-                exit_code: status.code(),
-                error_summary,
-                no_side_effects_proven,
-                stderr: strip_ansi(stderr.trim()),
-                elapsed_ms: started.elapsed().as_millis(),
-            });
-        }
-
         let completion = async {
             let writer = async {
                 match writer_task.as_mut() {
@@ -411,11 +430,13 @@ where
                     None => None,
                 }
             };
-            let (writer, status, stderr) = tokio::join!(
-                writer,
-                wait_for_child_and_disarm(&mut child, &mut process_group),
-                &mut stderr_task,
-            );
+            let status = async {
+                match child_status {
+                    Some(status) => Ok(status),
+                    None => wait_for_child_and_cleanup(&mut child, &mut process_group).await,
+                }
+            };
+            let (writer, status, stderr) = tokio::join!(writer, status, &mut stderr_task);
             let status = status.map_err(HarnessError::from)?;
             let stderr = stderr.map_err(HarnessError::from)?;
             if let Some(writer) = writer {
@@ -465,7 +486,13 @@ where
             Ok(outcome)
         }
         Ok(Err(error)) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, writer_task.as_mut()).await;
+            cleanup_failed_run(
+                &mut child,
+                &mut process_group,
+                &mut stderr_task,
+                writer_task.as_mut(),
+            )
+            .await;
             process_group.disarm();
             Err(RunFailure {
                 error,
@@ -473,7 +500,13 @@ where
             })
         }
         Err(_) => {
-            cleanup_failed_run(&mut child, &mut stderr_task, writer_task.as_mut()).await;
+            cleanup_failed_run(
+                &mut child,
+                &mut process_group,
+                &mut stderr_task,
+                writer_task.as_mut(),
+            )
+            .await;
             process_group.disarm();
             Err(RunFailure {
                 error: HarnessError::BackendTimedOut,
@@ -492,12 +525,13 @@ fn spawn_failure() -> RunFailure {
 
 async fn cleanup_missing_pipe(
     child: &mut Child,
+    process_group: &mut ProcessGroupGuard,
     writer_task: Option<&mut JoinHandle<std::io::Result<()>>>,
 ) {
     if let Some(task) = writer_task {
         task.abort();
     }
-    kill_and_reap(child).await;
+    kill_and_reap(child, process_group).await;
 }
 
 /// Writes and closes backend stdin concurrently with stdout consumption.
@@ -542,6 +576,7 @@ async fn capture_bounded_shared(
 /// Aborts auxiliary tasks, terminates the child, and reaps it after failure.
 async fn cleanup_failed_run(
     child: &mut Child,
+    process_group: &mut ProcessGroupGuard,
     stderr_task: &mut JoinHandle<String>,
     writer_task: Option<&mut JoinHandle<std::io::Result<()>>>,
 ) {
@@ -549,21 +584,82 @@ async fn cleanup_failed_run(
         task.abort();
     }
     stderr_task.abort();
-    kill_and_reap(child).await;
+    kill_and_reap(child, process_group).await;
     if !stderr_task.is_finished() {
         let _ = stderr_task.await;
     }
 }
 
 /// Best-effort terminates and reaps a backend child.
-async fn kill_and_reap(child: &mut Child) {
+async fn kill_and_reap(child: &mut Child, process_group: &mut ProcessGroupGuard) {
     #[cfg(unix)]
-    if let Some(pgid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: The child was spawned as the leader of its own process group.
-        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    }
+    process_group.terminate();
     let _ = child.start_kill();
     let _ = child.wait().await;
+    process_group.disarm();
+}
+
+/// Captures a small command response under one deadline for output and exit.
+/// The child and its inherited-pipe descendants are terminated on every path.
+#[cfg(unix)]
+pub fn bounded_command_output(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    output_limit: usize,
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut group = ProcessGroupGuard {
+        pgid: Some(i32::try_from(child.id()).expect("Unix PID fits i32")),
+    };
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(Error::last_os_error());
+    }
+    let deadline = StdInstant::now() + timeout;
+    let mut output = Vec::new();
+    let mut eof = false;
+    loop {
+        if StdInstant::now() >= deadline {
+            return Err(Error::new(ErrorKind::TimedOut, "command probe timed out"));
+        }
+        let mut buffer = [0; 1024];
+        if !eof {
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    if count > output_limit.saturating_sub(output.len()) {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "command output too large",
+                        ));
+                    }
+                    output.extend_from_slice(&buffer[..count]);
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if eof && group.has_exited()? {
+            group.terminate();
+            let status = child.wait()?;
+            group.disarm();
+            return Ok((status, output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Removes ANSI CSI control sequences from bounded stderr.
@@ -622,7 +718,7 @@ mod tests {
         let mut child = Command::new("true").spawn().unwrap();
         let mut guard = ProcessGroupGuard::new(&child);
 
-        let status = wait_for_child_and_disarm(&mut child, &mut guard)
+        let status = wait_for_child_and_cleanup(&mut child, &mut guard)
             .await
             .unwrap();
 
