@@ -5973,14 +5973,16 @@ impl AccountManager {
             })
         }
         .await;
-        self.shared.app_performance_telemetry().record_sync_result(
-            AppPerformanceOperation::AccountCatchUp,
-            started_at.elapsed(),
-            result
-                .as_ref()
-                .err()
-                .map(account_catch_up_metric_classification),
-        );
+        self.shared
+            .app_performance_telemetry()
+            .record_classified_result(
+                AppPerformanceOperation::AccountCatchUp,
+                started_at.elapsed(),
+                result
+                    .as_ref()
+                    .err()
+                    .map(account_catch_up_metric_classification),
+            );
         result
     }
 
