@@ -384,3 +384,5 @@ input/report, and mutates every participant's message/roster/profile observation
 sensitivity. See `SCENARIOS.md` for the production-policy command and evidence boundaries.
 
 See [app recovery expansion](APP_RECOVERY_EXPANSION.md) for generated contracts and weekly/manual campaign selection.
+The expansion contracts cover indices 0–3, publication/event/reopen capability preflight, and strict recovery evidence;
+`app_runtime::tests::unknown_group_tolerance_preserves_refusal_boundary` pins the transient error wrapper boundary.

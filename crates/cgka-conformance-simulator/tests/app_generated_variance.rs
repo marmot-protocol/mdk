@@ -197,7 +197,9 @@ fn runtime_stimulus_oracle_rejects_missing_faults_and_unaccepted_races() {
                 closed_connections, ..
             } => *closed_connections = 0,
             Evidence::ConcurrentProfiles { outcomes, .. } => outcomes[0].accepted = false,
-            Evidence::InviteProfileRecovery { .. } => unreachable!(),
+            Evidence::InviteProfileRecovery { .. } => {
+                unreachable!("this family emits no invite/profile recovery evidence")
+            }
         }
         assert!(validate_scenario_stimulus_evidence(&case.scenario, &false_claim).is_err());
     }

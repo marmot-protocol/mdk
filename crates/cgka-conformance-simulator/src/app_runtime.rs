@@ -2003,6 +2003,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 Err(error) => return Err(error),
             }
             if tokio::time::Instant::now() >= deadline {
+                // Accepted mutations without an offer cannot distinguish an
+                // unexercised selector tie from broken recovery. Keep this an
+                // unresolved failure, not an expected refusal inferred from time.
                 return Err(SubjectError::new(
                     "explicit_invitee_recovery_not_exercised",
                     "accepted concurrent calls did not produce a validated recipient recovery offer",
@@ -2715,6 +2718,34 @@ async fn make_participant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_group_tolerance_preserves_refusal_boundary() {
+        assert!(tolerates_unknown_group(&SubjectError::new(
+            "unknown_group",
+            "group unavailable"
+        )));
+        assert!(tolerates_unknown_group(&SubjectError::classified(
+            SubjectFailureCategory::ExpectedRefusal,
+            "wrapped_refusal",
+            "public observation: unknown_group"
+        )));
+        for error in [
+            SubjectError::new("wrapped_refusal", "public observation: unknown_group"),
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "wrapped_refusal",
+                "public observation: permission_denied",
+            ),
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "wrapped_refusal",
+                "unknown_group: unexpected trailing detail",
+            ),
+        ] {
+            assert!(!tolerates_unknown_group(&error), "{error}");
+        }
+    }
 
     /// Even a pre-publication validation error must release maintenance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

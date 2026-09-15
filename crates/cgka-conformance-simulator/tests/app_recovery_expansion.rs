@@ -15,7 +15,7 @@ const FAMILIES: [&str; 3] = [
 fn expansion_replay_prefix_diversity_and_reachability() {
     for family in FAMILIES {
         let mut shapes = BTreeSet::new();
-        for (case_index, seed) in (0..2).flat_map(|index| (0..16).map(move |seed| (index, seed))) {
+        for (case_index, seed) in (0..4).flat_map(|index| (0..16).map(move |seed| (index, seed))) {
             let case = generate_family_case(family, seed, case_index).unwrap();
             assert_eq!(
                 case,
@@ -75,7 +75,7 @@ fn expansion_replay_prefix_diversity_and_reachability() {
                         .iter()
                         .filter(|a| matches!(a.step, ScenarioStep::RemoveMembers { .. }))
                         .count(),
-                    2 + case_index as usize
+                    2 + (case_index % 2) as usize
                 );
             }
             let shape = compiled
@@ -209,18 +209,23 @@ async fn expansion_preflights_and_rejects_unsupported_relay_configuration() {
         preflight_compiled_scenario(&compile_scenario(&case.scenario).unwrap(), &descriptor)
             .is_err()
     );
-    let mut no_reopen = descriptor;
-    no_reopen
-        .capabilities
-        .remove(&SubjectCapability::CrashReopen);
     let mut race = generate_family_case(FAMILIES[0], 7, 0).unwrap();
     race.scenario
         .steps
         .retain(|s| matches!(s, ScenarioStep::RaceInviteProfile { .. }));
-    assert!(
-        preflight_compiled_scenario(&compile_scenario(&race.scenario).unwrap(), &no_reopen)
-            .is_err()
-    );
+    let compiled = compile_scenario(&race.scenario).unwrap();
+    for capability in [
+        SubjectCapability::CrashReopen,
+        SubjectCapability::OutboundPublication,
+        SubjectCapability::EventObservation,
+    ] {
+        let mut missing = descriptor.clone();
+        missing.capabilities.remove(&capability);
+        assert!(
+            preflight_compiled_scenario(&compiled, &missing).is_err(),
+            "race must require {capability}"
+        );
+    }
 }
 
 #[test]

@@ -694,6 +694,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         return vec![
             SubjectCapability::ConcurrentGroupMutation,
             SubjectCapability::GroupMutation,
+            SubjectCapability::OutboundPublication,
+            SubjectCapability::EventObservation,
             SubjectCapability::CrashReopen,
             SubjectCapability::TransportDelivery,
             SubjectCapability::PublicGroupStateObservation,
