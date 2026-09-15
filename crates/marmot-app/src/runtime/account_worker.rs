@@ -1479,6 +1479,9 @@ async fn run_app_runtime_account_worker(
                                                         | AccountWorkerCommand::ConnectivityRestored { .. }) => {
                                                             pending.push_back(command);
                                                         }
+                                                        AccountWorkerCommand::CaptureConversation { respond, .. } => {
+                                                            let _ = respond.send(Err(ConversationWindowError::NotReady));
+                                                        }
                                                         command => drop(command),
                                                     }
                                                 }
@@ -1494,6 +1497,9 @@ async fn run_app_runtime_account_worker(
                                                     "host recovery interrupted account worker reconnect backoff",
                                                 );
                                                 break;
+                                            }
+                                            Some(AccountWorkerCommand::CaptureConversation { respond, .. }) => {
+                                                let _ = respond.send(Err(ConversationWindowError::NotReady));
                                             }
                                             // There is deliberately no engine
                                             // session during this backoff.

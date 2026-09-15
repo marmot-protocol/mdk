@@ -53,6 +53,7 @@ impl Fixture {
                             let result = match mode {
                                 1 => Err(ConversationWindowError::NotReady),
                                 2 => Err(StorageError::Busy("test contention".into()).into()),
+                                4 => Err(AppError::BlockingTask("test task failure".into()).into()),
                                 _ => capture_conversation(&mut client, &group_id, query, &store_epoch),
                             };
                             if mode == 3 {
@@ -127,6 +128,24 @@ impl Fixture {
                 account_label: "alice".into(),
                 version: self.store.chat_presentation_version().unwrap(),
             });
+    }
+    fn projection_event(&self, account_id: &str, group_hex: &str) {
+        self.runtime
+            .events
+            .send(MarmotAppEvent::ProjectionUpdated(
+                crate::RuntimeProjectionUpdate {
+                    account_id_hex: account_id.to_owned(),
+                    account_label: "alice".into(),
+                    update: crate::AppProjectionUpdate {
+                        group_id_hex: group_hex.to_owned(),
+                        timeline_messages: vec![],
+                        timeline_changes: vec![],
+                        chat_list_row: None,
+                        chat_list_trigger: Default::default(),
+                    },
+                },
+            ))
+            .unwrap();
     }
     fn draft(&self, text: &str) {
         self.app
@@ -620,7 +639,18 @@ async fn latest_follows_arrivals_but_history_paging_retains_the_viewport() {
     let f = Fixture::new(12).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
     f.add_sender(12, &"cc".repeat(32));
-    f.signal();
+    let captures = f.captures.load(Ordering::SeqCst);
+    // Matching labels must not accidentally cross account or group boundaries.
+    f.projection_event("alice", &f.group_hex());
+    f.projection_event(&f.account, &hex::encode([99; 16]));
+    assert!(
+        timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(f.captures.load(Ordering::SeqCst), captures);
+    // This is the production projection event bus, with no presentation/draft wakeup.
+    f.projection_event(&f.account, &f.group_hex());
     let latest = next(&mut sub).await;
     assert_eq!(ids(&latest), (8..=12).map(id).collect::<Vec<_>>());
     assert!(
@@ -641,7 +671,14 @@ async fn latest_follows_arrivals_but_history_paging_retains_the_viewport() {
     );
     let _ = next(&mut sub).await;
     f.add(13);
-    f.signal();
+    f.runtime
+        .events
+        .send(MarmotAppEvent::GroupStateUpdated {
+            account_id_hex: f.account.clone(),
+            account_label: "alice".into(),
+            group_id: f.group.clone(),
+        })
+        .unwrap();
     let held = next(&mut sub).await;
     assert_eq!(ids(&held), ids(&older));
     assert!(held.page.page().has_more_after);
@@ -688,5 +725,147 @@ async fn provenance_only_change_is_not_suppressed_as_unchanged_content() {
     let mut after = before.clone();
     after.page = trusted;
     assert!(!after.same_content(&before));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn saturated_history_paging_continues_after_reporting_the_new_visible_anchor() {
+    let f = Fixture::new(430).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 50).await;
+    let handle = sub.window_handle();
+    let mut page = sub.snapshot.clone();
+    for _ in 0..4 {
+        page = handle
+            .page(&page.revision, ConversationPageDirection::Older, 50)
+            .await
+            .unwrap();
+    }
+    assert_eq!(page.anchors.len(), CONVERSATION_WINDOW_MAX_ROWS);
+    assert!(page.page.page().has_more_before);
+    let saturated = handle
+        .page(&page.revision, ConversationPageDirection::Older, 50)
+        .await
+        .unwrap();
+    assert_eq!(ids(&saturated), ids(&page));
+    let visible = handle
+        .set_visible_anchor(&saturated.revision, &id(230))
+        .await
+        .unwrap();
+    let advanced = handle
+        .page(&visible.revision, ConversationPageDirection::Older, 50)
+        .await
+        .unwrap();
+    assert_eq!(ids(&advanced).first(), Some(&id(180)));
+    assert_eq!(
+        advanced.anchors[anchor_index(advanced.anchor).unwrap()].message_id_hex(),
+        id(230)
+    );
+    assert_eq!(advanced.anchors.len(), CONVERSATION_WINDOW_MAX_ROWS);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn terminal_task_failure_after_transient_failure_is_reported_and_stops_retrying() {
+    let f = Fixture::new(3).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    f.mode.store(1, Ordering::SeqCst);
+    f.signal();
+    assert!(matches!(
+        timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
+        Err(ConversationWindowError::NotReady)
+    ));
+    f.mode.store(4, Ordering::SeqCst);
+    assert!(
+        matches!(timeout(Duration::from_secs(3), sub.recv()).await.unwrap(), Err(ConversationWindowError::App(e)) if matches!(e.as_ref(), AppError::BlockingTask(_)))
+    );
+    assert!(sub.recv().await.unwrap().is_none());
+    assert!(matches!(
+        sub.window_handle()
+            .return_to_latest(&sub.snapshot.revision)
+            .await,
+        Err(ConversationWindowError::Closed)
+    ));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
+    let f = Fixture::new(3).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    let commands = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .get(&f.account)
+        .unwrap()
+        .commands
+        .clone();
+    tokio::time::pause();
+    f.runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_recovery_for_test(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match f.runtime.unhydrated_group_count_for_test("alice").await {
+            Err(AppError::TransportClosed) => break,
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not enter reconnect backoff"
+        );
+    }
+    let capture = || {
+        let (respond, response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::CaptureConversation {
+                group_id: f.group.clone(),
+                query: Default::default(),
+                store_epoch: f.store.chat_presentation_version().unwrap().store_epoch,
+                respond,
+            })
+            .unwrap();
+        response
+    };
+    // The ordinary backoff arm must not close the responder.
+    assert!(matches!(
+        capture().await.unwrap(),
+        Err(ConversationWindowError::NotReady)
+    ));
+    let (respond, recovery) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::CatchUp { respond })
+        .unwrap();
+    // Queue without yielding so capture is drained by the recovery coalesce arm.
+    let response = capture();
+    assert!(matches!(
+        response.await.unwrap(),
+        Err(ConversationWindowError::NotReady)
+    ));
+    tokio::time::resume();
+    timeout(Duration::from_secs(10), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let recovered = sub
+        .window_handle()
+        .return_to_latest(&sub.snapshot.revision)
+        .await
+        .unwrap();
+    assert_eq!(ids(&recovered), ids(&sub.snapshot));
     f.close().await;
 }

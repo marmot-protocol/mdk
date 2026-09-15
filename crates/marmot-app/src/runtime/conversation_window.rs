@@ -87,7 +87,7 @@ impl ConversationWindowError {
         matches!(self, Self::Closed | Self::Presentation(_))
             || matches!(self, Self::Query(error) if !matches!(error.as_ref(), ConversationOpenError::MessageNotFound))
             || matches!(self, Self::App(e) if matches!(e.as_ref(),
-                AppError::RuntimeStopping | AppError::TransportClosed | AppError::UnknownGroup(_) |
+                AppError::RuntimeStopping | AppError::TransportClosed | AppError::BlockingTask(_) | AppError::UnknownGroup(_) |
                 AppError::Session(cgka_session::SessionError::Engine(cgka_traits::EngineError::UnknownGroup(_))) |
                 AppError::AccountHome(marmot_account::AccountHomeError::AccountIdMismatch |
                     marmot_account::AccountHomeError::UnknownAccount(_)) |
@@ -175,6 +175,9 @@ pub(super) fn capture_conversation(
                     storage.conversation_account_snapshot(&group_hex, query.clone())?;
                 // A startup migration can still carry Member until its owner backfills.
                 // Use this capture's compact live membership, without loading another roster.
+                // Live removal facts do not distinguish voluntary departure from eviction.
+                // Removed is the conservative fallback only for stale Member rows; explicit
+                // Leaving/Left/Removed/Disbanded projection states remain authoritative.
                 let facts = authority.facts;
                 if account.presentation_input.self_membership == crate::SelfMembership::Member
                     && (facts.removed
@@ -210,11 +213,22 @@ pub(super) fn capture_conversation(
     }
 }
 
+/// Commands apply to the supplied snapshot revision. Every command can return
+/// `StaleWindow` if a replacement was published first; consume the latest snapshot
+/// and reassess the user's intent before retrying. In particular, paging is relative
+/// to that snapshot's retained viewport, not to a newer position changed concurrently.
+/// Commands from another handle generation are always rejected.
 #[derive(Clone)]
 pub struct ConversationWindowHandle {
     commands: mpsc::Sender<Command>,
 }
 impl ConversationWindowHandle {
+    /// Extend context around the retained visible anchor, keeping at most 200 rows.
+    /// This never implicitly moves the visible anchor. At the cap, a request may
+    /// return the same rows even when `has_more_before`/`has_more_after` is true:
+    /// those flags describe stored history, not room around this anchor. Report
+    /// the newly visible row with `set_visible_anchor`, then page using the
+    /// revision it returns to continue through history without a scroll jump.
     pub async fn page(
         &self,
         revision: &ConversationWindowRevision,
@@ -663,7 +677,7 @@ async fn run(
             Err(error) => {
                 let terminal = error.terminal();
                 let query_error = matches!(error, ConversationWindowError::Query(_));
-                if (!failed && !query_error) || (query_error && command.is_none()) {
+                if terminal || (!failed && !query_error) || (query_error && command.is_none()) {
                     let _ = updates.send_replace(Err(error.clone()));
                 }
                 if let Some(command) = command {
@@ -693,6 +707,7 @@ async fn wait_for_account_reset(resets: &mut broadcast::Receiver<String>, label:
     loop {
         match resets.recv().await {
             Ok(reset) if reset == label => return,
+            // A lost teardown signal is terminal, never a reason to rebind a handle.
             Err(_) => return,
             _ => {}
         }
