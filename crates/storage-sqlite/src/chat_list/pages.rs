@@ -9,8 +9,8 @@
 //! This is M1 of #1777. It intentionally does not change legacy APIs or implement runtime
 //! subscriptions, selected-presentation preparation, rejoin/archive command orchestration,
 //! effective screen badge values, account summaries or native bindings. Those follow in M2-M4.
-//! Legacy summary eligibility is deliberately unchanged in M1; M3 must reuse list_scope = 0
-//! and list_unread instead of adding another archive/terminal/invitation predicate.
+//! Account attention reuses these keys and additionally counts active pending invitations;
+//! the Unread list continues to exclude invitations.
 use crate::connection::CachedSql;
 use crate::{ChatListRow, SqliteAccountStorage, SqliteResultExt, deserialize};
 use cgka_traits::storage::StorageError;

@@ -1103,16 +1103,15 @@ pub struct AccountUnread {
     /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
     /// Number of eligible conversations that require badge attention:
-    /// unread messages or an independent manual-unread reminder.
+    /// unread messages, a manual-unread reminder, or a pending invitation.
     pub unread_conversations: u64,
-    /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread. A row that already has
-    /// unread messages is omitted so hosts can compute
-    /// `unread_count + attention_only_conversations` without overlap.
+    /// Active unarchived pending invitations (one each) and accepted manual
+    /// reminders with no unread messages. Invite message counts stay suppressed.
+    /// `unread_count + attention_only_conversations` is the application badge.
     #[serde(default)]
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder with no unread messages.
+    /// pending invitation or manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 
@@ -2562,8 +2561,10 @@ impl MarmotApp {
     /// materialized `chat_list_rows` projection (a single grouped
     /// `COUNT`/`SUM`), so this does not require switching into, or loading a
     /// full session/timeline for, any account — non-active accounts are
-    /// reported too. Pending invitations are excluded. `attention_only_conversations`
-    /// covers manual-only unread rows without overlapping unread-message totals.
+    /// reported too. `attention_only_conversations` counts each active unarchived
+    /// pending invitation once and accepted manual-only reminders, without
+    /// overlapping unread-message totals. Archived and departed/departing chats
+    /// contribute nothing.
     ///
     /// Only local-signing accounts are reported (matching `managed_accounts`).
     /// The chat-list projection is built from the on-disk store if missing;

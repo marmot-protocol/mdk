@@ -85,6 +85,9 @@ pub enum AccountAttentionUnavailableFfi {
     ReadFailed,
     Resetting,
 }
+/// Account/application badge counters; archived and departed/departing chats are excluded.
+/// Pending invitations add one attention-only item each, with no unread messages or mentions.
+/// The application badge is `unread_count + attention_only_conversations`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AccountAttentionTotalFfi {
     pub unread_count: u64,

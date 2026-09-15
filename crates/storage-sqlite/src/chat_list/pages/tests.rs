@@ -1205,7 +1205,7 @@ fn authoritative_self_arrival_restores_departed_archive_once_and_preserves_ordin
 }
 
 #[test]
-fn account_attention_matches_unread_predicates_and_preserves_manual_and_mute_policy() {
+fn account_attention_adds_invites_without_changing_unread_list_or_mute_policy() {
     for archived in [false, true] {
         for pending in [false, true] {
             for membership in ["member", "left", "removed"] {
@@ -1221,12 +1221,16 @@ fn account_attention_matches_unread_predicates_and_preserves_manual_and_mute_pol
                             .unwrap();
                         let total = store.account_attention_total().unwrap();
                         let rows = page(&store, ChatListView::Unread).rows;
-                        assert_eq!(total.unread_conversations, rows.len() as u64);
+                        let invite = !archived && pending && membership == "member";
+                        assert_eq!(
+                            total.unread_conversations,
+                            rows.len() as u64 + u64::from(invite)
+                        );
                         let eligible = !archived
                             && !pending
                             && membership == "member"
                             && (unread > 0 || manual);
-                        assert_eq!(total.has_unread(), eligible);
+                        assert_eq!(total.has_unread(), eligible || invite);
                         assert_eq!(total.unread_count, if eligible { unread as u64 } else { 0 });
                         assert_eq!(
                             total.unread_mention_count,
@@ -1234,7 +1238,7 @@ fn account_attention_matches_unread_predicates_and_preserves_manual_and_mute_pol
                         );
                         assert_eq!(
                             total.attention_only_conversations,
-                            u64::from(eligible && unread == 0)
+                            u64::from(invite || (eligible && unread == 0))
                         );
                     }
                 }
@@ -1287,11 +1291,60 @@ fn account_attention_query_work_is_independent_of_retained_history_and_skips_qui
             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
             INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
                 SELECT printf('%032x',1),printf('%064x',x),'received','sender','large retained history',9,'[]',x,x FROM n;")).unwrap();
+        seed(&store, "invite", false, "member", 30, true);
+        store.lock().unwrap().execute_batch("UPDATE account_groups SET pending_confirmation=1, archived=1 WHERE group_id_hex IN (SELECT printf('%032x',x) FROM numbers WHERE x>10);").unwrap();
         let (total, steps) = measure(&store, || store.account_attention_total().unwrap());
         assert_eq!(total.unread_count, 6);
-        assert_eq!(total.unread_conversations, 2);
-        assert!(steps < 500, "summary must use unread index; steps={steps}");
+        assert_eq!(total.unread_conversations, 3);
+        assert_eq!(total.attention_only_conversations, 1);
+        assert!(
+            steps < 500,
+            "summary must use attention indexes; steps={steps}"
+        );
         work.push(steps);
     }
     assert!(work[0].abs_diff(work[1]) < 100);
+}
+
+#[test]
+fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_refresh() {
+    use cgka_traits::storage::{StorageError, StorageProvider};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "01", false, "member", 3, true);
+    let group = engine_group(&store, "01");
+    let invite = store.account_attention_total().unwrap();
+    assert_eq!(invite.unread_count, 0);
+    assert_eq!(invite.attention_only_conversations, 1);
+    // Keep a deliberately stale invitation display row through each source update.
+    for (pending, archived, messages, attention) in [
+        (false, false, 3, 0),
+        (true, false, 0, 1),
+        (true, true, 0, 0),
+        (true, false, 0, 1),
+    ] {
+        store.lock().unwrap().execute("UPDATE account_groups SET pending_confirmation=?1, archived=?2 WHERE group_id_hex='01'", params![pending, archived]).unwrap();
+        let total = store.account_attention_total().unwrap();
+        assert_eq!(total.unread_count, messages);
+        assert_eq!(total.attention_only_conversations, attention);
+    }
+    let result = store.with_transaction(|s| -> Result<(), StorageError> {
+        s.put_leave_request(&LeaveRequest {
+            group_id: group.clone(),
+            requested_at_ms: 123,
+            last_proposed_epoch: None,
+        })?;
+        assert!(!s.account_attention_total()?.has_unread());
+        Err(StorageError::NotFound)
+    });
+    assert!(result.is_err());
+    assert_eq!(store.account_attention_total().unwrap(), invite);
+    store
+        .put_disband_request(&DisbandRequest {
+            group_id: group,
+            requested_at_ms: 123,
+            status: DisbandRequestStatus::Pending,
+            last_prepared_epoch: None,
+        })
+        .unwrap();
+    assert!(!store.account_attention_total().unwrap().has_unread());
 }

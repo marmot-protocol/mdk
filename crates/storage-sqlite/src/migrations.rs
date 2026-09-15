@@ -156,6 +156,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 #[path = "migrations/0073_message_draft_revisions.rs"]
 mod migration_0073_message_draft_revisions;
 
+#[path = "migrations/0074_chat_list_invite_attention.rs"]
+mod migration_0074_chat_list_invite_attention;
+
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
@@ -527,6 +530,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 73,
         name: "0073_message_draft_revisions",
         apply: migration_0073_message_draft_revisions::apply,
+    },
+    Migration {
+        version: 74,
+        name: "0074_chat_list_invite_attention",
+        apply: migration_0074_chat_list_invite_attention::apply,
     },
 ];
 
@@ -1298,7 +1306,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 73,
+                found: 74,
                 latest_supported: 46,
             }
         ));
@@ -1354,7 +1362,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 73,
+                found: 74,
                 latest_supported: 46,
             }
         ));
@@ -1658,7 +1666,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 73,
+                found: 74,
                 latest_supported: 46,
             }
         ));

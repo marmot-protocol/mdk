@@ -42,9 +42,9 @@ impl Marmot {
     /// into, or loading a full session/timeline for, any account — non-active
     /// (not-`running`) local-signing accounts are reported too. This legacy
     /// getter omits accounts whose projection read fails.
-    /// `attention_only_conversations` covers manual-only unread rows without
-    /// overlapping unread-message totals. Pending invitations, archived chats
-    /// and departed or departing groups do not contribute attention.
+    /// `attention_only_conversations` counts each active pending invitation once
+    /// and accepted manual-only reminders, without overlapping message totals.
+    /// Archived chats and departed or departing groups contribute nothing.
     pub fn account_unread_summary(
         &self,
     ) -> Result<Vec<conversions::AccountUnreadFfi>, MarmotKitError> {

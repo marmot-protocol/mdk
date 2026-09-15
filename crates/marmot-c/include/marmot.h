@@ -1059,8 +1059,8 @@ typedef struct MarmotAccountUnread {
    */
   uint64_t unread_conversations;
   /**
-   * Conversations with badge attention solely from a manual-unread
-   * reminder (no unread messages). Pending invitations are excluded.
+   * Active unarchived pending invitations (one each) and accepted manual
+   * reminders with no unread messages. Invite message counts stay suppressed.
    */
   uint64_t attention_only_conversations;
   /**

@@ -53,16 +53,15 @@ pub struct AccountUnreadFfi {
     pub account_id_hex: String,
     /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
-    /// Number of eligible conversations with unread messages or a manual reminder.
-    /// Pending invitations and queued departures are excluded.
+    /// Active unarchived conversations with unread messages, a manual reminder,
+    /// or a pending invitation. Departed/departing groups are excluded.
     pub unread_conversations: u64,
-    /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread. A row that already has
-    /// unread messages is omitted so hosts can compute
-    /// `unread_count + attention_only_conversations` without overlap.
+    /// Active unarchived pending invitations (one each) and accepted manual
+    /// reminders with no unread messages. Invite message counts stay suppressed.
+    /// `unread_count + attention_only_conversations` is the application badge.
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder with no unread messages.
+    /// pending invitation or manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 

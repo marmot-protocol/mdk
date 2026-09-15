@@ -1,7 +1,7 @@
 ---
 title: "Native chat-list and account-attention handoff"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 status: implementation
 ---
 
@@ -35,8 +35,11 @@ no schema, second projection store, or release version bump.
 6. Open `subscribeAccountAttention()` separately for the account switcher and
    badges. Take its initial snapshot, then replace the complete account set on
    updates. `Ready` carries counters; `Unavailable` carries only Preparing,
-   ReadFailed or Resetting. `unreadConversations > 0` means attention; manual-only
-   reminders do not invent message counts. Missing accounts have left the signed-in
+   ReadFailed or Resetting. `unreadConversations > 0` means attention. The application
+   badge is `unreadCount + attentionOnlyConversations`: each unarchived pending invite
+   adds one attention-only item, as does an accepted manual reminder without unread
+   messages. Invites never add message/mention counts before acceptance; archived and
+   departed/departing chats add nothing. Missing accounts have left the signed-in
    set. Do not substitute zero for unavailable entries or derive totals from loaded
    list rows. Counters are coherent per account, not across all databases at once.
 
