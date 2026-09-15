@@ -27,13 +27,17 @@ operations; the screen never downloads them. Low-level timeline queries still
 provide their original raw fields and collections, including raw media JSON when
 a caller needs to inspect a rejected attachment beyond its typed rejection outcome.
 
-The window currently does **not** expose whether the viewing account reacted.
-Its compatibility `reactions.user_reactions` is empty, and each sidecar reactor
-preview contains at most two identities without prioritizing the viewer. Absence
-from that preview does not mean the viewer did not react. Apps needing highlighted
-reaction chips must temporarily retain their existing timeline query for own-reaction
-state. Before C9 adoption, #1838 tracks adding a viewer-scoped signal to the shared
-presentation and native bindings so this state needs no per-message lookup.
+Each displayed `references.reactions.items` entry includes `viewer_reacted`
+(Swift/Kotlin `viewerReacted`). Use this flag to highlight the viewing account's
+active reaction for that emoji. It uses the complete active reactor list, not the
+bounded two-identity preview, and refreshes with live reaction additions/removals.
+No separate timeline query or viewer identity lookup is needed for these chips.
+The existing reaction-kind cap and `omitted_kinds` still apply; this flag does not
+expose reactions for omitted emoji kinds. The compatibility timeline's raw
+`reactions` remains empty; expanded reaction details still use the narrow APIs.
+
+Regenerate native sources and use matching libraries when adopting this field:
+it changes the UniFFI record schema and the C `MarmotConversationReaction` layout.
 
 ## Paging and lifetime
 

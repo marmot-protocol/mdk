@@ -869,3 +869,55 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
     assert_eq!(ids(&recovered), ids(&sub.snapshot));
     f.close().await;
 }
+
+#[tokio::test]
+async fn conversation_viewer_reaction_updates_after_add_and_remove() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION};
+    let f = Fixture::new(1).await;
+    let record = |number: usize, sender: &str, kind: u64, target: String| {
+        f.store
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: f.group_hex(),
+                message_id_hex: id(number),
+                source_message_id_hex: Some(id(number + 10000)),
+                source_epoch: Some(1),
+                direction: "received".into(),
+                sender: sender.into(),
+                plaintext: if kind == MARMOT_APP_EVENT_KIND_REACTION {
+                    "👍".into()
+                } else {
+                    String::new()
+                },
+                kind,
+                tags: vec![vec!["e".into(), target]],
+                recorded_at: number as u64 + 200,
+                received_at: number as u64 + 200,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+    };
+    let peer = id(1);
+    record(20, &peer, MARMOT_APP_EVENT_KIND_REACTION, id(0));
+    let mut sub = f.open(ConversationOpenTarget::Latest, 1).await;
+    assert!(!sub.snapshot.presentation.messages[0].reactions.items[0].viewer_reacted);
+    let initial = sub.snapshot.revision.sequence;
+    record(21, &f.account, MARMOT_APP_EVENT_KIND_REACTION, id(0));
+    f.projection_event(&f.account, &f.group_hex());
+    let added = next(&mut sub).await;
+    assert!(added.revision.sequence > initial);
+    assert!(added.presentation.messages[0].reactions.items[0].viewer_reacted);
+    assert_eq!(added.presentation.messages[0].reactions.items[0].count, 2);
+    record(22, &f.account, MARMOT_APP_EVENT_KIND_DELETE, id(21));
+    f.projection_event(&f.account, &f.group_hex());
+    let removed = next(&mut sub).await;
+    assert!(removed.revision.sequence > added.revision.sequence);
+    assert!(!removed.presentation.messages[0].reactions.items[0].viewer_reacted);
+    assert_eq!(removed.presentation.messages[0].reactions.items[0].count, 1);
+    assert_eq!(
+        removed.presentation.messages[0].reactions.items[0].reactors,
+        vec![peer]
+    );
+    drop(sub);
+    f.close().await;
+}

@@ -88,6 +88,9 @@ pub struct ConversationReaction {
     pub emoji: String,
     pub count: usize,
     pub reactors: Vec<String>,
+    /// Whether the viewing account has an active reaction of this emoji,
+    /// independently of the bounded reactor preview.
+    pub viewer_reacted: bool,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -199,6 +202,7 @@ impl MarmotApp {
             }
             let references = message_references(
                 message,
+                &account.account_id_hex,
                 prepared.authenticated_system_content(index),
                 &mut ids,
             );
@@ -365,6 +369,7 @@ fn mentions(
 
 fn message_references(
     message: &TimelineMessageRecord,
+    viewer: &str,
     trusted: Option<&str>,
     ids: &mut BTreeSet<String>,
 ) -> ConversationMessageReferences {
@@ -423,6 +428,7 @@ fn message_references(
             emoji: emoji.clone(),
             count: reactors.len(),
             reactors: previews,
+            viewer_reacted: reactors.iter().any(|id| id.eq_ignore_ascii_case(viewer)),
         });
     }
     reactions.omitted_kinds = reactions.total_kinds - reactions.items.len();
@@ -484,6 +490,7 @@ mod budget_tests {
                     ConversationReaction {
                         emoji: "\u{0000}".repeat(MAX_NAME_BYTES),
                         count: usize::MAX,
+                        viewer_reacted: true,
                         reactors: vec![id.clone(); MAX_CONVERSATION_REACTOR_PREVIEWS],
                     };
                     MAX_CONVERSATION_REACTION_KINDS

@@ -4512,6 +4512,7 @@ typedef struct MarmotConversationReaction {
   uint64_t count;
   char **reactors;
   uintptr_t reactors_len;
+  bool viewer_reacted;
 } MarmotConversationReaction;
 
 typedef struct MarmotConversationReactions {

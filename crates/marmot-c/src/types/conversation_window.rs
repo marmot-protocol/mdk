@@ -62,6 +62,7 @@ c_mirror! { MarmotConversationReaction from ConversationReactionFfi {
 str emoji,
 copy count: u64,
 str_vec reactors/reactors_len,
+copy viewer_reacted: bool,
 } }
 c_mirror! { MarmotConversationReactions from ConversationReactionsFfi {
 copy total_count: u64,
@@ -173,4 +174,31 @@ copy has_more_after: bool,
 
 impl CFree for MarmotMessageDraftRevision {
     unsafe fn free_in_place(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_viewer_reaction_c_mirror_preserves_flag_and_frees() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        for viewer_reacted in [false, true] {
+            let ffi = ConversationReactionFfi {
+                emoji: "👍".into(),
+                count: 3,
+                reactors: vec!["other-a".into(), "other-b".into()],
+                viewer_reacted,
+            };
+            let mut mirror = MarmotConversationReaction::from(ffi);
+            assert_eq!(mirror.viewer_reacted, viewer_reacted);
+            assert_eq!(mirror.count, 3);
+            assert_eq!(mirror.reactors_len, 2);
+            unsafe { mirror.free_in_place() };
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
 }
