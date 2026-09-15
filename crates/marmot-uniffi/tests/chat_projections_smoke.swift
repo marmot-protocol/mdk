@@ -57,8 +57,13 @@ func conversationRoundTrips() throws {
         let copy = try FfiConverterTypeConversationAnchorOutcomeFfi.lift(FfiConverterTypeConversationAnchorOutcomeFfi.lower(value))
         precondition(copy == value)
     }
+    for reacted in [false, true] {
+        let value = ConversationReactionFfi(emoji: "👍", count: 3, reactors: ["other-a", "other-b"], viewerReacted: reacted)
+        let copy = try FfiConverterTypeConversationReactionFfi.lift(FfiConverterTypeConversationReactionFfi.lower(value))
+        precondition(copy.viewerReacted == reacted && copy == value)
+    }
     let reactions = ConversationReactionsFfi(totalCount: UInt64.max, totalKinds: 10,
-        items: [ConversationReactionFfi(emoji: "👍", count: UInt64.max, reactors: ["author"])], omittedKinds: 9)
+        items: [ConversationReactionFfi(emoji: "👍", count: UInt64.max, reactors: ["author"], viewerReacted: true)], omittedKinds: 9)
     let refs = ConversationMessageReferencesFfi(messageIdHex: "message", sender: "author", replyAuthor: nil,
         mentions: ["author"], mentionsTruncated: true, replyMentions: [], replyMentionsTruncated: false,
         system: ConversationSystemReferencesFfi(systemType: "member_removed", actor: "author", subject: nil), reactions: reactions)

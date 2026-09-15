@@ -572,3 +572,56 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
     assert_eq!(complete.messages[0].reply_mentions, reply_ids[..1]);
     assert!(!complete.messages[0].reply_mentions_truncated);
 }
+
+#[test]
+fn conversation_viewer_reaction_is_account_scoped_and_independent_of_preview() {
+    let (_dir, app, input) = setup();
+    let viewer = app.account_home().account("alice").unwrap().account_id_hex;
+    let previews = vec!["00".repeat(32), format!("{:064x}", 1)];
+    let mut row = message(&input.group_id_hex, &"ff".repeat(32));
+    let mut reactors = previews.clone();
+    // The viewing account must not need an identity slot to highlight its reaction.
+    reactors.push(viewer.to_uppercase());
+    row.reactions.by_emoji.insert("👍".into(), reactors);
+    row.reactions.by_emoji.insert("🎉".into(), previews.clone());
+    let result = project(&app, &input, &page(vec![row.clone()]));
+    let reactions = &result.messages[0].reactions;
+    let mine = reactions.items.iter().find(|r| r.emoji == "👍").unwrap();
+    assert!(mine.viewer_reacted);
+    assert_eq!(mine.count, 3);
+    assert_eq!(mine.reactors, previews);
+    assert!(!result.identities.contains_key(&viewer));
+    assert!(
+        !reactions
+            .items
+            .iter()
+            .find(|r| r.emoji == "🎉")
+            .unwrap()
+            .viewer_reacted
+    );
+    assert_eq!(reactions.total_count, 5);
+
+    // The same reaction content viewed by a different account is not "mine".
+    let (_other_dir, other_app, other_input) = setup();
+    let other = project(&other_app, &other_input, &page(vec![row.clone()]));
+    assert!(
+        other.messages[0]
+            .reactions
+            .items
+            .iter()
+            .all(|r| !r.viewer_reacted)
+    );
+
+    // Removing the viewer leaves peers' reactions visible but unselected.
+    row.reactions.by_emoji.get_mut("👍").unwrap().pop();
+    let removed = project(&app, &input, &page(vec![row]));
+    let reaction = removed.messages[0]
+        .reactions
+        .items
+        .iter()
+        .find(|r| r.emoji == "👍")
+        .unwrap();
+    assert!(!reaction.viewer_reacted);
+    assert_eq!(reaction.count, 2);
+    assert_eq!(reaction.reactors, previews);
+}

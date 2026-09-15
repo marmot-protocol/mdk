@@ -47,8 +47,13 @@ fun conversationRoundTrips() {
         val value = ConversationAnchorOutcomeFfi(kind, if (kind == ConversationAnchorKindFfi.EMPTY) null else 199u)
         check(FfiConverterTypeConversationAnchorOutcomeFfi.lift(FfiConverterTypeConversationAnchorOutcomeFfi.lower(value)) == value)
     }
+    for (reacted in listOf(false, true)) {
+        val value = ConversationReactionFfi("👍", 3u, listOf("other-a", "other-b"), reacted)
+        val copy = FfiConverterTypeConversationReactionFfi.lift(FfiConverterTypeConversationReactionFfi.lower(value))
+        check(copy.viewerReacted == reacted && copy == value)
+    }
     val reactions = ConversationReactionsFfi(ULong.MAX_VALUE, 10u,
-        listOf(ConversationReactionFfi("👍", ULong.MAX_VALUE, listOf("author"))), 9u)
+        listOf(ConversationReactionFfi("👍", ULong.MAX_VALUE, listOf("author"), true)), 9u)
     val refs = ConversationMessageReferencesFfi("message", "author", null, listOf("author"), true,
         emptyList(), false, ConversationSystemReferencesFfi("member_removed", "author", null), reactions)
     check(FfiConverterTypeConversationMessageReferencesFfi.lift(FfiConverterTypeConversationMessageReferencesFfi.lower(refs)) == refs)

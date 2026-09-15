@@ -138,6 +138,8 @@ pub struct ConversationReactionFfi {
     pub emoji: String,
     pub count: u64,
     pub reactors: Vec<String>,
+    /// Active reaction by the viewing account; independent of reactor previews.
+    pub viewer_reacted: bool,
 }
 impl From<app::conversation_presentation::ConversationReaction> for ConversationReactionFfi {
     fn from(v: app::conversation_presentation::ConversationReaction) -> Self {
@@ -145,6 +147,7 @@ impl From<app::conversation_presentation::ConversationReaction> for Conversation
             emoji: v.emoji,
             count: v.count as u64,
             reactors: v.reactors,
+            viewer_reacted: v.viewer_reacted,
         }
     }
 }
@@ -521,6 +524,22 @@ impl std::fmt::Debug for ConversationWindowSnapshotFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversation_viewer_reaction_survives_native_conversion() {
+        for viewer_reacted in [false, true] {
+            let reaction = app::conversation_presentation::ConversationReaction {
+                emoji: "👍".into(),
+                count: 3,
+                reactors: vec!["other-a".into(), "other-b".into()],
+                viewer_reacted,
+            };
+            let native = ConversationReactionFfi::from(reaction);
+            assert_eq!(native.viewer_reacted, viewer_reacted);
+            assert_eq!(native.count, 3);
+            assert_eq!(native.reactors, ["other-a", "other-b"]);
+        }
+    }
+
     #[test]
     fn conversation_native_timeline_requires_provenance_and_omits_unbounded_collections() {
         let content = cgka_traits::app_event::GroupSystemEvent::new(

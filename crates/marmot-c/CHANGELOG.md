@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotConversationReaction.viewer_reacted` identifies the viewing account's
+  active reaction independently of the bounded reactor preview. Regenerate headers
+  and use the matching library: the output record layout has changed.
+
 - Prepared conversation windows with initial/live history, header/capabilities, visible
   identities, read state and revisioned draft descriptors. Add independent paging,
   anchor/jump/tail commands, finite operation deadlines, explicit cancellation and
