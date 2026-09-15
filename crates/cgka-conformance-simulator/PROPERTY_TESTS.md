@@ -383,12 +383,4 @@ The ignored `large_group_app_canary` selects one case using `MDK_LARGE_APP_CASE=
 input/report, and mutates every participant's message/roster/profile observations to prove oracle
 sensitivity. See `SCENARIOS.md` for the production-policy command and evidence boundaries.
 
-## Opt-in recovery expansion
-
-See [the first-increment generator and campaign guide](APP_RECOVERY_EXPANSION.md).
-`public-app-invite-profile-recovery/v1`, `public-app-longevity/v1` and
-`public-app-retained-traffic/v1` add six opt-in selections per seed: invite/profile generator version 2,
-pressure version 3 and longevity version 1. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
-The existing default 72-case campaign is unchanged; use `--catalog expansion`.
-`app_recovery_expansion.rs` checks replay, prefix stability, structural diversity,
-required interactions and rejection of missing/refused recovery evidence.
+See [app recovery expansion](APP_RECOVERY_EXPANSION.md) for generated contracts and weekly/manual campaign selection.

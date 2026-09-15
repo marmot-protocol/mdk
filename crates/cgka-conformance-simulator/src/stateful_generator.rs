@@ -1509,6 +1509,7 @@ pub fn generate_public_app_invite_profile_case(
     let mut model = JourneyModel::new_public(case_index);
     // Rebuild formation before any actions execute: david is the late invitee.
     model.steps.clear();
+    model.expected.clear();
     model.members.remove("david");
     model.non_members.insert("david".into());
     model.steps.push(ScenarioStep::CreateGroup {
@@ -1519,12 +1520,7 @@ pub fn generate_public_app_invite_profile_case(
         initial_admins: Some(vec!["alice".into(), "bob".into(), "carol".into()]),
         pending: "create".into(),
     });
-    model.steps.push(ScenarioStep::AcknowledgeOutbound {
-        client: "alice".into(),
-        publication: Some("create".into()),
-        selection: ScenarioOutboundSelection::All,
-        outcome: SubjectOutboundOutcome::Accepted,
-    });
+    model.confirm_publication("alice", "create");
     model.admins = BTreeSet::from(["alice".into(), "bob".into(), "carol".into()]);
     model.public_state_checkpoint();
     let mut founders = ["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];

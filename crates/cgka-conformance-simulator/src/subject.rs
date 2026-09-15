@@ -740,9 +740,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             }
             ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
             ScenarioStep::InterruptRelay { .. } => SubjectCapability::RelayInterruption,
-            ScenarioStep::RaceInviteProfile { .. } | ScenarioStep::RaceGroupProfiles { .. } => {
-                SubjectCapability::ConcurrentGroupMutation
-            }
+            ScenarioStep::RaceGroupProfiles { .. } => SubjectCapability::ConcurrentGroupMutation,
             ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
                 SubjectCapability::ParticipantConnectivity
@@ -767,6 +765,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             | ScenarioStep::WithholdMessage { .. }
             | ScenarioStep::ReleaseWithheld { .. }
             | ScenarioStep::ReorderMessages { .. } => SubjectCapability::SemanticTransportFaults,
+            ScenarioStep::RaceInviteProfile { .. } => unreachable!("handled above"),
             ScenarioStep::Barrier { .. } => unreachable!("handled above"),
             ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),

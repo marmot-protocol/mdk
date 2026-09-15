@@ -195,8 +195,6 @@ pub enum ScenarioStep {
         relay: String,
         outage_ms: u64,
     },
-    /// Release independent public profile calls at one barrier. All must be accepted;
-    /// semantic expected outcomes still decide whether their effects survive.
     /// Force the higher-identity invitation to compete with a profile edit,
     /// then require durable explicit recipient recovery through public APIs.
     RaceInviteProfile {
@@ -205,6 +203,8 @@ pub enum ScenarioStep {
         name: String,
         restart_at_offer: bool,
     },
+    /// Release independent public profile calls at one barrier. All must be accepted;
+    /// semantic expected outcomes still decide whether their effects survive.
     RaceGroupProfiles {
         updates: Vec<crate::ScenarioProfileUpdate>,
     },

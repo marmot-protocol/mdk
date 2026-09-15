@@ -16,7 +16,11 @@ New harness support adds the invite/profile action and its append-only evidence,
 the default shared-relay alias, and a separate relay-configuration capability.
 It chooses the higher credential identity as inviter, races that call with the other
 actor's rename, and requires a validated explicit rejoin offer. Acceptance of both calls
-alone is insufficient. Refusals remain classified outcomes in a failed coverage report;
+alone is insufficient. The forced loser assumes equal-depth same-epoch branches:
+the engine's final `tip_committer` tie-break favors the smaller identity. Earlier
+selector criteria can win instead; the public checkpoints after a pre-race restart
+do not prove private branch equality. A run without a validated offer stays a
+coverage failure, including when the intended tie was not reached. Refusals remain classified outcomes in a failed coverage report;
 there is no automatic retry or conversion of an unexercised race into a pass.
 
 ## Versioned generators
@@ -29,9 +33,7 @@ there is no automatic retry or conversion of an unexercised race into a pass.
 | `public-app-longevity-extended/v1` | explicit only | 48 cycles in one harness, using the same identities and databases; not a wall-clock duration guarantee |
 
 Invite/profile is generator version `2`, retained traffic version `3`, and longevity version `1`.
-The version-1 race input omitted the named creation acknowledgement and correctly
-failed its pending-resolution oracle; saved version-1 inputs remain unchanged. Existing families and their versions are
-unchanged. Indices are independently seeded, so increasing case count preserves prefixes.
+Existing families and their versions are unchanged. Indices are independently seeded, so increasing case count preserves prefixes.
 OS scheduling and cryptographic identities remain nondeterministic; saved inputs pin the
 schedule, not a promise that a race will occur. The runtime evidence must prove recovery.
 
@@ -48,12 +50,8 @@ No cycle reconstructs participant identities or databases.
 
 Pressure uses an all-offline boundary to remove an event from the shared relay,
 then reopens the caught-up peers on their same databases before traffic resumes.
-It is not same-process longevity evidence. Version 1 incorrectly requested a
-duplicate-copy relay control unavailable on the app adapter; version 2 uses
-repeated full-history requests. Version 2 then exposed the relay selector contract:
-the real relay accepts an action-id-only selector; version 3 uses that exact selector
-and the contract tests require it to resolve to a send action. Relay configuration now has a distinct preflight
-capability, so unsupported configuration fails before action zero.
+It is not same-process longevity evidence. The shared relay accepts action-id-only
+selectors, and relay configuration has a distinct preflight capability.
 
 Pressure first proves a hidden message is absent after initial recovery, then releases
 that exact correlated relay event and requires its delivery exactly once while fresh
@@ -81,7 +79,10 @@ Use fresh roots. The campaign freezes helpers and records source, binaries, exac
 reports, failures and timing. `--mode full` deliberately repeats its canary in the matrix;
 keep those execution receipts distinct. Diagnostic retries require separate roots and
 must not replace initial failed verdicts. Expensive generated executions are opt-in;
-only cheap generator/oracle contract tests join ordinary PR testing.
+only cheap generator/oracle contract tests join ordinary PR testing. Weekly/manual
+hardening runs the six-case expansion in its own matrix job, with serial catch-up,
+independent verdicts and a separate evidence artifact. The 72-case baseline job
+keeps eight-way catch-up. The 48-cycle profile remains explicit manual coverage.
 
 ## Negative discovery scan investigation
 
@@ -104,53 +105,3 @@ preserve late arrivals, replacement, cross-connection writes and restart behavio
 
 Short canaries do not establish full-catalog, long-duration or production-service success.
 
-## Local validation, 15 September 2026
-
-Nine bounded process canaries passed, all case index 0, serial catch-up and an
-unoptimized test/dev build with production timing policy. This is evidence across
-explicitly recorded builds, not nine executions on one final source revision.
-
-| Family | Seed 7 | Seed 42 | Seed 17001 |
-| --- | ---: | ---: | ---: |
-| Invite/profile, generator 2 | 52.760 s (`94df78ec`) | 60.859 s (`ac42d4a1`) | 62.489 s (`ac42d4a1`) |
-| Longevity, generator 1 | 50.339 s (`1978ad07`) | 48.925 s (`ac42d4a1`) | 45.385 s (`ac42d4a1`) |
-| Retained traffic, generator 3 | 59.512 s (`ac42d4a1`) | 55.478 s (`ac42d4a1`) | 58.540 s (`ac42d4a1`) |
-
-Times are isolated-worker wall times, not end-to-end campaign startup or product
-latency thresholds. The passed cases contain 1,406 completed actions and 511
-assertion samples. Pressure cases send 55–58 distinct public messages; longevity
-cases send 16–19 across two cycles. Each family has three distinct operation
-schedules after dropping assertions, observations, labels and payload values.
-All race cases exercised explicit recipient recovery and offer-boundary restart.
-The odd-index no-offer-restart arm and three-cycle arm remain unexecuted.
-
-Three earlier failed verdicts remain preserved: the version-1 race missing its named
-creation acknowledgement (51.724 s); pressure version 1 requesting unsupported
-relay configuration (5.285 s); pressure version 2 using an unsupported selector
-filter (6.755 s). These are authoring/harness-contract failures, not production
-recovery failures. Corrected generator executions use new evidence roots and versions.
-
-Private evidence roots are `target/recovery-expansion-{1978ad07,94df78ec,fcd767e3,ac42d4a1}-debug`.
-The last root contains `verified-validation.json`, source/binary hash receipts,
-commands, test/gate logs, and the verification script. Exact inputs, reports, fixtures
-and capsules remain under each original root. Independent verification checked all
-12 reports against input SHA-256, generated metadata, frozen binary hashes, artifact
-integrity, completed actions, nonempty passing assertion samples and strict oracles.
-No failed verdict was removed or reclassified as a pass.
-
-Local contracts: 27 targeted tests passed across `app_recovery_expansion`,
-`app_generated_variance` and `scenario_ir`; one existing slow test stayed ignored.
-The expansion contracts also generate (but do not execute) the 48-cycle profile and
-verify one group creation and no offline/restart action for Alice. Python campaign
-contracts passed 19 tests. `just fast-ci` passed, including telemetry feature checks,
-Clippy and five convergence-policy tests. The final code-only change after
-`ac42d4a1` moved generator definitions before the test module; later changes add
-contract coverage and this validation record. Remote CI is a separate result.
-
-Recommended next campaign: run the opt-in full expansion with fresh seeds 101, 211
-and 307 (two cases per family), recording the deliberately repeated canary phase
-separately. That reaches the odd-index restart and third-cycle arms. Inspect those
-results before executing the 48-cycle profile. Continuous overlapping traffic,
-inside-recovery fault placement, beyond-anchor public terminal dispositions and
-long-duration acceptance remain separate work; these short canaries establish none
-of those claims.

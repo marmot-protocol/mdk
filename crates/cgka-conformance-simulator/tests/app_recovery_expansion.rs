@@ -15,9 +15,12 @@ const FAMILIES: [&str; 3] = [
 fn expansion_replay_prefix_diversity_and_reachability() {
     for family in FAMILIES {
         let mut shapes = BTreeSet::new();
-        for seed in 0..32 {
-            let case = generate_family_case(family, seed, 0).unwrap();
-            assert_eq!(case, generate_family_case(family, seed, 0).unwrap());
+        for (case_index, seed) in (0..2).flat_map(|index| (0..16).map(move |seed| (index, seed))) {
+            let case = generate_family_case(family, seed, case_index).unwrap();
+            assert_eq!(
+                case,
+                generate_family_case(family, seed, case_index).unwrap()
+            );
             assert_eq!(
                 case,
                 serde_json::from_slice(&serde_json::to_vec(&case).unwrap()).unwrap()
@@ -61,6 +64,19 @@ fn expansion_replay_prefix_diversity_and_reachability() {
                         == selector.action_id.as_ref()
                         && matches!(a.step, ScenarioStep::SendAppMessage { .. })));
                 }
+            }
+            if family == FAMILIES[0] {
+                assert!(compiled.actions.iter().any(|a| matches!(a.step,
+                    ScenarioStep::RaceInviteProfile { restart_at_offer, .. } if restart_at_offer == case_index.is_multiple_of(2))));
+            } else {
+                assert_eq!(
+                    compiled
+                        .actions
+                        .iter()
+                        .filter(|a| matches!(a.step, ScenarioStep::RemoveMembers { .. }))
+                        .count(),
+                    2 + case_index as usize
+                );
             }
             let shape = compiled
                 .actions
@@ -111,9 +127,18 @@ fn invite_recovery_evidence_rejects_unexercised_races_and_lost_consent() {
         .steps
         .retain(|s| matches!(s, ScenarioStep::RaceInviteProfile { .. }));
     let action = compile_scenario(&case.scenario).unwrap().actions.remove(0);
-    let ScenarioStep::RaceInviteProfile { actors, .. } = action.step else {
+    let ScenarioStep::RaceInviteProfile {
+        actors,
+        restart_at_offer,
+        ..
+    } = action.step
+    else {
         panic!("race")
     };
+    assert!(
+        restart_at_offer,
+        "offer persistence mutation requires the restart arm"
+    );
     let good = Evidence::InviteProfileRecovery {
         action_id: action.schedule.action_id,
         inviter: actors[0].clone(),

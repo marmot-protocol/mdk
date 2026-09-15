@@ -43,6 +43,19 @@ use crate::{
 
 pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "1";
 
+// Matches the fixed strict invite/rename journey's automatic re-invitation allowance.
+const INVITEE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(150);
+
+fn owns_relay(relay: &str) -> bool {
+    ["relay:shared", "relay:default"].contains(&relay)
+}
+
+fn tolerates_unknown_group(error: &SubjectError) -> bool {
+    error.code == "unknown_group"
+        || (error.category == SubjectFailureCategory::ExpectedRefusal
+            && error.message.ends_with("unknown_group"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRuntimeProtocolProjectionV1 {
     pub epoch: u64,
@@ -411,11 +424,11 @@ impl AppRuntimeHarness {
         clients: &[String],
         visible: bool,
     ) -> Result<(), SubjectError> {
-        if !["relay:shared", "relay:default"].contains(&relay) {
+        if !owns_relay(relay) {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "unknown_relay",
-                "the app-runtime adapter owns only relay:shared",
+                "the app-runtime adapter owns relay:shared and its relay:default alias",
             ));
         }
         if clients
@@ -1834,8 +1847,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         relay: &str,
         outage_ms: u64,
     ) -> Result<(), SubjectError> {
-        if !["relay:shared", "relay:default"].contains(&relay) || !(1..=30_000).contains(&outage_ms)
-        {
+        if !owns_relay(relay) || !(1..=30_000).contains(&outage_ms) {
             return Err(SubjectError::new(
                 "invalid_relay_interruption",
                 "unknown local relay or invalid outage duration",
@@ -1877,6 +1889,10 @@ impl ConvergenceSubject for AppRuntimeHarness {
         name: &str,
         restart_at_offer: bool,
     ) -> Result<(), SubjectError> {
+        // With equal-depth same-epoch branches, convergence's final tip_committer
+        // tie-break favors the smaller identity. The higher-identity invite then
+        // loses. Earlier selector criteria may break the tie (including after a
+        // restart); only an actual rejoin offer below proves this race occurred.
         let (inviter, renamer) =
             if self.account_identity(&actors[0])? < self.account_identity(&actors[1])? {
                 (&actors[1], &actors[0])
@@ -1923,15 +1939,12 @@ impl ConvergenceSubject for AppRuntimeHarness {
         }
         // A barrier alone proves simultaneous calls, not a losing branch. Only
         // a validated rejoin offer and explicit recovery satisfy this action.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        let deadline = tokio::time::Instant::now() + INVITEE_RECOVERY_TIMEOUT;
         loop {
             self.tick(actors).await?;
             match self.tick(&invitees).await {
                 Ok(()) => (),
-                Err(error)
-                    if error.code == "unknown_group"
-                        || (error.category == SubjectFailureCategory::ExpectedRefusal
-                            && error.message.ends_with("unknown_group")) => {}
+                Err(error) if tolerates_unknown_group(&error) => {}
                 Err(error) => return Err(error),
             }
             let status = self.group_recovery_status(invitee).await;
@@ -1986,10 +1999,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                         return Ok(());
                     }
                 }
-                Err(error)
-                    if error.code == "unknown_group"
-                        || (error.category == SubjectFailureCategory::ExpectedRefusal
-                            && error.message.ends_with("unknown_group")) => {}
+                Err(error) if tolerates_unknown_group(&error) => {}
                 Err(error) => return Err(error),
             }
             if tokio::time::Instant::now() >= deadline {

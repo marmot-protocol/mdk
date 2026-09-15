@@ -16,6 +16,15 @@ SPEC.loader.exec_module(campaign)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_weekly_expansion_is_separate_from_baseline_and_pr_ci(self):
+        workflow = (campaign.REPO / ".github/workflows/convergence-hardening.yml").read_text()
+        self.assertNotIn("pull_request:", workflow)
+        self.assertIn("- catalog: baseline", workflow)
+        self.assertIn("- catalog: expansion", workflow)
+        self.assertIn("fail-fast: false", workflow)
+        self.assertIn("--catalog ${{ matrix.catalog }} --generated-only --mode full", workflow)
+        self.assertIn("name: app-catalog-${{ matrix.catalog }}-", workflow)
+
     def test_expansion_selection_excludes_baseline(self):
         args = campaign.parse_args(["unused", "--catalog", "expansion", "--generated-only", "--seeds", "7"])
         tasks = campaign.make_plan(args, {"cgka-conformance-campaign": "campaign"}, {})

@@ -243,11 +243,19 @@ jobs:
           retention-days: ${{ inputs.lane == 'release_hardening' && 180 || 60 }}
 
   app-catalog:
-    name: Weekly public app catalog
+    name: Weekly public app catalog (${{ matrix.catalog }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - catalog: baseline
+            catch-up-parallelism: "8"
+          - catalog: expansion
+            catch-up-parallelism: "1"
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      MDK_APP_CATCH_UP_PARALLELISM: "8"
+      MDK_APP_CATCH_UP_PARALLELISM: ${{ matrix.catch-up-parallelism }}
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -266,18 +274,18 @@ jobs:
         with:
           key: app-catalog
 
-      - name: Run generated canaries and all 72 seed-7 cases
+      - name: Run generated canaries and selected seed-7 catalog
         timeout-minutes: 150
         run: |
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           python3 scripts/app_stack_campaign.py target/app-weekly-catalog \
-            --generated-only --mode full --seeds 7 --jobs 1 --budget-secs 8400
+            --catalog ${{ matrix.catalog }} --generated-only --mode full --seeds 7 --jobs 1 --budget-secs 8400
 
       - name: Upload app catalog evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: app-catalog-${{ github.run_id }}-${{ github.run_attempt }}
+          name: app-catalog-${{ matrix.catalog }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/app-weekly-catalog
             !target/app-weekly-catalog/bin
