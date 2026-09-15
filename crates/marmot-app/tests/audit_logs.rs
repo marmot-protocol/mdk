@@ -48,6 +48,19 @@ async fn capture_one_request(listener: TcpListener, tx: oneshot::Sender<Captured
     let _ = tx.send(request);
 }
 
+/// Reports as soon as TCP is accepted, before any HTTP parse.
+///
+/// Redirect traps must observe a followed hop even when the client starts TLS
+/// or otherwise never writes a plaintext HTTP request. Close the socket after
+/// signaling so leftover I/O cannot stall cleanup.
+async fn observe_one_accept(listener: TcpListener, tx: oneshot::Sender<()>) {
+    let Ok((stream, _)) = listener.accept().await else {
+        return;
+    };
+    let _ = tx.send(());
+    drop(stream);
+}
+
 async fn capture_requests(
     listener: TcpListener,
     tx: oneshot::Sender<Vec<CapturedRequest>>,
@@ -1545,7 +1558,7 @@ async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect()
             let _ = tx.send(request);
         });
         let (sink_tx, mut sink_rx) = oneshot::channel();
-        let sink_server = tokio::spawn(capture_one_request(sink, sink_tx));
+        let sink_server = tokio::spawn(observe_one_accept(sink, sink_tx));
         let err = app
             .post_audit_log_file(
                 &audit_path.to_string_lossy(),
@@ -1564,9 +1577,10 @@ async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect()
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut sink_rx)
                 .await
                 .is_err(),
-            "redirect sink received a request for {status}"
+            "redirect sink accepted a TCP connection for {status}"
         );
         sink_server.abort();
+        let _ = sink_server.await;
         redirect_server.await.unwrap();
     }
 
@@ -1680,6 +1694,23 @@ async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing
         tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
             .await
             .is_err(),
-        "rejected uploads must not open a socket"
+        "mapped IPv6 loopback trap must not receive a connection"
     );
+}
+
+#[tokio::test]
+async fn redirect_trap_observes_raw_tcp_accept_without_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let observer = tokio::spawn(observe_one_accept(listener, tx));
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // TLS record header, not a valid HTTP request.
+    let _ = stream.write_all(&[0x16, 0x03, 0x01, 0x00, 0x01]).await;
+    tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+        .await
+        .expect("raw TCP accept must be observed without HTTP parsing")
+        .expect("observer closed before reporting accept");
+    drop(stream);
+    observer.await.unwrap();
 }

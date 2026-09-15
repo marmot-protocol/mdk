@@ -38,8 +38,8 @@ OTLP export, product analytics, and forensic audit-log POST uploads.
   pin. A `3xx` is a non-success status; no request, body, or bearer token is sent to
   the `Location` target, regardless of original or target scheme.
 - Keep TLS verification enabled, including for local HTTPS collectors.
-- DNS and connect are bounded at 10 seconds. Collector export stays inside a 30-second
-  request/attempt limit.
+- DNS and connect are bounded at 10 seconds. The helper's request timeout is 30
+  seconds. It does not wrap resolve-plus-send in an enclosing attempt deadline.
 
 ## Forensic audit upload
 
@@ -59,11 +59,14 @@ checkpointing, and header set.
 
 ## Timeouts
 
-| Budget | Collector default | Audit upload |
-| --- | --- | --- |
-| DNS / connect | 10s | 10s (helper) |
-| Request | 30s | 60s request override |
-| Enclosing attempt | 30s | 60s network-attempt deadline |
+The shared helper supplies DNS/connect and request bounds only. Enclosing
+attempt deadlines belong to callers.
+
+| Budget | Shared helper | OTLP export | Product analytics | Audit upload |
+| --- | --- | --- | --- | --- |
+| DNS / connect | 10s | 10s (helper) | 10s (helper) | 10s (helper) |
+| Request | 30s | 30s (helper) | 30s (helper) | 60s request override |
+| Enclosing attempt | none | 30s resolve+send wrapper | none on send; 2s explicit-flush wrapper | 60s network-attempt deadline |
 
 ## Residual
 
