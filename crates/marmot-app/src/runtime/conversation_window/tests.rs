@@ -285,7 +285,7 @@ async fn mutations_during_initial_capture_are_reconciled_after_delivery() {
     assert!(sub.snapshot.draft.draft.is_none());
     let updated = next(&mut sub).await;
     assert_eq!(
-        updated.draft.draft.unwrap().content,
+        updated.draft.draft.as_ref().unwrap().content,
         "arrived during capture"
     );
     assert!(
@@ -475,8 +475,7 @@ async fn draft_acceptance_cannot_erase_newer_edit_and_unrelated_signals_do_not_r
     assert!(f.store.clear_message_draft_if_revision(&accepted).is_err());
     let refreshed = next(&mut sub).await;
     assert_eq!(refreshed.draft.draft.unwrap().content, "new edit");
-    // The initial Latest outcome has now normalized to Retained. An unchanged
-    // account-wide invalidation may read once but must not create a redraw loop.
+    // An unchanged account-wide invalidation may read once but must not create a redraw loop.
     let before = f.captures.load(Ordering::SeqCst);
     f.signal();
     assert!(
@@ -613,5 +612,81 @@ async fn closed_session_storage_terminates_retry_and_missing_jump_recovers_origi
             .is_err()
     );
     assert!(sub.recv().await.unwrap().is_none());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn latest_follows_arrivals_but_history_paging_retains_the_viewport() {
+    let f = Fixture::new(12).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    f.add_sender(12, &"cc".repeat(32));
+    f.signal();
+    let latest = next(&mut sub).await;
+    assert_eq!(ids(&latest), (8..=12).map(id).collect::<Vec<_>>());
+    assert!(
+        latest
+            .presentation
+            .identities
+            .contains_key(&"cc".repeat(32))
+    );
+    assert!(!latest.page.page().has_more_after);
+    let handle = sub.window_handle();
+    let older = handle
+        .page(&latest.revision, ConversationPageDirection::Older, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        older.anchors[anchor_index(older.anchor).unwrap()].message_id_hex(),
+        id(12)
+    );
+    let _ = next(&mut sub).await;
+    f.add(13);
+    f.signal();
+    let held = next(&mut sub).await;
+    assert_eq!(ids(&held), ids(&older));
+    assert!(held.page.page().has_more_after);
+    let tail = handle.return_to_latest(&held.revision).await.unwrap();
+    assert_eq!(ids(&tail).last(), Some(&id(13)));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn provenance_only_change_is_not_suppressed_as_unchanged_content() {
+    let f = Fixture::new(1).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 1).await;
+    let mut raw = sub.snapshot.page.page().clone();
+    let row = &mut raw.messages[0];
+    row.message_id_hex = id(100);
+    row.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    row.direction = "system".into();
+    row.source_message_id_hex = None;
+    row.plaintext = "unrecognized future system payload".into();
+    let event = StoredAppEvent {
+        group_id_hex: row.group_id_hex.clone(),
+        message_id_hex: row.message_id_hex.clone(),
+        source_message_id_hex: None,
+        source_epoch: row.source_epoch,
+        direction: row.direction.clone(),
+        sender: row.sender.clone(),
+        plaintext: row.plaintext.clone(),
+        kind: row.kind,
+        tags: vec![],
+        recorded_at: 200,
+        received_at: 200,
+        origin_commit_id: Some(id(900)),
+        moderation_grant: false,
+    };
+    let untrusted = f.store.conversation_presentation_page(raw.clone()).unwrap();
+    f.store.record_app_event(&event).unwrap();
+    let trusted = f.store.conversation_presentation_page(raw).unwrap();
+    assert!(untrusted.authenticated_system_content(0).is_none());
+    assert!(trusted.authenticated_system_content(0).is_some());
+    // Even if the presentation parser does not yet interpret this system payload,
+    // the provenance-bearing page has changed and must reach its consumer.
+    let mut before = sub.snapshot.clone();
+    before.page = untrusted;
+    let mut after = before.clone();
+    after.page = trusted;
+    assert!(!after.same_content(&before));
     f.close().await;
 }

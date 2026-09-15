@@ -114,6 +114,8 @@ pub struct ConversationWindowSnapshot {
     pub revision: ConversationWindowRevision,
     pub page: storage_sqlite::ConversationPresentationPage,
     pub presentation: ConversationWindowPresentation,
+    /// Raw retained read intent/counters, including pending invitations. Use
+    /// header participation for effective display policy; this is not an account badge.
     pub read_state: ConversationOpenReadState,
     pub draft: SelectedMessageDraft,
     pub pending_confirmation: bool,
@@ -133,6 +135,10 @@ impl std::fmt::Debug for ConversationWindowSnapshot {
 impl ConversationWindowSnapshot {
     fn same_content(&self, other: &Self) -> bool {
         self.page.page() == other.page.page()
+            && (0..self.anchors.len()).all(|index| {
+                self.page.authenticated_system_content(index).is_some()
+                    == other.page.authenticated_system_content(index).is_some()
+            })
             && self.presentation == other.presentation
             && self.read_state == other.read_state
             && self.draft.revision == other.draft.revision
@@ -469,7 +475,18 @@ fn retain_anchor(
     mut position: ConversationWindowQuery,
     snapshot: &ConversationWindowSnapshot,
 ) -> ConversationWindowQuery {
-    if let Some(index) = anchor_index(snapshot.anchor) {
+    if matches!(
+        snapshot.anchor,
+        ConversationOpenAnchorOutcome::Latest { .. }
+    ) && matches!(
+        position.opening.target,
+        ConversationOpenTarget::Latest | ConversationOpenTarget::Automatic
+    ) {
+        // Tail mode includes new arrivals. Explicit viewport anchors/history
+        // paging leave tail mode until return_to_latest is requested.
+        position.opening.target = ConversationOpenTarget::Latest;
+        position.before_anchor = None;
+    } else if let Some(index) = anchor_index(snapshot.anchor) {
         position.opening.target = ConversationOpenTarget::Anchor(snapshot.anchors[index].clone());
         position.before_anchor = Some(index);
     } else {
@@ -509,6 +526,13 @@ fn command_position(
         Action::Page(direction, count) => {
             if !(1..=CONVERSATION_WINDOW_MAX_ROWS).contains(count) {
                 return Err(ConversationWindowError::InvalidLimit);
+            }
+            if *direction == ConversationPageDirection::Older
+                && matches!(next.opening.target, ConversationOpenTarget::Latest)
+                && let Some(anchor) = current.anchors.last()
+            {
+                next.opening.target = ConversationOpenTarget::Anchor(anchor.clone());
+                next.before_anchor = Some(current.anchors.len() - 1);
             }
             let old_limit = next.opening.limit;
             next.opening.limit = (old_limit + count).min(CONVERSATION_WINDOW_MAX_ROWS);

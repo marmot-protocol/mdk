@@ -39,8 +39,15 @@ outbox acceptance clears only the submitted revision. See the
 
 C5's shared conversation presentation builds a compact header, shared capability hints and a complete dictionary
 for its bounded visible identity references from local caches. Native management policy delegates to the same
-Rust selector. The combined live screen is a later slice; see the
+Rust selector; see the
 [conversation presentation contract](../../docs/marmot-architecture/further-context/conversation-presentation.md).
+
+`MarmotAppRuntime::open_conversation_window` combines that presentation with bounded history, retained read
+state and the selected draft in one initial/live Rust handle. It opens at first unread or latest, follows new
+arrivals in latest mode, preserves explicit/history anchors, and serializes paging with refreshes. Capture
+failures retain timed retries; account teardown and subscription drop close the handle. It never marks read
+or loads attachment bytes. Native handles remain C5 M5; see the
+[live conversation contract](../../docs/marmot-architecture/further-context/conversation-live-window-plan.md).
 
 New-account bootstrap publishes the required NIP-65 kind `10002` and inbox kind `10050` relay-list events, a
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. KeyPackages are

@@ -98,8 +98,10 @@ read counters; effective participation and actions come from the header capabili
 
 `window_handle()` provides independent `page(Older | Newer)`, `set_visible_anchor`,
 `jump_to_message` and `return_to_latest` commands. Each carries the current generation/sequence;
-a generation belongs to one open handle. Invalid/stale requests fail explicitly. Normal refreshes
-retain the selected message and context rather than recalculating first unread. Paging retains
+a generation belongs to one open handle. Invalid/stale requests fail explicitly. Latest mode
+follows new arrivals. First-unread opening, an explicit visible anchor or paging into history
+retains that message and context; ordinary updates never recalculate first unread. The client
+explicitly returns to latest to resume following the tail. Paging retains
 at most 200 rows: to continue beyond that context, the client reports its new visible anchor.
 Pixel offsets and read acknowledgements remain separate client actions.
 
