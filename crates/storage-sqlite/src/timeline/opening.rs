@@ -122,15 +122,7 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         query: ConversationWindowQuery,
     ) -> Result<ConversationOpenSnapshot, ConversationOpenError> {
-        if !(1..=MAX_TIMELINE_LIMIT).contains(&query.opening.limit) {
-            return Err(ConversationOpenError::InvalidLimit);
-        }
-        if query
-            .before_anchor
-            .is_some_and(|before| before >= query.opening.limit)
-        {
-            return Err(ConversationOpenError::InvalidAnchorPosition);
-        }
+        validate_window_query(&query)?;
         let conn = self.lock()?;
         let transaction = if conn.is_autocommit() {
             Some(conn.unchecked_transaction().storage()?)
@@ -218,7 +210,7 @@ fn opening_read_state_tx(
     })
 }
 
-fn opening_tx(
+pub(super) fn opening_tx(
     conn: &Connection,
     group: &str,
     query: ConversationOpenQuery,
@@ -424,6 +416,21 @@ fn neighbor_key(
         Ok((class, i64_to_u64(primary)?, phase, i64_to_u64(at)?, id))
     })
     .transpose()
+}
+
+pub(super) fn validate_window_query(
+    query: &ConversationWindowQuery,
+) -> Result<(), ConversationOpenError> {
+    if !(1..=MAX_TIMELINE_LIMIT).contains(&query.opening.limit) {
+        return Err(ConversationOpenError::InvalidLimit);
+    }
+    if query
+        .before_anchor
+        .is_some_and(|before| before >= query.opening.limit)
+    {
+        return Err(ConversationOpenError::InvalidAnchorPosition);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

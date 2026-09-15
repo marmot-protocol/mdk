@@ -230,61 +230,19 @@ impl SqliteAccountStorage {
         &self,
         group: &str,
     ) -> StorageResult<Option<ChatPresentationInput>> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let input = conn.query_row(
-                "SELECT m.store_epoch, r.presentation_source_revision, a.profile_name, a.member_count,
-                        a.image_hash_hex, a.image_key_hex, a.image_nonce_hex, a.image_upload_key_hex,
-                        a.image_media_type,
-                        (SELECT component_data_hex FROM account_group_app_components c
-                         WHERE c.group_id_hex = a.group_id_hex AND c.component_id = ?2),
-                        r.presentation_row_epoch, a.self_membership
-                 FROM chat_list_rows r JOIN account_groups a ON a.group_id_hex = r.group_id_hex
-                 CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
-                params![group, GROUP_AVATAR_URL_COMPONENT_ID],
-                |row| {
-                    let hash: String = row.get(4)?;
-                    let avatar = if hash.is_empty() {
-                        None
-                    } else {
-                        Some(ChatListAvatar {
-                            image_hash_hex: hash,
-                            image_key_hex: row.get(5)?,
-                            image_nonce_hex: row.get(6)?,
-                            image_upload_key_hex: row.get(7)?,
-                            media_type: row.get(8)?,
-                        })
-                    };
-                    let component: Option<String> = row.get(9)?;
-                    Ok(ChatPresentationInput {
-                        group_id_hex: group.to_owned(),
-                        row_epoch: row.get(10)?,
-                        self_membership: crate::SelfMembership::from_storage(&row.get::<_, String>(11)?),
-                        source_version: ChatPresentationVersion {
-                            store_epoch: row.get(0)?,
-                            revision: nonnegative(row, 1)?,
-                        },
-                        group_name: row.get(2)?,
-                        member_count: row.get::<_, Option<i64>>(3)?
-                            .and_then(|count| u64::try_from(count).ok()),
-                        members: Vec::new(),
-                        avatar_url: crate::chat_list::decoded_avatar_url(component.as_deref()),
-                        avatar,
-                    })
-                },
-            ).optional().storage()?;
-            let Some(mut input) = input else {
-                return Ok(None);
-            };
-            let mut query = conn.prepare_cached(
-                "SELECT member_id_hex FROM chat_presentation_members
-                 WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3",
-            ).storage()?;
-            input.members = query.query_map([group], |row| row.get::<_, String>(0))
-                .storage()?.collect::<rusqlite::Result<Vec<_>>>().storage()?;
-            Ok(Some(input))
-        })
+        let conn = self.lock()?;
+        let owned = if conn.is_autocommit() {
+            Some(conn.unchecked_transaction().storage()?)
+        } else {
+            None
+        };
+        let input = presentation_input_tx(&conn, group)?;
+        if let Some(tx) = owned {
+            tx.commit().storage()?;
+        }
+        Ok(input)
     }
+
     /// Account orchestration supplies the complete authoritative two-member roster, including named groups.
     /// Other roster sizes/unknown membership clear peer evidence. Does not alter direct-chat reuse policy.
     pub fn set_chat_presentation_members(
@@ -617,4 +575,73 @@ impl SqliteAccountStorage {
             presentation_version,
         }))
     }
+}
+
+/// Shared by the keyed read and the atomic conversation capture.
+pub(crate) fn presentation_input_tx(
+    conn: &rusqlite::Connection,
+    group: &str,
+) -> StorageResult<Option<ChatPresentationInput>> {
+    let input = conn
+        .query_row(
+            "SELECT m.store_epoch, r.presentation_source_revision, a.profile_name, a.member_count,
+                a.image_hash_hex, a.image_key_hex, a.image_nonce_hex, a.image_upload_key_hex,
+                a.image_media_type,
+                (SELECT component_data_hex FROM account_group_app_components c
+                 WHERE c.group_id_hex = a.group_id_hex AND c.component_id = ?2),
+                r.presentation_row_epoch, a.self_membership
+         FROM chat_list_rows r JOIN account_groups a ON a.group_id_hex = r.group_id_hex
+         CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
+            params![group, GROUP_AVATAR_URL_COMPONENT_ID],
+            |row| {
+                let hash: String = row.get(4)?;
+                let avatar = if hash.is_empty() {
+                    None
+                } else {
+                    Some(ChatListAvatar {
+                        image_hash_hex: hash,
+                        image_key_hex: row.get(5)?,
+                        image_nonce_hex: row.get(6)?,
+                        image_upload_key_hex: row.get(7)?,
+                        media_type: row.get(8)?,
+                    })
+                };
+                let component: Option<String> = row.get(9)?;
+                Ok(ChatPresentationInput {
+                    group_id_hex: group.to_owned(),
+                    row_epoch: row.get(10)?,
+                    self_membership: crate::SelfMembership::from_storage(
+                        &row.get::<_, String>(11)?,
+                    ),
+                    source_version: ChatPresentationVersion {
+                        store_epoch: row.get(0)?,
+                        revision: nonnegative(row, 1)?,
+                    },
+                    group_name: row.get(2)?,
+                    member_count: row
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|count| u64::try_from(count).ok()),
+                    members: Vec::new(),
+                    avatar_url: crate::chat_list::decoded_avatar_url(component.as_deref()),
+                    avatar,
+                })
+            },
+        )
+        .optional()
+        .storage()?;
+    let Some(mut input) = input else {
+        return Ok(None);
+    };
+    let mut query = conn
+        .prepare_cached(
+            "SELECT member_id_hex FROM chat_presentation_members
+         WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3",
+        )
+        .storage()?;
+    input.members = query
+        .query_map([group], |row| row.get::<_, String>(0))
+        .storage()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .storage()?;
+    Ok(Some(input))
 }

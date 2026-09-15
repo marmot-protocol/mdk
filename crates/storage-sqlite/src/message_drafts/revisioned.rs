@@ -235,7 +235,7 @@ fn check_revision_tx(
     Ok(())
 }
 
-fn selected_tx(conn: &Connection, group: &str) -> StorageResult<SelectedMessageDraft> {
+pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<SelectedMessageDraft> {
     let revision = revision_tx(conn, group)?;
     let mut draft = conn
         .query_row_cached(

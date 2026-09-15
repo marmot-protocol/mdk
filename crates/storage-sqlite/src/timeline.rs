@@ -1,3 +1,5 @@
+mod capture;
+pub use capture::ConversationAccountSnapshot;
 mod opening;
 mod presentation;
 pub use opening::{

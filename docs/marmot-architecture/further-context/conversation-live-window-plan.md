@@ -30,12 +30,14 @@ M5 exports native handles. The account badge correction #1847 is independent.
 
 ## Implementation checkpoints within M4
 
-1. **Viewport placement primitive — started.** `conversation_window` adds explicit context before
+1. **Viewport placement primitive — implemented.** `conversation_window` adds explicit context before
    a retained anchor over M1's read/recovery implementation. Test extension in both directions,
    edge filling, anchor removal and unchanged read intent; retain M1's bounded-query tests.
-2. **Coherent capture — next.** Capture timeline/provenance, selected presentation inputs,
-   read state and revisioned draft in a single deferred account read. Establish a compact,
-   revision-bound authority capture before composing header capabilities.
+2. **Coherent capture — account boundary implemented; engine authority remains.**
+   `conversation_account_snapshot` captures timeline/provenance, selected presentation inputs,
+   read state, revisioned draft descriptors and persisted archive/admin/leave controls in one
+   deferred read. A concurrent WAL writer test verifies that every field stays on the same
+   snapshot. The combined screen still needs compact, revision-bound engine authority.
 3. **Actor and handles.** Attach projection/group, draft, relevant profile, presentation and reset
    sources; serialize page/anchor/latest requests; deliver complete replacements with retries.
 4. **Adversarial integration coverage.** Race initial read vs mutations, concurrent receive/page,
@@ -57,6 +59,11 @@ shippable screen APIs. The combined contract must pass before the M4 PR is ready
 | `marmot-app/src/client/mod.rs::group_mls_state_unchecked` | Reads a group record including its members; lifecycle also comes from the in-memory epoch manager. When lifecycle support is not enabled it calls the engine's MLS-backed blocker query. Not yet a compact screen-capture path. |
 | `cgka-engine/src/disband.rs::disbanding_support_blockers` | Loads OpenMLS state and examines leaf support. Calling this per message/profile/draft refresh would reintroduce roster work. Do not guess an empty blocker set or fabricate enabled actions. |
 | #1793 | Still open and separately owned. Removes the whole-account lookup for one group; does not alone solve compact engine authority or cross-source coherence. |
+
+The existing `presentation_source_revision` cannot serve as an authority revision: migration 0065
+invalidates it for title/avatar/member presentation changes, not admin policy or engine lifecycle.
+The startup/recovery `GroupReadSnapshot` freezes engine facts before network work while account
+storage can advance. Zipping its MLS state with a fresh account capture is therefore not coherent.
 
 Before the actor is wired, pin how the account worker supplies compact authority and its
 frontier during startup, ordinary operation and recovery. Prototype against both live and

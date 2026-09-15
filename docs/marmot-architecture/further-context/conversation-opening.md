@@ -51,6 +51,16 @@ with its durable read marker and chat-list summary. `ReadStateNotReady` asks the
 or refresh that group before retrying. It does not trigger a history scan on the opening path. Raw unread counters
 are deliberately distinct from C4 attention eligibility, which suppresses pending/archived/departed conversations.
 
+M4 also adds `conversation_account_snapshot`: the opening page and read state, authenticated system-row
+provenance, selected title/avatar inputs, revisioned draft descriptors, and persisted archive/admin/leave controls
+share the same deferred transaction. It moves the timeline into the immutable provenance page, without copying a
+second transcript. The keyed presentation-input getter now uses a deferred read as well. A second WAL connection
+can commit during either read; those changes appear on the next snapshot.
+
+This is the account-data boundary, not an engine authority capture. In-memory lifecycle and MLS-backed capability
+facts must still be captured coherently by the worker before the live screen API can compose them. Directory
+identity enrichment remains a separate consistency domain.
+
 ## Inputs to later screen composition
 
 The compact header should combine keyed group lifecycle state (pending, accepted, leaving/departed and reason),

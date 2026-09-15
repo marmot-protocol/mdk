@@ -32,6 +32,11 @@ C5 M3 adds shared Rust conversation capabilities and a bounded identity presenta
 authors and commit-attributed system references. The combined live window/native screen API remains M4/M5.
 See [shared conversation presentation](../further-context/conversation-presentation.md).
 
+C5 M4 preparation adds explicit viewport placement and a single deferred account capture of history/provenance,
+read state, draft descriptors and persisted header inputs. Compact engine authority and the live actor are still
+in progress; this storage boundary does not expose the combined screen API. See the
+[live conversation implementation plan](../further-context/conversation-live-window-plan.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
