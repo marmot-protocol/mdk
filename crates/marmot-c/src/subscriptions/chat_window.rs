@@ -592,17 +592,104 @@ mod tests {
             );
             assert!(update.is_null());
             // Borrow a token from the still-owned snapshot; free returned drafts independently.
+            let attachment_id = c"missing";
+            let mut found = 99;
+            let mut bytes = ptr::dangling_mut();
+            let mut bytes_len = 99;
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    attachment_id.as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!((found, bytes.is_null(), bytes_len), (0, true, 0));
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    attachment_id.as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    ptr::null_mut(),
+                ),
+                MarmotStatus::NullPointer
+            );
+            let attachment = crate::types::draft::MarmotMessageDraftAttachmentInput {
+                id: c"empty".as_ptr(),
+                file_name: c"empty.txt".as_ptr(),
+                media_type: c"text/plain".as_ptr(),
+                plaintext: ptr::null(),
+                plaintext_len: 0,
+                dim: ptr::null(),
+                thumbhash: ptr::null(),
+                has_duration_seconds: 0,
+                duration_seconds: 0.0,
+                waveform_samples: ptr::null(),
+                waveform_samples_len: 0,
+            };
+            let mut edited = ptr::null_mut();
+            assert_eq!(
+                marmot_save_message_draft_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    c"edited".as_ptr(),
+                    ptr::null(),
+                    &attachment,
+                    1,
+                    &mut edited,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*edited).revision,
+                    c"empty".as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!((found, bytes_len), (1, 0));
+            crate::marmot_bytes_free(bytes, bytes_len);
+            found = 99;
+            bytes = ptr::dangling_mut();
+            bytes_len = 99;
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    c"empty".as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::MessageDraftRevisionConflict
+            );
+            assert_eq!((found, bytes.is_null(), bytes_len), (0, true, 0));
             let mut selected = ptr::null_mut();
             assert_eq!(
                 marmot_clear_message_draft_if_revision(
                     &client,
                     account.as_ptr(),
-                    (*initial).draft.revision,
+                    (*edited).revision,
                     &mut selected
                 ),
                 MarmotStatus::Ok
             );
             marmot_selected_message_draft_free(selected);
+            marmot_selected_message_draft_free(edited);
             marmot_conversation_window_snapshot_free(initial);
             assert_eq!(
                 marmot_conversation_window_subscription_cancel(window),

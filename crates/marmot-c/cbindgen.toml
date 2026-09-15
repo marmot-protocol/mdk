@@ -36,6 +36,8 @@ prefix = ""
 # by any signature, so cbindgen would drop the constants consumers need.
 include = [
     "MarmotChatListPageDirection",
+    "MarmotConversationOpenMode",
+    "MarmotConversationPageDirection",
     "MarmotRelayPolicy",
     "MarmotPublisherRecord",
     "MarmotPublisherTrust",

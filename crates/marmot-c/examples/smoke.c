@@ -21,6 +21,12 @@
 
 #include <marmot.h>
 
+_Static_assert(MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC == 0, "automatic ABI value");
+_Static_assert(MARMOT_CONVERSATION_OPEN_MODE_LATEST == 1, "latest ABI value");
+_Static_assert(MARMOT_CONVERSATION_OPEN_MODE_MESSAGE == 2, "message ABI value");
+_Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER == 0, "older ABI value");
+_Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_NEWER == 1, "newer ABI value");
+
 static int failures = 0;
 
 static void ok(const char *what) {
@@ -116,9 +122,9 @@ int main(int argc, char **argv) {
     marmot_conversation_window_snapshot_free(NULL);
     marmot_selected_message_draft_free(NULL);
     marmot_conversation_window_subscription_free(NULL);
-    check(marmot_open_conversation_window(NULL, NULL, NULL, 0, NULL, NULL, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
+    check(marmot_open_conversation_window(NULL, NULL, NULL, MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC, NULL, NULL, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
           "conversation open preflights outputs");
-    check(marmot_conversation_window_subscription_page(NULL, NULL, 0, 1, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
+    check(marmot_conversation_window_subscription_page(NULL, NULL, MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER, 1, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
           "conversation page preflights outputs");
     check(marmot_conversation_window_subscription_cancel(NULL) == MARMOT_STATUS_NULL_POINTER,
           "conversation cancel rejects NULL handle");

@@ -1007,6 +1007,45 @@ impl From<marmot_app::ChatListWindowError> for MarmotKitError {
 mod screen_error_tests {
     use super::*;
     #[test]
+    fn conversation_errors_preserve_retry_revision_and_close_classification() {
+        use marmot_app::ConversationWindowError as W;
+        use std::sync::Arc;
+        assert!(matches!(
+            MarmotKitError::from(W::InvalidLimit),
+            MarmotKitError::ConversationWindowInvalidLimit
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::StaleWindow),
+            MarmotKitError::ConversationWindowStale
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::AnchorOutsideWindow),
+            MarmotKitError::ConversationWindowAnchorOutside
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::NotReady),
+            MarmotKitError::ConversationWindowNotReady
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::Closed),
+            MarmotKitError::ConversationWindowClosed
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::App(Arc::new(AppError::Storage(
+                cgka_traits::storage::StorageError::Busy("busy".into())
+            )))),
+            MarmotKitError::StorageBusy { .. }
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::App(Arc::new(AppError::RuntimeStopping))),
+            MarmotKitError::RuntimeStopping
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::App(Arc::new(AppError::MessageDraftRevisionConflict))),
+            MarmotKitError::MessageDraftRevisionConflict
+        ));
+    }
+    #[test]
     fn shared_screen_errors_preserve_retry_and_close_classification() {
         use marmot_app::ChatListWindowError as W;
         use std::sync::Arc;

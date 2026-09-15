@@ -123,7 +123,8 @@ unsafe fn read_revision(
 
 /// Apply against the installed revision. May run while next waits; deduplicate completions by
 /// generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
-/// timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+/// timeout through next; refresh before retrying. Extend history around the visible anchor;
+/// paging preserves that anchor at the retained-row cap.
 /// # Safety
 /// sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 #[unsafe(no_mangle)]
@@ -153,7 +154,8 @@ pub unsafe extern "C" fn marmot_conversation_window_subscription_page(
 
 /// Apply against the installed revision. May run while next waits; deduplicate completions by
 /// generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
-/// timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+/// timeout through next; refresh before retrying. Report a row in the installed window as
+/// the visible anchor; this does not acknowledge reads or encode pixel offsets.
 /// # Safety
 /// sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 #[unsafe(no_mangle)]
@@ -182,7 +184,8 @@ pub unsafe extern "C" fn marmot_conversation_window_subscription_set_visible_anc
 
 /// Apply against the installed revision. May run while next waits; deduplicate completions by
 /// generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
-/// timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+/// timeout through next; refresh before retrying. Center the window on a retained message;
+/// a missing target fails explicitly.
 /// # Safety
 /// sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 #[unsafe(no_mangle)]
@@ -211,7 +214,8 @@ pub unsafe extern "C" fn marmot_conversation_window_subscription_jump_to_message
 
 /// Apply against the installed revision. May run while next waits; deduplicate completions by
 /// generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
-/// timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+/// timeout through next; refresh before retrying. Move to the latest message and resume
+/// following arrivals, retaining the current row budget.
 /// # Safety
 /// sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 #[unsafe(no_mangle)]

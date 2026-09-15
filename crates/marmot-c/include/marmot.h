@@ -752,6 +752,17 @@ typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_BACKWARD,
 } MarmotChatListPageDirection;
 
+typedef enum MarmotConversationOpenMode {
+  MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC,
+  MARMOT_CONVERSATION_OPEN_MODE_LATEST,
+  MARMOT_CONVERSATION_OPEN_MODE_MESSAGE,
+} MarmotConversationOpenMode;
+
+typedef enum MarmotConversationPageDirection {
+  MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER,
+  MARMOT_CONVERSATION_PAGE_DIRECTION_NEWER,
+} MarmotConversationPageDirection;
+
 /**
  * Relay endpoint policy used by `marmot_client_new_with_options`.
  */
@@ -8721,7 +8732,8 @@ MarmotStatus marmot_open_conversation_window(const struct MarmotClient *client,
 /**
  * Apply against the installed revision. May run while next waits; deduplicate completions by
  * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
- * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * timeout through next; refresh before retrying. Extend history around the visible anchor;
+ * paging preserves that anchor at the retained-row cap.
  * # Safety
  * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
  */
@@ -8735,7 +8747,8 @@ MarmotStatus marmot_conversation_window_subscription_page(const struct MarmotCon
 /**
  * Apply against the installed revision. May run while next waits; deduplicate completions by
  * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
- * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * timeout through next; refresh before retrying. Report a row in the installed window as
+ * the visible anchor; this does not acknowledge reads or encode pixel offsets.
  * # Safety
  * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
  */
@@ -8748,7 +8761,8 @@ MarmotStatus marmot_conversation_window_subscription_set_visible_anchor(const st
 /**
  * Apply against the installed revision. May run while next waits; deduplicate completions by
  * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
- * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * timeout through next; refresh before retrying. Center the window on a retained message;
+ * a missing target fails explicitly.
  * # Safety
  * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
  */
@@ -8761,7 +8775,8 @@ MarmotStatus marmot_conversation_window_subscription_jump_to_message(const struc
 /**
  * Apply against the installed revision. May run while next waits; deduplicate completions by
  * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
- * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * timeout through next; refresh before retrying. Move to the latest message and resume
+ * following arrivals, retaining the current row budget.
  * # Safety
  * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
  */
