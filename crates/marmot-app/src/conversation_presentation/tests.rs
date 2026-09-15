@@ -86,7 +86,14 @@ fn project(
     input: &ChatPresentationInput,
     page: &TimelinePage,
 ) -> ConversationWindowPresentation {
-    app.conversation_window_presentation("alice", input, state(), page)
+    let prepared = prepare(app, page.clone());
+    app.conversation_window_presentation("alice", input, state(), &prepared)
+        .unwrap()
+}
+fn prepare(app: &MarmotApp, page: TimelinePage) -> ConversationPresentationPage {
+    app.account_storage("alice")
+        .unwrap()
+        .conversation_presentation_page(page)
         .unwrap()
 }
 fn profile(app: &MarmotApp, id: &str, name: &str, at: u64) {
@@ -176,6 +183,8 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
         assert_eq!(c.participation, expected);
         assert!(!c.can_send && !c.can_invite && !c.can_disband && !c.can_leave);
         assert!(!a.member_actions(false, false).can_promote);
+        assert_eq!(c.is_self_admin, membership == SelfMembership::Member);
+        assert!(!c.is_last_admin); // Two actual admins in this fixture.
     }
     input.unrecoverable = true;
     assert!(!input.capabilities().can_send);
@@ -344,6 +353,50 @@ fn conversation_system_references_require_matching_stored_commit_provenance() {
     assert_eq!(system.actor.as_ref(), Some(&actor));
     assert_eq!(system.subject.as_ref(), Some(&subject));
     assert!(trusted.identities.contains_key(&subject));
+    // Matching trusted storage must not bless a caller row with different
+    // direction, inner-source provenance or epoch.
+    for forged in 0..3 {
+        let mut altered = row.clone();
+        match forged {
+            0 => altered.direction = "received".into(),
+            1 => altered.source_message_id_hex = Some("ff".repeat(32)),
+            _ => altered.source_epoch = Some(2),
+        }
+        assert!(
+            project(&app, &input, &page(vec![altered])).messages[0]
+                .system
+                .is_none()
+        );
+    }
+    // Capture in the existing caller-owned account transaction; enrichment
+    // happens afterwards. The wrapper owns exactly the checked page.
+    use cgka_traits::StorageProvider;
+    let captured = store
+        .with_transaction::<_, cgka_traits::storage::StorageError, _>(|store| {
+            store.conversation_presentation_page(page(vec![row.clone(); MAX_TIMELINE_LIMIT]))
+        })
+        .unwrap();
+    assert_eq!(captured.page().messages.len(), MAX_TIMELINE_LIMIT);
+    for index in 0..MAX_TIMELINE_LIMIT {
+        assert_eq!(
+            captured.authenticated_system_content(index),
+            Some(row.plaintext.as_str())
+        );
+    }
+    assert!(
+        captured
+            .authenticated_system_content(MAX_TIMELINE_LIMIT)
+            .is_none()
+    );
+    assert_eq!(
+        app.conversation_window_presentation("alice", &input, state(), &captured)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.system.is_some())
+            .count(),
+        MAX_TIMELINE_LIMIT
+    );
     row.plaintext.push(' ');
     assert!(
         project(&app, &input, &page(vec![row])).messages[0]
@@ -357,21 +410,60 @@ fn conversation_scope_and_row_limit_fail_before_directory_hydration() {
     let (_dir, app, mut input) = setup();
     let row = message("22", &"aa".repeat(32));
     assert!(matches!(
-        app.conversation_window_presentation("alice", &input, state(), &page(vec![row])),
+        app.conversation_window_presentation(
+            "alice",
+            &input,
+            state(),
+            &prepare(&app, page(vec![row]))
+        ),
         Err(ConversationPresentationError::GroupMismatch)
     ));
     let row = message(&input.group_id_hex, &"aa".repeat(32));
-    assert!(matches!(
-        app.conversation_window_presentation("alice", &input, state(), &page(vec![row; 201])),
-        Err(ConversationPresentationError::LimitExceeded)
-    ));
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .conversation_presentation_page(page(vec![row; 201]))
+            .is_err()
+    );
     // Opaque MLS ids are not pubkeys or 32-byte routing ids. The input id is
     // not copied into this bounded output, so do not impose a new length rule.
     input.group_id_hex = "ab".repeat(600);
     project(&app, &input, &page(vec![]));
     input.source_version.store_epoch = vec![0; 32];
     assert!(matches!(
-        app.conversation_window_presentation("alice", &input, state(), &page(vec![])),
+        app.conversation_window_presentation(
+            "alice",
+            &input,
+            state(),
+            &prepare(&app, page(vec![]))
+        ),
         Err(ConversationPresentationError::StoreMismatch)
     ));
+}
+
+#[test]
+fn conversation_prepared_page_cannot_cross_account_stores() {
+    let (_dir, app, input) = setup();
+    let (_other_dir, other, _) = setup();
+    let prepared = prepare(&other, page(vec![]));
+    assert!(matches!(
+        app.conversation_window_presentation("alice", &input, state(), &prepared),
+        Err(ConversationPresentationError::StoreMismatch)
+    ));
+}
+
+#[test]
+fn conversation_peer_avatar_keys_match_header_and_change_with_store_identity() {
+    let (_dir, app, mut input) = setup();
+    let peer = "bb".repeat(32);
+    let fallback = project(&app, &input, &page(vec![]));
+    assert!(fallback.header.selected.avatar == fallback.identities[&peer].avatar);
+    profile(&app, &peer, "Peer", 1);
+    let loaded = project(&app, &input, &page(vec![]));
+    assert!(loaded.header.selected.avatar == loaded.identities[&peer].avatar);
+    let local = app.account_home().account("alice").unwrap().account_id_hex;
+    input.source_version.store_epoch.reverse();
+    input.source_version.store_epoch.push(1);
+    let reset = crate::chat_presentation::select_chat_presentation(&input, &local, None);
+    assert!(reset.avatar != fallback.header.selected.avatar);
 }

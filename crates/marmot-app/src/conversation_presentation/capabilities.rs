@@ -1,5 +1,4 @@
 use crate::{AppGroupLifecycleState, SelfMembership};
-use serde::Serialize;
 
 /// Scalar inputs captured by an account reader. No roster or profile is needed
 /// by the selector. Unknown self membership must be represented by `is_member = false`.
@@ -19,7 +18,8 @@ pub struct ConversationAuthority {
     pub has_disbanding_blockers: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub enum ConversationParticipation {
     PendingInvitation,
     Active,
@@ -30,7 +30,8 @@ pub enum ConversationParticipation {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationCapabilities {
     pub participation: ConversationParticipation,
     pub is_self_admin: bool,
@@ -73,7 +74,10 @@ impl ConversationAuthority {
             && !self.disbanding
             && !self.unrecoverable
             && self.lifecycle != AppGroupLifecycleState::Unrecoverable;
-        let admin = self.is_member && self.is_admin;
+        // Pending confirmation and lifecycle gates affect display actions, not
+        // the observed MLS role. A retained departed roster is no active role.
+        let admin =
+            self.is_member && self.self_membership == SelfMembership::Member && self.is_admin;
         let manage = ordinary && admin;
         ConversationCapabilities {
             participation,

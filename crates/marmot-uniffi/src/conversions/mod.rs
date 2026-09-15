@@ -196,6 +196,8 @@ mod tests {
                 },
             );
             assert!(!state.can_invite, "inactive scenario {scenario}");
+            assert_eq!(state.is_self_admin, matches!(scenario, 0 | 3));
+            assert_eq!(state.is_last_admin, matches!(scenario, 0 | 3));
             assert!(!state.requires_self_demote_before_leave);
             assert!(!state.can_disband);
         }

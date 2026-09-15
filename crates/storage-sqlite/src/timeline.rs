@@ -5,6 +5,7 @@ pub use opening::{
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenSnapshot,
     ConversationOpenTarget,
 };
+pub use presentation::ConversationPresentationPage;
 
 use crate::connection::CachedSql;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

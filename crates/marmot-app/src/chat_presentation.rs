@@ -9,7 +9,7 @@ use storage_sqlite::{
 };
 
 /// Determine the eligible peer without selecting text, avatars, or cache keys.
-fn presentation_peer(input: &ChatPresentationInput, local_id: &str) -> Option<String> {
+pub(crate) fn presentation_peer(input: &ChatPresentationInput, local_id: &str) -> Option<String> {
     let local_id = canonical_identity(local_id);
     let members: Option<Vec<_>> = input
         .members
@@ -96,25 +96,14 @@ pub(crate) fn select_chat_presentation(
             PresentationSource::UnknownFallback,
         )
     };
-    // Resetting an account store deliberately changes its cache namespace. Refetching is the
-    // accepted cost of preventing old-store avatar reuse after identity/storage replacement.
     let key = |subject: &str, kind: &str, parts: &[&str]| {
-        let mut digest = Sha256::new();
-        for part in [
-            b"mdk-chat-presentation-v1".as_slice(),
-            input.source_version.store_epoch.as_slice(),
-            local_id.as_deref().unwrap_or("").as_bytes(),
-            input.group_id_hex.as_bytes(),
-            subject.as_bytes(),
-            kind.as_bytes(),
-        ]
-        .into_iter()
-        .chain(parts.iter().map(|s| s.as_bytes()))
-        {
-            digest.update((part.len() as u64).to_be_bytes());
-            digest.update(part);
-        }
-        hex::encode(digest.finalize())
+        presentation_cache_key(
+            input,
+            local_id.as_deref().unwrap_or(""),
+            subject,
+            kind,
+            parts,
+        )
     };
     // Valid encrypted group material wins when both group sources are present.
     let (avatar, avatar_source) = if let Some(image) = input.avatar.as_ref().filter(|image| {
@@ -196,6 +185,33 @@ pub(crate) fn select_chat_presentation(
         peer_id: peer,
         resolution,
     }
+}
+
+/// One key framing for selected headers and window identities. Preserve the
+/// shipped domain and framing so the same avatar uses the same cache entry.
+pub(crate) fn presentation_cache_key(
+    input: &ChatPresentationInput,
+    local_id: &str,
+    subject: &str,
+    kind: &str,
+    parts: &[&str],
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        b"mdk-chat-presentation-v1".as_slice(),
+        input.source_version.store_epoch.as_slice(),
+        local_id.as_bytes(),
+        input.group_id_hex.as_bytes(),
+        subject.as_bytes(),
+        kind.as_bytes(),
+    ]
+    .into_iter()
+    .chain(parts.iter().map(|s| s.as_bytes()))
+    {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    hex::encode(digest.finalize())
 }
 
 pub(crate) fn canonical_identity(raw: &str) -> Option<String> {

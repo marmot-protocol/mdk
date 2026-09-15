@@ -3,10 +3,9 @@ use crate::chat_presentation::{canonical_identity, safe_image_url, safe_name};
 use crate::{
     AppError, AppGroupLifecycleState, ConversationPresentation, MarmotApp, SelectedAvatar,
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use storage_sqlite::{ChatPresentationInput, TimelineMessageRecord, TimelinePage};
+pub use storage_sqlite::ConversationPresentationPage;
+use storage_sqlite::{ChatPresentationInput, TimelineMessageRecord};
 
 pub const MAX_CONVERSATION_TAG_SCAN: usize = 256;
 pub const MAX_CONVERSATION_MENTIONS: usize = 8;
@@ -16,7 +15,10 @@ pub const MAX_CONVERSATION_IDENTITIES: usize = crate::MAX_TIMELINE_LIMIT
     * (4 + 2 * MAX_CONVERSATION_MENTIONS
         + MAX_CONVERSATION_REACTION_KINDS * MAX_CONVERSATION_REACTOR_PREVIEWS)
     + 1;
-pub const MAX_CONVERSATION_PRESENTATION_BYTES: usize = 32 * 1024 * 1024;
+/// Conservative serialized upper bound implied by field/collection limits;
+/// verified in tests, without encoding the screen on every read/refresh.
+pub const MAX_CONVERSATION_PRESENTATION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_MEDIA_TYPE_BYTES: usize = 128;
 const MAX_REFERENCE_BYTES: usize = 1024;
 const MAX_NAME_BYTES: usize = 256;
 
@@ -30,7 +32,8 @@ pub struct ConversationHeaderState {
     pub epoch: Option<u64>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationHeader {
     pub selected: ConversationPresentation,
     pub member_count: Option<u64>,
@@ -42,7 +45,8 @@ pub struct ConversationHeader {
     pub capabilities: ConversationCapabilities,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationIdentity {
     pub account_id_hex: String,
     pub display_name: String,
@@ -52,7 +56,8 @@ pub struct ConversationIdentity {
 
 /// `None` means unavailable/malformed identity, not an invitation to look it up.
 /// Every `Some` reference in this projection has an entry in `identities`.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationMessageReferences {
     pub message_id_hex: String,
     pub sender: Option<String>,
@@ -67,21 +72,24 @@ pub struct ConversationMessageReferences {
     pub reactions: ConversationReactions,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationSystemReferences {
     pub system_type: String,
     pub actor: Option<String>,
     pub subject: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationReaction {
     pub emoji: String,
     pub count: usize,
     pub reactors: Vec<String>,
 }
 
-#[derive(Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationReactions {
     pub total_count: usize,
     pub total_kinds: usize,
@@ -93,7 +101,8 @@ pub struct ConversationReactions {
 /// Only these explicit references request resolved identity rendering. Raw
 /// tags/content remain available through the existing narrow timeline API.
 /// Ancillary lists report truncation; aggregate reaction counts stay exact.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationWindowPresentation {
     pub header: ConversationHeader,
     pub messages: Vec<ConversationMessageReferences>,
@@ -146,9 +155,16 @@ impl MarmotApp {
         label: &str,
         input: &ChatPresentationInput,
         state: ConversationHeaderState,
-        page: &TimelinePage,
+        prepared: &ConversationPresentationPage,
     ) -> Result<ConversationWindowPresentation, ConversationPresentationError> {
-        if page.messages.len() > crate::MAX_TIMELINE_LIMIT {
+        let page = prepared.page();
+        if page.messages.len() > crate::MAX_TIMELINE_LIMIT
+            || input
+                .avatar
+                .as_ref()
+                .and_then(|a| a.media_type.as_ref())
+                .is_some_and(|value| value.len() > MAX_IMAGE_MEDIA_TYPE_BYTES)
+        {
             return Err(ConversationPresentationError::LimitExceeded);
         }
         if input.self_membership != state.authority.self_membership {
@@ -156,6 +172,9 @@ impl MarmotApp {
         }
         let account = self.account_home().account(label).map_err(AppError::from)?;
         let storage = self.account_storage(label)?;
+        if prepared.store_epoch() != input.source_version.store_epoch {
+            return Err(ConversationPresentationError::StoreMismatch);
+        }
         if storage
             .chat_presentation_version()
             .map_err(AppError::from)?
@@ -165,27 +184,23 @@ impl MarmotApp {
             return Err(ConversationPresentationError::StoreMismatch);
         }
         let mut ids = BTreeSet::new();
-        // Reuse the existing selector to identify a possible presentation peer.
-        let fallback = crate::chat_presentation::select_chat_presentation(
-            input,
-            &account.account_id_hex,
-            None,
-        );
-        if let Some(peer) = &fallback.peer_id {
+        let peer = crate::chat_presentation::presentation_peer(input, &account.account_id_hex);
+        if let Some(peer) = &peer {
             ids.insert(peer.clone());
         }
         let mut messages = Vec::with_capacity(page.messages.len());
-        for message in &page.messages {
+        for (index, message) in page.messages.iter().enumerate() {
             if message.group_id_hex != input.group_id_hex {
                 return Err(ConversationPresentationError::GroupMismatch);
             }
             if message.message_id_hex.len() > MAX_REFERENCE_BYTES {
                 return Err(ConversationPresentationError::LimitExceeded);
             }
-            let trusted = storage
-                .conversation_system_event_content(message)
-                .map_err(AppError::from)?;
-            let references = message_references(message, trusted.as_deref(), &mut ids);
+            let references = message_references(
+                message,
+                prepared.authenticated_system_content(index),
+                &mut ids,
+            );
             messages.push(references);
         }
         if ids.len() > MAX_CONVERSATION_IDENTITIES {
@@ -199,7 +214,7 @@ impl MarmotApp {
                 let Some(id) = cached.account_id_hex else {
                     continue;
                 };
-                if fallback.peer_id.as_ref() == Some(&id) {
+                if peer.as_ref() == Some(&id) {
                     peer_profile = cached.profile.clone();
                 }
                 identities.insert(
@@ -208,7 +223,8 @@ impl MarmotApp {
                         &id,
                         cached.profile.as_ref(),
                         cached.local_label.as_deref(),
-                        &input.source_version.store_epoch,
+                        input,
+                        &account.account_id_hex,
                     ),
                 );
             }
@@ -218,12 +234,12 @@ impl MarmotApp {
         for id in requested {
             identities
                 .entry(id.clone())
-                .or_insert_with(|| identity(&id, None, None, &input.source_version.store_epoch));
+                .or_insert_with(|| identity(&id, None, None, input, &account.account_id_hex));
         }
         let selected = crate::chat_presentation::select_chat_presentation(
             input,
             &account.account_id_hex,
-            fallback.peer_id.as_deref().zip(peer_profile.as_ref()),
+            peer.as_deref().zip(peer_profile.as_ref()),
         );
         let result = ConversationWindowPresentation {
             header: ConversationHeader {
@@ -240,25 +256,7 @@ impl MarmotApp {
             messages,
             identities,
         };
-        // Count encoded bytes without allocating a second, potentially large
-        // serialized copy. This covers escaping and repeated reference keys.
-        serde_json::to_writer(ByteBudget(MAX_CONVERSATION_PRESENTATION_BYTES), &result)
-            .map_err(|_| ConversationPresentationError::LimitExceeded)?;
         Ok(result)
-    }
-}
-
-struct ByteBudget(usize);
-impl std::io::Write for ByteBudget {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_sub(bytes.len())
-            .ok_or_else(|| std::io::Error::other("conversation presentation byte limit"))?;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -274,7 +272,8 @@ fn identity(
     id: &str,
     profile: Option<&crate::UserProfileMetadata>,
     local_label: Option<&str>,
-    store_epoch: &[u8],
+    input: &ChatPresentationInput,
+    local_id: &str,
 ) -> ConversationIdentity {
     let name = profile.and_then(|p| {
         p.display_name
@@ -288,24 +287,24 @@ fn identity(
     let avatar = profile
         .and_then(|p| p.picture.as_deref())
         .and_then(safe_image_url)
-        .map(|url| {
-            let mut hash = Sha256::new();
-            for part in [
-                b"conversation-identity-avatar-v1".as_slice(),
-                store_epoch,
-                id.as_bytes(),
-                url.as_bytes(),
-            ] {
-                hash.update((part.len() as u64).to_le_bytes());
-                hash.update(part);
-            }
-            SelectedAvatar::RemoteImage {
-                url,
-                cache_key: hex::encode(hash.finalize()),
-            }
+        .map(|url| SelectedAvatar::RemoteImage {
+            cache_key: crate::chat_presentation::presentation_cache_key(
+                input,
+                local_id,
+                id,
+                "peer-url",
+                &[&url],
+            ),
+            url,
         })
         .unwrap_or_else(|| SelectedAvatar::Placeholder {
-            stable_seed: id.to_owned(),
+            stable_seed: crate::chat_presentation::presentation_cache_key(
+                input,
+                local_id,
+                id,
+                "person",
+                &[],
+            ),
             source: crate::PresentationSource::PeerFallback,
         });
     ConversationIdentity {
@@ -439,21 +438,108 @@ mod budget_tests {
     use super::*;
 
     #[test]
-    fn conversation_encoded_byte_budget_counts_json_escaping() {
-        assert!(serde_json::to_writer(ByteBudget(7), &"\n\n\n").is_err());
-        assert!(serde_json::to_writer(ByteBudget(8), &"\n\n\n").is_ok());
-        let id = "bb".repeat(32);
-        let profile = crate::UserProfileMetadata {
-            display_name: Some(format!("\u{202e}{}", "🦫".repeat(5000))),
-            picture: Some("https://127.0.0.1/private".into()),
-            ..Default::default()
+    fn conversation_field_limits_bound_escaped_output_without_runtime_encoding() {
+        let id = "a".repeat(64);
+        // Quotes maximize JSON expansion for sanitized names and normalized
+        // URLs (neither contains ASCII controls). This synthetic URL is a
+        // conservative byte bound, not a valid contact descriptor.
+        let avatar = SelectedAvatar::RemoteImage {
+            url: "\"".repeat(cgka_traits::app_components::GROUP_AVATAR_URL_MAX_LEN),
+            cache_key: id.clone(),
         };
-        let projected = identity(&id, Some(&profile), None, &[1; 16]);
-        assert_eq!(projected.display_name.len(), MAX_NAME_BYTES);
-        assert!(matches!(
-            projected.avatar,
-            SelectedAvatar::Placeholder { .. }
-        ));
+        let identity = ConversationIdentity {
+            account_id_hex: id.clone(),
+            display_name: "\"".repeat(MAX_NAME_BYTES),
+            avatar: avatar.clone(),
+            has_cached_profile: false,
+        };
+        let row = ConversationMessageReferences {
+            message_id_hex: "\u{0000}".repeat(MAX_REFERENCE_BYTES),
+            sender: Some(id.clone()),
+            reply_author: Some(id.clone()),
+            mentions: vec![id.clone(); MAX_CONVERSATION_MENTIONS],
+            mentions_truncated: false,
+            reply_mentions: vec![id.clone(); MAX_CONVERSATION_MENTIONS],
+            reply_mentions_truncated: false,
+            system: Some(ConversationSystemReferences {
+                system_type: "\u{0000}".repeat(MAX_NAME_BYTES),
+                actor: Some(id.clone()),
+                subject: Some(id.clone()),
+            }),
+            reactions: ConversationReactions {
+                total_count: usize::MAX,
+                total_kinds: usize::MAX,
+                omitted_kinds: usize::MAX,
+                items: vec![
+                    ConversationReaction {
+                        emoji: "\u{0000}".repeat(MAX_NAME_BYTES),
+                        count: usize::MAX,
+                        reactors: vec![id.clone(); MAX_CONVERSATION_REACTOR_PREVIEWS],
+                    };
+                    MAX_CONVERSATION_REACTION_KINDS
+                ],
+            },
+        };
+        let authority = ConversationAuthority {
+            is_member: true,
+            self_membership: crate::SelfMembership::Member,
+            is_admin: true,
+            admin_count: 1,
+            pending_confirmation: true,
+            leave_request_pending: false,
+            lifecycle: AppGroupLifecycleState::Stable,
+            unrecoverable: false,
+            disbanding: false,
+            disbanding_enabled: false,
+            has_disbanding_blockers: false,
+        };
+        let header = ConversationHeader {
+            selected: ConversationPresentation {
+                // safe_name takes <=4096 Unicode scalars (<=16384 UTF-8
+                // bytes), with <=2x escaping after stripping controls.
+                title: crate::PresentationText::Literal("\"".repeat(4096 * 4)),
+                avatar,
+                title_source: crate::PresentationSource::UnknownFallback,
+                avatar_source: crate::PresentationSource::UnknownFallback,
+                peer_id: Some(id.clone()),
+                resolution: crate::PresentationResolution::Fallback,
+            },
+            member_count: Some(u64::MAX),
+            archived: false,
+            epoch: Some(u64::MAX),
+            lifecycle: AppGroupLifecycleState::Unrecoverable,
+            disbanding: false,
+            unrecoverable: false,
+            capabilities: authority.capabilities(),
+        };
+        let identity_bytes = serde_json::to_vec(&identity).unwrap().len() + id.len() + 4;
+        let row_bytes = serde_json::to_vec(&row).unwrap().len() + 1;
+        // Fixed slack covers outer field names and enum spelling differences.
+        let bound = identity_bytes * MAX_CONVERSATION_IDENTITIES
+            + row_bytes * crate::MAX_TIMELINE_LIMIT
+            + serde_json::to_vec(&header).unwrap().len()
+            + 1024;
+        assert!(bound < MAX_CONVERSATION_PRESENTATION_BYTES, "{bound}");
+        // The other header avatar variant is smaller, even with max escaping
+        // in its separately capped media type.
+        let encrypted = SelectedAvatar::EncryptedGroupImage {
+            cache_key: id.clone(),
+            image: storage_sqlite::ChatListAvatar {
+                image_hash_hex: id.clone(),
+                image_key_hex: id.clone(),
+                image_nonce_hex: "a".repeat(24),
+                image_upload_key_hex: id,
+                media_type: Some("\u{0000}".repeat(MAX_IMAGE_MEDIA_TYPE_BYTES)),
+            },
+        };
+        assert!(
+            serde_json::to_vec(&encrypted).unwrap().len()
+                < serde_json::to_vec(&identity.avatar).unwrap().len()
+        );
+        let name = safe_name(&format!("\u{0000}\u{202e}{}", "🦫".repeat(300))).unwrap();
+        let bounded = bounded_text(&name, MAX_NAME_BYTES);
+        assert_eq!(bounded.len(), MAX_NAME_BYTES);
+        assert!(bounded.chars().all(|c| c == '🦫'));
     }
 
     #[test]

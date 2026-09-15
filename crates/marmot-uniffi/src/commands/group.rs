@@ -267,26 +267,25 @@ fn ensure_can_remove_members(
     member_refs: &[String],
 ) -> Result<(), MarmotKitError> {
     ensure_group_admin(state, group_id_hex)?;
+    let admin_count = state
+        .member_actions
+        .iter()
+        .filter(|member| member.is_admin)
+        .count();
     for member_ref in member_refs {
-        let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
+        let (action, _) = group_member_action(state, group_id_hex, member_ref)?;
         if action.is_self {
             return Err(MarmotKitError::AdminCannotSelfRemove {
                 group_id_hex: group_id_hex.to_string(),
             });
         }
-        if !action.can_remove && action.is_admin {
+        if action.is_admin && admin_count == 1 {
             return Err(MarmotKitError::WouldRemoveLastAdmin {
                 group_id_hex: group_id_hex.to_string(),
             });
         }
-        if !action.can_remove {
-            return Err(MarmotKitError::Runtime {
-                details: format!(
-                    "member {} cannot be removed from group {}",
-                    normalized.account_id_hex, group_id_hex
-                ),
-            });
-        }
+        // Display gates (pending invitation, frozen/disbanding state) do not
+        // establish a command refusal. The runtime validates current policy.
     }
     Ok(())
 }
@@ -1563,6 +1562,24 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn remove_preflight_uses_role_and_target_not_display_capabilities() {
+        let mut state = state(true, false);
+        let target = state.member_actions[1].member_id_hex.clone();
+        for is_admin in [false, true] {
+            state.member_actions[1].is_admin = is_admin;
+            state.member_actions[1].can_remove = false;
+            assert!(
+                ensure_can_remove_members(&state, "group", std::slice::from_ref(&target)).is_ok()
+            );
+        }
+        let own = state.my_account_id_hex.clone();
+        assert!(matches!(
+            ensure_can_remove_members(&state, "group", &[own]),
+            Err(MarmotKitError::AdminCannotSelfRemove { .. })
+        ));
     }
 
     #[test]

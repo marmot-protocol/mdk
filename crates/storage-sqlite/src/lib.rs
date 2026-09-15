@@ -79,10 +79,11 @@ pub use timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence, ConversationAnchor,
     ConversationOpenAnchorOutcome, ConversationOpenError, ConversationOpenQuery,
     ConversationOpenReadState, ConversationOpenSnapshot, ConversationOpenTarget,
-    LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult, StoredAppEvent,
-    TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget,
-    TimelinePage, TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary,
-    TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
+    ConversationPresentationPage, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
+    SecurePruneAppEventsResult, StoredAppEvent, TimelineMessageChange, TimelineMessageQuery,
+    TimelineMessageRecord, TimelineMessageTarget, TimelinePage, TimelinePagination,
+    TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
+    TimelineUpdateTrigger, TimelineUserReaction,
 };
 pub use transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
