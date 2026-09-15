@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import plistlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -75,6 +76,35 @@ class PrivacyPackagingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             privacy.check_xcframework(xc)
 
+    def test_packaged_source_is_validation_baseline(self):
+        xc, _, manifest = self.artifact("ios")
+        source = self.root / "packaged-source-privacy"
+        shutil.copytree(HERE / "apple-privacy", source)
+        data = plistlib.loads(manifest.read_bytes())
+        data["NSPrivacyCollectedDataTypes"].reverse()
+        (source / "PrivacyInfo.xcprivacy").write_bytes(plistlib.dumps(data))
+        manifest.write_bytes(plistlib.dumps(data))
+        with self.assertRaises(ValueError):
+            privacy.check_xcframework(xc)
+        privacy.check_xcframework(xc, source, False)
+        with self.assertRaises(ValueError):
+            privacy.check_xcframework(xc, source, True)
+
+    def test_zip_preserves_versioned_framework(self):
+        xc, _, _ = self.artifact("macos")
+        archive = self.root / "release.zip"
+        subprocess.run(["zip", "-qry", str(archive), xc.name], cwd=self.root, check=True)
+        extracted = self.root / "extracted"
+        subprocess.run(["unzip", "-q", str(archive), "-d", str(extracted)], check=True)
+        unpacked = extracted / xc.name
+        privacy.check_xcframework(unpacked)
+        current = unpacked / "arm64/marmot_uniffiFFI.framework/Versions/Current"
+        self.assertTrue(current.is_symlink())
+        current.unlink()
+        shutil.copytree(current.parent / "A", current)
+        with self.assertRaises(ValueError):
+            privacy.check_xcframework(unpacked)
+
     def test_input_resource_does_not_count_as_archived(self):
         xc, _, manifest = self.artifact("ios")
         archive = self.root / "Consumer.xcarchive"
@@ -87,11 +117,15 @@ class PrivacyPackagingTests(unittest.TestCase):
         resource = app / "Frameworks/marmot_uniffiFFI.framework/PrivacyInfo.xcprivacy"
         resource.parent.mkdir(parents=True)
         resource.write_bytes(manifest.read_bytes())
-        privacy.check_archive(archive, xc)
+        privacy.check_archive(archive, xc, analytics=False)
+        with self.assertRaises(ValueError):
+            privacy.check_archive(archive, xc, analytics=True)
         embedded_binary = resource.parent / "marmot_uniffiFFI"
         embedded_binary.write_bytes(self.library.read_bytes())
         with self.assertRaises(ValueError):
-            privacy.check_archive(archive, xc)
+            privacy.check_archive(archive, xc, analytics=False)
+        with self.assertRaises(ValueError):
+            privacy.check_archive(archive, xc, analytics=True)
         embedded_binary.unlink()
         resource.unlink()
         with self.assertRaises(ValueError):

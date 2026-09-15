@@ -14,7 +14,6 @@
 # building both in one workspace cannot clobber the iOS artifact.
 
 set -euo pipefail
-umask 077
 
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
 # rust-toolchain.toml is honored and Apple targets are visible.
@@ -105,7 +104,7 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.mo
 python3 "$TOOL_DIR/apple-framework.py" \
   "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
   "$BUILD_DIR/$MACOS_TARGET/marmot_uniffiFFI.framework" macos "$MACOSX_DEPLOYMENT_TARGET" \
-  --privacy-dir "$CRATE_DIR/apple-privacy"
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
   -framework "$BUILD_DIR/$MACOS_TARGET/marmot_uniffiFFI.framework" \

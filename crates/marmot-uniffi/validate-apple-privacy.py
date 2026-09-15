@@ -12,7 +12,7 @@ framework = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(framework)
 
 
-def check_manifest(path):
+def check_manifest(path, privacy_dir=HERE / "apple-privacy", analytics=None):
     with path.open("rb") as f:
         actual = plistlib.load(f)
     if type(actual.get("NSPrivacyTracking")) is not bool:
@@ -38,12 +38,13 @@ def check_manifest(path):
         raise ValueError("required-reason categories/reasons need review")
     # Exact reviewed values also reject unknown keys, invalid types, duplicate
     # categories, missing declarations, and unsupported reason/purpose strings.
-    if actual not in [framework.privacy_manifest(False), framework.privacy_manifest(True)]:
+    variants = (False, True) if analytics is None else (analytics,)
+    if actual not in [framework.privacy_manifest(mode, privacy_dir) for mode in variants]:
         raise ValueError(f"unreviewed or incomplete privacy manifest: {path}")
     return actual
 
 
-def check_xcframework(path):
+def check_xcframework(path, privacy_dir=HERE / "apple-privacy", analytics=None):
     with (path / "Info.plist").open("rb") as f:
         slices = plistlib.load(f)["AvailableLibraries"]
     if not slices:
@@ -54,9 +55,14 @@ def check_xcframework(path):
         if bundle.name != framework.NAME + ".framework":
             raise ValueError("MarmotKit requires resource-bearing static framework slices")
         resource = bundle / ("Resources" if entry["SupportedPlatform"] == "macos" else "")
-        manifests.append(check_manifest(resource / "PrivacyInfo.xcprivacy"))
-        if (bundle / framework.NAME).read_bytes()[:8] != b"!<arch>\n":
-            raise ValueError(f"expected an unchanged static archive: {bundle}")
+        manifests.append(check_manifest(resource / "PrivacyInfo.xcprivacy", privacy_dir, analytics))
+        if entry["SupportedPlatform"] == "macos":
+            for name in ("Versions/Current", framework.NAME, "Headers", "Modules", "Resources"):
+                if not (bundle / name).is_symlink():
+                    raise ValueError(f"missing versioned framework symlink: {bundle / name}")
+        with (bundle / framework.NAME).open("rb") as f:
+            if f.read(8) != b"!<arch>\n":
+                raise ValueError(f"expected an unchanged static archive: {bundle}")
         for relative in [f"Headers/{framework.NAME}.h", "Modules/module.modulemap"]:
             if not (bundle / relative).is_file():
                 raise ValueError(f"missing {bundle / relative}")
@@ -65,8 +71,8 @@ def check_xcframework(path):
     return manifests[0]
 
 
-def check_archive(path, artifact):
-    expected = check_xcframework(artifact)
+def check_archive(path, artifact, privacy_dir=HERE / "apple-privacy", analytics=None):
+    expected = check_xcframework(artifact, privacy_dir, analytics)
     apps = list((path / "Products/Applications").glob("*.app"))
     if len(apps) != 1:
         raise ValueError("expected one consuming app in archive")
@@ -77,7 +83,7 @@ def check_archive(path, artifact):
     manifest = bundle / ("Resources" if macos else "") / "PrivacyInfo.xcprivacy"
     if not manifest.is_file():
         raise ValueError("MarmotKit privacy resource did not reach the archived app")
-    if check_manifest(manifest) != expected:
+    if check_manifest(manifest, privacy_dir, analytics) != expected:
         raise ValueError("archived SDK privacy resource differs from the input artifact")
     for binary in apps[0].rglob(framework.NAME):
         if binary.is_file():
@@ -92,14 +98,13 @@ if __name__ == "__main__":
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--product-analytics", choices=["0", "1", "true", "false"])
+    parser.add_argument("--privacy-dir", type=Path, default=HERE / "apple-privacy")
     args = parser.parse_args()
+    analytics = None if args.product_analytics is None else args.product_analytics in ("1", "true")
     if args.archive:
-        check_archive(args.archive, args.artifact)
+        check_archive(args.archive, args.artifact, args.privacy_dir, analytics)
     elif args.artifact.suffix == ".xcprivacy":
-        check_manifest(args.artifact)
+        check_manifest(args.artifact, args.privacy_dir, analytics)
     else:
-        actual = check_xcframework(args.artifact)
-        if args.product_analytics is not None and actual != framework.privacy_manifest(
-                args.product_analytics in ("1", "true")):
-            raise ValueError("privacy resource does not match packaged product-analytics feature")
+        check_xcframework(args.artifact, args.privacy_dir, analytics)
     print("Validated MarmotKit privacy resources (not App Store upload validation)")

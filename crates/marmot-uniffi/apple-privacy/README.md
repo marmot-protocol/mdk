@@ -106,7 +106,7 @@ or a successful SwiftPM library link is not archive evidence.
 ## Validation and host adoption
 
 Run the resource-loss tests and both platform validators. For full artifact and
-app-archive checks (XcodeGen is required):
+app-archive checks (XcodeGen is required; local validation used 2.44.1):
 
 ```sh
 python3 crates/marmot-uniffi/test-apple-privacy.py
@@ -118,9 +118,18 @@ python3 crates/marmot-uniffi/validate-apple-archive.py ios crates/marmot-uniffi/
 python3 crates/marmot-uniffi/validate-apple-archive.py macos crates/marmot-uniffi/output/macos/MarmotKit.xcframework crates/marmot-uniffi/output/macos/MarmotKit.swift /tmp/mdk-macos-privacy-consumer
 ```
 
+The archive validator also accepts the packaged `.xcframework.zip` in place of
+the XCFramework directory; use that ZIP for release validation. Pass
+`--privacy-dir <packaged-source>/crates/marmot-uniffi/apple-privacy` when the
+source differs from the builder, and `--product-analytics 1` (or `0`) to require
+the declarations for the built feature. The shell artifact validators honor
+`MARMOTKIT_CRATE_DIR` and, when supplied, `PRODUCT_ANALYTICS_EXPORT`.
+
 Each archive work directory must be new. The generated test app has no host
-privacy manifest or custom resource-copy phase. CI runs the archive check before
-uploading Apple artifacts. The checker inspects only `Products/Applications`
+privacy manifest or custom resource-copy phase. CI builds the consumer from the packaged SwiftPM ZIP before
+uploading Apple artifacts. macOS uses ad-hoc signing and strict signature
+verification. The device iOS fixture is unsigned because development signing
+requires a certificate/profile; a signed host archive remains a release check. The checker inspects only `Products/Applications`
 in the archive and compares the embedded SDK manifest to the artifact's manifest.
 It fails if resources exist only in the input XCFramework or DerivedData.
 

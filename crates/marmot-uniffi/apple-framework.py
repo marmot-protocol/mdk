@@ -3,7 +3,6 @@
 
 import argparse
 import hashlib
-import os
 from pathlib import Path
 import plistlib
 import shutil
@@ -43,7 +42,14 @@ def stage(library, headers, output, platform, minimum, analytics, privacy_dir):
     (root / "Headers").mkdir()
     (root / "Modules").mkdir()
     shutil.copyfile(library, root / NAME)
-    assert hashlib.sha256(library.read_bytes()).digest() == hashlib.sha256((root / NAME).read_bytes()).digest()
+    def digest(path):
+        value = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                value.update(chunk)
+        return value.digest()
+    if digest(library) != digest(root / NAME):
+        raise ValueError("framework staging changed Cargo archive bytes")
     shutil.copyfile(headers / (NAME + ".h"), root / "Headers" / (NAME + ".h"))
     # Keep the generated C module's name and declarations; only its packaging changes.
     modulemap = (headers / "module.modulemap").read_text()
@@ -59,7 +65,6 @@ def stage(library, headers, output, platform, minimum, analytics, privacy_dir):
 
 
 if __name__ == "__main__":
-    os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library", type=Path)
     parser.add_argument("headers", type=Path)
@@ -67,5 +72,7 @@ if __name__ == "__main__":
     parser.add_argument("platform", choices=["ios", "macos"])
     parser.add_argument("minimum")
     parser.add_argument("--privacy-dir", type=Path, required=True)
-    args = parser.parse_args()
-    stage(**vars(args), analytics=os.environ.get("PRODUCT_ANALYTICS_EXPORT") in ("1", "true"))
+    parser.add_argument("--product-analytics", choices=["0", "1", "true", "false"], required=True)
+    args = vars(parser.parse_args())
+    args["analytics"] = args.pop("product_analytics") in ("1", "true")
+    stage(**args)

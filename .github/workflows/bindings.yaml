@@ -166,6 +166,7 @@ jobs:
         shell: bash
         env:
           BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: |
           set -euo pipefail
           ./crates/marmot-uniffi/validate-ios-artifact.sh \
@@ -183,14 +184,18 @@ jobs:
 
       - name: Verify privacy resources in a consuming app archive
         shell: bash
+        env:
+          PRIVACY_BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
         run: |
           set -euo pipefail
           command -v xcodegen >/dev/null || brew install xcodegen
           python3 crates/marmot-uniffi/test-apple-privacy.py
           python3 crates/marmot-uniffi/validate-apple-archive.py ios \
-            packaged-source/crates/marmot-uniffi/output/MarmotKit.xcframework \
+            "dist/$PRIVACY_BINARY_NAME" \
             packaged-source/crates/marmot-uniffi/output/MarmotKit.swift \
-            "$RUNNER_TEMP/marmotkit-ios-privacy-archive"
+            "$RUNNER_TEMP/marmotkit-ios-privacy-archive" \
+            --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
+            --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
 
       - name: Upload iOS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -267,6 +272,7 @@ jobs:
         shell: bash
         env:
           MACOS_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
+          MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi
         run: |
           set -euo pipefail
           ./crates/marmot-uniffi/validate-macos-artifact.sh \
@@ -284,14 +290,18 @@ jobs:
 
       - name: Verify privacy resources in a consuming app archive
         shell: bash
+        env:
+          PRIVACY_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
         run: |
           set -euo pipefail
           command -v xcodegen >/dev/null || brew install xcodegen
           python3 crates/marmot-uniffi/test-apple-privacy.py
           python3 crates/marmot-uniffi/validate-apple-archive.py macos \
-            packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.xcframework \
+            "dist/$PRIVACY_BINARY_NAME" \
             packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift \
-            "$RUNNER_TEMP/marmotkit-macos-privacy-archive"
+            "$RUNNER_TEMP/marmotkit-macos-privacy-archive" \
+            --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
+            --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
 
       - name: Upload macOS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

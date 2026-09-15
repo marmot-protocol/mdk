@@ -12,7 +12,6 @@
 # Add x86_64-apple-ios + lipo if/when an Intel Mac is on the test matrix.
 
 set -euo pipefail
-umask 077
 
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
 # rust-toolchain.toml is honored and iOS targets are visible.
@@ -91,11 +90,11 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.mo
 python3 "$TOOL_DIR/apple-framework.py" \
   "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
   "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
-  --privacy-dir "$CRATE_DIR/apple-privacy"
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 python3 "$TOOL_DIR/apple-framework.py" \
   "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
   "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
-  --privacy-dir "$CRATE_DIR/apple-privacy"
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
   -framework "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" \
