@@ -1,0 +1,617 @@
+use super::*;
+use crate::runtime::account_worker::ManagedAccountWorker;
+use marmot_account::AccountHome;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
+use tokio::sync::{Notify, Semaphore};
+use tokio::time::timeout;
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    app: MarmotApp,
+    runtime: MarmotAppRuntime,
+    group: GroupId,
+    account: String,
+    store: SqliteAccountStorage,
+    mode: Arc<AtomicUsize>,
+    captures: Arc<AtomicUsize>,
+    captured: Arc<Notify>,
+    release: Arc<Notify>,
+}
+impl Fixture {
+    async fn new(count: usize) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("window test", &[]).await.unwrap();
+        let store = app.account_storage("alice").unwrap();
+        let runtime = MarmotAppRuntime::new(app.clone());
+        let mode = Arc::new(AtomicUsize::new(0));
+        let captures = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (commands, mut rx) = mpsc::channel(8);
+        let (shutdown, mut stop) = oneshot::channel();
+        let m = mode.clone();
+        let n = captures.clone();
+        let reached = captured.clone();
+        let resume = release.clone();
+        // Exercise the real worker capture, with controllable contention and
+        // delivery barriers. Separate dispatch tests cover actual sync arbitration.
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop => return,
+                    command = rx.recv() => match command {
+                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, respond }) => {
+                            n.fetch_add(1, Ordering::SeqCst);
+                            let mode = m.load(Ordering::SeqCst);
+                            let result = match mode {
+                                1 => Err(ConversationWindowError::NotReady),
+                                2 => Err(StorageError::Busy("test contention".into()).into()),
+                                _ => capture_conversation(&mut client, &group_id, query, &store_epoch),
+                            };
+                            if mode == 3 {
+                                reached.notify_one();
+                                tokio::select! { _ = resume.notified() => {}, _ = &mut stop => return }
+                            }
+                            let _ = respond.send(result);
+                        }
+                        None => return,
+                        _ => panic!("unexpected fixture command"),
+                    }
+                }
+            }
+        });
+        runtime.accounts.workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                handle,
+                commands,
+                media_admission: Arc::new(Semaphore::new(1)),
+                shutdown,
+            },
+        );
+        let f = Self {
+            _dir: dir,
+            app,
+            runtime,
+            group,
+            account: account.account_id_hex,
+            store,
+            mode,
+            captures,
+            captured,
+            release,
+        };
+        for i in 0..count {
+            f.add(i);
+        }
+        f
+    }
+    fn group_hex(&self) -> String {
+        hex::encode(self.group.as_slice())
+    }
+    fn add(&self, i: usize) {
+        self.add_sender(i, &"bb".repeat(32));
+    }
+    fn add_sender(&self, i: usize, sender: &str) {
+        self.store
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: self.group_hex(),
+                message_id_hex: id(i),
+                source_message_id_hex: Some(id(i + 10000)),
+                source_epoch: Some(1),
+                direction: "received".into(),
+                sender: sender.to_owned(),
+                plaintext: format!("message {i}"),
+                kind: 9,
+                tags: vec![],
+                recorded_at: 100 + i as u64,
+                received_at: 100 + i as u64,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+    }
+    fn signal(&self) {
+        let _ = self
+            .app
+            .presentation_signals
+            .updates
+            .send(PresentationInvalidation {
+                account_label: "alice".into(),
+                version: self.store.chat_presentation_version().unwrap(),
+            });
+    }
+    fn draft(&self, text: &str) {
+        self.app
+            .save_message_draft("alice", &self.group_hex(), text, None, vec![])
+            .unwrap();
+    }
+    async fn open(
+        &self,
+        target: ConversationOpenTarget,
+        limit: usize,
+    ) -> RuntimeConversationWindowSubscription {
+        timeout(
+            Duration::from_secs(10),
+            self.runtime.open_conversation_window(
+                "alice",
+                &self.group,
+                ConversationOpenQuery { target, limit },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+    async fn close(self) {
+        self.runtime.shutdown_and_close().await.unwrap();
+    }
+}
+fn id(i: usize) -> String {
+    format!("{i:064x}")
+}
+fn ids(s: &ConversationWindowSnapshot) -> Vec<String> {
+    s.page
+        .page()
+        .messages
+        .iter()
+        .map(|m| m.message_id_hex.clone())
+        .collect()
+}
+async fn next(sub: &mut RuntimeConversationWindowSubscription) -> ConversationWindowSnapshot {
+    timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn open_combines_first_unread_draft_identity_and_permissions_without_marking_read() {
+    let f = Fixture::new(12).await;
+    f.store
+        .refresh_chat_list_row(&f.account, &f.group_hex(), &|_, _| false)
+        .unwrap();
+    f.store
+        .mark_timeline_message_read(&f.account, &f.group_hex(), &id(3), &|_, _| false)
+        .unwrap();
+    f.draft("unsent");
+    let sub = f.open(ConversationOpenTarget::Automatic, 5).await;
+    assert!(matches!(
+        sub.snapshot.anchor,
+        ConversationOpenAnchorOutcome::FirstUnread { .. }
+    ));
+    let index = anchor_index(sub.snapshot.anchor).unwrap();
+    assert_eq!(sub.snapshot.anchors[index].message_id_hex(), id(4));
+    assert_eq!(sub.snapshot.read_state.unread_count, 8);
+    assert_eq!(sub.snapshot.draft.draft.as_ref().unwrap().content, "unsent");
+    assert!(sub.snapshot.presentation.header.capabilities.is_self_admin);
+    assert!(
+        sub.snapshot
+            .presentation
+            .identities
+            .contains_key(&"bb".repeat(32))
+    );
+    assert_eq!(sub.snapshot.page.page().messages.len(), 5);
+    let handle = sub.window_handle();
+    let page = handle
+        .page(&sub.snapshot.revision, ConversationPageDirection::Older, 3)
+        .await
+        .unwrap();
+    assert_eq!(page.read_state.last_read_message_id_hex, Some(id(3)));
+    assert_eq!(page.read_state.unread_count, 8);
+    assert_eq!(
+        page.anchors[anchor_index(page.anchor).unwrap()].message_id_hex(),
+        id(4)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn receive_and_commands_are_independent_and_paging_retains_anchor_with_a_row_cap() {
+    let f = Fixture::new(230).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 50).await;
+    let handle = sub.window_handle();
+    let anchored = handle
+        .set_visible_anchor(&sub.snapshot.revision, &id(210))
+        .await
+        .unwrap();
+    let _ = next(&mut sub).await;
+    let (received, paged) = tokio::join!(
+        sub.recv(),
+        handle.page(&anchored.revision, ConversationPageDirection::Older, 200)
+    );
+    let paged = paged.unwrap();
+    assert_eq!(
+        received.unwrap().unwrap().revision.sequence,
+        paged.revision.sequence
+    );
+    assert_eq!(paged.page.page().messages.len(), 200);
+    assert_eq!(
+        paged.anchors[anchor_index(paged.anchor).unwrap()].message_id_hex(),
+        id(210)
+    );
+    assert!(matches!(
+        handle.return_to_latest(&anchored.revision).await,
+        Err(ConversationWindowError::StaleWindow)
+    ));
+    let newer = handle
+        .page(&paged.revision, ConversationPageDirection::Newer, 40)
+        .await
+        .unwrap();
+    assert_eq!(newer.page.page().messages.len(), 200);
+    assert_eq!(
+        newer.anchors[anchor_index(newer.anchor).unwrap()].message_id_hex(),
+        id(210)
+    );
+    assert_eq!(ids(&newer).last(), Some(&id(229)));
+    let latest = handle.return_to_latest(&newer.revision).await.unwrap();
+    assert_eq!(ids(&latest).last(), Some(&id(229)));
+    assert!(!latest.page.page().has_more_after);
+    let mut alien = latest.revision.clone();
+    alien.generation.push('x');
+    assert!(matches!(
+        handle.return_to_latest(&alien).await,
+        Err(ConversationWindowError::StaleWindow)
+    ));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn mutations_during_initial_capture_are_reconciled_after_delivery() {
+    let f = Fixture::new(5).await;
+    f.mode.store(3, Ordering::SeqCst);
+    let open =
+        f.runtime
+            .open_conversation_window("alice", &f.group, ConversationOpenQuery::default());
+    let mutate = async {
+        timeout(Duration::from_secs(5), f.captured.notified())
+            .await
+            .unwrap();
+        f.add_sender(5, &"cc".repeat(32));
+        f.draft("arrived during capture");
+        f.mode.store(0, Ordering::SeqCst);
+        f.release.notify_one();
+    };
+    let (sub, ()) = tokio::join!(open, mutate);
+    let mut sub = sub.unwrap();
+    assert!(sub.snapshot.draft.draft.is_none());
+    let updated = next(&mut sub).await;
+    assert_eq!(
+        updated.draft.draft.unwrap().content,
+        "arrived during capture"
+    );
+    assert!(
+        updated
+            .presentation
+            .identities
+            .contains_key(&"cc".repeat(32))
+    );
+    assert_eq!(ids(&updated).last(), Some(&id(5)));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn quiet_busy_retries_keep_cancelled_command_position() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    f.mode.store(3, Ordering::SeqCst);
+    let revision = sub.snapshot.revision.clone();
+    let caller = tokio::spawn(async move { handle.jump_to_message(&revision, &id(4)).await });
+    timeout(Duration::from_secs(5), f.captured.notified())
+        .await
+        .unwrap();
+    caller.abort();
+    let _ = caller.await;
+    f.mode.store(2, Ordering::SeqCst);
+    f.release.notify_one();
+    let jumped = next(&mut sub).await;
+    assert_eq!(
+        jumped.anchors[anchor_index(jumped.anchor).unwrap()].message_id_hex(),
+        id(4)
+    );
+    f.draft("retry me");
+    assert!(matches!(
+        timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
+        Err(ConversationWindowError::App(_))
+    ));
+    f.mode.store(0, Ordering::SeqCst); // no further signal
+    let recovered = next(&mut sub).await;
+    assert_eq!(recovered.draft.draft.unwrap().content, "retry me");
+    assert_eq!(
+        recovered.anchors[anchor_index(recovered.anchor).unwrap()].message_id_hex(),
+        id(4)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn transient_command_failure_keeps_target_until_quiet_retry() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    f.mode.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        sub.window_handle()
+            .jump_to_message(&sub.snapshot.revision, &id(3))
+            .await,
+        Err(ConversationWindowError::NotReady)
+    ));
+    assert!(matches!(
+        sub.recv().await,
+        Err(ConversationWindowError::NotReady)
+    ));
+    f.mode.store(0, Ordering::SeqCst);
+    let recovered = next(&mut sub).await;
+    assert_eq!(
+        recovered.anchors[anchor_index(recovered.anchor).unwrap()].message_id_hex(),
+        id(3)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn lag_recovers_newer_draft_and_missing_explicit_target_does_not_close_handle() {
+    let f = Fixture::new(12).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let handle = sub.window_handle();
+    assert!(matches!(
+        handle
+            .jump_to_message(&sub.snapshot.revision, &id(999))
+            .await,
+        Err(ConversationWindowError::Query(_))
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), sub.recv())
+            .await
+            .is_err()
+    );
+    f.store
+        .save_message_draft(&f.group_hex(), "newest", None, &[])
+        .unwrap();
+    // Overwrite the relevant signal with unrelated traffic. Lag itself requires a read.
+    for _ in 0..1500 {
+        let _ = f
+            .app
+            .presentation_signals
+            .drafts
+            .send(MessageDraftInvalidation {
+                account_label: "other".into(),
+                group_id_hex: "other".into(),
+            });
+    }
+    let refreshed = next(&mut sub).await;
+    assert_eq!(refreshed.draft.draft.unwrap().content, "newest");
+    let latest = handle.return_to_latest(&refreshed.revision).await.unwrap();
+    assert_eq!(ids(&latest).last(), Some(&id(11)));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn reset_and_subscription_drop_close_surviving_command_handles() {
+    let f = Fixture::new(5).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    let handle = sub.window_handle();
+    let _ = f
+        .app
+        .presentation_signals
+        .account_resets
+        .send("alice".into());
+    assert!(
+        timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        handle.return_to_latest(&sub.snapshot.revision).await,
+        Err(ConversationWindowError::Closed)
+    ));
+    let sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    let handle = sub.window_handle();
+    let revision = sub.snapshot.revision.clone();
+    drop(sub);
+    assert!(matches!(
+        timeout(Duration::from_secs(2), handle.return_to_latest(&revision))
+            .await
+            .unwrap(),
+        Err(ConversationWindowError::Closed)
+    ));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn retained_anchor_recovers_after_expiry_and_profile_only_updates_refresh_header_dictionary()
+{
+    let f = Fixture::new(15).await;
+    let mut sub = f.open(ConversationOpenTarget::Message(id(5)), 5).await;
+    f.store
+        .prune_app_events_before(&f.group_hex(), 106, &f.account, &|_, _| false)
+        .unwrap();
+    f.signal();
+    let recovered = next(&mut sub).await;
+    assert!(matches!(
+        recovered.anchor,
+        ConversationOpenAnchorOutcome::RecoveredNext { .. }
+    ));
+    assert_eq!(
+        recovered.anchors[anchor_index(recovered.anchor).unwrap()].message_id_hex(),
+        id(6)
+    );
+    let mut record = f.app.empty_directory_record(&"bb".repeat(32));
+    record.profile = Some(crate::UserProfileMetadata {
+        display_name: Some("Updated sender".into()),
+        created_at: 42,
+        ..Default::default()
+    });
+    f.app.save_directory_entry(&record).unwrap();
+    let refreshed = next(&mut sub).await;
+    assert_eq!(
+        refreshed.presentation.identities[&"bb".repeat(32)].display_name,
+        "Updated sender"
+    );
+    assert_eq!(
+        refreshed.anchors[anchor_index(refreshed.anchor).unwrap()].message_id_hex(),
+        id(6)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn draft_acceptance_cannot_erase_newer_edit_and_unrelated_signals_do_not_redraw() {
+    let f = Fixture::new(6).await;
+    f.draft("accepted draft");
+    let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    let accepted = sub.snapshot.draft.revision.clone();
+    f.draft("new edit");
+    assert!(f.store.clear_message_draft_if_revision(&accepted).is_err());
+    let refreshed = next(&mut sub).await;
+    assert_eq!(refreshed.draft.draft.unwrap().content, "new edit");
+    // The initial Latest outcome has now normalized to Retained. An unchanged
+    // account-wide invalidation may read once but must not create a redraw loop.
+    let before = f.captures.load(Ordering::SeqCst);
+    f.signal();
+    assert!(
+        timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(f.captures.load(Ordering::SeqCst), before + 1);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn production_worker_opens_and_shutdown_closes_window() {
+    let f = Fixture::new(8).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await; // releases the real AppClient before ordinary worker startup
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    assert_eq!(ids(&sub.snapshot).last(), Some(&id(7)));
+    assert!(sub.snapshot.presentation.header.capabilities.can_send);
+    f.runtime.shutdown_and_close().await.unwrap();
+    assert!(sub.recv().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn invitation_acceptance_archive_and_departure_refresh_capabilities_with_retained_history() {
+    use crate::conversation_presentation::ConversationParticipation;
+    let f = Fixture::new(9).await;
+    let mut state = f.app.load_state("alice").unwrap();
+    state.groups[0].pending_confirmation = true;
+    state.groups[0].archived = true;
+    f.app.save_state(&state).unwrap();
+    let mut sub = f.open(ConversationOpenTarget::Automatic, 4).await;
+    assert!(matches!(
+        sub.snapshot.anchor,
+        ConversationOpenAnchorOutcome::Latest { .. }
+    ));
+    assert_eq!(
+        sub.snapshot.presentation.header.capabilities.participation,
+        ConversationParticipation::PendingInvitation
+    );
+    assert!(!sub.snapshot.presentation.header.capabilities.can_send);
+    state.groups[0].pending_confirmation = false;
+    f.app.save_state(&state).unwrap();
+    f.signal();
+    let accepted = next(&mut sub).await;
+    assert!(!accepted.pending_confirmation);
+    assert!(accepted.presentation.header.archived);
+    assert!(accepted.presentation.header.capabilities.can_send);
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Left)
+        .unwrap();
+    f.signal();
+    let left = next(&mut sub).await;
+    assert_eq!(
+        left.presentation.header.capabilities.participation,
+        ConversationParticipation::Left
+    );
+    assert!(!left.presentation.header.capabilities.can_send);
+    assert_eq!(ids(&left), ids(&accepted));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn eviction_and_lost_reset_are_terminal_even_if_same_store_can_reopen() {
+    let f = Fixture::new(3).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
+    f.app.drop_account_caches("alice");
+    for i in 0..100 {
+        let _ = f
+            .app
+            .presentation_signals
+            .account_resets
+            .send(format!("other-{i}"));
+    }
+    let _ = f.app.account_storage("alice").unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        sub.window_handle()
+            .return_to_latest(&sub.snapshot.revision)
+            .await,
+        Err(ConversationWindowError::Closed)
+    ));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn closed_session_storage_terminates_retry_and_missing_jump_recovers_original_viewport() {
+    let f = Fixture::new(20).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    f.mode.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        sub.window_handle()
+            .jump_to_message(&sub.snapshot.revision, &id(3))
+            .await,
+        Err(ConversationWindowError::NotReady)
+    ));
+    assert!(sub.recv().await.is_err());
+    f.store
+        .prune_app_events_before(&f.group_hex(), 105, &f.account, &|_, _| false)
+        .unwrap();
+    f.mode.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
+        Err(ConversationWindowError::Query(_))
+    ));
+    let recovered = next(&mut sub).await;
+    assert_eq!(ids(&recovered).last(), Some(&id(19)));
+    f.store.close().unwrap();
+    let _ = f
+        .app
+        .presentation_signals
+        .drafts
+        .send(MessageDraftInvalidation {
+            account_label: "alice".into(),
+            group_id_hex: f.group_hex(),
+        });
+    assert!(
+        timeout(Duration::from_secs(3), sub.recv())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(sub.recv().await.unwrap().is_none());
+    f.close().await;
+}

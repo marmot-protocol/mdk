@@ -144,6 +144,12 @@ pub use runtime::{
     ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
     RuntimePresentedChatListSubscription,
 };
+pub use runtime::{
+    CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
+    ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
+    ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
+    ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
+};
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
     ChatPinState, ChatPresentationVersion, ConversationPresentation, PresentationResolution,

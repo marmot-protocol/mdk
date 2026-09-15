@@ -21,7 +21,7 @@ status: overview
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
-return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
+return a typed preparation requirement. Live screen composition is C5 M4; native bindings remain M5. See
 [bounded conversation opening](../further-context/conversation-opening.md).
 
 C5 M2 adds selected draft metadata, revision-checked mutations and a send handoff that clears the submitted
@@ -29,13 +29,13 @@ revision atomically with existing outbox acceptance. Newer edits survive; attach
 See [revision-safe conversation drafts](../further-context/conversation-drafts.md).
 
 C5 M3 adds shared Rust conversation capabilities and a bounded identity presentation sidecar, including historical
-authors and commit-attributed system references. The combined live window/native screen API remains M4/M5.
+authors and commit-attributed system references. The combined live window is C5 M4; native screen bindings remain M5.
 See [shared conversation presentation](../further-context/conversation-presentation.md).
 
-C5 M4 foundations include explicit viewport placement, atomic account-window reads and compact live engine
-capture of membership, roles and capabilities. The session callback keeps persisted reads on the session's
-exact SQLite connection and combines them with live engine facts; startup seeds remain unavailable until
-hydration. The live actor, recovery protocol and native handles remain unfinished.
+C5 M4 adds a combined Rust conversation handle: initial/live history, header and identities, read state and draft,
+with serialized paging, retained anchors, timed retries and terminal account-store teardown. Its worker capture
+combines compact live engine authority with persisted fields on the exact session connection. Frozen startup/
+recovery snapshots return a retry requirement. Native handles remain M5; publication and adoption remain C9.
 See the [live conversation implementation plan](../further-context/conversation-live-window-plan.md).
 
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.

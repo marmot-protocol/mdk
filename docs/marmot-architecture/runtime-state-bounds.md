@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-12
+updated: 2026-09-15
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -64,6 +64,14 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | Initial and current complete snapshots | Existing account-list cardinality; no history retained | Current snapshot is replaced, never appended. UniFFI transfers the initial snapshot once. Dropping the handle releases both and closes the underlying list consumer; shutdown terminates reads. C4 owns future bounded paging. |
 | Invalidation receivers | Existing bounded chat-list queue plus the shared 64-entry presentation broadcast | Lag rebuilds current local state. No per-subscriber presentation timer or durable event log. |
+
+### Combined conversation windows (`marmot-app/src/runtime/conversation_window.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Per-subscription actor and snapshots | One account/group; initial, current and latest replacement each contain at most 200 rows plus M3's bounded identity sidecar and one descriptor-only draft. Text byte sizes retain their existing source limits. | Replaced atomically; no accumulated transcript. Subscription drop, account reset/eviction, closed storage or shutdown terminates the actor. A surviving command clone cannot keep it alive. |
+| Commands and invalidations | Eight queued commands; existing bounded broadcasts, with at most 1024 queued entries drained per source per capture. | Commands serialize with refresh. Slow receivers coalesce to the latest complete replacement; lag rereads local state. Failed refresh retains one timed retry obligation, not a queue of failed work. |
+| Worker/source identity | One pinned worker sender and account-store epoch per open handle. | Never rebound after teardown. Initial opening can be cancelled while live capture is temporarily unavailable. |
 
 ### `marmot-app` (`src/sqlcipher.rs`)
 

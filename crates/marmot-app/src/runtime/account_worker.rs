@@ -19,6 +19,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, Sleep, interval, sleep, timeout};
 use zeroize::Zeroizing;
 
+use super::conversation_window::{
+    CapturedConversation, ConversationWindowError, capture_conversation,
+};
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
@@ -151,6 +154,12 @@ pub(crate) enum AccountWorkerCommand {
     MemberIdsPage {
         group_ids: Vec<GroupId>,
         respond: oneshot::Sender<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
+    },
+    CaptureConversation {
+        group_id: GroupId,
+        query: storage_sqlite::ConversationWindowQuery,
+        store_epoch: Vec<u8>,
+        respond: oneshot::Sender<Result<CapturedConversation, ConversationWindowError>>,
     },
     GroupMlsState {
         group_id: GroupId,
@@ -789,6 +798,10 @@ async fn run_app_runtime_account_worker(
                                     AccountWorkerCommand::MemberIdsPage { group_ids, respond },
                                 ))),
                             }
+                        }
+                        Some(AccountWorkerCommand::CaptureConversation { respond, .. }) => {
+                            // Frozen startup facts cannot be composed with newer account rows.
+                            let _ = respond.send(Err(ConversationWindowError::NotReady));
                         }
                         Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
                             match &read_snapshot {
@@ -1869,6 +1882,9 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(snapshot.member_ids_page(&group_ids));
                 }
+                AccountWorkerCommand::CaptureConversation { respond, .. } => {
+                    let _ = respond.send(Err(ConversationWindowError::NotReady));
+                }
                 AccountWorkerCommand::GroupMlsState { group_id, respond }
                     if snapshot_reads_available =>
                 {
@@ -2356,6 +2372,14 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
             let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
         }
+        AccountWorkerCommand::CaptureConversation {
+            group_id,
+            query,
+            store_epoch,
+            respond,
+        } => {
+            let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+        }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let _ = client
                 .runtime
@@ -2720,6 +2744,9 @@ where
                     .as_ref()
                     .expect("snapshot availability checked above");
                 let _ = respond.send(snapshot.member_ids_page(&group_ids));
+            }
+            AccountWorkerCommand::CaptureConversation { respond, .. } => {
+                let _ = respond.send(Err(ConversationWindowError::NotReady));
             }
             AccountWorkerCommand::GroupMlsState { group_id, respond }
                 if snapshot_reads_available =>
@@ -3252,6 +3279,15 @@ fn account_worker_command_future<'a>(
                 respond,
                 member_ids_page_after_hydration(client, &group_ids),
             );
+            true
+        }),
+        AccountWorkerCommand::CaptureConversation {
+            group_id,
+            query,
+            store_epoch,
+            respond,
+        } => Box::pin(async move {
+            let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
             true
         }),
         AccountWorkerCommand::GroupMlsState { group_id, respond } => Box::pin(async move {
@@ -5341,6 +5377,56 @@ mod tests {
             reused_account_id_credential: false,
             kind,
             phase,
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_capture_retries_while_snapshot_work_owns_client_even_without_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = app.client("alice").await.unwrap();
+        for available in [true, false] {
+            let snapshot = available.then(|| client.group_read_snapshot().unwrap());
+            let (commands, mut receiver) = mpsc::channel(8);
+            let (respond, response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::CaptureConversation {
+                    group_id: GroupId::new(vec![1; 16]),
+                    query: Default::default(),
+                    store_epoch: vec![],
+                    respond,
+                })
+                .unwrap();
+            let (release, work) = oneshot::channel::<()>();
+            let mut pending = VecDeque::new();
+            let serve = serve_snapshot_reads_until(
+                snapshot,
+                work,
+                &mut receiver,
+                &mut pending,
+                &app,
+                "alice",
+            );
+            let check = async {
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), response)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Err(ConversationWindowError::NotReady)
+                ));
+                release.send(()).unwrap();
+            };
+            let (result, ()) = tokio::join!(serve, check);
+            result.unwrap();
+            assert!(
+                pending.is_empty(),
+                "captures must not queue behind stalled work"
+            );
         }
     }
 

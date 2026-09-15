@@ -73,6 +73,8 @@ pub use account_attention::{
     AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
 };
 mod chat_list_window;
+mod conversation_window;
+pub use conversation_window::*;
 mod commands;
 mod event_routing;
 mod onboarding;
