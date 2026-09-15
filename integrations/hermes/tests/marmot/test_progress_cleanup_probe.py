@@ -84,64 +84,18 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         finally:
             probe._restore_home_env(original_home, original_hermes)
 
-    def test_plugin_entries_drop_install_source_and_transport(self):
-        entries = probe._plugin_entries_for_probe(
-            {
-                "plugins": {
-                    "entries": {
-                        "marmot": {
-                            "enabled": True,
-                            "source": "file:///tmp/mdk#integrations/hermes/marmot",
-                            "settings": {
-                                "socket_path": "/tmp/parent-marmot-agent.sock",
-                                "home": "/tmp/parent-home",
-                                "home_channel": "22" * 32,
-                            },
-                        }
-                    }
-                }
-            }
-        )
-        marmot = entries["entries"]["marmot"]
-        self.assertTrue(marmot["enabled"])
-        self.assertNotIn("source", marmot)
-        self.assertEqual(marmot["settings"], {"home_channel": "22" * 32})
+    def test_scenario_control_socket_stays_under_unix_limit(self):
+        path = probe._scenario_control_socket("accumulate")
+        self.assertLess(len(os.fsencode(path)), probe.UNIX_SOCKET_PATH_LIMIT)
+        self.assertTrue(path.name.endswith(".sock"))
+        self.assertIn(str(os.getpid()), path.name)
 
-    def test_materialize_registered_home_copies_plugin_and_fails_closed(self):
-        helper = probe._load_helper()
-        with tempfile.TemporaryDirectory() as raw:
-            installed = Path(raw) / "installed"
-            dest = Path(raw) / "isolated"
-            with self.assertRaisesRegex(AssertionError, "installed Marmot plugin"):
-                probe._materialize_registered_home(dest, installed, helper)
-            plugin = installed / "plugins" / "marmot"
-            plugin.mkdir(parents=True)
-            (plugin / "adapter.py").write_text("# fixture\n", encoding="utf-8")
-            (installed / "config.yaml").write_text(
-                "\n".join(
-                    [
-                        "plugins:",
-                        "  entries:",
-                        "    marmot:",
-                        "      enabled: true",
-                        "      source: file:///tmp/mdk#integrations/hermes/marmot",
-                        "      settings:",
-                        "        socket_path: /tmp/parent-marmot-agent.sock",
-                        "        home_channel: keep-me",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            materialized = probe._materialize_registered_home(dest, installed, helper)
-            self.assertEqual(materialized, dest)
-            self.assertTrue((dest / "plugins" / "marmot" / "adapter.py").is_file())
-            config = helper.load_config(dest / "config.yaml")
-            marmot = config["plugins"]["entries"]["marmot"]
-            self.assertTrue(marmot["enabled"])
-            self.assertNotIn("source", marmot)
-            self.assertNotIn("socket_path", marmot.get("settings") or {})
-            self.assertEqual(marmot["settings"]["home_channel"], "keep-me")
+    def test_wait_until_idle_fails_closed_on_timeout(self):
+        server = probe.RecordingControlServer(Path("/tmp/progress-cleanup-unused.sock"))
+        with self.assertRaisesRegex(AssertionError, "did not settle"):
+            server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=0.05)
+        server.operation_sends = 1
+        server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=0.2)
 
     def test_apply_scenario_transport_overrides_loaded_extra(self):
         config = types.SimpleNamespace(enabled=False, extra={"socket_path": "/tmp/stale.sock"})

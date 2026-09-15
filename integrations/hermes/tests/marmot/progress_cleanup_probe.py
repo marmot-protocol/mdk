@@ -18,11 +18,12 @@ import importlib.util
 import inspect
 import json
 import os
-import shutil
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest import mock
 
 
@@ -35,7 +36,10 @@ PROTOCOL = "marmot.agent-control.v2"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HELPER_PATH = REPO_ROOT / "scripts" / "hermes_marmot_configure_gateway.py"
 TOOL_PROGRESS_PREFIX = "marmot-tool-progress:"
-SCHEDULED_WORK_TIMEOUT_S = 3.0
+SCHEDULED_WORK_TIMEOUT_S = 8.0
+PROGRESS_WAIT_TIMEOUT_S = 8.0
+PROGRESS_QUIET_S = 2.0
+UNIX_SOCKET_PATH_LIMIT = 100
 
 
 def _load_helper():
@@ -85,6 +89,7 @@ class RecordingControlServer:
         self._operation_failures = 0
         self._next_id = 16
         self.fail_final = False
+        self._progress_event = threading.Event()
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +125,12 @@ class RecordingControlServer:
                 response = self._response_for(request, request_type)
                 writer.write(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
                 await writer.drain()
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
+        except (
+            asyncio.TimeoutError,
+            asyncio.IncompleteReadError,
+            ConnectionError,
+            ValueError,
+        ):
             return
         finally:
             writer.close()
@@ -146,6 +156,7 @@ class RecordingControlServer:
             if should_fail:
                 self._operation_failures += 1
                 self.operation_attempts.append({**identity, "outcome": "failed"})
+                self._progress_event.set()
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
@@ -158,6 +169,7 @@ class RecordingControlServer:
             self.operation_sends += 1
             self.durable_operation_ids.append(durable)
             self.operation_attempts.append({**identity, "outcome": "accepted"})
+            self._progress_event.set()
             return {
                 "marmot_agent_control": PROTOCOL,
                 "id": request_id,
@@ -213,9 +225,37 @@ class RecordingControlServer:
             "type": "ack",
         }
 
+    def acknowledged_or_failed_operations(self) -> int:
+        return self.operation_sends + self._operation_failures
+
+    def wait_until_idle(
+        self,
+        *,
+        min_operations: int,
+        quiet_s: float = PROGRESS_QUIET_S,
+        timeout: float = PROGRESS_WAIT_TIMEOUT_S,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        last_count = -1
+        last_change = time.monotonic()
+        while True:
+            count = self.acknowledged_or_failed_operations()
+            now = time.monotonic()
+            if count != last_count:
+                last_count = count
+                last_change = now
+            if count >= min_operations and (now - last_change) >= quiet_s:
+                return
+            remaining = deadline - now
+            if remaining <= 0:
+                raise AssertionError("progress operations did not settle before timeout")
+            self._progress_event.wait(timeout=min(0.05, remaining))
+            self._progress_event.clear()
+
 
 class DeterministicAIAgent:
     instances: list["DeterministicAIAgent"] = []
+    progress_server: ClassVar[RecordingControlServer | None] = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.tool_progress_callback = None
@@ -229,19 +269,25 @@ class DeterministicAIAgent:
         self.created = True
         DeterministicAIAgent.instances.append(self)
 
+    def _wait_progress(self, *, min_operations: int, quiet_s: float) -> None:
+        server = type(self).progress_server
+        if server is None:
+            return
+        server.wait_until_idle(min_operations=min_operations, quiet_s=quiet_s)
+
     def run_conversation(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         callback = self.tool_progress_callback
         if callback is not None:
             if self.stagger_after_first and len(self.tool_names) >= 2:
                 first, *rest = self.tool_names
                 callback("tool.started", first, preview=f"{first}-preview", args={"q": first})
-                time.sleep(2.0)
+                self._wait_progress(min_operations=1, quiet_s=PROGRESS_QUIET_S)
                 for name in rest:
                     callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
             else:
                 for name in self.tool_names:
                     callback("tool.started", name, preview=f"{name}-preview", args={"q": name})
-        time.sleep(2.2)
+            self._wait_progress(min_operations=1, quiet_s=PROGRESS_QUIET_S)
         if self.fail_turn:
             self.last_result = {
                 "final_response": "",
@@ -298,39 +344,15 @@ def _registered_hermes_home() -> Path:
     return home
 
 
-def _plugin_entries_for_probe(installed_config: dict[str, Any]) -> dict[str, Any]:
-    installed_entry = (
-        ((installed_config.get("plugins") or {}).get("entries") or {}).get("marmot") or {}
-    )
-    settings = dict(installed_entry.get("settings") or {})
-    for key in ("socket_path", "home", "agent_home", "agent_socket"):
-        settings.pop(key, None)
-    marmot_entry: dict[str, Any] = {"enabled": True}
-    if settings:
-        marmot_entry["settings"] = settings
-    return {"entries": {"marmot": marmot_entry}}
-
-
-def _materialize_registered_home(dest: Path, installed: Path, helper) -> Path:
-    plugin_src = installed / "plugins" / "marmot" / "adapter.py"
-    if not plugin_src.is_file():
-        raise AssertionError("installed HERMES_HOME does not contain an installed Marmot plugin")
-    dest.mkdir(parents=True, exist_ok=True)
-    dest_plugins = dest / "plugins"
-    if dest_plugins.exists():
-        shutil.rmtree(dest_plugins)
-    shutil.copytree(installed / "plugins", dest_plugins, symlinks=True)
-    if not (dest / "plugins" / "marmot" / "adapter.py").is_file():
-        raise AssertionError("isolated registered home is missing the installed Marmot plugin")
-    installed_config: dict[str, Any] = {}
-    if (installed / "config.yaml").is_file():
-        installed_config = helper.load_config(installed / "config.yaml")
-    dest_config: dict[str, Any] = {}
-    if (dest / "config.yaml").is_file():
-        dest_config = helper.load_config(dest / "config.yaml")
-    dest_config["plugins"] = _plugin_entries_for_probe(installed_config)
-    (dest / "config.yaml").write_text(helper.dump_config(dest_config), encoding="utf-8")
-    return dest
+def _scenario_control_socket(label: str) -> Path:
+    ident = "".join(ch for ch in label if ch.isalnum())[:8] or "turn"
+    tmp = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    path = tmp / f"pcp{os.getpid()}{ident}.sock"
+    if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_LIMIT:
+        path = Path("/tmp") / f"pcp{os.getpid()}{ident}.sock"
+    if len(os.fsencode(path)) >= UNIX_SOCKET_PATH_LIMIT:
+        raise AssertionError("scenario control socket path exceeds the Unix socket limit")
+    return path
 
 
 def _apply_scenario_transport(platform_config, *, socket_path: Path, agent_home: Path):
@@ -358,8 +380,10 @@ def _quiet_helper_kwargs(
     *,
     tool_progress: str = "off",
     agent_home: Path | None = None,
+    socket_path: Path | None = None,
 ) -> dict[str, Any]:
     agent = agent_home if agent_home is not None else home / "marmot-agent"
+    socket = socket_path if socket_path is not None else agent / "wn-agent.sock"
     return {
         "hermes_home": home,
         "platform": "marmot",
@@ -370,7 +394,7 @@ def _quiet_helper_kwargs(
         "long_running_notifications": False,
         "busy_ack_detail": False,
         "agent_home": agent,
-        "socket_path": agent / "wn-agent.sock",
+        "socket_path": socket,
         "account_id_hex": ACCOUNT_ID_HEX,
         "backup": False,
     }
@@ -723,12 +747,14 @@ async def _run_gateway_turn_body(
     _bind_home_env(registered_home)
     hermes_home.mkdir(parents=True, exist_ok=True)
     agent_home = hermes_home / "marmot-agent"
+    socket_path = _scenario_control_socket(hermes_home.name)
     _write_seed_with_global_cleanup(registered_home, helper, agent_home=agent_home)
     helper.configure_gateway_config(
         **_quiet_helper_kwargs(
             registered_home,
             tool_progress=tool_progress,
             agent_home=agent_home,
+            socket_path=socket_path,
         )
     )
     config = helper.load_config(registered_home / "config.yaml")
@@ -738,15 +764,15 @@ async def _run_gateway_turn_body(
         marmot_display["cleanup_progress"] = True
     (registered_home / "config.yaml").write_text(helper.dump_config(config), encoding="utf-8")
 
-    socket_path = agent_home / "wn-agent.sock"
     fake = RecordingControlServer(socket_path, fail_operation_after=fail_operation_after)
     fake.fail_final = fail_final
     await fake.start()
     original_load_gateway_config = None
     gateway_run = None
     runner = None
+    previous_progress_server = DeterministicAIAgent.progress_server
+    DeterministicAIAgent.progress_server = fake
     try:
-        from hermes_cli.plugins import discover_plugins
         from gateway.config import Platform, load_gateway_config
         from gateway.display_config import resolve_display_setting
         from gateway.platforms.base import MessageEvent
@@ -754,7 +780,6 @@ async def _run_gateway_turn_body(
         from gateway.session import SessionSource
         import run_agent
 
-        discover_plugins(force=True)
         written_config = helper.load_config(registered_home / "config.yaml")
         original_load_gateway_config = gateway_run._load_gateway_config
         gateway_run._load_gateway_config = lambda: written_config
@@ -839,6 +864,7 @@ async def _run_gateway_turn_body(
                 except Exception:
                     pass
         await fake.close()
+        DeterministicAIAgent.progress_server = previous_progress_server
 
     agent_results = [
         inst.last_result for inst in DeterministicAIAgent.instances if inst.last_result is not None
@@ -960,12 +986,7 @@ def _assert_partial_retry(result: dict[str, Any]) -> None:
 
 async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
     helper = _load_helper()
-    installed_home = _registered_hermes_home()
-    registered_home = _materialize_registered_home(
-        hermes_home / "registered",
-        installed_home,
-        helper,
-    )
+    registered_home = _registered_hermes_home()
     _bind_home_env(registered_home)
     defaults_home = hermes_home / "defaults"
     _write_seed_with_global_cleanup(defaults_home, helper)
