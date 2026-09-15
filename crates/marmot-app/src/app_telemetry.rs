@@ -689,11 +689,13 @@ impl AppPerformanceTelemetry {
     ) {
         if matches!(
             operation,
-            AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp
+            AppPerformanceOperation::AccountSync
+                | AppPerformanceOperation::AccountCatchUp
+                | AppPerformanceOperation::GroupAcceptInvite
         ) {
             debug_assert!(
                 false,
-                "account sync/catch-up must use record_sync_result with a bounded failure classification"
+                "classified operations must use record_classified_result with a bounded failure classification"
             );
             return;
         }
@@ -976,15 +978,17 @@ impl AppPerformanceTelemetry {
         }
     }
 
-    /// Record a terminal account sync/catch-up result with its bounded failure
+    /// Record a terminal sync or invite acceptance result with its bounded failure
     /// classification. Successful samples carry no failure attributes.
-    pub(crate) fn record_sync_result(
+    pub(crate) fn record_classified_result(
         &self,
         operation: AppPerformanceOperation,
         duration: Duration,
         failure: Option<SyncFailureClassification>,
     ) {
-        if let Some(product) = &self.product {
+        if operation == AppPerformanceOperation::GroupAcceptInvite {
+            self.record_product(operation, duration, failure.is_none());
+        } else if let Some(product) = &self.product {
             product.observe_sync(
                 if operation == AppPerformanceOperation::AccountCatchUp {
                     "foreground"
@@ -997,7 +1001,9 @@ impl AppPerformanceTelemetry {
         }
         debug_assert!(matches!(
             operation,
-            AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp
+            AppPerformanceOperation::AccountSync
+                | AppPerformanceOperation::AccountCatchUp
+                | AppPerformanceOperation::GroupAcceptInvite
         ));
         let mut inner = self
             .inner
@@ -1006,6 +1012,7 @@ impl AppPerformanceTelemetry {
         let target = match operation {
             AppPerformanceOperation::AccountSync => &mut inner.account_sync,
             AppPerformanceOperation::AccountCatchUp => &mut inner.account_catch_up,
+            AppPerformanceOperation::GroupAcceptInvite => &mut inner.group_accept_invite,
             _ => return,
         };
         target.record_with_failure(duration, failure.is_none(), failure);
@@ -1277,12 +1284,12 @@ mod tests {
         assert_eq!(propagated.sync_error_class(), child.error_class);
 
         let telemetry = AppPerformanceTelemetry::default();
-        telemetry.record_sync_result(
+        telemetry.record_classified_result(
             AppPerformanceOperation::AccountSync,
             Duration::from_millis(1),
             Some(child),
         );
-        telemetry.record_sync_result(
+        telemetry.record_classified_result(
             AppPerformanceOperation::AccountCatchUp,
             Duration::from_millis(2),
             Some(child),
@@ -1311,7 +1318,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "account sync/catch-up must use record_sync_result with a bounded failure classification"
+        expected = "classified operations must use record_classified_result with a bounded failure classification"
     )]
     fn generic_record_rejects_classified_sync_operations() {
         AppPerformanceTelemetry::default().record(
@@ -1540,27 +1547,28 @@ mod tests {
     #[test]
     fn records_group_accept_invite_operation() {
         let telemetry = AppPerformanceTelemetry::default();
-        telemetry.record(
+        telemetry.record_classified_result(
             AppPerformanceOperation::GroupAcceptInvite,
             Duration::from_millis(30),
-            true,
+            None,
         );
-        telemetry.record(
+        let failure = SyncFailureClassification::new(
+            SyncFailureStage::AccountWorker,
+            SyncErrorClass::Timeout,
+        );
+        telemetry.record_classified_result(
             AppPerformanceOperation::GroupAcceptInvite,
             Duration::from_millis(70),
-            false,
+            Some(failure),
         );
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.group_accept_invite.attempts, 2);
         assert_eq!(snapshot.group_accept_invite.successes, 1);
         assert_eq!(snapshot.group_accept_invite.failures, 1);
-        assert!(
-            snapshot
-                .group_accept_invite
-                .failure_classifications
-                .is_empty(),
-            "generic operation failures must not populate sync classifications"
+        assert_eq!(
+            snapshot.group_accept_invite.failure_classifications[0].classification,
+            failure
         );
         assert_eq!(snapshot.group_accept_invite.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
