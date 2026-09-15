@@ -7509,6 +7509,14 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         original_admit = adapter._try_admit_spooled
         attempts = 0
         failed_once = asyncio.Event()
+        handed_off = asyncio.Event()
+        original_handle = adapter.handle_message
+
+        async def observed_handle(message):
+            await original_handle(message)
+            handed_off.set()
+
+        adapter.handle_message = observed_handle
 
         async def flaky_admit(message_id):
             nonlocal attempts
@@ -7522,18 +7530,20 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
         try:
             adapter._inbound_spool_wakeup.set()
-            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            await asyncio.wait_for(failed_once.wait(), timeout=5)
             self.assertFalse(retry.done())
             adapter._inbound_spool_wakeup.set()
-            for _ in range(20):
-                if adapter.events:
-                    break
-                await asyncio.sleep(0.01)
+            # Durable admission and dispatch include asynchronous storage work.
+            # Observe the actual handoff instead of imposing a 200 ms budget.
+            await asyncio.wait_for(handed_off.wait(), timeout=5)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
             self.assertEqual([item.text for item in adapter.events], ["durable"])
+            self.assertGreaterEqual(attempts, 2)
+            self.assertFalse(retry.done())
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+            await adapter.disconnect()
 
     async def test_debounce_enqueue_failure_releases_and_preserves_same_group_fifo(self):
         adapter = self.make_adapter(
