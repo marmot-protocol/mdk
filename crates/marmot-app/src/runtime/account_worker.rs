@@ -436,6 +436,12 @@ pub(crate) enum AccountWorkerCommand {
         enabled: bool,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    #[cfg(test)]
+    HoldMediaHttp {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
+    },
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
     #[cfg(test)]
@@ -445,15 +451,27 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
-    fn waits_for_media(&self, media_http: &MediaHttpContext) -> bool {
-        media_http.permits.available_permits() == 0
-            && matches!(
-                self,
-                Self::UploadPreparedGroupImage { .. }
-                    | Self::DownloadGroupImage { .. }
-                    | Self::UploadMedia { .. }
-                    | Self::DownloadMedia { .. }
-            )
+    fn needs_media_slot(&self, client: &AppClient) -> bool {
+        match self {
+            Self::UploadPreparedGroupImage { upload_id, .. } => {
+                // Only confirmed completed uploads can bypass HTTP capacity.
+                !client
+                    .prepared_initial_group_image_status(upload_id)
+                    .is_ok_and(|status| {
+                        matches!(
+                            status.state,
+                            crate::AppPreparedGroupImageUploadState::Uploaded
+                                | crate::AppPreparedGroupImageUploadState::Consumed
+                        )
+                    })
+            }
+            Self::DownloadGroupImage { .. }
+            | Self::UploadMedia { .. }
+            | Self::DownloadMedia { .. } => true,
+            #[cfg(test)]
+            Self::HoldMediaHttp { .. } => true,
+            _ => false,
+        }
     }
 
     fn may_change_push_registration_work(&self) -> bool {
@@ -972,14 +990,11 @@ async fn run_app_runtime_account_worker(
             DeferredStartupCommand::Command(command) => *command,
         })
         .collect::<VecDeque<_>>();
-    // Every remaining startup command is visible to snapshot serving in this
-    // one FIFO. Live commands received during fanout append behind it, so a
-    // later read cannot bypass an earlier deferred mutation.
-    while let Some(command) = pending.pop_front() {
-        if command.waits_for_media(&media_http) {
-            pending.push_front(command);
-            break;
-        }
+    // Skip only media waiting for capacity; retain FIFO order among the rest.
+    while let Some(index) = ready_command_index(&pending, &client, &media_http) {
+        let command = pending
+            .remove(index)
+            .expect("selected pending command exists");
         match command {
             AccountWorkerCommand::CatchUp { respond } => {
                 handle_account_worker_catch_up(
@@ -1065,6 +1080,7 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     'worker: loop {
+        let ready_command = ready_command_index(&pending, &client, &media_http);
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1104,16 +1120,23 @@ async fn run_app_runtime_account_worker(
                     let _ = respond.send(());
                 }
             }
+            // Consume completed blobs before admitting more commands.
+            done = media_http_rx.recv() => {
+                match done {
+                    Some(done) => {
+                        complete_media_http(&mut client, done, &shared, &media_http).await;
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                    }
+                    None => return,
+                }
+            }
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
             command = async {
-                if pending.front().is_some_and(|command| command.waits_for_media(&media_http)) {
-                    // Keep polling completions below: they release the permits.
-                    // Stop consuming the bounded command channel while full.
-                    let permit = media_http.permits.acquire().await.ok()?;
-                    drop(permit);
-                }
-                match pending.pop_front() {
+                match ready_command.and_then(|index| pending.remove(index)) {
                     Some(command) => Some(command),
                     None => commands.recv().await,
                 }
@@ -1293,18 +1316,6 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                 ))
                 .await;
-            }
-            done = media_http_rx.recv() => {
-                match done {
-                    Some(done) => {
-                        complete_media_http(&mut client, done, &shared, &media_http).await;
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                    }
-                    None => return,
-                }
             }
             received = client.receive_next_delivery() => {
                 // Only the transport wait participates in `select!`. Once a
@@ -2482,12 +2493,24 @@ fn spawn_media_http<T>(
     });
 }
 
-fn reserve_media_http(media_http: &MediaHttpContext) -> Result<OwnedSemaphorePermit, AppError> {
+fn ready_command_index(
+    pending: &VecDeque<AccountWorkerCommand>,
+    client: &AppClient,
+    media_http: &MediaHttpContext,
+) -> Option<usize> {
+    let has_capacity =
+        !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
+    pending
+        .iter()
+        .position(|command| has_capacity || !command.needs_media_slot(client))
+}
+
+fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
     media_http
         .permits
         .clone()
         .try_acquire_owned()
-        .map_err(|_| AppError::AccountWorkerBusy)
+        .expect("media commands dispatch only with capacity")
 }
 
 fn reserve_prepared_group_image_upload(
@@ -2776,7 +2799,11 @@ async fn handle_account_worker_command(
     command: AccountWorkerCommand,
     context: AccountWorkerCommandContext<'_>,
 ) {
-    if command.waits_for_media(context.media_http) {
+    if (context.media_http.permits.is_closed()
+        || context.media_http.permits.available_permits() == 0)
+        && command.needs_media_slot(client)
+    {
+        // Only newly received commands reach this gate; parked media keep their order.
         context.pending.push_back(command);
         return;
     }
@@ -2847,6 +2874,25 @@ fn account_worker_command_future<'a>(
             };
             let _ = respond.send(pending);
             true
+        }),
+        #[cfg(test)]
+        AccountWorkerCommand::HoldMediaHttp {
+            started,
+            release,
+            respond,
+        } => Box::pin(async move {
+            let permit = reserve_media_http(media_http);
+            spawn_media_http(
+                media_http,
+                permit,
+                async move {
+                    let _ = started.send(());
+                    release.await.expect("test releases transfer");
+                    Ok(Vec::new())
+                },
+                move |result| MediaHttpCompletion::GroupImage { result, respond },
+            );
+            false
         }),
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
@@ -3138,19 +3184,7 @@ fn account_worker_command_future<'a>(
                             respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                         return false;
                     }
-                    let permit = match reserve_media_http(media_http) {
-                        Ok(permit) => permit,
-                        Err(err) => {
-                            release_prepared_group_image_upload(media_http, &upload_id);
-                            let _ = respond_diagnosed(
-                                shared,
-                                storage_permit.as_ref(),
-                                respond,
-                                Err(err),
-                            );
-                            return false;
-                        }
-                    };
+                    let permit = reserve_media_http(media_http);
                     let started_at = Instant::now();
                     spawn_media_http(media_http, permit, http.run(), move |result| {
                         MediaHttpCompletion::PreparedGroupImageUpload {
@@ -3778,13 +3812,7 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::DownloadGroupImage { group_id, respond } => Box::pin(async move {
-            let permit = match reserve_media_http(media_http) {
-                Ok(permit) => permit,
-                Err(err) => {
-                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
-                    return false;
-                }
-            };
+            let permit = reserve_media_http(media_http);
             match client.prepare_group_image_download(&group_id).await {
                 Ok(http) => spawn_media_http(media_http, permit, http.run(), move |result| {
                     MediaHttpCompletion::GroupImage { result, respond }
@@ -3947,18 +3975,7 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let started_at = Instant::now();
-            let permit = match reserve_media_http(media_http) {
-                Ok(permit) => permit,
-                Err(err) => {
-                    shared.app_performance_telemetry().record(
-                        AppPerformanceOperation::MediaUpload,
-                        started_at.elapsed(),
-                        false,
-                    );
-                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
-                    return false;
-                }
-            };
+            let permit = reserve_media_http(media_http);
             match client
                 .prepare_encrypted_media_upload(&group_id, request)
                 .await
@@ -3996,18 +4013,7 @@ fn account_worker_command_future<'a>(
                 enqueued_at.elapsed(),
                 true,
             );
-            let permit = match reserve_media_http(media_http) {
-                Ok(permit) => permit,
-                Err(err) => {
-                    telemetry.record(
-                        AppPerformanceOperation::MediaDownload,
-                        enqueued_at.elapsed(),
-                        false,
-                    );
-                    let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
-                    return false;
-                }
-            };
+            let permit = reserve_media_http(media_http);
             let preparation_started = Instant::now();
             match client
                 .prepare_encrypted_media_download(&group_id, reference)
@@ -5781,7 +5787,7 @@ mod tests {
     #[tokio::test]
     async fn media_http_capacity_stays_reserved_until_completion_is_consumed() {
         let (media_http, mut completions) = media_http_context(1);
-        let permit = reserve_media_http(&media_http).expect("first transfer reserves capacity");
+        let permit = reserve_media_http(&media_http);
         let (respond, _response) = oneshot::channel();
         spawn_media_http(
             &media_http,
@@ -5795,62 +5801,209 @@ mod tests {
             .expect("HTTP work completes")
             .expect("worker completion channel remains open");
         assert!(
-            matches!(
-                reserve_media_http(&media_http),
-                Err(AppError::AccountWorkerBusy)
-            ),
-            "a queued whole-blob result must continue to consume capacity and report retryable backpressure"
+            media_http.permits.clone().try_acquire_owned().is_err(),
+            "a queued whole-blob result must continue to consume capacity"
         );
 
         drop(completion);
-        assert!(reserve_media_http(&media_http).is_ok());
+        let _permit = reserve_media_http(&media_http);
     }
 
     #[tokio::test]
     async fn full_media_capacity_queues() {
+        use image::ImageEncoder as _;
+
         let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
+        let account = AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = app.client("alice").await.unwrap();
-        let (media_http, _completions) = media_http_context(4);
-        let permits = (0..4)
-            .map(|_| reserve_media_http(&media_http).unwrap())
-            .collect::<Vec<_>>();
-        let (respond, mut response) = oneshot::channel();
-        let (mut commands, mut pending) = unused_account_worker_command_io();
-        let (events, _) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
-        handle_account_worker_command(
-            &mut client,
-            AccountWorkerCommand::DownloadGroupImage {
+        let client = app.client("alice").await.unwrap();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&png, "image/png")
+            .unwrap();
+        client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        let (respond, _response) = oneshot::channel();
+        assert!(
+            AccountWorkerCommand::UploadPreparedGroupImage {
+                upload_id: "missing".into(),
+                server: None,
+                respond,
+            }
+            .needs_media_slot(&client)
+        );
+        drop(client);
+
+        // Fill the startup channel before spawning the real worker.
+        let (commands, receiver) = mpsc::channel(8);
+        let mut transfers = Vec::new();
+        for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
+            let (started, start) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
+            let (respond, response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::HoldMediaHttp {
+                    started,
+                    release: wait,
+                    respond,
+                })
+                .unwrap();
+            transfers.push((start, release, response));
+        }
+        let (respond, mut queued) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::DownloadGroupImage {
                 group_id: GroupId::new(vec![1; 16]),
                 respond,
+            })
+            .unwrap();
+        let (respond, drained) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::Drain { respond })
+            .unwrap();
+        let (respond, uploaded) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::UploadPreparedGroupImage {
+                upload_id: staged.upload_id.clone(),
+                server: None,
+                respond,
+            })
+            .unwrap();
+        let shared = RuntimeSharedServices::default();
+        let startup = Arc::new(tokio::sync::Barrier::new(2));
+        shared.set_next_startup_sync_barrier(startup.clone());
+        let (events, _) = broadcast::channel(8);
+        let (ready, readiness) = oneshot::channel();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let worker = spawn_app_runtime_account_worker(
+            AccountWorkerRuntime {
+                app: app.clone(),
+                account_label: "alice".into(),
+                account_id_hex: account.account_id_hex,
+                relay_plane: app.relay_plane.clone(),
+                events,
+                lifecycle: shared.lifecycle(),
+                shared,
             },
-            AccountWorkerCommandContext {
-                commands: &mut commands,
-                pending: &mut pending,
-                app: &app,
-                events: &events,
-                account_id_hex: "",
-                account_label: "alice",
-                shared: &shared,
-                media_http: &media_http,
-                scheduled_convergence: &mut scheduled,
-            },
-        )
-        .await;
+            commands.clone(),
+            receiver,
+            ready,
+            shutdown_rx,
+        );
+        timeout(Duration::from_secs(5), readiness)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), startup.wait())
+            .await
+            .unwrap();
+        // A snapshot reply proves every preceding command entered startup replay.
+        let (respond, snapshot) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), snapshot)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), startup.wait())
+            .await
+            .unwrap();
+        let mut active = Vec::new();
+        for (start, release, response) in transfers {
+            timeout(Duration::from_secs(5), start)
+                .await
+                .unwrap()
+                .unwrap();
+            active.push((release, response));
+        }
+        timeout(Duration::from_secs(5), drained)
+            .await
+            .unwrap()
+            .unwrap();
+        let uploaded = timeout(Duration::from_secs(5), uploaded)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            uploaded.state,
+            crate::AppPreparedGroupImageUploadState::Uploaded
+        );
         assert!(matches!(
-            response.try_recv(),
+            queued.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        assert_eq!(pending.len(), 1);
-        assert!(pending.front().unwrap().waits_for_media(&media_http));
-        drop(permits);
-        assert!(!pending.front().unwrap().waits_for_media(&media_http));
+
+        // The steady-state receiver must also stay live behind parked media.
+        let (started, mut next_start) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::HoldMediaHttp {
+                started,
+                release: wait,
+                respond,
+            })
+            .await
+            .unwrap();
+        let (respond, drained) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::Drain { respond })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), drained)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            next_start.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Consuming one completion admits the parked download; its preparation
+        // error frees that slot for the next transfer, without a busy response.
+        let (first_release, first_response) = active.remove(0);
+        first_release.send(()).unwrap();
+        timeout(Duration::from_secs(5), first_response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(AppError::AccountWorkerBusy)));
+        timeout(Duration::from_secs(5), next_start)
+            .await
+            .unwrap()
+            .unwrap();
+        active.push((release, response));
+        for (release, response) in active {
+            release.send(()).unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        shutdown.send(()).unwrap();
+        timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5874,7 +6027,7 @@ mod tests {
 
         let (media_http, _completions) = media_http_context(1);
         reserve_prepared_group_image_upload(&media_http, &staged.upload_id).unwrap();
-        let permit = reserve_media_http(&media_http).unwrap();
+        let permit = reserve_media_http(&media_http);
         let (respond, response) = oneshot::channel();
         let done = MediaHttpDone {
             cancellation: None,
@@ -5925,7 +6078,7 @@ mod tests {
 
         let (media_http, _completions) = media_http_context(1);
         let permits = media_http.permits.clone();
-        let permit = reserve_media_http(&media_http).expect("transfer reserves capacity");
+        let permit = reserve_media_http(&media_http);
         let (started_tx, started_rx) = oneshot::channel();
         let (cancelled_tx, cancelled_rx) = oneshot::channel();
         let (respond, _response) = oneshot::channel();
