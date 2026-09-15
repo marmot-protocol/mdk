@@ -737,6 +737,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 platform: Some("ios".into()),
                 app_version: Some("2026.6.8".into()),
                 upload_trigger: Some("managed_send".into()),
+                local_member_ref: Some("a".repeat(32)),
             },
         },
         AuditEventKind::PendingCommitRecoveredOnOpen { recovered_epoch: 3 },
@@ -1242,6 +1243,7 @@ fn sample_events_serialize_within_schema_property_names() {
                 inferred: Some(false),
             }),
             source: Some(AuditSourceContext {
+                local_member_ref: Some("b".repeat(32)),
                 ..Default::default()
             }),
         }),
@@ -1585,6 +1587,7 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
             AuditEventKind::SourceContext {
                 source: AuditSourceContext {
                     platform: Some("test".into()),
+                    local_member_ref: Some("c".repeat(32)),
                     ..Default::default()
                 },
             },
@@ -1632,6 +1635,14 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
         "rotation must not add, drop, or pad a single byte"
     );
     assert_eq!(normalize_run(&rotated_bytes), normalize_run(&plain_bytes));
+    let source_rows = normalize_run(&rotated_bytes)
+        .lines()
+        .filter(|line| line.contains("\"source_context\""))
+        .count();
+    assert_eq!(
+        source_rows, 1,
+        "size-based segment rolls must not replay source_context"
+    );
 }
 
 #[test]
@@ -1727,4 +1738,363 @@ fn failed_compensation_keeps_a_tracked_writer_and_can_recover() {
     assert_eq!(all.len(), 2);
     assert_eq!(all[1].seq, all[0].seq + 1);
     recorder.rotate().unwrap();
+}
+
+fn sample_source(local_member_ref: &str) -> AuditSourceContext {
+    AuditSourceContext {
+        platform: Some("test".into()),
+        local_member_ref: Some(local_member_ref.to_owned()),
+        ..Default::default()
+    }
+}
+
+fn recorded_events(path: &Path) -> Vec<AuditEvent> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn assert_jsonl_matches_v4_schema(path: &Path) {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for (idx, line) in fs::read_to_string(path).unwrap().lines().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            validator.is_valid(&value),
+            "generated line {idx} must satisfy v4: {:?}",
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn member_ref_hex_uses_fixed_domain_and_truncation() {
+    let alice: Vec<u8> = (0u8..32).collect();
+    let bob: Vec<u8> = (32u8..64).collect();
+    assert_eq!(member_ref_hex(&alice), "8e66aded45480108db05bdf8af61c8d8");
+    assert_eq!(member_ref_hex(&bob), "5469b0a49fe3c891746157be46309935");
+    assert_eq!(member_ref_hex(b""), "fefba45141e6f9cbee5f1c9954e8a80f");
+    assert_ne!(member_ref_hex(&alice), member_ref_hex(&bob));
+}
+
+#[test]
+fn local_member_ref_round_trips_and_omission_defaults_to_none() {
+    let populated = AuditSourceContext {
+        local_member_ref: Some("8e66aded45480108db05bdf8af61c8d8".into()),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&populated).unwrap();
+    assert!(json.contains("local_member_ref"));
+    let parsed: AuditSourceContext = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, populated);
+
+    let omitted: AuditSourceContext = serde_json::from_str("{}").unwrap();
+    assert_eq!(omitted.local_member_ref, None);
+    assert!(
+        !serde_json::to_string(&omitted)
+            .unwrap()
+            .contains("local_member_ref")
+    );
+}
+
+#[test]
+fn v4_schema_accepts_optional_local_member_ref_in_both_source_placements() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let populated = "8e66aded45480108db05bdf8af61c8d8";
+    let kind_row = serde_json::json!({
+        "schema_version": AUDIT_LOG_SCHEMA_VERSION,
+        "seq": 0,
+        "wall_time_ms": 0,
+        "engine_id": "engine",
+        "kind": {
+            "type": "source_context",
+            "source": { "local_member_ref": populated, "platform": "linux" }
+        }
+    });
+    let context_row = serde_json::json!({
+        "schema_version": AUDIT_LOG_SCHEMA_VERSION,
+        "seq": 1,
+        "wall_time_ms": 0,
+        "engine_id": "engine",
+        "context": { "source": { "local_member_ref": populated } },
+        "kind": { "type": "recorder_started", "recorder": "test" }
+    });
+    let omitted = serde_json::json!({
+        "schema_version": AUDIT_LOG_SCHEMA_VERSION,
+        "seq": 2,
+        "wall_time_ms": 0,
+        "engine_id": "engine",
+        "kind": { "type": "source_context", "source": { "platform": "linux" } }
+    });
+    for value in [&kind_row, &context_row, &omitted] {
+        assert!(
+            validator.is_valid(value),
+            "v4 must accept optional local_member_ref: {:?}",
+            validator.iter_errors(value).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn v4_schema_rejects_malformed_local_member_ref() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let base = serde_json::json!({
+        "schema_version": AUDIT_LOG_SCHEMA_VERSION,
+        "seq": 0,
+        "wall_time_ms": 0,
+        "engine_id": "engine",
+        "kind": { "type": "source_context", "source": {} }
+    });
+    for bad in [
+        serde_json::json!(true),
+        serde_json::json!("not-hex"),
+        serde_json::json!("abcd"),
+        serde_json::json!("g".repeat(32)),
+        serde_json::json!("aa".repeat(17)),
+    ] {
+        let mut value = base.clone();
+        value["kind"]["source"]["local_member_ref"] = bad;
+        assert!(
+            !validator.is_valid(&value),
+            "malformed local_member_ref must fail v4 validation"
+        );
+    }
+}
+
+#[test]
+fn historical_v2_and_v3_source_rows_without_local_member_ref_still_validate() {
+    for (version, schema_src) in [
+        (
+            "v2",
+            include_str!("../../schema/audit-log-event.v2.schema.json"),
+        ),
+        (
+            "v3",
+            include_str!("../../schema/audit-log-event.v3.schema.json"),
+        ),
+    ] {
+        let schema: serde_json::Value = serde_json::from_str(schema_src).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut row = serde_json::json!({
+            "schema_version": format!("marmot-forensics-audit/{version}"),
+            "seq": 0,
+            "wall_time_ms": 0,
+            "engine_id": "engine",
+            "kind": {
+                "type": "source_context",
+                "source": { "platform": "linux", "app_version": "old" }
+            }
+        });
+        if version == "v2" {
+            row["audit_data_mode"] = "obfuscated_sensitive_data".into();
+        }
+        assert!(
+            validator.is_valid(&row),
+            "{version} source rows without local_member_ref must keep validating: {:?}",
+            validator.iter_errors(&row).collect::<Vec<_>>()
+        );
+        let mut with_new_field = row.clone();
+        with_new_field["kind"]["source"]["local_member_ref"] =
+            serde_json::json!("8e66aded45480108db05bdf8af61c8d8");
+        assert!(
+            !validator.is_valid(&with_new_field),
+            "{version} schemas must keep rejecting undeclared local_member_ref"
+        );
+    }
+}
+
+#[test]
+fn destructive_rotation_replays_latest_source_context_and_resets_session() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open_with_account_ref(
+        &path,
+        "engine-abc".to_string(),
+        Some("0123456789abcdef0123456789abcdef".into()),
+    )
+    .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        },
+    ));
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        },
+    ));
+    let first_session = recorded_events(&path)[0]
+        .recorder_session_id
+        .clone()
+        .expect("session id");
+
+    recorder.rotate().unwrap();
+    let after_first = recorded_events(&path);
+    assert_eq!(after_first.len(), 2);
+    assert!(matches!(
+        after_first[0].kind,
+        AuditEventKind::RecorderStarted { .. }
+    ));
+    assert_eq!(after_first[0].seq, 0);
+    assert_ne!(
+        after_first[0].recorder_session_id.as_deref(),
+        Some(first_session.as_str())
+    );
+    match &after_first[1].kind {
+        AuditEventKind::SourceContext { source } => {
+            assert_eq!(
+                source.local_member_ref.as_deref(),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            );
+        }
+        other => panic!("expected replayed source, got {other:?}"),
+    }
+    assert_eq!(after_first[1].seq, 1);
+    assert_eq!(
+        after_first[1].account_ref.as_deref(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+    assert_jsonl_matches_v4_schema(&path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    recorder.rotate().unwrap();
+    let after_second = recorded_events(&path);
+    assert_eq!(after_second.len(), 2);
+    match &after_second[1].kind {
+        AuditEventKind::SourceContext { source } => {
+            assert_eq!(
+                source.local_member_ref.as_deref(),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            );
+        }
+        other => panic!("expected retained latest source, got {other:?}"),
+    }
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let continued = recorded_events(&path);
+    assert_eq!(continued.len(), 3);
+    assert_eq!(continued[2].seq, 2);
+    assert_jsonl_matches_v4_schema(&path);
+}
+
+#[test]
+fn destructive_rotation_without_source_context_emits_only_startup() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.rotate().unwrap();
+    let events = recorded_events(&path);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].kind,
+        AuditEventKind::RecorderStarted { .. }
+    ));
+}
+
+#[test]
+fn failed_source_write_is_still_replayed_after_successful_rotation() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.fail_next_write();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source("cccccccccccccccccccccccccccccccc"),
+        },
+    ));
+    assert_eq!(
+        recorded_events(&path).len(),
+        1,
+        "failed source write must not appear in the original file"
+    );
+    recorder.rotate().unwrap();
+    let events = recorded_events(&path);
+    assert_eq!(events.len(), 2);
+    match &events[1].kind {
+        AuditEventKind::SourceContext { source } => {
+            assert_eq!(
+                source.local_member_ref.as_deref(),
+                Some("cccccccccccccccccccccccccccccccc")
+            );
+        }
+        other => panic!("expected retained source after failed write, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn failed_destructive_swap_preserves_writer_and_source_context() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let logs = dir.path().join("logs");
+    fs::create_dir(&logs).unwrap();
+    let path = default_jsonl_path(&logs, "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source("dddddddddddddddddddddddddddddddd"),
+        },
+    ));
+    let before = fs::read_to_string(&path).unwrap();
+
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
+    if fs::write(logs.join("probe.tmp"), b"").is_ok() {
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let err = recorder.rotate().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let after_continue = recorded_events(&path);
+    assert_eq!(after_continue.last().unwrap().seq, 2);
+
+    recorder.rotate().unwrap();
+    let events = recorded_events(&path);
+    assert_eq!(events.len(), 2);
+    match &events[1].kind {
+        AuditEventKind::SourceContext { source } => {
+            assert_eq!(
+                source.local_member_ref.as_deref(),
+                Some("dddddddddddddddddddddddddddddddd")
+            );
+        }
+        other => panic!("expected preserved source after failed swap, got {other:?}"),
+    }
 }

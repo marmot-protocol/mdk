@@ -29,6 +29,7 @@ use std::time::Duration;
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 
@@ -71,6 +72,19 @@ pub type MessageRefHex = String;
 
 /// Hex-encoded 16-byte stable hash of Marmot member identity bytes.
 pub type MemberRefHex = String;
+
+/// Domain-separated diagnostic member reference used by audit rows.
+///
+/// Returns the lowercase hex of the first 16 bytes of
+/// `SHA-256(b"marmot-audit-member-ref/v1" || member_identity)`.
+/// This is a pseudonymous join key, not authentication or a membership verdict.
+/// The prefix is a public domain separator, not a secret salt.
+pub fn member_ref_hex(member_identity: &[u8]) -> MemberRefHex {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-member-ref/v1");
+    hasher.update(member_identity);
+    hex::encode(&hasher.finalize()[..16])
+}
 
 /// Hex-encoded 32-byte SHA-256 digest.
 pub type DigestHex = String;
@@ -158,6 +172,18 @@ pub struct AuditSourceContext {
     pub app_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_trigger: Option<String>,
+    /// Producer member reference: lowercase hex of the first 16 bytes of
+    /// `SHA-256(b"marmot-audit-member-ref/v1" || member_identity_bytes)`.
+    ///
+    /// This is a pseudonymous diagnostic join so a producing engine can be
+    /// correlated with `group_state_changed.subject_member_ref` /
+    /// `actor_member_ref`. It is not authentication or a membership verdict.
+    /// Absence means unknown or unavailable, including older rows; it is never
+    /// evidence that a producer was removed. The value is never an
+    /// [`AccountRefHex`] — account and member references use distinct hash
+    /// domains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_member_ref: Option<MemberRefHex>,
 }
 
 /// Correlates every row produced during one distributed-convergence run via a
@@ -1329,6 +1355,16 @@ struct JsonlInner {
     /// or absent hint costs a gap in the numbering at worst. Unbounded segment
     /// counts are mdk#1014's to bound.
     next_segment_index: Option<u32>,
+    /// Most recently explicitly recorded `AuditEventKind::SourceContext`.
+    /// Retained even when the best-effort write fails so a later successful
+    /// destructive rotation can replay it. Not inferred from
+    /// `AuditEventContext.source`. Survives destructive swaps; size-based
+    /// segment rolls do not replay it.
+    retained_source_context: Option<AuditSourceContext>,
+    /// Test seam: fail the next `write_record` after capturing any source
+    /// context, so retention can be proven independently of a durable write.
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 fn validate_account_ref_hex(account_ref: &str) -> std::io::Result<()> {
@@ -1376,6 +1412,9 @@ impl JsonlRecorder {
                 segment_retry_after: None,
                 writer_path: path.clone(),
                 next_segment_index: None,
+                retained_source_context: None,
+                #[cfg(test)]
+                fail_next_write: false,
             }),
             #[cfg(test)]
             fail_segment_reopen: std::sync::atomic::AtomicBool::new(false),
@@ -1484,23 +1523,35 @@ impl ForensicRecorder for JsonlRecorder {
     }
 
     fn rotate(&self) -> std::io::Result<()> {
-        {
-            let mut inner = match self.inner.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            self.swap_to_fresh_file(&mut inner)?;
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.swap_to_fresh_file(&mut inner)?;
+        // Replay lifecycle rows under the same mutex. `record()` would
+        // re-lock; size-based segment rolls must not take this path.
+        Self::write_record(&mut inner, AuditRecord::new(None, recorder_started_kind()));
+        if let Some(source) = inner.retained_source_context.clone() {
+            Self::write_record(
+                &mut inner,
+                AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+            );
         }
-        // Mark the start of the fresh file, mirroring `open_with_account_ref`.
-        // `record` re-acquires the lock, so this runs after the guard is
-        // dropped above.
-        self.record(AuditRecord::new(None, recorder_started_kind()));
         Ok(())
     }
 }
 
 impl JsonlRecorder {
     fn write_record(inner: &mut JsonlInner, record: AuditRecord) -> bool {
+        if let AuditEventKind::SourceContext { source } = &record.kind {
+            inner.retained_source_context = Some(source.clone());
+        }
+        #[cfg(test)]
+        if inner.fail_next_write {
+            inner.fail_next_write = false;
+            inner.health.write_failures = inner.health.write_failures.saturating_add(1);
+            return false;
+        }
         let seq = inner.seq;
         inner.seq = seq.wrapping_add(1);
         let kind = record.kind;
@@ -1679,6 +1730,16 @@ impl JsonlRecorder {
             return Err(std::io::Error::other("forced segment reopen failure"));
         }
         fs_private::open_private_append(&self.path)
+    }
+
+    /// Fail the next best-effort write after capturing any source context.
+    #[cfg(test)]
+    fn fail_next_write(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.fail_next_write = true;
     }
 
     /// Make the *next* segment reopen fail, so a test can drive the

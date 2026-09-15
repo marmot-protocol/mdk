@@ -561,6 +561,7 @@ impl MarmotApp {
     fn audit_source_context_for_recorder(
         &self,
         device_id_hex: &str,
+        account_id: &MemberId,
     ) -> marmot_forensics::AuditSourceContext {
         let upload_source = self.audit_log_tracker_config().source;
         marmot_forensics::AuditSourceContext {
@@ -568,6 +569,7 @@ impl MarmotApp {
             hardware_model: upload_source.hardware_model,
             platform: upload_source.platform,
             app_version: upload_source.app_version,
+            local_member_ref: Some(marmot_forensics::member_ref_hex(account_id.as_slice())),
             ..Default::default()
         }
     }
@@ -808,7 +810,7 @@ impl MarmotApp {
                 // Emit a source_context row identifying the producing account and
                 // the host-supplied device/client metadata from tracker config.
                 use marmot_forensics::ForensicRecorder as _;
-                let source = self.audit_source_context_for_recorder(&device_id_hex);
+                let source = self.audit_source_context_for_recorder(&device_id_hex, account_id);
                 recorder.record(marmot_forensics::AuditRecord::new(
                     None,
                     marmot_forensics::AuditEventKind::SourceContext { source },
@@ -1356,12 +1358,23 @@ mod tests {
         let second_device = "02".repeat(16);
 
         let account_ref = audit_account_ref_hex(&account_id);
+        let member_ref = marmot_forensics::member_ref_hex(account_id.as_slice());
+        let other = MemberId::new(vec![0xcd; 32]);
         let first_engine = audit_engine_id_hex(&account_id, &first_device);
         let second_engine = audit_engine_id_hex(&account_id, &second_device);
 
-        assert_eq!(account_ref.len(), 32);
-        assert_eq!(account_ref, audit_account_ref_hex(&account_id));
+        assert_eq!(account_ref, "c27882eb80e58cbc3c5daddd0b0ab806");
+        assert_eq!(member_ref, "58cedb13787381c2bd910fa2ec7a1c64");
         assert_ne!(account_ref, hex::encode(&account_id.as_slice()[..16]));
+        assert_ne!(account_ref, member_ref);
+        assert_ne!(
+            member_ref,
+            marmot_forensics::member_ref_hex(other.as_slice())
+        );
+        assert_eq!(
+            marmot_forensics::member_ref_hex(other.as_slice()),
+            "006db2679a7e3260a8eaba11ab3bbb1c"
+        );
         assert_ne!(first_engine, second_engine);
     }
 
@@ -1521,6 +1534,89 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+        let account_id = app.member_id("alice").unwrap();
+        assert_eq!(
+            source["local_member_ref"],
+            marmot_forensics::member_ref_hex(account_id.as_slice())
+        );
+        assert_eq!(event["account_ref"], audit_account_ref_hex(&account_id));
+        assert_ne!(event["account_ref"], source["local_member_ref"]);
+        assert!(!first_line.contains(&hex::encode(account_id.as_slice())));
+        assert!(!first_line.contains("alice"));
+    }
+
+    #[test]
+    fn two_device_directories_share_member_ref_and_differ_in_engine_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let account_id = app.member_id("alice").unwrap();
+        let expected_member = marmot_forensics::member_ref_hex(account_id.as_slice());
+        let expected_account = audit_account_ref_hex(&account_id);
+
+        let first = app.build_audit_recorder("alice", true);
+        let first_path = first.audit_log_path().expect("first recorder");
+        let first_source = source_context_event(&first_path);
+        drop(first);
+        fs::remove_file(app.account_dir("alice").join(AUDIT_DEVICE_ID_FILE)).unwrap();
+        let second = app.build_audit_recorder("alice", true);
+        let second_path = second.audit_log_path().expect("second recorder");
+        let second_source = source_context_event(&second_path);
+        assert_ne!(first_path, second_path);
+        assert_eq!(first_source["account_ref"], expected_account);
+        assert_eq!(second_source["account_ref"], expected_account);
+        assert_eq!(
+            first_source["kind"]["source"]["local_member_ref"],
+            expected_member
+        );
+        assert_eq!(
+            second_source["kind"]["source"]["local_member_ref"],
+            expected_member
+        );
+        assert_ne!(first_source["engine_id"], second_source["engine_id"]);
+        assert_ne!(
+            first_source["kind"]["source"]["device_id"],
+            second_source["kind"]["source"]["device_id"]
+        );
+    }
+
+    #[test]
+    fn recorder_rotate_replays_startup_source_and_disabled_stays_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let account_id = app.member_id("alice").unwrap();
+        let expected_member = marmot_forensics::member_ref_hex(account_id.as_slice());
+
+        let recorder = app.build_audit_recorder("alice", true);
+        let path = recorder.audit_log_path().expect("enabled recorder");
+        let before = source_context_event(&path);
+        recorder.rotate().unwrap();
+        let after = source_context_event(&path);
+        assert_eq!(after["kind"]["source"]["local_member_ref"], expected_member);
+        assert_eq!(after["account_ref"], before["account_ref"]);
+        assert_eq!(after["engine_id"], before["engine_id"]);
+        assert_ne!(after["recorder_session_id"], before["recorder_session_id"]);
+        drop(recorder);
+        let lines_before_disable = fs::read_to_string(&path).unwrap().lines().count();
+
+        let disabled = app.build_audit_recorder("alice", false);
+        assert!(disabled.audit_log_path().is_none());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            lines_before_disable
+        );
+    }
+
+    fn source_context_event(path: &Path) -> serde_json::Value {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["kind"]["type"] == "source_context")
+            .expect("source_context row")
     }
 
     #[test]
