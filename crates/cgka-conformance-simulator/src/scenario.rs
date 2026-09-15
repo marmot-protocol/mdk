@@ -197,6 +197,14 @@ pub enum ScenarioStep {
     },
     /// Release independent public profile calls at one barrier. All must be accepted;
     /// semantic expected outcomes still decide whether their effects survive.
+    /// Force the higher-identity invitation to compete with a profile edit,
+    /// then require durable explicit recipient recovery through public APIs.
+    RaceInviteProfile {
+        actors: Vec<String>,
+        invitee: String,
+        name: String,
+        restart_at_offer: bool,
+    },
     RaceGroupProfiles {
         updates: Vec<crate::ScenarioProfileUpdate>,
     },
@@ -281,6 +289,7 @@ impl ScenarioStep {
         "set_partition",
         "clear_partition",
         "interrupt_relay",
+        "race_invite_profile",
         "race_group_profiles",
         "restart_client",
         "set_client_offline",
@@ -349,6 +358,7 @@ impl ScenarioStep {
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
             ScenarioStep::InterruptRelay { .. } => "interrupt_relay",
+            ScenarioStep::RaceInviteProfile { .. } => "race_invite_profile",
             ScenarioStep::RaceGroupProfiles { .. } => "race_group_profiles",
             ScenarioStep::RestartClient { .. } => "restart_client",
             ScenarioStep::SetClientOffline { .. } => "set_client_offline",
@@ -1153,6 +1163,15 @@ async fn execute_scenario_step(
             .map_err(|error| subject_step_error(step_index, error))?,
         ScenarioStep::InterruptRelay { relay, outage_ms } => subject
             .interrupt_relay(action_id, relay, *outage_ms)
+            .await
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RaceInviteProfile {
+            actors,
+            invitee,
+            name,
+            restart_at_offer,
+        } => subject
+            .race_invite_profile(action_id, actors, invitee, name, *restart_at_offer)
             .await
             .map_err(|error| subject_step_error(step_index, error))?,
         ScenarioStep::RaceGroupProfiles { updates } => subject

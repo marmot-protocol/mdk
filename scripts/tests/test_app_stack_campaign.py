@@ -16,6 +16,13 @@ SPEC.loader.exec_module(campaign)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_expansion_selection_excludes_baseline(self):
+        args = campaign.parse_args(["unused", "--catalog", "expansion", "--generated-only", "--seeds", "7"])
+        tasks = campaign.make_plan(args, {"cgka-conformance-campaign": "campaign"}, {})
+        self.assertEqual(sum(t["cases"] for t in tasks), 6)
+        self.assertEqual({t["family"] for t in tasks}, set(campaign.EXPANSION_FAMILIES))
+        self.assertFalse(set(campaign.FAMILIES) & {t["family"] for t in tasks})
+
     def test_generated_only_selects_all_72_cases_without_fixed_diagnostics(self):
         args = campaign.parse_args(["unused", "--generated-only", "--seeds", "7", "--jobs", "1"])
         executables = {"cgka-conformance-campaign": "campaign"}

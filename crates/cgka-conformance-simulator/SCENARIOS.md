@@ -1275,3 +1275,13 @@ attempt can finish after restart, not that the original repair or full scenario 
 The ignored `diagnose_retained_app_replay` test can reopen one stopped synthetic app fixture for a short reconstruction
 observation. Set `MDK_RETAINED_APP_ROOT` to a private copy containing the `replay-diagnostic-fixture` marker. It uses
 normal runtime policy and a new local relay; it mutates that copy and is diagnostic evidence, not a full scenario pass.
+
+## Opt-in recovery expansion
+
+See [the first-increment generator and campaign guide](APP_RECOVERY_EXPANSION.md).
+`public-app-invite-profile-recovery/v1`, `public-app-longevity/v1` and
+`public-app-retained-traffic/v1` add six opt-in selections per seed, all generator
+version 1. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
+The existing default 72-case campaign is unchanged; use `--catalog expansion`.
+`app_recovery_expansion.rs` checks replay, prefix stability, structural diversity,
+required interactions and rejection of missing/refused recovery evidence.

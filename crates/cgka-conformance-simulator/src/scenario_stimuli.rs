@@ -21,6 +21,16 @@ pub enum ScenarioStimulusObservation {
         rejected_connections: u64,
         runtimes_running: usize,
     },
+    InviteProfileRecovery {
+        action_id: String,
+        inviter: String,
+        renamer: String,
+        outcomes: Vec<crate::app_runtime::ConcurrentMutationOutcome>,
+        admitted_publications: usize,
+        explicit_rejoin: bool,
+        offer_survived_restart: bool,
+        confirmation_survived_restart: bool,
+    },
     ConcurrentProfiles {
         action_id: String,
         /// Callers released together; this does not claim an MLS commit race.
@@ -42,6 +52,7 @@ pub fn validate_scenario_stimulus_evidence(
             .iter()
             .filter(|observation| match observation {
                 ScenarioStimulusObservation::RelayInterruption { action_id, .. }
+                | ScenarioStimulusObservation::InviteProfileRecovery { action_id, .. }
                 | ScenarioStimulusObservation::ConcurrentProfiles { action_id, .. } => {
                     action_id == &action.schedule.action_id
                 }
@@ -51,6 +62,17 @@ pub fn validate_scenario_stimulus_evidence(
             crate::ScenarioStep::InterruptRelay { outage_ms, .. } => matches!(matching.as_slice(),
                 [ScenarioStimulusObservation::RelayInterruption { requested_outage_ms, closed_connections, runtimes_running, .. }]
                     if requested_outage_ms == outage_ms && *closed_connections > 0 && *runtimes_running > 0),
+            crate::ScenarioStep::RaceInviteProfile {
+                actors,
+                restart_at_offer,
+                ..
+            } => matches!(matching.as_slice(),
+                [ScenarioStimulusObservation::InviteProfileRecovery { inviter, renamer, outcomes, admitted_publications, explicit_rejoin, offer_survived_restart, confirmation_survived_restart, .. }]
+                    if inviter != renamer && actors.contains(inviter) && actors.contains(renamer)
+                    && outcomes.len() == 2 && outcomes[0].client == *inviter && outcomes[1].client == *renamer
+                    && outcomes.iter().all(|o| o.accepted && o.error_kind.is_none())
+                    && *admitted_publications >= 2 && *explicit_rejoin
+                    && (!restart_at_offer || *offer_survived_restart) && *confirmation_survived_restart),
             crate::ScenarioStep::RaceGroupProfiles { updates } => matches!(matching.as_slice(),
                 [ScenarioStimulusObservation::ConcurrentProfiles { callers_released, outcomes, .. }]
                     if *callers_released == updates.len() && outcomes.len() == updates.len()

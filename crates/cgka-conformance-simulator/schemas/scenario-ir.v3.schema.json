@@ -133,6 +133,9 @@
                 },
                 {
                   "$ref": "#/$defs/public_history_assertion"
+                },
+                {
+                  "$ref": "#/$defs/race_invite_profile"
                 }
               ]
             }
@@ -146,6 +149,9 @@
         },
         {
           "$ref": "#/$defs/public_history_assertion"
+        },
+        {
+          "$ref": "#/$defs/race_invite_profile"
         }
       ]
     },
@@ -408,6 +414,43 @@
               }
             }
           ]
+        }
+      }
+    },
+    "race_invite_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "actors",
+        "invitee",
+        "name",
+        "restart_at_offer"
+      ],
+      "properties": {
+        "type": {
+          "const": "race_invite_profile"
+        },
+        "actors": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "invitee": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "restart_at_offer": {
+          "type": "boolean"
         }
       }
     }

@@ -30,6 +30,18 @@ FAMILIES = {
     "public-app-backlog-recovery/v1": (6, 900),
     "cross-route-restart-permutations/v1": (12, 900),
 }
+# Explicit expansion selection leaves the existing 72-case baseline unchanged.
+EXPANSION_FAMILIES = {
+    "public-app-invite-profile-recovery/v1": (2, 600),
+    "public-app-longevity/v1": (2, 900),
+    "public-app-retained-traffic/v1": (2, 1200),
+}
+
+
+def selected_families(args):
+    return EXPANSION_FAMILIES if getattr(args, "catalog", "baseline") == "expansion" else FAMILIES
+
+
 TEST_BINARIES = (
     "app_runtime_adapter", "app_runtime_journeys",
     "app_runtime_interaction_journeys", "public_app_families", "app_generated_variance", "process_orchestrator",
@@ -72,6 +84,7 @@ def positive(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path, help="fresh evidence directory (must not exist)")
+    parser.add_argument("--catalog", choices=("baseline", "expansion"), default="baseline")
     parser.add_argument("--mode", choices=("canary", "full"), default="full")
     parser.add_argument("--seeds", nargs="+", type=int, default=[7, 42, 17001])
     parser.add_argument("--rounds", type=positive, default=1,
@@ -240,7 +253,7 @@ def test_names(executable, env, deadline=None):
 def make_plan(args, executables, inventory):
     tasks = []
     for iteration in range(args.rounds):
-        for family, (count, timeout) in FAMILIES.items():
+        for family, (count, timeout) in selected_families(args).items():
             for seed in (args.seeds[:1] if args.mode == "canary" else args.seeds):
                 cases = 1 if args.mode == "canary" else count
                 tasks.append({"id": f"round-{iteration}/{family.replace('/', '-')}-seed-{seed}",
@@ -400,7 +413,7 @@ def main(argv=None):
     if args.plan_only:
         print(json.dumps({"mode": args.mode, "seeds": args.seeds, "rounds": args.rounds,
                           "budget_seconds": args.budget_secs,
-                          "families": FAMILIES, "test_binaries": [] if args.generated_only else TEST_BINARIES,
+                          "families": selected_families(args), "test_binaries": [] if args.generated_only else TEST_BINARIES,
                           "scope": "fresh app stacks per case; real local relay; production timing"}, indent=2))
         return 0
     os.umask(0o077)

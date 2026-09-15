@@ -26,6 +26,7 @@ pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &[
     "update_group_profile",
     "expect_tick_error",
     "interrupt_relay",
+    "race_invite_profile",
     "race_group_profiles",
 ];
 
@@ -216,6 +217,7 @@ fn is_group_scoped(step: &ScenarioStep) -> bool {
             | ScenarioStep::SelfUpdate { .. }
             | ScenarioStep::UpdateGroupData { .. }
             | ScenarioStep::UpdateGroupProfile { .. }
+            | ScenarioStep::RaceInviteProfile { .. }
             | ScenarioStep::RaceGroupProfiles { .. }
             | ScenarioStep::UpdateAdminPolicy { .. }
             | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
@@ -399,6 +401,22 @@ fn validate_step(
                     Some(step_index),
                     "relay outage must be 1..=30000 ms".into(),
                 ));
+            }
+        }
+        ScenarioStep::RaceInviteProfile {
+            actors,
+            invitee,
+            name,
+            ..
+        } => {
+            validate_nonempty_clients(step_index, actors, clients, "invite/profile race")?;
+            validate_client(step_index, invitee, clients, "invite/profile race")?;
+            if actors.len() != 2
+                || actors[0] == actors[1]
+                || actors.contains(invitee)
+                || name.is_empty()
+            {
+                return Err(compile_error(Some(step_index), "invite/profile race requires two distinct actors, a separate invitee and a name".into()));
             }
         }
         ScenarioStep::RaceGroupProfiles { updates } => {

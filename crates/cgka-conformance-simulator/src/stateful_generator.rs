@@ -1552,3 +1552,221 @@ mod checkpoint_tests {
         assert_eq!(checks, model.members.len() * payloads.len());
     }
 }
+/// New families leave all existing generator identities and prefixes unchanged.
+pub fn generate_public_app_invite_profile_case(
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4956_5052 ^ case_index.rotate_left(23));
+    let mut model = JourneyModel::new_public(case_index);
+    // Rebuild formation before any actions execute: david is the late invitee.
+    model.steps.clear();
+    model.members.remove("david");
+    model.non_members.insert("david".into());
+    model.steps.push(ScenarioStep::CreateGroup {
+        creator: "alice".into(),
+        name: model.group_name.clone(),
+        invitees: vec!["bob".into(), "carol".into()],
+        required_features: vec![],
+        initial_admins: Some(vec!["alice".into(), "bob".into(), "carol".into()]),
+        pending: "create".into(),
+    });
+    model.steps.push(accept_all_outbound("alice"));
+    model.admins = BTreeSet::from(["alice".into(), "bob".into(), "carol".into()]);
+    model.public_state_checkpoint();
+    let mut founders = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+    founders.shuffle(&mut rng);
+    for _ in 0..rng.gen_range(1..=3) {
+        model.apply(JourneyAction::Send {
+            sender: founders[rng.gen_range(0..3)].clone(),
+        });
+    }
+    // Vary which observer sees the race live and when it reopens. Actors stay
+    // online; the invitee must receive the losing Welcome to exercise recovery.
+    let observer_offline = rng.gen_bool(0.5);
+    if observer_offline {
+        model.steps.push(ScenarioStep::SetClientOffline {
+            client: founders[2].clone(),
+        });
+        model.online.remove(&founders[2]);
+    }
+    if rng.gen_bool(0.5) {
+        model.apply(JourneyAction::Restart {
+            client: founders[0].clone(),
+        });
+    }
+    model.group_name = format!("invite-profile-{case_index}");
+    model.steps.push(ScenarioStep::RaceInviteProfile {
+        actors: founders[..2].to_vec(),
+        invitee: "david".into(),
+        name: model.group_name.clone(),
+        restart_at_offer: case_index % 2 == 0,
+    });
+    model.members.insert("david".into());
+    model.non_members.remove("david");
+    model.epoch += 1;
+    if rng.gen_bool(0.5) {
+        model.steps.push(ScenarioStep::InterruptRelay {
+            relay: "relay:default".into(),
+            outage_ms: rng.gen_range(50..=200),
+        });
+    }
+    if observer_offline {
+        model.steps.push(ScenarioStep::ReconnectClient {
+            client: founders[2].clone(),
+        });
+        model.online.insert(founders[2].clone());
+    }
+    model.deliver_to_online();
+    model.public_state_checkpoint();
+    for sender in ["david".to_owned(), founders[0].clone()] {
+        model.apply(JourneyAction::Send { sender });
+    }
+    model.compact_public_payload_checks = true;
+    let mut case = model.finish_public("public-app-invite-profile-recovery/v1", seed);
+    case.generator_version = "1".into();
+    case
+}
+
+/// Same app participants and encrypted databases across every activity cycle.
+/// The long profile changes cycle count, never starts another fresh stack.
+pub fn generate_public_app_activity_case(
+    family: &str,
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4143_5449 ^ case_index.rotate_left(23));
+    let pressure = family == "public-app-retained-traffic/v1";
+    let cycles = if family == "public-app-longevity-extended/v1" {
+        48
+    } else {
+        2 + (case_index % 2) as usize
+    };
+    let mut model = JourneyModel::new_public(case_index);
+    model.compact_public_payload_checks = true;
+    if pressure {
+        model.steps.push(ScenarioStep::ConfigureRelay {
+            relay: "relay:default".into(),
+            order: crate::ScenarioRelayOrderV2::Natural,
+            duplicate_copies: 2,
+        });
+    }
+    for cycle in 0..cycles {
+        model.offline_client = CLIENTS[rng.gen_range(1..4)].into();
+        model.apply(JourneyAction::SetOffline);
+        let late = if pressure {
+            let index = model.steps.len();
+            model.apply(JourneyAction::Send {
+                sender: "alice".into(),
+            });
+            let payload = model.received_payloads[&model.offline_client]
+                .last()
+                .unwrap()
+                .clone();
+            let selector = crate::ScenarioMessageSelectorV2 {
+                action_id: Some(format!("step-{index}:send_app_message")),
+                class: Some(crate::ScenarioTransportClass::Application),
+                ..Default::default()
+            };
+            model.steps.push(ScenarioStep::SetRelayEventVisibility {
+                relay: "relay:default".into(),
+                selector: selector.clone(),
+                clients: vec![model.offline_client.clone()],
+                visible: false,
+            });
+            // The returning device must first recover without this one event.
+            model
+                .received_payloads
+                .get_mut(&model.offline_client)
+                .unwrap()
+                .retain(|p| p != &payload);
+            Some((selector, payload))
+        } else {
+            None
+        };
+        let mut motifs = vec![0, 1, 2];
+        motifs.shuffle(&mut rng);
+        for motif in motifs {
+            match motif {
+                0 => public_recovery_burst(
+                    &mut model,
+                    &mut rng,
+                    if pressure { 16..=24 } else { 2..=4 },
+                ),
+                1 => model.apply(JourneyAction::UpdateProfile {
+                    actor: "alice".into(),
+                }),
+                2 => {
+                    let victim = public_online_peer(&model, &mut rng);
+                    model.apply(JourneyAction::Remove {
+                        member: victim.clone(),
+                    });
+                    // Establish exclusion traffic before the fresh invitation.
+                    model.apply(JourneyAction::Send {
+                        sender: "alice".into(),
+                    });
+                    model.apply(JourneyAction::Invite { invitee: victim });
+                }
+                _ => unreachable!(),
+            }
+        }
+        model.steps.push(ScenarioStep::InterruptRelay {
+            relay: "relay:default".into(),
+            outage_ms: rng.gen_range(50..=250),
+        });
+        // Reconnect without draining first; fresh sends enter while retained
+        // history is eligible. This is interleaved traffic, not continuous load.
+        let returning = model.offline_client.clone();
+        model.steps.push(ScenarioStep::ReconnectClient {
+            client: returning.clone(),
+        });
+        model.online.insert(returning.clone());
+        public_recovery_burst(&mut model, &mut rng, 2..=4);
+        model.steps.push(ScenarioStep::SyncRelayHistory {
+            clients: vec![returning.clone()],
+            sync: ScenarioRelaySyncModeV2::FullHistory,
+        });
+        model.deliver_to_online();
+        model.public_state_checkpoint();
+        model.public_payload_checkpoint();
+        if let Some((selector, payload)) = late {
+            model.eventually(crate::ScenarioPredicateV2::PayloadCount {
+                client: returning.clone(),
+                payload: payload.clone(),
+                count: 0,
+            });
+            model.steps.push(ScenarioStep::SetRelayEventVisibility {
+                relay: "relay:default".into(),
+                selector,
+                clients: vec![returning.clone()],
+                visible: true,
+            });
+            model
+                .received_payloads
+                .get_mut(&returning)
+                .unwrap()
+                .push(payload);
+            model.steps.push(ScenarioStep::SyncRelayHistory {
+                clients: vec![returning.clone()],
+                sync: ScenarioRelaySyncModeV2::FullHistory,
+            });
+            model.apply(JourneyAction::Send {
+                sender: "alice".into(),
+            });
+            model.public_payload_checkpoint();
+        }
+        // Deliberate restarts only on alternating cycles; alice stays running.
+        if cycle % 2 == 1 {
+            model.apply(JourneyAction::Restart {
+                client: returning.clone(),
+            });
+        }
+        model.apply(JourneyAction::Send { sender: returning });
+        model.apply(JourneyAction::Send {
+            sender: "alice".into(),
+        });
+    }
+    let mut case = model.finish_public(family, seed);
+    case.generator_version = "1".into();
+    case
+}

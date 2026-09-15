@@ -1869,6 +1869,146 @@ impl ConvergenceSubject for AppRuntimeHarness {
         Ok(())
     }
 
+    async fn race_invite_profile(
+        &mut self,
+        action_id: &str,
+        actors: &[String],
+        invitee: &str,
+        name: &str,
+        restart_at_offer: bool,
+    ) -> Result<(), SubjectError> {
+        let (inviter, renamer) =
+            if self.account_identity(&actors[0])? < self.account_identity(&actors[1])? {
+                (&actors[1], &actors[0])
+            } else {
+                (&actors[0], &actors[1])
+            };
+        let invitees = vec![invitee.to_owned()];
+        let report = self
+            .race_mutations(
+                action_id,
+                &[
+                    ConcurrentMutation::InviteMembers {
+                        inviter,
+                        invitees: &invitees,
+                    },
+                    ConcurrentMutation::UpdateGroupProfile {
+                        client: renamer,
+                        name: Some(name),
+                        description: None,
+                    },
+                ],
+            )
+            .await?;
+        let all_accepted = report.outcomes.iter().all(|o| o.accepted);
+        let evidence_index = self.stimulus_observations.len();
+        self.stimulus_observations.push(
+            crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                action_id: action_id.into(),
+                inviter: inviter.clone(),
+                renamer: renamer.clone(),
+                outcomes: report.outcomes,
+                admitted_publications: report.admitted_publications,
+                explicit_rejoin: false,
+                offer_survived_restart: false,
+                confirmation_survived_restart: false,
+            },
+        );
+        if !all_accepted {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "invite_profile_race_not_exercised",
+                "a competing command was refused; retained outcomes do not establish race recovery",
+            ));
+        }
+        // A barrier alone proves simultaneous calls, not a losing branch. Only
+        // a validated rejoin offer and explicit recovery satisfy this action.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        loop {
+            self.tick(actors).await?;
+            match self.tick(&invitees).await {
+                Ok(()) => (),
+                Err(error)
+                    if error.code == "unknown_group"
+                        || (error.category == SubjectFailureCategory::ExpectedRefusal
+                            && error.message.ends_with("unknown_group")) =>
+                {
+                    ()
+                }
+                Err(error) => return Err(error),
+            }
+            let status = self.group_recovery_status(invitee).await;
+            match status {
+                Ok(status) => {
+                    if let Some(offer) = status.rejoin_invitations.first() {
+                        let offer = offer.clone();
+                        if restart_at_offer {
+                            self.reopen(invitee).await?;
+                            if !self
+                                .group_recovery_status(invitee)
+                                .await?
+                                .rejoin_invitations
+                                .contains(&offer)
+                            {
+                                return Err(SubjectError::new(
+                                    "rejoin_offer_lost",
+                                    "validated offer did not survive reopen",
+                                ));
+                            }
+                            if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                                offer_survived_restart,
+                                ..
+                            } = &mut self.stimulus_observations[evidence_index]
+                            {
+                                *offer_survived_restart = true;
+                            }
+                        }
+                        self.confirm_group_rejoin(invitee, &offer).await?;
+                        if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                            explicit_rejoin,
+                            ..
+                        } = &mut self.stimulus_observations[evidence_index]
+                        {
+                            *explicit_rejoin = true;
+                        }
+                        self.reopen(invitee).await?;
+                        let view = self.observations(&invitees).await?;
+                        if view[0].application.pending_confirmation {
+                            return Err(SubjectError::new(
+                                "rejoin_confirmation_lost",
+                                "confirmed rejoin did not survive reopen",
+                            ));
+                        }
+                        if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                            confirmation_survived_restart,
+                            ..
+                        } = &mut self.stimulus_observations[evidence_index]
+                        {
+                            *confirmation_survived_restart = true;
+                        }
+                        return Ok(());
+                    }
+                }
+                Err(error)
+                    if error.code == "unknown_group"
+                        || (error.category == SubjectFailureCategory::ExpectedRefusal
+                            && error.message.ends_with("unknown_group")) =>
+                {
+                    ()
+                }
+                Err(error) => return Err(error),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SubjectError::new(
+                    "explicit_invitee_recovery_not_exercised",
+                    "accepted concurrent calls did not produce a validated recipient recovery offer",
+                ));
+            }
+            self.run_due_maintenance(actors).await?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     async fn race_group_profiles(
         &mut self,
         action_id: &str,

@@ -412,6 +412,11 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::SetPartition { .. } | ScenarioStep::ClearPartition => {
                 stimuli.insert(ScenarioStimulus::Partition);
             }
+            ScenarioStep::RaceInviteProfile { .. } => {
+                stimuli.insert(ScenarioStimulus::InviteMembers);
+                stimuli.insert(ScenarioStimulus::GroupDataUpdate);
+                commits += 2;
+            }
             ScenarioStep::RaceGroupProfiles { updates } => {
                 stimuli.insert(ScenarioStimulus::GroupDataUpdate);
                 commits += updates.len();

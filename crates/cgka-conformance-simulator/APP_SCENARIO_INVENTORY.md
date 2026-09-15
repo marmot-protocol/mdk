@@ -158,3 +158,13 @@ requirement to rerun every case for each PR edit. Other gates include the two ex
 diversity when widening seeds. Keep completed-case ledgers so
 broadening does not repeat prior passes; a deliberate regression campaign uses a fresh ledger. A fresh-stack campaign establishes repeated execution coverage; continuous longevity
 requires repeated activity and recovery in the same long-lived participant processes and databases.
+
+## Opt-in recovery expansion
+
+See [the first-increment generator and campaign guide](APP_RECOVERY_EXPANSION.md).
+`public-app-invite-profile-recovery/v1`, `public-app-longevity/v1` and
+`public-app-retained-traffic/v1` add six opt-in selections per seed, all generator
+version 1. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
+The existing default 72-case campaign is unchanged; use `--catalog expansion`.
+`app_recovery_expansion.rs` checks replay, prefix stability, structural diversity,
+required interactions and rejection of missing/refused recovery evidence.

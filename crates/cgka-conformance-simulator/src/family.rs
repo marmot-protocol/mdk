@@ -205,6 +205,14 @@ pub fn generate_family_case(
     case_index: u64,
 ) -> Result<GeneratedScenarioCase, UnsupportedGeneratedFamily> {
     let case = match family {
+        "public-app-invite-profile-recovery/v1" => {
+            crate::stateful_generator::generate_public_app_invite_profile_case(seed, case_index)
+        }
+        "public-app-longevity/v1"
+        | "public-app-longevity-extended/v1"
+        | "public-app-retained-traffic/v1" => {
+            crate::stateful_generator::generate_public_app_activity_case(family, seed, case_index)
+        }
         crate::PUBLIC_APP_LARGE_GROUP_FAMILY => {
             crate::generate_public_app_large_group_case(seed, case_index)
         }

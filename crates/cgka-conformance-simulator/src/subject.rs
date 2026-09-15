@@ -531,6 +531,19 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    async fn race_invite_profile(
+        &mut self,
+        _action_id: &str,
+        _actors: &[String],
+        _invitee: &str,
+        _name: &str,
+        _restart_at_offer: bool,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ConcurrentGroupMutation,
+        ))
+    }
+
     async fn race_group_profiles(
         &mut self,
         _action_id: &str,
@@ -716,7 +729,9 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             }
             ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
             ScenarioStep::InterruptRelay { .. } => SubjectCapability::RelayInterruption,
-            ScenarioStep::RaceGroupProfiles { .. } => SubjectCapability::ConcurrentGroupMutation,
+            ScenarioStep::RaceInviteProfile { .. } | ScenarioStep::RaceGroupProfiles { .. } => {
+                SubjectCapability::ConcurrentGroupMutation
+            }
             ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
                 SubjectCapability::ParticipantConnectivity
