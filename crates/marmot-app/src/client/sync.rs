@@ -2337,9 +2337,12 @@ impl AppClient {
                 if self.adapter.pending_delivery_overflow().is_some() {
                     self.state.last_transport_timestamp = cursor_before_secs;
                 }
-                if let Err(error) =
-                    self.save_state_with_pending_local_group_deletion_frontier_clears()
-                {
+                // Persist group fields without acknowledging replayable output:
+                // the caller has not received this drain's summary yet.
+                let pending_acks = std::mem::take(&mut self.pending_application_event_acks);
+                let saved = self.save_state_with_pending_local_group_deletion_frontier_clears();
+                self.pending_application_event_acks = pending_acks;
+                if let Err(error) = saved {
                     return Err(self
                         .finish_failed_sync_drain(
                             summary,
