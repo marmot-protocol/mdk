@@ -27,7 +27,7 @@ there is no automatic retry or conversion of an unexercised race into a pass.
 | `public-app-retained-traffic/v1` | 2 cases/seed | Same cycles with 16–24-message bursts, repeated real membership/profile operations, repeated history repair and one hidden historical message per cycle |
 | `public-app-longevity-extended/v1` | explicit only | 48 cycles in one harness, using the same identities and databases; not a wall-clock duration guarantee |
 
-The invite/profile and retained-traffic generators are version `2`; longevity is version `1`.
+Invite/profile is generator version `2`, retained traffic version `3`, and longevity version `1`.
 The version-1 race input omitted the named creation acknowledgement and correctly
 failed its pending-resolution oracle; saved version-1 inputs remain unchanged. Existing families and their versions are
 unchanged. Indices are independently seeded, so increasing case count preserves prefixes.
@@ -49,7 +49,9 @@ Pressure uses an all-offline boundary to remove an event from the shared relay,
 then reopens the caught-up peers on their same databases before traffic resumes.
 It is not same-process longevity evidence. Version 1 incorrectly requested a
 duplicate-copy relay control unavailable on the app adapter; version 2 uses
-repeated full-history requests. Relay configuration now has a distinct preflight
+repeated full-history requests. Version 2 then exposed the relay selector contract:
+the real relay accepts an action-id-only selector; version 3 uses that exact selector
+and the contract tests require it to resolve to a send action. Relay configuration now has a distinct preflight
 capability, so unsupported configuration fails before action zero.
 
 Pressure first proves a hidden message is absent after initial recovery, then releases

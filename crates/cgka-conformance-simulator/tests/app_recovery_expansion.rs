@@ -50,6 +50,18 @@ fn expansion_replay_prefix_diversity_and_reachability() {
                 oracle.weak_oracle_warnings
             );
             let compiled = compile_scenario(&case.scenario).unwrap();
+            for action in &compiled.actions {
+                if let ScenarioStep::SetRelayEventVisibility { selector, .. } = &action.step {
+                    assert!(
+                        selector.class.is_none()
+                            && selector.sender.is_none()
+                            && selector.publication.is_none()
+                    );
+                    assert!(compiled.actions.iter().any(|a| Some(&a.schedule.action_id)
+                        == selector.action_id.as_ref()
+                        && matches!(a.step, ScenarioStep::SendAppMessage { .. })));
+                }
+            }
             let shape = compiled
                 .actions
                 .iter()
@@ -121,7 +133,7 @@ fn invite_recovery_evidence_rejects_unexercised_races_and_lost_consent() {
         offer_survived_restart: true,
         confirmation_survived_restart: true,
     };
-    validate_scenario_stimulus_evidence(&case.scenario, &[good.clone()]).unwrap();
+    validate_scenario_stimulus_evidence(&case.scenario, std::slice::from_ref(&good)).unwrap();
     for mutation in 0..6 {
         let mut bad = good.clone();
         if let Evidence::InviteProfileRecovery {

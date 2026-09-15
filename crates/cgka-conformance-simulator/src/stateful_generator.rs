@@ -1663,7 +1663,6 @@ pub fn generate_public_app_activity_case(
                 .clone();
             let selector = crate::ScenarioMessageSelectorV2 {
                 action_id: Some(format!("step-{index}:send_app_message")),
-                class: Some(crate::ScenarioTransportClass::Application),
                 ..Default::default()
             };
             // Shared relay presence is global. Close every participant before
@@ -1782,6 +1781,6 @@ pub fn generate_public_app_activity_case(
         });
     }
     let mut case = model.finish_public(family, seed);
-    case.generator_version = if pressure { "2" } else { "1" }.into();
+    case.generator_version = if pressure { "3" } else { "1" }.into();
     case
 }
