@@ -411,7 +411,7 @@ impl AppRuntimeHarness {
         clients: &[String],
         visible: bool,
     ) -> Result<(), SubjectError> {
-        if relay != "relay:shared" {
+        if !["relay:shared", "relay:default"].contains(&relay) {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "unknown_relay",
@@ -1931,10 +1931,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 Err(error)
                     if error.code == "unknown_group"
                         || (error.category == SubjectFailureCategory::ExpectedRefusal
-                            && error.message.ends_with("unknown_group")) =>
-                {
-                    ()
-                }
+                            && error.message.ends_with("unknown_group")) => {}
                 Err(error) => return Err(error),
             }
             let status = self.group_recovery_status(invitee).await;
@@ -1992,10 +1989,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 Err(error)
                     if error.code == "unknown_group"
                         || (error.category == SubjectFailureCategory::ExpectedRefusal
-                            && error.message.ends_with("unknown_group")) =>
-                {
-                    ()
-                }
+                            && error.message.ends_with("unknown_group")) => {}
                 Err(error) => return Err(error),
             }
             if tokio::time::Instant::now() >= deadline {

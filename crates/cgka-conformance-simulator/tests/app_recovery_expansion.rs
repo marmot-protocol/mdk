@@ -148,3 +148,40 @@ fn invite_recovery_evidence_rejects_unexercised_races_and_lost_consent() {
         assert!(validate_scenario_stimulus_evidence(&case.scenario, &[bad]).is_err());
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expansion_preflights_and_rejects_unsupported_relay_configuration() {
+    use cgka_conformance_simulator::{
+        AppRuntimeHarness, ConvergenceSubject, SubjectCapability, preflight_compiled_scenario,
+    };
+    let mut app = AppRuntimeHarness::new(&[]).await.unwrap();
+    let descriptor = app.descriptor();
+    app.shutdown().await.unwrap();
+    for family in FAMILIES {
+        let case = generate_family_case(family, 7, 0).unwrap();
+        preflight_compiled_scenario(&compile_scenario(&case.scenario).unwrap(), &descriptor)
+            .unwrap();
+    }
+    let mut case = generate_family_case(FAMILIES[2], 7, 0).unwrap();
+    case.scenario.steps.push(ScenarioStep::ConfigureRelay {
+        relay: "relay:default".into(),
+        order: cgka_conformance_simulator::ScenarioRelayOrderV2::Natural,
+        duplicate_copies: 2,
+    });
+    assert!(
+        preflight_compiled_scenario(&compile_scenario(&case.scenario).unwrap(), &descriptor)
+            .is_err()
+    );
+    let mut no_reopen = descriptor;
+    no_reopen
+        .capabilities
+        .remove(&SubjectCapability::CrashReopen);
+    let mut race = generate_family_case(FAMILIES[0], 7, 0).unwrap();
+    race.scenario
+        .steps
+        .retain(|s| matches!(s, ScenarioStep::RaceInviteProfile { .. }));
+    assert!(
+        preflight_compiled_scenario(&compile_scenario(&race.scenario).unwrap(), &no_reopen)
+            .is_err()
+    );
+}

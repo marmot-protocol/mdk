@@ -387,8 +387,8 @@ sensitivity. See `SCENARIOS.md` for the production-policy command and evidence b
 
 See [the first-increment generator and campaign guide](APP_RECOVERY_EXPANSION.md).
 `public-app-invite-profile-recovery/v1`, `public-app-longevity/v1` and
-`public-app-retained-traffic/v1` add six opt-in selections per seed: invite/profile generator version 2,
-activity/pressure version 1. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
+`public-app-retained-traffic/v1` add six opt-in selections per seed: invite/profile and pressure generator version 2,
+longevity version 1. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
 The existing default 72-case campaign is unchanged; use `--catalog expansion`.
 `app_recovery_expansion.rs` checks replay, prefix stability, structural diversity,
 required interactions and rejection of missing/refused recovery evidence.

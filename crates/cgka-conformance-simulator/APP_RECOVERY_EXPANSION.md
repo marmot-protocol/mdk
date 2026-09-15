@@ -24,10 +24,10 @@ there is no automatic retry or conversion of an unexercised race into a pass.
 | --- | --- | --- |
 | `public-app-invite-profile-recovery/v1` | 2 cases/seed | Two of three admin actors; prior traffic length/sender; observer offline visibility; actor restart before race; offer restart arm; relay interruption after recovery |
 | `public-app-longevity/v1` | 2 cases/seed | Two or three cycles; shuffled message/profile/remove-reinvite motifs; offline participant, removed participant, senders, burst lengths and socket outage duration |
-| `public-app-retained-traffic/v1` | 2 cases/seed | Same cycles with 16–24-message bursts, repeated real membership/profile operations, duplicate history and one hidden historical message per cycle |
+| `public-app-retained-traffic/v1` | 2 cases/seed | Same cycles with 16–24-message bursts, repeated real membership/profile operations, repeated history repair and one hidden historical message per cycle |
 | `public-app-longevity-extended/v1` | explicit only | 48 cycles in one harness, using the same identities and databases; not a wall-clock duration guarantee |
 
-The invite/profile generator is version `2`; the other new generators are version `1`.
+The invite/profile and retained-traffic generators are version `2`; longevity is version `1`.
 The version-1 race input omitted the named creation acknowledgement and correctly
 failed its pending-resolution oracle; saved version-1 inputs remain unchanged. Existing families and their versions are
 unchanged. Indices are independently seeded, so increasing case count preserves prefixes.
@@ -39,11 +39,18 @@ a validated offer, explicit consent and confirmation persistence after reopening
 invitee. The even case also requires offer persistence before consent. Subsequent public
 assertions require the complete roster/profile and bidirectional fresh messages.
 
-Activity scenarios create one group once. Alice stays in the same running process;
+Activity scenarios create one group once. In longevity cases Alice stays in the same running process;
 other participants close/reopen for offline periods and explicit alternating-cycle
 restarts using their existing roots. Whole accumulated payload multisets and public
 roster/profile assertions detect loss, duplicates and membership divergence each cycle.
 No cycle reconstructs participant identities or databases.
+
+Pressure uses an all-offline boundary to remove an event from the shared relay,
+then reopens the caught-up peers on their same databases before traffic resumes.
+It is not same-process longevity evidence. Version 1 incorrectly requested a
+duplicate-copy relay control unavailable on the app adapter; version 2 uses
+repeated full-history requests. Relay configuration now has a distinct preflight
+capability, so unsupported configuration fails before action zero.
 
 Pressure first proves a hidden message is absent after initial recovery, then releases
 that exact correlated relay event and requires its delivery exactly once while fresh

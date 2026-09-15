@@ -62,6 +62,7 @@ pub enum SubjectCapability {
     MultiGroup,
     RetainedRelayHistory,
     RetainedRelayControl,
+    RetainedRelayConfiguration,
 }
 
 impl SubjectCapability {
@@ -93,6 +94,7 @@ impl SubjectCapability {
             Self::MultiGroup => "multi_group",
             Self::RetainedRelayHistory => "retained_relay_history",
             Self::RetainedRelayControl => "retained_relay_control",
+            Self::RetainedRelayConfiguration => "retained_relay_configuration",
         }
     }
 
@@ -478,7 +480,7 @@ pub trait ConvergenceSubject: Send {
         _duplicate_copies: usize,
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
-            SubjectCapability::RetainedRelayControl,
+            SubjectCapability::RetainedRelayConfiguration,
         ))
     }
 
@@ -746,8 +748,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
                 SubjectCapability::ParticipantConnectivity
             }
             ScenarioStep::SyncRelayHistory { .. } => SubjectCapability::RetainedRelayHistory,
-            ScenarioStep::ConfigureRelay { .. }
-            | ScenarioStep::SetRelayEventVisibility { .. }
+            ScenarioStep::ConfigureRelay { .. } => SubjectCapability::RetainedRelayConfiguration,
+            ScenarioStep::SetRelayEventVisibility { .. }
             | ScenarioStep::ReconcileRelayHistories { .. } => {
                 SubjectCapability::RetainedRelayControl
             }

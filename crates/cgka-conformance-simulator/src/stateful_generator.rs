@@ -1579,7 +1579,7 @@ pub fn generate_public_app_invite_profile_case(
     });
     model.admins = BTreeSet::from(["alice".into(), "bob".into(), "carol".into()]);
     model.public_state_checkpoint();
-    let mut founders = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+    let mut founders = ["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
     founders.shuffle(&mut rng);
     for _ in 0..rng.gen_range(1..=3) {
         model.apply(JourneyAction::Send {
@@ -1605,7 +1605,7 @@ pub fn generate_public_app_invite_profile_case(
         actors: founders[..2].to_vec(),
         invitee: "david".into(),
         name: model.group_name.clone(),
-        restart_at_offer: case_index % 2 == 0,
+        restart_at_offer: case_index.is_multiple_of(2),
     });
     model.members.insert("david".into());
     model.non_members.remove("david");
@@ -1649,13 +1649,6 @@ pub fn generate_public_app_activity_case(
     };
     let mut model = JourneyModel::new_public(case_index);
     model.compact_public_payload_checks = true;
-    if pressure {
-        model.steps.push(ScenarioStep::ConfigureRelay {
-            relay: "relay:default".into(),
-            order: crate::ScenarioRelayOrderV2::Natural,
-            duplicate_copies: 2,
-        });
-    }
     for cycle in 0..cycles {
         model.offline_client = CLIENTS[rng.gen_range(1..4)].into();
         model.apply(JourneyAction::SetOffline);
@@ -1673,12 +1666,23 @@ pub fn generate_public_app_activity_case(
                 class: Some(crate::ScenarioTransportClass::Application),
                 ..Default::default()
             };
+            // Shared relay presence is global. Close every participant before
+            // removing history, then reopen the caught-up peers on the same DBs.
+            let live = model.online.iter().cloned().collect::<Vec<_>>();
+            for client in &live {
+                model.steps.push(ScenarioStep::SetClientOffline {
+                    client: client.clone(),
+                });
+            }
             model.steps.push(ScenarioStep::SetRelayEventVisibility {
                 relay: "relay:default".into(),
                 selector: selector.clone(),
                 clients: vec![model.offline_client.clone()],
                 visible: false,
             });
+            for client in live {
+                model.steps.push(ScenarioStep::ReconnectClient { client });
+            }
             // The returning device must first recover without this one event.
             model
                 .received_payloads
@@ -1759,6 +1763,12 @@ pub fn generate_public_app_activity_case(
                 sender: "alice".into(),
             });
             model.public_payload_checkpoint();
+            // Re-request retained history after delivery to exercise deduplication.
+            model.steps.push(ScenarioStep::SyncRelayHistory {
+                clients: vec![returning.clone()],
+                sync: ScenarioRelaySyncModeV2::FullHistory,
+            });
+            model.public_payload_checkpoint();
         }
         // Deliberate restarts only on alternating cycles; alice stays running.
         if cycle % 2 == 1 {
@@ -1772,6 +1782,6 @@ pub fn generate_public_app_activity_case(
         });
     }
     let mut case = model.finish_public(family, seed);
-    case.generator_version = "1".into();
+    case.generator_version = if pressure { "2" } else { "1" }.into();
     case
 }
