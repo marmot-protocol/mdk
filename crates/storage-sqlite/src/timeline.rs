@@ -3,7 +3,7 @@ mod presentation;
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenSnapshot,
-    ConversationOpenTarget,
+    ConversationOpenTarget, ConversationWindowQuery,
 };
 pub use presentation::ConversationPresentationPage;
 

@@ -1,7 +1,7 @@
 ---
 title: "Bounded conversation opening"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 status: implementation
 ---
 
@@ -29,6 +29,12 @@ target, the query initially reserves half the context for older rows and fills u
 Results are in ascending canonical order with exact `has_more_before` and `has_more_after` flags. Canonical order
 uses the existing source epoch/phase/time/identity key, not timestamp alone. Reply previews use the existing bounded
 hydration path. The limit bounds row count and SQL work, not the total bytes of message content.
+
+M4's storage preparation adds `conversation_window(ConversationWindowQuery)`. It reuses this same read and
+recovery path but accepts an explicit number of rows before the retained anchor. The future actor can extend
+older/newer context or trim at the 200-row cap while preserving a client-reported viewport identity. A placement
+outside the row budget returns `InvalidAnchorPosition`; missing edge context is filled from the other side.
+The legacy opening API retains centered placement. This primitive alone is not a live subscription.
 
 Tokens are opaque Rust values scoped to a database's durable store epoch and a group. They survive reopening the
 same database while held by the caller; they have no serialization or cross-process/native wire contract yet.

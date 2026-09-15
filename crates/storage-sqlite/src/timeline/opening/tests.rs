@@ -595,3 +595,110 @@ fn opening_query_work_is_bounded_for_deep_anchors_and_unrelated_groups() {
         );
     }
 }
+
+#[test]
+fn live_window_placement_pages_both_ways_without_moving_the_retained_anchor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    for i in 0..12 {
+        add(&store, &format!("m{i:02}"), i, i);
+    }
+    let opened = store
+        .conversation_open(
+            GROUP,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Message("m05".into()),
+                limit: 3,
+            },
+        )
+        .unwrap();
+    let anchor = opened.anchors[1].clone();
+    for (limit, before, first, last) in [
+        (5, 3, "m02", "m06"),
+        (7, 3, "m02", "m08"),
+        (7, 5, "m00", "m06"),
+    ] {
+        let read = store
+            .conversation_window(
+                GROUP,
+                ConversationWindowQuery {
+                    opening: ConversationOpenQuery {
+                        target: ConversationOpenTarget::Anchor(anchor.clone()),
+                        limit,
+                    },
+                    before_anchor: Some(before),
+                },
+            )
+            .unwrap();
+        assert_eq!(read.page.messages.len(), limit);
+        assert_eq!(ids(&read).first().copied(), Some(first));
+        assert_eq!(ids(&read).last().copied(), Some(last));
+        assert_eq!(
+            read.anchor,
+            ConversationOpenAnchorOutcome::Retained { index: before }
+        );
+        assert_eq!(read.anchors[before].message_id_hex(), "m05");
+    }
+    // Window navigation does not acknowledge any messages.
+    assert_eq!(
+        store
+            .conversation_open(GROUP, ConversationOpenQuery::default())
+            .unwrap()
+            .read_state
+            .unread_count,
+        opened.read_state.unread_count
+    );
+}
+
+#[test]
+fn live_window_placement_fills_edges_and_recovers_deleted_anchor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    for i in 0..8 {
+        add(&store, &format!("m{i}"), i, i);
+    }
+    let opened = store
+        .conversation_open(
+            GROUP,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Message("m1".into()),
+                limit: 3,
+            },
+        )
+        .unwrap();
+    let anchor = opened.anchors[1].clone();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Anchor(anchor),
+            limit: 5,
+        },
+        before_anchor: Some(4),
+    };
+    let read = store.conversation_window(GROUP, query.clone()).unwrap();
+    assert_eq!(ids(&read), ["m0", "m1", "m2", "m3", "m4"]);
+    assert_eq!(
+        read.anchor,
+        ConversationOpenAnchorOutcome::Retained { index: 1 }
+    );
+    remove(&store, "m1");
+    let read = store.conversation_window(GROUP, query).unwrap();
+    assert_eq!(ids(&read), ["m0", "m2", "m3", "m4", "m5"]);
+    assert_eq!(
+        read.anchor,
+        ConversationOpenAnchorOutcome::RecoveredNext { index: 1 }
+    );
+    let error = store.conversation_window(
+        GROUP,
+        ConversationWindowQuery {
+            opening: ConversationOpenQuery {
+                limit: 5,
+                ..Default::default()
+            },
+            before_anchor: Some(5),
+        },
+    );
+    assert!(matches!(
+        error,
+        Err(ConversationOpenError::InvalidAnchorPosition)
+    ));
+}
