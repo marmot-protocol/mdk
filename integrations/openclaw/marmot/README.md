@@ -174,6 +174,8 @@ Invite the printed agent account from the phone app.
 ```sh
 just openclaw-dev-test                 # pnpm install + typecheck + vitest
 just openclaw-host-compat-test         # build + focused runtime tests on supported beta
+# The script installs into a throwaway tree and sets isolated OPENCLAW_HOME /
+# OPENCLAW_STATE_DIR so host registry state cannot leak from the operator home.
 # Beta send_final uses OpenClaw's SQLite delivery queue. On Node whose embedded
 # SQLite is outside OpenClaw's WAL-safe range, that one host-contract check is
 # treated as unavailable instead of failing the lane.

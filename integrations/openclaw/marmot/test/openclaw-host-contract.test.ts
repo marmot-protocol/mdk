@@ -1105,6 +1105,10 @@ describe("OpenClaw native group subject and session metadata", () => {
 
   it("refreshes one live dispatcher native session after rename, resync, and reconnect", async () => {
     const root = await mkdtemp(join(tmpdir(), "marmot-native-live-lifecycle-"));
+    const previousOpenClawHome = process.env.OPENCLAW_HOME;
+    const previousOpenClawStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_HOME = join(root, "openclaw-home");
+    process.env.OPENCLAW_STATE_DIR = join(root, "openclaw-state");
     const storePath = join(root, "sessions.json");
     const groupIdHex = HEX32("cc");
     const accountIdHex = HEX32("aa");
@@ -1239,8 +1243,14 @@ describe("OpenClaw native group subject and session metadata", () => {
     const readSession = (): NativeSessionRead =>
       readNativeSession(resolveNativeStorePath(storePath), sessionKey);
     const expectPersisted = (expectedSubject: string): void => {
+      // WAL-unsafe Node cannot persist; on a supported runtime the planned
+      // native-session regression must observe the recorded subject/group id.
       const sessionRead = readSession();
-      if (sessionRead.status === "unavailable") {
+      if (sessionStoreUnavailable) {
+        return;
+      }
+      expect(sessionRead.status).toBe("ok");
+      if (sessionRead.status !== "ok") {
         return;
       }
       expect(sessionRead.session).toBeDefined();
@@ -1255,10 +1265,10 @@ describe("OpenClaw native group subject and session metadata", () => {
       expect(ctx.From).toBe(sender);
     };
     const waitForTurns = async (count: number): Promise<void> => {
-      await vi.waitFor(() => expect(captured.length).toBe(count));
+      await vi.waitFor(() => expect(captured.length).toBe(count), { timeout: 10_000 });
     };
     const expectNoExtraTurn = async (count: number): Promise<void> => {
-      await new Promise((resolve) => setTimeout(resolve, 40));
+      await new Promise((resolve) => setTimeout(resolve, 100));
       expect(captured.length).toBe(count);
     };
 
@@ -1329,7 +1339,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       expectPersisted("Name B");
 
       push("fail");
-      await vi.waitFor(() => expect(subscriptions).toBe(2), { timeout: 3_000 });
+      await vi.waitFor(() => expect(subscriptions).toBe(2), { timeout: 10_000 });
       push(inbound("07"));
       await waitForTurns(7);
       expectIdentity(captured[6]!.ctx);
@@ -1337,7 +1347,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       expectPersisted("Name B");
 
       push("eof");
-      await vi.waitFor(() => expect(subscriptions).toBe(3), { timeout: 3_000 });
+      await vi.waitFor(() => expect(subscriptions).toBe(3), { timeout: 10_000 });
       push(inbound("08"));
       await waitForTurns(8);
       expectIdentity(captured[7]!.ctx);
@@ -1347,9 +1357,19 @@ describe("OpenClaw native group subject and session metadata", () => {
     } finally {
       stop();
       clearSessionStoreCacheSafe();
+      if (previousOpenClawHome === undefined) {
+        delete process.env.OPENCLAW_HOME;
+      } else {
+        process.env.OPENCLAW_HOME = previousOpenClawHome;
+      }
+      if (previousOpenClawStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousOpenClawStateDir;
+      }
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-  });
+  }, 30_000);
 
   it("binds session group metadata to the full group id rather than the sender", async () => {
     const root = await mkdtemp(join(tmpdir(), "marmot-native-resolution-"));

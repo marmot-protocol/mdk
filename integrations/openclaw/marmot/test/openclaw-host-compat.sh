@@ -36,6 +36,14 @@ cp -R "$plugin_dir/src" "$compat_root/"
 cp -R "$plugin_dir/test" "$compat_root/"
 
 cd "$compat_root"
+# Keep the beta lane off the operator/default OpenClaw home. Plugin-loader
+# tests and native session recording share process-global host registry state;
+# an isolated pair prevents a leftover home from failing an otherwise valid run.
+compat_home="$compat_root/openclaw-home"
+compat_state="$compat_root/openclaw-state"
+mkdir -p "$compat_home" "$compat_state"
+export OPENCLAW_HOME="$compat_home"
+export OPENCLAW_STATE_DIR="$compat_state"
 npm pkg set "devDependencies.openclaw=$beta_version" >/dev/null
 if [ "$update_lock" = true ]; then
   pnpm install --ignore-scripts --lockfile-only
