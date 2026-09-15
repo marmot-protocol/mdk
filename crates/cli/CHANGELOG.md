@@ -212,7 +212,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   cleanup scheduler before the delivery callback. The pinned-Hermes lifecycle probe keeps the
   already-registered plugin home, constructs turn/restart adapters through the platform factory
   with an explicit short-path scenario control socket, waits for acknowledged progress instead of
-  fixed sleeps, and fails closed if delete or factory registration is missing.
+  fixed sleeps, and fails closed if delete or factory registration is missing. The probe's fake
+  control endpoint runs on a private thread so pinned Hermes 0.19.0 can acknowledge progress
+  without deadlocking the host event loop.
 
 - `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
   directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran

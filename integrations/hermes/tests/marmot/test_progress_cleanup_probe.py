@@ -1,4 +1,7 @@
+import asyncio
+import json
 import os
+import socket
 import sys
 import tempfile
 import types
@@ -97,6 +100,59 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         server.operation_sends = 1
         server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=0.2)
 
+    def test_control_server_answers_blocking_client_without_caller_loop(self):
+        with tempfile.TemporaryDirectory() as raw:
+            socket_path = Path(raw) / "control.sock"
+            server = probe.RecordingControlServer(socket_path)
+            server.start_sync()
+            try:
+                response = _blocking_control_request(
+                    socket_path,
+                    {
+                        "marmot_agent_control": probe.PROTOCOL,
+                        "id": "req-1",
+                        "type": "send_agent_operation_event",
+                        "name": "probe_alpha",
+                        "preview": "alpha-preview",
+                        "status": "started",
+                    },
+                )
+                self.assertEqual(response["type"], "app_event_sent")
+                self.assertEqual(server.operation_sends, 1)
+                self.assertEqual(len(server.durable_operation_ids), 1)
+            finally:
+                server.close_sync()
+
+    def test_blocking_client_from_running_loop_does_not_deadlock(self):
+        async def scenario() -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as raw:
+                socket_path = Path(raw) / "control.sock"
+                server = probe.RecordingControlServer(socket_path)
+                await server.start()
+                try:
+                    response = _blocking_control_request(
+                        socket_path,
+                        {
+                            "marmot_agent_control": probe.PROTOCOL,
+                            "id": "req-loop",
+                            "type": "send_agent_operation_event",
+                            "name": "probe_beta",
+                            "preview": "beta-preview",
+                            "status": "started",
+                        },
+                    )
+                    server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=1.0)
+                    return {
+                        "type": response["type"],
+                        "operation_sends": server.operation_sends,
+                    }
+                finally:
+                    await server.close()
+
+        observed = asyncio.run(scenario())
+        self.assertEqual(observed["type"], "app_event_sent")
+        self.assertEqual(observed["operation_sends"], 1)
+
     def test_apply_scenario_transport_overrides_loaded_extra(self):
         config = types.SimpleNamespace(enabled=False, extra={"socket_path": "/tmp/stale.sock"})
         with tempfile.TemporaryDirectory() as raw:
@@ -156,6 +212,25 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
             self.assertEqual(config["plugins"]["entries"]["marmot"]["settings"]["keep"], "retained")
             self.assertIs(config["display"]["cleanup_progress"], True)
             self.assertIs(config["display"]["platforms"]["marmot"]["cleanup_progress"], False)
+
+
+def _blocking_control_request(socket_path: Path, payload: dict) -> dict:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(2.0)
+    try:
+        sock.connect(os.fspath(socket_path))
+        sock.sendall(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
+        raw = b""
+        while not raw.endswith(b"\n"):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        sock.close()
+    if not raw:
+        raise AssertionError("blocking control client received no response")
+    return json.loads(raw.decode("utf-8"))
 
 
 if __name__ == "__main__":

@@ -90,24 +90,86 @@ class RecordingControlServer:
         self._next_id = 16
         self.fail_final = False
         self._progress_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
 
-    async def start(self) -> None:
+    def start_sync(self) -> None:
+        """Serve on a private thread so a host-loop turn cannot deadlock."""
+        if self._thread is not None and self._thread.is_alive():
+            raise AssertionError("recording control server is already running")
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.socket_path.unlink()
         except FileNotFoundError:
             pass
-        self.server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
+        self._error = None
+        self._ready.clear()
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="progress-cleanup-control",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            self.close_sync()
+            raise AssertionError("recording control server failed to start")
+        if self._error is not None:
+            error = self._error
+            self.close_sync()
+            raise AssertionError("recording control server failed to start") from error
 
-    async def close(self) -> None:
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
+    def close_sync(self) -> None:
+        loop = self._loop
+        thread = self._thread
+        if loop is not None and thread is not None and thread.is_alive():
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+        self._loop = None
+        self._thread = None
+        self.server = None
         try:
             self.socket_path.unlink()
         except FileNotFoundError:
             pass
+
+    def _thread_main(self) -> None:
+        loop = self._loop
+        if loop is None:
+            self._error = AssertionError("recording control server loop was not created")
+            self._ready.set()
+            return
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._bind())
+        except BaseException as exc:
+            self._error = exc
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            loop.run_forever()
+            loop.run_until_complete(self._shutdown_server())
+        finally:
+            loop.close()
+
+    async def _bind(self) -> None:
+        self.server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
+
+    async def _shutdown_server(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+
+    async def start(self) -> None:
+        self.start_sync()
+
+    async def close(self) -> None:
+        self.close_sync()
 
     def _alloc(self) -> str:
         self._next_id += 1
@@ -121,7 +183,6 @@ class RecordingControlServer:
                     return
                 request = json.loads(raw.decode("utf-8"))
                 request_type = str(request.get("type") or "unknown")
-                self.requests.append(request_type)
                 response = self._response_for(request, request_type)
                 writer.write(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
                 await writer.drain()
@@ -141,92 +202,95 @@ class RecordingControlServer:
 
     def _response_for(self, request: dict[str, Any], request_type: str) -> dict[str, Any]:
         request_id = request.get("id")
-        if request_type == "send_agent_operation_event":
-            self._operation_seen += 1
-            identity = {
-                "name": str(request.get("name") or ""),
-                "preview": str(request.get("preview") or ""),
-                "status": str(request.get("status") or ""),
-            }
-            should_fail = (
-                self.fail_operation_after is not None
-                and self._operation_seen > self.fail_operation_after
-                and self._operation_failures == 0
-            )
-            if should_fail:
-                self._operation_failures += 1
-                self.operation_attempts.append({**identity, "outcome": "failed"})
+        with self._state_lock:
+            self.requests.append(request_type)
+            if request_type == "send_agent_operation_event":
+                self._operation_seen += 1
+                identity = {
+                    "name": str(request.get("name") or ""),
+                    "preview": str(request.get("preview") or ""),
+                    "status": str(request.get("status") or ""),
+                }
+                should_fail = (
+                    self.fail_operation_after is not None
+                    and self._operation_seen > self.fail_operation_after
+                    and self._operation_failures == 0
+                )
+                if should_fail:
+                    self._operation_failures += 1
+                    self.operation_attempts.append({**identity, "outcome": "failed"})
+                    self._progress_event.set()
+                    return {
+                        "marmot_agent_control": PROTOCOL,
+                        "id": request_id,
+                        "type": "error",
+                        "code": "temporary_unavailable",
+                        "retryable": True,
+                        "message": "injected operation-send failure",
+                    }
+                durable = self._alloc()
+                self.operation_sends += 1
+                self.durable_operation_ids.append(durable)
+                self.operation_attempts.append({**identity, "outcome": "accepted"})
                 self._progress_event.set()
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
-                    "type": "error",
-                    "code": "temporary_unavailable",
-                    "retryable": True,
-                    "message": "injected operation-send failure",
+                    "type": "app_event_sent",
+                    "message_ids_hex": [durable],
                 }
-            durable = self._alloc()
-            self.operation_sends += 1
-            self.durable_operation_ids.append(durable)
-            self.operation_attempts.append({**identity, "outcome": "accepted"})
-            self._progress_event.set()
-            return {
-                "marmot_agent_control": PROTOCOL,
-                "id": request_id,
-                "type": "app_event_sent",
-                "message_ids_hex": [durable],
-            }
-        if request_type == "send_final":
-            if self.fail_final:
-                self.final_failures += 1
+            if request_type == "send_final":
+                if self.fail_final:
+                    self.final_failures += 1
+                    return {
+                        "marmot_agent_control": PROTOCOL,
+                        "id": request_id,
+                        "type": "error",
+                        "code": "delivery_failed",
+                        "message": "injected final-delivery failure",
+                    }
+                self.final_sends += 1
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
-                    "type": "error",
-                    "code": "delivery_failed",
-                    "message": "injected final-delivery failure",
+                    "type": "final_sent",
+                    "message_ids_hex": [self._alloc()],
                 }
-            self.final_sends += 1
+            if request_type == "delete_message":
+                self.wire_deletes += 1
+                target = str(request.get("target_message_id_hex") or "")
+                self.delete_targets.append(target)
+                return {
+                    "marmot_agent_control": PROTOCOL,
+                    "id": request_id,
+                    "type": "app_event_sent",
+                    "message_ids_hex": [],
+                }
+            if request_type == "account_list":
+                return {
+                    "marmot_agent_control": PROTOCOL,
+                    "id": request_id,
+                    "type": "account_list",
+                    "accounts": [{"account_id_hex": ACCOUNT_ID_HEX, "local_signing": True}],
+                }
+            if request_type in {"allowlist_list", "allowlist_add"}:
+                return {
+                    "marmot_agent_control": PROTOCOL,
+                    "id": request_id,
+                    "type": "allowlist",
+                    "entries": [],
+                }
+            if request_type == "subscribe_inbound":
+                return {"marmot_agent_control": PROTOCOL, "id": request_id, "type": "ack"}
             return {
                 "marmot_agent_control": PROTOCOL,
                 "id": request_id,
-                "type": "final_sent",
-                "message_ids_hex": [self._alloc()],
+                "type": "ack",
             }
-        if request_type == "delete_message":
-            self.wire_deletes += 1
-            target = str(request.get("target_message_id_hex") or "")
-            self.delete_targets.append(target)
-            return {
-                "marmot_agent_control": PROTOCOL,
-                "id": request_id,
-                "type": "app_event_sent",
-                "message_ids_hex": [],
-            }
-        if request_type == "account_list":
-            return {
-                "marmot_agent_control": PROTOCOL,
-                "id": request_id,
-                "type": "account_list",
-                "accounts": [{"account_id_hex": ACCOUNT_ID_HEX, "local_signing": True}],
-            }
-        if request_type in {"allowlist_list", "allowlist_add"}:
-            return {
-                "marmot_agent_control": PROTOCOL,
-                "id": request_id,
-                "type": "allowlist",
-                "entries": [],
-            }
-        if request_type == "subscribe_inbound":
-            return {"marmot_agent_control": PROTOCOL, "id": request_id, "type": "ack"}
-        return {
-            "marmot_agent_control": PROTOCOL,
-            "id": request_id,
-            "type": "ack",
-        }
 
     def acknowledged_or_failed_operations(self) -> int:
-        return self.operation_sends + self._operation_failures
+        with self._state_lock:
+            return self.operation_sends + self._operation_failures
 
     def wait_until_idle(
         self,
