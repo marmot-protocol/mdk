@@ -23,19 +23,19 @@ type PendingEntry = {
   generation: number;
   membershipRequired: boolean;
   promise: Promise<GroupInfoLookupResult>;
-  lastUsed: number;
+  lastUsedSeq: number;
 };
 
 type FactsEntry = {
   kind: "facts";
   facts: GroupInfoFacts;
-  lastUsed: number;
+  lastUsedSeq: number;
 };
 
 type CooldownEntry = {
   kind: "cooldown";
   untilMs: number;
-  lastUsed: number;
+  lastUsedSeq: number;
 };
 
 type CacheEntry = PendingEntry | FactsEntry | CooldownEntry;
@@ -94,6 +94,10 @@ export class GroupInfoCache {
   private readonly cooldownMs: number;
   private readonly now: () => number;
   private nextGeneration = 1;
+  // Monotonic access order for settled LRU eviction. Wall-clock `now()` is
+  // reserved for label-failure cooldown expiry so same-millisecond hits stay
+  // distinguishable.
+  private nextAccessSeq = 1;
 
   constructor(options: GroupInfoCacheOptions = {}) {
     this.capacity = Math.max(1, Math.trunc(options.capacity ?? GROUP_INFO_CACHE_CAPACITY));
@@ -128,12 +132,12 @@ export class GroupInfoCache {
     const existing = this.entries.get(key);
 
     if (existing?.kind === "facts") {
-      existing.lastUsed = now;
+      this.touch(existing);
       return { status: "ok", facts: existing.facts };
     }
 
     if (existing?.kind === "pending") {
-      existing.lastUsed = now;
+      this.touch(existing);
       if (purpose === "activation") {
         existing.membershipRequired = true;
       }
@@ -142,7 +146,7 @@ export class GroupInfoCache {
 
     if (existing?.kind === "cooldown") {
       if (purpose === "label" && now < existing.untilMs) {
-        existing.lastUsed = now;
+        this.touch(existing);
         return { status: "unavailable" };
       }
       this.entries.delete(key);
@@ -174,7 +178,7 @@ export class GroupInfoCache {
         settle = resolve;
         fail = reject;
       }),
-      lastUsed: this.now(),
+      lastUsedSeq: this.nextAccessSeq++,
     };
     this.entries.set(key, pending);
     try {
@@ -203,7 +207,7 @@ export class GroupInfoCache {
       return this.finishFailure(key, generation, "failed");
     }
     if (this.isCurrentPending(key, generation)) {
-      this.entries.set(key, { kind: "facts", facts, lastUsed: this.now() });
+      this.entries.set(key, { kind: "facts", facts, lastUsedSeq: this.nextAccessSeq++ });
     }
     return { status: "ok", facts };
   }
@@ -221,7 +225,7 @@ export class GroupInfoCache {
       this.entries.set(key, {
         kind: "cooldown",
         untilMs: this.now() + this.cooldownMs,
-        lastUsed: this.now(),
+        lastUsedSeq: this.nextAccessSeq++,
       });
       return { status: "unavailable" };
     }
@@ -234,6 +238,10 @@ export class GroupInfoCache {
     return entry?.kind === "pending" && entry.generation === generation;
   }
 
+  private touch(entry: CacheEntry): void {
+    entry.lastUsedSeq = this.nextAccessSeq++;
+  }
+
   private evictLruSettled(): boolean {
     let oldestKey: string | undefined;
     let oldest = Number.POSITIVE_INFINITY;
@@ -241,8 +249,8 @@ export class GroupInfoCache {
       if (entry.kind === "pending") {
         continue;
       }
-      if (entry.lastUsed < oldest) {
-        oldest = entry.lastUsed;
+      if (entry.lastUsedSeq < oldest) {
+        oldest = entry.lastUsedSeq;
         oldestKey = key;
       }
     }

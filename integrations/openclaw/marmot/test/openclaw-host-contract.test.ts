@@ -633,7 +633,10 @@ describe("OpenClaw native group subject and session metadata", () => {
     | { status: "ok"; session?: NativeSessionRecord }
     | { status: "unavailable" };
 
+  let sessionStoreUnavailable = false;
+
   afterEach(() => {
+    sessionStoreUnavailable = false;
     clearSessionStoreCacheSafe();
   });
 
@@ -664,17 +667,29 @@ describe("OpenClaw native group subject and session metadata", () => {
     );
   }
 
+  function markSessionStoreUnavailable(error: unknown): boolean {
+    if (!isUnsafeSqliteRuntime(error)) {
+      return false;
+    }
+    sessionStoreUnavailable = true;
+    return true;
+  }
+
   function readNativeSession(storePath: string, sessionKey: string): NativeSessionRead {
+    if (sessionStoreUnavailable) {
+      return { status: "unavailable" };
+    }
     try {
       return {
         status: "ok",
         session: getSessionEntry({
           storePath,
           sessionKey,
+          agentId: NATIVE_SESSION_AGENT_ID,
         }) as NativeSessionRecord | undefined,
       };
     } catch (error) {
-      if (isUnsafeSqliteRuntime(error)) {
+      if (markSessionStoreUnavailable(error)) {
         return { status: "unavailable" };
       }
       throw error;
@@ -701,7 +716,11 @@ describe("OpenClaw native group subject and session metadata", () => {
         ctx: params.ctx as never,
         groupResolution: params.groupResolution,
         createIfMissing: true,
-        onRecordError: () => undefined,
+        onRecordError: (error) => {
+          if (!markSessionStoreUnavailable(error)) {
+            throw error;
+          }
+        },
         trackSessionMetaTask: (task) => {
           meta = task;
         },
@@ -709,7 +728,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       await meta;
       return readNativeSession(storePath, params.sessionKey);
     } catch (error) {
-      if (isUnsafeSqliteRuntime(error)) {
+      if (markSessionStoreUnavailable(error)) {
         return { status: "unavailable" };
       }
       throw error;
@@ -747,29 +766,19 @@ describe("OpenClaw native group subject and session metadata", () => {
     } as unknown as MarmotDispatchClient;
   }
 
-  async function dispatchNamedTurn(opts: {
+  function createNativeDispatchHarness(opts: {
     storePath: string;
     groupIdHex: string;
-    accountIdHex?: string;
-    senderAccountIdHex?: string;
     sessionKey?: string;
+    client: MarmotDispatchClient;
     groupActivation?: "always" | "mention";
     mentionPatterns?: string[];
-    mentionsSelf?: boolean;
-    text?: string;
-    isDirect?: boolean;
-    subject?: unknown;
-    client?: MarmotDispatchClient;
-  }): Promise<{
-    ctx: Record<string, unknown>;
-    session: NativeSessionRecord | undefined;
-    sessionRead: NativeSessionRead;
-  }> {
-    let capturedCtx: Record<string, unknown> | undefined;
-    const accountIdHex = opts.accountIdHex ?? HEX32("aa");
+  }): {
+    dispatch: ReturnType<typeof createMarmotInboundDispatcher>;
+    captured: Array<{ ctx: Record<string, unknown> }>;
+  } {
+    const captured: Array<{ ctx: Record<string, unknown> }> = [];
     const groupIdHex = opts.groupIdHex;
-    const senderAccountIdHex = opts.senderAccountIdHex ?? HEX32("bb");
-    const sessionKey = opts.sessionKey ?? `agent:marmot:${groupIdHex}`;
     const deliverInboundReply = vi.fn(async () => ({
       status: "handled_visible" as const,
       delivery: {},
@@ -811,7 +820,11 @@ describe("OpenClaw native group subject and session metadata", () => {
             await recordInboundSession({
               ...input,
               ctx: input.ctx as never,
-              onRecordError: input.onRecordError ?? (() => undefined),
+              onRecordError: (error) => {
+                if (!markSessionStoreUnavailable(error)) {
+                  throw error;
+                }
+              },
               trackSessionMetaTask: (task) => {
                 meta = task;
                 input.trackSessionMetaTask?.(task);
@@ -819,7 +832,7 @@ describe("OpenClaw native group subject and session metadata", () => {
             });
             await meta;
           } catch (error) {
-            if (!isUnsafeSqliteRuntime(error)) {
+            if (!markSessionStoreUnavailable(error)) {
               throw error;
             }
           }
@@ -827,7 +840,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       },
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
-          capturedCtx = (params as { ctx: Record<string, unknown> }).ctx;
+          captured.push({ ctx: (params as { ctx: Record<string, unknown> }).ctx });
           const deliver = (params as {
             dispatcherOptions: {
               deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
@@ -841,11 +854,44 @@ describe("OpenClaw native group subject and session metadata", () => {
     const dispatch = createMarmotInboundDispatcher({
       cfg: { session: { store: opts.storePath } },
       runtimeChannel,
-      client: opts.client ?? groupInfoClient({ subject: opts.subject, isDirect: opts.isDirect }),
+      client: opts.client,
       channelAccountId: "default",
       groupActivation: opts.groupActivation ?? "always",
       mentionPatterns: opts.mentionPatterns ?? [],
       deliverInboundReply: deliverInboundReply as never,
+    });
+    return { dispatch, captured };
+  }
+
+  async function dispatchNamedTurn(opts: {
+    storePath: string;
+    groupIdHex: string;
+    accountIdHex?: string;
+    senderAccountIdHex?: string;
+    sessionKey?: string;
+    groupActivation?: "always" | "mention";
+    mentionPatterns?: string[];
+    mentionsSelf?: boolean;
+    text?: string;
+    isDirect?: boolean;
+    subject?: unknown;
+    client?: MarmotDispatchClient;
+  }): Promise<{
+    ctx: Record<string, unknown>;
+    session: NativeSessionRecord | undefined;
+    sessionRead: NativeSessionRead;
+  }> {
+    const accountIdHex = opts.accountIdHex ?? HEX32("aa");
+    const groupIdHex = opts.groupIdHex;
+    const senderAccountIdHex = opts.senderAccountIdHex ?? HEX32("bb");
+    const sessionKey = opts.sessionKey ?? `agent:marmot:${groupIdHex}`;
+    const { dispatch, captured } = createNativeDispatchHarness({
+      storePath: opts.storePath,
+      groupIdHex,
+      sessionKey: opts.sessionKey,
+      client: opts.client ?? groupInfoClient({ subject: opts.subject, isDirect: opts.isDirect }),
+      groupActivation: opts.groupActivation,
+      mentionPatterns: opts.mentionPatterns,
     });
     await dispatch({
       accountIdHex,
@@ -855,6 +901,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       text: opts.text ?? "hello",
       mentionsSelf: opts.mentionsSelf,
     });
+    const capturedCtx = captured[0]?.ctx;
     if (!capturedCtx) {
       throw new Error("turn did not build a native context");
     }
@@ -1051,6 +1098,254 @@ describe("OpenClaw native group subject and session metadata", () => {
         expect(unlabeled.session.subject).toBe("Name B");
       }
     } finally {
+      clearSessionStoreCacheSafe();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("refreshes one live dispatcher native session after rename, resync, and reconnect", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-native-live-lifecycle-"));
+    const storePath = join(root, "sessions.json");
+    const groupIdHex = HEX32("cc");
+    const accountIdHex = HEX32("aa");
+    const sender = HEX32("bb");
+    const sessionKey = `agent:marmot:${groupIdHex}`;
+    let subject: unknown = "Name A";
+    let groupInfoCalls = 0;
+    const client = {
+      async groupInfo(requestAccountIdHex: string, requestGroupIdHex: string) {
+        groupInfoCalls += 1;
+        return {
+          type: "group_info",
+          account_id_hex: requestAccountIdHex,
+          group_id_hex: requestGroupIdHex,
+          member_count: 5,
+          is_direct: false,
+          subject,
+        };
+      },
+      async timelineList(requestAccountIdHex: string, requestGroupIdHex: string) {
+        return {
+          type: "timeline_page" as const,
+          account_id_hex: requestAccountIdHex,
+          group_id_hex: requestGroupIdHex,
+          messages: [],
+          has_more_before: false,
+          has_more_after: false,
+        };
+      },
+    } as unknown as MarmotDispatchClient;
+    const { dispatch, captured } = createNativeDispatchHarness({
+      storePath,
+      groupIdHex,
+      sessionKey,
+      client,
+    });
+
+    type Queued = AgentControlEvent | "fail" | "eof";
+    const queued: Queued[] = [];
+    const waiters: Array<() => void> = [];
+    const push = (item: Queued): void => {
+      queued.push(item);
+      waiters.shift()?.();
+    };
+    const take = async (signal?: AbortSignal): Promise<Queued | undefined> => {
+      if (queued.length > 0) {
+        return queued.shift();
+      }
+      await new Promise<void>((resolve) => {
+        const finish = (): void => {
+          const index = waiters.indexOf(finish);
+          if (index >= 0) {
+            waiters.splice(index, 1);
+          }
+          resolve();
+        };
+        waiters.push(finish);
+        signal?.addEventListener("abort", finish, { once: true });
+      });
+      return queued.shift();
+    };
+
+    const inbound = (idByte: string): AgentControlEvent => ({
+      type: "inbound_message",
+      account_id_hex: accountIdHex,
+      group_id_hex: groupIdHex,
+      message: {
+        message_id_hex: HEX32(idByte),
+        sender: { account_id_hex: sender, display_name: null, is_self: false },
+        text: "hello",
+        recorded_at: 123,
+        media: [],
+      },
+    });
+    const renamed = (): AgentControlEvent => ({
+      type: "group_state_changed",
+      account_id_hex: accountIdHex,
+      group_id_hex: groupIdHex,
+      change: "group_renamed",
+      detail: "ignored",
+    });
+    const resync = (): AgentControlEvent => ({
+      type: "resync_required",
+      account_id_hex: accountIdHex,
+      group_id_hex: null,
+      dropped_events: 1,
+    });
+
+    let subscriptions = 0;
+    const stop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { debounceMs: 0, profileNameOnboarding: false } } },
+        logger: { info: () => undefined, warn: () => undefined },
+      },
+      dispatch,
+      {
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return {
+                type: "account_list",
+                accounts: [{ account_id_hex: accountIdHex, label: "agent", local_signing: true }],
+              };
+            },
+            async *subscribeInbound(
+              _filter?: unknown,
+              signal?: AbortSignal,
+              hooks?: { onReady?: () => void },
+            ) {
+              subscriptions += 1;
+              hooks?.onReady?.();
+              while (!signal?.aborted) {
+                const item = await take(signal);
+                if (item === undefined || signal?.aborted) {
+                  return;
+                }
+                if (item === "fail") {
+                  throw new Error("subscription dropped");
+                }
+                if (item === "eof") {
+                  return;
+                }
+                yield item;
+              }
+            },
+          }) as unknown as MarmotAgentControlClient,
+        invalidateGroupActivation: dispatch.invalidateGroupActivation,
+        clearGroupActivationCache: dispatch.clearGroupActivationCache,
+      },
+    );
+
+    const readSession = (): NativeSessionRead =>
+      readNativeSession(resolveNativeStorePath(storePath), sessionKey);
+    const expectPersisted = (expectedSubject: string): void => {
+      const sessionRead = readSession();
+      if (sessionRead.status === "unavailable") {
+        return;
+      }
+      expect(sessionRead.session).toBeDefined();
+      expect(sessionRead.session?.groupId).toBe(groupIdHex);
+      expect(sessionRead.session?.subject).toBe(expectedSubject);
+    };
+    const expectIdentity = (ctx: Record<string, unknown>): void => {
+      expect(ctx.ChatId).toBe(groupIdHex);
+      expect(ctx.To).toBe(groupIdHex);
+      expect(ctx.OriginatingTo ?? ctx.To).toBe(groupIdHex);
+      expect(ctx.SessionKey).toBe(sessionKey);
+      expect(ctx.From).toBe(sender);
+    };
+    const waitForTurns = async (count: number): Promise<void> => {
+      await vi.waitFor(() => expect(captured.length).toBe(count));
+    };
+    const expectNoExtraTurn = async (count: number): Promise<void> => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(captured.length).toBe(count);
+    };
+
+    try {
+      push(inbound("01"));
+      await waitForTurns(1);
+      expect(captured[0]?.ctx.ConversationLabel).toBe("Name A");
+      expect(captured[0]?.ctx.GroupSubject).toBe("Name A");
+      expectIdentity(captured[0]!.ctx);
+      expect(groupInfoCalls).toBe(1);
+      expectPersisted("Name A");
+
+      push(inbound("02"));
+      await waitForTurns(2);
+      expect(captured[1]?.ctx.ConversationLabel).toBe("Name A");
+      expectIdentity(captured[1]!.ctx);
+      expect(groupInfoCalls).toBe(1);
+
+      const beforeRename = readSession();
+      subject = "Name B";
+      push(renamed());
+      await expectNoExtraTurn(2);
+      expect(groupInfoCalls).toBe(1);
+      const afterRenameEvent = readSession();
+      if (beforeRename.status === "ok" && afterRenameEvent.status === "ok") {
+        expect(afterRenameEvent.session?.subject).toBe(beforeRename.session?.subject);
+        expect(afterRenameEvent.session?.groupId).toBe(groupIdHex);
+      }
+
+      push(inbound("03"));
+      await waitForTurns(3);
+      expect(captured[2]?.ctx.ConversationLabel).toBe("Name B");
+      expect(captured[2]?.ctx.GroupSubject).toBe("Name B");
+      expectIdentity(captured[2]!.ctx);
+      expect(groupInfoCalls).toBe(2);
+      expectPersisted("Name B");
+
+      push(inbound("04"));
+      await waitForTurns(4);
+      expect(captured[3]?.ctx.ConversationLabel).toBe("Name B");
+      expect(groupInfoCalls).toBe(2);
+
+      const beforeBlank = readSession();
+      subject = "";
+      push(renamed());
+      await expectNoExtraTurn(4);
+      expect(groupInfoCalls).toBe(2);
+      const afterBlankEvent = readSession();
+      if (beforeBlank.status === "ok" && afterBlankEvent.status === "ok") {
+        expect(afterBlankEvent.session?.subject).toBe(beforeBlank.session?.subject);
+      }
+
+      push(inbound("05"));
+      await waitForTurns(5);
+      expect(captured[4]?.ctx.GroupSubject).toBeUndefined();
+      expectIdentity(captured[4]!.ctx);
+      expect(groupInfoCalls).toBe(3);
+      expectPersisted("Name B");
+
+      push(resync());
+      await expectNoExtraTurn(5);
+      expect(groupInfoCalls).toBe(3);
+      push(inbound("06"));
+      await waitForTurns(6);
+      expect(captured[5]?.ctx.GroupSubject).toBeUndefined();
+      expectIdentity(captured[5]!.ctx);
+      expect(groupInfoCalls).toBe(4);
+      expectPersisted("Name B");
+
+      push("fail");
+      await vi.waitFor(() => expect(subscriptions).toBe(2), { timeout: 3_000 });
+      push(inbound("07"));
+      await waitForTurns(7);
+      expectIdentity(captured[6]!.ctx);
+      expect(groupInfoCalls).toBe(5);
+      expectPersisted("Name B");
+
+      push("eof");
+      await vi.waitFor(() => expect(subscriptions).toBe(3), { timeout: 3_000 });
+      push(inbound("08"));
+      await waitForTurns(8);
+      expectIdentity(captured[7]!.ctx);
+      expect(captured[7]?.ctx.ChatId).toBe(groupIdHex);
+      expect(groupInfoCalls).toBe(6);
+      expectPersisted("Name B");
+    } finally {
+      stop();
       clearSessionStoreCacheSafe();
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }

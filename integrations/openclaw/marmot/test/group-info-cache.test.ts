@@ -248,6 +248,36 @@ describe("GroupInfoCache", () => {
     expect(pendingCache.size()).toBe(2);
   });
 
+  it("evicts the least-recently-used settled entry when wall-clock timestamps tie", async () => {
+    const cache = new GroupInfoCache({ capacity: 2, now: () => 1_000 });
+    await cache.lookup(ACCOUNT_A, GROUP_32, "label", async () => info({ subject: "A" }));
+    await cache.lookup(ACCOUNT_A, GROUP_OTHER, "label", async () =>
+      info({ group: GROUP_OTHER, subject: "B" }),
+    );
+    await expect(
+      cache.lookup(ACCOUNT_A, GROUP_32, "label", async () => {
+        throw new Error("A must remain a warm hit");
+      }),
+    ).resolves.toMatchObject({ facts: { label: "A" } });
+    await cache.lookup(ACCOUNT_B, GROUP_32, "label", async () =>
+      info({ account: ACCOUNT_B, subject: "C" }),
+    );
+    expect(cache.size()).toBe(2);
+    expect(cache.peek(ACCOUNT_A, GROUP_32)).toBe("facts");
+    expect(cache.peek(ACCOUNT_A, GROUP_OTHER)).toBeUndefined();
+    expect(cache.peek(ACCOUNT_B, GROUP_32)).toBe("facts");
+    await expect(
+      cache.lookup(ACCOUNT_A, GROUP_32, "label", async () => {
+        throw new Error("A must still be a warm hit after C");
+      }),
+    ).resolves.toMatchObject({ facts: { label: "A" } });
+    await expect(
+      cache.lookup(ACCOUNT_B, GROUP_32, "label", async () => {
+        throw new Error("C must remain a warm hit");
+      }),
+    ).resolves.toMatchObject({ facts: { label: "C" } });
+  });
+
   it("invalidates in-flight generations and ignores a late stale completion", async () => {
     let resolveOld!: (value: unknown) => void;
     let resolveNew!: (value: unknown) => void;
