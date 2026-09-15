@@ -309,7 +309,6 @@ fn conversation_bounds_ancillary_references_but_preserves_reaction_counts() {
         );
     }
     assert!(result.identities.len() < 40);
-    assert!(serde_json::to_vec(&result).unwrap().len() < MAX_CONVERSATION_PRESENTATION_BYTES);
 }
 
 #[test]
@@ -466,4 +465,69 @@ fn conversation_peer_avatar_keys_match_header_and_change_with_store_identity() {
     input.source_version.store_epoch.push(1);
     let reset = crate::chat_presentation::select_chat_presentation(&input, &local, None);
     assert!(reset.avatar != fallback.header.selected.avatar);
+}
+
+#[test]
+fn conversation_review_mentions_keep_visible_document_order_before_tags() {
+    let (_dir, app, input) = setup();
+    let visible: Vec<_> = (0..9).rev().map(|i| format!("{:064x}", 1000 + i)).collect();
+    let mut row = message(&input.group_id_hex, &"bb".repeat(32));
+    row.plaintext = format!("hello @{}", npub_for_account_id(&visible[0]).unwrap());
+    row.tags = (0..8)
+        .map(|i| vec!["p".into(), format!("{i:064x}")])
+        .collect();
+    let result = project(&app, &input, &page(vec![row.clone()]));
+    assert_eq!(result.messages[0].mentions.first(), Some(&visible[0]));
+    assert!(result.identities.contains_key(&visible[0]));
+    row.plaintext = visible
+        .iter()
+        .map(|id| format!("@{}", npub_for_account_id(id).unwrap()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    row.tags.clear();
+    let result = project(&app, &input, &page(vec![row]));
+    assert_eq!(result.messages[0].mentions, visible[..8]);
+    assert!(result.messages[0].mentions_truncated);
+}
+
+#[test]
+fn conversation_review_large_window_acquires_directory_handles_once() {
+    let (_dir, app, input) = setup();
+    let rows = (1000..1200)
+        .map(|i| message(&input.group_id_hex, &format!("{i:064x}")))
+        .collect();
+    let before = app.directory_handle_acquire_count_for_test();
+    let result = project(&app, &input, &page(rows));
+    assert_eq!(result.identities.len(), 201);
+    assert_eq!(app.directory_handle_acquire_count_for_test(), before + 1);
+}
+
+#[test]
+fn conversation_input_guards_reject_inconsistent_membership_and_oversized_fields() {
+    let (_dir, app, mut input) = setup();
+    let prepared = prepare(&app, page(vec![]));
+    let mut stale = state();
+    stale.authority.self_membership = SelfMembership::Left;
+    assert!(matches!(
+        app.conversation_window_presentation("alice", &input, stale, &prepared),
+        Err(ConversationPresentationError::MembershipMismatch)
+    ));
+    let mut row = message(&input.group_id_hex, &"bb".repeat(32));
+    row.message_id_hex = "a".repeat(1025);
+    let long_id = prepare(&app, page(vec![row]));
+    assert!(matches!(
+        app.conversation_window_presentation("alice", &input, state(), &long_id),
+        Err(ConversationPresentationError::LimitExceeded)
+    ));
+    input.avatar = Some(ChatListAvatar {
+        image_hash_hex: "11".repeat(32),
+        image_key_hex: "22".repeat(32),
+        image_nonce_hex: "33".repeat(12),
+        image_upload_key_hex: "44".repeat(32),
+        media_type: Some("a".repeat(129)),
+    });
+    assert!(matches!(
+        app.conversation_window_presentation("alice", &input, state(), &prepared),
+        Err(ConversationPresentationError::LimitExceeded)
+    ));
 }

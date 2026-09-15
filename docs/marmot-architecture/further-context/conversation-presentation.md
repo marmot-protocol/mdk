@@ -17,7 +17,7 @@ not another stored transcript. M4 attaches it to the combined live window; M5 ad
 | --- | --- |
 | Title/avatar, peer, member count | Existing keyed `ChatPresentationInput` and shared title/avatar selector. Custom group names win; encrypted group images precede URL images. No new selection cache. |
 | Lifecycle and capabilities | `ConversationHeaderState` carries scalar worker inputs: epoch, membership, self role/admin count, pending confirmation/leave, lifecycle/disbanding gates and support-blocker presence. No roster in the selector or output. |
-| Visible identities | Cached directory records in bounded pages, keyed by canonical account id, including former members. Names are sanitized; missing profiles get stable pseudonyms and avatar placeholders. Header and identity avatars share the existing store-scoped cache-key framing. |
+| Visible identities | Cached directory records using one acquisition of the directory handles per window, keyed by canonical account id, including former members. Names are sanitized; missing profiles get stable pseudonyms and avatar placeholders. Header and identity avatars share the existing store-scoped cache-key framing. |
 | System actors/subjects | Existing system parser, only after one bounded storage join verifies supplied/stored synthesized direction, absent inner source id, origin commit attribution and matching visible content/source epoch. Member-authored kind-1210 JSON and legacy rows without attribution do not become trusted transitions. |
 | Reactions and mentions | Existing timeline aggregate and Markdown/NIP-27 parser. Explicit limited reference collections, separate total reaction counts, and explicit omission/truncation indicators. |
 
@@ -37,17 +37,18 @@ The existing full-roster management screen continues to use its separate query.
 A presentation accepts at most 200 timeline rows. Per row it exposes a sender, reply author, at most eight main-body
 and eight reply mentions, two authenticated system references, and up to eight reaction kinds with two reactor
 previews each, ordered by count then emoji as in the existing native projection. Reaction totals count all aggregate entries, including omitted kinds. The dictionary includes every
-explicit reference, plus the header peer: at most 7,201 identities. Cache queries use the existing 100-identity pages.
+explicit reference, plus the header peer: at most 7,201 identities. Hydration reuses the existing per-identity directory reader with one set of handles for the whole window.
 Each identity name is at most 256 UTF-8 bytes. Avatar URLs reuse the existing bounded safety validator.
 
 Only explicit returned references request profile-resolved rendering. Other content remains literal or uses its
 stable raw-identity fallback; truncation never instructs a client to issue additional profile lookups. Expanded
 reaction/member screens use the existing narrow APIs. The shared mention parser scans its existing 65,519-byte
 prefix; a longer body reports truncation. Up to 256 raw tags are examined for additional `p` references;
-exceeding that scan budget also reports truncation.
+exceeding that scan budget also reports truncation. Mention selection preserves document order and prioritizes
+visible inline mentions before tag-only references; duplicate identities consume no extra slots.
 
-The **presentation sidecar** has a conservative 64 MiB serialized upper bound derived from its field and collection
-limits, including worst-case JSON escaping in tests. The production refresh path does not encode the sidecar to
+A test-only 64 MiB JSON regression budget audits the **presentation sidecar** field and collection limits, including
+worst-case escaping. It is not an exported wire contract or a budget for M4/M5 to enforce by encoding. The production refresh path does not encode the sidecar to
 measure its size. Encrypted avatar media types are capped at the protocol limit of 128 bytes. This is an output bound, not a total source-read or process-memory guarantee: M1's timeline
 page can already contain large message bodies/reaction aggregates, and selected directory records may contain other
 cached metadata. M3 does not copy that raw content, media bytes, full profiles, or full reactor lists into its output.

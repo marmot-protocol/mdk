@@ -48,7 +48,8 @@ pub struct AppGroupRecordFfi {
     pub relays: Vec<String>,
     pub nostr_group_id_hex: String,
     /// URL-based group avatar (`marmot.group.avatar-url.v1`), `None` when absent.
-    /// Used when no valid encrypted Blossom image is available.
+    /// Used when no valid encrypted Blossom image is available. See the shared
+    /// [presentation contract](https://github.com/marmot-protocol/mdk/blob/master/docs/marmot-architecture/further-context/conversation-presentation.md#sources-and-ownership).
     pub avatar_url: Option<String>,
     pub avatar_dim: Option<String>,
     pub avatar_thumbhash: Option<String>,

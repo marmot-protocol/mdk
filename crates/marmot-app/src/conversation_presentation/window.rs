@@ -15,9 +15,6 @@ pub const MAX_CONVERSATION_IDENTITIES: usize = crate::MAX_TIMELINE_LIMIT
     * (4 + 2 * MAX_CONVERSATION_MENTIONS
         + MAX_CONVERSATION_REACTION_KINDS * MAX_CONVERSATION_REACTOR_PREVIEWS)
     + 1;
-/// Conservative serialized upper bound implied by field/collection limits;
-/// verified in tests, without encoding the screen on every read/refresh.
-pub const MAX_CONVERSATION_PRESENTATION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IMAGE_MEDIA_TYPE_BYTES: usize = 128;
 const MAX_REFERENCE_BYTES: usize = 1024;
 const MAX_NAME_BYTES: usize = 256;
@@ -158,12 +155,11 @@ impl MarmotApp {
         prepared: &ConversationPresentationPage,
     ) -> Result<ConversationWindowPresentation, ConversationPresentationError> {
         let page = prepared.page();
-        if page.messages.len() > crate::MAX_TIMELINE_LIMIT
-            || input
-                .avatar
-                .as_ref()
-                .and_then(|a| a.media_type.as_ref())
-                .is_some_and(|value| value.len() > MAX_IMAGE_MEDIA_TYPE_BYTES)
+        if input
+            .avatar
+            .as_ref()
+            .and_then(|a| a.media_type.as_ref())
+            .is_some_and(|value| value.len() > MAX_IMAGE_MEDIA_TYPE_BYTES)
         {
             return Err(ConversationPresentationError::LimitExceeded);
         }
@@ -203,38 +199,35 @@ impl MarmotApp {
             );
             messages.push(references);
         }
-        if ids.len() > MAX_CONVERSATION_IDENTITIES {
-            return Err(ConversationPresentationError::LimitExceeded);
-        }
-        let requested: Vec<_> = ids.into_iter().collect();
         let mut identities = BTreeMap::new();
         let mut peer_profile = None;
-        for chunk in requested.chunks(crate::MAX_CACHED_IDENTITY_PAGE_SIZE) {
-            for cached in self.cached_identity_projections_for_account_ids(chunk)? {
-                let Some(id) = cached.account_id_hex else {
-                    continue;
-                };
+        if !ids.is_empty() {
+            // Reuse one set of handles for the entire bounded window. The
+            // public 100-id API is for independent requests; calling it once
+            // per chunk would reacquire every account's directory handles.
+            let caches = self.directory_caches()?;
+            let shared = self.shared_storage()?;
+            let local_labels = self.local_account_labels_by_id()?;
+            for id in ids {
+                let profile = self
+                    .directory_entry_for_account_id_with_handles(&id, &caches, &shared)?
+                    .and_then(|entry| entry.profile);
                 if peer.as_ref() == Some(&id) {
-                    peer_profile = cached.profile.clone();
+                    peer_profile = profile.clone();
                 }
+                // Each canonical reference receives an entry, including a
+                // stable fallback when no cached record exists.
                 identities.insert(
                     id.clone(),
                     identity(
                         &id,
-                        cached.profile.as_ref(),
-                        cached.local_label.as_deref(),
+                        profile.as_ref(),
+                        local_labels.get(&id).map(String::as_str),
                         input,
                         &account.account_id_hex,
                     ),
                 );
             }
-        }
-        // Valid canonical identifiers always have a stable fallback, even if a
-        // cache adapter cannot represent one. Dictionary completeness is total.
-        for id in requested {
-            identities
-                .entry(id.clone())
-                .or_insert_with(|| identity(&id, None, None, input, &account.account_id_hex));
         }
         let selected = crate::chat_presentation::select_chat_presentation(
             input,
@@ -330,7 +323,7 @@ fn mentions(
     if kind != cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT {
         return (Vec::new(), false);
     }
-    let mut found = BTreeSet::new();
+    let mut found = Vec::new();
     // Inline parsing reuses the same bounded Markdown/NIP-27 parser as sends
     // and unread classification. Never interpret a raw hex substring as a mention.
     for id in crate::messages::inline_mention_pubkey_hexes(plaintext)
@@ -344,7 +337,9 @@ fn mentions(
                 .filter_map(|v| crate::messages::mention_pubkey_hex(v)),
         )
     {
-        found.insert(id);
+        if !found.contains(&id) {
+            found.push(id);
+        }
         if found.len() > MAX_CONVERSATION_MENTIONS {
             break;
         }
@@ -436,6 +431,10 @@ fn message_references(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    // A regression budget for the structural caps, not a production wire
+    // contract or an instruction to encode every projection at runtime.
+    const MAX_CONVERSATION_PRESENTATION_BYTES: usize = 64 * 1024 * 1024;
 
     #[test]
     fn conversation_field_limits_bound_escaped_output_without_runtime_encoding() {
