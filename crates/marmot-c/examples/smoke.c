@@ -26,6 +26,7 @@ _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_LATEST == 1, "latest ABI value");
 _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_MESSAGE == 2, "message ABI value");
 _Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER == 0, "older ABI value");
 _Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_NEWER == 1, "newer ABI value");
+_Static_assert(MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED == 89, "missing target ABI value");
 
 static int failures = 0;
 

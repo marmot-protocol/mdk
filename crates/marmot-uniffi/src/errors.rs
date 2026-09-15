@@ -305,6 +305,9 @@ pub enum MarmotKitError {
     ConversationWindowQuery { details: String },
     #[error("conversation presentation failed: {details}")]
     ConversationWindowPresentation { details: String },
+    /// An explicit target disappeared; an already-open window remains usable.
+    #[error("conversation target message is no longer retained")]
+    ConversationWindowMessageNotRetained,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -1011,6 +1014,22 @@ mod screen_error_tests {
         use marmot_app::ConversationWindowError as W;
         use std::sync::Arc;
         assert!(matches!(
+            MarmotKitError::from(W::Query(Arc::new(
+                marmot_app::ConversationOpenError::MessageNotFound
+            ))),
+            MarmotKitError::ConversationWindowMessageNotRetained
+        ));
+        for error in [
+            marmot_app::ConversationOpenError::InvalidLimit,
+            marmot_app::ConversationOpenError::InvalidAnchorPosition,
+            marmot_app::ConversationOpenError::AnchorScopeMismatch,
+        ] {
+            assert!(matches!(
+                MarmotKitError::from(W::Query(Arc::new(error))),
+                MarmotKitError::ConversationWindowQuery { .. }
+            ));
+        }
+        assert!(matches!(
             MarmotKitError::from(W::InvalidLimit),
             MarmotKitError::ConversationWindowInvalidLimit
         ));
@@ -1098,6 +1117,14 @@ impl From<marmot_app::ConversationWindowError> for MarmotKitError {
             E::Closed => Self::ConversationWindowClosed,
             E::NotReady => Self::ConversationWindowNotReady,
             E::App(e) => Self::from(e.as_ref()),
+            E::Query(e)
+                if matches!(
+                    e.as_ref(),
+                    marmot_app::ConversationOpenError::MessageNotFound
+                ) =>
+            {
+                Self::ConversationWindowMessageNotRetained
+            }
             E::Query(e) => Self::ConversationWindowQuery {
                 details: e.to_string(),
             },

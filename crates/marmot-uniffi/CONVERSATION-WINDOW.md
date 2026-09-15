@@ -19,12 +19,13 @@ in `messages[*].references` is resolved there or explicitly absent. These are
 window-scoped display identities, not a roster or a source of mutation authority.
 
 Timeline content uses the existing Markdown/media converters. For this screen,
-raw tags and full reactor lists are omitted from the compatibility timeline record;
+raw tags, full reactor lists and raw `media_json` are omitted from the compatibility timeline record;
 use the bounded `references.reactions` tallies/previews and truncation flags.
 System presentation is exposed only for stored authenticated system rows. Media
 outcomes preserve rejected attachments in order. Bytes remain separate local/media
 operations; the screen never downloads them. Low-level timeline queries still
-provide their original raw fields and collections.
+provide their original raw fields and collections, including raw media JSON when
+a caller needs to inspect a rejected attachment beyond its typed rejection outcome.
 
 ## Paging and lifetime
 
@@ -38,7 +39,12 @@ Report the actually visible message using `set_visible_anchor` before paging
 beyond the retained 200-row context. Paging preserves that anchor, so a saturated
 page can return unchanged rows while stored-history flags remain true. Keep pixel
 offsets on the client. `return_to_latest` resumes following arrivals and retains
-the current row budget. Explicit jumps fail when the target no longer exists.
+the current row budget. Explicit jumps to missing targets return
+`ConversationWindowMessageNotRetained` (C status `MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED`).
+Keep the existing window and viewport on this error; further commands and updates
+remain available. Other `ConversationWindowQuery` errors are terminal and require
+reopening. Opening on a missing explicit target returns the same missing-message
+error without creating a handle.
 
 Opening and each window command take a deadline: zero selects **30 seconds**,
 otherwise milliseconds. Cancelling/timing out opening abandons it. A command that

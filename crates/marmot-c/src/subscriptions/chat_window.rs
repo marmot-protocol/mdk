@@ -527,6 +527,20 @@ mod tests {
             );
             assert_eq!((*initial).messages_len, 2);
             let mut update = ptr::null_mut();
+            let missing = CString::new("00".repeat(32)).unwrap();
+            assert_eq!(
+                marmot_conversation_window_subscription_jump_to_message(
+                    window,
+                    &(*initial).revision,
+                    missing.as_ptr(),
+                    0,
+                    &mut update,
+                ),
+                MarmotStatus::ConversationWindowMessageNotRetained
+            );
+            assert!(update.is_null());
+            // The failed jump neither closes nor advances this window: same-revision
+            // paging below still succeeds and its stream echo remains available.
             assert_eq!(
                 marmot_conversation_window_subscription_next(window, 10, &mut update),
                 MarmotStatus::Timeout

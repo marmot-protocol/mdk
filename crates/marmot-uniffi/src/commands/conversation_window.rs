@@ -239,6 +239,26 @@ mod tests {
             window.return_to_latest(wrong, 0).await,
             Err(MarmotKitError::ConversationWindowWrongGeneration)
         ));
+        let missing = "00".repeat(32);
+        assert!(matches!(
+            kit.open_conversation_window(
+                account.clone(),
+                group.clone(),
+                ConversationOpenModeFfi::Message,
+                Some(missing.clone()),
+                Some(2),
+                0
+            )
+            .await,
+            Err(MarmotKitError::ConversationWindowMessageNotRetained)
+        ));
+        assert!(matches!(
+            window
+                .jump_to_message(initial.revision.clone(), missing, 0)
+                .await,
+            Err(MarmotKitError::ConversationWindowMessageNotRetained)
+        ));
+        // Missing jumps retain the old revision and leave paging and the stream usable.
         let (received, paged) = tokio::join!(
             window.next(),
             window.page(
@@ -258,6 +278,35 @@ mod tests {
             window.return_to_latest(initial.revision, 0).await,
             Err(MarmotKitError::ConversationWindowStale)
         ));
+        let target = paged.messages[0].timeline.message_id_hex.clone();
+        let (received, anchored) = tokio::join!(
+            window.next(),
+            window.set_visible_anchor(paged.revision.clone(), target.clone(), 0),
+        );
+        let anchored = anchored.unwrap();
+        assert_eq!(
+            received.unwrap().unwrap().revision.sequence,
+            anchored.revision.sequence
+        );
+        assert!(matches!(
+            anchored.anchor.kind,
+            ConversationAnchorKindFfi::Retained
+        ));
+        let (received, jumped) = tokio::join!(
+            window.next(),
+            window.jump_to_message(anchored.revision, target.clone(), 0),
+        );
+        let jumped = jumped.unwrap();
+        assert_eq!(
+            received.unwrap().unwrap().revision.sequence,
+            jumped.revision.sequence
+        );
+        assert_eq!(
+            jumped.messages[jumped.anchor.index.unwrap() as usize]
+                .timeline
+                .message_id_hex,
+            target
+        );
         // Cancellation of next must not swallow a subsequent draft replacement.
         assert!(
             tokio::time::timeout(Duration::from_millis(20), window.next())

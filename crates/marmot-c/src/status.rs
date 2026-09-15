@@ -127,6 +127,7 @@ pub enum MarmotStatus {
     ConversationWindowQuery = 86,
     ConversationWindowPresentation = 87,
     MessageDraftRevisionConflict = 88,
+    ConversationWindowMessageNotRetained = 89,
 }
 
 thread_local! {
@@ -147,6 +148,9 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ConversationWindowMessageNotRetained => {
+            MarmotStatus::ConversationWindowMessageNotRetained
+        }
         MarmotKitError::MessageDraftRevisionConflict => MarmotStatus::MessageDraftRevisionConflict,
         MarmotKitError::ConversationWindowInvalidLimit => {
             MarmotStatus::ConversationWindowInvalidLimit
@@ -275,6 +279,7 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::ConversationWindowMessageNotRetained,
             MarmotKitError::ConversationWindowInvalidLimit,
             MarmotKitError::ConversationWindowStale,
             MarmotKitError::ConversationWindowWrongGeneration,
@@ -446,7 +451,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            79,
+            80,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         let mut seen = std::collections::BTreeSet::new();

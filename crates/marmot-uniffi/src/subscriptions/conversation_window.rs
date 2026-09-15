@@ -65,9 +65,10 @@ impl ConversationWindowSubscription {
         if *closed.borrow() {
             return Err(MarmotKitError::ConversationWindowClosed);
         }
-        tokio::select! {biased;
-            _=closed.changed()=>Err(MarmotKitError::ConversationWindowClosed),
-            result=conversation_deadline(timeout_ms,async {Ok(future.await?.into())})=>result,
+        tokio::select! {
+            biased;
+            _ = closed.changed() => Err(MarmotKitError::ConversationWindowClosed),
+            result = conversation_deadline(timeout_ms, async { Ok(future.await?.into()) }) => result,
         }
     }
 }
@@ -84,12 +85,16 @@ impl ConversationWindowSubscription {
         if *closed.borrow() {
             return Ok(None);
         }
-        tokio::select! {biased;
-            _=closed.changed()=>Ok(None),
-            result=async {
-                let mut guard=self.receiver.lock().await;
-                match guard.as_mut() {Some(inner)=>Ok(inner.recv().await?.map(Into::into)),None=>Ok(None)}
-            }=>result,
+        tokio::select! {
+            biased;
+            _ = closed.changed() => Ok(None),
+            result = async {
+                let mut guard = self.receiver.lock().await;
+                match guard.as_mut() {
+                    Some(inner) => Ok(inner.recv().await?.map(Into::into)),
+                    None => Ok(None),
+                }
+            } => result,
         }
     }
     /// Wake receivers/commands and release the retained runtime window. Idempotent.
