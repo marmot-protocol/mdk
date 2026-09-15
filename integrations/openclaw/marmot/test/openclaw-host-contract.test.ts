@@ -4,6 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import { recordInboundSession } from "openclaw/plugin-sdk/conversation-runtime";
+import {
+  clearSessionStoreCacheForTest,
+  loadSessionStore,
+} from "openclaw/plugin-sdk/session-store-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Deliberate test-only internal import: OpenClaw exposes neither its plugin
@@ -588,6 +594,466 @@ describe("installed OpenClaw inbound host contract", () => {
     } finally {
       releaseFirst();
       stop();
+    }
+  });
+});
+
+describe("OpenClaw native group subject and session metadata", () => {
+  const HEX16 = (byte: string): string => byte.repeat(16);
+
+  afterEach(() => {
+    clearSessionStoreCacheSafe();
+  });
+
+  function isUnsafeSqliteRuntime(error: unknown): boolean {
+    return error instanceof Error && /SQLite support is unavailable or unsafe/.test(error.message);
+  }
+
+  function clearSessionStoreCacheSafe(): void {
+    try {
+      clearSessionStoreCacheForTest();
+    } catch (error) {
+      if (!isUnsafeSqliteRuntime(error)) {
+        throw error;
+      }
+    }
+  }
+
+  function loadSessionStoreIfSafe(
+    storePath: string,
+  ): Record<string, { groupId?: string; subject?: string; channel?: string; origin?: { label?: string } }> | undefined {
+    try {
+      return loadSessionStore(storePath) as Record<
+        string,
+        { groupId?: string; subject?: string; channel?: string; origin?: { label?: string } }
+      >;
+    } catch (error) {
+      if (isUnsafeSqliteRuntime(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  async function recordSessionAndWait(params: {
+    storePath: string;
+    sessionKey: string;
+    ctx: unknown;
+    groupResolution?: {
+      key: string;
+      channel: string;
+      id: string;
+      chatType: "group";
+    };
+  }): Promise<boolean> {
+    let meta: Promise<unknown> | undefined;
+    try {
+      await recordInboundSession({
+        storePath: params.storePath,
+        sessionKey: params.sessionKey,
+        ctx: params.ctx as never,
+        groupResolution: params.groupResolution,
+        createIfMissing: true,
+        onRecordError: () => undefined,
+        trackSessionMetaTask: (task) => {
+          meta = task;
+        },
+      });
+      await meta;
+      return true;
+    } catch (error) {
+      if (isUnsafeSqliteRuntime(error)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  function groupInfoClient(opts: {
+    subject?: unknown;
+    isDirect?: boolean;
+    byGroup?: Record<string, { subject?: unknown; isDirect?: boolean }>;
+  } = {}): MarmotDispatchClient {
+    return {
+      async groupInfo(accountIdHex: string, groupIdHex: string) {
+        const override = opts.byGroup?.[groupIdHex];
+        const isDirect = override?.isDirect ?? opts.isDirect ?? false;
+        return {
+          type: "group_info",
+          account_id_hex: accountIdHex,
+          group_id_hex: groupIdHex,
+          member_count: isDirect ? 2 : 5,
+          is_direct: isDirect,
+          subject: override?.subject ?? opts.subject ?? null,
+        };
+      },
+      async timelineList(accountIdHex: string, groupIdHex: string) {
+        return {
+          type: "timeline_page" as const,
+          account_id_hex: accountIdHex,
+          group_id_hex: groupIdHex,
+          messages: [],
+          has_more_before: false,
+          has_more_after: false,
+        };
+      },
+    } as unknown as MarmotDispatchClient;
+  }
+
+  async function dispatchNamedTurn(opts: {
+    storePath: string;
+    groupIdHex: string;
+    accountIdHex?: string;
+    senderAccountIdHex?: string;
+    sessionKey?: string;
+    groupActivation?: "always" | "mention";
+    mentionPatterns?: string[];
+    mentionsSelf?: boolean;
+    text?: string;
+    isDirect?: boolean;
+    subject?: unknown;
+    client?: MarmotDispatchClient;
+  }): Promise<{ ctx: Record<string, unknown>; session: Record<string, unknown> | undefined }> {
+    let capturedCtx: Record<string, unknown> | undefined;
+    const accountIdHex = opts.accountIdHex ?? HEX32("aa");
+    const groupIdHex = opts.groupIdHex;
+    const senderAccountIdHex = opts.senderAccountIdHex ?? HEX32("bb");
+    const sessionKey = opts.sessionKey ?? `agent:marmot:${groupIdHex}`;
+    const deliverInboundReply = vi.fn(async () => ({
+      status: "handled_visible" as const,
+      delivery: {},
+    }));
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: (input) => {
+          const peer = (input as { peer?: { id?: string } }).peer;
+          return {
+            agentId: "agent",
+            accountId: "default",
+            sessionKey: opts.sessionKey ?? `agent:marmot:${peer?.id ?? groupIdHex}`,
+          };
+        },
+      },
+      session: {
+        resolveStorePath: (store) => String(store ?? opts.storePath),
+        recordInboundSession: async (params: unknown) => {
+          const input = params as {
+            storePath: string;
+            sessionKey: string;
+            ctx: unknown;
+            groupResolution?: {
+              key: string;
+              channel: string;
+              id: string;
+              chatType: "group";
+            };
+            createIfMissing?: boolean;
+            trackSessionMetaTask?: (task: Promise<unknown>) => void;
+            onRecordError?: (err: unknown) => void;
+          };
+          let meta: Promise<unknown> | undefined;
+          try {
+            await recordInboundSession({
+              ...input,
+              ctx: input.ctx as never,
+              onRecordError: input.onRecordError ?? (() => undefined),
+              trackSessionMetaTask: (task) => {
+                meta = task;
+                input.trackSessionMetaTask?.(task);
+              },
+            });
+            await meta;
+          } catch (error) {
+            if (!isUnsafeSqliteRuntime(error)) {
+              throw error;
+            }
+          }
+        },
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          capturedCtx = (params as { ctx: Record<string, unknown> }).ctx;
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "native-subject-reply" }, { kind: "final" });
+          return { counts: {} };
+        },
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: { session: { store: opts.storePath } },
+      runtimeChannel,
+      client: opts.client ?? groupInfoClient({ subject: opts.subject, isDirect: opts.isDirect }),
+      channelAccountId: "default",
+      groupActivation: opts.groupActivation ?? "always",
+      mentionPatterns: opts.mentionPatterns ?? [],
+      deliverInboundReply: deliverInboundReply as never,
+    });
+    await dispatch({
+      accountIdHex,
+      groupIdHex,
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex,
+      text: opts.text ?? "hello",
+      mentionsSelf: opts.mentionsSelf,
+    });
+    if (!capturedCtx) {
+      throw new Error("turn did not build a native context");
+    }
+    const store = loadSessionStoreIfSafe(opts.storePath);
+    return {
+      ctx: capturedCtx,
+      session: store?.[sessionKey],
+    };
+  }
+
+  it("maps a named group onto native ConversationLabel/GroupSubject and session metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-native-subject-"));
+    const storePath = join(root, "sessions.json");
+    const groupIdHex = HEX32("cc");
+    const sender = HEX32("bb");
+    try {
+      const unlabeledControl = await buildChannelInboundEventContext({
+        channel: "marmot",
+        accountId: "default",
+        messageId: HEX32("dd"),
+        timestamp: 1_721_000_000_000,
+        from: sender,
+        sender: { id: sender },
+        conversation: { kind: "group", id: groupIdHex },
+        route: {
+          agentId: "agent",
+          accountId: "default",
+          routeSessionKey: `agent:marmot:${groupIdHex}`,
+        },
+        reply: { to: groupIdHex },
+        message: { rawBody: "hello", bodyForAgent: "hello" },
+      });
+      const cases: Array<{
+        groupActivation: "always" | "mention";
+        mentionsSelf?: boolean;
+        mentionPatterns?: string[];
+        text?: string;
+        isDirect?: boolean;
+      }> = [
+        { groupActivation: "always" },
+        { groupActivation: "mention", mentionsSelf: true },
+        { groupActivation: "mention", mentionPatterns: ["marvin"], text: "hey Marvin" },
+        { groupActivation: "mention", isDirect: true },
+      ];
+      for (const activation of cases) {
+        clearSessionStoreCacheSafe();
+        const { ctx, session } = await dispatchNamedTurn({
+          storePath,
+          groupIdHex,
+          senderAccountIdHex: sender,
+          subject: "Project Marmot",
+          ...activation,
+        });
+        expect(ctx.ConversationLabel).toBe("Project Marmot");
+        expect(ctx.GroupSubject).toBe("Project Marmot");
+        expect(ctx.ChatId).toBe(groupIdHex);
+        expect(ctx.To).toBe(groupIdHex);
+        expect(ctx.OriginatingTo ?? ctx.To).toBe(groupIdHex);
+        expect(ctx.SessionKey).toBe(`agent:marmot:${groupIdHex}`);
+        expect(ctx.From).toBe(sender);
+        if (session) {
+          expect(session.subject).toBe("Project Marmot");
+          expect((session.origin as { label?: string } | undefined)?.label).toBe("Project Marmot");
+          expect(session.groupId).toBe(groupIdHex);
+          expect(session.channel).toBe("marmot");
+        } else {
+          expect(loadSessionStoreIfSafe(storePath)).toBeUndefined();
+        }
+        expect(unlabeledControl.ConversationLabel).not.toBe("Project Marmot");
+      }
+    } finally {
+      clearSessionStoreCacheSafe();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("matches the unlabeled SDK control case and does not coerce malformed subjects", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-native-unlabeled-"));
+    const storePath = join(root, "sessions.json");
+    const groupIdHex = HEX32("cc");
+    const sender = HEX32("bb");
+    try {
+      const control = await buildChannelInboundEventContext({
+        channel: "marmot",
+        accountId: "default",
+        messageId: HEX32("dd"),
+        timestamp: 1_721_000_000_000,
+        from: sender,
+        sender: { id: sender },
+        conversation: { kind: "group", id: groupIdHex },
+        route: {
+          agentId: "agent",
+          accountId: "default",
+          routeSessionKey: `agent:marmot:${groupIdHex}`,
+        },
+        reply: { to: groupIdHex },
+        message: { rawBody: "hello", bodyForAgent: "hello" },
+      });
+      for (const subject of [null, "", "   ", 12, { name: "nope" }]) {
+        clearSessionStoreCacheForTest();
+        const { ctx } = await dispatchNamedTurn({
+          storePath,
+          groupIdHex,
+          senderAccountIdHex: sender,
+          subject,
+        });
+        expect(ctx.ConversationLabel).toBe(control.ConversationLabel);
+        expect(ctx.GroupSubject).toBe(control.GroupSubject);
+      }
+    } finally {
+      clearSessionStoreCacheSafe();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("keeps same-label groups and a 16-byte MLS id on distinct native sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-native-isolation-"));
+    const storePath = join(root, "sessions.json");
+    const groupA = HEX32("c1");
+    const groupB = HEX32("c2");
+    const group16 = HEX16("ab");
+    try {
+      const first = await dispatchNamedTurn({ storePath, groupIdHex: groupA, subject: "Shared" });
+      const second = await dispatchNamedTurn({ storePath, groupIdHex: groupB, subject: "Shared" });
+      const third = await dispatchNamedTurn({ storePath, groupIdHex: group16, subject: "Shared" });
+      expect(first.ctx.ChatId).toBe(groupA);
+      expect(second.ctx.ChatId).toBe(groupB);
+      expect(third.ctx.ChatId).toBe(group16);
+      expect(first.ctx.SessionKey).toBe(`agent:marmot:${groupA}`);
+      expect(second.ctx.SessionKey).toBe(`agent:marmot:${groupB}`);
+      expect(third.ctx.SessionKey).toBe(`agent:marmot:${group16}`);
+      const store = loadSessionStoreIfSafe(storePath);
+      if (store) {
+        expect(store[`agent:marmot:${groupA}`]?.groupId).toBe(groupA);
+        expect(store[`agent:marmot:${groupB}`]?.groupId).toBe(groupB);
+        expect(store[`agent:marmot:${group16}`]?.groupId).toBe(group16);
+        expect(store[`agent:marmot:${groupA}`]?.subject).toBe("Shared");
+        expect(store[`agent:marmot:${groupB}`]?.subject).toBe("Shared");
+      }
+    } finally {
+      clearSessionStoreCacheSafe();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("updates the existing native session after rename and retains a host subject when later unlabeled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-native-rename-"));
+    const storePath = join(root, "sessions.json");
+    const groupIdHex = HEX32("cc");
+    let subject: unknown = "Name A";
+    const client = groupInfoClient({
+      get subject() {
+        return subject;
+      },
+    });
+    try {
+      const first = await dispatchNamedTurn({
+        storePath,
+        groupIdHex,
+        client,
+        subject: "Name A",
+      });
+      if (first.session) {
+        expect(first.session.subject).toBe("Name A");
+      } else {
+        expect(loadSessionStoreIfSafe(storePath)).toBeUndefined();
+      }
+
+      subject = "Name B";
+      const renamed = await dispatchNamedTurn({
+        storePath,
+        groupIdHex,
+        client,
+        subject: "Name B",
+      });
+      expect(renamed.ctx.ConversationLabel).toBe("Name B");
+      if (renamed.session) {
+        expect(renamed.session.subject).toBe("Name B");
+        expect(renamed.session.groupId).toBe(groupIdHex);
+      }
+
+      subject = "";
+      const unlabeled = await dispatchNamedTurn({
+        storePath,
+        groupIdHex,
+        client,
+        subject: "",
+      });
+      expect(unlabeled.ctx.GroupSubject).toBeUndefined();
+      if (unlabeled.session) {
+        expect(unlabeled.session.groupId).toBe(groupIdHex);
+        expect(unlabeled.session.subject).toBe("Name B");
+      }
+    } finally {
+      clearSessionStoreCacheSafe();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("binds session group metadata to the full group id rather than the sender", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-native-resolution-"));
+    const storePath = join(root, "sessions.json");
+    const groupIdHex = HEX32("cc");
+    const sender = HEX32("bb");
+    try {
+      const ctx = await buildChannelInboundEventContext({
+        channel: "marmot",
+        accountId: "default",
+        messageId: HEX32("dd"),
+        timestamp: 1_721_000_000_000,
+        from: sender,
+        sender: { id: sender },
+        conversation: { kind: "group", id: groupIdHex, label: "Project Marmot" },
+        route: {
+          agentId: "agent",
+          accountId: "default",
+          routeSessionKey: `agent:marmot:${groupIdHex}`,
+        },
+        reply: { to: groupIdHex },
+        message: { rawBody: "hello", bodyForAgent: "hello" },
+      });
+      const recorded = await recordSessionAndWait({
+        storePath,
+        sessionKey: `agent:marmot:${groupIdHex}`,
+        ctx,
+        groupResolution: {
+          key: `marmot:group:${groupIdHex}`,
+          channel: "marmot",
+          id: groupIdHex,
+          chatType: "group",
+        },
+      });
+      const withResolution = loadSessionStoreIfSafe(storePath)?.[`agent:marmot:${groupIdHex}`];
+      if (recorded && withResolution) {
+        expect(withResolution.groupId).toBe(groupIdHex);
+        expect(withResolution.groupId).not.toBe(sender);
+      } else {
+        expect(withResolution).toBeUndefined();
+      }
+
+      clearSessionStoreCacheSafe();
+      const defaultStore = join(root, "default-sessions.json");
+      await recordSessionAndWait({
+        storePath: defaultStore,
+        sessionKey: `agent:marmot:${groupIdHex}`,
+        ctx,
+      });
+      const withoutResolution = loadSessionStoreIfSafe(defaultStore)?.[`agent:marmot:${groupIdHex}`];
+      if (withoutResolution) {
+        expect(withoutResolution.groupId).not.toBe(groupIdHex);
+      }
+    } finally {
+      clearSessionStoreCacheSafe();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
   });
 });

@@ -16,6 +16,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   display. Missing, blank, or unusable names still fall back to
   `Marmot <first 12 hex characters>`. Display names are read fresh each lookup and never
   become routing ids, authorization facts, or cache keys.
+- OpenClaw inbound turns now pass that same `group_info.subject` through as the native
+  conversation label and persist it on the host session, using one bounded shared
+  group-info cache for both effective-DM activation and display. Rename and subscription
+  reconnect refresh the cache on the next turn; full group-id routing and existing
+  activation policy stay unchanged.
 
 - Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
   commands and independent live account-attention summaries across Swift/Kotlin and C.

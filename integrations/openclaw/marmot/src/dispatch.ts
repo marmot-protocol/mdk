@@ -23,6 +23,7 @@ import type {
   MarmotAgentControlClient,
 } from "./client.js";
 import type { GroupActivation } from "./config.js";
+import { GroupInfoCache, type GroupInfoFacts } from "./group-info-cache.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
 
@@ -131,83 +132,83 @@ function matchesMentionPattern(text: string, patterns: string[]): boolean {
   });
 }
 
-/**
- * Per-(account, group) cache of the `is_direct` activation fact. `is_direct`
- * (the group has exactly two members → effective DM → always reply) only changes
- * when membership changes, so it is cached after the first lookup and reused for
- * every subsequent unaddressed message in that group. The inbound runtime
- * invalidates an entry when wn-agent reports a `group_state_changed` event for
- * the group (membership/admin/rename/avatar), so the next unaddressed message
- * re-reads fresh membership. Keyed on `${accountIdHex}:${groupIdHex}`; both are
- * already lowercase hex (the client normalizes them), and neither the key nor
- * the cached boolean is ever logged.
- */
-export class GroupActivationCache {
-  private readonly isDirect = new Map<string, boolean>();
-
-  private static key(accountIdHex: string, groupIdHex: string): string {
-    return `${accountIdHex}:${groupIdHex}`;
-  }
-
-  get(accountIdHex: string, groupIdHex: string): boolean | undefined {
-    return this.isDirect.get(GroupActivationCache.key(accountIdHex, groupIdHex));
-  }
-
-  set(accountIdHex: string, groupIdHex: string, isDirect: boolean): void {
-    this.isDirect.set(GroupActivationCache.key(accountIdHex, groupIdHex), isDirect);
-  }
-
-  /** Drop the cached activation fact for one group; the next gate re-reads membership. */
-  invalidate(accountIdHex: string, groupIdHex: string): void {
-    this.isDirect.delete(GroupActivationCache.key(accountIdHex, groupIdHex));
-  }
-
-  /** Drop every cached activation fact (e.g. on an inbound resync). */
-  clear(): void {
-    this.isDirect.clear();
-  }
+function marmotGroupResolution(groupIdHex: string): {
+  key: string;
+  channel: "marmot";
+  id: string;
+  chatType: "group";
+} {
+  return {
+    key: `marmot:group:${groupIdHex}`,
+    channel: "marmot",
+    id: groupIdHex,
+    chatType: "group",
+  };
 }
+
+type ActivationDecision = { run: false } | { run: true; facts?: GroupInfoFacts };
 
 /**
  * Decide whether an inbound group message should run an agent turn. Always reply
  * when addressed (`mentionsSelf`, a trigger matches) or in an effective DM
- * (exactly two members). Membership is queried lazily — only when the message is
- * otherwise unaddressed — to avoid a round-trip on the common addressed case, and
- * the `is_direct` result is cached per (account, group) so repeated ambient
- * messages don't each re-read MLS state (the cache is invalidated on a
- * `group_state_changed` event). On a membership-lookup error we fail **closed**
- * (skip the turn): under the `mention` policy an unaddressed message in a group
- * whose membership we can't resolve is more likely a multi-party conversation the
- * agent wasn't addressed in, and barging in there is worse (and unrecallable)
- * than dropping a single reply in a true two-party DM, where the user can simply
- * re-send or address the agent explicitly. The error is not cached.
+ * (exactly two members). Membership is queried only when the message is
+ * otherwise unaddressed. Addressed and always-on turns still share the same
+ * bounded group-info cache so a later ambient message can reuse `is_direct`
+ * and the normalized subject without a second control-socket read. On a
+ * membership-lookup error we fail **closed** (skip the turn): under the
+ * `mention` policy an unaddressed message in a group whose membership we can't
+ * resolve is more likely a multi-party conversation the agent wasn't addressed
+ * in, and barging in there is worse (and unrecallable) than dropping a single
+ * reply in a true two-party DM, where the user can simply re-send or address
+ * the agent explicitly. Membership errors are not cached as `isDirect: false`.
  */
-async function shouldRunTurn(
+async function decideActivation(
   deps: MarmotDispatchDeps,
-  cache: GroupActivationCache,
+  cache: GroupInfoCache,
   message: MarmotInboundMessage,
-): Promise<boolean> {
-  if (deps.groupActivation === "always") {
-    return true;
+): Promise<ActivationDecision> {
+  if (
+    deps.groupActivation === "always" ||
+    message.mentionsSelf ||
+    matchesMentionPattern(message.text, deps.mentionPatterns)
+  ) {
+    return { run: true };
   }
-  if (message.mentionsSelf) {
-    return true;
+  const result = await cache.lookup(
+    message.accountIdHex,
+    message.groupIdHex,
+    "activation",
+    () => deps.client.groupInfo(message.accountIdHex, message.groupIdHex),
+  );
+  if (result.status === "ok") {
+    return result.facts.isDirect ? { run: true, facts: result.facts } : { run: false };
   }
-  if (matchesMentionPattern(message.text, deps.mentionPatterns)) {
-    return true;
+  deps.log?.("marmot: group membership lookup failed; skipping turn (fail-closed)");
+  return { run: false };
+}
+
+async function resolveGroupFacts(
+  deps: MarmotDispatchDeps,
+  cache: GroupInfoCache,
+  message: MarmotInboundMessage,
+  existing?: GroupInfoFacts,
+): Promise<GroupInfoFacts | undefined> {
+  if (existing) {
+    return existing;
   }
-  const cached = cache.get(message.accountIdHex, message.groupIdHex);
-  if (cached !== undefined) {
-    return cached;
+  const result = await cache.lookup(
+    message.accountIdHex,
+    message.groupIdHex,
+    "label",
+    () => deps.client.groupInfo(message.accountIdHex, message.groupIdHex),
+  );
+  if (result.status === "ok") {
+    return result.facts;
   }
-  try {
-    const info = await deps.client.groupInfo(message.accountIdHex, message.groupIdHex);
-    cache.set(message.accountIdHex, message.groupIdHex, info.is_direct);
-    return info.is_direct;
-  } catch {
-    deps.log?.("marmot: group membership lookup failed; skipping turn (fail-closed)");
-    return false;
+  if (result.status === "failed") {
+    deps.log?.("marmot: group info lookup failed; continuing without label");
   }
+  return undefined;
 }
 
 /** Map a media MIME type onto the OpenClaw inbound media `kind` enum. */
@@ -451,9 +452,10 @@ async function downloadInboundMedia(
 /**
  * The inbound dispatcher callable plus a cache-invalidation hook. The function
  * runs an agent turn for a received message; `invalidateGroupActivation` drops
- * the cached `is_direct` activation fact for a group whose membership changed
+ * the cached group-info facts for a group whose membership or subject changed
  * (driven by the inbound runtime's `group_state_changed` handler), and
- * `clearGroupActivationCache` drops every entry (e.g. on an inbound resync).
+ * `clearGroupActivationCache` drops every entry (e.g. on an inbound resync or
+ * subscription reconnect). Hook names stay stable for gateway compatibility.
  */
 export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promise<boolean>) & {
   invalidateGroupActivation: (accountIdHex: string, groupIdHex: string) => void;
@@ -469,15 +471,17 @@ export type MarmotInboundDispatcher = ((message: MarmotInboundMessage) => Promis
 export function createMarmotInboundDispatcher(
   deps: MarmotDispatchDeps,
 ): MarmotInboundDispatcher {
-  // Per-(account, group) is_direct cache, scoped to this dispatcher instance so
-  // it lives exactly as long as the inbound subscription that owns it.
-  const activationCache = new GroupActivationCache();
+  // Per-(account, group) facts cache, scoped to this dispatcher instance so it
+  // lives exactly as long as the inbound subscription that owns it.
+  const groupInfoCache = new GroupInfoCache();
   const dispatch = async (message: MarmotInboundMessage): Promise<boolean> => {
     // Activation gating: in a multi-party group, only run a turn when addressed.
-    if (!(await shouldRunTurn(deps, activationCache, message))) {
+    const decision = await decideActivation(deps, groupInfoCache, message);
+    if (!decision.run) {
       deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
       return false;
     }
+    const groupFacts = await resolveGroupFacts(deps, groupInfoCache, message, decision.facts);
     const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
       cfg: deps.cfg,
@@ -521,7 +525,11 @@ export function createMarmotInboundDispatcher(
         id: message.senderAccountIdHex,
         ...(message.senderDisplayName ? { name: message.senderDisplayName } : {}),
       },
-      conversation: { kind: "group", id: message.groupIdHex },
+      conversation: {
+        kind: "group",
+        id: message.groupIdHex,
+        ...(groupFacts?.label ? { label: groupFacts.label } : {}),
+      },
       route: {
         agentId: route.agentId,
         accountId: route.accountId,
@@ -564,6 +572,9 @@ export function createMarmotInboundDispatcher(
           storePath,
           ctxPayload,
           recordInboundSession: deps.runtimeChannel.session.recordInboundSession as never,
+          record: {
+            groupResolution: marmotGroupResolution(message.groupIdHex),
+          },
           // OpenClaw 2026.7.2-beta requires prepared dispatch runners to
           // declare who owns their adoption lifecycle. Marmot does not create
           // a durable adoption resource outside runDispatch, so a skipped turn
@@ -616,7 +627,7 @@ export function createMarmotInboundDispatcher(
 
   return Object.assign(dispatch, {
     invalidateGroupActivation: (accountIdHex: string, groupIdHex: string) =>
-      activationCache.invalidate(accountIdHex, groupIdHex),
-    clearGroupActivationCache: () => activationCache.clear(),
+      groupInfoCache.invalidate(accountIdHex, groupIdHex),
+    clearGroupActivationCache: () => groupInfoCache.clear(),
   });
 }

@@ -183,16 +183,19 @@ export interface StartMarmotInboundOptions {
    */
   configuredAgentName?: string | null;
   /**
-   * Invalidate the dispatcher's cached `is_direct` activation fact for one group.
-   * Called when wn-agent reports a `group_state_changed` event so the next
-   * unaddressed message in that group re-reads fresh membership instead of a
-   * stale cached value. When omitted, the cache is never invalidated from here.
+   * Invalidate the dispatcher's cached group-info facts for one group
+   * (`is_direct` plus the normalized subject). Called when wn-agent reports a
+   * `group_state_changed` event — including rename — so the next relevant turn
+   * re-reads authoritative `group_info` instead of a stale cached value. Event
+   * `detail` is never treated as a separately maintained label. When omitted,
+   * the cache is never invalidated from here.
    */
   invalidateGroupActivation?: (accountIdHex: string, groupIdHex: string) => void;
   /**
-   * Drop every cached `is_direct` activation fact. Called on an inbound resync,
-   * where dropped broadcast slots mean a `group_state_changed` for some group may
-   * have been missed, so no cached membership can be trusted.
+   * Drop every cached group-info fact and in-flight generation. Called on an
+   * inbound resync, subscription drop, or clean-EOF reconnect, where a missed
+   * `group_state_changed` (including rename) means no cached membership or
+   * subject can be trusted.
    */
   clearGroupActivationCache?: () => void;
 }
@@ -556,6 +559,11 @@ export function startMarmotInbound(
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
       onReady: () => {
+        if (readyLogged) {
+          // Clean EOF or post-error reconnect can miss a rename while the
+          // socket was down; drop every fact and pending generation.
+          options.clearGroupActivationCache?.();
+        }
         markMarmotInboundReady(statusAccountId);
         options.statusSink?.({
           running: true,
@@ -611,13 +619,14 @@ export function startMarmotInbound(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
         );
         // Dropped broadcast slots can include a missed group_state_changed for any
-        // group, so no cached is_direct fact can be trusted; drop them all.
+        // group, so no cached membership or subject can be trusted; drop them all.
         options.clearGroupActivationCache?.();
       },
       onSubmissionError: () => {
         api.logger.warn("marmot: inbound submission failed before admission; replay remains retryable");
       },
       onError: () => {
+        options.clearGroupActivationCache?.();
         markMarmotInboundReconnect(statusAccountId);
         options.statusSink?.({
           running: true,

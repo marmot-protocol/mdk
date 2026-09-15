@@ -303,7 +303,10 @@ for any plugin or tenant that is not in the same trust boundary.
   feeds each received Marmot message (`chatId` = Marmot group id, `userId` =
   sender) into OpenClaw's turn kernel via `runChannelInboundEvent` +
   `dispatchReplyWithBufferedBlockDispatcher`. The trusted inbound context owns
-  the destination. A normal assistant final is passed to
+  the destination. A nonempty cached group subject is passed only as the
+  conversation `label` (native `ConversationLabel` / `GroupSubject`); session
+  metadata also binds `record.groupResolution` to the full group id so the host
+  session record is not keyed from the sender. A normal assistant final is passed to
   `deliverInboundReplyWithMessageSendContext`, which invokes the registered
   Marmot message adapter and threads the reply to the triggering message. The
   model never has to reconstruct or select the source group.
@@ -315,18 +318,25 @@ for any plugin or tenant that is not in the same trust boundary.
   trigger (or the agent name), or the conversation is an effective DM (exactly
   two members, resolved via the `group_info` control op). Set
   `groupActivation: "always"` to reply to every message. Effective DMs always
-  reply. Membership is queried lazily — only for otherwise-unaddressed messages,
-  so the common addressed case never pays the round-trip — and the resulting
-  `is_direct` fact is cached per (account, group), since it only changes when
-  membership changes. The cache entry is invalidated on a `group_state_changed`
-  event for that group (and cleared entirely on an inbound resync), so the next
-  unaddressed message re-reads fresh membership. On a membership-lookup error
-  the gate fails **closed** (skips the turn) under the `mention` policy: an
-  unaddressed message in a group whose membership can't be resolved is more
-  likely a multi-party conversation the agent wasn't addressed in, and an
-  unrecallable barge-in there is worse than dropping a single reply in a true
-  two-party DM (where the user can re-send or address the agent explicitly). The
-  error is not cached, so the next message retries the lookup.
+  reply. Activation policy itself is unchanged. A single bounded
+  per-(account, group) cache now stores both `is_direct` and the normalized
+  group subject (display text only) so activation and native conversation
+  metadata share one in-flight `group_info` read. The cache holds at most 256
+  entries (hits, unnamed groups, label-failure cooldown, and pending lookups),
+  evicts least-recently-used settled entries, and never keys, routes, or logs
+  by subject. The first turn for a group pays one control-socket lookup; later
+  turns reuse the warm named or unnamed hit. A failed label-only lookup keeps
+  a 5-second retry-after and leaves that already-admitted turn unlabeled; a
+  membership-required lookup ignores that cooldown and still fails **closed**
+  (skips the turn) under the `mention` policy, then retries on the next
+  message. Membership errors are not cached as `is_direct: false`. The cache
+  entry is invalidated on a `group_state_changed` event for that group
+  (including rename) and cleared on inbound resync or subscription
+  loss/re-establishment, so the next relevant turn re-reads authoritative
+  `group_info`. Routing, session keys, reply targets, and the `message` tool
+  stay on the full group id; the subject is never an address. OpenClaw's host
+  session store may retain a previous display name after a later unlabeled
+  turn — that retention is host-owned, not a plugin migration.
 - **Durable replies** are sent verbatim as `kind: 9` messages via the registered
   message adapter's `send.text` → `wn-agent send_final` mapping. The adapter
   never merges or rewrites text across sends. A bounded retry reuses one
@@ -359,7 +369,12 @@ for any plugin or tenant that is not in the same trust boundary.
 - **Group state changes**: durable, MLS-authenticated changes (member
   add/remove/leave, admin grant/revoke, rename/avatar) surface as a
   `group_state_changed` event carrying only a coarse `change` kind and, for a
-  rename, the new group display name — never a member pubkey.
+  rename, the new group display name — never a member pubkey. The event is
+  ambient: it invalidates that group's cached facts and is attached to the
+  next triggering user turn, but it never starts an agent turn or writes the
+  host session store. The next admitted turn re-reads `group_info`; a rename
+  to a blank name omits the plugin label and then follows OpenClaw's native
+  session-display retention.
 - **Native reply and ambient context**: reply hydration maps to
   `supplemental.quote`; quoted attachment summaries and buffered
   `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`, and

@@ -6,6 +6,11 @@ import type {
   MarmotAgentControlClient,
 } from "../src/client.js";
 import {
+  createMarmotInboundDispatcher,
+  type MarmotDispatchClient,
+  type OpenClawChannelRuntime,
+} from "../src/dispatch.js";
+import {
   resetMarmotInboundAccountsForTests,
   startMarmotInbound,
   syncMarmotAllowlist,
@@ -614,6 +619,102 @@ describe("startMarmotInbound", () => {
     expect(invalidated[0]).toEqual({ accountIdHex: HEX32("aa"), groupIdHex: HEX32("cc") });
   });
 
+  it("clears the group-info cache on subscription drop and re-establishment", async () => {
+    vi.useFakeTimers();
+    const cleared: string[] = [];
+    let subscriptions = 0;
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        ({
+          async accountList() {
+            return {
+              type: "account_list",
+              accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+            };
+          },
+          async *subscribeInbound(
+            _filter?: unknown,
+            signal?: AbortSignal,
+            hooks?: { onReady?: () => void },
+          ) {
+            subscriptions += 1;
+            hooks?.onReady?.();
+            if (subscriptions === 1) {
+              throw new Error("subscription dropped");
+            }
+            await new Promise<void>((resolve) => {
+              if (signal?.aborted) {
+                resolve();
+              } else {
+                signal?.addEventListener("abort", () => resolve(), { once: true });
+              }
+            });
+          },
+        }) as unknown as MarmotAgentControlClient,
+      clearGroupActivationCache: () => {
+        cleared.push(`clear-${subscriptions}`);
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cleared).toEqual(["clear-1"]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(cleared).toEqual(["clear-1", "clear-2"]);
+    stop();
+  });
+
+  it("clears the group-info cache after a clean-EOF reconnect", async () => {
+    vi.useFakeTimers();
+    const cleared: string[] = [];
+    let subscriptions = 0;
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        ({
+          async accountList() {
+            return {
+              type: "account_list",
+              accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+            };
+          },
+          async *subscribeInbound(
+            _filter?: unknown,
+            signal?: AbortSignal,
+            hooks?: { onReady?: () => void },
+          ) {
+            subscriptions += 1;
+            hooks?.onReady?.();
+            if (subscriptions === 1) {
+              return;
+            }
+            await new Promise<void>((resolve) => {
+              if (signal?.aborted) {
+                resolve();
+              } else {
+                signal?.addEventListener("abort", () => resolve(), { once: true });
+              }
+            });
+          },
+        }) as unknown as MarmotAgentControlClient,
+      clearGroupActivationCache: () => {
+        cleared.push(`clear-${subscriptions}`);
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cleared).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(cleared).toEqual(["clear-2"]);
+    stop();
+  });
+
   it("clears the whole group-activation cache on an inbound resync", async () => {
     let cleared = 0;
     const api: InboundPluginApi = {
@@ -783,6 +884,217 @@ describe("startMarmotInbound", () => {
       event.message.message_id_hex,
     ]);
     secondStop();
+  });
+});
+
+describe("startMarmotInbound with the real dispatcher cache", () => {
+  function quietRuntime(): OpenClawChannelRuntime {
+    return {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot:lifecycle",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-lifecycle",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async () => undefined,
+      },
+    };
+  }
+
+  function countingGroupInfo(subject = "Project Marmot"): {
+    client: MarmotDispatchClient;
+    groupInfoCalls: () => number;
+  } {
+    let calls = 0;
+    return {
+      client: {
+        async groupInfo(accountIdHex: string, groupIdHex: string) {
+          calls += 1;
+          return {
+            type: "group_info",
+            account_id_hex: accountIdHex,
+            group_id_hex: groupIdHex,
+            member_count: 5,
+            is_direct: false,
+            subject,
+          };
+        },
+        async timelineList(accountIdHex: string, groupIdHex: string) {
+          return {
+            type: "timeline_page",
+            account_id_hex: accountIdHex,
+            group_id_hex: groupIdHex,
+            messages: [],
+            has_more_before: false,
+            has_more_after: false,
+          };
+        },
+      } as unknown as MarmotDispatchClient,
+      groupInfoCalls: () => calls,
+    };
+  }
+
+  it("invalidates on rename, clears on resync, and does not start a turn from the event", async () => {
+    const { client, groupInfoCalls } = countingGroupInfo();
+    const turns: string[] = [];
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: {
+        ...quietRuntime(),
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: async () => {
+            turns.push("turn");
+          },
+        },
+      },
+      client,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+    const events: AgentControlEvent[] = [
+      inboundEvent("cc", "d1"),
+      {
+        type: "group_state_changed",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: HEX32("cc"),
+        change: "group_renamed",
+        detail: "Renamed",
+      },
+      inboundEvent("cc", "d2"),
+      {
+        type: "resync_required",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: null,
+        dropped_events: 2,
+      },
+      inboundEvent("cc", "d3"),
+    ];
+    let releaseNext!: () => void;
+    let nextEvent = new Promise<void>((resolve) => {
+      releaseNext = resolve;
+    });
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, dispatch, {
+      clientFactory: () =>
+        ({
+          async accountList() {
+            return {
+              type: "account_list",
+              accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+            };
+          },
+          async *subscribeInbound(
+            _filter?: unknown,
+            _signal?: AbortSignal,
+            hooks?: { onReady?: () => void },
+          ) {
+            hooks?.onReady?.();
+            for (const event of events) {
+              await nextEvent;
+              nextEvent = new Promise<void>((resolve) => {
+                releaseNext = resolve;
+              });
+              yield event;
+            }
+          },
+        }) as unknown as MarmotAgentControlClient,
+      invalidateGroupActivation: dispatch.invalidateGroupActivation,
+      clearGroupActivationCache: dispatch.clearGroupActivationCache,
+    });
+
+    releaseNext();
+    await waitFor(() => turns.length >= 1);
+    expect(groupInfoCalls()).toBe(1);
+    const afterFirst = turns.length;
+    releaseNext();
+    await waitFor(() => turns.length === afterFirst);
+    expect(groupInfoCalls()).toBe(1);
+    releaseNext();
+    await waitFor(() => turns.length >= 2);
+    expect(groupInfoCalls()).toBe(2);
+    releaseNext();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseNext();
+    await waitFor(() => turns.length >= 3);
+    stop();
+    expect(turns).toHaveLength(3);
+    expect(groupInfoCalls()).toBe(3);
+  });
+
+  it("refreshes group facts after a failed reconnect when wired to the real dispatcher", async () => {
+    const { client, groupInfoCalls } = countingGroupInfo();
+    const turns: string[] = [];
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: {
+        ...quietRuntime(),
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: async () => {
+            turns.push("turn");
+          },
+        },
+      },
+      client,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+    let subscriptions = 0;
+    const stop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: noopLogger,
+      },
+      dispatch,
+      {
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return {
+                type: "account_list",
+                accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+              };
+            },
+            async *subscribeInbound(
+              _filter?: unknown,
+              signal?: AbortSignal,
+              hooks?: { onReady?: () => void },
+            ) {
+              subscriptions += 1;
+              hooks?.onReady?.();
+              yield inboundEvent("cc", subscriptions === 1 ? "d1" : "d2");
+              if (subscriptions === 1) {
+                throw new Error("subscription dropped");
+              }
+              await new Promise<void>((resolve) => {
+                if (signal?.aborted) {
+                  resolve();
+                } else {
+                  signal?.addEventListener("abort", () => resolve(), { once: true });
+                }
+              });
+            },
+          }) as unknown as MarmotAgentControlClient,
+        invalidateGroupActivation: dispatch.invalidateGroupActivation,
+        clearGroupActivationCache: dispatch.clearGroupActivationCache,
+      },
+    );
+
+    await waitFor(() => turns.length >= 1);
+    expect(groupInfoCalls()).toBe(1);
+    await waitFor(() => turns.length >= 2, 3_000);
+    expect(groupInfoCalls()).toBe(2);
+    stop();
   });
 });
 

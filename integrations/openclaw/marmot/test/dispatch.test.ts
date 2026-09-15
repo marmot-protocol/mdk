@@ -86,7 +86,7 @@ function emptyCalls(): Calls {
 
 function stubClient(
   calls: Calls,
-  opts: { isDirect?: boolean; history?: unknown[] } = {},
+  opts: { isDirect?: boolean; history?: unknown[]; subject?: string | null } = {},
 ): MarmotDispatchClient {
   return {
     async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
@@ -100,7 +100,7 @@ function stubClient(
         group_id_hex: groupIdHex,
         member_count: opts.isDirect ? 2 : 5,
         is_direct: opts.isDirect ?? false,
-        subject: null,
+        subject: opts.subject === undefined ? null : opts.subject,
       };
     },
     async timelineList(accountIdHex: string, groupIdHex: string) {
@@ -176,6 +176,14 @@ describe("createMarmotInboundDispatcher", () => {
     const inboundEvent = runInboundEventMock.mock.calls[0]?.[0] as unknown as {
       adapter: {
         resolveTurn: () => {
+          record?: {
+            groupResolution?: {
+              key: string;
+              channel: string;
+              id: string;
+              chatType: string;
+            };
+          };
           runDispatchLifecycle?: {
             turnAdoptionLifecycle?: unknown;
             onDispatchSkipped?: (reason: string) => Promise<void>;
@@ -183,7 +191,14 @@ describe("createMarmotInboundDispatcher", () => {
         };
       };
     };
-    const lifecycle = inboundEvent.adapter.resolveTurn().runDispatchLifecycle;
+    const prepared = inboundEvent.adapter.resolveTurn();
+    expect(prepared.record?.groupResolution).toEqual({
+      key: `marmot:group:${HEX32("cc")}`,
+      channel: "marmot",
+      id: HEX32("cc"),
+      chatType: "group",
+    });
+    const lifecycle = prepared.runDispatchLifecycle;
     expect(lifecycle).toMatchObject({ turnAdoptionLifecycle: undefined });
     await expect(lifecycle?.onDispatchSkipped?.("observeOnly")).resolves.toBeUndefined();
     expect((captured[0] as { ctx: { accountId: string } }).ctx.accountId).toBe("default");
@@ -537,6 +552,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
   function countingClient(opts: {
     isDirect: boolean | (() => boolean);
     throwError?: () => boolean;
+    subject?: string | null | (() => string | null);
   }): { client: MarmotDispatchClient; groupInfoCalls: () => number } {
     let calls = 0;
     const client = {
@@ -549,13 +565,15 @@ describe("createMarmotInboundDispatcher activation cache", () => {
           throw new Error("group_info failed");
         }
         const isDirect = typeof opts.isDirect === "function" ? opts.isDirect() : opts.isDirect;
+        const subject =
+          typeof opts.subject === "function" ? opts.subject() : (opts.subject ?? null);
         return {
           type: "group_info" as const,
           account_id_hex: accountIdHex,
           group_id_hex: groupIdHex,
           member_count: isDirect ? 2 : 5,
           is_direct: isDirect,
-          subject: null,
+          subject,
         };
       },
     } as unknown as MarmotDispatchClient;
@@ -595,15 +613,19 @@ describe("createMarmotInboundDispatcher activation cache", () => {
     expect(turns.count).toBe(0);
   });
 
-  it("does not consult the cache for an addressed message (no membership read)", async () => {
+  it("reads shared group facts once for an addressed message and then hits the cache", async () => {
     const turns = { count: 0 };
-    const { client, groupInfoCalls } = countingClient({ isDirect: false });
+    const { client, groupInfoCalls } = countingClient({
+      isDirect: false,
+      subject: "Project Marmot",
+    });
     const dispatch = makeDispatch(client, turns);
 
-    await dispatch({ ...baseMessage, mentionsSelf: true });
+    await dispatch({ ...baseMessage, mentionsSelf: true, messageIdHex: HEX32("01") });
+    await dispatch({ ...baseMessage, mentionsSelf: true, messageIdHex: HEX32("02") });
 
-    expect(groupInfoCalls()).toBe(0);
-    expect(turns.count).toBe(1);
+    expect(groupInfoCalls()).toBe(1);
+    expect(turns.count).toBe(2);
   });
 
   it("re-reads membership after the activation cache is invalidated", async () => {
@@ -666,6 +688,112 @@ describe("createMarmotInboundDispatcher activation cache", () => {
     fail = false;
     expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("02") })).toBe(true);
     expect(groupInfoCalls()).toBe(2);
+  });
+
+  it("still dispatches an addressed turn when the label lookup fails", async () => {
+    const turns = { count: 0 };
+    const { client, groupInfoCalls } = countingClient({
+      isDirect: false,
+      throwError: () => true,
+    });
+    const dispatch = makeDispatch(client, turns);
+
+    expect(
+      await runTurn(dispatch, turns, { ...baseMessage, mentionsSelf: true }),
+    ).toBe(true);
+    expect(groupInfoCalls()).toBe(1);
+    expect(turns.count).toBe(1);
+  });
+
+  it("keeps cache entries isolated across groups and accounts", async () => {
+    const turns = { count: 0 };
+    const { client, groupInfoCalls } = countingClient({
+      isDirect: false,
+      subject: "Shared Label",
+    });
+    const dispatch = makeDispatch(client, turns);
+    const otherGroup = "ee".repeat(32);
+    const otherAccount = "99".repeat(32);
+    const mls16 = "ab".repeat(16);
+
+    await dispatch({ ...baseMessage, mentionsSelf: true, messageIdHex: HEX32("01") });
+    await dispatch({
+      ...baseMessage,
+      groupIdHex: otherGroup,
+      mentionsSelf: true,
+      messageIdHex: HEX32("02"),
+    });
+    await dispatch({
+      ...baseMessage,
+      accountIdHex: otherAccount,
+      mentionsSelf: true,
+      messageIdHex: HEX32("03"),
+    });
+    await dispatch({
+      ...baseMessage,
+      groupIdHex: mls16,
+      mentionsSelf: true,
+      messageIdHex: HEX32("04"),
+    });
+    expect(groupInfoCalls()).toBe(4);
+
+    dispatch.invalidateGroupActivation(baseMessage.accountIdHex, otherGroup);
+    await dispatch({
+      ...baseMessage,
+      groupIdHex: otherGroup,
+      mentionsSelf: true,
+      messageIdHex: HEX32("05"),
+    });
+    await dispatch({ ...baseMessage, mentionsSelf: true, messageIdHex: HEX32("06") });
+    expect(groupInfoCalls()).toBe(5);
+  });
+
+  it("passes a normalized subject as conversation.label and omits malformed ones", async () => {
+    buildCtxMock.mockClear();
+    const turns = { count: 0 };
+    const { client } = countingClient({ isDirect: false, subject: "  Project Marmot  " });
+    const dispatch = makeDispatch(client, turns);
+    await dispatch({ ...baseMessage, mentionsSelf: true });
+    const named = buildCtxMock.mock.calls.at(-1)?.[0] as {
+      conversation: { kind: string; id: string; label?: string };
+    };
+    expect(named.conversation).toEqual({
+      kind: "group",
+      id: baseMessage.groupIdHex,
+      label: "Project Marmot",
+    });
+
+    buildCtxMock.mockClear();
+    const malformed = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: cachingRuntime({ count: 0 }),
+      client: {
+        async groupInfo(accountIdHex: string, groupIdHex: string) {
+          return {
+            type: "group_info",
+            account_id_hex: accountIdHex,
+            group_id_hex: groupIdHex,
+            member_count: 5,
+            is_direct: false,
+            subject: 12,
+          };
+        },
+        async timelineList() {
+          return { type: "timeline_page", messages: [], has_more_before: false, has_more_after: false };
+        },
+      } as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+    await malformed({ ...baseMessage, messageIdHex: HEX32("99") });
+    const omitted = buildCtxMock.mock.calls.at(-1)?.[0] as {
+      conversation: { kind: string; id: string; label?: string };
+    };
+    expect(omitted.conversation).toEqual({
+      kind: "group",
+      id: baseMessage.groupIdHex,
+    });
   });
 
   /** Dispatch a message and report whether an agent turn ran (the gate let it through). */
