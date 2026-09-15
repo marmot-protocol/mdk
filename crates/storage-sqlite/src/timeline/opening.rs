@@ -323,7 +323,7 @@ pub(super) fn opening_tx(
             ConversationOpenAnchorOutcome::Empty => unreachable!(),
         }
     }
-    attach_reply_previews(conn, &mut messages)?;
+    hydrate_timeline_presentation(conn, &mut messages)?;
     let anchors = messages
         .iter()
         .map(|message| {
@@ -367,7 +367,7 @@ fn slice(
         inclusive: true,
         limit,
     };
-    let rows = select_timeline_rows_tx(conn, &query, &pagination, true)?;
+    let rows = select_timeline_rows_tx(conn, &query, &pagination, true, true)?;
     let more = rows.len() > limit;
     let mut rows = rows.into_iter().take(limit).collect::<Vec<_>>();
     if direction != CursorDirection::After {
@@ -389,7 +389,7 @@ fn neighbor_key(
         TIMELINE_GROUP_ORDER_BY_DESC
     };
     let sql = format!("SELECT timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, message_id_hex
-        FROM message_timeline AS timeline WHERE group_id_hex = ? AND
+        FROM visible_message_timeline AS timeline WHERE group_id_hex = ? AND
         (timeline_order_class, timeline_order_primary, timeline_order_phase, timeline_order_at, message_id_hex) {op} (?, ?, ?, ?, ?)
         {order} LIMIT 1");
     let mut values = vec![rusqlite::types::Value::Text(group.to_owned())];

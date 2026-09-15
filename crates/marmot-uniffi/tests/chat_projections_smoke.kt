@@ -1,6 +1,8 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val blocks = BlockListSnapshotFfi(ULong.MAX_VALUE, listOf(BlockedUserFfi("key", true, 123L)))
+    check(FfiConverterTypeBlockListSnapshotFfi.lift(FfiConverterTypeBlockListSnapshotFfi.lower(blocks)) == blocks)
     val anchors = listOf(ChatListAnchorOutcomeFfi.Top, ChatListAnchorOutcomeFfi.Retained("aabb", 0u),
         ChatListAnchorOutcomeFfi.Recovered("ccdd", 199u), ChatListAnchorOutcomeFfi.Reset)
     for (view in ChatListViewFfi.entries) {
@@ -70,4 +72,12 @@ suspend fun compileConversationCommands(marmot: Marmot, account: String, group: 
         window.next()
         window.cancel()
     }
+}
+
+suspend fun compileBlockCommands(marmot: Marmot, account: String, user: String) {
+    marmot.blockUser(account, user)
+    marmot.unblockUser(account, user)
+    marmot.getBlockedUsers(account)
+    marmot.isUserBlocked(account, user)
+    marmot.subscribeBlockedUsers(account).use { sub -> sub.snapshot(); sub.next() }
 }

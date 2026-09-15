@@ -943,7 +943,7 @@ fn rewrite_pinned_chat_order_tx(
     Ok(())
 }
 
-fn rebuild_all_chat_list_rows_tx(
+pub(crate) fn rebuild_all_chat_list_rows_tx(
     tx: &Connection,
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
@@ -1814,7 +1814,7 @@ fn unread_membership_for_message_tx(
         "SELECT plaintext, tags_json, kind, timeline_order_class,
                 timeline_order_primary, timeline_order_phase, timeline_order_at
          FROM message_timeline
-         WHERE group_id_hex = ?1 AND sender != ?2 AND message_id_hex = ?3
+         WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
            AND {activity_filter} AND deleted = 0
            AND invalidation_status IS NULL AND {where_sql}"
     );
@@ -1926,7 +1926,7 @@ fn rebuild_unread_membership_tx(
            AND {activity_filter}
            AND deleted = 0
            AND invalidation_status IS NULL
-           AND sender != ?2
+           AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2
            AND {where_sql}
          ORDER BY {order_sql}"
     );
@@ -2365,6 +2365,7 @@ fn direct_conversation_candidate_sql() -> String {
          LEFT JOIN chat_pin_positions AS pin
             ON pin.group_id_hex = row.group_id_hex
          WHERE dcm.member_id_hex = ?1
+           AND row.group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)
            AND TRIM(row.group_name) = ''
            AND ag.member_count = 2
          ORDER BY row.activity_sort_at DESC, row.group_id_hex"
@@ -2445,7 +2446,7 @@ macro_rules! chat_list_columns {
             row.title, row.group_name, row.avatar_url,
             row.avatar_image_hash_hex, row.avatar_image_key_hex,
             row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
-            row.avatar_media_type, row.last_message_id_hex,
+            row.avatar_media_type, CASE WHEN row.last_message_sender IN (SELECT public_key FROM user_blocks) THEN NULL ELSE row.last_message_id_hex END,
             row.last_message_sender, row.last_message_preview,
             row.last_message_kind, row.last_message_timeline_at,
             row.last_message_deleted, row.last_message_media_json,
@@ -2489,7 +2490,7 @@ const CHAT_PIN_POSITION_SQL: &str = "CASE WHEN pin.ordinal IS NULL THEN NULL ELS
                 WHERE earlier_pin.ordinal < pin.ordinal
             ) END";
 
-const CHAT_LIST_ROW_JOINS: &str = "FROM chat_list_rows AS row
+const CHAT_LIST_ROW_JOINS: &str = "FROM visible_chat_list_rows AS row
      LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
      LEFT JOIN chat_notification_settings AS mute
         ON mute.group_id_hex = row.group_id_hex";

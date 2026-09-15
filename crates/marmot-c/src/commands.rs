@@ -81,6 +81,7 @@ use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
 use crate::types::timeline::{MarmotTimelineMessageQuery, MarmotTimelinePage};
+use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
 
 /// Shorthand used by every command wrapper: validate + read an argument,
@@ -930,6 +931,15 @@ c_cmd! {
     /// Fetch an account's published relay lists from `relays`, updating
     /// the cache. Free with `marmot_account_relay_lists_free`.
     async fn marmot_refresh_user_relay_lists(account_id_hex: str, relays/relays_len: str_arr) -> rec(MarmotAccountRelayLists) = refresh_user_relay_lists;
+
+    /// Block a user privately and publish the updated list. Requires relay synchronization.
+    async fn marmot_block_user(account_ref: str, user_account_id_hex: str) -> unit = block_user;
+    /// Unblock a user and publish the updated list. Requires relay synchronization.
+    async fn marmot_unblock_user(account_ref: str, user_account_id_hex: str) -> unit = unblock_user;
+    /// Read the local blocked-user list, newest first. Free with `marmot_blocked_user_list_free`.
+    sync fn marmot_get_blocked_users(account_ref: str) -> rec(MarmotBlockedUserList) = get_blocked_users;
+    /// Whether the local account currently blocks this public key.
+    sync fn marmot_is_user_blocked(account_ref: str, user_account_id_hex: str) -> scalar(bool) = is_user_blocked;
 
     /// The account ids this account follows (NIP-02). Free with
     /// `marmot_string_list_free`.

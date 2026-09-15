@@ -1257,5 +1257,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
         AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
         AppError::TransportClosed => "read_marker_failed:transport_closed",
+        AppError::UserBlocked => "read_marker_failed:user_blocked",
+        AppError::BlockListUnavailable => "read_marker_failed:block_list_unavailable",
+        AppError::BlockPublicationUncertain => "read_marker_failed:block_publication_uncertain",
     }
 }

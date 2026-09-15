@@ -23,6 +23,8 @@ mod recovery_health;
 mod shared;
 mod storage;
 mod timeline;
+mod user_blocks;
+pub use user_blocks::{BlockListSnapshot, BlockedUser, PendingBlockPublication, StoredBlockList};
 mod transport_reconciliation;
 
 pub use account_projection::{

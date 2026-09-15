@@ -71,6 +71,9 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
+mod user_blocks;
+pub use runtime::RuntimeBlockListSubscription;
+pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
 mod app_telemetry;
 #[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
@@ -458,6 +461,8 @@ type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 pub struct MarmotApp {
+    block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
     root: PathBuf,
     /// Present for exclusive-root entry points. Every clone shares this cell,
     /// so the root remains exclusively owned until all database-capable app and
@@ -1373,6 +1378,8 @@ impl MarmotApp {
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
+            block_list_locks: Arc::default(),
+            block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -1454,6 +1461,8 @@ impl MarmotApp {
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
+            block_list_locks: Arc::default(),
+            block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -2405,7 +2414,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
-            .app_messages(StoredAppMessageQuery {
+            .visible_app_messages(StoredAppMessageQuery {
                 group_id_hex: query.group_id_hex,
                 kinds: query.kinds,
                 limit: query.limit,
@@ -2415,7 +2424,7 @@ impl MarmotApp {
             .collect())
     }
 
-    /// Resolve one durable raw app event by group/message id.
+    /// Resolve one app-visible event by group/message id, applying block policy.
     pub fn message_by_id(
         &self,
         label: &str,
@@ -2423,10 +2432,14 @@ impl MarmotApp {
         message_id_hex: &str,
     ) -> Result<Option<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self
-            .account_storage(label)?
-            .app_message(group_id_hex, message_id_hex)?
-            .map(app_message_record_from_stored))
+        let storage = self.account_storage(label)?;
+        let Some(record) = storage.app_message(group_id_hex, message_id_hex)? else {
+            return Ok(None);
+        };
+        if !storage.is_app_author_visible(&record.sender, group_id_hex)? {
+            return Ok(None);
+        }
+        Ok(Some(app_message_record_from_stored(record)))
     }
 
     /// Resolve the reacted-to target for a reaction notification from the
@@ -3484,10 +3497,32 @@ impl MarmotApp {
     }
 
     pub fn visible_groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        self.listed_groups(label, false)
+    }
+
+    pub(crate) fn listed_groups(
+        &self,
+        label: &str,
+        include_archived: bool,
+    ) -> Result<Vec<AppGroupRecord>, AppError> {
+        let blocked = self
+            .account_storage(label)?
+            .block_list_snapshot()?
+            .users
+            .into_iter()
+            .map(|u| u.public_key)
+            .collect::<std::collections::HashSet<_>>();
         Ok(self
             .groups(label)?
             .into_iter()
-            .filter(|group| !group.archived)
+            .filter(|group| {
+                (include_archived || !group.archived)
+                    && !(group.pending_confirmation
+                        && group
+                            .welcomer_account_id_hex
+                            .as_ref()
+                            .is_some_and(|key| blocked.contains(key)))
+            })
             .collect())
     }
 

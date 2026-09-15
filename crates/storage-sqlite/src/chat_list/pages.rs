@@ -63,10 +63,18 @@ const REVERSE: &str =
 impl ChatListView {
     pub(super) fn predicate(self) -> &'static str {
         match self {
-            Self::Chats => "list_scope = 0",
-            Self::Unread => "list_scope = 0 AND list_unread = 1",
-            Self::Archived => "list_scope = 1",
-            Self::Left => "list_scope = 2",
+            Self::Chats => {
+                "list_scope = 0 AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)"
+            }
+            Self::Unread => {
+                "list_scope = 0 AND list_unread = 1 AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)"
+            }
+            Self::Archived => {
+                "list_scope = 1 AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)"
+            }
+            Self::Left => {
+                "list_scope = 2 AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)"
+            }
         }
     }
     fn index(self) -> &'static str {

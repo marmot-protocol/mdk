@@ -1310,4 +1310,70 @@ mod chat_window;
 pub use chat_window::*;
 
 mod conversation_window;
+use crate::types::user_blocks::MarmotBlockListSnapshot;
 pub use conversation_window::*;
+use marmot_uniffi::BlockListSubscription;
+// Owns its deep allocations, like the other callback snapshot mirrors.
+unsafe impl Send for MarmotBlockListSnapshot {}
+c_subscription! {
+    /// Account-private block list changes.
+    MarmotBlockListSubscription(BlockListSubscription),
+    item MarmotBlockListSnapshot from marmot_uniffi::BlockListSnapshotFfi,
+    item_free "marmot_block_list_snapshot_free",
+    callback MarmotBlockListCallback,
+    read next,
+    next marmot_block_list_subscription_next,
+    set_callback marmot_block_list_subscription_set_callback,
+    clear_callback marmot_block_list_subscription_clear_callback,
+    free marmot_block_list_subscription_free
+}
+/// Subscribe to an account's block list.
+/// # Safety
+/// Client, account string and output pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_subscribe_blocked_users(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out_sub: *mut *mut MarmotBlockListSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        match client.marmot.subscribe_blocked_users(account_ref) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotBlockListSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
+}
+/// Take the initial snapshot once; subsequent calls return NULL.
+/// # Safety
+/// Subscription and output pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
+    sub: *const MarmotBlockListSubscription,
+    out: *mut *mut MarmotBlockListSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let value = sub.inner.snapshot().map_or(std::ptr::null_mut(), |v| {
+            boxed(MarmotBlockListSnapshot::from(v))
+        });
+        match unsafe { write_out(out, value) } {
+            Ok(()) => MarmotStatus::Ok,
+            Err(error) => {
+                unsafe { free_boxed(value) };
+                error
+            }
+        }
+    })
+}

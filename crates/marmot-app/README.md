@@ -181,3 +181,58 @@ The account remains serialized during repair. The worker can serve committed mem
 I/O waits; mutations, subsequent repair requests, and reads behind queued mutations retain FIFO order. This does
 not yet provide send fairness during repair or isolate network tasks from synchronous engine work. Automatic
 backfill and automatic overflow scheduling retain their existing single-quantum behavior.
+
+## User blocking
+
+`MarmotAppRuntime` exposes `block_user`, `unblock_user`, `get_blocked_users`,
+`is_user_blocked`, and `subscribe_blocked_users`. The same API is available in
+UniFFI (Swift/Kotlin) and the C ABI. All calls resolve an existing account reference;
+user keys use the existing public-key parser. Blocking yourself and repeating an
+already completed operation succeed without changing state.
+
+Reads use the account's SQLCipher database. Lists contain `public_key`,
+`is_private`, and local `created_at_ms`, sorted newest first with public key as the
+tie-breaker. The subscription supplies an initial snapshot and subsequent complete
+snapshots with a durable revision. Intermediate revisions may coalesce; subscribers
+replace their local list with each snapshot.
+
+Changes fetch the latest readable [NIP-51 kind 10000 list](https://github.com/nostr-protocol/nips/blob/master/51.md)
+from the account's NIP-65 relays (or configured discovery relays). New entries are
+private NIP-44 tags; legacy NIP-04 content remains readable. Other public and private
+tags retain their placement. Startup, reconnect, and owned-account subscriptions
+synchronize published lists. Whole-list replacement can still cause independent
+cross-device edits to compete.
+
+`BlockListUnavailable` means synchronization or definite publication failed;
+changes learned during the preceding fetch are retained. `BlockPublicationUncertain`
+means delivery or local completion is unresolved. The exact signed event remains in
+the account database. While it is unresolved, other edits return the same uncertainty
+error. Retrying the original operation reuses it after fetching again;
+a newer remote replacement supersedes the old intent. Startup reconciles retained
+intents against relays. A definite rejection on a later retry cannot disprove delivery
+of the original attempt: the intent still fences other edits until that original
+operation succeeds or a current relay replacement resolves it. Restoring relay write
+access may be necessary; retrying alone does not guarantee recovery.
+Success requires relay acceptance and committed local state.
+An unreadable authenticated replacement prevents edits until a readable replacement
+catches up, including after restart. Private plaintext never enters the shared directory.
+
+Blocking retains history and existing DMs, disables their user-authored sends, and
+rejects new DMs with `UserBlocked`. It hides blocked authors from app message reads,
+search, timelines, media lists, reactions, quotes, previews, and attention counts.
+Chat-list activity ordering deliberately still advances on blocked traffic; when
+the latest message's author is blocked, its preview is blank and no older visible
+message is substituted.
+Manual-unread reminders remain independent. Shared groups continue to process MLS
+state and permit communication with other members. Pending invitations from blocked
+inviters remain stored but hidden; new Welcomes are checked against their authenticated
+sender before admission and durably dismissed. Unblocking refreshes retained content
+and invitations without replaying suppressed notifications. Raw storage and the
+runtime diagnostic event stream remain separate from these presentation APIs.
+Notification suppression records are removed when their source event or group is
+physically deleted. Dismissed Welcome IDs remain for the account's lifetime: they
+have no admitted group or event to attach retention to, and forgetting them would
+allow an old relay delivery to create an invitation after unblocking.
+
+Native screens and imports of old White Noise local databases are outside this
+feature. Existing published lists migrate through relay synchronization.

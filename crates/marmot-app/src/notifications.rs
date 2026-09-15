@@ -1592,8 +1592,7 @@ pub(crate) fn notification_update_from_event_cached(
             account_label,
             account_id_hex,
             group_id,
-        )
-        .map(Some),
+        ),
         MarmotAppEvent::GroupEvent(group_event) => {
             notification_update_from_runtime_group_event(app, resolver, group_event)
         }
@@ -1787,6 +1786,16 @@ fn notification_update_from_classified_group_state(
     account_id_hex: &str,
     notice: ClassifiedGroupStateNotice<'_>,
 ) -> Result<Option<NotificationUpdate>, AppError> {
+    if app
+        .account_storage(account_label)?
+        .suppress_blocked_notification(
+            notice.actor_account_id_hex.unwrap_or(""),
+            notice.group_id_hex,
+            notice.message_id_hex,
+        )?
+    {
+        return Ok(None);
+    }
     let settings = resolver.settings(app, account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
@@ -1861,6 +1870,14 @@ fn notification_update_from_message(
     resolver: &mut NotificationResolver,
     event: &RuntimeMessageReceived,
 ) -> Result<Option<NotificationUpdate>, AppError> {
+    let storage = app.account_storage(&event.account_label)?;
+    if storage.suppress_blocked_notification(
+        &event.message.sender,
+        &hex::encode(event.message.group_id.as_slice()),
+        &event.message.message_id_hex,
+    )? {
+        return Ok(None);
+    }
     let settings = resolver.settings(app, &event.account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
@@ -1945,7 +1962,7 @@ fn notification_update_from_group_join(
     account_label: &str,
     account_id_hex: &str,
     group_id: &cgka_traits::GroupId,
-) -> Result<NotificationUpdate, AppError> {
+) -> Result<Option<NotificationUpdate>, AppError> {
     let settings = resolver.settings(app, account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
@@ -1957,12 +1974,28 @@ fn notification_update_from_group_join(
         .as_ref()
         .and_then(|group| group.welcomer_account_id_hex.clone())
         .unwrap_or_else(|| account_id_hex.to_owned());
+    if app
+        .account_storage(account_label)?
+        .suppress_blocked_notification(
+            &sender_id,
+            &group_id_hex,
+            &format!(
+                "invite:{}",
+                group
+                    .as_ref()
+                    .and_then(|g| g.via_welcome_message_id_hex.as_deref())
+                    .unwrap_or(&group_id_hex)
+            ),
+        )?
+    {
+        return Ok(None);
+    }
     let sender = resolver.user(app, &sender_id)?;
     let invite_ref = group
         .as_ref()
         .and_then(|group| group.via_welcome_message_id_hex.clone())
         .unwrap_or_else(|| group_id_hex.clone());
-    Ok(NotificationUpdate {
+    Ok(Some(NotificationUpdate {
         notification_key: format!("invite:{account_id_hex}:{invite_ref}"),
         conversation_key: conversation_key(account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::GroupInvite,
@@ -1981,7 +2014,7 @@ fn notification_update_from_group_join(
         reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),
         is_from_self: sender_id == account_id_hex,
-    })
+    }))
 }
 
 fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {

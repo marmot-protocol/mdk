@@ -755,6 +755,119 @@ pub(crate) fn retire_commits_superseded_by_replacement_welcome<S: StorageProvide
     Ok(retired)
 }
 
+/// Re-open the raw transport rows the eviction era refused, so the join's own
+/// replay can process them.
+///
+/// `Failed` on these rows is a verdict on the local copy this Welcome discards,
+/// not on the message: builds before #1840 recorded every post-removal message
+/// `Failed`, and `Failed` is invisible to `replay_buffered_messages`, outside
+/// `unresolved_commit_state`, and answers `Duplicate` on redelivery. A commit
+/// that raced ahead of the re-add Welcome would stay lost for good. Flipping
+/// the rows to `Retryable` lets the replay the join runs anyway apply it from
+/// the copy we already hold, with no dependence on relay redelivery.
+///
+/// Raw transport rows only: content-derived rows carry a verdict from a seam
+/// that authenticated them. `refused_at_or_above` is the discarded record's own
+/// epoch — the engine's stamp on every eviction-era refusal — used only to
+/// narrow which rows are looked at, never to judge a message; it is
+/// over-inclusive on a copy whose roster was never mirrored, which is benign.
+///
+/// At most [`MAX_DEFERRED_ROWS_PER_SWEEP`] ELIGIBLE raw rows are re-opened,
+/// from the newest end (`list_messages_in_states` returns insert order). That
+/// bound is the join's SYNCHRONOUS-REPLAY BUDGET, not a judgement about which
+/// rows deserve recovery — it cannot be one, because a raw row is a sealed
+/// wrapper and this helper holds no epoch secret to tell a commit from an
+/// application message. It has to stay a bound: a re-opened row the new copy
+/// cannot decrypt lands `PeelDeferred` and holds a slot in the bounded
+/// per-group cap for its residence deadline, so a chatty removal interval
+/// would otherwise park that whole cap on content unreadable by construction.
+///
+/// Every OTHER eligible row is RELEASED, newest-first, rather than left
+/// `Failed`. `Failed` is a dead end: `recorded_message_outcome` answers
+/// `Duplicate` for it, nothing prunes `cgka_messages` on a schedule, and this
+/// helper is the only reader of `Failed` rows in the engine — so relay
+/// redelivery could never rescue such a row either. Releasing drops the
+/// retained bytes WITHOUT a terminal deduplication verdict
+/// (`MessageStorage::release_message_for_replay`), so exact-id redelivery
+/// processes the message normally. That is the same footing #1840's traceless
+/// refusal already leaves every raced-ahead message on, which is what the
+/// bound's remainder owes them. No cap accounting is involved: a `Failed` row
+/// holds no deferred-peel slot.
+///
+/// Release is per-row and monotone, so a mid-sweep error is not a torn write.
+/// The backend records the host receipt BEFORE it deletes any bytes, so a
+/// failing row keeps both its bytes and its `Failed` state, rows not yet
+/// reached keep theirs, and rows already released stay repaired; the caller
+/// warns and the join stands. The receipt journal is capacity-bounded, so a
+/// removal interval long enough to exhaust it stops the sweep there: those
+/// remaining rows stay `Failed`, and nothing later reaches them. Newest-first
+/// is what makes that survivable — the rows nearest the raced set are released
+/// before any capacity failure can fire.
+///
+/// A re-opened row gets another trip through ingest, not a guaranteed recovery.
+/// Its wrapper is sealed under a per-epoch exporter secret, so it peels only
+/// while a retained anchor at its epoch survives; otherwise it lands
+/// `PeelDeferred` and holds a bounded-cap slot until its residence deadline
+/// retires it. An eviction-era commit among them meets the install-epoch floor
+/// in `commit_is_below_this_copys_history` and terminalizes as past-epoch
+/// traffic instead of being mistaken for a rival.
+///
+/// Runs after the join's write transaction, not inside it: telling raw from
+/// content decodes payload blobs, which the sibling retirement helpers keep out
+/// of write transactions. It is idempotent and no failure of it leaves the
+/// group worse off than before the join, so the caller treats an error as
+/// best-effort. Like every `Retryable`
+/// row, a crash before the replay leaves the rows retained until the next
+/// publish resolution or re-join replays them; hydration does not replay.
+pub(crate) fn reopen_rows_refused_by_the_removed_copy<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    refused_at_or_above: EpochId,
+) -> Result<RefusedRowRepair, cgka_traits::error::EngineError> {
+    let candidates =
+        storage.list_messages_in_states(group_id, &[MessageState::Failed], refused_at_or_above)?;
+    // Filter BEFORE the bound, lazily: the bound counts rows this can act on,
+    // never rows it merely looked at. A content-derived or undecodable row that
+    // happens to sit newer would otherwise spend a slot, and the row it
+    // displaces is the OLDEST raced commit — the one the rest of the chain
+    // hangs off. Fail open on unreadable rows, exactly as the retirement sweep
+    // above does: this repair must not turn unrelated storage damage into a
+    // failed join. Those rows are left alone entirely — neither re-opened nor
+    // released — because a payload this cannot decode is not evidence that the
+    // row is ours to retire.
+    let mut eligible_newest_first = candidates.into_iter().rev().filter(|record| {
+        StoredMessagePayload::decode(&record.payload)
+            .is_ok_and(|payload| payload.as_raw_transport().is_some())
+    });
+    let mut repair = RefusedRowRepair::default();
+    // One pass over one iterator: the newest rows fill the replay budget, and
+    // whatever the budget could not take continues from where it stopped, so
+    // no row is both re-opened and released and none is skipped between them.
+    for record in eligible_newest_first
+        .by_ref()
+        .take(crate::message_processor::MAX_DEFERRED_ROWS_PER_SWEEP)
+    {
+        storage.update_message_state(&record.id, MessageState::Retryable)?;
+        repair.reopened += 1;
+    }
+    for record in eligible_newest_first {
+        storage.release_message_for_replay(&record)?;
+        repair.released += 1;
+    }
+    Ok(repair)
+}
+
+/// What [`reopen_rows_refused_by_the_removed_copy`] did, as aggregate counts
+/// for the caller's privacy-safe trace.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusedRowRepair {
+    /// Rows flipped to `Retryable` for the join's own replay.
+    pub(crate) reopened: usize,
+    /// Rows whose retained bytes were dropped without a terminal deduplication
+    /// verdict, so exact-id redelivery can still process them.
+    pub(crate) released: usize,
+}
+
 /// Retire deferred commits that can no longer enter the retained candidate
 /// graph.
 ///
@@ -4600,6 +4713,7 @@ mod checkpoint_prefix_tests {
                 unrecoverable: false,
                 disbanded: None,
                 join_epoch: EpochId(0),
+                local_copy_install_epoch: EpochId(0),
             })
             .unwrap();
         storage

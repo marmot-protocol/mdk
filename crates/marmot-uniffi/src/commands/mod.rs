@@ -38,3 +38,4 @@ mod presentation;
 mod chat_window;
 
 mod conversation_window;
+pub mod user_blocks;

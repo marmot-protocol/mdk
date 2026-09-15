@@ -3,11 +3,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 
 use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::{
     AppError, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -33,6 +34,7 @@ pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
 /// not amplify: their follows feed search/discovery without scheduling new
 /// contact-list subscriptions for the discovered users.
 pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
+    crate::user_blocks::MUTE_LIST_KIND,
     KIND_NOSTR_METADATA,
     KIND_NOSTR_CONTACT_LIST,
     KIND_NIP65_RELAY_LIST,
@@ -88,6 +90,28 @@ struct DirectoryRecoveryRebuildTask(JoinHandle<Result<DirectorySyncRunSummary, A
 impl Drop for DirectoryRecoveryRebuildTask {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+// Coalesced block-list fetches and live adoption are owned by the directory
+// worker, but never park its event-drain loop on an account's mutation lock.
+struct BlockListReconcileTask(JoinHandle<()>);
+
+impl Drop for BlockListReconcileTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn request_block_reconcile(
+    app: &MarmotApp,
+    queue: &mut DirectoryRecoveryRebuildQueue,
+    task: &mut Option<BlockListReconcileTask>,
+) {
+    if queue.request() {
+        *task = Some(BlockListReconcileTask(tokio::spawn(reconcile_block_lists(
+            app.clone(),
+        ))));
     }
 }
 
@@ -280,6 +304,11 @@ async fn run_directory_sync_worker(
 ) {
     let mut recovery_rebuilds = DirectoryRecoveryRebuildQueue::default();
     let mut recovery_task: Option<DirectoryRecoveryRebuildTask> = None;
+    let mut block_rebuilds = DirectoryRecoveryRebuildQueue::default();
+    let mut block_task: Option<BlockListReconcileTask> = None;
+    // JoinSet aborts all remaining adoption tasks when the worker is dropped.
+    let mut block_adoptions = JoinSet::new();
+    const MAX_BLOCK_ADOPTIONS: usize = 32;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -288,6 +317,7 @@ async fn run_directory_sync_worker(
                         rebuild_queued.store(false, Ordering::SeqCst);
                         let result =
                             run_directory_sync_once(app.clone(), relay_plane.clone(), false).await;
+                        request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
                         if let Some(respond) = respond {
                             let _ = respond.send(result.map_err(|err| err.to_string()));
                         }
@@ -319,14 +349,43 @@ async fn run_directory_sync_worker(
                     ));
                 }
             }
+            block_result = async {
+                (&mut block_task.as_mut().expect("enabled while task is present").0).await
+            }, if block_task.is_some() => {
+                block_task = None;
+                if block_result.is_err() {
+                    tracing::warn!(target: "marmot_app::directory", method = "run_directory_sync_worker", "block list reconciliation task failed");
+                }
+                if block_rebuilds.complete() {
+                    block_task = Some(BlockListReconcileTask(tokio::spawn(reconcile_block_lists(app.clone()))));
+                }
+            }
+            adoption = block_adoptions.join_next(), if !block_adoptions.is_empty() => {
+                if !matches!(adoption, Some(Ok(Ok(())))) {
+                    tracing::warn!(target: "marmot_app::directory", method = "run_directory_sync_worker", "block list event adoption failed");
+                }
+            }
             event = directory_events.recv() => {
                 match event {
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::Record(record)) => {
                         let app = app.clone();
-                        let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                        if record.event.kind == crate::user_blocks::MUTE_LIST_KIND {
+                            if block_adoptions.len() < MAX_BLOCK_ADOPTIONS {
+                                block_adoptions.spawn(async move {
+                                    app.ingest_block_list_event(record.event).await
+                                });
+                            } else {
+                                // Bound queued decryptions. A complete owned-account
+                                // relay fetch recovers the current replacements.
+                                request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
+                            }
+                        } else {
+                            let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                        }
                     }
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::RecoveryRequired)
                     | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
                         if recovery_rebuilds.request() {
                             recovery_task = Some(spawn_directory_recovery_rebuild(
                                 app.clone(),
@@ -360,7 +419,8 @@ async fn run_directory_sync_once(
     relay_plane: MarmotRelayPlane,
     force_rebuild: bool,
 ) -> Result<DirectorySyncRunSummary, AppError> {
-    let plan = blocking_app_task(move || app.directory_sync_plan()).await?;
+    let app_for_plan = app.clone();
+    let plan = blocking_app_task(move || app_for_plan.directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane
         .sync_directory_user_subscriptions(plan, force_rebuild)
@@ -372,6 +432,40 @@ async fn run_directory_sync_once(
         subscriptions_created: subscriptions.subscriptions_created,
         subscriptions_removed: subscriptions.subscriptions_removed,
     })
+}
+
+async fn reconcile_block_lists(app: MarmotApp) {
+    // Install live subscriptions first. Reconcile accounts concurrently with a
+    // fixed bound so one slow account does not serialize every other account's
+    // startup/reconnect, and report failures without exposing identities.
+    let app_for_accounts = app.clone();
+    let accounts = match blocking_app_task(move || {
+        Ok(app_for_accounts.account_home().accounts()?)
+    })
+    .await
+    {
+        Ok(accounts) => accounts,
+        Err(_) => {
+            tracing::warn!(target: "marmot_app::directory", method = "reconcile_block_lists", "block list account enumeration failed");
+            return;
+        }
+    };
+    let failures = stream::iter(accounts.into_iter().map(|account| {
+        let app = app.clone();
+        async move {
+            let lock = app.block_update_lock(&account.label).await;
+            let _guard = lock.lock().await;
+            app.fetch_block_list(&account.label).await.is_err()
+        }
+    }))
+    .buffer_unordered(4)
+    .fold(0usize, |count, failed| async move {
+        count + usize::from(failed)
+    })
+    .await;
+    if failures != 0 {
+        tracing::warn!(target: "marmot_app::directory", method = "reconcile_block_lists", failed_account_count = failures, "block list reconciliation incomplete");
+    }
 }
 
 fn directory_subscription_id(group: &str, index: usize, authors: &[String]) -> String {
@@ -589,5 +683,93 @@ mod tests {
         ));
 
         task.abort();
+    }
+    #[tokio::test]
+    async fn blocked_account_lock_does_not_stall_directory_drain_or_rebuild_completion() {
+        use crate::relay_plane::{DirectoryRelayEventRecord, DirectoryRelayPlaneEvent};
+        use std::time::Duration;
+        use transport_nostr_peeler::NostrTransportEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relays(dir.path(), vec![]);
+        app.account_home().create_account("alice").unwrap();
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let lock = app.block_update_lock("alice").await;
+        let guard = lock.lock().await;
+        let (commands, command_rx) = mpsc::channel(32);
+        let (events, event_rx) = tokio::sync::broadcast::channel(64);
+        let worker = tokio::spawn(run_directory_sync_worker(
+            app.clone(),
+            app.relay_plane.clone(),
+            command_rx,
+            event_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let mute = nostr::EventBuilder::new(nostr::Kind::MuteList, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+        // Fill and exceed the bounded adoption task set while its account is
+        // busy. Public records and rebuild responses must still be serviced.
+        for _ in 0..40 {
+            events
+                .send(DirectoryRelayPlaneEvent::Record(
+                    DirectoryRelayEventRecord {
+                        endpoints: vec![],
+                        event: NostrTransportEvent::from_nostr_event(&mute).unwrap(),
+                    },
+                ))
+                .unwrap();
+        }
+        let remote = nostr::Keys::generate();
+        let profile =
+            nostr::EventBuilder::new(nostr::Kind::Metadata, r#"{"name":"directory stays live"}"#)
+                .sign_with_keys(&remote)
+                .unwrap();
+        events
+            .send(DirectoryRelayPlaneEvent::Record(
+                DirectoryRelayEventRecord {
+                    endpoints: vec![],
+                    event: NostrTransportEvent::from_nostr_event(&profile).unwrap(),
+                },
+            ))
+            .unwrap();
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(DirectorySyncCommand::Rebuild {
+                respond: Some(respond),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .expect("rebuild response must not wait for block reconciliation")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if app
+                    .directory_entry_for_account_id(&remote.public_key().to_hex())
+                    .unwrap()
+                    .is_some_and(|entry| entry.profile.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocked adoption must not park the directory event drain");
+        commands.send(DirectorySyncCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            storage.block_list_revision().unwrap(),
+            0,
+            "queued adoption is cancelled at shutdown"
+        );
     }
 }

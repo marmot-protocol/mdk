@@ -1545,6 +1545,16 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
         validate_group_profile(name, &description)?;
+        if name.trim().is_empty()
+            && member_refs.len() == 1
+            && let Ok(member) = crate::ids::account_id_hex_from_ref(member_refs[0])
+            && self
+                .app
+                .account_storage(&self.state.label)?
+                .is_user_blocked(&member)?
+        {
+            return Err(AppError::UserBlocked);
+        }
         let key_package_started_at = Instant::now();
         let key_packages = self
             .app
@@ -3063,6 +3073,14 @@ impl AppClient {
             .app
             .group(&self.state.label, &group_id_hex)?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        if let Some(sender) = &authoritative.welcomer_account_id_hex
+            && self
+                .app
+                .account_storage(&self.state.label)?
+                .is_user_blocked(sender)?
+        {
+            return Err(AppError::UserBlocked);
+        }
         if authoritative.self_membership != SelfMembership::Member
             || !authoritative.pending_confirmation
         {
@@ -4900,6 +4918,13 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .direct_conversation_has_blocked_user(&hex::encode(group_id.as_slice()))?
+        {
+            return Err(AppError::UserBlocked);
+        }
         // One `is_terminal` gate, two errors. Both terminal reasons block the
         // send, but they are not the same news for the user: disbanded means
         // the group is gone for everyone, removed means it goes on without

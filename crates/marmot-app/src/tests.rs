@@ -1,6 +1,7 @@
 mod draft_lifecycle;
 mod key_package_inventory;
 mod message_journeys;
+mod user_blocks;
 
 use super::*;
 use async_trait::async_trait;

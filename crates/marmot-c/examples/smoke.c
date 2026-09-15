@@ -26,7 +26,7 @@ _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_LATEST == 1, "latest ABI value");
 _Static_assert(MARMOT_CONVERSATION_OPEN_MODE_MESSAGE == 2, "message ABI value");
 _Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER == 0, "older ABI value");
 _Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_NEWER == 1, "newer ABI value");
-_Static_assert(MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED == 89, "missing target ABI value");
+_Static_assert(MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED == 92, "missing target ABI value");
 
 static int failures = 0;
 
@@ -119,6 +119,12 @@ int main(int argc, char **argv) {
     marmot_client_free(NULL);
     marmot_string_free(NULL);
     marmot_account_summary_list_free(NULL);
+    marmot_blocked_user_list_free(NULL);
+    marmot_block_list_snapshot_free(NULL);
+    marmot_block_list_subscription_free(NULL);
+    check(marmot_get_blocked_users(NULL, "alice", NULL) == MARMOT_STATUS_NULL_POINTER, "block list null boundary");
+    check(marmot_is_user_blocked(NULL, "alice", "key", NULL) == MARMOT_STATUS_NULL_POINTER, "block boolean null boundary");
+    check(marmot_subscribe_blocked_users(NULL, "alice", NULL) == MARMOT_STATUS_NULL_POINTER, "block subscription null boundary");
     marmot_markdown_document_free(NULL);
     marmot_conversation_window_snapshot_free(NULL);
     marmot_selected_message_draft_free(NULL);

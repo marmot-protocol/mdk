@@ -14048,3 +14048,402 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
     );
     runtime.shutdown().await;
 }
+
+/// Published policy is account-scoped and follows the identity across independent databases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
+    // Real relay publication can lose an acknowledgement. Exercise the public
+    // explicit-retry contract; success and cross-device observation are still
+    // required, and unavailable synchronization is not treated as success.
+    async fn edit(runtime: &MarmotAppRuntime, target: &str, blocked: bool) {
+        for attempt in 0..3 {
+            let result = if blocked {
+                runtime.block_user("alice", target).await
+            } else {
+                runtime.unblock_user("alice", target).await
+            };
+            match result {
+                Ok(()) => return,
+                Err(AppError::BlockPublicationUncertain) if attempt < 2 => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("block-list operation failed: {error}"),
+            }
+        }
+        unreachable!("last attempt must succeed or fail");
+    }
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let (_relay, first_app, url) = mock_app(&first_dir).await;
+    AccountHome::open(first_dir.path())
+        .create_account("alice")
+        .unwrap();
+    let bob = AccountHome::open(first_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let second_app = MarmotApp::with_relay_and_config(
+        second_dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    AccountHome::open(second_dir.path())
+        .import_account(
+            "alice",
+            &AccountHome::open(first_dir.path())
+                .reveal_nsec("alice")
+                .unwrap(),
+        )
+        .unwrap();
+    let first = first_app.runtime();
+    let second = second_app.runtime();
+    first.start().await.unwrap();
+    second.start().await.unwrap();
+    edit(&first, &bob.account_id_hex, true).await;
+    timeout(Duration::from_secs(15), async {
+        while !second
+            .is_user_blocked("alice", &bob.account_id_hex)
+            .unwrap()
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("second device learns private block");
+    assert!(first.get_blocked_users("bob").unwrap().is_empty());
+    edit(&second, &bob.account_id_hex, false).await;
+    timeout(Duration::from_secs(15), async {
+        while first.is_user_blocked("alice", &bob.account_id_hex).unwrap() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first device learns empty replacement");
+    edit(&first, &bob.account_id_hex, true).await;
+    second.shutdown().await;
+    first.shutdown().await;
+    drop(second);
+    drop(first);
+    drop(second_app);
+    let restarted = MarmotApp::with_relay_and_config(
+        second_dir.path(),
+        url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    )
+    .runtime();
+    restarted.start().await.unwrap();
+    timeout(Duration::from_secs(15), async {
+        while !restarted
+            .is_user_blocked("alice", &bob.account_id_hex)
+            .unwrap()
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup reconciles latest replacement");
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_blocks_dm_history_send_gate_and_invite_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = app.runtime();
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup())
+        .await
+        .account
+        .account_id_hex;
+    let bob = create_network_ready_identity(&runtime, setup())
+        .await
+        .account
+        .account_id_hex;
+    let group = runtime
+        .create_group(&alice, "", std::slice::from_ref(&bob), None)
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&runtime, &bob, &group)
+        .await
+        .unwrap();
+    let sent = runtime
+        .send_message(&bob, &group, b"retained history".to_vec())
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    timeout(Duration::from_secs(15), async {
+        while runtime
+            .timeline_message(&alice, &group_hex, &sent.message_ids[0])
+            .unwrap()
+            .is_none()
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = runtime
+        .create_group(
+            &bob,
+            "retained invitation",
+            std::slice::from_ref(&alice),
+            None,
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while runtime
+            .chat_list_row(&alice, &hex::encode(pending.as_slice()))
+            .unwrap()
+            .is_none()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            &alice,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime.block_user(&alice, &bob).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            timeline.recv().await.unwrap();
+            if !timeline
+                .take_snapshot()
+                .messages
+                .iter()
+                .any(|m| m.message_id_hex == sent.message_ids[0])
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("live window removes blocked history");
+    assert!(
+        runtime
+            .chat_list_row(&alice, &hex::encode(pending.as_slice()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        accept_group_invite_retrying_busy(&runtime, &alice, &pending).await,
+        Err(AppError::UserBlocked)
+    ));
+    let mut events = runtime.subscribe();
+    let hidden = runtime
+        .send_message(&bob, &group, b"received while blocked".to_vec())
+        .await
+        .unwrap();
+    wait_for_event(&mut events,|e| matches!(e,MarmotAppEvent::MessageReceived(m) if m.account_id_hex==alice && m.message.message_id_hex==hidden.message_ids[0])).await;
+    assert!(
+        runtime
+            .timeline_message(&alice, &group_hex, &hidden.message_ids[0])
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .timeline_message(&alice, &group_hex, &sent.message_ids[0])
+            .unwrap()
+            .is_none()
+    );
+    let row = runtime.chat_list_row(&alice, &group_hex).unwrap().unwrap();
+    assert!(row.last_message.is_none());
+    assert!(matches!(
+        runtime
+            .send_message(&alice, &group, b"prohibited".to_vec())
+            .await,
+        Err(AppError::UserBlocked)
+    ));
+    assert!(matches!(
+        runtime
+            .create_group(&alice, "", std::slice::from_ref(&bob), None)
+            .await,
+        Err(AppError::UserBlocked)
+    ));
+    // A fresh authenticated gift-wrap uses a random outer key. Its real inviter
+    // remains blocked and must never create an invitation or MLS group for Alice.
+    let rejected = runtime
+        .create_group(
+            &bob,
+            "blocked invitation",
+            std::slice::from_ref(&alice),
+            None,
+        )
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        runtime
+            .chat_list_row(&alice, &hex::encode(rejected.as_slice()))
+            .unwrap()
+            .is_none()
+    );
+    let alice_label = runtime.accounts().resolve(&alice).unwrap().label;
+    assert!(
+        app.group(&alice_label, &hex::encode(rejected.as_slice()))
+            .unwrap()
+            .is_none(),
+        "blocked Welcome must not enter MLS state"
+    );
+    runtime.unblock_user(&alice, &bob).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            timeline.recv().await.unwrap();
+            if timeline
+                .take_snapshot()
+                .messages
+                .iter()
+                .any(|m| m.message_id_hex == hidden.message_ids[0])
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("unblock refreshes the retained live window");
+    assert!(
+        runtime
+            .chat_list_row(&alice, &hex::encode(pending.as_slice()))
+            .unwrap()
+            .is_some()
+    );
+    runtime.accept_group_invite(&alice, &pending).await.unwrap();
+    assert!(
+        runtime
+            .timeline_message(&alice, &group_hex, &sent.message_ids[0])
+            .unwrap()
+            .is_some()
+    );
+    runtime
+        .send_message(&alice, &group, b"restored composer".to_vec())
+        .await
+        .unwrap();
+    // The dismissed invitation is not replayed when the block is lifted.
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        runtime
+            .chat_list_row(&alice, &hex::encode(rejected.as_slice()))
+            .unwrap()
+            .is_none()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = app.runtime();
+    let mut accounts = Vec::new();
+    for _ in 0..3 {
+        accounts.push(
+            create_network_ready_identity(
+                &runtime,
+                AccountSetupRequest {
+                    default_relays: vec![endpoint(&url)],
+                    bootstrap_relays: vec![endpoint(&url)],
+                    publish_initial_key_package: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .account
+            .account_id_hex,
+        );
+    }
+    let (alice, bob, carol) = (&accounts[0], &accounts[1], &accounts[2]);
+    let group = runtime
+        .create_group(alice, "shared group", &accounts[1..], None)
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&runtime, bob, &group)
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&runtime, carol, &group)
+        .await
+        .unwrap();
+    runtime.block_user(alice, bob).await.unwrap();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            alice,
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group.as_slice())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut events = runtime.subscribe();
+    let hidden = runtime
+        .send_message(bob, &group, b"hidden author".to_vec())
+        .await
+        .unwrap();
+    wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::MessageReceived(m) if &m.account_id_hex==alice && m.message.message_id_hex==hidden.message_ids[0])).await;
+    let visible = runtime
+        .send_message(carol, &group, b"visible author".to_vec())
+        .await
+        .unwrap();
+    wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::MessageReceived(m) if &m.account_id_hex==alice && m.message.message_id_hex==visible.message_ids[0])).await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = timeline.recv().await.unwrap();
+            assert!(
+                !timeline
+                    .take_snapshot()
+                    .messages
+                    .iter()
+                    .any(|m| m.message_id_hex == hidden.message_ids[0])
+            );
+            if let marmot_app::RuntimeTimelineMessageUpdate::Projection(update) = update
+                && update
+                    .update
+                    .timeline_messages
+                    .iter()
+                    .any(|m| m.message_id_hex == visible.message_ids[0])
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("blocking preserves incremental visible-author updates");
+    let group_hex = hex::encode(group.as_slice());
+    assert!(
+        runtime
+            .timeline_message(alice, &group_hex, &hidden.message_ids[0])
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .timeline_message(alice, &group_hex, &visible.message_ids[0])
+            .unwrap()
+            .is_some()
+    );
+    runtime
+        .send_message(alice, &group, b"shared composer remains enabled".to_vec())
+        .await
+        .unwrap();
+    runtime.unblock_user(alice, bob).await.unwrap();
+    assert!(
+        runtime
+            .timeline_message(alice, &group_hex, &hidden.message_ids[0])
+            .unwrap()
+            .is_some()
+    );
+    runtime.shutdown().await;
+}

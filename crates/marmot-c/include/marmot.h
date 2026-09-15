@@ -154,18 +154,21 @@ enum MarmotStatus
   MARMOT_STATUS_CHAT_WINDOW_ANCHOR_OUTSIDE = 75,
   MARMOT_STATUS_CHAT_WINDOW_CLOSED = 76,
   MARMOT_STATUS_CHAT_WINDOW_QUERY = 77,
-  MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_LIMIT = 78,
-  MARMOT_STATUS_CONVERSATION_WINDOW_STALE = 79,
-  MARMOT_STATUS_CONVERSATION_WINDOW_WRONG_GENERATION = 80,
-  MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE = 81,
-  MARMOT_STATUS_CONVERSATION_WINDOW_CLOSED = 82,
-  MARMOT_STATUS_CONVERSATION_WINDOW_NOT_READY = 83,
-  MARMOT_STATUS_CONVERSATION_WINDOW_TIMED_OUT = 84,
-  MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_TARGET = 85,
-  MARMOT_STATUS_CONVERSATION_WINDOW_QUERY = 86,
-  MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 87,
-  MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 88,
-  MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 89,
+  MARMOT_STATUS_USER_BLOCKED = 78,
+  MARMOT_STATUS_BLOCK_LIST_UNAVAILABLE = 79,
+  MARMOT_STATUS_BLOCK_PUBLICATION_UNCERTAIN = 80,
+  MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_LIMIT = 81,
+  MARMOT_STATUS_CONVERSATION_WINDOW_STALE = 82,
+  MARMOT_STATUS_CONVERSATION_WINDOW_WRONG_GENERATION = 83,
+  MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE = 84,
+  MARMOT_STATUS_CONVERSATION_WINDOW_CLOSED = 85,
+  MARMOT_STATUS_CONVERSATION_WINDOW_NOT_READY = 86,
+  MARMOT_STATUS_CONVERSATION_WINDOW_TIMED_OUT = 87,
+  MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_TARGET = 88,
+  MARMOT_STATUS_CONVERSATION_WINDOW_QUERY = 89,
+  MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 90,
+  MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 91,
+  MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 92,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -919,6 +922,11 @@ typedef struct MarmotAgentPublisher MarmotAgentPublisher;
  * matching anchor/start command is `marmot_start_agent_text_stream`.
  */
 typedef struct MarmotAgentStreamSubscription MarmotAgentStreamSubscription;
+
+/**
+ * Account-private block list changes.
+ */
+typedef struct MarmotBlockListSubscription MarmotBlockListSubscription;
 
 /**
  * Opaque handle to one account's durable chat-list projection: an
@@ -2490,6 +2498,20 @@ typedef struct MarmotMediaRecordList {
   struct MarmotMediaRecord *items;
   uintptr_t len;
 } MarmotMediaRecordList;
+
+typedef struct MarmotBlockedUser {
+  char *public_key;
+  bool is_private;
+  int64_t created_at_ms;
+} MarmotBlockedUser;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotBlockedUserList {
+  struct MarmotBlockedUser *items;
+  uintptr_t len;
+} MarmotBlockedUserList;
 
 /**
  * A freshly created identity plus its published profile and setup
@@ -4348,6 +4370,18 @@ typedef struct MarmotPresentedChatListUpdate {
   uint64_t sequence;
   struct MarmotPresentedChatListSnapshot snapshot;
 } MarmotPresentedChatListUpdate;
+
+typedef struct MarmotBlockListSnapshot {
+  uint64_t revision;
+  struct MarmotBlockedUser *users;
+  uintptr_t users_len;
+} MarmotBlockListSnapshot;
+
+/**
+ * Callback invoked with each item (borrowed; valid only during
+ * the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotBlockListCallback)(const struct MarmotBlockListSnapshot *item, void *user_data);
 
 typedef enum MarmotChatListAnchorOutcome_Tag {
   MARMOT_CHAT_LIST_ANCHOR_OUTCOME_TOP,
@@ -6283,6 +6317,59 @@ MarmotStatus marmot_refresh_user_relay_lists(const struct MarmotClient *client,
                                              const char *const *relays,
                                              uintptr_t relays_len,
                                              struct MarmotAccountRelayLists **out);
+
+/**
+ * Block a user privately and publish the updated list. Requires relay synchronization.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_block_user(const struct MarmotClient *client,
+                               const char *account_ref,
+                               const char *user_account_id_hex);
+
+/**
+ * Unblock a user and publish the updated list. Requires relay synchronization.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_unblock_user(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *user_account_id_hex);
+
+/**
+ * Read the local blocked-user list, newest first. Free with `marmot_blocked_user_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_get_blocked_users(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      struct MarmotBlockedUserList **out);
+
+/**
+ * Whether the local account currently blocks this public key.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_is_user_blocked(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *user_account_id_hex,
+                                    bool *out);
 
 /**
  * The account ids this account follows (NIP-02). Free with
@@ -8577,6 +8664,72 @@ MarmotStatus marmot_presented_chat_list_subscription_next(const struct MarmotPre
 void marmot_presented_chat_list_subscription_free(struct MarmotPresentedChatListSubscription *sub);
 
 /**
+ *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_block_list_snapshot_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` must be a valid pointer.
+ */
+MarmotStatus marmot_block_list_subscription_next(const struct MarmotBlockListSubscription *sub,
+                                                 uint32_t timeout_ms,
+                                                 struct MarmotBlockListSnapshot **out);
+
+/**
+ * Install a callback pump for this subscription. `callback` runs
+ * on a runtime worker thread with a borrowed item pointer (valid
+ * only during the call; do not store or free it) and a final
+ * NULL item on close. `callback` and `user_data` access must be
+ * thread-safe. Fails if a callback is already installed.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function
+ * pointer. `user_data` must outlive every callback invocation —
+ * clear/free only *request* cancellation without waiting (see
+ * the module docs).
+ */
+MarmotStatus marmot_block_list_subscription_set_callback(const struct MarmotBlockListSubscription *sub,
+                                                         MarmotBlockListCallback callback,
+                                                         void *user_data);
+
+/**
+ * Request cancellation of this subscription's callback pump, if
+ * any. Non-blocking: a callback already running keeps executing
+ * after this returns (see the module docs).
+ *
+ * # Safety
+ * `sub` must be a live handle.
+ */
+MarmotStatus marmot_block_list_subscription_clear_callback(const struct MarmotBlockListSubscription *sub);
+
+/**
+ * Free the subscription handle. Requests callback-pump
+ * cancellation without waiting (a callback may still be running
+ * after this returns — do not free `user_data` on that basis).
+ * NULL is a no-op. Free every handle before the client that
+ * created it.
+ *
+ * # Safety
+ * `sub` must be NULL or an unfreed handle pointer.
+ */
+void marmot_block_list_subscription_free(struct MarmotBlockListSubscription *sub);
+
+/**
+ * Subscribe to an account's block list.
+ * # Safety
+ * Client, account string and output pointer must be valid.
+ */
+MarmotStatus marmot_subscribe_blocked_users(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            struct MarmotBlockListSubscription **out_sub);
+
+/**
+ * Take the initial snapshot once; subsequent calls return NULL.
+ * # Safety
+ * Subscription and output pointer must be valid.
+ */
+MarmotStatus marmot_block_list_subscription_snapshot(const struct MarmotBlockListSubscription *sub,
+                                                     struct MarmotBlockListSnapshot **out);
+
+/**
  * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
  * # Safety
  * sub must be live and out writable.
@@ -9766,6 +9919,25 @@ void marmot_selected_message_draft_free(struct MarmotSelectedMessageDraft *p);
  * this library.
  */
 void marmot_conversation_window_snapshot_free(struct MarmotConversationWindowSnapshot *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_blocked_user_list_free(struct MarmotBlockedUserList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_block_list_snapshot_free(struct MarmotBlockListSnapshot *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

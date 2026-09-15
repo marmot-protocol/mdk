@@ -134,6 +134,12 @@ pub enum AppError {
     /// an empty list could silently erase follows published elsewhere.
     #[error("current account follow list is unavailable")]
     FollowListUnavailable,
+    #[error("user is blocked")]
+    UserBlocked,
+    #[error("block list synchronization unavailable")]
+    BlockListUnavailable,
+    #[error("block list publication outcome is uncertain; retry to reconcile")]
+    BlockPublicationUncertain,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -349,6 +355,9 @@ impl AppError {
             Self::Publish(_) => "publish",
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
+            Self::UserBlocked => "user_blocked",
+            Self::BlockListUnavailable => "block_list_unavailable",
+            Self::BlockPublicationUncertain => "block_publication_uncertain",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",

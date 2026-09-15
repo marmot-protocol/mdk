@@ -3,6 +3,9 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        let blocks = BlockListSnapshotFfi(revision: UInt64.max, users: [BlockedUserFfi(publicKey: "key", isPrivate: true, createdAtMs: 123)])
+        let blockCopy = try FfiConverterTypeBlockListSnapshotFfi.lift(FfiConverterTypeBlockListSnapshotFfi.lower(blocks))
+        precondition(blockCopy == blocks)
         let anchors: [ChatListAnchorOutcomeFfi] = [
             .top, .retained(groupIdHex: "aabb", index: 0),
             .recovered(groupIdHex: "ccdd", index: 199), .reset,
@@ -83,4 +86,14 @@ func compileConversationCommands(_ marmot: Marmot, account: String, group: Strin
     }
     _ = try await window.next()
     await window.cancel()
+}
+
+func compileBlockCommands(_ marmot: Marmot, account: String, user: String) async throws {
+    try await marmot.blockUser(accountRef: account, userAccountIdHex: user)
+    try await marmot.unblockUser(accountRef: account, userAccountIdHex: user)
+    _ = try marmot.getBlockedUsers(accountRef: account)
+    _ = try marmot.isUserBlocked(accountRef: account, userAccountIdHex: user)
+    let sub = try marmot.subscribeBlockedUsers(accountRef: account)
+    _ = sub.snapshot()
+    _ = await sub.next()
 }

@@ -90,6 +90,24 @@ pub struct Group {
     /// traffic.
     #[serde(default)]
     pub join_epoch: EpochId,
+    /// Epoch at which this device's CURRENT local copy of the group was
+    /// installed — group creation, a first welcome-join, or the replacement
+    /// welcome that discarded the previous copy.
+    ///
+    /// Distinct from [`Group::join_epoch`], which is a membership lower bound
+    /// for application messages and is deliberately reset to zero by a
+    /// replacement welcome so prior-interval messages stay decryptable from
+    /// retained anchors. This field is the copy's own start: below it no
+    /// commit can be a rival, because this copy holds no state at that epoch
+    /// to rewind to and never will. It is the live-ingest counterpart of the
+    /// bound `retire_commits_superseded_by_replacement_welcome` already
+    /// applies to retained rows.
+    ///
+    /// `EpochId(0)` (the default for records persisted before this field
+    /// existed) means "unknown" and applies no floor, exactly like
+    /// `join_epoch`.
+    #[serde(default)]
+    pub local_copy_install_epoch: EpochId,
 }
 
 impl Group {

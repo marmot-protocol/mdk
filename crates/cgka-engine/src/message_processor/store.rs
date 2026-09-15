@@ -232,11 +232,14 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Retirement paths re-read through this rather than trusting a row state
     /// snapshotted before re-ingest: `ingest_group_message` can commit a
-    /// terminal state to this same row during the call (e.g. the `SelfEvicted`
-    /// path persists it `Failed`, `ingest.rs`), and that verdict is
-    /// authoritative — overwriting it with `Processed` would relabel a row we
-    /// were evicted on as a canonicalization input. A vanished row
-    /// (`NotFound`) is not awaiting retry.
+    /// terminal state to this same row during the call (the post-peel terminal
+    /// paths call `mark_raw_transport_message_failed_if_awaiting_retry`,
+    /// `ingest.rs`), and that verdict is authoritative — overwriting it with
+    /// `Processed` would relabel a row ingest already terminalized as a
+    /// canonicalization input. A vanished row (`NotFound`) is not awaiting
+    /// retry. Our own eviction is NOT such a path: both the record gate and the
+    /// realizing arm write nothing at all, so the row stays exactly as
+    /// retained.
     pub(crate) fn raw_transport_row_awaiting_retry(
         &self,
         id: &MessageId,
@@ -1040,6 +1043,7 @@ mod tests {
                 unrecoverable: false,
                 disbanded: None,
                 join_epoch: EpochId(0),
+                local_copy_install_epoch: EpochId(0),
             })
             .unwrap();
         (storage, engine, group_id)

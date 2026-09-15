@@ -4,6 +4,12 @@ use marmot_app::AppError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
+    #[error("user is blocked")]
+    UserBlocked,
+    #[error("block list synchronization unavailable")]
+    BlockListUnavailable,
+    #[error("block list publication outcome uncertain")]
+    BlockPublicationUncertain,
     #[error("usage and diagnostics consent required")]
     ConsentRequired,
     #[error("invalid product analytics configuration")]
@@ -322,6 +328,9 @@ impl From<&AppError> for MarmotKitError {
             return Self::from_engine_error(err);
         }
         match value {
+            AppError::UserBlocked => Self::UserBlocked,
+            AppError::BlockListUnavailable => Self::BlockListUnavailable,
+            AppError::BlockPublicationUncertain => Self::BlockPublicationUncertain,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }

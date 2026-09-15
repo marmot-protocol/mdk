@@ -38,7 +38,7 @@ jsonschema.workspace = true
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 marmot-markdown.workspace = true
-nostr.workspace = true
+nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

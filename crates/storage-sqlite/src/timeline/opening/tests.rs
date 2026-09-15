@@ -996,3 +996,63 @@ fn latest_targets_keep_the_tail_regardless_of_requested_anchor_placement() {
         assert!(!snapshot.page.has_more_after);
     }
 }
+
+#[test]
+fn user_blocks_recompute_counts_clear_preview_and_restore_retained_messages() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    add(&store, "old", 1, 1);
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "old", &no_mentions)
+        .unwrap();
+    add(&store, "new", 2, 2);
+    let before = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(before.unread_count, 1);
+    assert!(before.last_message.is_some());
+    let policy = |id: &str, at, entries: Vec<(String, bool)>| {
+        store
+            .adopt_block_list(
+                &crate::StoredBlockList {
+                    event_id: id.into(),
+                    event_created_at: at,
+                    ..Default::default()
+                },
+                &entries,
+                100,
+                LOCAL,
+                &no_mentions,
+            )
+            .unwrap();
+    };
+    store
+        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+        .unwrap();
+    policy("a", 1, vec![("bb".into(), true)]);
+    let hidden = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(hidden.unread_count, 0);
+    assert!(hidden.manually_marked_unread);
+    assert_eq!(
+        store
+            .account_attention_total()
+            .unwrap()
+            .attention_only_conversations,
+        1
+    );
+    assert!(hidden.last_message.is_none());
+    let opened = open(&store, ConversationOpenTarget::Automatic, 2);
+    assert!(opened.page.messages.is_empty());
+    assert_eq!(opened.read_state.unread_count, 0);
+    policy("b", 2, vec![]);
+    assert_eq!(
+        ids(&open(&store, ConversationOpenTarget::Automatic, 2)),
+        ["old", "new"]
+    );
+    let restored = store.chat_list_row(GROUP).unwrap().unwrap();
+    assert_eq!(restored.unread_count, 1);
+    assert!(restored.last_message.is_some());
+    store.lock().unwrap().execute("UPDATE account_groups SET pending_confirmation=1,welcomer_account_id_hex='bb' WHERE group_id_hex=?1",[GROUP]).unwrap();
+    policy("c", 3, vec![("bb".into(), true)]);
+    assert!(store.chat_list_row(GROUP).unwrap().is_none());
+    policy("d", 4, vec![]);
+    assert!(store.chat_list_row(GROUP).unwrap().is_some());
+}

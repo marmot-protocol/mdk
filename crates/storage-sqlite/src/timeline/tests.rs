@@ -3417,3 +3417,138 @@ fn rerecording_with_retention_keeps_the_tombstone() {
         Some("BeyondAppRetention")
     );
 }
+
+#[test]
+fn user_blocks_filter_before_pagination_and_restore_without_erasing_history() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (id, author, at) in [
+        ("a", "alice", 1),
+        ("b", "bob", 2),
+        ("c", "bob", 3),
+        ("d", "alice", 4),
+    ] {
+        store
+            .record_app_event(&chat(id, author, at, "retained"))
+            .unwrap();
+    }
+    let mut reply = chat("reply", "carol", 5, "reply");
+    reply.tags = vec![vec!["e".into(), "b".into(), "".into(), "reply".into()]];
+    store.record_app_event(&reply).unwrap();
+    store
+        .record_app_event(&reaction("react", "bob", "a", 6, "+"))
+        .unwrap();
+    let list = crate::StoredBlockList {
+        event_id: "block".into(),
+        event_created_at: 10,
+        ..Default::default()
+    };
+    store
+        .adopt_block_list(&list, &[("bob".into(), true)], 10, "local", &no_mentions)
+        .unwrap();
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            pagination: TimelinePagination {
+                limit: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&page), ["a", "d", "reply"]);
+    assert!(!page.has_more_before);
+    assert!(page.messages[0].reactions.by_emoji.is_empty());
+    assert!(page.messages[2].reply_preview.is_none());
+    assert!(
+        store
+            .timeline_message(&reply.group_id_hex, "b")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .app_messages(crate::StoredAppMessageQuery::default())
+            .unwrap()
+            .len(),
+        6
+    );
+    store
+        .record_app_event(&chat("during", "bob", 7, "hidden notification"))
+        .unwrap();
+    assert!(
+        store
+            .blocked_notification_suppressed(&reply.group_id_hex, "during")
+            .unwrap()
+    );
+    store
+        .adopt_block_list(
+            &crate::StoredBlockList {
+                event_id: "unblock".into(),
+                event_created_at: 11,
+                ..Default::default()
+            },
+            &[],
+            11,
+            "local",
+            &no_mentions,
+        )
+        .unwrap();
+    assert!(
+        store
+            .timeline_message(&reply.group_id_hex, "b")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .blocked_notification_suppressed(&reply.group_id_hex, "during")
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .message_timeline(TimelineMessageQuery::default())
+            .unwrap()
+            .messages
+            .len(),
+        6
+    );
+}
+
+#[test]
+fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fence_retained() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .adopt_block_list(
+            &crate::StoredBlockList {
+                event_id: "block".into(),
+                event_created_at: 1,
+                ..Default::default()
+            },
+            &[("bob".into(), true)],
+            1,
+            "local",
+            &no_mentions,
+        )
+        .unwrap();
+    let event = chat("hidden", "bob", 2, "retained until prune");
+    store.record_app_event(&event).unwrap();
+    store.dismiss_blocked_welcome("old-welcome").unwrap();
+    assert!(
+        store
+            .blocked_notification_suppressed(&event.group_id_hex, "hidden")
+            .unwrap()
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2",
+            rusqlite::params![event.group_id_hex, "hidden"],
+        )
+        .unwrap();
+    assert!(
+        !store
+            .blocked_notification_suppressed(&event.group_id_hex, "hidden")
+            .unwrap()
+    );
+    assert!(store.is_blocked_welcome_dismissed("old-welcome").unwrap());
+}

@@ -25,6 +25,7 @@ use marmot_app::{
 };
 
 mod commands;
+pub use commands::user_blocks::{BlockListSnapshotFfi, BlockListSubscription, BlockedUserFfi};
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so
 // the C ABI can never drift from the Swift/Kotlin surface.
 pub mod conversions;

@@ -116,18 +116,21 @@ pub enum MarmotStatus {
     ChatWindowAnchorOutside = 75,
     ChatWindowClosed = 76,
     ChatWindowQuery = 77,
-    ConversationWindowInvalidLimit = 78,
-    ConversationWindowStale = 79,
-    ConversationWindowWrongGeneration = 80,
-    ConversationWindowAnchorOutside = 81,
-    ConversationWindowClosed = 82,
-    ConversationWindowNotReady = 83,
-    ConversationWindowTimedOut = 84,
-    ConversationWindowInvalidTarget = 85,
-    ConversationWindowQuery = 86,
-    ConversationWindowPresentation = 87,
-    MessageDraftRevisionConflict = 88,
-    ConversationWindowMessageNotRetained = 89,
+    UserBlocked = 78,
+    BlockListUnavailable = 79,
+    BlockPublicationUncertain = 80,
+    ConversationWindowInvalidLimit = 81,
+    ConversationWindowStale = 82,
+    ConversationWindowWrongGeneration = 83,
+    ConversationWindowAnchorOutside = 84,
+    ConversationWindowClosed = 85,
+    ConversationWindowNotReady = 86,
+    ConversationWindowTimedOut = 87,
+    ConversationWindowInvalidTarget = 88,
+    ConversationWindowQuery = 89,
+    ConversationWindowPresentation = 90,
+    MessageDraftRevisionConflict = 91,
+    ConversationWindowMessageNotRetained = 92,
 }
 
 thread_local! {
@@ -172,6 +175,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::ConversationWindowPresentation { .. } => {
             MarmotStatus::ConversationWindowPresentation
         }
+        MarmotKitError::UserBlocked => MarmotStatus::UserBlocked,
+        MarmotKitError::BlockListUnavailable => MarmotStatus::BlockListUnavailable,
+        MarmotKitError::BlockPublicationUncertain => MarmotStatus::BlockPublicationUncertain,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -295,6 +301,9 @@ mod tests {
                 details: "test".into(),
             },
             MarmotKitError::MessageDraftRevisionConflict,
+            MarmotKitError::UserBlocked,
+            MarmotKitError::BlockListUnavailable,
+            MarmotKitError::BlockPublicationUncertain,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -451,8 +460,17 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            80,
+            83,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
+        );
+        assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
+        assert_eq!(
+            status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
+            79
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
+            80
         );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {

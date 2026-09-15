@@ -1081,6 +1081,7 @@ mod prior_nostr_route_tests {
             unrecoverable: false,
             disbanded: None,
             join_epoch: EpochId(0),
+            local_copy_install_epoch: EpochId(0),
         }
     }
 
@@ -1943,6 +1944,7 @@ mod delete_moderation_grant_tests {
             unrecoverable: false,
             disbanded: None,
             join_epoch: EpochId(0),
+            local_copy_install_epoch: EpochId(0),
         }
     }
 

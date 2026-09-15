@@ -239,6 +239,12 @@ impl MarmotApp {
             &account.account_id_hex,
             peer.as_deref().zip(peer_profile.as_ref()),
         );
+        let mut capabilities = state.authority.capabilities();
+        if let Some(peer) = peer.as_deref()
+            && storage.is_user_blocked(peer).map_err(AppError::from)?
+        {
+            capabilities.can_send = false;
+        }
         let result = ConversationWindowPresentation {
             header: ConversationHeader {
                 selected,
@@ -249,7 +255,7 @@ impl MarmotApp {
                 disbanding: state.authority.disbanding,
                 unrecoverable: state.authority.unrecoverable
                     || state.authority.lifecycle == AppGroupLifecycleState::Unrecoverable,
-                capabilities: state.authority.capabilities(),
+                capabilities,
             },
             messages,
             identities,

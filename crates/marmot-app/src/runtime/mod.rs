@@ -93,6 +93,8 @@ pub use chat_list_window::{
 pub use onboarding::*;
 pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
 mod subscriptions;
+mod user_blocks;
+pub use user_blocks::RuntimeBlockListSubscription;
 
 // Re-export the public surface so `crate::runtime::Item` and the
 // `marmot_app::...` paths in `lib.rs` resolve unchanged after the split.

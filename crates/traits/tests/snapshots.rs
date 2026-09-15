@@ -849,6 +849,7 @@ fn snapshot_group_and_member() {
             unrecoverable: false,
             disbanded: None,
             join_epoch: EpochId(2),
+            local_copy_install_epoch: EpochId(2),
         }
     );
 }

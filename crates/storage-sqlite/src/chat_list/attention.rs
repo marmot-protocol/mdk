@@ -50,7 +50,7 @@ impl SqliteAccountStorage {
                     FROM chat_list_rows INDEXED BY idx_chat_list_unread_page WHERE {}
                     UNION ALL
                     SELECT 0, 0 FROM chat_list_rows INDEXED BY idx_chat_list_invite_attention
-                    WHERE list_scope = 0 AND list_pending_invite = 1
+                    WHERE list_scope = 0 AND list_pending_invite = 1 AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)
                 )",
                 ChatListView::Unread.predicate()
             ),
