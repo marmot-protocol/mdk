@@ -2506,7 +2506,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .chat_list_row(group_id_hex)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2622,7 +2622,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .refresh_chat_list_row(&account.account_id_hex, group_id_hex, &classifier)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2642,7 +2642,7 @@ impl MarmotApp {
                 message_ids_hex,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2657,7 +2657,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .initialize_chat_read_state(&account.account_id_hex, group_id_hex, &classifier)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2678,7 +2678,7 @@ impl MarmotApp {
                 message_id_hex,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2701,7 +2701,7 @@ impl MarmotApp {
                 manually_unread,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -4731,22 +4731,31 @@ impl MarmotApp {
         Ok(())
     }
 
-    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) -> Result<(), AppError> {
+    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) {
         let Some(row) = row else {
-            return Ok(());
+            return;
         };
         let Some(message) = row.last_message.as_mut() else {
-            return Ok(());
+            return;
         };
         (message.attachment_kind, message.attachment_count) =
             media::classify_chat_list_attachments(message.media_json.as_deref());
         let Some(sender) = Self::chat_list_sender_for_profile_hydration(message) else {
-            return Ok(());
+            return;
         };
-        if let Some(name) = self.display_name_for_account_id(sender)? {
-            message.sender_display_name = Some(name);
+        // Optional names must not roll back the enclosing message projection.
+        match self.display_name_for_account_id(sender) {
+            Ok(Some(name)) => message.sender_display_name = Some(name),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "hydrate_chat_list_row",
+                    error_kind = error.privacy_safe_kind(),
+                    "projecting chat preview without display name",
+                );
+            }
         }
-        Ok(())
     }
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
@@ -4833,7 +4842,7 @@ impl MarmotApp {
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         self.presentation_signals.wake();
-        self.hydrate_chat_list_row(Some(&mut row))?;
+        self.hydrate_chat_list_row(Some(&mut row));
 
         // Only the created row belongs on the response tail. Preserve any
         // pre-existing stale marker, and add one if this delta also persisted

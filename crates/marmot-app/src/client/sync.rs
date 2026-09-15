@@ -1324,7 +1324,7 @@ impl AppClient {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
-        let display_names = self.display_names_for_events(&effects.events)?;
+        let display_names = self.display_names_for_events(&effects.events);
         let source_received_at = unix_now_seconds();
         // Hydration replays a stored group's `GroupDisbanded` once ever
         // (`restore_disband_tombstone`), as the belt-and-braces reconciler for a
@@ -4495,7 +4495,14 @@ impl AppClient {
         }
         let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
             && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
-        self.app.remember_directory_message_sender(&message)?;
+        if let Err(error) = self.app.remember_directory_message_sender(&message) {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "project_received_message",
+                error_kind = error.privacy_safe_kind(),
+                "projecting message without directory enrichment",
+            );
+        }
         let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
             && self.delete_moderation_grant(&message.group_id, &message.sender);
         let message_projection = AppMessageProjection {
@@ -4780,7 +4787,7 @@ impl AppClient {
     fn display_names_for_events(
         &self,
         events: &[cgka_traits::engine::GroupEvent],
-    ) -> Result<HashMap<String, String>, AppError> {
+    ) -> HashMap<String, String> {
         let senders = events
             .iter()
             .filter_map(|event| match event {
@@ -4790,7 +4797,19 @@ impl AppClient {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        self.app.display_names_for_account_ids(&senders)
+        // Enrichment must not discard effects the engine already consumed.
+        match self.app.display_names_for_account_ids(&senders) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "display_names_for_events",
+                    error_kind = error.privacy_safe_kind(),
+                    "projecting events without display names",
+                );
+                HashMap::new()
+            }
+        }
     }
 
     async fn observe_account_device_effects(
@@ -4800,7 +4819,7 @@ impl AppClient {
         source_message_id_hex: &str,
         source_received_at: u64,
     ) -> Result<bool, AppError> {
-        let display_names = self.display_names_for_events(&effects.events)?;
+        let display_names = self.display_names_for_events(&effects.events);
         self.note_superseded_intent_reports(effects);
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
@@ -5630,6 +5649,27 @@ mod tests {
                     retention: None,
                 });
         }
+        // A corrupt sender profile must not lose any already-ingested message,
+        // including during drained-event replay below.
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&storage_sqlite::PublicDirectoryUserRecord {
+                account_id_hex: account.account_id_hex.clone(),
+                npub: String::new(),
+                profile_json: Some("{".into()),
+                relay_lists_json: serde_json::to_string(&crate::AccountRelayListStatus::empty())
+                    .unwrap(),
+                key_package_json: None,
+                event_id_hex: None,
+                event_kind: None,
+                event_created_at: None,
+                follows: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            app.display_names_for_account_ids(std::slice::from_ref(&account.account_id_hex))
+                .is_err()
+        );
         match observation {
             ReleasedBatchObservation::Scheduled => {
                 client
