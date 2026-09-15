@@ -261,7 +261,44 @@ class DeterministicAIAgent:
         return self.last_result
 
 
-def _quiet_helper_kwargs(home: Path, *, tool_progress: str = "off") -> dict[str, Any]:
+def _restore_home_env(original_home: str | None, original_hermes_home: str | None) -> None:
+    if original_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = original_home
+    if original_hermes_home is None:
+        os.environ.pop("HERMES_HOME", None)
+    else:
+        os.environ["HERMES_HOME"] = original_hermes_home
+
+
+@contextlib.contextmanager
+def _preserve_home_env():
+    original_home = os.environ.get("HOME")
+    original_hermes_home = os.environ.get("HERMES_HOME")
+    try:
+        yield
+    finally:
+        _restore_home_env(original_home, original_hermes_home)
+
+
+def _registered_hermes_home() -> Path:
+    raw = os.environ.get("HERMES_HOME")
+    if not raw:
+        raise AssertionError("progress cleanup probe requires HERMES_HOME from the real install/enable fixture")
+    home = Path(raw)
+    if not (home / "plugins" / "marmot" / "adapter.py").is_file():
+        raise AssertionError("registered HERMES_HOME does not contain an installed Marmot plugin")
+    return home
+
+
+def _quiet_helper_kwargs(
+    home: Path,
+    *,
+    tool_progress: str = "off",
+    agent_home: Path | None = None,
+) -> dict[str, Any]:
+    agent = agent_home if agent_home is not None else home / "marmot-agent"
     return {
         "hermes_home": home,
         "platform": "marmot",
@@ -271,32 +308,37 @@ def _quiet_helper_kwargs(home: Path, *, tool_progress: str = "off") -> dict[str,
         "interim_assistant_messages": False,
         "long_running_notifications": False,
         "busy_ack_detail": False,
-        "agent_home": home / "marmot-agent",
-        "socket_path": home / "marmot-agent" / "wn-agent.sock",
+        "agent_home": agent,
+        "socket_path": agent / "wn-agent.sock",
         "account_id_hex": ACCOUNT_ID_HEX,
         "backup": False,
     }
 
 
-def _write_seed_with_global_cleanup(home: Path, helper) -> None:
+def _write_seed_with_global_cleanup(
+    home: Path,
+    helper,
+    *,
+    agent_home: Path | None = None,
+) -> None:
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(
-        "\n".join(
-            [
-                "model: probe-model",
-                "display:",
-                "  cleanup_progress: true",
-                "  tool_progress: all",
-                "  platforms:",
-                "    telegram:",
-                "      cleanup_progress: true",
-                "      tool_progress: verbose",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    config_path = home / "config.yaml"
+    existing: dict[str, Any] = {}
+    if config_path.is_file():
+        existing = helper.load_config(config_path)
+    display = existing.setdefault("display", {})
+    display["cleanup_progress"] = True
+    display["tool_progress"] = "all"
+    platforms = display.setdefault("platforms", {})
+    telegram = platforms.setdefault("telegram", {})
+    telegram["cleanup_progress"] = True
+    telegram["tool_progress"] = "verbose"
+    if not existing.get("model"):
+        existing["model"] = "probe-model"
+    config_path.write_text(helper.dump_config(existing), encoding="utf-8")
+    helper.configure_gateway_config(
+        **_quiet_helper_kwargs(home, agent_home=agent_home)
     )
-    helper.configure_gateway_config(**_quiet_helper_kwargs(home))
 
 
 def _assert_resolver_defaults(config: dict[str, Any]) -> None:
@@ -476,15 +518,61 @@ def _build_event(SessionSource, MessageEvent, Platform):
     )
 
 
-async def _dispatch_registered_delete(adapter_module) -> dict[str, Any]:
+def _registered_delete_handler():
     from tools.registry import registry
 
     entry = registry.get_entry("delete_marmot_message")
     handler = getattr(entry, "handler", None) if entry is not None else None
     if not callable(handler):
-        handler = getattr(adapter_module, "_delete_marmot_message_tool", None)
-    if not callable(handler):
         raise AssertionError("delete_marmot_message was not registered with Hermes")
+    return handler
+
+
+def _create_registered_adapter(platform_config):
+    from gateway.platform_registry import platform_registry
+
+    adapter = platform_registry.create_adapter("marmot", platform_config)
+    if adapter is None:
+        raise AssertionError("registered platform factory returned no adapter")
+    return adapter
+
+
+def _assert_fresh_progress_state(adapter) -> None:
+    if not hasattr(adapter, "_tool_progress_events"):
+        raise AssertionError("fresh adapter is missing _tool_progress_events")
+    events = adapter._tool_progress_events
+    if events is None or len(events) != 0:
+        raise AssertionError("fresh adapter reconstructed in-memory synthetic cleanup targets")
+
+
+def _assert_missing_delete_registration_fails() -> None:
+    from tools.registry import registry
+
+    with mock.patch.object(registry, "get_entry", return_value=None):
+        try:
+            _registered_delete_handler()
+        except AssertionError as exc:
+            if "was not registered" not in str(exc):
+                raise
+        else:
+            raise AssertionError("missing delete registry entry was accepted")
+
+
+def _assert_missing_factory_fails() -> None:
+    from gateway.platform_registry import platform_registry
+
+    with mock.patch.object(platform_registry, "create_adapter", return_value=None):
+        try:
+            _create_registered_adapter(object())
+        except AssertionError as exc:
+            if "returned no adapter" not in str(exc):
+                raise
+        else:
+            raise AssertionError("missing platform factory was accepted")
+
+
+async def _dispatch_registered_delete() -> dict[str, Any]:
+    handler = _registered_delete_handler()
     raw = handler(
         {
             "message_id": EXPLICIT_OPERATION_ID,
@@ -503,29 +591,22 @@ async def _dispatch_registered_delete(adapter_module) -> dict[str, Any]:
     return payload
 
 
-def _fresh_persisted_gateway(hermes_home: Path, helper, adapter_module):
+def _fresh_persisted_gateway(hermes_home: Path, helper):
     from gateway.config import Platform, load_gateway_config
     from gateway.display_config import resolve_display_setting
-    from gateway.platform_registry import platform_registry
     import gateway.run as gateway_run
 
-    os.environ["HERMES_HOME"] = str(hermes_home)
-    os.environ["HOME"] = str(hermes_home.parent)
-    persisted = helper.load_config(hermes_home / "config.yaml")
-    if resolve_display_setting(persisted, "marmot", "cleanup_progress") is not False:
-        raise AssertionError("reconfigured persisted cleanup_progress did not remain false")
-    loaded = load_gateway_config()
-    platform_config = loaded.platforms.get(Platform("marmot"))
-    if platform_config is None:
-        raise AssertionError("persisted gateway load missing marmot platform")
-    adapter = platform_registry.create_adapter("marmot", platform_config)
-    if adapter is None:
-        adapter = adapter_module.MarmotPlatformAdapter(platform_config)
-        adapter_module._remember_live_adapter(adapter)
-    if adapter is None:
-        raise AssertionError("persisted gateway adapter factory returned no adapter")
-    runner = gateway_run.GatewayRunner(config=loaded)
-    return persisted, runner, adapter
+    with _preserve_home_env():
+        persisted = helper.load_config(hermes_home / "config.yaml")
+        if resolve_display_setting(persisted, "marmot", "cleanup_progress") is not False:
+            raise AssertionError("reconfigured persisted cleanup_progress did not remain false")
+        loaded = load_gateway_config()
+        platform_config = loaded.platforms.get(Platform("marmot"))
+        if platform_config is None:
+            raise AssertionError("persisted gateway load missing marmot platform")
+        adapter = _create_registered_adapter(platform_config)
+        runner = gateway_run.GatewayRunner(config=loaded)
+        return persisted, runner, adapter
 
 
 async def _run_gateway_turn(
@@ -542,93 +623,124 @@ async def _run_gateway_turn(
     stagger_after_first: bool = False,
 ) -> dict[str, Any]:
     helper = _load_helper()
+    original_home = os.environ.get("HOME")
+    original_hermes_home = os.environ.get("HERMES_HOME")
+    try:
+        return await _run_gateway_turn_body(
+            hermes_home=hermes_home,
+            adapter_module=adapter_module,
+            helper=helper,
+            grouping=grouping,
+            tool_progress=tool_progress,
+            fail_operation_after=fail_operation_after,
+            fail_turn=fail_turn,
+            fail_final=fail_final,
+            cleanup_override=cleanup_override,
+            explicit_delete=explicit_delete,
+            stagger_after_first=stagger_after_first,
+        )
+    finally:
+        _restore_home_env(original_home, original_hermes_home)
+
+
+async def _run_gateway_turn_body(
+    *,
+    hermes_home: Path,
+    adapter_module,
+    helper,
+    grouping: str,
+    tool_progress: str,
+    fail_operation_after: int | None,
+    fail_turn: bool,
+    fail_final: bool,
+    cleanup_override: bool | None,
+    explicit_delete: bool,
+    stagger_after_first: bool,
+) -> dict[str, Any]:
+    registered_home = _registered_hermes_home()
     hermes_home.mkdir(parents=True, exist_ok=True)
-    _write_seed_with_global_cleanup(hermes_home, helper)
+    agent_home = hermes_home / "marmot-agent"
+    _write_seed_with_global_cleanup(registered_home, helper, agent_home=agent_home)
     helper.configure_gateway_config(
-        **_quiet_helper_kwargs(hermes_home, tool_progress=tool_progress)
+        **_quiet_helper_kwargs(
+            registered_home,
+            tool_progress=tool_progress,
+            agent_home=agent_home,
+        )
     )
-    config = helper.load_config(hermes_home / "config.yaml")
+    config = helper.load_config(registered_home / "config.yaml")
     marmot_display = config.setdefault("display", {}).setdefault("platforms", {}).setdefault("marmot", {})
     marmot_display["tool_progress_grouping"] = grouping
     if cleanup_override is True:
         marmot_display["cleanup_progress"] = True
-    (hermes_home / "config.yaml").write_text(helper.dump_config(config), encoding="utf-8")
+    (registered_home / "config.yaml").write_text(helper.dump_config(config), encoding="utf-8")
 
-    os.environ["HERMES_HOME"] = str(hermes_home)
-    os.environ["HOME"] = str(hermes_home.parent)
-
-    socket_path = hermes_home / "marmot-agent" / "wn-agent.sock"
+    socket_path = agent_home / "wn-agent.sock"
     fake = RecordingControlServer(socket_path, fail_operation_after=fail_operation_after)
     fake.fail_final = fail_final
     await fake.start()
-
-    from hermes_cli.plugins import discover_plugins
-    from gateway.config import Platform, PlatformConfig, load_gateway_config
-    from gateway.display_config import resolve_display_setting
-    from gateway.platforms.base import MessageEvent
-    import gateway.run as gateway_run
-    from gateway.session import SessionSource
-    import run_agent
-
-    discover_plugins(force=True)
-    written_config = helper.load_config(hermes_home / "config.yaml")
-    original_load_gateway_config = gateway_run._load_gateway_config
-    gateway_run._load_gateway_config = lambda: written_config
-
-    loaded = load_gateway_config()
-    resolved_cleanup = resolve_display_setting(
-        written_config,
-        "marmot",
-        "cleanup_progress",
-    )
-    platform_config = PlatformConfig(
-        enabled=True,
-        extra={
-            "socket_path": str(socket_path),
-            "home": str(hermes_home / "marmot-agent"),
-            "account_id_hex": ACCOUNT_ID_HEX,
-            "profile_name_onboarding": False,
-        },
-    )
-    adapter = adapter_module.MarmotPlatformAdapter(platform_config)
-    adapter_module._remember_live_adapter(adapter)
-    delete_attempts: list[str] = []
-    _wrap_delete(adapter, delete_attempts)
-    callback_registrations: list[bool] = []
-    callback_invocations: list[bool] = []
-    pop_calls: list[bool] = []
-    scheduled: list[Any] = []
-    _wrap_post_delivery_boundary(
-        adapter,
-        callback_registrations=callback_registrations,
-        callback_invocations=callback_invocations,
-        pop_calls=pop_calls,
-    )
-    send_ids: list[str] = []
-    original_send = adapter.send
-
-    async def tracking_send(chat_id, content, *args, **kwargs):
-        result = await original_send(chat_id, content, *args, **kwargs)
-        if getattr(result, "message_id", None):
-            send_ids.append(str(result.message_id))
-        return result
-
-    adapter.send = tracking_send
-
-    DeterministicAIAgent.instances.clear()
-    create_kwargs = {
-        "_fail_turn": fail_turn,
-        "_stagger_after_first": stagger_after_first,
-    }
-
-    def agent_factory(*args, **kwargs):
-        kwargs.update(create_kwargs)
-        return DeterministicAIAgent(*args, **kwargs)
-
+    original_load_gateway_config = None
+    gateway_run = None
     runner = None
-    delivery_boundary_observed = False
-    scheduled_work_drained = False
     try:
+        from hermes_cli.plugins import discover_plugins
+        from gateway.config import Platform, load_gateway_config
+        from gateway.display_config import resolve_display_setting
+        from gateway.platforms.base import MessageEvent
+        import gateway.run as gateway_run
+        from gateway.session import SessionSource
+        import run_agent
+
+        discover_plugins(force=True)
+        written_config = helper.load_config(registered_home / "config.yaml")
+        original_load_gateway_config = gateway_run._load_gateway_config
+        gateway_run._load_gateway_config = lambda: written_config
+
+        loaded = load_gateway_config()
+        resolved_cleanup = resolve_display_setting(
+            written_config,
+            "marmot",
+            "cleanup_progress",
+        )
+        platform_config = loaded.platforms.get(Platform("marmot"))
+        if platform_config is None:
+            raise AssertionError("persisted gateway load missing marmot platform")
+        adapter = _create_registered_adapter(platform_config)
+        delete_attempts: list[str] = []
+        _wrap_delete(adapter, delete_attempts)
+        callback_registrations: list[bool] = []
+        callback_invocations: list[bool] = []
+        pop_calls: list[bool] = []
+        scheduled: list[Any] = []
+        _wrap_post_delivery_boundary(
+            adapter,
+            callback_registrations=callback_registrations,
+            callback_invocations=callback_invocations,
+            pop_calls=pop_calls,
+        )
+        send_ids: list[str] = []
+        original_send = adapter.send
+
+        async def tracking_send(chat_id, content, *args, **kwargs):
+            result = await original_send(chat_id, content, *args, **kwargs)
+            if getattr(result, "message_id", None):
+                send_ids.append(str(result.message_id))
+            return result
+
+        adapter.send = tracking_send
+
+        DeterministicAIAgent.instances.clear()
+        create_kwargs = {
+            "_fail_turn": fail_turn,
+            "_stagger_after_first": stagger_after_first,
+        }
+
+        def agent_factory(*args, **kwargs):
+            kwargs.update(create_kwargs)
+            return DeterministicAIAgent(*args, **kwargs)
+
+        delivery_boundary_observed = False
+        scheduled_work_drained = False
         with mock.patch.object(run_agent, "AIAgent", agent_factory):
             runner = gateway_run.GatewayRunner(config=loaded)
             runner._resolve_session_agent_runtime = lambda **_kwargs: (
@@ -645,9 +757,10 @@ async def _run_gateway_turn(
                 await _await_scheduled_work(scheduled, timeout=SCHEDULED_WORK_TIMEOUT_S)
                 scheduled_work_drained = True
                 if explicit_delete:
-                    await _dispatch_registered_delete(adapter_module)
+                    await _dispatch_registered_delete()
     finally:
-        gateway_run._load_gateway_config = original_load_gateway_config
+        if gateway_run is not None and original_load_gateway_config is not None:
+            gateway_run._load_gateway_config = original_load_gateway_config
         if runner is not None:
             stop = getattr(runner, "stop", None)
             if callable(stop):
@@ -857,14 +970,17 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         hermes_home=restart_home,
         adapter_module=adapter_module,
     )
-    helper.configure_gateway_config(**_quiet_helper_kwargs(restart_home, tool_progress="all"))
-    _persisted, fresh_runner, fresh = _fresh_persisted_gateway(
-        restart_home, helper, adapter_module
+    registered_home = _registered_hermes_home()
+    helper.configure_gateway_config(
+        **_quiet_helper_kwargs(
+            registered_home,
+            tool_progress="all",
+            agent_home=restart_home / "marmot-agent",
+        )
     )
+    _persisted, fresh_runner, fresh = _fresh_persisted_gateway(registered_home, helper)
     try:
-        events = getattr(fresh, "_tool_progress_events", None)
-        if events and len(events) != 0:
-            raise AssertionError("fresh adapter reconstructed in-memory synthetic cleanup targets")
+        _assert_fresh_progress_state(fresh)
     finally:
         stop = getattr(fresh_runner, "stop", None)
         if callable(stop):
@@ -895,6 +1011,9 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
     if extra_attempts:
         raise AssertionError("explicit delete was accompanied by automatic cleanup attempts")
 
+    _assert_missing_delete_registration_fails()
+    _assert_missing_factory_fails()
+
     return {
         "defaults_resolved_false": True,
         "accumulate_operations": accumulate["operation_sends"],
@@ -905,8 +1024,10 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         "retry_operations": retry["operation_sends"],
         "retry_failures": retry["operation_failures"],
         "explicit_deletes": explicit["wire_deletes"],
+        "registration_fail_closed": True,
     }
 
 
 def run(adapter_module, hermes_home: Path) -> dict[str, Any]:
-    return asyncio.run(_run_scenarios(adapter_module, hermes_home))
+    with _preserve_home_env():
+        return asyncio.run(_run_scenarios(adapter_module, hermes_home))
