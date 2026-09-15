@@ -402,3 +402,9 @@ Existing chat-list APIs remain available during client migration. Android/iOS ad
 C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
 See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
 for paging, sequence handling, cancellation, C ownership, and compatibility.
+
+## Apple privacy resources
+
+Apple exporters use resource-bearing static framework slices. See the
+[privacy audit and adoption guide](apple-privacy/README.md) for declarations,
+archive validation, host integration changes, and unresolved release questions.

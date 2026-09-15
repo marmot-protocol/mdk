@@ -12,6 +12,7 @@
 # Add x86_64-apple-ios + lipo if/when an Intel Mac is on the test matrix.
 
 set -euo pipefail
+umask 077
 
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
 # rust-toolchain.toml is honored and iOS targets are visible.
@@ -87,12 +88,18 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"
 # XCFramework expects the modulemap to be named module.modulemap
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.modulemap"
 
+python3 "$TOOL_DIR/apple-framework.py" \
+  "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
+  "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
+  --privacy-dir "$CRATE_DIR/apple-privacy"
+python3 "$TOOL_DIR/apple-framework.py" \
+  "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
+  "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
+  --privacy-dir "$CRATE_DIR/apple-privacy"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
-  -library "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" \
-  -headers "$BUILD_DIR/headers" \
-  -library "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" \
-  -headers "$BUILD_DIR/headers" \
+  -framework "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" \
+  -framework "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" \
   -output "$OUT_DIR/$FRAMEWORK_NAME.xcframework"
 
 echo "==> Copying generated Swift binding to output dir"

@@ -14,6 +14,7 @@
 # building both in one workspace cannot clobber the iOS artifact.
 
 set -euo pipefail
+umask 077
 
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
 # rust-toolchain.toml is honored and Apple targets are visible.
@@ -101,10 +102,13 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.mo
 # strip=none and debug=0, and package-macos-artifacts.sh publishes that profile
 # as provenance, so a post-link strip would make the manifest describe an
 # artifact that is not the one shipped.
+python3 "$TOOL_DIR/apple-framework.py" \
+  "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
+  "$BUILD_DIR/$MACOS_TARGET/marmot_uniffiFFI.framework" macos "$MACOSX_DEPLOYMENT_TARGET" \
+  --privacy-dir "$CRATE_DIR/apple-privacy"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
-  -library "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" \
-  -headers "$BUILD_DIR/headers" \
+  -framework "$BUILD_DIR/$MACOS_TARGET/marmot_uniffiFFI.framework" \
   -output "$OUT_DIR/$FRAMEWORK_NAME.xcframework"
 
 echo "==> Copying generated Swift binding to output dir"

@@ -181,6 +181,17 @@ jobs:
             packaged-source/crates/marmot-uniffi/output/MarmotKit.swift \
             "$RUNNER_TEMP/marmotkit-local-consumer"
 
+      - name: Verify privacy resources in a consuming app archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          python3 crates/marmot-uniffi/test-apple-privacy.py
+          python3 crates/marmot-uniffi/validate-apple-archive.py ios \
+            packaged-source/crates/marmot-uniffi/output/MarmotKit.xcframework \
+            packaged-source/crates/marmot-uniffi/output/MarmotKit.swift \
+            "$RUNNER_TEMP/marmotkit-ios-privacy-archive"
+
       - name: Upload iOS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -270,6 +281,17 @@ jobs:
             - \
             packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift \
             "$RUNNER_TEMP/marmotkit-local-macos-consumer"
+
+      - name: Verify privacy resources in a consuming app archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          python3 crates/marmot-uniffi/test-apple-privacy.py
+          python3 crates/marmot-uniffi/validate-apple-archive.py macos \
+            packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.xcframework \
+            packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift \
+            "$RUNNER_TEMP/marmotkit-macos-privacy-archive"
 
       - name: Upload macOS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
