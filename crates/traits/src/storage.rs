@@ -300,6 +300,25 @@ pub trait MessageStorage {
             .collect())
     }
 
+    /// Visit matching rows in replay order, stopping as soon as `visitor` returns
+    /// false. Backends should stream rows so early termination avoids reading or
+    /// decoding the remainder. The callback must not call back into storage:
+    /// implementations may hold their connection lock while visiting a row.
+    fn visit_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        visitor: &mut dyn FnMut(MessageRecord) -> bool,
+    ) -> StorageResult<()> {
+        for record in self.list_messages_in_states(group_id, states, at_or_after_epoch)? {
+            if !visitor(record) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Deferred rows in the same stable order as `list_messages_in_states`,
     /// without copying payload bytes when the backend supports separate metadata.
     /// This is a complete metadata enumeration: callers must still discover work
@@ -939,6 +958,24 @@ pub trait StorageProvider:
     /// outlive the state it was loaded from.
     fn mls_write_generation(&self) -> Option<u64> {
         None
+    }
+
+    /// Optional cryptographic content fingerprint for resumable group replay.
+    /// Covers live canonical/OpenMLS state (including secret ratchets), member
+    /// validation/capabilities/policy, and every retained snapshot/checkpoint
+    /// that replay can restore. Capture must be a consistent read. Mutable
+    /// message/outbound/app-projection rows are excluded: callers separately
+    /// validate their exact frozen inputs and pass identity.
+    ///
+    /// Unlike `mls_write_generation`, unchanged content may retain this value
+    /// across no-op restores or unrelated writes through another connection.
+    /// `None` leaves callers using strict generation invalidation. This is
+    /// memory-only, secret-derived validation material: never log or persist it.
+    fn group_replay_state_fingerprint(
+        &self,
+        _group_id: &GroupId,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        Ok(None)
     }
 
     /// Optional account-device maintenance store.

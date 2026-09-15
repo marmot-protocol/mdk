@@ -294,6 +294,12 @@ pub(crate) enum AccountWorkerCommand {
         thumbhash: Option<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    SendMessageDraft {
+        group_id: GroupId,
+        revision: crate::MessageDraftRevision,
+        attachments: Vec<MediaAttachmentReference>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     SendMessage {
         enqueued_at: Instant,
         group_id: GroupId,
@@ -2889,7 +2895,26 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::RepairFullHistory { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
-            let result = match client.repair_full_history().await {
+            let read_snapshot = capture_group_read_snapshot(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                "full-history repair snapshot failed",
+            );
+            // Observe cancellation at checkpoint boundaries, never by dropping
+            // an in-flight durable ingest or a live engine transaction.
+            let cancelled = || respond.is_closed() || shared.lifecycle().is_stopping();
+            let repaired = Box::pin(serve_snapshot_reads_until(
+                read_snapshot,
+                client.repair_full_history_cancellable(&cancelled),
+                commands,
+                pending,
+                app,
+                account_label,
+            ))
+            .await;
+            let result = match repaired {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
                     publish_client_pending_projection_updates(
@@ -3743,6 +3768,30 @@ fn account_worker_command_future<'a>(
                     let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(err));
                 }
             }
+            true
+        }),
+        AccountWorkerCommand::SendMessageDraft {
+            group_id,
+            revision,
+            attachments,
+            respond,
+        } => Box::pin(async move {
+            let result = client
+                .send_message_draft_with_local_projection(
+                    &group_id,
+                    revision,
+                    attachments,
+                    |update| {
+                        publish_app_runtime_projection_update(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            update,
+                        );
+                    },
+                )
+                .await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
         AccountWorkerCommand::SendMessage {
@@ -6983,5 +7032,92 @@ mod tests {
             Some(&(CONVERGENCE_UNSETTLED_MAX_REARMS + 1))
         );
         assert_eq!(scheduled.retry_attempts.get(&group_id), Some(&1));
+    }
+    #[cfg(feature = "test-policy-overrides")]
+    #[tokio::test]
+    async fn full_history_repair_serves_snapshot_reads_and_stops_at_checkpoint() {
+        for caller_cancels in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay_and_config(
+                dir.path(),
+                "wss://relay.example".to_owned(),
+                bounded_epoch_backfill_config().with_dev_epoch_backfill_execution_quantum_ms(10),
+            )
+            .with_test_relay_client(relay.clone());
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let before = relay.subscription_count();
+            let (events, _subscriber) = broadcast::channel(4);
+            let shared = RuntimeSharedServices::default();
+            let (respond, mut response) = oneshot::channel();
+            let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+            let (worker_lifetime, _) = watch::channel(());
+            let media_http = MediaHttpContext {
+                product: Default::default(),
+                tx: media_http_tx,
+                permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                worker_lifetime,
+            };
+            let (command_tx, mut commands) = mpsc::channel(4);
+            let mut pending = VecDeque::new();
+            let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
+            let handler = handle_account_worker_command(
+                &mut client,
+                AccountWorkerCommand::RepairFullHistory { respond },
+                AccountWorkerCommandContext {
+                    commands: &mut commands,
+                    pending: &mut pending,
+                    app: &app,
+                    events: &events,
+                    account_id_hex: "account-id",
+                    account_label: "alice",
+                    shared: &shared,
+                    media_http: &media_http,
+                    scheduled_convergence: &mut scheduled_convergence,
+                },
+            );
+            let observer = async {
+                while relay.subscription_count() == before {
+                    tokio::task::yield_now().await;
+                }
+                let (respond, read) = oneshot::channel();
+                command_tx
+                    .send(AccountWorkerCommand::QuarantinedGroups { respond })
+                    .await
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), read)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                if caller_cancels {
+                    drop(response);
+                } else {
+                    shared.lifecycle().begin_shutdown();
+                    let failure = response.await.unwrap().unwrap_err();
+                    assert_eq!(
+                        failure.classification().failure_stage,
+                        crate::SyncFailureStage::RelayReceive
+                    );
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(handler, observer);
+            })
+            .await
+            .unwrap();
+            assert_eq!(relay.subscription_count(), before + 1);
+        }
     }
 }

@@ -158,7 +158,7 @@ These are the scenarios another implementation should be able to load from JSON 
   `four_party_cross_route_recovery_containers_match_unified_route`; promotion to a portable saved input still requires
   an adapter-neutral representation of reversible retained-event staging.
 - Subject: the strict half uses retained-engine exact observations; the black-box half uses the public
-  `MarmotAppRuntime` commands and projections either in-process or in four isolated child processes. Every participant
+  `MarmotAppRuntime` commands and projections in isolated participant processes. Every participant
   has a separate encrypted SQLite root and uses a real runner-owned local Nostr relay.
 - Pressure: Alpha and Observer are offline while Zeta's root is retained; Yankee ingests that root, then goes offline.
   The harness reversibly hides Zeta's root from whole-relay queries before Alpha reconnects and authors its competing
@@ -1150,3 +1150,128 @@ The `vectors/byte-fixtures/` files are conformance artifacts, but they are not s
 encoding and validation for app-component data such as Nostr routing component state and updates.
 
 Keep those in the vector manifest. Add them here only if they become runnable `ScenarioSpec` fixtures.
+
+### `public-app-backlog-recovery/v1`
+
+- Generator version: `2`; app-runtime subject; six bounded catalog arms per seed. Intermediate projection checks
+  are batched at commit/recovery boundaries; version-1 saved inputs retain per-send checks.
+- Setup: four founding members with distinct SQLCipher stores and a real local Nostr relay; Bob goes offline.
+- Cases 0/1/2: 64/128/256 messages, with profile commits every 16 messages and administrator changes every 32.
+- Cases 3/4/5: the same sizes with a reopen between the first repair request and the terminal recovery checks.
+- Oracle: exact public payload multiset for every member, expected roster/admin/profile plus common epoch,
+  fresh messages from every member, and full history after another recipient reopen. No exact/private engine
+  oracle is removed from another family; this companion owns its public expectations.
+- Canaries: `public_backlog_recovery_strict_canary` and `public_backlog_recovery_restart_strict_canary` also mutate
+  observed messages, member counts, admin sets, profile and epoch to check the oracle rejects incorrect outcomes.
+- Fixed companions: `public_app_13_offline_removal_then_rejoin_preserves_history` combines offline eviction,
+  send refusal and fresh admission without exposing exclusion-period history;
+  `public_app_14_two_groups_recover_without_starving_live_traffic` checks live traffic in one group throughout
+  another group's backlog, membership/profile change and recovery.
+- Entry point and exact execution/evidence boundaries: [unified app campaign](APP_PATH_COVERAGE.md#unified-public-app-campaign).
+
+
+### Seeded app runtime faults and mixed recovery
+
+`public-app-stateful-recovery/v1` (generator version 1) emits bounded legal mixed histories for
+3–6 accounts, one device per account and one shared real local relay. Seed and case index drive the
+population, offline participant, shuffled operation motifs, additional motifs, message-burst lengths,
+admin/profile authors, removal/re-invitation targets, one/two offline intervals and recovery boundaries.
+Every case includes membership changes while another participant is offline, an orderly reopen,
+simultaneously released disjoint profile edits, and a real relay socket interruption. Sends can be
+batched without per-message catch-up barriers. Recovery either requests full history, reopens after a
+repair request, or issues fresh traffic before explicit repair. The latter two specify operation
+boundaries; they do not claim recovery was still partial at the interruption.
+
+The symbolic model pins intermediate public membership/admin/profile state and terminal exact message
+multisets for every participant, including periods outside membership. Concurrent name/description
+edits must both be accepted and both survive; a refusal is reported as
+`concurrent_profiles_not_all_accepted`, not silently treated as a successful race. The shared relay
+proxy closes established TCP connections, rejects new connections for a seeded 50–500 ms, then
+restores service. App runtimes remain alive. A zero-connection interruption is explicitly inconclusive
+(`relay_interruption_not_exercised`). Typed `stimulus_observations` retain action IDs, socket counts,
+running-runtime counts and every concurrent caller's acceptance/refusal. Report validation rejects
+missing stimulus evidence as well as wrong public outcomes.
+
+`public-app-recovery-schedules/v1` (generator version 2) preserves the four-party unequal-history and
+competing-branch contract while combining 2–4 reviewed additional restart boundaries with seeded
+recipient request/wakeup ordering and history-repair waves. It uses the same exact expected final
+profile, membership, administrator set and five-message multiset as the cross-route regression.
+It runs through the app adapter and the existing isolated-process adapter. In the process adapter,
+`restart_client` kills a running participant process group (or reopens an already stopped participant)
+and relaunches the same SQLCipher root; the
+explicit process canary validates actual `killed`/`restarted` lifecycle evidence and public outcomes.
+
+These are sampled schedules, not six-entry catalogs. Tests compare 128 seeds after discarding actor
+names and payload values, require at least 100 distinct operation sequences per family, verify
+prefix/replay stability, all four population sizes and capability preflight. Older family generators
+remain unchanged so their saved inputs retain their original meaning. New APIs do not add arbitrary
+packet reordering, separate relay histories, process crashes inside database writes, or virtual time
+to the public app adapter. Transport interruptions currently affect the shared relay as a whole.
+
+### `public-app-large-group/v1`
+
+Generator version 2 is a dedicated public-app companion to the engine pressure catalog. Six indexed
+cases cover bulk/staged formation at 10 (0/1), 20 (2/3) and 50 (4/5) account-device participants.
+Each participant has a production `MarmotAppRuntime`, a separate SQLCipher database and real sockets
+to the harness-owned local Nostr relay. These are requested test sizes, not certified capacity limits.
+The existing engine pressure family and its private oracles remain unchanged.
+
+Bulk formation invites everyone in one create. Staged formation starts with four members and grows
+in seeded batches of 3–5 invitees. Formation failures remain failures; the runner never silently
+switches a bulk case to staged joins or relaxes relay/event-size bounds. Seeds shuffle formation and
+sender order, select the offline cohort, removal target and second administrator, and vary burst size.
+Each case includes one message from every member, a 20% offline cohort, admin/profile changes,
+removal and re-invitation of another member, traffic during exclusion, full cohort history repair,
+two orderly database reopens and fresh traffic from the founder, recovered and re-invited members.
+
+Every member must agree on the exact public roster, administrators and profile, with a common epoch
+at or above the logical mutation floor. Every participant's exact visible payload multiset is checked,
+including exclusion-period privacy. The v3 `public_payload_multiset` assertion reads one snapshot per
+participant/checkpoint rather than a snapshot for every payload. This bounds harness observation work
+without sampling away participant histories. Terminal trace expectations independently pin the same
+histories. Reopens here are orderly app shutdown/reopen; this family does not claim abrupt process kills.
+
+The unified campaign includes all six cases with a 1,800-second per-case budget. For a selected case
+without rerunning earlier indices, use the explicit canary below. Use a new private artifact directory
+every time. Keep production policy enabled (release, no `test-policy-overrides`).
+
+```sh
+MDK_LARGE_APP_CASE=0 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/large-app-10-bulk-1" \
+  cargo test --release --locked -p cgka-conformance-simulator --test app_large_group \
+  large_group_app_canary -- --ignored --exact --nocapture
+```
+
+Change the index to 1–5 for the other size/formation cases. The canary saves the exact input and report,
+then checks that missing/duplicate payloads and incorrect roster/profile observations for every
+participant fail the public oracle. It also tests the whole-history predicate against the real runtime.
+A 200-member app case is deliberately outside this initial catalog.
+
+Large-app generator version 2 adds a verified exclusion-period delivery checkpoint before re-inviting
+the removed member. Version 1 could submit a queued message before re-invitation but publish it after
+re-entry, making its exclusion-history expectation ambiguous. Saved version-1 inputs remain replayable.
+Set `MDK_SCENARIO_PROGRESS=1` to trace action numbers/types during long runs; the large-group canary
+installs the progress subscriber automatically. Other runners must enable the
+`cgka_conformance_simulator::progress=debug` tracing target. Logs omit payloads and participant
+identities. `MDK_REPLAY_SLICE_DIAGNOSTICS=1` adds aggregate reconstruction slice timing and history-drain
+verdicts, delivery counts, and end-of-stored-events coverage to the canary. It does not change policy or deadlines.
+Canary failure reports are saved before bounded cleanup, and extra oracle
+mutation queries are performed only after successful workloads.
+Set `MDK_RETAIN_FAILED_APP_FIXTURE=1` to retain stopped synthetic app roots on failure. After successful cleanup,
+`retained-fixture/manifest.json` names the retained private roots and `relay-publications.json` preserves admitted
+relay events. These artifacts and roots contain sensitive replay material; keep them private, never commit them,
+and use copies for subsequent diagnosis. Retention does not claim a checkpoint taken before the failed action.
+
+`app_history_repair_diagnostic::large_app_history_prefix_diagnostic` is an ignored diagnostic target.
+Set `MDK_APP_DIAGNOSTIC_INPUT` to the saved case-4 generated input, `MDK_SCENARIO_PROGRESS=1`, and
+`MDK_APP_JOURNEY_ARTIFACTS` to a nonexistent directory. It executes unchanged actions 0–254 and their
+assertions, then retains stopped roots and relay publications on either outcome. It preserves both the original
+input and selected prefix; it omits the unexecuted suffix's final oracles and must not count as a family pass.
+The same target's ignored `retained_history_repair_diagnostic` reopens one private marked root copy against
+the retained relay publication history at its original loopback port. Set `MDK_RETAINED_APP_ROOT` to the copy
+and `MDK_RETAINED_RELAY_FIXTURE` to the retained-fixture directory; the original relay must be stopped.
+It records up to three repair attempts in the copy's `history-repair-attempts.json`. Success proves a new
+attempt can finish after restart, not that the original repair or full scenario succeeded.
+
+The ignored `diagnose_retained_app_replay` test can reopen one stopped synthetic app fixture for a short reconstruction
+observation. Set `MDK_RETAINED_APP_ROOT` to a private copy containing the `replay-diagnostic-fixture` marker. It uses
+normal runtime policy and a new local relay; it mutates that copy and is diagnostic evidence, not a full scenario pass.

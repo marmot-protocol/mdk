@@ -100,6 +100,9 @@ jobs:
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh
 
+      - name: Public app campaign contract
+        run: python3 -m unittest discover -s scripts/tests -p 'test_app_stack_campaign.py'
+
       - name: CI policy and path-classifier gates
         run: |
           ./scripts/check_convergence_constant_ledger.sh
@@ -403,7 +406,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
 
       - name: Run doctests
         if: matrix.partition == 1

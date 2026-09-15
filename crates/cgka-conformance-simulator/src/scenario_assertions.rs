@@ -16,6 +16,11 @@ pub enum ScenarioPredicateV2 {
         description: String,
         minimum_epoch: u64,
     },
+    /// Exact visible history, including multiplicity, from one public snapshot.
+    PublicPayloadMultiset {
+        client: String,
+        payloads: Vec<String>,
+    },
     ClientState {
         client: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,7 +76,8 @@ impl ScenarioComparison {
 pub enum ScenarioAssertionV2 {
     /// Predicate must hold at this exact action boundary.
     Exactly { predicate: ScenarioPredicateV2 },
-    /// Predicate must hold within a bounded number of deterministic tick rounds.
+    /// Predicate must hold within a bounded number of tick rounds. Real app
+    /// adapters use one-second rounds and a matching wall-clock deadline.
     Eventually {
         predicate: ScenarioPredicateV2,
         max_iterations: usize,
@@ -108,6 +114,10 @@ pub struct ScenarioAssertionObservationV2 {
     pub passed: bool,
     pub samples: usize,
     pub elapsed_virtual_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_wall_ms: Option<u64>,
     pub final_actual: Value,
 }
 

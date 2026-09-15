@@ -54,6 +54,8 @@ pub use connection::{
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
+    MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,
+    SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
     StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,
     StoredMessageDraftSummary,
 };

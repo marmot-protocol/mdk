@@ -316,6 +316,7 @@ struct SharedConnectionInner {
     transaction_owner: Mutex<Option<ThreadId>>,
     transaction_unusable: Mutex<Option<String>>,
     transaction_released: Condvar,
+    post_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// Bumped before every write to `openmls_values` and on every rollback;
     /// see `StorageProvider::mls_write_generation`.
     openmls_writes: AtomicU64,
@@ -336,6 +337,7 @@ impl SharedConnection {
                 transaction_owner: Mutex::new(None),
                 transaction_unusable: Mutex::new(None),
                 transaction_released: Condvar::new(),
+                post_commit: Mutex::new(Vec::new()),
                 openmls_writes: AtomicU64::new(0),
             }),
         }
@@ -432,6 +434,37 @@ impl SharedConnection {
         owner.as_ref().is_some_and(|owner| owner == &current)
     }
 
+    /// Run a wakeup after the owning transaction commits, or immediately when
+    /// called outside a transaction. Callers register only after their local
+    /// savepoint succeeds. Rollback, panic, and failed commits discard wakeups.
+    pub(crate) fn after_commit(&self, callback: impl FnOnce() + Send + 'static) {
+        let owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if owner.as_ref() == Some(&std::thread::current().id()) {
+            self.inner
+                .post_commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Box::new(callback));
+            return;
+        }
+        drop(owner);
+        callback();
+    }
+
+    fn take_post_commit(&self) -> Vec<Box<dyn FnOnce() + Send>> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .post_commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
+    }
+
     pub(crate) fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,
@@ -476,7 +509,11 @@ impl SharedConnection {
         match result {
             Ok(Ok(value)) => match self.execute_transaction_boundary_with_retry("COMMIT") {
                 Ok(()) => {
+                    let callbacks = self.take_post_commit();
                     self.clear_transaction_owner();
+                    for callback in callbacks {
+                        callback();
+                    }
                     Ok(value)
                 }
                 Err(commit_err) => match self.rollback_boundary_with_retry() {
@@ -615,6 +652,7 @@ impl SharedConnection {
             .transaction_owner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.take_post_commit();
         *owner = None;
         self.inner.transaction_released.notify_all();
     }
@@ -633,6 +671,7 @@ impl SharedConnection {
         if unusable.is_none() {
             *unusable = Some(reason.clone());
         }
+        self.take_post_commit();
         *owner = None;
         drop(unusable);
         drop(owner);
@@ -728,6 +767,8 @@ impl fmt::Debug for SqlCipherKey {
 
 #[derive(Clone)]
 pub struct SqliteAccountStorage {
+    pub(crate) draft_commit_observer:
+        Arc<Mutex<Option<crate::message_drafts::revisioned::MessageDraftCommitObserver>>>,
     migrations_applied: usize,
     migration_duration: Duration,
     pub(crate) connection: SharedConnection,
@@ -876,6 +917,7 @@ impl SqliteAccountStorage {
         Ok(Self {
             connection,
             openmls,
+            draft_commit_observer: Default::default(),
             migrations_applied,
             migration_duration,
         })
@@ -1104,6 +1146,13 @@ impl StorageProvider for SqliteAccountStorage {
 
     fn maintenance_storage(&self) -> Option<&dyn cgka_traits::storage::MaintenanceStorage> {
         Some(self)
+    }
+
+    fn group_replay_state_fingerprint(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        crate::storage::snapshots::replay_fingerprint(self, group_id).map(Some)
     }
 
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>

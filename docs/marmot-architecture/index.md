@@ -199,6 +199,9 @@ These are longer working documents. Go here when you need depth, not orientation
 
 ### Current state — facts and analysis
 
+- **Doc:** [`further-context/conversation-drafts.md`](./further-context/conversation-drafts.md)
+  - **What it covers:** C5 M2 revision-safe composer metadata, conditional mutation, durable send handoff and wakeups.
+
 - **Doc:** [`further-context/conversation-opening.md`](./further-context/conversation-opening.md)
   - **What it covers:** C5 M1 bounded storage opening, canonical anchors, read-state readiness and later screen inputs.
 

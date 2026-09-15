@@ -2367,6 +2367,65 @@ impl MarmotAppRuntime {
             .chat_notification_settings(account_ref, group_id_hex)
     }
 
+    pub fn message_draft_attachment_if_revision(
+        &self,
+        account: &str,
+        revision: &crate::MessageDraftRevision,
+        attachment: &str,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.accounts
+            .app
+            .message_draft_attachment_if_revision(account, revision, attachment)
+    }
+    pub fn selected_message_draft(
+        &self,
+        account: &str,
+        group: &str,
+    ) -> Result<crate::SelectedMessageDraft, AppError> {
+        self.accounts.app.selected_message_draft(account, group)
+    }
+    pub fn save_message_draft_if_revision(
+        &self,
+        account: &str,
+        expected: &crate::MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: Vec<MessageDraftAttachment>,
+    ) -> Result<crate::SelectedMessageDraft, AppError> {
+        self.accounts.app.save_message_draft_if_revision(
+            account,
+            expected,
+            content,
+            reply,
+            attachments,
+        )
+    }
+    pub fn clear_message_draft_if_revision(
+        &self,
+        account: &str,
+        expected: &crate::MessageDraftRevision,
+    ) -> Result<crate::SelectedMessageDraft, AppError> {
+        self.accounts
+            .app
+            .clear_message_draft_if_revision(account, expected)
+    }
+    pub fn subscribe_message_draft_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::MessageDraftInvalidation> {
+        self.accounts.app.subscribe_message_draft_changes()
+    }
+    pub async fn send_message_draft(
+        &self,
+        account: &str,
+        group: &GroupId,
+        revision: crate::MessageDraftRevision,
+        attachments: Vec<MediaAttachmentReference>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_message_draft(account, group, revision, attachments)
+            .await
+    }
+
     pub fn message_drafts(&self, account_ref: &str) -> Result<Vec<MessageDraftSummary>, AppError> {
         self.accounts.app.message_drafts(account_ref)
     }

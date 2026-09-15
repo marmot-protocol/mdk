@@ -24,6 +24,10 @@ snapshot, first-unread/latest selection, and scoped anchor recovery after physic
 return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
 [bounded conversation opening](../further-context/conversation-opening.md).
 
+C5 M2 adds selected draft metadata, revision-checked mutations and a send handoff that clears the submitted
+revision atomically with existing outbox acceptance. Newer edits survive; attachment bytes remain keyed reads.
+See [revision-safe conversation drafts](../further-context/conversation-drafts.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
@@ -65,6 +69,11 @@ Legacy permanent markers migrate to a cutoff at migration time. Ordinary `delete
 membership and permits fresh messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
 must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
 network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
+
+Explicit app full-history repair now retains one activation and strict endpoint EOSE coverage across checkpointed
+work quanta, with a 60-second cooperative overall budget and safe-boundary cancellation. Incomplete overflow
+recovery remains durable and generation-checked. Snapshot reads can run during the wait; mutations retain account
+FIFO ordering. This continuation does not isolate engine or network execution from the account worker.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must

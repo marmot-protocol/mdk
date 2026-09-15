@@ -426,6 +426,16 @@ impl AccountDeviceSession {
         })
     }
 
+    /// Forward the host's post-commit storage wakeup to the actual engine
+    /// connection. Projection policy and subscription ownership stay in the host.
+    #[doc(hidden)]
+    pub fn set_message_draft_commit_observer(
+        &self,
+        observer: storage_sqlite::MessageDraftCommitObserver,
+    ) {
+        self.storage.set_message_draft_commit_observer(observer);
+    }
+
     /// Stage timings captured by [`Self::open`]; durations and aggregate
     /// counts only, safe for fixed-bucket telemetry.
     pub fn open_timings(&self) -> &SessionOpenTimings {

@@ -45,6 +45,11 @@ use crate::convergence::BranchCandidate;
 #[path = "openmls_projection/tests.rs"]
 mod graph_tests;
 
+mod resumable;
+pub(crate) use resumable::{
+    CanonicalReplay, PeelReplay, ReplaySlice, candidate_peel_slice, canonicalize_stored_slice,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMlsContentKind {
     Application,
@@ -136,7 +141,7 @@ pub struct OpenMlsCanonicalizationBatch {
     pub now_ms: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredCommitMessage {
     message: TransportMessage,
     source_epoch: u64,
@@ -157,7 +162,7 @@ struct CandidatePathProbe {
     materialized: Option<OpenMlsMaterializedCandidate>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredOpenMlsCandidatePathResult {
     candidate_paths: Vec<OpenMlsCandidatePath>,
     /// Terminal materialized candidates for `candidate_paths`, in the same order. Reusable by
@@ -177,6 +182,8 @@ struct StoredOpenMlsCandidatePathResult {
 struct ReplayBudget {
     remaining: u64,
     consumed: u64,
+    #[cfg(test)]
+    probe_measurements: Vec<(usize, u128)>,
 }
 
 /// Multiplicative slack over the linear `commits × (max_rewind_commits + 1)` probe estimate.
@@ -191,6 +198,8 @@ impl ReplayBudget {
         Self {
             remaining: limit,
             consumed: 0,
+            #[cfg(test)]
+            probe_measurements: Vec::new(),
         }
     }
 
@@ -200,6 +209,8 @@ impl ReplayBudget {
         Self {
             remaining: u64::MAX,
             consumed: 0,
+            #[cfg(test)]
+            probe_measurements: Vec::new(),
         }
     }
 
@@ -442,7 +453,7 @@ impl From<StorageError> for OpenMlsProjectionError {
 /// stamp was persisted at confirm time is realized from its immutable,
 /// commit-addressed canonical-state checkpoint, and its `CommitStaged`
 /// observation is synthesized from that stamp.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PrevalidatedOwnCommits {
     /// Confirm-stamped own `Processed` commits, keyed by wire-bytes digest.
     by_digest: BTreeMap<[u8; 32], cgka_traits::message::OwnCommitConvergenceStamp>,
@@ -847,6 +858,23 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
+    // A probe restores its starting state before this transaction commits.
+    // Joining all temporary OpenMLS writes avoids a durable commit per value;
+    // the guard still restores state for nested/nontransactional backends.
+    storage.with_transaction(|storage| {
+        replay_openmls_messages_probe(storage, group_id, messages, own_commits, profile_policy)
+    })
+}
+
+// Keep the restoration body separate so tests can compare identical replay work
+// with and without the transaction. Production callers enter through the wrapper.
+fn replay_openmls_messages_probe<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
     // RAII: on any unwind path (panic during replay, early error)
     // Drop rolls back + releases. On the happy path we explicitly
@@ -869,9 +897,19 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
         profile_policy,
         None,
     );
+    #[cfg(test)]
+    candidate_branch_peel_halt_tests::panic_after_replay_if_requested();
+    // A crash fixture must successfully process its candidate before signaling
+    // readiness; an invalid fixture must not pass by killing an unchanged probe.
+    if result.is_ok() {
+        crate::test_crash_hooks::pause_if_requested("candidate-replay-after-processing");
+    }
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    if result.is_ok() {
+        crate::test_crash_hooks::pause_if_requested("candidate-replay-after-restoration");
+    }
     result
 }
 
@@ -906,13 +944,20 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             ));
         }
         budget.consume()?;
+        #[cfg(test)]
+        let probe_started = std::time::Instant::now();
         let replay = replay_openmls_messages_prevalidated_output(
             storage,
             group_id,
             &path.messages,
             own_commits,
             profile_policy,
-        )?;
+        );
+        #[cfg(test)]
+        budget
+            .probe_measurements
+            .push((path.messages.len(), probe_started.elapsed().as_micros()));
+        let replay = replay?;
         let observations = replay.observations;
         let mut fork_epoch: Option<u64> = None;
         let mut tip_epoch: Option<u64> = None;
@@ -1173,6 +1218,31 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     Ok(result)
 }
 
+/// Apply one retained application against the already selected live state.
+/// The caller owns the transaction spanning MLS ratchets, disposition and app outbox.
+pub(crate) fn process_current_openmls_application<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    message: &TransportMessage,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    let projection = project_mls_message(&message.payload)?;
+    if projection.kind != OpenMlsContentKind::Application {
+        return Err(OpenMlsProjectionError::UnsupportedMessageKind(
+            projection.kind,
+        ));
+    }
+    Ok(process_openmls_messages_inner(
+        storage,
+        group_id,
+        std::slice::from_ref(message),
+        &PrevalidatedOwnCommits::default(),
+        profile_policy,
+        None,
+    )?
+    .observations)
+}
+
 /// Stored rows classified into the inputs the candidate-path BFS consumes.
 ///
 /// Seeding is shared by the canonicalization pass and by
@@ -1185,6 +1255,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
 /// feeds the next pass more evidence. What must not drift is the classification
 /// itself; a second copy of it would let branch-relative peeling reason about a
 /// differently-shaped graph than the pass that adjudicates it.
+#[derive(Clone, PartialEq, Eq)]
 struct StoredOpenMlsGraphInputs {
     commit_messages: Vec<StoredCommitMessage>,
     pending_messages: Vec<TransportMessage>,
@@ -2186,6 +2257,33 @@ fn capture_candidate_tip_context<S: StorageProvider>(
 // struct would just relocate the same fields.
 #[allow(clippy::too_many_arguments)]
 fn build_stored_openmls_candidate_paths<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    commits: Vec<StoredCommitMessage>,
+    pending_messages: &[TransportMessage],
+    starting_epoch: u64,
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+    budget: &mut ReplayBudget,
+) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
+    let mut search = resumable::CandidateSearch::new(commits, pending_messages, starting_epoch)?;
+    let complete = search.advance(
+        storage,
+        group_id,
+        own_commits,
+        profile_policy,
+        budget,
+        &mut resumable::ReplaySlice::unlimited(),
+    )?;
+    debug_assert!(complete);
+    Ok(search.finish())
+}
+
+// Frozen pre-continuation BFS: deliberately independent of CandidateSearch to
+// detect changes in probe order and deduplication, not just slice-size parity.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_stored_openmls_candidate_paths_reference<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     mut commits: Vec<StoredCommitMessage>,
@@ -3736,7 +3834,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             Sender::Member(index) => Some(*index),
             _ => None,
         };
-        let sender_id = crate::identity::member_id_of_sender(processed.sender(), &mls_group);
+        let sender_id = crate::identity::member_id_of_processed_message(&processed, &mls_group);
 
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
@@ -3984,9 +4082,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let payload = bytes.into_bytes();
                 // Mirror the direct ingest seam (audit item S3): an
-                // application message whose MLS sender does not resolve to a
-                // validated member leaf is never surfaced, so a blank,
-                // unauthenticated author cannot reach the app through the
+                // application message whose authenticated source-epoch sender
+                // does not resolve to a validated member id is never surfaced,
+                // so a blank, unauthenticated author cannot reach the app through the
                 // replay seam (#383). Pushing `Ignored` keeps the message out
                 // of `app_messages_by_id`; canonicalization then classifies
                 // it undecryptable-in-canonical-state and the disposition
@@ -4632,559 +4730,5 @@ mod checkpoint_prefix_tests {
 /// apart is pinned separately, over constructed values, in
 /// `message_processor::ingest`.
 #[cfg(test)]
-mod candidate_branch_peel_halt_tests {
-    use super::{
-        CANDIDATE_REPLAY_BUDGET_FLOOR, CANDIDATE_REPLAY_BUDGET_SLACK, CandidateBranchPeel,
-        ReplayProfilePolicy, candidate_branch_peel, own_commit_checkpoint_id,
-    };
-    use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
-    use crate::convergence::V1_MAX_REWIND_COMMITS;
-    use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
-    use crate::provider::EngineOpenMlsProvider;
-    use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
-    use async_trait::async_trait;
-    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
-    use cgka_traits::error::PeelerError;
-    use cgka_traits::group_context::GroupContextSnapshot;
-    use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-    use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-    use cgka_traits::peeler::TransportPeeler;
-    use cgka_traits::storage::{
-        AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
-    };
-    use cgka_traits::transport::{
-        EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-    };
-    use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-    use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
-    use openmls::group::MlsGroup;
-    use openmls::prelude::{MlsMessageIn, ProcessedMessageContent};
-    use openmls_basic_credential::SignatureKeyPair;
-    use openmls_rust_crypto::RustCrypto;
-    use openmls_traits::OpenMlsProvider as _;
-    use sha2::{Digest, Sha256};
-    use std::sync::Arc;
-    use storage_sqlite::SqliteAccountStorage;
-    use tls_codec::{Deserialize as _, Serialize as _};
-
-    // --- Test devices --------------------------------------------------------
-
-    /// Deterministic BIP-340 key for a seed label. Marmot credential identities
-    /// MUST be a valid 32-byte x-only secp256k1 public key, so identities are
-    /// derived rather than invented.
-    fn signing_key(seed: &[u8]) -> SigningKey {
-        for counter in 0u64.. {
-            let mut material = [0u8; 32];
-            let mut hasher = Sha256::new();
-            hasher.update(b"cgka-engine-test-identity-v1");
-            hasher.update(seed);
-            hasher.update(counter.to_be_bytes());
-            material.copy_from_slice(&hasher.finalize());
-            if let Ok(key) = SigningKey::from_bytes(&material) {
-                return key;
-            }
-        }
-        unreachable!("a signing key is found within u64 counters")
-    }
-
-    fn member_id(seed: &[u8]) -> MemberId {
-        MemberId::new(signing_key(seed).verifying_key().to_bytes().to_vec())
-    }
-
-    struct SeedProofSigner(SigningKey);
-
-    impl AccountIdentityProofSigner for SeedProofSigner {
-        fn sign_account_identity_proof(
-            &self,
-            request: &AccountIdentityProofRequest,
-        ) -> Result<[u8; 64], String> {
-            Ok(self
-                .0
-                .sign_prehash(&request.proof_event_id()?)
-                .map_err(|e| e.to_string())?
-                .to_bytes())
-        }
-    }
-
-    /// Transport is not under test here: every message is carried verbatim.
-    struct PassthroughPeeler;
-
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    impl TransportPeeler for PassthroughPeeler {
-        async fn peel_group_message(
-            &self,
-            msg: &TransportMessage,
-            _ctx: &GroupContextSnapshot,
-        ) -> Result<PeeledMessage, PeelerError> {
-            Ok(PeeledMessage {
-                id: msg.id.clone(),
-                group_id: None,
-                sender: None,
-                content: PeeledContent::MlsMessage {
-                    bytes: msg.payload.clone(),
-                },
-                origin: msg.clone(),
-            })
-        }
-
-        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-            Ok(PeeledMessage {
-                id: msg.id.clone(),
-                group_id: None,
-                sender: None,
-                content: PeeledContent::Welcome {
-                    created_at: None,
-                    bytes: msg.payload.clone(),
-                },
-                origin: msg.clone(),
-            })
-        }
-
-        async fn wrap_group_message(
-            &self,
-            payload: &EncryptedPayload,
-            _ctx: &GroupContextSnapshot,
-        ) -> Result<TransportMessage, PeelerError> {
-            Ok(transport_message(
-                &payload.ciphertext,
-                TransportEnvelope::GroupMessage {
-                    transport_group_id: vec![],
-                },
-            ))
-        }
-
-        async fn wrap_welcome(
-            &self,
-            payload: &EncryptedPayload,
-            recipient: &MemberId,
-        ) -> Result<TransportMessage, PeelerError> {
-            Ok(transport_message(
-                &payload.ciphertext,
-                TransportEnvelope::Welcome {
-                    recipient: recipient.clone(),
-                },
-            ))
-        }
-    }
-
-    fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
-        TransportMessage {
-            id: MessageId::new(Sha256::digest(payload).to_vec()),
-            payload: payload.to_vec(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("candidate-branch-peel-test".into()),
-            envelope,
-        }
-    }
-
-    fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
-        let engine = EngineBuilder::new(storage.clone())
-            .legacy_compatibility_profile()
-            .identity(member_id(seed).as_slice().to_vec())
-            .account_identity_proof_signer(Arc::new(SeedProofSigner(signing_key(seed))))
-            .peeler(Box::new(PassthroughPeeler))
-            .build()
-            .unwrap();
-        (engine, storage)
-    }
-
-    async fn group_with(
-        creator: &mut Engine<SqliteAccountStorage>,
-        joiners: &mut [&mut Engine<SqliteAccountStorage>],
-    ) -> GroupId {
-        let mut key_packages = Vec::new();
-        for joiner in joiners.iter_mut() {
-            key_packages.push(joiner.fresh_key_package().await.unwrap());
-        }
-        let (group_id, created) = creator
-            .create_group(CreateGroupRequest {
-                name: "candidate branch peel".into(),
-                description: String::new(),
-                members: key_packages,
-                required_features: vec![],
-                app_components: vec![],
-                initial_admins: vec![creator.self_id()],
-            })
-            .await
-            .unwrap();
-        let SendResult::GroupCreated { pending, welcomes } = created else {
-            panic!("expected GroupCreated");
-        };
-        creator.confirm_published(pending).await.unwrap();
-        for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-            joiner.join_welcome(welcome).await.unwrap();
-        }
-        group_id
-    }
-
-    #[tokio::test]
-    async fn graph_seed_keeps_stale_commits() {
-        let (mut alice, storage) = build_client(b"graph-seed");
-        let (mut bob, _) = build_client(b"graph-seed-peer");
-        let group_id = group_with(&mut alice, &mut [&mut bob]).await;
-        let epoch = storage.get_group(&group_id).unwrap().epoch.0;
-        let commit = rival_commit(&storage, &alice.self_id(), &group_id);
-        admit_rival(&storage, &group_id, &commit, epoch);
-
-        let retained =
-            super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch, None).unwrap();
-        assert!(
-            retained
-                .commit_messages
-                .iter()
-                .any(|row| row.message.id == commit.id)
-        );
-        let stale =
-            super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch + 1, None).unwrap();
-        assert!(stale.commit_messages.is_empty());
-        assert!(stale.stale_commit_drops.iter().any(|row| {
-            row.message_id == hex::encode(commit.id.as_slice())
-                && row.reason == super::DroppedMessageReason::BeyondAnchor
-        }));
-        // Seeding classifies; only canonical apply may persist the verdict.
-        assert_eq!(
-            storage.get_message(&commit.id).unwrap().state,
-            MessageState::ConvergenceDeferred
-        );
-    }
-
-    // --- Graph fixtures ------------------------------------------------------
-
-    /// Grind one more valid commit out of a device's live state without
-    /// advancing it: the pending commit is cleared, so the next call forks from
-    /// the same epoch again. This is how a wide same-epoch fork is built.
-    fn rival_commit(
-        storage: &SqliteAccountStorage,
-        sender: &MemberId,
-        group_id: &GroupId,
-    ) -> TransportMessage {
-        let crypto = RustCrypto::default();
-        let provider =
-            EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
-        let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
-            .expect("load rival MLS group")
-            .expect("rival has group state");
-        let binding = storage
-            .account_device_signer(sender)
-            .expect("load signer binding")
-            .expect("signer binding exists");
-        let signer = SignatureKeyPair::read(
-            storage.mls_storage(),
-            &binding.mls_signature_public_key,
-            DEFAULT_CIPHERSUITE.signature_algorithm(),
-        )
-        .expect("MLS signer exists");
-
-        let bundle = mls_group
-            .commit_builder()
-            .load_psks(provider.storage())
-            .expect("load PSKs")
-            .build(provider.rand(), provider.crypto(), &signer, |_| true)
-            .expect("build rival self-update commit")
-            .stage_commit(&provider)
-            .expect("stage rival self-update commit");
-        let (commit, _welcome, _group_info) = bundle.into_contents();
-        let bytes = commit
-            .tls_serialize_detached()
-            .expect("serialize rival self-update commit");
-        mls_group
-            .clear_pending_commit(provider.storage())
-            .expect("clear the rival's pending commit");
-
-        transport_message(
-            &bytes,
-            TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
-            },
-        )
-    }
-
-    /// Apply a commit to a device's stored state, putting it on that branch.
-    /// Grinding successors out of a device ([`rival_commit`]) needs it standing
-    /// where those successors fork from.
-    fn adopt_branch(storage: &SqliteAccountStorage, group_id: &GroupId, commit: &TransportMessage) {
-        let crypto = RustCrypto::default();
-        let provider =
-            EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
-        let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
-            .expect("load adopting MLS group")
-            .expect("adopter has group state");
-        let message = MlsMessageIn::tls_deserialize_exact(commit.payload.as_slice())
-            .expect("adopted commit deserializes")
-            .try_into_protocol_message()
-            .expect("adopted commit is a protocol message");
-        let processed = mls_group
-            .process_message(&provider, message)
-            .expect("adopted commit processes");
-        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
-            panic!("expected a staged commit");
-        };
-        mls_group
-            .merge_staged_commit(&provider, *staged)
-            .expect("merge the adopted commit");
-
-        let mut group = storage.get_group(group_id).unwrap();
-        group.epoch = EpochId(mls_group.epoch().as_u64());
-        storage.put_group(&group).unwrap();
-    }
-
-    /// Admit a rival commit into the observer's graph in the state ingest
-    /// leaves behind for a peeled commit that convergence has not adjudicated.
-    fn admit_rival(
-        storage: &SqliteAccountStorage,
-        group_id: &GroupId,
-        commit: &TransportMessage,
-        source_epoch: u64,
-    ) {
-        storage
-            .put_message(&MessageRecord {
-                id: commit.id.clone(),
-                group_id: group_id.clone(),
-                epoch: EpochId(source_epoch),
-                state: MessageState::ConvergenceDeferred,
-                payload: StoredMessagePayload::openmls_wire(commit.clone())
-                    .encode()
-                    .unwrap(),
-                deferred_peel: None,
-            })
-            .unwrap();
-    }
-
-    /// Survey the observer's graph exactly as the deferred-peel sweep does,
-    /// under the rewind allowance the caller wants to give enumeration.
-    fn peel(
-        storage: &SqliteAccountStorage,
-        group_id: &GroupId,
-        max_rewind_commits: u64,
-    ) -> CandidateBranchPeel {
-        let epoch = storage.get_group(group_id).unwrap().epoch.0;
-        candidate_branch_peel(
-            storage,
-            group_id,
-            epoch.saturating_sub(max_rewind_commits),
-            max_rewind_commits,
-            ReplayProfilePolicy::default(),
-            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
-        )
-        .expect("a branch survey over healthy storage")
-    }
-
-    // --- The halts -----------------------------------------------------------
-
-    #[tokio::test]
-    async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
-        let (mut alice, alice_storage) = build_client(b"peel-halt-alice");
-        let (mut bob, bob_storage) = build_client(b"peel-halt-bob");
-        let group_id = group_with(&mut alice, &mut [&mut bob]).await;
-
-        // Alice commits at epoch 1 and advances; Bob forks from the same epoch.
-        let own_commit = match alice
-            .send(SendIntent::SelfUpdate {
-                group_id: group_id.clone(),
-            })
-            .await
-            .unwrap()
-        {
-            SendResult::GroupEvolution { msg, pending, .. } => {
-                alice.confirm_published(pending).await.unwrap();
-                msg
-            }
-            other => panic!("expected GroupEvolution, got {other:?}"),
-        };
-        assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
-        let rival = rival_commit(&bob_storage, &member_id(b"peel-halt-bob"), &group_id);
-        admit_rival(&alice_storage, &group_id, &rival, 1);
-
-        // Control: with the checkpoint in place both branches materialize, so
-        // the halt below is what empties the contexts — not a graph that never
-        // had two branches to enumerate.
-        let enumerated = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
-        assert!(enumerated.contested);
-        assert!(
-            enumerated.contexts.len() > 1,
-            "a two-way epoch-1 fork offers a context per branch"
-        );
-
-        // MLS cannot replay this device's own path-bearing commit from the
-        // public wire echo, so losing its post-merge checkpoint costs
-        // enumeration the branch it is standing on.
-        let checkpoint = own_commit_checkpoint_id(&alice_storage, &own_commit.id).unwrap();
-        alice_storage
-            .release_group_state_checkpoint(&group_id, &checkpoint)
-            .unwrap();
-
-        let halted = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
-        assert!(
-            halted.contexts.is_empty(),
-            "a missing own-commit checkpoint must halt enumeration"
-        );
-        assert!(
-            halted.contested,
-            "the fork is in the stored graph, not in what enumeration managed to read"
-        );
-    }
-
-    /// A same-epoch fork wide enough that probing it costs more replays than
-    /// the enumeration budget allows.
-    ///
-    /// Every rival at the fork epoch becomes a frontier path, and every commit
-    /// at the next epoch is probed against every one of those paths: the budget
-    /// is linear in the commit count, the probes are its product.
-    const WIDTH: usize = 10;
-    const DEPTH: usize = 13;
-
-    /// `WIDTH * (1 + DEPTH)` probes against the smallest budget a legal rewind
-    /// allowance can produce. Held at compile time so that raising either
-    /// budget constant lands here, with the arithmetic in view, rather than as
-    /// a mystifying empty-context assertion.
-    const _: () = assert!(
-        (WIDTH * (1 + DEPTH)) as u64
-            > CANDIDATE_REPLAY_BUDGET_SLACK * (WIDTH + DEPTH) as u64
-                + CANDIDATE_REPLAY_BUDGET_FLOOR
-    );
-
-    #[tokio::test]
-    async fn an_exhausted_replay_budget_halts_enumeration_and_keeps_the_fork() {
-        let (mut alice, alice_storage) = build_client(b"peel-budget-alice");
-        let (mut bob, bob_storage) = build_client(b"peel-budget-bob");
-        let (mut carol, carol_storage) = build_client(b"peel-budget-carol");
-        let group_id = group_with(&mut alice, &mut [&mut bob, &mut carol]).await;
-
-        // Bob forks the epoch WIDTH ways. Alice never leaves epoch 1, so every
-        // rival is a branch she has to enumerate.
-        let bob_id = member_id(b"peel-budget-bob");
-        let mut fork = Vec::new();
-        for _ in 0..WIDTH {
-            let commit = rival_commit(&bob_storage, &bob_id, &group_id);
-            admit_rival(&alice_storage, &group_id, &commit, 1);
-            fork.push(commit);
-        }
-
-        // Carol adopts one branch and commits on it DEPTH times. Those commits
-        // are valid only on that branch, but enumeration cannot know that
-        // without probing each of them against every branch.
-        adopt_branch(&carol_storage, &group_id, &fork[0]);
-        assert_eq!(
-            carol_storage.get_group(&group_id).unwrap().epoch,
-            EpochId(2)
-        );
-        let carol_id = member_id(b"peel-budget-carol");
-        for _ in 0..DEPTH {
-            let commit = rival_commit(&carol_storage, &carol_id, &group_id);
-            admit_rival(&alice_storage, &group_id, &commit, 2);
-        }
-
-        // Control: the same graph under the production rewind allowance has
-        // budget to spare, so it enumerates instead of halting.
-        let enumerated = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
-        assert!(enumerated.contested);
-        assert!(
-            enumerated.contexts.len() > 1,
-            "a {WIDTH}-way fork offers a context per branch"
-        );
-
-        let halted = peel(&alice_storage, &group_id, 0);
-        assert!(
-            halted.contexts.is_empty(),
-            "an exhausted replay budget must halt enumeration"
-        );
-        assert!(
-            halted.contested,
-            "the fork is in the stored graph, not in what enumeration managed to read"
-        );
-    }
-
-    // --- The cap -------------------------------------------------------------
-
-    /// The epoch every device in these fixtures is standing on when the fork
-    /// happens, so a one-commit branch tips at `FORK_EPOCH + 1` and the
-    /// two-commit branch at `FORK_EPOCH + 2`.
-    const FORK_EPOCH: u64 = 1;
-
-    /// Wide enough that the surviving branches outnumber the cap: one rival per
-    /// width, minus the one Carol extends, plus her deeper branch.
-    const WIDE_FORK_WIDTH: usize = MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS + 2;
-
-    /// A fork wider than the cap, with one branch carried a commit deeper, as
-    /// stored by two devices that never left the fork epoch.
-    ///
-    /// Bob forks [`WIDE_FORK_WIDTH`] ways and Carol adopts one rival and commits
-    /// on it, so each observer holds `WIDE_FORK_WIDTH - 1` one-commit branches
-    /// plus one two-commit branch. Both observers are given the same evidence,
-    /// which is what lets a peer comparison mean anything.
-    async fn wide_fork_with_one_deep_branch()
-    -> (GroupId, SqliteAccountStorage, SqliteAccountStorage) {
-        let (mut alice, alice_storage) = build_client(b"peel-rank-alice");
-        let (mut bob, bob_storage) = build_client(b"peel-rank-bob");
-        let (mut carol, carol_storage) = build_client(b"peel-rank-carol");
-        let (mut dave, dave_storage) = build_client(b"peel-rank-dave");
-        let group_id = group_with(&mut alice, &mut [&mut bob, &mut carol, &mut dave]).await;
-
-        let bob_id = member_id(b"peel-rank-bob");
-        let mut fork = Vec::new();
-        for _ in 0..WIDE_FORK_WIDTH {
-            let commit = rival_commit(&bob_storage, &bob_id, &group_id);
-            for observer in [&alice_storage, &dave_storage] {
-                admit_rival(observer, &group_id, &commit, FORK_EPOCH);
-            }
-            fork.push(commit);
-        }
-
-        adopt_branch(&carol_storage, &group_id, &fork[0]);
-        let deeper = rival_commit(&carol_storage, &member_id(b"peel-rank-carol"), &group_id);
-        for observer in [&alice_storage, &dave_storage] {
-            admit_rival(observer, &group_id, &deeper, FORK_EPOCH + 1);
-        }
-
-        (group_id, alice_storage, dave_storage)
-    }
-
-    fn branch_ids(survey: &CandidateBranchPeel) -> Vec<String> {
-        survey
-            .contexts
-            .iter()
-            .map(|context| context.branch_id.clone())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn a_fork_wider_than_the_cap_keeps_the_same_branches_on_every_peer() {
-        let (group_id, alice_storage, dave_storage) = wide_fork_with_one_deep_branch().await;
-
-        let alice = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
-        let dave = peel(&dave_storage, &group_id, V1_MAX_REWIND_COMMITS);
-
-        assert!(alice.contested && dave.contested);
-        assert_eq!(
-            alice.contexts.len(),
-            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
-            "a graph offering more branches than the cap must fill it exactly"
-        );
-        assert_eq!(
-            branch_ids(&alice),
-            branch_ids(&dave),
-            "the capped subset is content-derived, so peers holding the same \
-             evidence must keep the same branches in the same order"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_deeper_branch_outranks_shallow_rivals_for_the_capped_contexts() {
-        let (group_id, alice_storage, _dave_storage) = wide_fork_with_one_deep_branch().await;
-
-        let survey = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
-
-        assert_eq!(
-            survey.contexts.iter().map(|c| c.tip_epoch).max(),
-            Some(FORK_EPOCH + 2),
-            "a branch carried two commits deep holds traffic the one-commit \
-             rivals cannot unseal, so filling the cap with rivals must not \
-             evict it"
-        );
-    }
-}
+#[path = "openmls_projection/tests/candidate_replay.rs"]
+mod candidate_branch_peel_halt_tests;

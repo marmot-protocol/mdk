@@ -9,7 +9,8 @@ use std::{collections::BTreeMap, error::Error, path::Path, time::Duration};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeObservationV1, ConcurrentMutation, ConcurrentMutationReport,
     ConvergenceSubject, SubjectCreateGroup, SubjectError, SubjectFailureCategory,
-    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
+    SubjectInviteMembers, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
+    SubjectUpdateGroupData,
 };
 use serde_json::json;
 
@@ -40,6 +41,8 @@ type Timeline = BTreeMap<String, Vec<String>>;
 #[derive(Clone, Copy, Debug)]
 enum Journey {
     TwoGroups,
+    TwoGroupRecovery,
+    OfflineRemovalReentry,
     ConcurrentProfileEdits { strict: bool },
     ConcurrentInviteAndRename { strict: bool },
     RemovedWhileOffline,
@@ -51,6 +54,8 @@ impl Journey {
     fn label(self) -> &'static str {
         match self {
             Self::TwoGroups => "two_groups",
+            Self::TwoGroupRecovery => "two_group_recovery",
+            Self::OfflineRemovalReentry => "offline_removal_reentry",
             Self::LeaveWithSeveralRemaining { strict: false } => "leave_with_several_remaining",
             Self::LeaveWithSeveralRemaining { strict: true } => {
                 "leave_with_several_remaining_strict"
@@ -172,13 +177,24 @@ async fn expect_timeline(
     out: &Path,
     checkpoint: &str,
 ) -> TestResult<Vec<AppRuntimeObservationV1>> {
+    expect_timeline_with_members(subject, group, expected, out, checkpoint, expected.len()).await
+}
+
+async fn expect_timeline_with_members(
+    subject: &mut AppRuntimeHarness,
+    group: &str,
+    expected: &Timeline,
+    out: &Path,
+    checkpoint: &str,
+    members: usize,
+) -> TestResult<Vec<AppRuntimeObservationV1>> {
     let clients = expected.keys().cloned().collect::<Vec<_>>();
     let deadline = tokio::time::Instant::now() + SETTLEMENT;
     loop {
         subject.select_scenario_group(group, false)?;
         subject.catch_up(&clients).await?;
         let observations = subject.observations(&clients).await?;
-        if complete(&observations, expected, clients.len()) {
+        if complete(&observations, expected, members) {
             save(out, checkpoint, &observations)?;
             return Ok(observations);
         }
@@ -340,6 +356,130 @@ async fn two_groups(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
     expect_timeline(subject, "work", &work, out, "work-terminal.json")
         .await
         .map(|_| ())
+}
+
+/// Bob recovers two groups through the same account worker and database. A
+/// retained work backlog and a removal compete with a live side conversation.
+/// Side traffic is checked throughout recovery, not
+/// merely after the work group has settled.
+async fn two_group_recovery(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
+    create_group(
+        subject,
+        "work",
+        &labels(&["bob", "carol"]),
+        &labels(&["alice"]),
+    )
+    .await?;
+    create_group(
+        subject,
+        "pair",
+        &labels(&["bob", "carol"]),
+        &labels(&["alice"]),
+    )
+    .await?;
+    let mut work = labels(&["alice", "bob", "carol"])
+        .into_iter()
+        .map(|c| (c, Vec::new()))
+        .collect::<Timeline>();
+    let mut pair = labels(&["alice", "bob", "carol"])
+        .into_iter()
+        .map(|c| (c, Vec::new()))
+        .collect::<Timeline>();
+    send(subject, "work", "bob", "work-before-offline").await?;
+    push_all(&mut work, "work-before-offline");
+    expect_timeline(subject, "work", &work, out, "work-before-offline.json").await?;
+    subject.set_online("bob", false).await?;
+    let mut carol_history = Vec::new();
+    for index in 0..64 {
+        if index == 32 {
+            subject.select_scenario_group("work", false)?;
+            subject
+                .remove_members(SubjectRemoveMembers {
+                    action_id: "work-remove-carol",
+                    remover: "alice",
+                    members: &labels(&["carol"]),
+                    pending: "work-remove-carol",
+                })
+                .await?;
+            subject.tick(&labels(&["alice", "carol"])).await?;
+            carol_history = work.remove("carol").unwrap();
+            subject
+                .update_group_data(SubjectUpdateGroupData {
+                    action_id: "work-rename",
+                    client: "alice",
+                    name: Some("recovered work"),
+                    description: Some("pair remains independent"),
+                    pending: "work-rename",
+                })
+                .await?;
+        }
+        let payload = format!("work-backlog-{index}");
+        send(subject, "work", "alice", &payload).await?;
+        push_all(&mut work, &payload);
+        if index % 4 == 0 {
+            let payload = format!("pair-during-backlog-{index}");
+            send(subject, "pair", "carol", &payload).await?;
+            push_all(&mut pair, &payload);
+            let online_pair = pair
+                .iter()
+                .filter(|(client, _)| client.as_str() != "bob")
+                .map(|(client, messages)| (client.clone(), messages.clone()))
+                .collect();
+            expect_timeline_with_members(subject, "pair", &online_pair, out, "pair-live.json", 3)
+                .await?;
+        }
+    }
+    subject.reopen("bob").await?;
+    subject.select_scenario_group("work", false)?;
+    subject.repair_full_history(&labels(&["bob"])).await?;
+    // Reopen after the first repair request, before asserting completion.
+    // Real scheduling may already have finished the repair on a fast host.
+    subject.reopen("bob").await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut pass = 0;
+    loop {
+        let payload = format!("pair-during-recovery-{pass}");
+        send(subject, "pair", "carol", &payload).await?;
+        push_all(&mut pair, &payload);
+        expect_timeline(subject, "pair", &pair, out, "pair-live.json").await?;
+        subject.select_scenario_group("work", false)?;
+        subject.repair_full_history(&labels(&["bob"])).await?;
+        subject.catch_up(&labels(&["alice", "bob"])).await?;
+        let observations = subject.observations(&labels(&["alice", "bob"])).await?;
+        save(out, "work-recovery.json", &observations)?;
+        if complete(&observations, &work, 2)
+            && observations.iter().all(|o| {
+                o.protocol.group_name == "recovered work"
+                    && o.protocol.group_description == "pair remains independent"
+                    && o.protocol.member_identities == labels(&["alice", "bob"])
+            })
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("work group did not recover while pair traffic continued".into());
+        }
+        pass += 1;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    subject.catch_up(&labels(&["carol"])).await?;
+    let carol = subject.observations(&labels(&["carol"])).await?;
+    save(out, "removed-carol.json", &carol)?;
+    if multiset(&carol[0].application.visible_plaintexts) != multiset(&carol_history) {
+        return Err("removed member's work history changed during pair traffic".into());
+    }
+    fresh_traffic_and_reopen(subject, "work", &mut work, "alice", out, "work").await?;
+    expect_timeline(subject, "pair", &pair, out, "pair-after-shared-reopen.json").await?;
+    fresh_traffic_and_reopen(subject, "pair", &mut pair, "carol", out, "pair").await?;
+    let pair_states = expect_timeline(subject, "pair", &pair, out, "pair-terminal.json").await?;
+    if pair_states.iter().any(|o| {
+        o.protocol.group_name != "pair group"
+            || o.protocol.member_identities != labels(&["alice", "bob", "carol"])
+    }) {
+        return Err("work mutations changed the pair group".into());
+    }
+    expect_timeline(subject, "work", &work, out, "work-terminal.json").await?;
+    Ok(())
 }
 
 /// Whether every settled observation carries the edit.
@@ -681,7 +821,11 @@ async fn concurrent_invite_and_rename(
 /// must learn the removal from relay history alone: no post-removal plaintext
 /// may ever appear on it, its own sends must be refused, and the remaining
 /// members' timelines must stay exact.
-async fn removed_while_offline(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
+async fn removed_while_offline(
+    subject: &mut AppRuntimeHarness,
+    out: &Path,
+    rejoin: bool,
+) -> TestResult {
     let clients = labels(&["alice", "bob", "carol"]);
     create_group(
         subject,
@@ -781,6 +925,28 @@ async fn removed_while_offline(subject: &mut AppRuntimeHarness, out: &Path) -> T
     if multiset(&carol.application.visible_plaintexts) != multiset(&carol_history) {
         return Err("removed member's history changed after reopen".into());
     }
+    if rejoin {
+        // Reopen the inviter too: both sides must use durable state and a
+        // fresh KeyPackage, not the old consumed Welcome or cached staging.
+        subject.reopen("alice").await?;
+        subject
+            .invite_members(SubjectInviteMembers {
+                action_id: "reinvite-carol",
+                inviter: "alice",
+                invitees: &labels(&["carol"]),
+                pending: "reinvite-carol",
+            })
+            .await?;
+        subject.tick(&clients).await?;
+        expected.insert("carol".into(), carol_history);
+        expect_timeline(subject, "main", &expected, out, "rejoined.json").await?;
+        // The exact per-recipient histories continue to exclude every message
+        // sent during Carol's absence, before and after her next reopen.
+        fresh_traffic_and_reopen(subject, "main", &mut expected, "carol", out, "rejoin").await?;
+        send(subject, "main", "carol", "rejoined-after-reopen").await?;
+        push_all(&mut expected, "rejoined-after-reopen");
+        expect_timeline(subject, "main", &expected, out, "rejoin-terminal.json").await?;
+    }
     Ok(())
 }
 
@@ -813,9 +979,9 @@ async fn leave_with_several_remaining(
     expect_timeline(subject, "main", &expected, out, "before.json").await?;
 
     subject.select_scenario_group("main", false)?;
-    let admitted_before_leave = subject.relay_admitted_events().await;
+    let admitted_before_leave = subject.relay_admitted_events().await?;
     subject.leave("leave-david", "david").await?;
-    let admitted_after_leave = subject.relay_admitted_events().await;
+    let admitted_after_leave = subject.relay_admitted_events().await?;
     let remaining = labels(&["alice", "bob", "carol"]);
     // The survivors' runtimes learn the proposal from their live subscriptions;
     // the engine schedules the auto-commit within 50 ms. Poll slowly so the
@@ -840,7 +1006,7 @@ async fn leave_with_several_remaining(
                 "seconds_since_leave": left_at.elapsed().as_secs(),
                 "admitted_before_leave": admitted_before_leave,
                 "admitted_after_leave": admitted_after_leave,
-                "admitted_now": subject.relay_admitted_events().await,
+                "admitted_now": subject.relay_admitted_events().await?,
                 "survivors": observations,
                 "leaver": leaver,
             }),
@@ -1025,9 +1191,19 @@ async fn check(journey: Journey) {
         _ => AppRuntimeHarness::new_with_pinned_settlement(&clients).await,
     }
     .expect("public runtime setup");
+    save(
+        artifacts.path(),
+        "execution-layout.json",
+        &subject.process_layout(),
+    )
+    .unwrap();
     let exercise = async {
         match journey {
             Journey::TwoGroups => two_groups(&mut subject, artifacts.path()).await,
+            Journey::TwoGroupRecovery => two_group_recovery(&mut subject, artifacts.path()).await,
+            Journey::OfflineRemovalReentry => {
+                removed_while_offline(&mut subject, artifacts.path(), true).await
+            }
             Journey::ConcurrentProfileEdits { strict } => {
                 concurrent_profile_edits(&mut subject, artifacts.path(), strict).await
             }
@@ -1035,7 +1211,7 @@ async fn check(journey: Journey) {
                 concurrent_invite_and_rename(&mut subject, artifacts.path(), strict).await
             }
             Journey::RemovedWhileOffline => {
-                removed_while_offline(&mut subject, artifacts.path()).await
+                removed_while_offline(&mut subject, artifacts.path(), false).await
             }
             Journey::LeaveWithSeveralRemaining { strict } => {
                 leave_with_several_remaining(&mut subject, artifacts.path(), strict).await
@@ -1057,7 +1233,7 @@ async fn check(journey: Journey) {
             close_errors.push(error.to_string());
         }
     }
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     drop(subject);
     save(
         artifacts.path(),
@@ -1088,6 +1264,14 @@ macro_rules! journey_test {
 }
 
 journey_test!(public_app_07_two_groups_stay_isolated, Journey::TwoGroups);
+journey_test!(
+    public_app_13_offline_removal_then_rejoin_preserves_history,
+    Journey::OfflineRemovalReentry
+);
+journey_test!(
+    public_app_14_two_groups_recover_without_starving_live_traffic,
+    Journey::TwoGroupRecovery
+);
 // Strict since #1734: a losing profile edit is re-issued when the winning
 // commit left its field untouched, so an edit the runtime reported as saved
 // reaches the settled public state.

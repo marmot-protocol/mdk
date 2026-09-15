@@ -20,7 +20,8 @@ App runtime bridge for the first real Marmot app surfaces.
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
-  the cursor unit tests), `projection.rs` (timeline/group projection accessors, the `*_for_group` component reads, the
+  the cursor unit tests; `sync/full_history_tests.rs` covers explicit repair continuation), `projection.rs`
+  (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
   and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
@@ -129,6 +130,12 @@ App runtime bridge for the first real Marmot app surfaces.
 - Incoming welcomes may auto-join MLS state, but app projections must preserve local confirmation state. Pending invites
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
+- Explicit full-history repair keeps one unfloored relay activation and its endpoint EOSE coverage across drain
+  quanta; a quantum yield is not completion or a new subscription. Keep cancellation/deadline checks cooperative
+  around completed ingest/checkpoint work, and preserve generation-checked overflow marker clearing. The account
+  worker can serve committed snapshot reads while repair waits; mutations retain FIFO order. Client continuation
+  tests live in `src/client/sync/full_history_tests.rs`; worker cancellation/read-order tests stay in
+  `src/runtime/account_worker.rs`. See the README for the automatic-recovery and send-fairness limits.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
   host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through

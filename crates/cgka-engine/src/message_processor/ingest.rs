@@ -9,7 +9,7 @@
 use super::{DeferredPeelPayloadPreparationError, content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
-use crate::identity::member_id_of_sender;
+use crate::identity::{member_id_of_processed_message, member_id_of_sender};
 use crate::openmls_projection::{
     CandidateBranchPeel, CandidateBranchPeelContext, OpenMlsContentKind,
     process_commit_with_app_data_updates, project_mls_message,
@@ -1249,7 +1249,7 @@ impl<S: StorageProvider> Engine<S> {
             Sender::Member(index) => Some(*index),
             _ => None,
         };
-        let sender_id = member_id_of_sender(processed.sender(), &mls_group);
+        let sender_id = member_id_of_processed_message(&processed, &mls_group);
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let Some(sender) = sender_id else {
@@ -2589,7 +2589,14 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
         let result = self
-            .converge_stored_openmls_messages_with_time(&group_id, now)
+            .converge_stored_openmls_messages_with_deadline(
+                &group_id,
+                now,
+                Some(
+                    web_time::Instant::now()
+                        + std::time::Duration::from_millis(super::BACKGROUND_CONVERGENCE_BUDGET_MS),
+                ),
+            )
             .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
         Ok(convergence_ingest_outcome(
             &result,

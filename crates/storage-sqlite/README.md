@@ -27,11 +27,25 @@ The crate is split around storage concerns:
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
   tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
+## Replay-state validation
+
+`group_replay_state_fingerprint` captures a consistent read of the same live canonical/OpenMLS state as a
+state-scoped snapshot, plus all retained snapshot/checkpoint bytes and checkpoint epochs. It excludes live message,
+outbound, and app-projection rows; the engine validates its frozen inputs separately. The fingerprint stays in engine
+memory and must never be logged or persisted. No schema migration or durable counter is needed.
+
+This lets resumable reconstruction distinguish actual state changes from unrelated writes through another app
+connection. The older `mls_write_generation` contract remains unchanged for cached `MlsGroup` objects.
+
 ## Conversation opening
 
 `conversation_open` composes a bounded canonical timeline page with retained read state in one read-only snapshot.
 It supports first-unread/latest opening and scoped anchor recovery; dirty projections return `ReadStateNotReady`
 for the existing owner to refresh. See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
+
+Selected composer reads and revision-checked mutations share the existing encrypted draft tables. Migration 0073
+tracks legacy writes too; queued/fanout acceptance clears only its submitted revision atomically. See the
+[draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
 
 ## Migrations
 

@@ -3,12 +3,12 @@
 
 use cgka_conformance_simulator::{
     AppRuntimeHarness, ConvergenceSubject, GeneratedSubjectKind, PUBLIC_APP_ADMIN_CHURN_FAMILY,
-    PUBLIC_APP_ADMIN_HANDOFF_FAMILY, PUBLIC_APP_LATE_JOIN_FAMILY,
-    PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY, PUBLIC_APP_OFFLINE_RECOVERY_FAMILY,
-    PUBLIC_APP_SEND_LEAVE_FAMILY, ScenarioAssertionV2, ScenarioPredicateV2, ScenarioStep,
-    ScenarioStepStatus, SubjectCapability, TraceExpectation, compare_trace_expectations,
-    compile_scenario, generate_family_case, preflight_compiled_scenario,
-    run_scenario_report_with_subject,
+    PUBLIC_APP_ADMIN_HANDOFF_FAMILY, PUBLIC_APP_BACKLOG_RECOVERY_FAMILY,
+    PUBLIC_APP_LATE_JOIN_FAMILY, PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY,
+    PUBLIC_APP_OFFLINE_RECOVERY_FAMILY, PUBLIC_APP_SEND_LEAVE_FAMILY, ScenarioAssertionV2,
+    ScenarioPredicateV2, ScenarioStep, ScenarioStepStatus, SubjectCapability, TraceExpectation,
+    compare_trace_expectations, compile_scenario, generate_family_case,
+    preflight_compiled_scenario, run_scenario_report_with_subject,
 };
 
 const FAMILIES: [&str; 4] = [
@@ -23,7 +23,7 @@ const PRESSURE_FAMILIES: [&str; 2] = [PUBLIC_APP_ADMIN_CHURN_FAMILY, PUBLIC_APP_
 async fn public_catalog_is_replayable_and_preflights_without_private_capabilities() {
     let mut subject = AppRuntimeHarness::new(&[]).await.unwrap();
     let descriptor = subject.descriptor();
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     let mut without_public_state = descriptor.clone();
     without_public_state
         .capabilities
@@ -36,7 +36,11 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
         )
         .is_err()
     );
-    for family in FAMILIES.into_iter().chain(PRESSURE_FAMILIES) {
+    for family in FAMILIES
+        .into_iter()
+        .chain(PRESSURE_FAMILIES)
+        .chain([PUBLIC_APP_BACKLOG_RECOVERY_FAMILY])
+    {
         let generate = |seed, count| {
             (0..count)
                 .map(|index| generate_family_case(family, seed, index).unwrap())
@@ -58,7 +62,9 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
             assert_eq!(case.subject, GeneratedSubjectKind::AppRuntime);
             assert_eq!(
                 case.generator_version,
-                if PRESSURE_FAMILIES.contains(&family) {
+                if family == PUBLIC_APP_BACKLOG_RECOVERY_FAMILY {
+                    "2"
+                } else if PRESSURE_FAMILIES.contains(&family) {
                     "1"
                 } else {
                     "4"
@@ -333,11 +339,13 @@ async fn strict_canary(family: &str, case_index: u64) {
         .await
         .unwrap();
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(if PRESSURE_FAMILIES.contains(&family) {
-            900
-        } else {
-            360
-        }),
+        std::time::Duration::from_secs(
+            if PRESSURE_FAMILIES.contains(&family) || family == PUBLIC_APP_BACKLOG_RECOVERY_FAMILY {
+                900
+            } else {
+                360
+            },
+        ),
         run_scenario_report_with_subject(
             &case.scenario,
             None,
@@ -356,7 +364,7 @@ async fn strict_canary(family: &str, case_index: u64) {
         payload: "never-sent".into(),
         count: 1,
     });
-    subject.shutdown().await;
+    subject.shutdown().await.expect("app shutdown");
     drop(subject); // Release all runtime/storage work before any assertion unwinds.
     let report = result
         .expect("public canary exceeded its wall-clock budget")
@@ -476,4 +484,82 @@ async fn public_admin_churn_strict_canary() {
 #[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
 async fn public_late_join_strict_canary() {
     strict_canary(PUBLIC_APP_LATE_JOIN_FAMILY, 0).await;
+}
+
+#[test]
+fn public_backlog_catalog_pins_volume_membership_and_recovery_restart() {
+    for index in 0..6 {
+        let case = generate_family_case(PUBLIC_APP_BACKLOG_RECOVERY_FAMILY, 7, index).unwrap();
+        let steps = &case.scenario.steps;
+        let offline = steps
+            .iter()
+            .position(|s| matches!(s, ScenarioStep::SetClientOffline { .. }))
+            .unwrap();
+        let reconnect = steps
+            .iter()
+            .position(|s| matches!(s, ScenarioStep::ReconnectClient { .. }))
+            .unwrap();
+        let backlog = &steps[offline + 1..reconnect];
+        let messages = [64, 128, 256][index as usize % 3];
+        assert_eq!(
+            backlog
+                .iter()
+                .filter(|s| matches!(s, ScenarioStep::SendAppMessage { .. }))
+                .count(),
+            messages
+        );
+        assert_eq!(
+            backlog
+                .iter()
+                .filter(|s| matches!(s, ScenarioStep::UpdateGroupProfile { .. }))
+                .count(),
+            messages / 16
+        );
+        assert_eq!(
+            backlog
+                .iter()
+                .filter(|s| matches!(s, ScenarioStep::UpdateAdminPolicy { .. }))
+                .count(),
+            messages / 32
+        );
+        assert!(
+            backlog.iter().all(
+                |s| !matches!(s, ScenarioStep::SendAppMessage { sender, .. } if sender == "bob")
+            )
+        );
+        let tail = &steps[reconnect + 1..];
+        if index >= 3 {
+            assert!(matches!(&tail[0], ScenarioStep::SyncRelayHistory { .. }));
+            assert!(matches!(&tail[1], ScenarioStep::RestartClient { client } if client == "bob"));
+            assert!(matches!(&tail[2], ScenarioStep::SyncRelayHistory { .. }));
+        }
+        let sent = steps
+            .iter()
+            .filter_map(|s| match s {
+                ScenarioStep::SendAppMessage { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), messages + 6);
+        for client in &case.scenario.clients {
+            assert!(case.expected_outcomes.contains(
+                &TraceExpectation::ApplicationPayloadMultiset {
+                    client: client.clone(),
+                    payloads: sent.clone(),
+                }
+            ));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "64-message SQLCipher and real-relay recovery canary"]
+async fn public_backlog_recovery_strict_canary() {
+    strict_canary(PUBLIC_APP_BACKLOG_RECOVERY_FAMILY, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "reopen after first repair request; run with production timing"]
+async fn public_backlog_recovery_restart_strict_canary() {
+    strict_canary(PUBLIC_APP_BACKLOG_RECOVERY_FAMILY, 3).await;
 }

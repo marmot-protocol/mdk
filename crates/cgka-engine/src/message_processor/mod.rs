@@ -8,6 +8,10 @@
 //! outcomes. `Err` is reserved for storage, peeler, serialization, and
 //! OpenMLS failures.
 
+mod application_replay;
+#[cfg(test)]
+#[path = "tests/application_replay.rs"]
+mod application_replay_tests;
 mod ingest;
 mod send;
 mod store;
@@ -136,15 +140,19 @@ pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 64 * 1024 * 1024;
 /// publish is accepted by at least one endpoint.
 pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 
-/// Upper bound on `PeelDeferred` rows re-attempted per retry sweep
-/// (mdk#339): a large historical backlog is worked through in slices
-/// across passes instead of holding a convergence drain hostage, so current
-/// events are never blocked behind irrelevant history.
+/// Shared background allowance for deferred-peel attempts and retained
+/// canonical application processing. A large historical backlog is worked
+/// through in slices instead of holding a convergence drain hostage (mdk#339).
+/// Foreground preflight retains its separate, smaller deferred-peel allowance.
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 
 /// Cooperative budget for one background convergence call. Stop only between
 /// complete row/MLS operations; never cancel a live snapshot rollback guard.
 pub const BACKGROUND_CONVERGENCE_BUDGET_MS: u64 = 500;
+
+/// Secondary scheduling bound inside candidate reconstruction. This does not
+/// reset or replace the cumulative replay budget for the frozen input graph.
+pub(crate) const BACKGROUND_CONVERGENCE_REPLAY_PROBES_PER_SLICE: usize = 32;
 
 /// Maximum deferred-history work admitted to one foreground outbound
 /// preflight (mdk#1176). The time bound is cooperative for synchronous storage
@@ -454,6 +462,13 @@ impl DeferredPeelExecution<'_> {
             Self::Background { rows_remaining, .. } => {
                 *rows_remaining = rows_remaining.saturating_sub(1)
             }
+        }
+    }
+
+    fn replay_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Background { deadline, .. } => *deadline,
+            Self::Foreground(_) => None,
         }
     }
 
@@ -1404,12 +1419,13 @@ impl<S: StorageProvider> Engine<S> {
             if self.has_unresolved_convergence_inputs(group_id)? && !peel_generation_active {
                 let convergence_started = Instant::now();
                 let result = self
-                    .converge_stored_openmls_messages_with_time(
+                    .converge_stored_openmls_messages_with_deadline(
                         group_id,
                         crate::convergence_clock::ConvergenceTime {
                             monotonic_ms: now_ms,
                             wall_ms: self.convergence_now().wall_ms,
                         },
+                        execution.replay_deadline(),
                     )
                     .map_err(|e| EngineError::Backend(format!("converge inputs: {e}")))?;
                 if record_outbound_phases {
@@ -1476,7 +1492,7 @@ impl<S: StorageProvider> Engine<S> {
                     if !self.has_unresolved_convergence_inputs(group_id)?
                         && self.storage.deferred_peel_generation(group_id)?.is_none()
                     {
-                        return Ok(AdvanceConvergenceStatus::Settled);
+                        return self.drain_canonical_applications(group_id, &mut execution);
                     }
                 }
             }
@@ -1660,6 +1676,9 @@ impl<S: StorageProvider> Engine<S> {
         false
     }
 
+    /// Branch-ambiguity safety gate shared with outbound admission. Canonical
+    /// application backlog is independent background work, reported through
+    /// `prepare_convergence_cutoff_delay_ms` and the hydration wake queue.
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         self.has_unresolved_convergence_inputs(group_id)
     }
@@ -1992,10 +2011,14 @@ impl<S: StorageProvider> Engine<S> {
             self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
-                self.converge_stored_openmls_messages_with_time(group_id, now)
-                    .map_err(|error| {
-                        EngineError::Backend(format!("converge completed peel generation: {error}"))
-                    })?;
+                self.converge_stored_openmls_messages_with_deadline(
+                    group_id,
+                    now,
+                    execution.replay_deadline(),
+                )
+                .map_err(|error| {
+                    EngineError::Backend(format!("converge completed peel generation: {error}"))
+                })?;
             }
             self.note_foreground_deferred_phase(
                 sweep_started,
@@ -2031,10 +2054,12 @@ impl<S: StorageProvider> Engine<S> {
             self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
-                self.converge_stored_openmls_messages_with_time(group_id, now)
-                    .map_err(|error| {
-                        EngineError::Backend(format!("converge swept batch: {error}"))
-                    })?;
+                self.converge_stored_openmls_messages_with_deadline(
+                    group_id,
+                    now,
+                    execution.replay_deadline(),
+                )
+                .map_err(|error| EngineError::Backend(format!("converge swept batch: {error}")))?;
             }
             tracing::debug!(
                 target: "cgka_engine::message_processor",
@@ -2101,12 +2126,28 @@ impl<S: StorageProvider> Engine<S> {
             self.engine_metrics.note_deferred_peel_candidate_cache_hit();
             (peel, past_contexts, true)
         } else {
-            self.invalidate_deferred_peel_candidate_cache(group_id);
+            self.clear_completed_candidate_cache(group_id);
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_miss();
             let candidate_enumeration_started = Instant::now();
-            let enumerated = match self.candidate_branch_peel(group_id) {
-                Ok(peel) => peel,
+            let enumerated = match self
+                .candidate_branch_peel_with_deadline(group_id, execution.replay_deadline())
+            {
+                Ok(Some(peel)) => peel,
+                Ok(None) => {
+                    self.schedule_pending_convergence_group(group_id);
+                    self.note_foreground_deferred_phase(
+                        sweep_started,
+                        foreground_budget_ms,
+                        0,
+                        total,
+                        crate::engine_metrics::DeferredPeelMetricOutcome::BudgetExhausted,
+                    );
+                    return Ok(DeferredPeelWorkResult {
+                        status: DeferredPeelWorkStatus::BudgetExhausted,
+                        progressed: 0,
+                    });
+                }
                 Err(failure) => {
                     self.engine_metrics
                         .note_deferred_peel_candidate_enumeration(
@@ -2307,10 +2348,12 @@ impl<S: StorageProvider> Engine<S> {
                 // Its completion cannot settle with the pre-sweep instant:
                 // even a zero-quiescence pass would then appear not yet due.
                 let completed_at = self.convergence_now();
-                self.converge_stored_openmls_messages_with_time(group_id, completed_at)
-                    .map_err(|error| {
-                        EngineError::Backend(format!("converge swept batch: {error}"))
-                    })?;
+                self.converge_stored_openmls_messages_with_deadline(
+                    group_id,
+                    completed_at,
+                    execution.replay_deadline(),
+                )
+                .map_err(|error| EngineError::Backend(format!("converge swept batch: {error}")))?;
             }
         }
 
@@ -2471,6 +2514,58 @@ impl<S: StorageProvider> Engine<S> {
             error: EngineError::Backend(format!("candidate branch peel: {}", failure.error)),
             replay_probe_count: failure.replay_probe_count,
         })
+    }
+
+    fn candidate_branch_peel_with_deadline(
+        &mut self,
+        group_id: &GroupId,
+        deadline: Option<Instant>,
+    ) -> Result<
+        Option<crate::openmls_projection::CandidateBranchPeel>,
+        DeferredPeelCandidateEnumerationFailure,
+    > {
+        let Some(deadline) = deadline else {
+            self.peel_replays.remove(group_id);
+            return self.candidate_branch_peel(group_id).map(Some);
+        };
+        let group = self.storage.get_group(group_id).map_err(|error| {
+            DeferredPeelCandidateEnumerationFailure {
+                error: error.into(),
+                replay_probe_count: 0,
+            }
+        })?;
+        let policy = self
+            .convergence_policy_for_group_ungated(group_id)
+            .map_err(|error| DeferredPeelCandidateEnumerationFailure {
+                error: EngineError::Backend(format!("load convergence policy: {error}")),
+                replay_probe_count: 0,
+            })?;
+        let max_rewind = policy.convergence.max_rewind_commits;
+        let mut continuation = self.peel_replays.remove(group_id);
+        let result = crate::openmls_projection::candidate_peel_slice(
+            &self.storage,
+            group_id,
+            group.epoch.0.saturating_sub(max_rewind),
+            max_rewind,
+            crate::openmls_projection::ReplayProfilePolicy {
+                reject_legacy_group_additions: self.new_protocol_profile
+                    == cgka_traits::group::ProtocolProfile::Current,
+            },
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+            &mut continuation,
+            &mut crate::openmls_projection::ReplaySlice::new(
+                deadline,
+                self.replay_slice_probe_limit,
+            ),
+        )
+        .map_err(|failure| DeferredPeelCandidateEnumerationFailure {
+            error: EngineError::Backend(format!("candidate branch peel: {}", failure.error)),
+            replay_probe_count: failure.replay_probe_count,
+        })?;
+        if let Some(continuation) = continuation {
+            self.peel_replays.insert(group_id.clone(), continuation);
+        }
+        Ok(result)
     }
 
     /// Re-ingest one retained raw-transport row and settle its retry lifecycle
@@ -2966,6 +3061,23 @@ impl<S: StorageProvider> Engine<S> {
     /// group, fingerprint, generation, and branch identities never leave
     /// engine memory.
     pub(crate) fn invalidate_deferred_peel_candidate_cache(&mut self, group_id: &GroupId) {
+        let canonical_pending = self.canonical_replays.contains_key(group_id);
+        let peel_pending = self.peel_replays.contains_key(group_id);
+        if canonical_pending || peel_pending {
+            tracing::debug!(
+                target: "cgka_engine::replay_slice",
+                method = "invalidate_deferred_peel_candidate_cache",
+                canonical_pending,
+                peel_pending,
+                "discarding candidate continuations"
+            );
+        }
+        self.canonical_replays.remove(group_id);
+        self.peel_replays.remove(group_id);
+        self.clear_completed_candidate_cache(group_id);
+    }
+
+    fn clear_completed_candidate_cache(&mut self, group_id: &GroupId) {
         let invalidated = self
             .deferred_peel
             .get_mut(group_id)
@@ -3484,6 +3596,92 @@ mod deferred_peel_accounting_tests {
                 .distinct_context_attempts,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_application_drain_finishes_one_unit_after_time_or_rows_are_spent() {
+        use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+        use cgka_traits::engine::{CgkaEngine, CreateGroupRequest};
+        use cgka_traits::message::{MessageRecord, StoredMessagePayload};
+        use cgka_traits::storage::MessageStorage;
+        for rows_remaining in [0, 64] {
+            let mut engine = crate::distributed_convergence::tests::test_engine();
+            let (group_id, created) = engine
+                .create_group(CreateGroupRequest {
+                    name: "spent application allowance".into(),
+                    description: String::new(),
+                    members: vec![],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap();
+            if let SendResult::GroupCreated { pending, .. } = created {
+                engine.confirm_published(pending).await.unwrap();
+            }
+            let mut ids = Vec::new();
+            for index in 0..3 {
+                let payload = MarmotAppEvent::new(
+                    hex::encode(engine.self_id().as_slice()),
+                    1_700_000_000,
+                    MARMOT_APP_EVENT_KIND_CHAT,
+                    vec![],
+                    format!("unit-{index}"),
+                )
+                .encode()
+                .unwrap();
+                let SendResult::ApplicationMessage { mut msg, .. } = engine
+                    .send(SendIntent::AppMessage {
+                        expected_epoch: None,
+                        group_id: group_id.clone(),
+                        payload,
+                    })
+                    .await
+                    .unwrap()
+                else {
+                    panic!("application");
+                };
+                // Treat the ciphertext as inbound: an own sender ratchet cannot
+                // decrypt it. Each selected row must still become terminal.
+                let id = MessageId::new(vec![index + 0x80; 32]);
+                msg.id = id.clone();
+                engine
+                    .storage
+                    .put_message(&MessageRecord {
+                        id: id.clone(),
+                        group_id: group_id.clone(),
+                        epoch: engine.epoch(&group_id).unwrap(),
+                        state: MessageState::Created,
+                        payload: StoredMessagePayload::openmls_wire(msg).encode().unwrap(),
+                        deferred_peel: None,
+                    })
+                    .unwrap();
+                ids.push(id);
+            }
+            for remaining in (0..3).rev() {
+                let mut execution = DeferredPeelExecution::Background {
+                    deadline: Some(Instant::now()),
+                    rows_remaining,
+                };
+                engine
+                    .drain_canonical_applications(&group_id, &mut execution)
+                    .unwrap();
+                assert_eq!(
+                    ids.iter()
+                        .filter(|id| engine.storage.get_message(id).unwrap().state
+                            == MessageState::Created)
+                        .count(),
+                    remaining
+                );
+                assert_eq!(
+                    engine
+                        .has_pending_canonical_applications(&group_id)
+                        .unwrap(),
+                    remaining != 0
+                );
+            }
+        }
     }
 
     #[test]

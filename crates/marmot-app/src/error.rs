@@ -99,6 +99,9 @@ pub enum AppError {
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
+    /// The composer changed after the caller selected it; reload before retrying.
+    #[error("message draft revision no longer matches")]
+    MessageDraftRevisionConflict,
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
     #[error("agent publisher: {0}")]
@@ -334,6 +337,7 @@ impl AppError {
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
+            Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
             Self::AgentStreamPublisher(_) => "agent_stream_publisher",
             Self::AgentStreamFinishMismatch => "agent_stream_finish_mismatch",

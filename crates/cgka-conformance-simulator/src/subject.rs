@@ -51,9 +51,13 @@ pub enum SubjectCapability {
     WhiteBoxStorageFaults,
     SemanticTransportFaults,
     ParticipantConnectivity,
+    RelayInterruption,
+    ConcurrentGroupMutation,
     ProcessLifecycle,
     StorageFaultInjection,
     AssertionEvaluation,
+    /// Exactly/eventually predicates over a client's public epoch and member count.
+    ClientStateAssertion,
     PublicGroupStateObservation,
     MultiGroup,
     RetainedRelayHistory,
@@ -79,9 +83,12 @@ impl SubjectCapability {
             Self::WhiteBoxStorageFaults => "white_box_storage_faults",
             Self::SemanticTransportFaults => "semantic_transport_faults",
             Self::ParticipantConnectivity => "participant_connectivity",
+            Self::RelayInterruption => "relay_interruption",
+            Self::ConcurrentGroupMutation => "concurrent_group_mutation",
             Self::ProcessLifecycle => "process_lifecycle",
             Self::StorageFaultInjection => "storage_fault_injection",
             Self::AssertionEvaluation => "assertion_evaluation",
+            Self::ClientStateAssertion => "client_state_assertion",
             Self::PublicGroupStateObservation => "public_group_state_observation",
             Self::MultiGroup => "multi_group",
             Self::RetainedRelayHistory => "retained_relay_history",
@@ -271,6 +278,11 @@ pub struct SubjectOutboundArtifact {
 pub trait ConvergenceSubject: Send {
     fn descriptor(&self) -> SubjectDescriptor;
 
+    /// Local execution receipt; it is not part of the protocol oracle.
+    fn execution_layout(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     fn database_bytes(&self) -> Option<u64> {
         None
     }
@@ -350,6 +362,12 @@ pub trait ConvergenceSubject: Send {
         Err(SubjectError::unsupported(
             SubjectCapability::TransportDelivery,
         ))
+    }
+
+    /// Real app adapters pace eventual assertions against wall time. Engine
+    /// subjects keep deterministic tick-count semantics by default.
+    fn uses_wall_clock_assertions(&self) -> bool {
+        false
     }
 
     /// Select controlled virtual-time behavior without advancing either clock
@@ -502,6 +520,33 @@ pub trait ConvergenceSubject: Send {
         ))
     }
 
+    async fn interrupt_relay(
+        &mut self,
+        _action_id: &str,
+        _relay: &str,
+        _outage_ms: u64,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::RelayInterruption,
+        ))
+    }
+
+    async fn race_group_profiles(
+        &mut self,
+        _action_id: &str,
+        _updates: &[crate::ScenarioProfileUpdate],
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ConcurrentGroupMutation,
+        ))
+    }
+
+    /// Append-only evidence for this subject's lifetime. Each report includes
+    /// only observations appended during its own execution.
+    fn stimulus_observations(&self) -> Vec<crate::ScenarioStimulusObservation> {
+        Vec::new()
+    }
+
     fn crash_process(&mut self, _process: &str) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::ProcessLifecycle,
@@ -580,14 +625,26 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             | crate::ScenarioAssertionV2::Never { predicate, .. } => Some(predicate),
             crate::ScenarioAssertionV2::Resource { .. } => None,
         };
+        let evaluation = if matches!(
+            assertion,
+            crate::ScenarioAssertionV2::Exactly {
+                predicate: crate::ScenarioPredicateV2::ClientState { .. }
+            } | crate::ScenarioAssertionV2::Eventually {
+                predicate: crate::ScenarioPredicateV2::ClientState { .. },
+                ..
+            }
+        ) {
+            SubjectCapability::ClientStateAssertion
+        } else {
+            SubjectCapability::AssertionEvaluation
+        };
         let mut capabilities = match assertion {
             crate::ScenarioAssertionV2::Exactly { .. } => {
-                vec![SubjectCapability::AssertionEvaluation]
+                vec![evaluation]
             }
-            crate::ScenarioAssertionV2::Eventually { .. } => vec![
-                SubjectCapability::AssertionEvaluation,
-                SubjectCapability::TransportDelivery,
-            ],
+            crate::ScenarioAssertionV2::Eventually { .. } => {
+                vec![evaluation, SubjectCapability::TransportDelivery]
+            }
             crate::ScenarioAssertionV2::Within { .. }
             | crate::ScenarioAssertionV2::Never { .. } => vec![
                 SubjectCapability::AssertionEvaluation,
@@ -609,7 +666,10 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         }
         if matches!(
             predicate,
-            Some(crate::ScenarioPredicateV2::PublicGroupState { .. })
+            Some(
+                crate::ScenarioPredicateV2::PublicGroupState { .. }
+                    | crate::ScenarioPredicateV2::PublicPayloadMultiset { .. }
+            )
         ) {
             capabilities.push(SubjectCapability::PublicGroupStateObservation);
         }
@@ -655,6 +715,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
                 SubjectCapability::ActiveDecryptabilityProbe
             }
             ScenarioStep::ObserveAdminPolicy { .. } => SubjectCapability::AdminPolicyObservation,
+            ScenarioStep::InterruptRelay { .. } => SubjectCapability::RelayInterruption,
+            ScenarioStep::RaceGroupProfiles { .. } => SubjectCapability::ConcurrentGroupMutation,
             ScenarioStep::RestartClient { .. } => SubjectCapability::CrashReopen,
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
                 SubjectCapability::ParticipantConnectivity
@@ -935,6 +997,7 @@ impl EngineHarnessSubject {
             SubjectCapability::WhiteBoxTransportPartition,
             SubjectCapability::SemanticTransportFaults,
             SubjectCapability::AssertionEvaluation,
+            SubjectCapability::ClientStateAssertion,
             SubjectCapability::MultiGroup,
         ]);
         Ok(Self {
@@ -2073,7 +2136,8 @@ impl ConvergenceSubject for EngineHarnessSubject {
     ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
         use crate::ScenarioPredicateV2;
         let (matched, actual) = match predicate {
-            ScenarioPredicateV2::PublicGroupState { .. } => {
+            ScenarioPredicateV2::PublicGroupState { .. }
+            | ScenarioPredicateV2::PublicPayloadMultiset { .. } => {
                 return Err(SubjectError::unsupported(
                     SubjectCapability::PublicGroupStateObservation,
                 ));

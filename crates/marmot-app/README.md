@@ -32,6 +32,11 @@ The app runtime exposes those projections through account status, group listing/
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases
 directly.
 
+Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes and
+revision-bound sends. Post-commit invalidations let conversation owners reload the selected composer; durable
+outbox acceptance clears only the submitted revision. See the
+[draft lifecycle contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
+
 New-account bootstrap publishes the required NIP-65 kind `10002` and inbox kind `10050` relay-list events, a
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. KeyPackages are
 published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay list. Import flows
@@ -146,3 +151,21 @@ cargo test -p marmot-app --features otlp-export
 ```
 
 See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe telemetry rules.
+
+## Explicit full-history repair
+
+`MarmotAppRuntime::repair_full_history` keeps one unfloored relay activation and its frozen endpoint EOSE coverage
+across checkpointed drain quanta. A quantum yield alone does not fail or resubscribe the repair. All required relay
+endpoints must confirm completion; silence, a fast subset, and EOSE from a superseded attempt cannot satisfy it.
+Explicit overflow recovery uses the same continuation and retains generation-checked durable marker clearing.
+
+The explicit attempt has a 60-second overall cooperative budget, including setup, reconciliation, and overflow
+recovery. A started ingest/checkpoint always finishes before observing the deadline or caller/runtime cancellation;
+this is not a hard wall-clock bound on an individual storage or network operation. A terminal transport failure or
+an earlier drain silence verdict still ends the attempt. Partial progress remains durable and incomplete overflow
+markers survive restart. A later call starts a new attempt; live continuation state is not persisted across restart.
+
+The account remains serialized during repair. The worker can serve committed member/roster snapshots while relay
+I/O waits; mutations, subsequent repair requests, and reads behind queued mutations retain FIFO order. This does
+not yet provide send fairness during repair or isolate network tasks from synchronous engine work. Automatic
+backfill and automatic overflow scheduling retain their existing single-quantum behavior.

@@ -8371,6 +8371,8 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
             self.group_info_payload(None, self.GROUP_DIGITS, leaked),
             self.group_info_payload(self.ACCOUNT, None, leaked),
             self.group_info_payload(True, self.GROUP_DIGITS, leaked),
+            self.group_info_payload([self.ACCOUNT], self.GROUP_DIGITS, leaked),
+            self.group_info_payload(self.ACCOUNT, {"hex": self.GROUP_DIGITS}, leaked),
             self.group_info_payload(self.ACCOUNT, self.GROUP_DIGITS, "  Digit Room  "),
         ]
 
@@ -8387,7 +8389,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
         names = []
         ids = []
         types = []
-        for _ in range(6):
+        for _ in range(8):
             info = await adapter.get_chat_info(self.GROUP_DIGITS)
             names.append(info["name"])
             ids.append(info["id"])
@@ -8401,11 +8403,13 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                 self.fallback(self.GROUP_DIGITS),
                 self.fallback(self.GROUP_DIGITS),
                 self.fallback(self.GROUP_DIGITS),
+                self.fallback(self.GROUP_DIGITS),
+                self.fallback(self.GROUP_DIGITS),
                 "Digit Room",
             ],
         )
-        self.assertEqual(ids, [self.GROUP_DIGITS] * 6)
-        self.assertEqual(types, ["group"] * 6)
+        self.assertEqual(ids, [self.GROUP_DIGITS] * 8)
+        self.assertEqual(types, ["group"] * 8)
 
     async def test_account_selection_and_timeouts(self):
         class SoleClient:

@@ -512,6 +512,12 @@ async fn check(journey: Journey) {
     let mut subject = AppRuntimeHarness::new(&clients)
         .await
         .expect("public runtime setup");
+    save(
+        artifacts.path(),
+        "execution-layout.json",
+        &subject.process_layout(),
+    )
+    .unwrap();
     let mut recovery_progress = RecoveryProgress {
         phase: "setup",
         ..RecoveryProgress::default()
@@ -554,7 +560,9 @@ async fn check(journey: Journey) {
             close_errors.push(error.to_string());
         }
     }
-    subject.shutdown().await;
+    if let Err(error) = subject.shutdown().await {
+        close_errors.push(format!("shutdown: {error}"));
+    }
     drop(subject);
     save(
         artifacts.path(),
@@ -565,7 +573,10 @@ async fn check(journey: Journey) {
         }),
     )
     .unwrap();
-    if result.is_err() || std::env::var_os("MDK_APP_JOURNEY_ARTIFACTS").is_some() {
+    if result.is_err()
+        || !close_errors.is_empty()
+        || std::env::var_os("MDK_APP_JOURNEY_ARTIFACTS").is_some()
+    {
         eprintln!("public journey evidence: {}", artifacts.keep().display());
     }
     assert!(
