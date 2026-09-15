@@ -8745,12 +8745,17 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                 group_b_dispatched.set()
 
         adapter.handle_message = handle_message
-        consume = asyncio.create_task(adapter._consume_inbound_once(drain=True))
-        await asyncio.wait_for(group_a_lookup_started.wait(), timeout=1)
-        await asyncio.wait_for(group_b_dispatched.wait(), timeout=1)
-        self.assertEqual(order, [("b", group_b, f"Name {group_b[:4]}")])
-        release_a.set()
-        await asyncio.wait_for(consume, timeout=1)
+        # The stalled group-A lookup is an explicit hold, not a hung control
+        # socket. Keep the production wait_for budget above the test's observe
+        # window so a loaded runner cannot convert the stall into a fallback
+        # name and fail the cross-group assertion.
+        with unittest.mock.patch.object(self.adapter_module, "CHAT_INFO_TIMEOUT_S", 30.0):
+            consume = asyncio.create_task(adapter._consume_inbound_once(drain=True))
+            await asyncio.wait_for(group_a_lookup_started.wait(), timeout=5)
+            await asyncio.wait_for(group_b_dispatched.wait(), timeout=5)
+            self.assertEqual(order, [("b", group_b, f"Name {group_b[:4]}")])
+            release_a.set()
+            await asyncio.wait_for(consume, timeout=5)
         self.assertEqual(
             [item[0] for item in order if item[1] == group_a],
             ["first-a", "second-a"],
