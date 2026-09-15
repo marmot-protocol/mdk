@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- WN Agent `group_info` now returns the current Marmot chat-list group name as `subject`
+  when that name is nonempty, and Hermes uses it for `get_chat_info` and activated inbound
+  display. Missing, blank, or unusable names still fall back to
+  `Marmot <first 12 hex characters>`. Display names are read fresh each lookup and never
+  become routing ids, authorization facts, or cache keys.
+
 - Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
   commands and independent live account-attention summaries across Swift/Kotlin and C.
   Existing list/read APIs and C record layouts remain; new typed window errors append
