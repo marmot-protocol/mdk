@@ -146,6 +146,56 @@ pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 /// Foreground preflight retains its separate, smaller deferred-peel allowance.
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 
+/// Raw transport rows one REMOVED group copy retains for its own re-join,
+/// as a newest-wins ring (`Engine::retain_transport_message_refused_while_removed`).
+///
+/// A removed copy refuses every inbound message, and nothing in production
+/// re-fetches a refused id: the relay SDK marks an event seen on first arrival
+/// whatever the engine answered, the app's epoch-gap backfill is unfloored, the
+/// transport cursor is account-wide and advances anyway, and the join path arms
+/// no fetch. So the bytes in hand are the device's only copy of every commit
+/// published between a re-add Welcome's minting and its arrival, and they are
+/// kept rather than dropped. This bounds two costs of keeping them: the storage
+/// one removed copy holds (~2 KiB per raw event, so ~0.5 MiB here), and the
+/// synchronous work `replay_buffered_messages` does at the re-join, which
+/// materializes every retained row.
+///
+/// RAW rows only. Content-derived `Retryable` rows of the same group are
+/// neither counted against this bound nor eligible for eviction; see
+/// `Engine::evict_oldest_retained_row_past_the_removed_ring` for why counting
+/// them would reintroduce unbounded raw growth.
+///
+/// The cliff: more than this many refused messages between the Welcome's
+/// minting and its arrival evicts the OLDEST raced commit, and the chain cannot
+/// apply past that gap. Newest-wins is what makes the bound survivable — a
+/// commit published before the Welcome was minted is below this copy's install
+/// epoch and terminalizes stale anyway, so only the newest rows are the ones
+/// worth keeping. An evicted row is RELEASED, not failed
+/// (`MessageStorage::release_message_for_replay`), which un-sees the id rather
+/// than recording a terminal dedup verdict: a redelivery of that exact event
+/// would be processed. Do not read that as automatic recovery — while the copy
+/// stays removed nothing re-fetches it (#1768 drops epoch-gap backfill intents
+/// for groups this device is terminal in), so the honest claim is that the id
+/// is left recoverable, by a targeted group reconciliation after a re-join,
+/// rather than recovered.
+///
+/// Per group, with no account-level ceiling — unlike
+/// [`MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT`], which bounds a resource an attacker
+/// can aim at from any group. This one is bounded by the number of groups this
+/// device has been removed from, and each of those windows is short: #1768
+/// prunes a terminal group from routing, so post-removal traffic stops arriving
+/// rather than continuing indefinitely. That is also why the ring's O(bound)
+/// scan per refused message is affordable.
+///
+/// Four times [`MAX_DEFERRED_ROWS_PER_SWEEP`], which #1843 reused as the
+/// re-join's replay budget for legacy `Failed` rows: the same budget, with
+/// headroom, because a live ring competes for slots with the group's ordinary
+/// chatter during the race window while that legacy repair did not. It stays
+/// far inside the per-group deferred-peel cap
+/// ([`MAX_PEEL_DEFERRED_ROWS_PER_GROUP`]) that the un-decryptable share of a
+/// replayed ring lands in.
+pub(crate) const MAX_RETAINED_ROWS_PER_REMOVED_GROUP: usize = 4 * MAX_DEFERRED_ROWS_PER_SWEEP;
+
 /// Cooperative budget for one background convergence call. Stop only between
 /// complete row/MLS operations; never cancel a live snapshot rollback guard.
 pub const BACKGROUND_CONVERGENCE_BUDGET_MS: u64 = 500;
@@ -2633,12 +2683,14 @@ impl<S: StorageProvider> Engine<S> {
                 state: LocalIngestState::Removed,
             })) => {
                 // Same rule as `replay_buffered_messages`: refused on our own
-                // removal before any peel, with nothing written by either the
-                // record gate or the realizing arm, so the row keeps
-                // `PeelDeferred` rather than becoming a `Processed` graph input. Defense in
-                // depth: the sweep's production door refuses a terminal group,
-                // and the sites that set `removed` retire the deferred backlog
-                // (and its cap slots) in the same transaction.
+                // removal before any peel. Neither the record gate nor the
+                // realizing arm re-stamps a row that already exists, so this
+                // one keeps `PeelDeferred` — and its cap slot — rather than
+                // becoming a `Processed` graph input for a message this device
+                // never applied. Defense in depth: the sweep's production door
+                // refuses a terminal group, and the sites that set `removed`
+                // retire the deferred backlog (and its cap slots) in the same
+                // transaction.
                 Ok(false)
             }
             Ok(Outcome(
@@ -3381,9 +3433,10 @@ impl<S: StorageProvider> Engine<S> {
                 }) => {
                     // Refused on our own removal before any peel — either on the
                     // durable record or by the realizing arm that writes that
-                    // marker. Neither writes a row, so this one is exactly as
-                    // retained. Leave it and stop: the record is terminal from
-                    // here, so every row behind this one gets the same refusal.
+                    // marker. Both retain the input, and neither re-stamps a row
+                    // that already exists, so this one is exactly as retained.
+                    // Leave it and stop: the record is terminal from here, so
+                    // every row behind this one gets the same refusal.
                     //
                     // Never relabel it `Processed`: that is an OpenMLS graph
                     // input state (`OPENMLS_GRAPH_INPUT_STATES`), so a
@@ -3393,9 +3446,10 @@ impl<S: StorageProvider> Engine<S> {
                     // state: a commit published after our removal is the "raced
                     // ahead of the re-add Welcome" case, and this replay runs
                     // again from `do_join_welcome`. Nothing spins on it meanwhile
-                    // (the convergence and outbound doors refuse a terminal
-                    // copy), and a `PeelDeferred` row's cap slot was already
-                    // returned when the removal retired the deferred backlog.
+                    // (`prepare_convergence_input_advance`'s terminal gate is the
+                    // convergence door, and the send gates refuse a removed copy),
+                    // and a `PeelDeferred` row's cap slot was already returned
+                    // when the removal retired the deferred backlog.
                     break;
                 }
                 Ok(_) => {

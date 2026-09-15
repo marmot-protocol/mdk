@@ -380,32 +380,35 @@ impl<S: StorageProvider> Engine<S> {
 
         // A copy already marked removed refuses group traffic on the durable
         // record alone — before hydration and before the OpenMLS load — so
-        // continued relay traffic for a group this device left costs neither a
-        // ledger row nor an epoch load. The `!is_active()` arm below is only
-        // reached before the marker exists: it realizes the removal, writes
-        // it, and from then on this gate answers.
+        // continued relay traffic for a group this device left costs no epoch
+        // load. The `!is_active()` arm below is only reached before the marker
+        // exists: it realizes the removal, writes it, and from then on this
+        // gate answers.
         //
-        // Deliberately no durable trace: no ledger row and no ingress dedup
-        // marker. A removed device is routinely re-added by an admin, and
-        // commits published between that Welcome and its delivery can arrive
-        // before it. Keeping the id out of the seen cache — exactly as the
-        // unknown-group arm below does for #740 — lets relay redelivery after
-        // the late Welcome process instead of classifying as `Duplicate`. (The
-        // disband tombstone gate above writes a marker because a disband is
-        // permanent; a removal is not.)
+        // Refused, but RETAINED in the removed copy's bounded ring
+        // (`retain_transport_message_refused_while_removed`). A removed device
+        // is routinely re-added by an admin, and commits published between that
+        // Welcome's minting and its delivery arrive here. Nothing re-fetches an
+        // id this gate refuses — the relay SDK marks an event seen on first
+        // arrival whatever the engine answered, the app's backfill is unfloored
+        // and the transport cursor is account-wide, and the join arms no fetch
+        // — so the bytes in hand are the device's only copy. Keeping them lets
+        // `do_join_welcome`'s `replay_buffered_messages` apply them at the
+        // re-join with no relay involvement. The ring is what keeps that from
+        // being unbounded ledger growth for a group this device left.
         //
-        // A row already retained when this fires therefore keeps its retained
-        // state, because nothing here touches it. The two seams that retire a
-        // replayed row — `replay_buffered_messages` and
+        // A row already retained when this fires keeps exactly the state it
+        // has, because the helper only writes when there is no row. The two
+        // seams that retire a replayed row — `replay_buffered_messages` and
         // `reingest_deferred_peel_row` — handle `Removed` explicitly for that
-        // reason: their catch-alls would stamp an untouched row `Processed`,
+        // reason: their catch-alls would stamp an unresolved row `Processed`,
         // making a never-applied message a canonicalization input that the
         // re-join sweep does not clean up.
-        if self
+        if let Some(record) = self
             .stored_group_record(&group_id)?
-            .is_some_and(|group| group.removed)
+            .filter(|group| group.removed)
         {
-            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+            self.retain_transport_message_refused_while_removed(msg, &group_id, record.epoch)?;
             return reported(IngestOutcome::LocalState {
                 state: LocalIngestState::Removed,
             });
@@ -515,17 +518,27 @@ impl<S: StorageProvider> Engine<S> {
             // Same rule as the record gate above, for the same reason: this is
             // the FIRST post-removal message on a copy the marker has not
             // reached yet, and the likeliest shape for it is a commit racing
-            // ahead of a re-add Welcome. A `Failed` row here is unreachable by
-            // `replay_buffered_messages` (`Created | Retryable | PeelDeferred`
-            // only) and answers `Duplicate` on redelivery, so the message would
-            // be lost to this device for good. Write nothing, keep the id out
-            // of the in-memory seen cache, and leave an already-retained row
-            // exactly as retained — the `Removed` arms in
+            // ahead of a re-add Welcome. It joins the same bounded ring, and
+            // this arm owes it more than the gate does — the arm runs once per
+            // copy, so a message dropped here has no second chance at all.
+            // A `Failed` row would be no better than dropping it:
+            // `replay_buffered_messages` admits only
+            // `Created | Retryable | PeelDeferred`, and `Failed` answers
+            // `Duplicate` on redelivery. An already-retained row keeps exactly
+            // the state it has — the `Removed` arms in
             // `replay_buffered_messages` and `reingest_deferred_peel_row` keep
             // it that way.
             self.realize_self_eviction(&group_id, current_epoch)?;
             self.return_unmodified_mls_group(&group_id, mls_group);
-            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+            // Stamped with the record's own epoch, matching the gate above and
+            // the floor `do_join_welcome` hands
+            // `reopen_rows_refused_by_the_removed_copy`; realization writes the
+            // marker but does not advance the epoch. Re-reading the record also
+            // discharges the retention helper's group-existence precondition:
+            // no record, no ring to retain into.
+            if let Some(record) = self.stored_group_record(&group_id)? {
+                self.retain_transport_message_refused_while_removed(msg, &group_id, record.epoch)?;
+            }
             return reported(IngestOutcome::LocalState {
                 state: LocalIngestState::Removed,
             });
