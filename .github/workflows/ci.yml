@@ -389,7 +389,7 @@ jobs:
           shared-key: rust-test
 
       - name: Verify workspace shard coverage
-        run: bash scripts/check_ci_partitions.sh 4 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: bash scripts/check_ci_partitions.sh 5 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
 
       - name: Archive workspace tests
         run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))' --archive-file tests.tar.zst
@@ -405,14 +405,14 @@ jobs:
           if-no-files-found: error
 
   rust-test:
-    name: Rust tests (${{ matrix.partition }}/4)
+    name: Rust tests (${{ matrix.partition }}/5)
     needs: rust-test-build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4]
+        partition: [1, 2, 3, 4, 5]
 
     steps:
       - name: Check out repository
@@ -443,7 +443,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --partition count:${{ matrix.partition }}/5 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
 
   rust-test-extras:
     name: Doctests and diagnostic exporters
@@ -720,16 +720,12 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  conformance:
-    name: Simulator and vectors (${{ matrix.lane }})
+  conformance-build:
+    name: Build simulator tests
     needs: changes
     if: needs.changes.outputs.run_conformance == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        lane: [smoke, offline-history]
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -759,38 +755,149 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' && matrix.lane == 'smoke' }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: simulator-tests
 
-      - name: Run unchanged offline-history regressions
-        if: matrix.lane == 'offline-history'
-        run: cargo nextest run -p cgka-conformance-simulator --test offline_catchup_regression --locked --profile ci
+      - name: Verify simulator smoke shard coverage
+        run: bash scripts/check_ci_partitions.sh 2 -p cgka-conformance-simulator --locked -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
 
-      - name: Run simulator smoke tests
-        if: matrix.lane == 'smoke'
-        # Multi-minute generated reliability batches and the adversarial
-        # campaign run in the scheduled Simulator Nightly workflow. Independent
-        # convergence checks run in their dedicated fast gate below.
-        run: just --set simulator-smoke-filter "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)" simulator-smoke
+      - name: Archive default-feature simulator tests
+        run: cargo nextest archive -p cgka-conformance-simulator --locked --archive-file simulator.tar.zst
+
+      - name: Upload simulator test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: simulator-tests
+          path: simulator.tar.zst
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  conformance:
+    name: Simulator and vectors (${{ matrix.lane }})
+    needs: conformance-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [smoke-1, smoke-2, offline-history, process, models]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
+        with:
+          tool: just
+
+      - name: Download simulator test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: simulator-tests
+
+      - name: Extract simulator test binaries
+        run: cargo nextest list --archive-file simulator.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --list-type binaries-only > /dev/null
+
+      - name: Run archived simulator tests
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          nextest=(cargo nextest run
+            --cargo-metadata target/nextest/cargo-metadata.json
+            --binaries-metadata target/nextest/binaries-metadata.json
+            --workspace-remap "$GITHUB_WORKSPACE"
+            --target-dir-remap "$GITHUB_WORKSPACE/target")
+          case "$LANE" in
+            smoke-*)
+              "${nextest[@]}" --profile ci --partition "count:${LANE#smoke-}/2" \
+                -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
+              ;;
+            offline-history)
+              # Preserve the complete suite, including both 1024-message cases.
+              "${nextest[@]}" --profile ci -E 'binary(=offline_catchup_regression)'
+              ;;
+            process)
+              "${nextest[@]}" --profile ci \
+                -E "binary(=process_orchestrator) and ($(just --evaluate simulator-process-filter))"
+              ;;
+            models)
+              for binary in route_assurance independent_reference_model lifecycle_model mutation_adequacy protocol_decision_gate semantic_reduction; do
+                "${nextest[@]}" -E "binary(=$binary)"
+              done
+              ;;
+            *) exit 2 ;;
+          esac
+
+  conformance-extras:
+    name: Convergence gates and simulator doctests
+    needs: changes
+    if: needs.changes.outputs.run_conformance == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
+        with:
+          tool: just
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Validate convergence execution-lane policy
-        if: matrix.lane == 'smoke'
         run: just convergence-lane-policy
 
       - name: Validate convergence failure-corpus lifecycle
-        if: matrix.lane == 'smoke'
-        run: just convergence-failure-corpus
+        run: cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
 
       - name: Run focused convergence regressions
-        if: matrix.lane == 'smoke'
         run: just focused-convergence-regressions
 
       - name: Run simulator doctests
-        if: matrix.lane == 'smoke'
         run: cargo test -p cgka-conformance-simulator --doc --locked
 
-      - name: Verify convergence with independent models
-        if: matrix.lane == 'smoke'
-        run: just convergence-verification-ci
+      - name: Verify TLA liveness and counterexample
+        run: just tla-liveness tla-liveness-counterexample
 
   formal:
     name: Tamarin proofs
@@ -946,7 +1053,9 @@ jobs:
       - relay-runtime-build
       - relay-runtime
       - relay-e2e
+      - conformance-build
       - conformance
+      - conformance-extras
       - formal
       - hermes-installer-auth
     runs-on: ubuntu-latest
