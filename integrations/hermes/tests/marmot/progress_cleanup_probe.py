@@ -60,6 +60,13 @@ def _hex_id(index: int) -> str:
     return f"{index:02x}" * 32
 
 
+def _acknowledges_probe_final(text: Any) -> bool:
+    raw = str(text or "")
+    if raw.strip() == PROBE_FINAL_TEXT:
+        return True
+    return any(line.strip() == PROBE_FINAL_TEXT for line in raw.splitlines())
+
+
 def _operation_key(attempt: dict[str, Any]) -> tuple[str, str, str]:
     return (
         str(attempt.get("name") or ""),
@@ -256,7 +263,7 @@ class RecordingControlServer:
                         "message": "injected final-delivery failure",
                     }
                 self.final_sends += 1
-                if str(request.get("text") or "") == PROBE_FINAL_TEXT:
+                if _acknowledges_probe_final(request.get("text")):
                     self.probe_final_acks += 1
                 return {
                     "marmot_agent_control": PROTOCOL,
@@ -809,6 +816,21 @@ async def _stop_runner(runner) -> None:
         pass
 
 
+@contextlib.contextmanager
+def _patched_ai_agent(agent_factory, *modules: Any):
+    patches = []
+    for module in modules:
+        if module is None or not hasattr(module, "AIAgent"):
+            continue
+        patches.append(mock.patch.object(module, "AIAgent", agent_factory))
+    if not patches:
+        raise AssertionError("host AIAgent was not importable")
+    with contextlib.ExitStack() as stack:
+        for patcher in patches:
+            stack.enter_context(patcher)
+        yield
+
+
 async def _exercise_reconstructed_adapter(
     *,
     hermes_home: Path,
@@ -819,16 +841,35 @@ async def _exercise_reconstructed_adapter(
     from gateway.config import Platform
     from gateway.platforms.base import MessageEvent
     from gateway.session import SessionSource
+    import gateway.run as gateway_run
     import run_agent
 
     socket_path = _scenario_control_socket("fresh")
+    # Persist the live scenario socket. Candidate hosts may reload
+    # gateway config during handle_message and otherwise reconnect to
+    # the previous turn's already-closed control socket.
+    helper.configure_gateway_config(
+        **_quiet_helper_kwargs(
+            hermes_home,
+            tool_progress="all",
+            agent_home=agent_home,
+            socket_path=socket_path,
+        )
+    )
     fake = RecordingControlServer(socket_path)
     delete_attempts: list[str] = []
-    await fake.start()
+    original_home = os.environ.get("HOME")
+    original_hermes_home = os.environ.get("HERMES_HOME")
+    original_load_gateway_config = None
     previous_progress_server = DeterministicAIAgent.progress_server
     DeterministicAIAgent.progress_server = fake
     runner = None
     try:
+        _bind_home_env(hermes_home)
+        await fake.start()
+        written_config = helper.load_config(hermes_home / "config.yaml")
+        original_load_gateway_config = gateway_run._load_gateway_config
+        gateway_run._load_gateway_config = lambda: written_config
         _persisted, runner, adapter = _fresh_persisted_gateway(
             hermes_home,
             helper,
@@ -843,7 +884,7 @@ async def _exercise_reconstructed_adapter(
             return DeterministicAIAgent(*args, **kwargs)
 
         scheduled: list[Any] = []
-        with mock.patch.object(run_agent, "AIAgent", agent_factory):
+        with _patched_ai_agent(agent_factory, run_agent, gateway_run):
             runner._resolve_session_agent_runtime = lambda **_kwargs: (
                 "probe-model",
                 {"provider": "local"},
@@ -867,9 +908,12 @@ async def _exercise_reconstructed_adapter(
         if fake.operation_sends < 1:
             raise AssertionError("reconstructed adapter turn produced no operation events")
     finally:
+        if original_load_gateway_config is not None:
+            gateway_run._load_gateway_config = original_load_gateway_config
         await _stop_runner(runner)
         await fake.close()
         DeterministicAIAgent.progress_server = previous_progress_server
+        _restore_home_env(original_home, original_hermes_home)
 
 
 async def _run_gateway_turn(
@@ -1011,7 +1055,7 @@ async def _run_gateway_turn_body(
 
         delivery_boundary_observed = False
         scheduled_work_drained = False
-        with mock.patch.object(run_agent, "AIAgent", agent_factory):
+        with _patched_ai_agent(agent_factory, run_agent, gateway_run):
             runner = gateway_run.GatewayRunner(config=loaded)
             runner._resolve_session_agent_runtime = lambda **_kwargs: (
                 "probe-model",
@@ -1247,13 +1291,6 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
         adapter_module=adapter_module,
     )
     registered_home = _registered_hermes_home()
-    helper.configure_gateway_config(
-        **_quiet_helper_kwargs(
-            registered_home,
-            tool_progress="all",
-            agent_home=restart_home / "marmot-agent",
-        )
-    )
     await _exercise_reconstructed_adapter(
         hermes_home=registered_home,
         helper=helper,

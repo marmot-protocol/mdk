@@ -227,7 +227,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   at the exact MDK revision instead of cloning the host checkout over ``file://``. The probe
   now requires acknowledgement of the expected final answer, closes the control-server event
   loop if bind fails, and dispatches a turn through the reconstructed restart adapter so prior
-  durable operation ids cannot be deleted after reload.
+  durable operation ids cannot be deleted after reload. The reconstructed restart turn persists
+  its live scenario socket and keeps the helper-written config patched for the whole turn so a
+  candidate host that reloads gateway config cannot reconnect to the previous closed socket.
+  The real-plugin fixture also ignores leftover host files during teardown so a successful
+  media-api-candidate run cannot fail after the probe has already passed.
 - Hermes chat metadata now rejects non-string `group_info` account and group identities before
   accepting a subject, so a JSON integer whose decimal spelling matches an all-digit hex id
   falls back to `Marmot <first 12 hex characters>` instead of using the supplied name.

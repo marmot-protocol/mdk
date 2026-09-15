@@ -44,6 +44,15 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _plugin_test_tempdir() -> tempfile.TemporaryDirectory[str]:
+    # Candidate hosts can keep writing into the fixture after the probe
+    # returns. Cleanup must not turn a successful run into a job failure.
+    return tempfile.TemporaryDirectory(
+        prefix="mdk-hermes-plugin-test-",
+        ignore_cleanup_errors=True,
+    )
+
+
 async def _exercise_media_routes(adapter_module, platform_config, temp_root: Path):
     class FakeClient:
         def __init__(self) -> None:
@@ -645,7 +654,7 @@ def main() -> int:
     if len(resolved_ref) != 40:
         raise SystemExit("MDK ref must resolve to a full commit")
 
-    with tempfile.TemporaryDirectory(prefix="mdk-hermes-plugin-test-") as temp:
+    with _plugin_test_tempdir() as temp:
         home = Path(temp)
         os.environ["HOME"] = str(home)
         os.environ["HERMES_HOME"] = str(home / ".hermes")

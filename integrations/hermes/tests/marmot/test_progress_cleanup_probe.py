@@ -125,13 +125,26 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         self.assertEqual(notice["type"], "final_sent")
         self.assertEqual(server.final_sends, 1)
         self.assertEqual(server.probe_final_acks, 0)
+        wrapped = server._response_for(
+            {"id": "2", "type": "send_final", "text": f"notice\n{probe.PROBE_FINAL_TEXT}\n"},
+            "send_final",
+        )
+        self.assertEqual(wrapped["type"], "final_sent")
+        self.assertEqual(server.final_sends, 2)
+        self.assertEqual(server.probe_final_acks, 1)
         ack = server._response_for(
-            {"id": "2", "type": "send_final", "text": probe.PROBE_FINAL_TEXT},
+            {"id": "3", "type": "send_final", "text": probe.PROBE_FINAL_TEXT},
             "send_final",
         )
         self.assertEqual(ack["type"], "final_sent")
-        self.assertEqual(server.final_sends, 2)
-        self.assertEqual(server.probe_final_acks, 1)
+        self.assertEqual(server.final_sends, 3)
+        self.assertEqual(server.probe_final_acks, 2)
+
+    def test_acknowledges_probe_final_rejects_unrelated_text(self):
+        self.assertFalse(probe._acknowledges_probe_final("unrelated notice"))
+        self.assertFalse(probe._acknowledges_probe_final(""))
+        self.assertTrue(probe._acknowledges_probe_final(f"  {probe.PROBE_FINAL_TEXT}  "))
+        self.assertTrue(probe._acknowledges_probe_final(f"prefix\n{probe.PROBE_FINAL_TEXT}"))
 
     def test_retained_success_requires_probe_final_ack(self):
         result = {
