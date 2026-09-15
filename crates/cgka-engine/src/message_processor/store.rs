@@ -237,9 +237,9 @@ impl<S: StorageProvider> Engine<S> {
     /// `ingest.rs`), and that verdict is authoritative — overwriting it with
     /// `Processed` would relabel a row ingest already terminalized as a
     /// canonicalization input. A vanished row (`NotFound`) is not awaiting
-    /// retry. Our own eviction is NOT such a path: both the record gate and the
-    /// realizing arm write nothing at all, so the row stays exactly as
-    /// retained.
+    /// retry. Our own eviction is NOT such a path: the record gate and the
+    /// realizing arm retain a refused message but never re-stamp a row that
+    /// already exists, so a replayed row stays exactly as retained.
     pub(crate) fn raw_transport_row_awaiting_retry(
         &self,
         id: &MessageId,
@@ -454,6 +454,125 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::raw_transport(msg.clone()),
             None,
         )
+    }
+
+    /// Retain one raw transport message that the removed-copy gates refused, so
+    /// the re-join's own replay can apply it.
+    ///
+    /// The bytes reached this device and nothing will send them again: no
+    /// production path re-fetches an id ingest refused, so discarding them is
+    /// silent, permanent loss of every commit published between a re-add
+    /// Welcome's minting and its arrival. Retained `Retryable`, they are
+    /// replayed by `replay_buffered_messages` at `do_join_welcome`.
+    ///
+    /// Write-once: an id that already has a row keeps it exactly as it is.
+    /// Internal replay re-enters ingest below the durable dedup seam, so a row
+    /// this already retained can reach the gates again, and re-stamping a
+    /// `PeelDeferred` row `Retryable` would leak its deferred-peel cap slot.
+    ///
+    /// Room is made BEFORE the row is written, so the bound is hard by
+    /// construction: when the ring is full and its oldest row cannot be
+    /// released, the new message is not retained at all and its id stays out
+    /// of the in-memory seen cache, exactly as the unknown-group arm does, so a
+    /// redelivery reaches this gate again. Dropping the newest inverts
+    /// newest-wins, but only while the receipt journal is failing, and a
+    /// bounded ledger outranks that preference.
+    ///
+    /// Release and insert are separate transactions on purpose. If the insert
+    /// fails or the process dies between them, the ring is one row short: the
+    /// released row was the oldest and was leaving on this refusal anyway, so
+    /// the retained suffix is exactly what the success path keeps minus the
+    /// newest, and the newest is not lost — the ingest did not complete, so the
+    /// host neither marks it seen nor advances its cursor past it, and the
+    /// transport presents it again. Wrapping both in one transaction would buy
+    /// nothing observable.
+    pub(crate) fn retain_transport_message_refused_while_removed(
+        &mut self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        match self.storage.get_message(&msg.id) {
+            Ok(_) => return Ok(()),
+            Err(StorageError::NotFound) => {}
+            Err(e) => return Err(EngineError::Storage(e)),
+        }
+        if !self.make_room_in_the_removed_ring(group_id)? {
+            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+            return Ok(());
+        }
+        self.persist_transport_message(msg, group_id, epoch, MessageState::Retryable)
+    }
+
+    /// Make room for one more raw row in the removed copy's ring of
+    /// [`MAX_RETAINED_ROWS_PER_REMOVED_GROUP`] by releasing its oldest raw row
+    /// when the ring is full. Returns whether a row may now be written.
+    ///
+    /// Newest-wins: a commit published before the re-add Welcome was minted is
+    /// below this copy's install epoch and terminalizes stale at the replay, so
+    /// the rows worth keeping are the newest ones.
+    ///
+    /// Raw rows only, counted and evicted alike. A content-derived `Retryable`
+    /// row (a retained proposal, say) is a convergence input authored by a seam
+    /// that authenticated it, so it is not this ring's to evict — and counting
+    /// rows the ring cannot evict would squeeze raw retention below the bound,
+    /// or leave no candidate at all and let raw rows grow without limit,
+    /// #1840's objection reintroduced.
+    ///
+    /// Released, never failed: `release_message_for_replay` drops the bytes
+    /// WITHOUT a terminal deduplication verdict and journals a host receipt, so
+    /// the host un-sees the id, whereas `Failed` would answer `Duplicate`
+    /// forever. The journal is capacity-bounded, so a release can fail; that is
+    /// reported as "no room" rather than propagated, because a refusal on a
+    /// group this device left must not become a repeating hard ingest error.
+    ///
+    /// O(bound): the streaming visit stops once the bound is reached, and the
+    /// first raw row visited is the oldest (`MessageStorage` requires
+    /// insertion-order visitation; see its trait doc). The per-row payload
+    /// decode is free next to the column materialization the backend already
+    /// pays to hand us the record. No deferred-peel accounting: `Retryable`
+    /// rows hold no slot in that budget.
+    fn make_room_in_the_removed_ring(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        let mut raw_rows = 0usize;
+        let mut oldest_raw: Option<MessageRecord> = None;
+        self.storage.visit_messages_in_states(
+            group_id,
+            &[MessageState::Retryable],
+            EpochId(0),
+            &mut |record| {
+                if StoredMessagePayload::decode(&record.payload)
+                    .is_ok_and(|payload| payload.as_raw_transport().is_some())
+                {
+                    raw_rows += 1;
+                    if oldest_raw.is_none() {
+                        oldest_raw = Some(record);
+                    }
+                }
+                raw_rows < super::MAX_RETAINED_ROWS_PER_REMOVED_GROUP
+            },
+        )?;
+        let Some(record) =
+            oldest_raw.filter(|_| raw_rows >= super::MAX_RETAINED_ROWS_PER_REMOVED_GROUP)
+        else {
+            return Ok(true);
+        };
+        // Privacy-safe: aggregate signal only, no ids (observability.md).
+        if self.storage.release_message_for_replay(&record).is_err() {
+            tracing::warn!(
+                target: "cgka_engine::message_processor",
+                method = "make_room_in_the_removed_ring",
+                "could not release the oldest row a removed copy is holding; \
+                 the refused message is not retained"
+            );
+            return Ok(false);
+        }
+        tracing::debug!(
+            target: "cgka_engine::message_processor",
+            method = "make_room_in_the_removed_ring",
+            retained = super::MAX_RETAINED_ROWS_PER_REMOVED_GROUP,
+            "released the oldest row a removed copy was holding for its re-join"
+        );
+        Ok(true)
     }
 
     pub(crate) fn persist_transport_message_for_existing_group(

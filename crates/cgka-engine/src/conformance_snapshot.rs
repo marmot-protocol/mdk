@@ -12,7 +12,7 @@ use cgka_traits::convergence_pass::{ConvergencePassPhase, DurableConvergencePass
 use cgka_traits::engine_state::{EpochState, GroupLifecycleState};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
-use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
@@ -548,6 +548,20 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
     messages: &[MessageRecord],
 ) -> Result<ConformancePendingWorkSnapshot, EngineError> {
     let disbanded = engine.storage.disband_tombstone(group_id)?.is_some();
+    // Raw transport rows a removed copy retains for its own re-join are parked,
+    // not pending: nothing on this account-device processes them until a re-add
+    // Welcome replays them, so they must not keep a simulator from calling it
+    // quiescent. Content-derived `Retryable` rows on the same copy still count:
+    // they are convergence inputs the re-join's pass owns, and removal never
+    // retires them.
+    let removed = engine
+        .stored_group_record(group_id)?
+        .is_some_and(|group| group.removed);
+    let parked_on_removed_copy = |message: &MessageRecord| {
+        removed
+            && StoredMessagePayload::decode(&message.payload)
+                .is_ok_and(|payload| payload.as_raw_transport().is_some())
+    };
     let recovering_buffered_messages = match epoch_state {
         EpochState::Recovering(recovering) => recovering.buffered().len(),
         _ => 0,
@@ -560,6 +574,7 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
     for message in messages {
         match message.state {
             MessageState::Created => stored_created_messages += 1,
+            MessageState::Retryable if parked_on_removed_copy(message) => {}
             MessageState::Retryable => stored_retryable_messages += 1,
             MessageState::PeelDeferred => stored_transport_deferred_messages += 1,
             MessageState::Sent

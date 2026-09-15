@@ -341,6 +341,9 @@ struct FaultStorage {
     leave_write_fault: LeaveWriteFault,
     intent_write_fault: LeaveWriteFault,
     failed_state_fault: FailedStateWriteFault,
+    /// Faults `delete_message`, which is how the `MessageStorage` default
+    /// `release_message_for_replay` drops retained bytes.
+    release_fault: LeaveWriteFault,
     preparation_delay: PreparationDelay,
     retained_anchor_rewinds: RetainedAnchorRewindCounter,
 }
@@ -414,6 +417,9 @@ impl MessageStorage for FaultStorage {
         self.inner.get_message(id)
     }
     fn delete_message(&self, id: &MessageId) -> StorageResult<()> {
+        if self.release_fault.should_fail() {
+            return Err(StorageError::Busy("injected release/delete failure".into()));
+        }
         self.inner.delete_message(id)
     }
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
@@ -820,6 +826,287 @@ fn build_fault_selfremove_client(
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(id))
+    .account_identity_proof_signer(proof_signer(id))
+    .feature_registry(selfremove_registry())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    (engine, handle)
+}
+
+/// Mirrors `message_processor::MAX_RETAINED_ROWS_PER_REMOVED_GROUP`.
+const REMOVED_RING_BOUND: usize = 256;
+
+/// A failed eviction must not turn a refusal into an ingest error.
+///
+/// The removed copy's retention ring releases its oldest raw row through
+/// `MessageStorage::release_message_for_replay`, whose receipt journal is
+/// capacity-bounded and fails before it deletes bytes. Propagating that would
+/// make every later delivery for a group this device LEFT a hard error the app
+/// retries forever. Instead the ring makes room BEFORE it writes: when the
+/// oldest row cannot be released, the new message is not retained, so the bound
+/// is hard even under a persistently failing journal, and the refusal is still
+/// `Removed`. Once the journal accepts again, eviction and retention resume.
+#[tokio::test]
+async fn a_failed_ring_eviction_drops_the_new_message_and_keeps_the_bound() {
+    let release_fault = LeaveWriteFault::default();
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"ring-evict-alice"))
+        .account_identity_proof_signer(proof_signer(b"ring-evict-alice"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let (mut bob, bob_handle) =
+        build_release_fault_client(b"ring-evict-bob", release_fault.clone());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "ring-evict".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+
+    let removal = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.drain_events();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..removal
+    })
+    .await
+    .unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    bob.drain_events();
+    assert!(bob_handle.get_group(&group_id).unwrap().removed);
+
+    let raw_rows = |handle: &SqliteAccountStorage| {
+        handle
+            .list_messages_in_states(&group_id, &[MessageState::Retryable], EpochId(0))
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                cgka_traits::message::StoredMessagePayload::decode(&record.payload)
+                    .is_ok_and(|payload| payload.as_raw_transport().is_some())
+            })
+            .count()
+    };
+
+    let oldest_raw_id = || {
+        bob_handle
+            .list_messages_in_states(&group_id, &[MessageState::Retryable], EpochId(0))
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                cgka_traits::message::StoredMessagePayload::decode(&record.payload)
+                    .is_ok_and(|payload| payload.as_raw_transport().is_some())
+            })
+            .expect("a raw row")
+            .id
+    };
+
+    // Fill the ring exactly to the bound: still no eviction owed.
+    while raw_rows(&bob_handle) < REMOVED_RING_BOUND {
+        let commit = match alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { msg, pending, .. } => {
+                alice.confirm_published(pending).await.unwrap();
+                msg
+            }
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        let routed = TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..commit
+        };
+        bob.ingest(routed).await.unwrap();
+    }
+    assert_eq!(raw_rows(&bob_handle), REMOVED_RING_BOUND);
+    let oldest = oldest_raw_id();
+
+    // One more, with the release armed to fail. The refusal must still be a
+    // refusal, not an error.
+    let overflow = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let overflow_id = overflow.id.clone();
+    release_fault.arm_on_write(1);
+    let outcome = bob
+        .ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..overflow
+        })
+        .await
+        .expect("a failed eviction must not fail the ingest");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::LocalState {
+                state: cgka_traits::ingest::LocalIngestState::Removed
+            }
+        ),
+        "the refusal is unchanged by the failed eviction; got {outcome:?}"
+    );
+    assert_eq!(
+        release_fault.remaining(),
+        0,
+        "the armed release was actually attempted"
+    );
+    assert_eq!(
+        bob_handle.get_message(&oldest).unwrap().state,
+        MessageState::Retryable,
+        "the row the release could not drop stays retained"
+    );
+    assert!(
+        matches!(
+            bob_handle.get_message(&overflow_id),
+            Err(StorageError::NotFound)
+        ),
+        "when no room can be made the new message is not retained: the bound is hard"
+    );
+    assert_eq!(raw_rows(&bob_handle), REMOVED_RING_BOUND);
+
+    // A persistently failing journal: every further refusal is dropped and the
+    // ring does not grow.
+    for _ in 0..3 {
+        let dropped = match alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { msg, pending, .. } => {
+                alice.confirm_published(pending).await.unwrap();
+                msg
+            }
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        release_fault.arm_on_write(1);
+        bob.ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..dropped
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        raw_rows(&bob_handle),
+        REMOVED_RING_BOUND,
+        "repeated release failures must not grow the ring"
+    );
+
+    // The journal recovers: the next refusal evicts the oldest and is retained.
+    let retry = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let retry_id = retry.id.clone();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..retry
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(bob_handle.get_message(&oldest), Err(StorageError::NotFound)),
+        "the oldest row is released once the journal accepts it again"
+    );
+    assert_eq!(
+        bob_handle.get_message(&retry_id).unwrap().state,
+        MessageState::Retryable,
+        "and the message that made room is retained"
+    );
+    assert_eq!(raw_rows(&bob_handle), REMOVED_RING_BOUND);
+}
+
+/// Engine whose retained-row RELEASE (the `delete_message` the `MessageStorage`
+/// default `release_message_for_replay` calls) can be faulted.
+fn build_release_fault_client(
+    id: &[u8],
+    release_fault: LeaveWriteFault,
+) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault,
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
@@ -846,6 +1133,7 @@ fn build_capability_fault_client(
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
@@ -873,6 +1161,7 @@ fn build_leave_write_fault_client(
         leave_write_fault,
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
@@ -1687,6 +1976,7 @@ async fn slow_preparation_case(
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
         preparation_delay: delay.clone(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
@@ -1758,6 +2048,7 @@ async fn past_peel_backlog_case(
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: rewinds.clone(),
     })
@@ -2116,6 +2407,7 @@ async fn setup_own_intent_fault_case(
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: fault,
         failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })
@@ -2324,6 +2616,7 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: failed_state_fault.clone(),
+        release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
     })

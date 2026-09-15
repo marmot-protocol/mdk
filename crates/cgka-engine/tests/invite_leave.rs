@@ -3891,15 +3891,16 @@ async fn forgotten_group_rejects_welcome_without_authenticated_creation_time() {
     assert!(bob.drain_events().is_empty());
 }
 
-/// A removed copy pays a bounded cost per inbound message, not a durable row.
+/// A removed copy retains inbound traffic, bounded by the ring.
 ///
-/// Once the local copy is marked removed, continued relay traffic for the
-/// group is refused on the durable record alone. Each message still reports
-/// `Removed`, but the ledger must not grow: the `!is_active()` arm below it
-/// writes one `Failed` row per message, which under sustained post-removal
-/// traffic is unbounded storage growth for a group this device left.
+/// #1840's objection was to UNBOUNDED growth: the pre-#1840 `!is_active()` arm
+/// wrote one `Failed` row per post-removal message, which under sustained
+/// traffic is storage growth with no ceiling for a group this device left. The
+/// answer is a ceiling, not amnesia — each message still reports `Removed` and
+/// is retained for the re-join, and the ledger never passes
+/// `MAX_RETAINED_ROWS_PER_REMOVED_GROUP` raw rows.
 #[tokio::test]
-async fn removed_copy_ingest_stays_removed_without_growing_the_durable_ledger() {
+async fn removed_copy_ingest_stays_removed_and_retains_within_the_ring_bound() {
     let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
         setup_removed_member(b"evict-no-ledger-growth").await;
 
@@ -3937,8 +3938,16 @@ async fn removed_copy_ingest_stays_removed_without_growing_the_durable_ledger() 
         .unwrap()
         .len();
     assert_eq!(
-        rows_after, rows_before,
-        "post-removal traffic must not add durable rows to a removed copy's ledger"
+        rows_after,
+        rows_before + 4,
+        "each refused message is retained for the re-join, exactly once"
+    );
+    assert_eq!(
+        retained_raw_rows(&bob_storage, &group_id),
+        4,
+        "all four are raw rows retained for the re-join; the ceiling that keeps \
+         this a ring rather than a ledger that grows is pinned by \
+         `the_removed_copys_retained_rows_are_a_newest_wins_ring`"
     );
 }
 
@@ -3947,11 +3956,12 @@ async fn removed_copy_ingest_stays_removed_without_growing_the_durable_ledger() 
 /// A copy whose record says removed while its OpenMLS state is still active is
 /// pathological — a crash between the marker write and the MLS advance, or a
 /// removal realized through convergence — but it is exactly the shape that
-/// must not fall through to the peel and start retaining rows again. The
-/// record is the terminal fact the send gates already read; ingest reads it
-/// the same way.
+/// must not fall through to the peel and apply group state the record says this
+/// device has no part in. The record is the terminal fact the send gates
+/// already read; ingest reads it the same way, and the input joins the ring
+/// rather than the group.
 #[tokio::test]
-async fn removed_record_with_live_mls_state_is_refused_without_a_durable_row() {
+async fn removed_record_with_live_mls_state_is_refused_and_retained() {
     let (mut alice, mut bob, bob_storage, group_id, _undelivered_commit) =
         setup_removed_member(b"evict-record-only").await;
 
@@ -3968,7 +3978,7 @@ async fn removed_record_with_live_mls_state_is_refused_without_a_durable_row() {
         .len();
 
     let routed_app = post_eviction_app_message(&mut alice, &group_id, b"record-only").await;
-    let outcome = bob.ingest(routed_app).await.unwrap();
+    let outcome = bob.ingest(routed_app.clone()).await.unwrap();
     assert!(
         matches!(
             outcome,
@@ -3983,22 +3993,26 @@ async fn removed_record_with_live_mls_state_is_refused_without_a_durable_row() {
             .list_messages(&group_id, cgka_traits::EpochId(0))
             .unwrap()
             .len(),
-        rows_before,
-        "the record gate must not retain the refused input"
+        rows_before + 1,
+        "the record gate retains the refused input, and only once"
+    );
+    assert_eq!(
+        bob_storage.get_message(&routed_app.id).unwrap().state,
+        MessageState::Retryable,
+        "retained in the state the re-join's replay admits"
     );
 }
 
-/// Refusing on the record must stay recoverable: a re-added device still
-/// processes the commits it refused while removed.
+/// A redelivery after the re-join is a duplicate of a message already applied.
 ///
-/// A removed device is routinely re-added by an admin, and the commits the
-/// group publishes after that Welcome is minted can reach the device before
-/// the Welcome itself does. Those arrive while the copy is still removed, so
-/// the gate refuses them — and it must leave no trace that turns the relay's
-/// redelivery after the join into a `Duplicate`. This mirrors the
-/// unknown-group arm's #740 rule for exactly the same reason.
+/// #1840 left the refused id no durable trace so that an eventual relay
+/// redelivery would not be answered `Duplicate`. Nothing re-fetches such an id
+/// in production, so that hope was never collected on; retention pays the debt
+/// directly, from the copy the device already holds. The redelivery, if it ever
+/// comes, is then a duplicate in the honest sense — the message is APPLIED, the
+/// device is already converged, and the second copy changes nothing.
 #[tokio::test]
-async fn commits_refused_while_removed_still_process_after_an_authenticated_rejoin() {
+async fn a_redelivered_refused_commit_duplicates_one_the_rejoin_already_applied() {
     let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
         setup_removed_member(b"evict-rejoin-redelivery").await;
 
@@ -4012,7 +4026,7 @@ async fn commits_refused_while_removed_still_process_after_an_authenticated_rejo
     let (rejoin_welcome, routed_later) =
         readd_bob_then_commit_ahead_of_the_welcome(&mut alice, &mut bob, &group_id).await;
 
-    // It reaches bob while he is still removed: refused, and left no trace.
+    // It reaches bob while he is still removed: refused, and retained.
     let outcome = bob.ingest(routed_later.clone()).await.unwrap();
     assert!(
         matches!(
@@ -4024,41 +4038,638 @@ async fn commits_refused_while_removed_still_process_after_an_authenticated_rejo
         "a commit arriving before the Welcome is refused on the record; got {outcome:?}"
     );
 
-    // The Welcome lands and the copy is live again.
+    // The Welcome lands and the copy is live again; its own replay applies the
+    // retained commit.
     bob.join_welcome(rejoin_welcome).await.unwrap();
     bob.drain_events();
+    converge_buffered_commit(&mut bob, &group_id);
 
     // Reopen over the same storage before the redelivery. Without this the
-    // in-process seen cache alone could carry the assertion; the claim under
-    // test is about what the refusal wrote durably, so the durable state must
-    // be the only thing left to answer it.
+    // in-process caches alone could carry the assertions; the claim under test
+    // is about what the refusal and the replay wrote durably, so the durable
+    // state must be the only thing left to answer it.
     drop(bob);
     let mut bob = build_client_on_storage(b"bob", bob_storage.clone());
     bob.hydrate_all_stored_groups().unwrap();
     bob.drain_events();
-    let rejoin_epoch = bob.epoch(&group_id).unwrap().0;
+    let converged = alice.epoch(&group_id).unwrap();
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        converged,
+        "the join's replay already applied the retained commit"
+    );
 
-    // Relay redelivery of the refused commit must now advance bob.
+    // The relay eventually redelivers that exact id. It is now a duplicate in
+    // the honest sense, and it moves nothing.
     let outcome = bob.ingest(routed_later).await.unwrap();
     assert!(
-        !matches!(
+        matches!(
             outcome,
             IngestOutcome::Ignored {
                 category: cgka_traits::ingest::InputRejectionCategory::Duplicate
             }
         ),
-        "redelivery after the re-join must not be discarded as a duplicate; got {outcome:?}"
+        "a redelivery of an applied message is a duplicate; got {outcome:?}"
     );
-    converge_buffered_commit(&mut bob, &group_id);
     assert_eq!(
-        bob.epoch(&group_id).unwrap().0,
-        rejoin_epoch + 1,
-        "the redelivered commit must advance the re-joined copy"
+        bob.epoch(&group_id).unwrap(),
+        converged,
+        "and it leaves the converged copy exactly where the join left it"
+    );
+}
+/// The re-join replays what the removed copy refused — no relay involved.
+///
+/// The bytes already reached this device: retaining them is the only thing
+/// that makes the catch-up independent of the relay. Nothing re-fetches a
+/// refused id in production — the relay SDK marks an event seen on first
+/// arrival whatever the engine answered, the app's backfill is unfloored, the
+/// transport cursor is account-wide and advances anyway, and the join arms no
+/// fetch — so a commit published between the re-add Welcome's minting and its
+/// arrival is this device's only copy. `do_join_welcome`'s
+/// `replay_buffered_messages` must apply it from storage alone.
+#[tokio::test]
+async fn a_commit_refused_while_removed_is_replayed_by_the_rejoin_without_redelivery() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-replay").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+
+    let (rejoin_welcome, routed_later) =
+        readd_bob_then_commit_ahead_of_the_welcome(&mut alice, &mut bob, &group_id).await;
+
+    // The raced-ahead commit reaches bob while he is still removed.
+    let outcome = bob.ingest(routed_later).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
+            }
+        ),
+        "a commit arriving before the Welcome is refused on the record; got {outcome:?}"
+    );
+
+    // Restart over the same storage before the Welcome: durable state is the
+    // only thing that can carry the raced commit across, and the in-process
+    // caches must not be able to stand in for it.
+    drop(bob);
+    let mut bob = build_client_on_storage(b"bob", bob_storage.clone());
+    bob.hydrate_all_stored_groups().unwrap();
+    bob.drain_events();
+
+    // The Welcome lands. Nothing is redelivered, ever.
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    bob.drain_events();
+    converge_buffered_commit(&mut bob, &group_id);
+
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap(),
+        "the join's replay must apply the retained commit: a re-added device \
+         has no re-fetch to fall back on"
+    );
+}
+
+/// The message that REALIZES the removal is retained on the same terms.
+///
+/// It is the first post-removal message on a copy the marker has not reached
+/// yet, and the likeliest shape for it is exactly the commit that raced ahead
+/// of a re-add Welcome. Refusing it without a row would lose it outright: the
+/// realizing arm is reached once per copy, so nothing brings it back.
+#[tokio::test]
+async fn the_commit_that_realizes_the_removal_is_replayed_by_the_rejoin() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-realizing").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // The silent-eviction shape: OpenMLS records the eviction, the durable
+    // record does not, so the next message reaches the realizing arm rather
+    // than the record gate.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    record.members = vec![cgka_traits::group::Member {
+        id: bob.self_id(),
+        credential: bob.self_id().as_slice().to_vec(),
+    }];
+    bob_storage.put_group(&record).unwrap();
+
+    let (rejoin_welcome, routed_later) =
+        readd_bob_then_commit_ahead_of_the_welcome(&mut alice, &mut bob, &group_id).await;
+
+    let outcome = bob.ingest(routed_later).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
+            }
+        ),
+        "the realizing message still classifies Removed; got {outcome:?}"
+    );
+    assert!(
+        bob_storage.get_group(&group_id).unwrap().removed,
+        "the realization obligation is unchanged: the copy is marked removed"
+    );
+
+    drop(bob);
+    let mut bob = build_client_on_storage(b"bob", bob_storage.clone());
+    bob.hydrate_all_stored_groups().unwrap();
+    bob.drain_events();
+
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    bob.drain_events();
+    converge_buffered_commit(&mut bob, &group_id);
+
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap(),
+        "the realizing arm owes the same retention as the record gate: this \
+         commit has no second delivery either"
+    );
+}
+
+/// A whole raced interval replays, commits and chat alike.
+///
+/// The realistic shape is not one commit: the group keeps committing AND
+/// talking while the re-add Welcome is in flight. Every one of those events
+/// reaches the removed copy first, so the retained ring has to carry the chain
+/// in order — each commit applying, each application message surfacing once the
+/// epoch that seals it lands.
+#[tokio::test]
+async fn a_raced_interval_of_commits_and_chat_replays_in_full_after_the_rejoin() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-interval").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let rejoin_welcome = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+
+    // Three commits and, after each, a message sealed under the epoch it
+    // opens. All of it races ahead of the Welcome and reaches bob removed.
+    const RACED_COMMITS: usize = 3;
+    for round in 0..RACED_COMMITS {
+        let commit = route_group_commit(
+            commit_and_confirm(
+                &mut alice,
+                SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                },
+            )
+            .await,
+            &group_id,
+        );
+        let outcome = bob.ingest(commit).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed
+                }
+            ),
+            "round {round}: raced commit is refused on the record; got {outcome:?}"
+        );
+        let chat =
+            post_eviction_app_message(&mut alice, &group_id, format!("raced-{round}").as_bytes())
+                .await;
+        let outcome = bob.ingest(chat).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed
+                }
+            ),
+            "round {round}: raced chat is refused on the record; got {outcome:?}"
+        );
+    }
+
+    // The Welcome lands. Nothing is redelivered.
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    bob.drain_events();
+
+    let target = alice.epoch(&group_id).unwrap();
+    let mut received = 0usize;
+    for round in 1..=8u64 {
+        bob.converge_stored_openmls_messages_at(&group_id, round * 1_000_000)
+            .expect("a replayed ring must not fail a pass");
+        received += bob
+            .drain_events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::MessageReceived { group_id: id, .. }
+                        if *id == group_id
+                )
+            })
+            .count();
+        if bob.epoch(&group_id).unwrap() == target && received == RACED_COMMITS {
+            break;
+        }
+    }
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        target,
+        "every raced commit in the ring must apply"
+    );
+    assert_eq!(
+        received, RACED_COMMITS,
+        "and every raced application message must surface behind them"
+    );
+}
+
+/// Mirrors `message_processor::MAX_RETAINED_ROWS_PER_REMOVED_GROUP`, which is
+/// crate-private. A change there is meant to be felt here.
+const REMOVED_RING_BOUND: usize = 256;
+
+/// Raw transport rows this group is holding for a later replay.
+fn retained_raw_rows(storage: &SqliteAccountStorage, group_id: &GroupId) -> usize {
+    storage
+        .list_messages_in_states(
+            group_id,
+            &[MessageState::Retryable],
+            cgka_traits::EpochId(0),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            StoredMessagePayload::decode(&record.payload)
+                .is_ok_and(|payload| payload.as_raw_transport().is_some())
+        })
+        .count()
+}
+
+/// Seed a content-derived `Retryable` row — the shape a retained standalone
+/// proposal, or a future-epoch application message the copy cannot decrypt,
+/// leaves behind. These survive a removal: only `PeelDeferred` rows are retired
+/// when the copy becomes terminal.
+fn seed_content_retryable_row(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    msg: &TransportMessage,
+) {
+    let epoch = storage.get_group(group_id).unwrap().epoch;
+    storage
+        .put_message(&MessageRecord {
+            id: msg.id.clone(),
+            group_id: group_id.clone(),
+            epoch,
+            state: MessageState::Retryable,
+            payload: StoredMessagePayload::openmls_wire(msg.clone())
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+}
+
+/// The ring is a bound on RAW rows, and content rows do not spend its slots.
+///
+/// A removed copy can hold content-derived `Retryable` rows — retained
+/// proposals, undecryptable future-epoch application messages — and the
+/// eviction helper must not evict them: they are convergence inputs authored by
+/// a seam that authenticated them. Counting them anyway would be the worst of
+/// both: every one squeezes raw retention below the bound and makes the next
+/// refusal evict a raced commit to make room for a row that is never evicted,
+/// and a group whose oldest rows are all content rows would find no
+/// candidate at all and grow raw rows without limit — #1840's objection exactly.
+#[tokio::test]
+async fn content_rows_neither_spend_nor_are_evicted_from_the_removed_ring() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-content").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Seeded first, so they are the OLDEST rows in insert order — the position
+    // from which a miscounted ring does its damage.
+    const CONTENT_ROWS: usize = 3;
+    let mut content = Vec::new();
+    for index in 0..CONTENT_ROWS {
+        let msg =
+            post_eviction_app_message(&mut alice, &group_id, format!("content-{index}").as_bytes())
+                .await;
+        seed_content_retryable_row(&bob_storage, &group_id, &msg);
+        content.push(msg);
+    }
+
+    let mut raw = Vec::new();
+    for index in 0..REMOVED_RING_BOUND + 1 {
+        let msg =
+            post_eviction_app_message(&mut alice, &group_id, format!("raw-{index}").as_bytes())
+                .await;
+        bob.ingest(msg.clone()).await.unwrap();
+        raw.push(msg);
+    }
+
+    assert_eq!(
+        retained_raw_rows(&bob_storage, &group_id),
+        REMOVED_RING_BOUND,
+        "the bound is over raw rows, so content rows must not spend its slots"
+    );
+    assert!(
+        matches!(
+            bob_storage.get_message(&raw[0].id),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ),
+        "the one row past the bound evicts the oldest RAW row; got {:?}",
+        bob_storage.get_message(&raw[0].id).map(|row| row.state)
+    );
+    for msg in raw.iter().skip(1) {
+        assert_eq!(
+            bob_storage.get_message(&msg.id).unwrap().state,
+            MessageState::Retryable,
+            "no raw row past the oldest is evicted"
+        );
+    }
+    for msg in &content {
+        assert_eq!(
+            bob_storage.get_message(&msg.id).unwrap().state,
+            MessageState::Retryable,
+            "a content-derived row is a convergence input, not the ring's to drop"
+        );
+    }
+}
+
+/// Retention is a newest-wins ring, not a licence to grow.
+///
+/// #1840's objection stands: a removed copy that kept every refused message
+/// would grow the durable ledger without bound for a group this device left.
+/// The ring answers it — past the bound the OLDEST row is released, which drops
+/// the bytes WITHOUT a terminal deduplication verdict, so the host un-sees the
+/// id and a later targeted re-fetch can still recover it.
+#[tokio::test]
+async fn the_removed_copys_retained_rows_are_a_newest_wins_ring() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-ring").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert_eq!(
+        retained_raw_rows(&bob_storage, &group_id),
+        0,
+        "precondition: the removed copy starts with an empty ring"
+    );
+
+    const OVERFLOW: usize = 4;
+    let mut delivered = Vec::new();
+    for index in 0..REMOVED_RING_BOUND + OVERFLOW {
+        let msg =
+            post_eviction_app_message(&mut alice, &group_id, format!("ring-{index}").as_bytes())
+                .await;
+        bob.ingest(msg.clone()).await.unwrap();
+        delivered.push(msg);
+    }
+
+    assert_eq!(
+        retained_raw_rows(&bob_storage, &group_id),
+        REMOVED_RING_BOUND,
+        "the ring holds the bound and no more"
+    );
+    for (index, msg) in delivered.iter().take(OVERFLOW).enumerate() {
+        assert!(
+            matches!(
+                bob_storage.get_message(&msg.id),
+                Err(cgka_traits::storage::StorageError::NotFound)
+            ),
+            "the oldest {OVERFLOW} rows are evicted; row {index} survived as {:?}",
+            bob_storage.get_message(&msg.id).map(|row| row.state)
+        );
+    }
+    for msg in delivered.iter().skip(OVERFLOW) {
+        assert_eq!(
+            bob_storage.get_message(&msg.id).unwrap().state,
+            MessageState::Retryable,
+            "everything newer than the evicted prefix is still retained"
+        );
+    }
+
+    // Released, not failed: the host un-sees the id, so redelivery of that
+    // exact event is processed rather than discarded as already-decided.
+    let evicted = delivered[0].clone();
+    let outcome = bob.ingest(evicted).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
+            }
+        ),
+        "an evicted id is un-seen, so redelivery reaches the gate again and is \
+         refused-and-retained rather than discarded as a duplicate; got {outcome:?}"
+    );
+}
+
+/// The re-join drains the ring in one pass — it does not inherit churn.
+///
+/// Most of a removal interval's traffic predates the re-add Welcome, and the
+/// new copy holds no secret that opens it. Those rows must settle on the
+/// join's own replay — terminal, or `PeelDeferred` under its bounded residence
+/// budget — rather than sitting `Retryable` and being re-peeled by every later
+/// publish-cycle replay. And a branch this copy never held must not halt the
+/// group the Welcome just repaired.
+#[tokio::test]
+async fn the_rejoin_settles_the_whole_ring_without_halting_the_repaired_group() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-drain").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Pre-Welcome traffic: commits from a branch this copy will never hold,
+    // and chat sealed under epochs the replacement copy has no secret for.
+    let mut refused = Vec::new();
+    for round in 0..3u8 {
+        let commit = route_group_commit(
+            commit_and_confirm(
+                &mut alice,
+                SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                },
+            )
+            .await,
+            &group_id,
+        );
+        bob.ingest(commit.clone()).await.unwrap();
+        refused.push(commit);
+        let chat =
+            post_eviction_app_message(&mut alice, &group_id, format!("era-{round}").as_bytes())
+                .await;
+        bob.ingest(chat.clone()).await.unwrap();
+        refused.push(chat);
+    }
+    for msg in &refused {
+        assert_eq!(
+            bob_storage.get_message(&msg.id).unwrap().state,
+            MessageState::Retryable,
+            "precondition: the removal interval is retained"
+        );
+    }
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let rejoin_welcome = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    let pass = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+
+    for msg in &refused {
+        let state = bob_storage.get_message(&msg.id).map(|record| record.state);
+        assert!(
+            !matches!(state, Ok(MessageState::Retryable)),
+            "a replayed row must leave the retry lifecycle on the join's own \
+             pass, not be re-peeled forever; got {state:?}"
+        );
+    }
+    let still_pending: Vec<_> = bob_storage
+        .list_messages_in_states(
+            &group_id,
+            &[MessageState::Retryable, MessageState::ConvergenceDeferred],
+            cgka_traits::EpochId(0),
+        )
+        .unwrap()
+        .iter()
+        .map(|record| (record.epoch, record.state))
+        .collect();
+    assert!(
+        still_pending.is_empty(),
+        "group-wide: the join's pass must leave no row of the removal interval \
+         in a retry or parked state, raw or content-derived; got {still_pending:?}"
+    );
+    assert!(
+        pass.errors.is_empty(),
+        "no pass should be asked to reconstruct a branch this copy never held; \
+         got {:?}",
+        pass.errors
+    );
+    assert!(
+        !bob_storage.get_group(&group_id).unwrap().unrecoverable,
+        "a replayed removal interval must not halt the group the Welcome repaired"
+    );
+    let events = bob.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupUnrecoverable { .. }
+        )),
+        "got {events:?}"
     );
     assert_eq!(
         bob.epoch(&group_id).unwrap(),
         alice.epoch(&group_id).unwrap(),
-        "bob converges with the group he was re-added to"
+        "and the re-joined copy stays converged"
+    );
+}
+
+/// Redelivery of a RETAINED id answers `Buffered`, and changes nothing.
+///
+/// A retained raw row is `Retryable`, and `recorded_message_outcome` maps that
+/// to `Buffered` before ingest ever reads the group record — deliberately, so
+/// the hot dedup seam does no per-group lookup. So the second copy of a refused
+/// message never reaches the gate, and the outcome the host sees is `Buffered`
+/// rather than `LocalState { Removed }`. The visible contract changed with
+/// retention; what must not change is the durable state.
+#[tokio::test]
+async fn redelivery_of_a_retained_id_answers_buffered_and_moves_nothing() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-retain-redeliver").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"retained-once").await;
+    let first = bob.ingest(routed_app.clone()).await.unwrap();
+    assert!(
+        matches!(
+            first,
+            IngestOutcome::LocalState {
+                state: LocalIngestState::Removed
+            }
+        ),
+        "the first copy reaches the gate; got {first:?}"
+    );
+    let rows_after_first = bob_storage
+        .list_messages(&group_id, cgka_traits::EpochId(0))
+        .unwrap()
+        .len();
+    let raw_after_first = retained_raw_rows(&bob_storage, &group_id);
+    let row_after_first = bob_storage.get_message(&routed_app.id).unwrap();
+
+    let second = bob.ingest(routed_app.clone()).await.unwrap();
+    assert!(
+        matches!(second, IngestOutcome::Buffered { .. }),
+        "the durable dedup seam answers a retained row before the gate is \
+         reached; got {second:?}"
+    );
+    assert_eq!(
+        bob_storage
+            .list_messages(&group_id, cgka_traits::EpochId(0))
+            .unwrap()
+            .len(),
+        rows_after_first,
+        "no duplicate row"
+    );
+    assert_eq!(
+        retained_raw_rows(&bob_storage, &group_id),
+        raw_after_first,
+        "the ring is unchanged, so a redelivery flood cannot churn it"
+    );
+    let row_after_second = bob_storage.get_message(&routed_app.id).unwrap();
+    assert_eq!(
+        (row_after_second.state, row_after_second.epoch),
+        (row_after_first.state, row_after_first.epoch),
+        "and the retained row is not re-stamped"
     );
 }
 
@@ -4137,19 +4748,18 @@ async fn removal_realized_mid_replay_leaves_later_buffered_rows_retained() {
     );
 }
 
-/// Realizing the removal must not write a ledger row for the message that
-/// realized it.
+/// Realizing the removal retains the message that realized it.
 ///
-/// The record gate (#1840) refuses every later post-removal message with no
-/// durable trace, precisely so relay redelivery after a re-add Welcome is not
-/// classified `Duplicate`. The realizing arm is the FIRST post-removal message
-/// on a copy the marker has not reached yet, and it is the one most likely to
-/// be a commit racing ahead of that Welcome — so it owes the same rule. A
-/// `Failed` row here is not replayable (`replay_buffered_messages` admits only
-/// `Created | Retryable | PeelDeferred`) and answers `Duplicate` on
-/// redelivery, so the message would be lost to this device for good.
+/// The realizing arm is the FIRST post-removal message on a copy the marker
+/// has not reached yet, and it is the one most likely to be a commit racing
+/// ahead of a re-add Welcome — so it owes the record gate's retention, and owes
+/// it more: the arm runs once per copy, so a message dropped here has no second
+/// chance at all. Retained `Retryable`, not `Failed`:
+/// `replay_buffered_messages` admits only `Created | Retryable | PeelDeferred`,
+/// and `Failed` answers `Duplicate` on redelivery, so a `Failed` row would lose
+/// the message to this device for good.
 #[tokio::test]
-async fn realizing_the_removal_writes_no_ledger_row_for_the_realizing_message() {
+async fn realizing_the_removal_retains_one_row_for_the_realizing_message() {
     let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
         setup_removed_member(b"evict-realize-no-row").await;
 
@@ -4173,7 +4783,7 @@ async fn realizing_the_removal_writes_no_ledger_row_for_the_realizing_message() 
         .len();
 
     let routed_app = post_eviction_app_message(&mut alice, &group_id, b"realizing").await;
-    let outcome = bob.ingest(routed_app).await.unwrap();
+    let outcome = bob.ingest(routed_app.clone()).await.unwrap();
     assert!(
         matches!(
             outcome,
@@ -4192,9 +4802,13 @@ async fn realizing_the_removal_writes_no_ledger_row_for_the_realizing_message() 
             .list_messages(&group_id, cgka_traits::EpochId(0))
             .unwrap()
             .len(),
-        rows_before,
-        "the message that realized the removal must leave no durable trace, so \
-         redelivery after a re-add Welcome is not answered as a duplicate"
+        rows_before + 1,
+        "the message that realized the removal is retained, exactly once"
+    );
+    assert_eq!(
+        bob_storage.get_message(&routed_app.id).unwrap().state,
+        MessageState::Retryable,
+        "and in the state the re-join's replay admits"
     );
 }
 
@@ -4506,6 +5120,56 @@ async fn eviction_era_commits_redelivered_after_a_rejoin_are_not_rivals() {
 }
 
 /// Seed a raw transport row exactly as a pre-#1840 build's realizing arm would
+/// The pending-work snapshot treats the removed copy's raw ring rows as parked:
+/// nothing on this device processes them until a re-add Welcome replays them.
+/// A content-derived `Retryable` row on the same copy is different — it is a
+/// convergence input the re-join's pass owns and removal never retires it — so
+/// it keeps counting as durable work.
+#[cfg(feature = "test-conformance-snapshot")]
+#[tokio::test]
+async fn only_the_removed_copys_raw_ring_rows_are_parked_in_pending_work() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-parked-rows").await;
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+
+    for label in [b"raw-one".as_slice(), b"raw-two".as_slice()] {
+        let msg = post_eviction_app_message(&mut alice, &group_id, label).await;
+        bob.ingest(msg).await.unwrap();
+    }
+    assert_eq!(retained_raw_rows(&bob_storage, &group_id), 2);
+    assert_eq!(
+        bob.conformance_pending_work_snapshot(&group_id)
+            .unwrap()
+            .stored_retryable_messages,
+        0,
+        "the ring's raw rows are parked for the re-join, not pending work"
+    );
+
+    let content = post_eviction_app_message(&mut alice, &group_id, b"content-row").await;
+    bob_storage
+        .put_message(&MessageRecord {
+            id: content.id.clone(),
+            group_id: group_id.clone(),
+            epoch: bob_storage.get_group(&group_id).unwrap().epoch,
+            state: MessageState::Retryable,
+            payload: StoredMessagePayload::openmls_wire(content.clone())
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bob.conformance_pending_work_snapshot(&group_id)
+            .unwrap()
+            .stored_retryable_messages,
+        1,
+        "a content-derived row on the removed copy is durable work the re-join's pass owns"
+    );
+}
+
 /// have written it: `Failed`, stamped with the removed copy's own epoch.
 fn seed_legacy_refused_row(
     storage: &SqliteAccountStorage,
