@@ -1500,58 +1500,6 @@ fn single_relay_topology_for(clients: &[String]) -> ScenarioTopologyV2 {
     }
 }
 
-#[cfg(test)]
-mod checkpoint_tests {
-    use super::*;
-
-    #[test]
-    fn public_send_checks_only_new_payload_but_restart_checks_full_history() {
-        let mut model = JourneyModel::new_public(0);
-        for _ in 0..2 {
-            model.apply(JourneyAction::Send {
-                sender: "alice".into(),
-            });
-        }
-        model.steps.clear();
-        model.apply(JourneyAction::Send {
-            sender: "alice".into(),
-        });
-        let payloads = model.received_payloads["alice"].clone();
-        let assertions = model
-            .steps
-            .iter()
-            .filter(|step| matches!(step, ScenarioStep::Assert { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(assertions.len(), model.members.len());
-        for step in assertions {
-            assert!(matches!(step, ScenarioStep::Assert {
-                assertion: crate::ScenarioAssertionV2::Eventually {
-                    predicate: crate::ScenarioPredicateV2::PayloadCount { payload, count: 1, .. }, ..
-                }
-            } if payload == &payloads[2]));
-        }
-        model.steps.clear();
-        model.apply(JourneyAction::Restart {
-            client: "bob".into(),
-        });
-        let checks = model
-            .steps
-            .iter()
-            .filter(|step| {
-                matches!(
-                    step,
-                    ScenarioStep::Assert {
-                        assertion: crate::ScenarioAssertionV2::Eventually {
-                            predicate: crate::ScenarioPredicateV2::PayloadCount { .. },
-                            ..
-                        }
-                    }
-                )
-            })
-            .count();
-        assert_eq!(checks, model.members.len() * payloads.len());
-    }
-}
 /// New families leave all existing generator identities and prefixes unchanged.
 pub fn generate_public_app_invite_profile_case(
     seed: u64,
@@ -1783,4 +1731,57 @@ pub fn generate_public_app_activity_case(
     let mut case = model.finish_public(family, seed);
     case.generator_version = if pressure { "3" } else { "1" }.into();
     case
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn public_send_checks_only_new_payload_but_restart_checks_full_history() {
+        let mut model = JourneyModel::new_public(0);
+        for _ in 0..2 {
+            model.apply(JourneyAction::Send {
+                sender: "alice".into(),
+            });
+        }
+        model.steps.clear();
+        model.apply(JourneyAction::Send {
+            sender: "alice".into(),
+        });
+        let payloads = model.received_payloads["alice"].clone();
+        let assertions = model
+            .steps
+            .iter()
+            .filter(|step| matches!(step, ScenarioStep::Assert { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(assertions.len(), model.members.len());
+        for step in assertions {
+            assert!(matches!(step, ScenarioStep::Assert {
+                assertion: crate::ScenarioAssertionV2::Eventually {
+                    predicate: crate::ScenarioPredicateV2::PayloadCount { payload, count: 1, .. }, ..
+                }
+            } if payload == &payloads[2]));
+        }
+        model.steps.clear();
+        model.apply(JourneyAction::Restart {
+            client: "bob".into(),
+        });
+        let checks = model
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    ScenarioStep::Assert {
+                        assertion: crate::ScenarioAssertionV2::Eventually {
+                            predicate: crate::ScenarioPredicateV2::PayloadCount { .. },
+                            ..
+                        }
+                    }
+                )
+            })
+            .count();
+        assert_eq!(checks, model.members.len() * payloads.len());
+    }
 }
