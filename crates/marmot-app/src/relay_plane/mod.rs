@@ -1785,6 +1785,12 @@ fn recover_relay_notification_forwarder(
 }
 
 impl MarmotRelayPlaneAccountAdapter {
+    /// Explicit catch-up must reissue even settled, matching subscriptions.
+    /// Cancellation leaves reuse disabled until an activation succeeds.
+    pub(crate) async fn require_fresh_activation(&self) {
+        *self.incremental_activation.lock().await = None;
+    }
+
     /// The account this adapter is bound to — the `MemberId` every subscription
     /// issued through it carries (activation and group sync reject any other
     /// id), and the key its registrations bucket under on the shared relay

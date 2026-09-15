@@ -1163,6 +1163,7 @@ impl AppClient {
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.adapter.require_fresh_activation().await;
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
