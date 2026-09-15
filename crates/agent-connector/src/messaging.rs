@@ -21,6 +21,25 @@ use crate::{
     MAX_MEDIA_UPLOAD_BATCH_BYTES,
 };
 
+/// Map an account-scoped chat-list projection onto the optional `group_info`
+/// display subject. Missing rows, blank names, and projection errors yield
+/// `None` so display enrichment cannot fail a valid membership response.
+pub(crate) fn group_info_subject_from_projection<E>(
+    row: Result<Option<impl AsRef<str>>, E>,
+) -> Option<String> {
+    match row {
+        Ok(Some(name)) => {
+            let trimmed = name.as_ref().trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        Ok(None) | Err(_) => None,
+    }
+}
+
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
 /// Current schema version for persisted `send_media` request fingerprints.
@@ -356,12 +375,17 @@ impl AgentConnector {
             .group_mls_state(&account.label, &group_id)
             .await?;
         let member_count = u32::try_from(state.member_count).unwrap_or(u32::MAX);
+        let subject = group_info_subject_from_projection(
+            self.runtime
+                .chat_list_row(&account.label, &group_id_hex)
+                .map(|row| row.map(|row| row.group_name)),
+        );
         Ok(AgentControlResponse::GroupInfo {
             account_id_hex: account.account_id_hex,
             group_id_hex: hex::encode(group_id.as_slice()),
             member_count,
             is_direct: state.member_count == 2,
-            subject: None,
+            subject,
         })
     }
 

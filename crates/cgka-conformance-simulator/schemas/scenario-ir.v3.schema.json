@@ -4,63 +4,455 @@
   "title": "MDK adapter-neutral scenario IR v3",
   "type": "object",
   "additionalProperties": false,
-  "required": ["name", "spec_version", "clients", "steps"],
+  "required": [
+    "name",
+    "spec_version",
+    "clients",
+    "steps"
+  ],
   "properties": {
-    "name": { "type": "string", "minLength": 1 },
-    "spec_version": { "const": "3" },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "spec_version": {
+      "const": "3"
+    },
     "clients": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
-    "topology": { "$ref": "scenario-ir.v2.schema.json#/$defs/topology" },
+    "topology": {
+      "$ref": "scenario-ir.v2.schema.json#/$defs/topology"
+    },
     "steps": {
       "type": "array",
-      "items": { "$ref": "#/$defs/step" }
+      "items": {
+        "$ref": "#/$defs/step"
+      }
     }
   },
   "$defs": {
     "update_group_profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "client", "pending"],
+      "required": [
+        "type",
+        "client",
+        "pending"
+      ],
       "properties": {
-        "type": { "const": "update_group_profile" },
-        "client": { "type": "string", "minLength": 1 },
-        "name": { "type": "string" },
-        "description": { "type": "string" },
-        "pending": { "type": "string", "minLength": 1 }
+        "type": {
+          "const": "update_group_profile"
+        },
+        "client": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "pending": {
+          "type": "string",
+          "minLength": 1
+        }
       },
       "anyOf": [
-        { "required": ["name"] },
-        { "required": ["description"] }
+        {
+          "required": [
+            "name"
+          ]
+        },
+        {
+          "required": [
+            "description"
+          ]
+        }
       ]
     },
     "step": {
       "oneOf": [
-        { "$ref": "scenario-ir.v2.schema.json#/$defs/step" },
-        { "$ref": "#/$defs/update_group_profile" },
+        {
+          "$ref": "scenario-ir.v2.schema.json#/$defs/step"
+        },
+        {
+          "$ref": "#/$defs/update_group_profile"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "client", "error"],
+          "required": [
+            "type",
+            "client",
+            "error"
+          ],
           "properties": {
-            "type": { "const": "expect_tick_error" },
-            "client": { "type": "string", "minLength": 1 },
-            "error": { "type": "string", "minLength": 1 }
+            "type": {
+              "const": "expect_tick_error"
+            },
+            "client": {
+              "type": "string",
+              "minLength": 1
+            },
+            "error": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "group", "action"],
+          "required": [
+            "type",
+            "group",
+            "action"
+          ],
           "properties": {
-            "type": { "const": "in_group" },
-            "group": { "type": "string", "minLength": 1 },
-            "action": { "$ref": "#/$defs/update_group_profile" }
+            "type": {
+              "const": "in_group"
+            },
+            "group": {
+              "type": "string",
+              "minLength": 1
+            },
+            "action": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/update_group_profile"
+                },
+                {
+                  "$ref": "#/$defs/race_group_profiles"
+                },
+                {
+                  "$ref": "#/$defs/public_history_assertion"
+                },
+                {
+                  "$ref": "#/$defs/race_invite_profile"
+                }
+              ]
+            }
           }
+        },
+        {
+          "$ref": "#/$defs/interrupt_relay"
+        },
+        {
+          "$ref": "#/$defs/race_group_profiles"
+        },
+        {
+          "$ref": "#/$defs/public_history_assertion"
+        },
+        {
+          "$ref": "#/$defs/race_invite_profile"
         }
       ]
+    },
+    "interrupt_relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "relay",
+        "outage_ms"
+      ],
+      "properties": {
+        "type": {
+          "const": "interrupt_relay"
+        },
+        "relay": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outage_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30000
+        }
+      }
+    },
+    "race_group_profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "updates"
+      ],
+      "properties": {
+        "type": {
+          "const": "race_group_profiles"
+        },
+        "updates": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "client"
+            ],
+            "anyOf": [
+              {
+                "required": [
+                  "name"
+                ]
+              },
+              {
+                "required": [
+                  "description"
+                ]
+              }
+            ],
+            "properties": {
+              "client": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "public_history_assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "assertion"
+      ],
+      "properties": {
+        "type": {
+          "const": "assert"
+        },
+        "assertion": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "predicate"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "exactly"
+                },
+                "predicate": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "type",
+                    "client",
+                    "payloads"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "public_payload_multiset"
+                    },
+                    "client": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "payloads": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "predicate",
+                "max_iterations"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "eventually"
+                },
+                "predicate": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "type",
+                    "client",
+                    "payloads"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "public_payload_multiset"
+                    },
+                    "client": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "payloads": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "max_iterations": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "predicate",
+                "timeout_ms",
+                "poll_interval_ms"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "within"
+                },
+                "predicate": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "type",
+                    "client",
+                    "payloads"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "public_payload_multiset"
+                    },
+                    "client": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "payloads": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "poll_interval_ms": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "predicate",
+                "duration_ms",
+                "poll_interval_ms"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "never"
+                },
+                "predicate": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "type",
+                    "client",
+                    "payloads"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "public_payload_multiset"
+                    },
+                    "client": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "payloads": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "duration_ms": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "poll_interval_ms": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "race_invite_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "actors",
+        "invitee",
+        "name",
+        "restart_at_offer"
+      ],
+      "properties": {
+        "type": {
+          "const": "race_invite_profile"
+        },
+        "actors": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "invitee": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "restart_at_offer": {
+          "type": "boolean"
+        }
+      }
     }
   }
 }

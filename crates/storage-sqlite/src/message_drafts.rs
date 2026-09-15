@@ -1,10 +1,16 @@
+pub(crate) mod revisioned;
+pub use revisioned::{
+    MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,
+    SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
+};
+
 use crate::connection::CachedSql;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, unix_now_ms};
+use crate::{SqliteAccountStorage, SqliteResultExt, unix_now_ms};
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Fully hydrated attachment row from the encrypted account database.
 #[derive(Clone, PartialEq)]
@@ -163,11 +169,9 @@ impl SqliteAccountStorage {
     ) -> StorageResult<StoredMessageDraft> {
         validate_waveform_samples(media_attachments)?;
         let now_ms = unix_now_ms();
-        retry_on_busy(|| {
+        self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .storage()?;
+            let tx = conn.savepoint().storage()?;
             let group_exists = tx
                 .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex = ?1)",
@@ -263,7 +267,7 @@ fn load_message_draft_attachment_summaries(
 }
 
 fn sync_message_draft_attachments(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     incoming: &[StoredMessageDraftAttachment],
 ) -> StorageResult<()> {
@@ -347,7 +351,7 @@ fn sync_message_draft_attachments(
 }
 
 fn insert_message_draft_attachment(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     position: i64,
     attachment: &StoredMessageDraftAttachment,
@@ -377,7 +381,7 @@ fn insert_message_draft_attachment(
 }
 
 fn update_message_draft_attachment(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     position: Option<i64>,
     attachment: &StoredMessageDraftAttachment,

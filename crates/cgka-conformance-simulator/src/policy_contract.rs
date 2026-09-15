@@ -151,6 +151,7 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 33] = [
         ConstantInfluence::OperationalScheduler,
         VersioningRule::OperationalNonInterference,
     ),
+    // Cooperative elapsed-time and replay-probe slicing share one scheduler decision.
     decision(
         "E13",
         ConstantInfluence::OperationalScheduler,

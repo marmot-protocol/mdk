@@ -237,16 +237,19 @@ async fn account_read_failure_is_not_zero_or_removal_and_recovers_without_notifi
 async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);
-    f.runtime
-        .set_chat_manually_unread("alice", "0000", true)
-        .unwrap();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
+    assert_eq!(
+        ready(&sub.snapshot, &f.alice.account_id_hex),
+        AccountAttentionTotal::default()
+    );
+    let mut was_eligible = false;
     for (pending, archived, membership) in [
         (true, false, SelfMembership::Member),
         (false, false, SelfMembership::Member),
-        (false, true, SelfMembership::Member),
-        (false, false, SelfMembership::Left),
-        (false, false, SelfMembership::Member),
+        (true, true, SelfMembership::Member),
+        (true, false, SelfMembership::Member),
+        (true, false, SelfMembership::Left),
+        (true, false, SelfMembership::Member),
     ] {
         let mut account = storage.load_account_projection_state("alice", 100).unwrap();
         account.groups[0].pending_confirmation = pending;
@@ -269,15 +272,17 @@ async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
                     version: storage.chat_presentation_version().unwrap(),
                 });
         }
-        let eligible = !pending && !archived && membership == SelfMembership::Member;
-        // Consecutive suppressed states do not manufacture duplicate updates.
-        if pending || (!archived && membership == SelfMembership::Member) {
+        let eligible = pending && !archived && membership == SelfMembership::Member;
+        // The invitation is the sole attention source; equal suppressed totals coalesce.
+        if eligible != was_eligible {
             assert_eq!(
-                ready(&next(&mut sub).await, &f.alice.account_id_hex).has_unread(),
-                eligible
+                ready(&next(&mut sub).await, &f.alice.account_id_hex),
+                AccountAttentionTotal {
+                    unread_conversations: u64::from(eligible),
+                    attention_only_conversations: u64::from(eligible),
+                    ..Default::default()
+                }
             );
-        } else if archived {
-            assert!(!ready(&next(&mut sub).await, &f.alice.account_id_hex).has_unread());
         } else {
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), sub.recv())
@@ -285,9 +290,10 @@ async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
                     .is_err()
             );
         }
+        was_eligible = eligible;
     }
     assert!(
-        storage
+        !storage
             .chat_list_row("0000")
             .unwrap()
             .unwrap()
@@ -655,4 +661,34 @@ async fn stalled_retry_backoff_is_capped_and_progress_resets_it() {
         progressing.at - tokio::time::Instant::now(),
         Duration::from_secs(1)
     );
+}
+
+#[tokio::test]
+async fn pending_invitation_attention_updates_without_an_account_worker() {
+    let f = Fixture::new();
+    let storage = f.seed(&f.alice, 1, true);
+    let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
+    assert!(!ready(&sub.snapshot, &f.alice.account_id_hex).has_unread());
+    // Arrival, archive, restore, acceptance. No message or manual unread is required.
+    for (pending, archived, attention) in [
+        (true, false, 1),
+        (true, true, 0),
+        (true, false, 1),
+        (false, false, 0),
+    ] {
+        let mut account = storage.load_account_projection_state("alice", 100).unwrap();
+        account.groups[0].pending_confirmation = pending;
+        account.groups[0].archived = archived;
+        storage
+            .save_account_projection_state(&account, 100, 120)
+            .unwrap();
+        f.signal(&f.alice);
+        let total = ready(&next(&mut sub).await, &f.alice.account_id_hex);
+        assert_eq!(total.unread_count, 0);
+        assert_eq!(total.unread_mention_count, 0);
+        assert_eq!(total.unread_conversations, attention);
+        assert_eq!(total.attention_only_conversations, attention);
+        assert_eq!(total.has_unread(), attention > 0);
+    }
+    f.runtime.shutdown_and_close().await.unwrap();
 }

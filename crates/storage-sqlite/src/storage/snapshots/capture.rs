@@ -17,6 +17,68 @@ use crate::{
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
+
+pub(crate) fn replay_fingerprint(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+) -> StorageResult<[u8; 32]> {
+    if store.connection.is_current_thread_transaction_owner() {
+        let conn = store.lock()?;
+        return replay_fingerprint_on_connection(&conn, group_id);
+    }
+    // Pin all component reads to one SQLite read snapshot. This writes no
+    // durable state and does not change the existing MLS generation contract.
+    let mut conn = store.lock()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .storage()?;
+    let fingerprint = replay_fingerprint_on_connection(&tx, group_id)?;
+    tx.commit().storage()?;
+    Ok(fingerprint)
+}
+
+fn replay_fingerprint_on_connection(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+) -> StorageResult<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"cgka-sqlite-group-replay-state/v1");
+    let live = snapshot_format::encode(&capture_snapshot(
+        conn,
+        group_id,
+        SnapshotScope::GroupState,
+    )?)?;
+    hash.update((live.len() as u64).to_be_bytes());
+    hash.update(live.as_slice());
+    for (domain, sql) in [
+        (
+            b"snapshots".as_slice(),
+            "SELECT name, snapshot, 0 FROM cgka_group_snapshots WHERE group_id = ?1 ORDER BY name",
+        ),
+        (
+            b"checkpoints".as_slice(),
+            "SELECT checkpoint_id, checkpoint, resulting_epoch FROM cgka_group_state_checkpoints WHERE group_id = ?1 ORDER BY checkpoint_id",
+        ),
+    ] {
+        hash.update(domain);
+        let mut statement = conn.prepare_cached(sql).storage()?;
+        let mut rows = statement.query(params![group_id.as_slice()]).storage()?;
+        while let Some(row) = rows.next().storage()? {
+            hash.update([1]);
+            let name: String = row.get(0).storage()?;
+            let epoch: i64 = row.get(2).storage()?;
+            hash.update(epoch.to_be_bytes());
+            let bytes = SensitiveBytes::new(row.get(1).storage()?);
+            hash.update((name.len() as u64).to_be_bytes());
+            hash.update(name.as_bytes());
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes.as_slice());
+        }
+        hash.update([0]);
+    }
+    Ok(hash.finalize().into())
+}
 
 /// What a snapshot captures — and therefore what its rollback later rewrites.
 #[derive(Clone, Copy)]

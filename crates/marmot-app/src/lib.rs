@@ -81,6 +81,7 @@ mod audit_log;
 mod chat_presentation;
 mod client;
 mod config;
+pub mod conversation_presentation;
 mod conversions;
 mod directory;
 mod drafts;
@@ -180,7 +181,9 @@ pub use directory::{
     UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
-    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
+    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftInvalidation,
+    MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
+    SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
 pub use error::{AccountCatchUpFailure, AppError};
 pub use groups::{
@@ -374,8 +377,10 @@ pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_sec
 /// never arrives.
 ///
 /// 30 s remains the conservative consecutive-silence ceiling, but an open
-/// production stream never spends it in one attempt: the 5 s execution quantum
-/// yields first and a later seam resubscribes. Production EOSE completion
+/// automatic recovery stream never spends it in one attempt: the 5 s execution quantum
+/// yields first and a later seam resubscribes. Explicit full-history repair instead
+/// continues the same activation across quanta under its own overall budget.
+/// Automatic EOSE completion
 /// therefore requires the gate to report within that quantum (or before an
 /// adapter-closed result). A worker-quantum yield is only a scheduling event:
 /// it paces a later resubscription but does not spend the EOSE-failure ordinal.
@@ -1099,16 +1104,15 @@ pub struct AccountUnread {
     /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
     /// Number of eligible conversations that require badge attention:
-    /// unread messages or an independent manual-unread reminder.
+    /// unread messages, a manual-unread reminder, or a pending invitation.
     pub unread_conversations: u64,
-    /// Conversations that contribute badge attention solely because they are
-    /// manually marked unread. A row that already has
-    /// unread messages is omitted so hosts can compute
-    /// `unread_count + attention_only_conversations` without overlap.
+    /// Active unarchived pending invitations (one each) and accepted manual
+    /// reminders with no unread messages. Invite message counts stay suppressed.
+    /// `unread_count + attention_only_conversations` is the application badge.
     #[serde(default)]
     pub attention_only_conversations: u64,
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder with no unread messages.
+    /// pending invitation or manual-only reminder with no unread messages.
     pub has_unread: bool,
 }
 
@@ -2502,7 +2506,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .chat_list_row(group_id_hex)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2558,8 +2562,10 @@ impl MarmotApp {
     /// materialized `chat_list_rows` projection (a single grouped
     /// `COUNT`/`SUM`), so this does not require switching into, or loading a
     /// full session/timeline for, any account — non-active accounts are
-    /// reported too. Pending invitations are excluded. `attention_only_conversations`
-    /// covers manual-only unread rows without overlapping unread-message totals.
+    /// reported too. `attention_only_conversations` counts each active unarchived
+    /// pending invitation once and accepted manual-only reminders, without
+    /// overlapping unread-message totals. Archived and departed/departing chats
+    /// contribute nothing.
     ///
     /// Only local-signing accounts are reported (matching `managed_accounts`).
     /// The chat-list projection is built from the on-disk store if missing;
@@ -2616,7 +2622,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .refresh_chat_list_row(&account.account_id_hex, group_id_hex, &classifier)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2636,7 +2642,7 @@ impl MarmotApp {
                 message_ids_hex,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2651,7 +2657,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .initialize_chat_read_state(&account.account_id_hex, group_id_hex, &classifier)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2672,7 +2678,7 @@ impl MarmotApp {
                 message_id_hex,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -2695,7 +2701,7 @@ impl MarmotApp {
                 manually_unread,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
     }
 
@@ -4625,17 +4631,6 @@ impl MarmotApp {
             .collect())
     }
 
-    fn display_names_by_id(&self) -> Result<HashMap<String, String>, AppError> {
-        let mut names = self.profiles_by_id()?;
-        for entry in self.directory_entries()? {
-            let Some(name) = display_name_for_profile(entry.profile.as_ref()) else {
-                continue;
-            };
-            names.insert(entry.account_id_hex, name);
-        }
-        Ok(names)
-    }
-
     fn display_names_for_account_ids(
         &self,
         account_id_hexes: &[String],
@@ -4736,22 +4731,31 @@ impl MarmotApp {
         Ok(())
     }
 
-    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) -> Result<(), AppError> {
+    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) {
         let Some(row) = row else {
-            return Ok(());
+            return;
         };
         let Some(message) = row.last_message.as_mut() else {
-            return Ok(());
+            return;
         };
         (message.attachment_kind, message.attachment_count) =
             media::classify_chat_list_attachments(message.media_json.as_deref());
         let Some(sender) = Self::chat_list_sender_for_profile_hydration(message) else {
-            return Ok(());
+            return;
         };
-        if let Some(name) = self.display_name_for_account_id(sender)? {
-            message.sender_display_name = Some(name);
+        // Optional names must not roll back the enclosing message projection.
+        match self.display_name_for_account_id(sender) {
+            Ok(Some(name)) => message.sender_display_name = Some(name),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "hydrate_chat_list_row",
+                    error_kind = error.privacy_safe_kind(),
+                    "projecting chat preview without display name",
+                );
+            }
         }
-        Ok(())
     }
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
@@ -4838,7 +4842,7 @@ impl MarmotApp {
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         self.presentation_signals.wake();
-        self.hydrate_chat_list_row(Some(&mut row))?;
+        self.hydrate_chat_list_row(Some(&mut row));
 
         // Only the created row belongs on the response tail. Preserve any
         // pre-existing stale marker, and add one if this delta also persisted

@@ -362,3 +362,27 @@ with loss, duplicate, profile, roster, admin and epoch mutation checks; registra
   database and WAL. The current cross-route catalog covers reviewed public/durable action boundaries, while the
   engine's separate crash-hook matrix covers its four internal convergence-pass phases. Recovery from genuinely
   missing or corrupted local records is still future work.
+
+
+## Seeded app generator and stimulus contracts
+
+`tests/app_generated_variance.rs` checks deterministic replay/prefix behavior, structural diversity
+across 128 seeds for each new app recovery family, population reachability, strict capability
+preflight, and rejection of missing/unexercised runtime stimuli. Diversity compares operation order
+without actors or payload text. The ignored process canary runs a seeded recovery schedule with real
+participant process kills and a strict public-state/history oracle. Socket interruption and listener
+restoration are independently exercised over real TCP in `src/relay_fault_proxy.rs`.
+
+### Public large-group app coverage
+
+`tests/app_large_group.rs` checks all six 10/20/50-member bulk/staged arms at three seeds for
+registration, deterministic JSON replay, prefix stability, app capability compatibility, offline-cohort
+size and full-population payload expectations. It bounds the number of generated steps so payload
+checks do not expand once per participant/message pair. The whole-history assertion requires IR v3.
+The ignored `large_group_app_canary` selects one case using `MDK_LARGE_APP_CASE=0..5`, preserves its
+input/report, and mutates every participant's message/roster/profile observations to prove oracle
+sensitivity. See `SCENARIOS.md` for the production-policy command and evidence boundaries.
+
+See [app recovery expansion](APP_RECOVERY_EXPANSION.md) for generated contracts and weekly/manual campaign selection.
+The expansion contracts cover indices 0–3, publication/event/reopen capability preflight, and strict recovery evidence;
+`app_runtime::tests::unknown_group_tolerance_preserves_refusal_boundary` pins the transient error wrapper boundary.

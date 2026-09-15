@@ -42,131 +42,124 @@ impl SqliteAccountStorage {
         {
             return Err(ChatListPageError::InvalidWindowQuery);
         }
-        let conn = self.lock()?;
-        let owned = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let missing_base: bool = conn
-            .query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)",
-                [],
-                |r| r.get(0),
-            )
-            .storage()?;
-        if missing_base {
-            return Err(cgka_traits::storage::StorageError::NotFound.into());
-        }
-        let anchor = choose_anchor(&conn, &query)?;
-        let mut page = match &anchor {
-            Some(anchor) => {
-                let mut before = read_page_tx(
-                    &conn,
-                    ChatListPageQuery {
-                        view: query.view,
-                        limit: query.before_anchor + 1,
-                        direction: ChatListPageDirection::Backward,
-                        cursor: None,
-                    },
-                    Some(anchor),
-                )?;
-                let remaining = query.limit - before.rows.len();
-                if remaining > 0 {
-                    let after = read_page_tx(
-                        &conn,
+        self.connection.with_deferred_read(|conn| {
+            let missing_base: bool = conn
+                .query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)",
+                    [],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if missing_base {
+                return Err(cgka_traits::storage::StorageError::NotFound.into());
+            }
+            let anchor = choose_anchor(conn, &query)?;
+            let mut page = match &anchor {
+                Some(anchor) => {
+                    let mut before = read_page_tx(
+                        conn,
                         ChatListPageQuery {
                             view: query.view,
-                            limit: remaining,
-                            direction: ChatListPageDirection::Forward,
-                            cursor: before.last.clone(),
+                            limit: query.before_anchor + 1,
+                            direction: ChatListPageDirection::Backward,
+                            cursor: None,
                         },
-                        None,
+                        Some(anchor),
                     )?;
-                    before.has_more_after = after.has_more_after;
-                    if after.last.is_some() {
-                        before.last = after.last;
+                    let remaining = query.limit - before.rows.len();
+                    if remaining > 0 {
+                        let after = read_page_tx(
+                            conn,
+                            ChatListPageQuery {
+                                view: query.view,
+                                limit: remaining,
+                                direction: ChatListPageDirection::Forward,
+                                cursor: before.last.clone(),
+                            },
+                            None,
+                        )?;
+                        before.has_more_after = after.has_more_after;
+                        if after.last.is_some() {
+                            before.last = after.last;
+                        }
+                        before.rows.extend(after.rows);
                     }
-                    before.rows.extend(after.rows);
+                    before
                 }
-                before
+                None => read_page_tx(
+                    conn,
+                    ChatListPageQuery {
+                        view: query.view,
+                        limit: query.limit,
+                        direction: ChatListPageDirection::Forward,
+                        cursor: None,
+                    },
+                    None,
+                )?,
+            };
+            // Near the end fill unused capacity from before the window, retaining the anchor.
+            // has_more_before excludes empty pages: a cursorless backward read would
+            // otherwise restart from the wrong end of the list.
+            if page.rows.len() < query.limit && page.has_more_before {
+                let mut before = read_page_tx(
+                    conn,
+                    ChatListPageQuery {
+                        view: query.view,
+                        limit: query.limit - page.rows.len(),
+                        direction: ChatListPageDirection::Backward,
+                        cursor: page.first.clone(),
+                    },
+                    None,
+                )?;
+                page.has_more_before = before.has_more_before;
+                if before.first.is_some() {
+                    page.first = before.first;
+                }
+                before.rows.extend(page.rows);
+                page.rows = before.rows;
             }
-            None => read_page_tx(
-                &conn,
-                ChatListPageQuery {
-                    view: query.view,
-                    limit: query.limit,
-                    direction: ChatListPageDirection::Forward,
-                    cursor: None,
-                },
-                None,
-            )?,
-        };
-        // Near the end fill unused capacity from before the window, retaining the anchor.
-        // has_more_before excludes empty pages: a cursorless backward read would
-        // otherwise restart from the wrong end of the list.
-        if page.rows.len() < query.limit && page.has_more_before {
-            let mut before = read_page_tx(
-                &conn,
-                ChatListPageQuery {
-                    view: query.view,
-                    limit: query.limit - page.rows.len(),
-                    direction: ChatListPageDirection::Backward,
-                    cursor: page.first.clone(),
-                },
-                None,
-            )?;
-            page.has_more_before = before.has_more_before;
-            if before.first.is_some() {
-                page.first = before.first;
+            let mut pending_presentations = Vec::new();
+            let mut rows = Vec::with_capacity(page.rows.len());
+            let mut statement = conn.prepare_cached("SELECT presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex=?1").storage()?;
+            for row in &page.rows {
+                let (bytes, dirty): (Option<Vec<u8>>, bool) = statement
+                    .query_row([&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .storage()?;
+                if let Some(bytes) = bytes {
+                    rows.push(PresentedChatRow {
+                        row: row.clone(),
+                        presentation: crate::chat_presentation::decode_retained(&bytes, dirty)?
+                            .presentation,
+                    });
+                } else {
+                    pending_presentations.push(row.group_id_hex.clone());
+                }
             }
-            before.rows.extend(page.rows);
-            page.rows = before.rows;
-        }
-        let mut pending_presentations = Vec::new();
-        let mut rows = Vec::with_capacity(page.rows.len());
-        let mut statement = conn.prepare_cached("SELECT presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex=?1").storage()?;
-        for row in &page.rows {
-            let (bytes, dirty): (Option<Vec<u8>>, bool) = statement
-                .query_row([&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?)))
+            drop(statement);
+            let presentation_version = conn
+                .query_row_cached(
+                    "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id=1",
+                    [],
+                    |r| {
+                        Ok(ChatPresentationVersion {
+                            store_epoch: r.get(0)?,
+                            revision: crate::chat_presentation::nonnegative(r, 1)?,
+                        })
+                    },
+                )
                 .storage()?;
-            if let Some(bytes) = bytes {
-                rows.push(PresentedChatRow {
-                    row: row.clone(),
-                    presentation: crate::chat_presentation::decode_retained(&bytes, dirty)?
-                        .presentation,
+            let snapshot = pending_presentations
+                .is_empty()
+                .then_some(PresentedChatListSnapshot {
+                    rows,
+                    presentation_version,
                 });
-            } else {
-                pending_presentations.push(row.group_id_hex.clone());
-            }
-        }
-        drop(statement);
-        let presentation_version = conn
-            .query_row_cached(
-                "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id=1",
-                [],
-                |r| {
-                    Ok(ChatPresentationVersion {
-                        store_epoch: r.get(0)?,
-                        revision: crate::chat_presentation::nonnegative(r, 1)?,
-                    })
-                },
-            )
-            .storage()?;
-        let snapshot = pending_presentations
-            .is_empty()
-            .then_some(PresentedChatListSnapshot {
-                rows,
-                presentation_version,
-            });
-        if let Some(tx) = owned {
-            tx.commit().storage()?;
-        }
-        Ok(ChatListWindowRead {
-            page,
-            snapshot,
-            pending_presentations,
-            anchor,
+            Ok(ChatListWindowRead {
+                page,
+                snapshot,
+                pending_presentations,
+                anchor,
+            })
         })
     }
 }

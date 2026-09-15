@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nostr_relay_builder::LocalRelay;
+use crate::app_runtime::process_relay::RelayBackend;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -20,8 +20,7 @@ use crate::node_protocol::{
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
 use crate::relay_control::{
-    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation, RelayControl,
-    RelayControlError,
+    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation,
 };
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
@@ -94,27 +93,32 @@ pub trait ProcessRelayControl: Send + Sync {
 }
 
 struct LocalProcessRelayControl {
-    control: RelayControl,
+    control: RelayBackend,
     action_events: Mutex<RelayActionEvents>,
 }
 
 impl LocalProcessRelayControl {
-    fn new() -> Self {
-        Self {
-            control: RelayControl::new(),
-            action_events: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    fn relay_builder(&self) -> nostr_relay_builder::RelayBuilder {
-        self.control.relay_builder()
+    async fn new() -> Result<(Self, String), ProcessOrchestratorError> {
+        let (control, _proxy, _relay, url) = RelayBackend::start(true)
+            .await
+            .map_err(|e| ProcessOrchestratorError::new(e.code, e.message))?;
+        Ok((
+            Self {
+                control,
+                action_events: Mutex::new(BTreeMap::new()),
+            },
+            url,
+        ))
     }
 }
 
 #[async_trait::async_trait]
 impl ProcessRelayControl for LocalProcessRelayControl {
     async fn publication_cursor(&self) -> Result<usize, ProcessRelayControlError> {
-        Ok(self.control.publication_cursor().await)
+        self.control
+            .publication_cursor()
+            .await
+            .map_err(process_relay_control_error_value)
     }
 
     async fn wait_for_action_events(
@@ -218,6 +222,8 @@ pub struct ProcessScenarioReportV1 {
     pub canonical_schedule: Vec<ScenarioActionScheduleV2>,
     pub actions: Vec<ProcessActionResultV1>,
     pub observations: Vec<NodeObservationV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
     pub lifecycle: Vec<ProcessLifecycleEventV1>,
     pub failure_capsules: Vec<PathBuf>,
     pub completed: bool,
@@ -275,7 +281,6 @@ pub struct ProcessOrchestrator {
     run_root: tempfile::TempDir,
     artifact_directory: PathBuf,
     compiled: CompiledScenarioV2,
-    _relays: BTreeMap<String, LocalRelay>,
     relay_controls: BTreeMap<String, Arc<dyn ProcessRelayControl>>,
     relay_urls: BTreeMap<String, String>,
     nodes: BTreeMap<String, NodeProcess>,
@@ -385,7 +390,6 @@ impl ProcessOrchestrator {
                 .map(|relay| relay.id.clone())
                 .collect()
         };
-        let mut relays = BTreeMap::new();
         let mut relay_controls = BTreeMap::<String, Arc<dyn ProcessRelayControl>>::new();
         let relay_urls = if let Some(relay_urls) = external_relay_urls {
             let expected = relay_labels
@@ -425,12 +429,9 @@ impl ProcessOrchestrator {
             }
             let mut relay_urls = BTreeMap::new();
             for label in relay_labels {
-                let relay_control = Arc::new(LocalProcessRelayControl::new());
-                let relay = LocalRelay::new(relay_control.relay_builder());
-                relay.run().await.map_err(environment_error)?;
-                relay_urls.insert(label.clone(), relay.url().await.to_string());
-                relays.insert(label.clone(), relay);
-                relay_controls.insert(label, relay_control);
+                let (relay_control, url) = LocalProcessRelayControl::new().await?;
+                relay_urls.insert(label.clone(), url);
+                relay_controls.insert(label, Arc::new(relay_control));
             }
             relay_urls
         };
@@ -460,7 +461,6 @@ impl ProcessOrchestrator {
             run_root,
             artifact_directory,
             compiled,
-            _relays: relays,
             relay_controls,
             relay_urls,
             nodes: BTreeMap::new(),
@@ -568,6 +568,7 @@ impl ProcessOrchestrator {
             canonical_schedule: schedule,
             actions: Vec::new(),
             observations: Vec::new(),
+            assertion_observations: Vec::new(),
             lifecycle: Vec::new(),
             failure_capsules: Vec::new(),
             completed: false,
@@ -616,6 +617,7 @@ impl ProcessOrchestrator {
                 let _ = kill_process_group(&mut node.child).await;
             }
         }
+        self.relay_controls.clear();
     }
 
     fn record_accepted_publication(&mut self, client: &str, publication: &str) {
@@ -1053,6 +1055,83 @@ impl ProcessOrchestrator {
                     .collect::<Vec<_>>();
                 self.catch_up(&labels, action_id, false).await?;
                 Ok((labels, ProcessActionStatusV1::Completed))
+            }
+            ScenarioStep::Assert { assertion } => {
+                // Preflight admits only exactly/eventually ClientState here. Do not
+                // advertise the broader private-state or virtual-time assertion API.
+                let (predicate, max_iterations) = match assertion {
+                    crate::ScenarioAssertionV2::Exactly { predicate } => (predicate, 0),
+                    crate::ScenarioAssertionV2::Eventually {
+                        predicate,
+                        max_iterations,
+                    } => (predicate, *max_iterations),
+                    _ => unreachable!("assertion rejected by process capability preflight"),
+                };
+                let crate::ScenarioPredicateV2::ClientState {
+                    client,
+                    epoch,
+                    member_count,
+                } = predicate
+                else {
+                    unreachable!("predicate rejected by process capability preflight")
+                };
+                let labels = vec![client.clone()];
+                let wait = crate::assertion_wait::AssertionWait::new(
+                    max_iterations,
+                    matches!(assertion, crate::ScenarioAssertionV2::Eventually { .. }),
+                );
+                let mut iteration = 0;
+                let mut samples = 0;
+                let mut last_actual = serde_json::Value::Null;
+                let (passed, final_actual) = loop {
+                    let Some(observations) = wait.run(self.observe(&labels, action_id)).await?
+                    else {
+                        break (false, last_actual);
+                    };
+                    samples += 1;
+                    let actual = &observations[0].protocol;
+                    let passed = epoch.is_none_or(|expected| actual.epoch == expected)
+                        && member_count.is_none_or(|expected| actual.member_count == expected)
+                        && !wait.expired();
+                    let final_actual = serde_json::json!({
+                        "client": client,
+                        "epoch": actual.epoch,
+                        "member_count": actual.member_count,
+                    });
+                    if passed || iteration == max_iterations || wait.expired() {
+                        break (passed, final_actual);
+                    }
+                    // Wake all running peers needed for repair, with the same
+                    // pacing/deadline as the public AppRuntimeHarness driver.
+                    let running = self.running_labels();
+                    if !wait.tick(self.catch_up(&running, action_id, false)).await? {
+                        break (false, final_actual);
+                    }
+                    last_actual = final_actual;
+                    iteration += 1;
+                };
+                report
+                    .assertion_observations
+                    .push(crate::ScenarioAssertionObservationV2 {
+                        step_index: action.schedule.source_step_index,
+                        assertion: assertion.clone(),
+                        passed,
+                        samples,
+                        elapsed_virtual_ms: 0,
+                        wall_timeout_ms: wait.timeout_ms(),
+                        elapsed_wall_ms: wait.elapsed_ms(),
+                        final_actual,
+                    });
+                if passed {
+                    Ok((labels, ProcessActionStatusV1::Completed))
+                } else {
+                    Err((Some(client.clone()), NodeErrorV1 {
+                        code: if wait.expired() { "scenario_assertion_timeout" } else { "scenario_assertion_failed" }.into(),
+                        category: SubjectFailureCategory::Protocol,
+                        retryable: false,
+                        message: "public client state did not match within the declared assertion budget".into(),
+                    }))
+                }
             }
             ScenarioStep::SyncRelayHistory { clients, sync } => {
                 let clients = clients
@@ -1873,6 +1952,7 @@ fn process_subject_descriptor(owns_relay_control: bool) -> SubjectDescriptor {
         SubjectCapability::ApplicationMessaging,
         SubjectCapability::TransportDelivery,
         SubjectCapability::EventObservation,
+        SubjectCapability::ClientStateAssertion,
         SubjectCapability::AdminPolicyObservation,
         SubjectCapability::CrashReopen,
         SubjectCapability::OutboundPublication,
@@ -1904,6 +1984,26 @@ fn preflight_process_compiled_scenario(
 ) -> Result<(), crate::ScenarioRunError> {
     let mut process_compiled = compiled.clone();
     for action in &mut process_compiled.actions {
+        if let ScenarioStep::Assert { assertion } = &action.step
+            && !matches!(
+                assertion,
+                crate::ScenarioAssertionV2::Exactly {
+                    predicate: crate::ScenarioPredicateV2::ClientState { .. }
+                } | crate::ScenarioAssertionV2::Eventually {
+                    predicate: crate::ScenarioPredicateV2::ClientState { .. },
+                    ..
+                }
+            )
+        {
+            return Err(crate::ScenarioRunError {
+                step_index: Some(action.schedule.source_step_index),
+                kind: "unsupported_subject_capability".into(),
+                category: SubjectFailureCategory::Environment,
+                message:
+                    "subject marmot_app_process does not support the evaluation required by assert"
+                        .into(),
+            });
+        }
         if matches!(action.step, ScenarioStep::AwaitQuiescence { .. }) {
             action
                 .schedule
@@ -1939,10 +2039,10 @@ fn environment_error(error: impl fmt::Display) -> ProcessOrchestratorError {
     ProcessOrchestratorError::new("process_environment", error.to_string())
 }
 
-fn process_relay_control_error_value(error: RelayControlError) -> ProcessRelayControlError {
+fn process_relay_control_error_value(error: crate::SubjectError) -> ProcessRelayControlError {
     ProcessRelayControlError {
-        code: error.code.into(),
-        message: error.message.into(),
+        code: error.code,
+        message: error.message,
     }
 }
 
@@ -2041,6 +2141,100 @@ async fn kill_process_group(child: &mut Child) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn first_observe_timeout_preserves_failed_report_and_reaps_node() {
+        use crate::{ScenarioAssertionV2, ScenarioPredicateV2};
+        let spec = ScenarioSpec {
+            name: "stalled-first-observe".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![
+                ScenarioStep::Assert {
+                    assertion: ScenarioAssertionV2::Eventually {
+                        predicate: ScenarioPredicateV2::ClientState {
+                            client: "alice".into(),
+                            epoch: Some(1),
+                            member_count: Some(1),
+                        },
+                        max_iterations: 1,
+                    },
+                },
+                ScenarioStep::DeliverAll,
+            ],
+        };
+        let artifacts = tempfile::tempdir().unwrap();
+        // A real owned process holds stdout open without answering the first RPC.
+        // Paused coordinator time makes both the assertion and shutdown bounded
+        // without waiting for the sleeper in wall time.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let node = NodeProcess {
+            participant: "alice".into(),
+            root: artifacts.path().join("node"),
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            next_request: 0,
+        };
+        let mut orchestrator = ProcessOrchestrator {
+            node_launch: ProcessNodeLaunchV1::executable(Path::new("/bin/sh")),
+            run_root: tempfile::tempdir().unwrap(),
+            artifact_directory: artifacts.path().to_path_buf(),
+            compiled: compile_scenario(&spec).unwrap(),
+            relay_controls: BTreeMap::new(),
+            relay_urls: BTreeMap::new(),
+            nodes: BTreeMap::from([("alice".into(), node)]),
+            account_ids: BTreeMap::new(),
+            processes: BTreeMap::new(),
+            process_relays: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            offline_observations: BTreeMap::new(),
+            lifecycle: Vec::new(),
+            input_provenance: None,
+            executed_scenario_ir_sha256: String::new(),
+            expected_outcomes: Vec::new(),
+            accepted_publications: BTreeMap::new(),
+        };
+        let report = orchestrator.run().await.unwrap();
+        let path = artifacts.path().join("report.json");
+        orchestrator.write_report_private(&report, &path).unwrap();
+        orchestrator.shutdown().await;
+        let saved: ProcessScenarioReportV1 =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved, report);
+        assert!(!saved.completed);
+        assert_eq!(saved.actions.len(), 1, "no action may follow the timeout");
+        assert_eq!(saved.actions[0].status, ProcessActionStatusV1::Failed);
+        let observed = &saved.assertion_observations[0];
+        assert!(!observed.passed);
+        assert_eq!(observed.samples, 0);
+        assert!(observed.final_actual.is_null());
+        assert_eq!(observed.wall_timeout_ms, Some(2_000));
+        assert_eq!(observed.elapsed_wall_ms, Some(2_000));
+        let capsule: NodeFailureCapsuleV1 =
+            serde_json::from_slice(&std::fs::read(&saved.failure_capsules[0]).unwrap()).unwrap();
+        assert_eq!(capsule.code, "scenario_assertion_timeout");
+        assert!(crate::validate_cross_route_public_process_report(&spec, &saved).is_err());
+        assert!(orchestrator.nodes.is_empty());
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
     #[test]
     fn process_report_round_trip_preserves_canonical_schedule() {
         let report = ProcessScenarioReportV1 {
@@ -2052,6 +2246,7 @@ mod tests {
             canonical_schedule: Vec::new(),
             actions: Vec::new(),
             observations: Vec::new(),
+            assertion_observations: Vec::new(),
             lifecycle: Vec::new(),
             failure_capsules: Vec::new(),
             completed: true,

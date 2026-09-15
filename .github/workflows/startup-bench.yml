@@ -37,6 +37,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just

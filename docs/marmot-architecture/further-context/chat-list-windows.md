@@ -1,7 +1,7 @@
 ---
 title: "Bounded live chat-list windows"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 status: implementation
 ---
 
@@ -91,7 +91,8 @@ refreshes only the retained window.
 
 Pending invitations and Left rows have effective unread/mention/manual-attention
 fields suppressed in this API; raw stored read intent and lower-level APIs remain
-unchanged. Acceptance preserves archive. Successful self-arrival from Left/Removed
+unchanged. The separate account attention summary counts each active unarchived
+invitation once without treating its messages as unread. Acceptance preserves archive. Successful self-arrival from Left/Removed
 atomically restores membership and archive eligibility and updates the account
 worker's in-memory intent. Consented rejoin restores once; replay cannot undo a
 subsequent explicit archive. Existing membership push-share side effects remain.

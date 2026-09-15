@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-14
+updated: 2026-09-15
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -24,11 +24,26 @@ snapshot, first-unread/latest selection, and scoped anchor recovery after physic
 return a typed preparation requirement. Live screen composition and native bindings are later C5 slices; see
 [bounded conversation opening](../further-context/conversation-opening.md).
 
+C5 M2 adds selected draft metadata, revision-checked mutations and a send handoff that clears the submitted
+revision atomically with existing outbox acceptance. Newer edits survive; attachment bytes remain keyed reads.
+See [revision-safe conversation drafts](../further-context/conversation-drafts.md).
+
+C5 M3 adds shared Rust conversation capabilities and a bounded identity presentation sidecar, including historical
+authors and commit-attributed system references. The combined live window/native screen API remains M4/M5.
+See [shared conversation presentation](../further-context/conversation-presentation.md).
+
+C5 M4 foundations include explicit viewport placement, atomic account-window reads and compact live engine
+capture of membership, roles and capabilities. The session callback keeps persisted reads on the session's
+exact SQLite connection and combines them with live engine facts; startup seeds remain unavailable until
+hydration. The live actor, recovery protocol and native handles remain unfinished.
+See the [live conversation implementation plan](../further-context/conversation-live-window-plan.md).
+
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
-archive; successful rejoin restores departed conversations. Independent live account attention reuses the Unread
-eligibility keys, reports unavailable accounts explicitly, and refreshes affected accounts without opening lists.
+archive; successful rejoin restores departed conversations. Independent live account attention combines accepted
+Unread-list counts with one attention item per active unarchived pending invitation. Archived and departed/departing
+groups contribute nothing. It reports unavailable accounts explicitly and refreshes affected accounts without opening lists.
 C4 M4 adds UniFFI/C handles, typed window errors and native ownership/parity checks;
 release and client adoption remain separate. See the [native handoff](../further-context/chat-projections-native.md),
 [bounded live chat-list windows](../further-context/chat-list-windows.md) and
@@ -65,6 +80,11 @@ Legacy permanent markers migrate to a cutoff at migration time. Ordinary `delete
 membership and permits fresh messages to recreate the chat. The Rust runtime, UniFFI (`forgetGroupLocal` in Swift), and C expose forgetting; hosts
 must close group views/subscriptions and clear host-owned media caches. Existing published or already in-flight
 network traffic cannot be recalled. Transport cleanup failures retry without undoing the committed local deletion.
+
+Explicit app full-history repair now retains one activation and strict endpoint EOSE coverage across checkpointed
+work quanta, with a 60-second cooperative overall budget and safe-boundary cancellation. Incomplete overflow
+recovery remains durable and generation-checked. Snapshot reads can run during the wait; mutations retain account
+FIFO ordering. This continuation does not isolate engine or network execution from the account worker.
 
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must

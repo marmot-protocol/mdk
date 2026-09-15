@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-08
+updated: 2026-09-12
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -23,6 +23,12 @@ Tracking issue: marmot-protocol/mdk#381.
 - **Each structure documents its bound** (max size, TTL, or eviction policy) below and enforces it in code.
 
 ## Inventory
+
+### `cgka-engine` candidate reconstruction (`src/openmls_projection/resumable.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `Engine::canonical_replays`, `Engine::peel_replays` | At most one continuation of each kind per pending group. Each owns one input graph; frontier and completed paths are bounded by the existing cumulative replay-probe budget, with path depth limited by the retained graph. Peel output remains capped at eight contexts. This is an input-relative bound, not a fixed account-wide byte cap. | Removed on completion/error, relevant state or policy invalidation, hydration/repair/removal, or engine drop. Exact source identity and replay-state content fingerprint (or strict MLS mutation generation on other tracking backends) are checked before reuse; a new canonical pass discards the old cursor. No transaction, snapshot guard, or durable scratch row survives a slice. |
 
 ### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
 

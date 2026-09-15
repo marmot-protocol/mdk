@@ -1170,6 +1170,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
+        AppError::MessageDraftRevisionConflict => {
+            "read_marker_failed:message_draft_revision_conflict"
+        }
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamPublisher(_) => "read_marker_failed:agent_stream_publisher",
         AppError::AgentStreamFinishMismatch => "read_marker_failed:agent_stream_finish_mismatch",

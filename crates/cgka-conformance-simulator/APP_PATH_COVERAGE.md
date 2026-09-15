@@ -537,3 +537,111 @@ its inviter to lose the identity tiebreak and requires recipient-confirmed repla
 before restart and accepted state after another restart. An engine regression independently fixes the exact sibling
 commit schedule and checks consumed-package rejection, stale consent after self-update, and bidirectional decryption.
 See [invitation recovery](../../docs/marmot-architecture/invitation-recovery.md) for the runtime/binding integration contract.
+
+## Unified public app campaign
+
+`just app-stack-campaign OUT` builds and freezes production-policy release executables, runs a canary phase, then
+runs the complete public matrix only if every canary passes. `OUT` must be a fresh directory outside the checkout
+or under an ignored directory such as `target/`. A clean worktree is required by default. Use `--allow-dirty` for
+local implementation validation; source commit, binary hashes, dirty patch and untracked-file hashes are retained.
+The build refuses test-policy overrides and detects source changes during compilation.
+
+```sh
+# Focused launch gate: one case from all eleven app families plus the new fixed
+# journeys, basic messaging and the backlog recovery/reopen oracle canary.
+just app-stack-campaign target/app-stack-canary-1 --mode canary
+
+# Canary gate, then complete catalog at seeds 7, 42 and 17001, at most two workers.
+just app-stack-campaign target/app-stack-full-1
+
+# Repeat the full catalog with fresh sockets and keys. Seeds vary logical inputs;
+# repetitions also sample real socket schedules and cryptographic randomness.
+just app-stack-campaign target/app-stack-repeat-1 --seeds 7 42 17001 --rounds 3 --jobs 2
+```
+
+The full matrix runs 216 generated cases per round (ten six-case catalogs and the twelve-case cross-route catalog,
+across three seeds), plus all tests in `app_runtime_adapter`, `app_runtime_journeys`,
+`app_runtime_interaction_journeys`, and `public_app_families`. Ignored tests are explicitly selected, including both
+1,024-message backlogs, production-timing manual self-update and strict invitation recovery. The app cross-route
+regression in `process_orchestrator` runs alone with its legacy retained-engine control. That comparison has a
+separate optimized build enabling debug compatibility only in `cgka-engine` and `cgka-conformance-simulator`;
+the app side retains pinned production timing without test-policy overrides. Its build exception is recorded in
+`build.json`. All generated campaigns and other app tests use the ordinary release build with debug assertions off.
+`--rounds` repeats that regression in
+individually isolated processes instead of hiding twenty trials inside one test result. App participants and the
+local relay run in separate processes. Container and external-relay campaigns remain separate execution layers.
+
+Every generated case retains its original strict public oracle and the existing campaign runner's input/report
+integrity checks. Fixed tests run exactly once per selected task, under an outer deadline, with retained output and
+journey artifacts. Results include failure, timeout and missing-evidence outcomes. A strict invitation diagnostic
+that misses the required race is marked `inconclusive_race` and cannot turn the overall campaign green. Failures
+are retained; there are no automatic success-masking retries. The runner finishes the current phase to collect its
+results, but does not start another phase after failure.
+
+`plan.json`, `source.json`, `build.json`, commands, per-task results and incremental `summary.json` live under a
+private evidence root; `--plan-only` prints the high-level selection without building or writing. The root is never
+reused. This runner requires Python 3.9+ on macOS/Linux. Campaign processes are killed as a group on timeout or
+interruption; per-task temporary participant stores are then removed while reports remain. The per-case runner records wall/CPU time, peak RSS and database size for generated cases.
+
+These are repeated fresh-stack campaigns over a local test relay with in-memory retained history. They do not
+establish long-lived-runtime memory stability, durable relay restart, device crash or external-relay interoperability.
+A sustained workload that preserves the same runtimes for hours remains a separate follow-up before making those
+longevity claims.
+
+### Intermediate backlog and combined interaction additions
+
+`public-app-backlog-recovery/v1` (generator version 2) uses four founding members and keeps Bob offline for
+64, 128 or 256 messages. Profile edits occur every 16 messages, admin changes every 32. Generation batches
+intermediate projection checks at commit/recovery boundaries; every send still uses public relay publication and
+all expected payloads remain in the exact terminal history. Version 1 saved inputs retain their per-send checks.
+Cases 0–2 use full-history
+recovery; cases 3–5 reopen Bob after the first repair request and request history again before checking completion.
+The real runtime may finish recovery before that reopen; this pins an operation boundary, not an incomplete row
+count. Every participant must retain the exact expected payload multiset, agree on the expected public roster,
+admin set and profile, exchange fresh traffic, and preserve Bob's complete timeline through another reopen.
+
+`public_app_13_offline_removal_then_rejoin_preserves_history` extends the removed-while-offline contract through
+fresh invitation and admission after both sides reopen. It checks that the removed device learns its eviction,
+refuses sends for `group_removed`, retains its original history and never gains messages sent during exclusion,
+including after rejoin, bidirectional traffic and another reopen.
+
+`public_app_14_two_groups_recover_without_starving_live_traffic` puts Alice, Bob and Carol in a work group and
+a separate side group (`pair`). Bob accumulates 64 work messages plus side-group traffic offline while Carol is
+removed from work and its profile changes. The online members exchange side-group traffic during backlog creation;
+after reconnect, Bob must receive fresh side-group traffic on every work recovery pass through the same account
+worker and database. The groups retain separate histories, rosters and profiles; Alice's shared database reopen
+preserves both. Carol retains exactly her
+pre-removal work history while continuing to send in the pair group.
+
+
+## Seeded runtime-fault expansion
+
+The unified campaign also samples `public-app-stateful-recovery/v1` and
+`public-app-recovery-schedules/v1`; see [the scenario contracts](SCENARIOS.md#seeded-app-runtime-faults-and-mixed-recovery).
+These vary operation sequences and recovery boundaries rather than rotating only actor choices.
+`app_generated_variance` supplies cheap diversity/preflight/stimulus-sensitivity checks and an explicit
+process-kill canary. The process-kill test receives an exclusive campaign batch. This expands the
+harness's supported inputs; broad runtime coverage still needs a separately selected campaign.
+
+### Large app groups
+
+`public-app-large-group/v1` adds bulk and staged formation at 10, 20 and 50 participants. It uses the
+same real local relay, production app runtimes and separate SQLCipher roots as the smaller public
+families. It includes all-member message fanout, a 20% offline cohort, admin/profile changes,
+removal/re-invitation and durable recovery. Whole-history assertions and terminal expectations cover
+every participant. Case registration is not execution evidence; record each size/formation result
+separately. See [the family contract and selected-case command](SCENARIOS.md#public-app-large-groupv1).
+
+The explicit large-group canary saves `performance-before-cleanup.json` from the public runtime
+telemetry, including closed sync failure stages and causes, before attempting teardown. This read
+does not queue another command behind a stalled account worker. `MDK_SCENARIO_PROGRESS=1` adds
+structured progress tracing with participant ordinals and elapsed times for catch-up and shutdown calls;
+the canary installs its subscriber automatically. `MDK_REPLAY_SLICE_DIAGNOSTICS=1` also records aggregate
+probe counts and slice durations. The report's broad
+`account_catch_up` resource category alone does not distinguish a worker timeout from a sync error;
+inspect the saved telemetry before assigning a cause. These diagnostics do not change runtime
+policy, scenario inputs, or the semantic oracle.
+
+## Default app execution layout
+
+All `AppRuntimeHarness` acceptance constructors now launch one participant process per encrypted account-device root and a separate real relay process. The action and assertion API is shared with the explicit `new_in_process_stress` diagnostic. See [the app scenario inventory](APP_SCENARIO_INVENTORY.md) for catalog counts, lifecycle semantics, helper builds and evidence receipts.

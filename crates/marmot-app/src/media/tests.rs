@@ -1454,6 +1454,75 @@ fn loopback_reference() -> MediaAttachmentReference {
     }
 }
 
+#[tokio::test]
+async fn download_prepare_stays_local() {
+    let dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = std::sync::Arc::new(crate::tests::ScriptedPushRelayClient::default());
+    let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("media", &[]).await.unwrap();
+    let mut reference = loopback_reference();
+    reference.source_epoch = client.runtime.group_record(&group).unwrap().epoch.0;
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .unwrap();
+    client
+        .update_group_profile(&group, Some("advanced media"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group).unwrap().epoch.0 > reference.source_epoch);
+    let subscriptions = relay.subscription_count();
+    relay.fail_next_subscribe();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .unwrap();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .unwrap();
+    // Remove only the historical cache entries; the current exporter cannot
+    // recover this original reference after the group has advanced.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    assert!(
+        connection
+            .execute(
+                "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1 AND source_epoch = ?2",
+                rusqlite::params![
+                    hex::encode(group.as_slice()),
+                    i64::try_from(reference.source_epoch).unwrap(),
+                ],
+            )
+            .unwrap() > 0
+    );
+    let error = client
+        .prepare_encrypted_media_download(&group, reference)
+        .await
+        .err()
+        .expect("the historical secret is unavailable");
+    assert!(
+        matches!(error, crate::AppError::InvalidEncryptedMedia(detail)
+        if detail.contains("missing encrypted media secret"))
+    );
+    assert_eq!(relay.subscription_count(), subscriptions);
+}
+
 #[test]
 fn loopback_locator_validation_follows_runtime_flag_not_build_profile() {
     // Issue #341 regression: the runtime `allow_loopback_http` flag (driven by

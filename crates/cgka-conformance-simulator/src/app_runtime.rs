@@ -22,9 +22,16 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
+mod process_backend;
+mod process_io;
+pub(crate) mod process_relay;
+mod process_server;
+use process_backend::{ParticipantApp, ParticipantRuntime};
+use process_relay::{ProxyBackend, RelayBackend};
+pub use process_server::run as run_app_process_stdio;
+
 use crate::relay_control::{
-    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation, RelayControl,
-    RelayControlError,
+    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation, RelayControlError,
 };
 use crate::{
     ClientEventCounts, ClientObservation, ConvergenceSubject, ScenarioAdminPolicyObservation,
@@ -35,6 +42,19 @@ use crate::{
 };
 
 pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "1";
+
+// Matches the fixed strict invite/rename journey's automatic re-invitation allowance.
+const INVITEE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(150);
+
+fn owns_relay(relay: &str) -> bool {
+    ["relay:shared", "relay:default"].contains(&relay)
+}
+
+fn tolerates_unknown_group(error: &SubjectError) -> bool {
+    error.code == "unknown_group"
+        || (error.category == SubjectFailureCategory::ExpectedRefusal
+            && error.message.ends_with("unknown_group"))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRuntimeProtocolProjectionV1 {
@@ -138,9 +158,8 @@ pub struct ConcurrentMutationReport {
 }
 
 struct Participant {
-    root: TempDir,
-    app: MarmotApp,
-    runtime: Option<MarmotAppRuntime>,
+    app: ParticipantApp,
+    runtime: Option<ParticipantRuntime>,
     events: Option<broadcast::Receiver<MarmotAppEvent>>,
     account_id: String,
     online: bool,
@@ -154,6 +173,8 @@ struct Participant {
     cached_members: BTreeMap<String, Vec<String>>,
     cached_epochs: BTreeMap<String, u64>,
     offline_observation: Option<AppRuntimeObservationV1>,
+    // Drop the child handles before removing its database directory.
+    root: TempDir,
 }
 
 impl Participant {
@@ -161,7 +182,7 @@ impl Participant {
         self.root.path()
     }
 
-    fn runtime(&self) -> Result<&MarmotAppRuntime, SubjectError> {
+    fn runtime(&self) -> Result<&ParticipantRuntime, SubjectError> {
         self.runtime.as_ref().ok_or_else(|| {
             SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
@@ -172,10 +193,13 @@ impl Participant {
     }
 }
 
-/// In-process application harness backed by one real local Nostr relay.
+/// Public app harness: a separate process per participant and a separate real relay.
+/// The explicitly named in-process constructor is only for component/stress diagnostics.
 pub struct AppRuntimeHarness {
-    _relay: LocalRelay,
-    relay_control: RelayControl,
+    _relay: Option<LocalRelay>,
+    relay_fault_proxy: ProxyBackend,
+    stimulus_observations: Vec<crate::ScenarioStimulusObservation>,
+    relay_control: RelayBackend,
     relay_url: String,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
@@ -184,6 +208,8 @@ pub struct AppRuntimeHarness {
     relay_action_events: RelayActionEvents,
     settlement_quiescence_ms: Option<u64>,
     maintenance_timing: Option<MaintenanceTiming>,
+    participant_processes: bool,
+    catch_up_parallelism: usize,
 }
 
 impl AppRuntimeHarness {
@@ -218,11 +244,34 @@ impl AppRuntimeHarness {
         settlement_quiescence_ms: Option<u64>,
         maintenance_timing: Option<MaintenanceTiming>,
     ) -> Result<Self, SubjectError> {
-        let relay_control = RelayControl::new();
-        let relay = LocalRelay::new(relay_control.relay_builder());
-        relay.run().await.map_err(environment_error)?;
-        let relay_url = relay.url().await.to_string();
-        let endpoint = TransportEndpoint::from(relay_url.clone());
+        Self::new_with_execution(clients, settlement_quiescence_ms, maintenance_timing, true).await
+    }
+
+    /// Explicit resource-contention/component diagnostic; acceptance defaults to processes.
+    pub async fn new_in_process_stress(clients: &[String]) -> Result<Self, SubjectError> {
+        Self::new_with_execution(clients, None, None, false).await
+    }
+
+    async fn new_with_execution(
+        clients: &[String],
+        settlement_quiescence_ms: Option<u64>,
+        maintenance_timing: Option<MaintenanceTiming>,
+        participant_processes: bool,
+    ) -> Result<Self, SubjectError> {
+        // Opt-in scheduling experiment; ordinary acceptance keeps its serial order.
+        let catch_up_parallelism = match std::env::var("MDK_APP_CATCH_UP_PARALLELISM") {
+            Ok(value) => value.parse::<usize>().ok().filter(|n| (1..=8).contains(n)),
+            Err(std::env::VarError::NotPresent) => Some(1),
+            Err(_) => None,
+        }
+        .ok_or_else(|| {
+            SubjectError::new(
+                "invalid_catch_up_parallelism",
+                "expected an integer from 1 to 8",
+            )
+        })?;
+        let (relay_control, relay_fault_proxy, relay, relay_url) =
+            RelayBackend::start(participant_processes).await?;
         let mut participants = BTreeMap::new();
         for client in clients {
             let root = tempfile::Builder::new()
@@ -230,33 +279,24 @@ impl AppRuntimeHarness {
                 .tempdir()
                 .map_err(environment_error)?;
             fs_private::create_dir_all_private(root.path()).map_err(environment_error)?;
-            let app = app_for_root(
+            let (app, runtime, events, account_id) = make_participant(
                 root.path(),
                 &relay_url,
                 settlement_quiescence_ms,
                 maintenance_timing,
-            );
-            let runtime = MarmotAppRuntime::new(app.clone());
-            runtime.start().await.map_err(app_error)?;
-            let setup = runtime
-                .create_identity(AccountSetupRequest {
-                    default_relays: vec![endpoint.clone()],
-                    bootstrap_relays: vec![endpoint.clone()],
-                    publish_missing_relay_lists: true,
-                    publish_initial_key_package: true,
-                    ..AccountSetupRequest::default()
-                })
-                .await
-                .map_err(app_error)?;
-            let events = runtime.subscribe();
+                participant_processes,
+                true,
+            )
+            .await
+            .map_err(app_error)?;
             participants.insert(
                 client.clone(),
                 Participant {
                     root,
                     app,
                     runtime: Some(runtime),
-                    events: Some(events),
-                    account_id: setup.account.account_id_hex,
+                    events,
+                    account_id,
                     online: true,
                     catch_up_attempts: 0,
                     reopen_count: 0,
@@ -273,6 +313,8 @@ impl AppRuntimeHarness {
         }
         Ok(Self {
             _relay: relay,
+            relay_fault_proxy,
+            stimulus_observations: Vec::new(),
             relay_control,
             relay_url,
             participants,
@@ -282,17 +324,19 @@ impl AppRuntimeHarness {
             relay_action_events: BTreeMap::new(),
             settlement_quiescence_ms,
             maintenance_timing,
+            participant_processes,
+            catch_up_parallelism,
         })
     }
 
-    async fn relay_publication_cursor(&self) -> usize {
+    async fn relay_publication_cursor(&self) -> Result<usize, SubjectError> {
         self.relay_control.publication_cursor().await
     }
 
     /// Number of events the shared relay has admitted so far. A scenario can
     /// difference two readings to prove that a command reached the relay at
     /// all, independently of any participant's projection.
-    pub async fn relay_admitted_events(&self) -> usize {
+    pub async fn relay_admitted_events(&self) -> Result<usize, SubjectError> {
         self.relay_publication_cursor().await
     }
 
@@ -352,7 +396,7 @@ impl AppRuntimeHarness {
             expected_event_ids,
             timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
         };
-        let result = if expected_event_ids.len() == expected_publications {
+        if expected_event_ids.len() == expected_publications {
             self.relay_control
                 .wait_for_exact_action_events(
                     &mut self.relay_action_events,
@@ -370,8 +414,7 @@ impl AppRuntimeHarness {
                     expectation,
                 )
                 .await
-        };
-        result.map_err(relay_control_error)
+        }
     }
 
     async fn set_shared_relay_event_presence(
@@ -381,11 +424,11 @@ impl AppRuntimeHarness {
         clients: &[String],
         visible: bool,
     ) -> Result<(), SubjectError> {
-        if relay != "relay:shared" {
+        if !owns_relay(relay) {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "unknown_relay",
-                "the app-runtime adapter owns only relay:shared",
+                "the app-runtime adapter owns relay:shared and its relay:default alias",
             ));
         }
         if clients
@@ -413,7 +456,6 @@ impl AppRuntimeHarness {
         self.relay_control
             .set_action_event_visibility(&self.relay_action_events, selector, visible)
             .await
-            .map_err(relay_control_error)
     }
 
     pub fn participant_roots(&self) -> BTreeMap<String, PathBuf> {
@@ -423,17 +465,111 @@ impl AppRuntimeHarness {
             .collect()
     }
 
+    /// Public, aggregate runtime telemetry without querying a busy account worker.
+    pub fn performance_snapshots(
+        &self,
+    ) -> Result<BTreeMap<String, marmot_app::AppPerformanceSnapshot>, SubjectError> {
+        self.participants
+            .iter()
+            .filter_map(|(label, p)| {
+                p.runtime.as_ref().map(|r| {
+                    r.app_performance_snapshot()
+                        .map(|s| (label.clone(), s))
+                        .map_err(app_error)
+                })
+            })
+            .collect()
+    }
+
+    /// Public test layout receipt. PIDs are local diagnostics, not protocol identities.
+    pub fn process_layout(&self) -> serde_json::Value {
+        let participants = self
+            .participants
+            .iter()
+            .map(|(label, p)| {
+                let pid = match &p.app {
+                    ParticipantApp::Remote(c) => Some(c.pid()),
+                    ParticipantApp::Local(_) => None,
+                };
+                (label.clone(), pid)
+            })
+            .collect::<BTreeMap<_, _>>();
+        serde_json::json!({"schema_version":"1","execution":if self.participant_processes {"participant_processes"} else {"in_process_stress"},"coordinator_pid":std::process::id(),"relay_pid":self.relay_control.pid(),"participants":participants,"worker_threads_per_participant":if self.participant_processes {Some(4)} else {None},"catch_up_parallelism":self.catch_up_parallelism})
+    }
+
     pub async fn catch_up(&mut self, clients: &[String]) -> Result<(), SubjectError> {
-        for label in clients {
+        if self.catch_up_parallelism > 1 {
+            return self.catch_up_parallel(clients).await;
+        }
+        let progress = std::env::var_os("MDK_SCENARIO_PROGRESS").is_some();
+        for (index, label) in clients.iter().enumerate() {
             let participant = self.participant_mut(label)?;
             if !participant.online {
                 continue;
             }
             participant.catch_up_attempts = participant.catch_up_attempts.saturating_add(1);
+            let started = std::time::Instant::now();
+            if progress {
+                tracing::debug!(target: "cgka_conformance_simulator::progress", method = "catch_up", participant_index = index, "app catch-up started");
+            }
             let result = participant.runtime()?.catch_up_accounts().await;
+            if progress {
+                tracing::debug!(
+                    target: "cgka_conformance_simulator::progress",
+                    method = "catch_up",
+                    participant_index = index,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    success = result.is_ok(),
+                    "app catch-up finished"
+                );
+            }
             if let Err(error) = result {
                 record_failure(participant, &error);
                 return Err(app_error(error));
+            }
+        }
+        self.refresh_cached_members(clients).await
+    }
+
+    async fn catch_up_parallel(&mut self, clients: &[String]) -> Result<(), SubjectError> {
+        let mut seen = BTreeSet::new();
+        for label in clients {
+            self.participant(label)?;
+            if !seen.insert(label) {
+                return Err(SubjectError::new(
+                    "duplicate_catch_up_participant",
+                    "parallel catch-up requires distinct participants",
+                ));
+            }
+        }
+        for batch in clients.chunks(self.catch_up_parallelism) {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, label) in batch.iter().enumerate() {
+                let participant = self.participant_mut(label)?;
+                if participant.online {
+                    let runtime = participant.runtime()?.clone();
+                    participant.catch_up_attempts = participant.catch_up_attempts.saturating_add(1);
+                    tasks.spawn(async move { (index, runtime.catch_up_accounts().await) });
+                }
+            }
+            // Await every started call before returning an ordinary app failure.
+            // Report the first failure in input order, regardless of completion order.
+            let mut results = BTreeMap::new();
+            while let Some(result) = tasks.join_next().await {
+                let (index, result) = result.map_err(|_| {
+                    SubjectError::new("catch_up_task_failed", "parallel catch-up task failed")
+                })?;
+                results.insert(index, result);
+            }
+            let mut first_failure = None;
+            for (index, result) in results {
+                if let Err(error) = result {
+                    record_failure(self.participant_mut(&batch[index])?, &error);
+                    first_failure.get_or_insert_with(|| app_error(error));
+                }
+            }
+            if let Some(error) = first_failure {
+                return Err(error);
             }
         }
         self.refresh_cached_members(clients).await
@@ -541,21 +677,30 @@ impl AppRuntimeHarness {
         let relay_url = self.relay_url.clone();
         let settlement_quiescence_ms = self.settlement_quiescence_ms;
         let maintenance_timing = self.maintenance_timing;
+        let participant_processes = self.participant_processes;
         let participant = self.participant_mut(client)?;
         if participant.online
             && let Some(runtime) = participant.runtime.take()
         {
             runtime.shutdown_and_close().await.map_err(app_error)?;
         }
-        participant.app = app_for_root(
+        let (app, runtime, events, account_id) = make_participant(
             participant.root(),
             &relay_url,
             settlement_quiescence_ms,
             maintenance_timing,
-        );
-        let runtime = MarmotAppRuntime::new(participant.app.clone());
-        runtime.start().await.map_err(app_error)?;
-        participant.events = Some(runtime.subscribe());
+            participant_processes,
+            false,
+        )
+        .await
+        .map_err(app_error)?;
+        if account_id != participant.account_id {
+            return Err(environment_error(
+                "participant identity changed after reopen",
+            ));
+        }
+        participant.app = app;
+        participant.events = events;
         participant.runtime = Some(runtime);
         participant.online = true;
         participant.reopen_count = participant.reopen_count.saturating_add(1);
@@ -625,13 +770,89 @@ impl AppRuntimeHarness {
         }
     }
 
-    pub async fn shutdown(&mut self) {
-        for participant in self.participants.values_mut() {
+    pub async fn shutdown(&mut self) -> Result<(), SubjectError> {
+        let mut failures = Vec::new();
+        let progress = std::env::var_os("MDK_SCENARIO_PROGRESS").is_some();
+        for (index, participant) in self.participants.values_mut().enumerate() {
             if let Some(runtime) = participant.runtime.take() {
-                runtime.shutdown().await;
+                let started = std::time::Instant::now();
+                if progress {
+                    tracing::debug!(target: "cgka_conformance_simulator::progress", method = "shutdown", participant_index = index, "app shutdown started");
+                }
+                if let Err(error) = runtime.shutdown_and_close().await {
+                    failures.push(app_error(error));
+                }
+                if progress {
+                    tracing::debug!(
+                        target: "cgka_conformance_simulator::progress",
+                        method = "shutdown",
+                        participant_index = index,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "app shutdown finished"
+                    );
+                }
             }
             participant.online = false;
         }
+        if let Err(error) = self.relay_control.shutdown().await {
+            failures.push(error);
+        }
+        failures.into_iter().next().map_or(Ok(()), Err)
+    }
+
+    /// Preserve stopped synthetic fixtures for private diagnosis. Consumes the
+    /// harness, closes remaining app handles, and disables TempDir deletion.
+    /// The manifest and relay events are sensitive replay material, not a
+    /// shareable scenario or an oracle. Call only after successful shutdown.
+    pub async fn retain_stopped_diagnostic_fixture(
+        self,
+        destination: &Path,
+    ) -> Result<(), SubjectError> {
+        if self
+            .participants
+            .values()
+            .any(|participant| participant.runtime.is_some())
+        {
+            return Err(environment_error("diagnostic fixture must be stopped"));
+        }
+        if destination.exists() {
+            return Err(environment_error("diagnostic fixture already exists"));
+        }
+        fs_private::create_dir_all_private(destination).map_err(environment_error)?;
+        let publications = self.relay_control.diagnostic_publications().await?;
+        let mut roots = BTreeMap::new();
+        for (label, participant) in self.participants {
+            let Participant {
+                root,
+                app,
+                runtime,
+                events,
+                ..
+            } = participant;
+            drop(events);
+            drop(runtime);
+            drop(app);
+            roots.insert(label, root.keep());
+        }
+        let manifest = serde_json::json!({
+            "schema_version": "1",
+            "sensitive": true,
+            "roots": roots,
+            "relay_url": self.relay_url,
+            "scenario_groups": self.scenario_groups,
+            "active_scenario_group": self.active_scenario_group,
+        });
+        fs_private::write_private(
+            &destination.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest).map_err(environment_error)?,
+        )
+        .map_err(environment_error)?;
+        fs_private::write_private(
+            &destination.join("relay-publications.json"),
+            &serde_json::to_vec(&publications).map_err(environment_error)?,
+        )
+        .map_err(environment_error)?;
+        Ok(())
     }
 
     /// Advance every named online participant's durable maintenance state once
@@ -677,8 +898,16 @@ impl AppRuntimeHarness {
                 "a concurrent mutation set needs at least one mutation",
             ));
         }
+        // Validate the entire batch before spawning any side effects.
+        for mutation in mutations {
+            self.participant(mutation.client())?.runtime()?;
+            if let ConcurrentMutation::InviteMembers { invitees, .. } = mutation {
+                self.account_ids(invitees)?;
+            }
+        }
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(mutations.len() + 1));
         let group_id = self.active_group()?;
-        let before = self.relay_publication_cursor().await;
+        let before = self.relay_publication_cursor().await?;
         let include_welcomes = mutations
             .iter()
             .any(|mutation| matches!(mutation, ConcurrentMutation::InviteMembers { .. }));
@@ -688,6 +917,7 @@ impl AppRuntimeHarness {
             let runtime = participant.runtime()?.clone();
             let account_id = participant.account_id.clone();
             let group_id = group_id.clone();
+            let barrier = barrier.clone();
             match mutation {
                 ConcurrentMutation::UpdateGroupProfile {
                     name, description, ..
@@ -695,6 +925,7 @@ impl AppRuntimeHarness {
                     let name = name.map(str::to_owned);
                     let description = description.map(str::to_owned);
                     tasks.spawn(async move {
+                        barrier.wait().await;
                         let result = runtime
                             .update_group_profile(&account_id, &group_id, name, description)
                             .await;
@@ -704,6 +935,7 @@ impl AppRuntimeHarness {
                 ConcurrentMutation::InviteMembers { invitees, .. } => {
                     let invitees = self.account_ids(invitees)?;
                     tasks.spawn(async move {
+                        barrier.wait().await;
                         let result = runtime
                             .invite_members(&account_id, &group_id, &invitees)
                             .await;
@@ -712,6 +944,7 @@ impl AppRuntimeHarness {
                 }
             }
         }
+        barrier.wait().await;
         let mut results = (0..mutations.len()).map(|_| None).collect::<Vec<_>>();
         while let Some(joined) = tasks.join_next().await {
             let (index, result) = joined.map_err(|_| {
@@ -759,8 +992,7 @@ impl AppRuntimeHarness {
                     timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
                 },
             )
-            .await
-            .map_err(relay_control_error)?;
+            .await?;
         for outcome in outcomes.iter().filter(|outcome| outcome.accepted) {
             self.record_accepted_publication(&outcome.client, action_id);
         }
@@ -839,7 +1071,7 @@ impl AppRuntimeHarness {
             {
                 participant.cached_members.remove(&group_label);
                 participant.cached_epochs.remove(&group_label);
-                drain_runtime_events(participant);
+                drain_runtime_events(participant)?;
                 continue;
             }
             let members = participant
@@ -872,7 +1104,7 @@ impl AppRuntimeHarness {
             participant
                 .cached_epochs
                 .insert(group_label.clone(), state.epoch);
-            drain_runtime_events(participant);
+            drain_runtime_events(participant)?;
         }
         Ok(())
     }
@@ -896,13 +1128,11 @@ impl AppRuntimeHarness {
                 .map_err(app_error)?
                 .is_some_and(|group| group.pending_confirmation)
             {
-                accept_group_invite_retrying_busy(
-                    participant.runtime()?,
-                    &participant.account_id,
-                    group_id,
-                )
-                .await
-                .map_err(app_error)?;
+                participant
+                    .runtime()?
+                    .accept_group_invite_retrying_busy(&participant.account_id, group_id)
+                    .await
+                    .map_err(app_error)?;
             }
         }
         Ok(())
@@ -931,7 +1161,7 @@ impl AppRuntimeHarness {
             .map(|(label, participant)| (participant.account_id.clone(), label.clone()))
             .collect::<BTreeMap<_, _>>();
         let participant = self.participant_mut(client)?;
-        drain_runtime_events(participant);
+        drain_runtime_events(participant)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let group = participant
             .app
@@ -1078,6 +1308,13 @@ impl AppRuntimeHarness {
 
 #[async_trait]
 impl ConvergenceSubject for AppRuntimeHarness {
+    fn uses_wall_clock_assertions(&self) -> bool {
+        true
+    }
+
+    fn execution_layout(&self) -> Option<serde_json::Value> {
+        Some(self.process_layout())
+    }
     fn descriptor(&self) -> SubjectDescriptor {
         SubjectDescriptor {
             adapter: "marmot_app_runtime".into(),
@@ -1089,11 +1326,14 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::TransportDelivery,
                 SubjectCapability::EventObservation,
                 SubjectCapability::AssertionEvaluation,
+                SubjectCapability::ClientStateAssertion,
                 SubjectCapability::PublicGroupStateObservation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,
                 SubjectCapability::OutboundPublication,
                 SubjectCapability::ParticipantConnectivity,
+                SubjectCapability::RelayInterruption,
+                SubjectCapability::ConcurrentGroupMutation,
                 SubjectCapability::MultiGroup,
                 SubjectCapability::RetainedRelayHistory,
                 SubjectCapability::RetainedRelayControl,
@@ -1135,7 +1375,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         }
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let invitees = self.account_ids(action.invitees)?;
             let participant = self.participant(action.creator)?;
             let group_id = participant
@@ -1181,7 +1421,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         // Keep maintenance publications outside this action's relay cursor.
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let invitees = self.account_ids(action.invitees)?;
             let participant = self.participant(action.inviter)?;
@@ -1214,7 +1454,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         // Keep maintenance publications outside this action's relay cursor.
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let participant = self.participant(action.client)?;
             let summary = participant
@@ -1251,7 +1491,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         // Keep maintenance publications outside this action's relay cursor.
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let members = self.account_ids(action.members)?;
             let participant = self.participant(action.remover)?;
@@ -1299,7 +1539,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         // Keep maintenance publications outside this action's relay cursor.
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let message_ids = self
                 .apply_admin_set(action.client, &group_id, action.admins)
@@ -1369,7 +1609,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
     ) -> Result<(), SubjectError> {
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let participant = self.participant(action.sender)?;
             let summary = participant
@@ -1431,7 +1671,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         // Keep maintenance publications outside this action's relay cursor.
         self.set_all_maintenance_paused(true).await?;
         let result = async {
-            let before = self.relay_publication_cursor().await;
+            let before = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let participant = self.participant(client)?;
             let summary = participant
@@ -1496,6 +1736,16 @@ impl ConvergenceSubject for AppRuntimeHarness {
                     *minimum_epoch,
                 );
                 (matched, serde_json::json!(states))
+            }
+            ScenarioPredicateV2::PublicPayloadMultiset { client, payloads } => {
+                let mut actual = self
+                    .layered_observation(client)?
+                    .application
+                    .visible_plaintexts;
+                let mut expected = payloads.clone();
+                actual.sort();
+                expected.sort();
+                (actual == expected, serde_json::json!({"payloads": actual}))
             }
             ScenarioPredicateV2::ClientState {
                 client,
@@ -1585,10 +1835,221 @@ impl ConvergenceSubject for AppRuntimeHarness {
     fn clear_events(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for client in clients {
             let participant = self.participant_mut(client)?;
-            drain_runtime_events(participant);
+            drain_runtime_events(participant)?;
             participant.runtime_events_observed = 0;
         }
         Ok(())
+    }
+
+    async fn interrupt_relay(
+        &mut self,
+        action_id: &str,
+        relay: &str,
+        outage_ms: u64,
+    ) -> Result<(), SubjectError> {
+        if !owns_relay(relay) || !(1..=30_000).contains(&outage_ms) {
+            return Err(SubjectError::new(
+                "invalid_relay_interruption",
+                "unknown local relay or invalid outage duration",
+            ));
+        }
+        let runtimes_running = self
+            .participants
+            .values()
+            .filter(|p| p.runtime.is_some())
+            .count();
+        let (closed_connections, rejected_connections) = self
+            .relay_fault_proxy
+            .interrupt(Duration::from_millis(outage_ms))
+            .await
+            .map_err(environment_error)?;
+        self.stimulus_observations
+            .push(crate::ScenarioStimulusObservation::RelayInterruption {
+                action_id: action_id.into(),
+                requested_outage_ms: outage_ms,
+                closed_connections,
+                rejected_connections,
+                runtimes_running,
+            });
+        if closed_connections == 0 {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "relay_interruption_not_exercised",
+                "no established relay connection was available to interrupt",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn race_invite_profile(
+        &mut self,
+        action_id: &str,
+        actors: &[String],
+        invitee: &str,
+        name: &str,
+        restart_at_offer: bool,
+    ) -> Result<(), SubjectError> {
+        // With equal-depth same-epoch branches, convergence's final tip_committer
+        // tie-break favors the smaller identity. The higher-identity invite then
+        // loses. Earlier selector criteria may break the tie (including after a
+        // restart); only an actual rejoin offer below proves this race occurred.
+        let (inviter, renamer) =
+            if self.account_identity(&actors[0])? < self.account_identity(&actors[1])? {
+                (&actors[1], &actors[0])
+            } else {
+                (&actors[0], &actors[1])
+            };
+        let invitees = vec![invitee.to_owned()];
+        let report = self
+            .race_mutations(
+                action_id,
+                &[
+                    ConcurrentMutation::InviteMembers {
+                        inviter,
+                        invitees: &invitees,
+                    },
+                    ConcurrentMutation::UpdateGroupProfile {
+                        client: renamer,
+                        name: Some(name),
+                        description: None,
+                    },
+                ],
+            )
+            .await?;
+        let all_accepted = report.outcomes.iter().all(|o| o.accepted);
+        let evidence_index = self.stimulus_observations.len();
+        self.stimulus_observations.push(
+            crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                action_id: action_id.into(),
+                inviter: inviter.clone(),
+                renamer: renamer.clone(),
+                outcomes: report.outcomes,
+                admitted_publications: report.admitted_publications,
+                explicit_rejoin: false,
+                offer_survived_restart: false,
+                confirmation_survived_restart: false,
+            },
+        );
+        if !all_accepted {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "invite_profile_race_not_exercised",
+                "a competing command was refused; retained outcomes do not establish race recovery",
+            ));
+        }
+        // A barrier alone proves simultaneous calls, not a losing branch. Only
+        // a validated rejoin offer and explicit recovery satisfy this action.
+        let deadline = tokio::time::Instant::now() + INVITEE_RECOVERY_TIMEOUT;
+        loop {
+            self.tick(actors).await?;
+            match self.tick(&invitees).await {
+                Ok(()) => (),
+                Err(error) if tolerates_unknown_group(&error) => {}
+                Err(error) => return Err(error),
+            }
+            let status = self.group_recovery_status(invitee).await;
+            match status {
+                Ok(status) => {
+                    if let Some(offer) = status.rejoin_invitations.first() {
+                        let offer = offer.clone();
+                        if restart_at_offer {
+                            self.reopen(invitee).await?;
+                            if !self
+                                .group_recovery_status(invitee)
+                                .await?
+                                .rejoin_invitations
+                                .contains(&offer)
+                            {
+                                return Err(SubjectError::new(
+                                    "rejoin_offer_lost",
+                                    "validated offer did not survive reopen",
+                                ));
+                            }
+                            if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                                offer_survived_restart,
+                                ..
+                            } = &mut self.stimulus_observations[evidence_index]
+                            {
+                                *offer_survived_restart = true;
+                            }
+                        }
+                        self.confirm_group_rejoin(invitee, &offer).await?;
+                        if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                            explicit_rejoin,
+                            ..
+                        } = &mut self.stimulus_observations[evidence_index]
+                        {
+                            *explicit_rejoin = true;
+                        }
+                        self.reopen(invitee).await?;
+                        let view = self.observations(&invitees).await?;
+                        if view[0].application.pending_confirmation {
+                            return Err(SubjectError::new(
+                                "rejoin_confirmation_lost",
+                                "confirmed rejoin did not survive reopen",
+                            ));
+                        }
+                        if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                            confirmation_survived_restart,
+                            ..
+                        } = &mut self.stimulus_observations[evidence_index]
+                        {
+                            *confirmation_survived_restart = true;
+                        }
+                        return Ok(());
+                    }
+                }
+                Err(error) if tolerates_unknown_group(&error) => {}
+                Err(error) => return Err(error),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Accepted mutations without an offer cannot distinguish an
+                // unexercised selector tie from broken recovery. Keep this an
+                // unresolved failure, not an expected refusal inferred from time.
+                return Err(SubjectError::new(
+                    "explicit_invitee_recovery_not_exercised",
+                    "accepted concurrent calls did not produce a validated recipient recovery offer",
+                ));
+            }
+            self.run_due_maintenance(actors).await?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn race_group_profiles(
+        &mut self,
+        action_id: &str,
+        updates: &[crate::ScenarioProfileUpdate],
+    ) -> Result<(), SubjectError> {
+        let mutations = updates
+            .iter()
+            .map(|u| ConcurrentMutation::UpdateGroupProfile {
+                client: &u.client,
+                name: u.name.as_deref(),
+                description: u.description.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let report = self.race_mutations(action_id, &mutations).await?;
+        let all_accepted = report.outcomes.iter().all(|outcome| outcome.accepted);
+        self.stimulus_observations
+            .push(crate::ScenarioStimulusObservation::ConcurrentProfiles {
+                action_id: action_id.into(),
+                callers_released: updates.len(),
+                outcomes: report.outcomes,
+                admitted_publications: report.admitted_publications,
+            });
+        if !all_accepted {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "concurrent_profiles_not_all_accepted",
+                "the requested concurrent profile inputs were not all accepted; inspect stimulus evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn stimulus_observations(&self) -> Vec<crate::ScenarioStimulusObservation> {
+        self.stimulus_observations.clone()
     }
 
     fn restart(&mut self, client: &str) -> Result<(), SubjectError> {
@@ -1640,7 +2101,7 @@ impl AppRuntimeHarness {
             let clients = vec![action.client.to_owned()];
             self.refresh_cached_members(&clients).await?;
             let before = self.layered_observation(action.client)?.protocol;
-            let publications = self.relay_publication_cursor().await;
+            let publications = self.relay_publication_cursor().await?;
             let group_id = self.active_group()?;
             let result = self
                 .apply_admin_set(action.client, &group_id, action.admins)
@@ -1648,7 +2109,7 @@ impl AppRuntimeHarness {
             self.refresh_cached_members(&clients).await?;
             let after = self.layered_observation(action.client)?.protocol;
             if result.is_err()
-                && (before != after || publications != self.relay_publication_cursor().await)
+                && (before != after || publications != self.relay_publication_cursor().await?)
             {
                 return Err(SubjectError::new(
                     "admin_refusal_changed_state_or_published",
@@ -1896,9 +2357,19 @@ pub(crate) fn opaque_public_identity(account: &str) -> String {
     )
 }
 
-fn drain_runtime_events(participant: &mut Participant) {
+fn drain_runtime_events(participant: &mut Participant) -> Result<(), SubjectError> {
+    if let Some(ParticipantRuntime::Remote(_)) = participant.runtime.as_ref() {
+        let summary = participant.runtime()?.drain_events().map_err(app_error)?;
+        participant.runtime_events_observed = participant
+            .runtime_events_observed
+            .saturating_add(summary.count);
+        participant.background_errors.extend(summary.errors);
+        let excess = participant.background_errors.len().saturating_sub(8);
+        participant.background_errors.drain(..excess);
+        return Ok(());
+    }
     let Some(events) = participant.events.as_mut() else {
-        return;
+        return Ok(());
     };
     loop {
         let event = match events.try_recv() {
@@ -1914,6 +2385,7 @@ fn drain_runtime_events(participant: &mut Participant) {
         }
         participant.runtime_events_observed = participant.runtime_events_observed.saturating_add(1);
     }
+    Ok(())
 }
 
 pub(crate) async fn accept_group_invite_retrying_busy(
@@ -1955,7 +2427,14 @@ pub(crate) async fn accept_group_invite_retrying_busy(
 
 /// Privacy-safe classification of a public runtime error: a fixed label per
 /// variant family, never the variant's inner details.
-fn app_error_kind(error: &AppError) -> &'static str {
+fn app_error_kind(error: &AppError) -> &str {
+    if let AppError::Io(error) = error
+        && let Some(remote) = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<process_io::WireError>())
+    {
+        return &remote.kind;
+    }
     match error {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
@@ -1974,6 +2453,7 @@ fn app_error_kind(error: &AppError) -> &'static str {
         AppError::GroupRemoved(_) => "group_removed",
         AppError::GroupDisbanding(_) => "group_disbanding",
         AppError::GroupInviteNotPending => "group_invite_not_pending",
+        AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
         AppError::MissingKeyPackage(_) => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         _ => "app_runtime_operation",
@@ -1982,7 +2462,22 @@ fn app_error_kind(error: &AppError) -> &'static str {
 
 fn record_failure(participant: &mut Participant, error: &AppError) {
     participant.last_error_kind = Some(app_error_kind(error).to_owned());
-    if matches!(
+    if app_error_retryable(error) {
+        participant.retryable_failures = participant.retryable_failures.saturating_add(1);
+    } else {
+        participant.terminal_failures = participant.terminal_failures.saturating_add(1);
+    }
+}
+
+fn app_error_retryable(error: &AppError) -> bool {
+    if let AppError::Io(error) = error
+        && let Some(remote) = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<process_io::WireError>())
+    {
+        return remote.retryable;
+    }
+    matches!(
         error,
         AppError::AccountSessionBusy
             | AppError::AccountWorkerBusy
@@ -1990,14 +2485,16 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
             | AppError::TransportClosed
             | AppError::ChatPresentationNotReady
             | AppError::DirectConversationIndexNotReady
-    ) {
-        participant.retryable_failures = participant.retryable_failures.saturating_add(1);
-    } else {
-        participant.terminal_failures = participant.terminal_failures.saturating_add(1);
-    }
+    )
 }
-
 fn app_error(error: AppError) -> SubjectError {
+    if let AppError::Io(error) = &error
+        && let Some(remote) = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<process_io::WireError>())
+    {
+        return remote.subject();
+    }
     if matches!(
         error.as_engine_error(),
         Some(cgka_traits::error::EngineError::NotGroupAdmin { .. })
@@ -2009,6 +2506,7 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
+        AppError::MessageDraftRevisionConflict => SubjectFailureCategory::ExpectedRefusal,
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
@@ -2155,15 +2653,107 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
     files
 }
 
+async fn make_participant(
+    root: &Path,
+    relay_url: &str,
+    settlement_ms: Option<u64>,
+    maintenance: Option<MaintenanceTiming>,
+    processes: bool,
+    create_identity: bool,
+) -> Result<
+    (
+        ParticipantApp,
+        ParticipantRuntime,
+        Option<broadcast::Receiver<MarmotAppEvent>>,
+        String,
+    ),
+    AppError,
+> {
+    if processes {
+        let (app, runtime, account) = process_backend::remote_participant(process_backend::Init {
+            root: root.to_path_buf(),
+            relay_url: relay_url.into(),
+            settlement_ms,
+            immediate_maintenance: maintenance.is_some(),
+            create_identity,
+        })
+        .await?;
+        Ok((app, runtime, None, account))
+    } else {
+        let app = app_for_root(root, relay_url, settlement_ms, maintenance);
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.start().await?;
+        let account = if create_identity {
+            let endpoint = TransportEndpoint::from(relay_url.to_owned());
+            runtime
+                .create_identity(AccountSetupRequest {
+                    default_relays: vec![endpoint.clone()],
+                    bootstrap_relays: vec![endpoint],
+                    publish_missing_relay_lists: true,
+                    publish_initial_key_package: true,
+                    ..Default::default()
+                })
+                .await?
+                .account
+                .account_id_hex
+        } else {
+            runtime
+                .accounts()
+                .managed_accounts()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Io(std::io::Error::other("missing scenario identity")))?
+                .account_id_hex
+        };
+        let events = runtime.subscribe();
+        Ok((
+            ParticipantApp::Local(Box::new(app)),
+            ParticipantRuntime::Local(Box::new(runtime)),
+            Some(events),
+            account,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_group_tolerance_preserves_refusal_boundary() {
+        assert!(tolerates_unknown_group(&SubjectError::new(
+            "unknown_group",
+            "group unavailable"
+        )));
+        assert!(tolerates_unknown_group(&SubjectError::classified(
+            SubjectFailureCategory::ExpectedRefusal,
+            "wrapped_refusal",
+            "public observation: unknown_group"
+        )));
+        for error in [
+            SubjectError::new("wrapped_refusal", "public observation: unknown_group"),
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "wrapped_refusal",
+                "public observation: permission_denied",
+            ),
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "wrapped_refusal",
+                "unknown_group: unexpected trailing detail",
+            ),
+        ] {
+            assert!(!tolerates_unknown_group(&error), "{error}");
+        }
+    }
 
     /// Even a pre-publication validation error must release maintenance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn profile_error_resumes_work() {
         let clients = vec!["alice".to_owned()];
-        let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+        let mut subject = AppRuntimeHarness::new_in_process_stress(&clients)
+            .await
+            .unwrap();
         subject
             .create_group(SubjectCreateGroup {
                 action_id: "create",
@@ -2208,7 +2798,7 @@ mod tests {
             .await
             .unwrap()
             .paused;
-        subject.shutdown().await;
+        subject.shutdown().await.expect("shutdown");
         assert!(!paused, "maintenance must resume after the failed command");
     }
 
@@ -2291,6 +2881,11 @@ mod tests {
             assert_ne!(resource.code, denied.code);
         }
         assert_ne!(environment.code, denied.code);
+
+        let conflict = app_error(AppError::MessageDraftRevisionConflict);
+        assert_eq!(conflict.category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(conflict.code, "app_runtime_operation_failed");
+        assert!(conflict.message.contains("message_draft_revision_conflict"));
 
         let refusal = app_error(AppError::GroupInviteNotPending);
         assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);

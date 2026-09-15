@@ -477,6 +477,42 @@ impl MessageStorage for SqliteAccountStorage {
         records.into_iter().map(decode_message_columns).collect()
     }
 
+    fn visit_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        visitor: &mut dyn FnMut(MessageRecord) -> bool,
+    ) -> StorageResult<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
+             WHERE group_id = ?1 AND epoch >= ?2 AND state IN ({})
+             ORDER BY insert_order",
+            state_placeholders(states)
+        );
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare_cached(&sql).storage()?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(state_query_params(
+                    group_id,
+                    at_or_after_epoch,
+                    states,
+                )?),
+                message_columns,
+            )
+            .storage()?;
+        for row in rows {
+            if !visitor(decode_message_columns(row.storage()?)?) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()> {
         let (group_id, message_id) = match event {
             GroupEvent::MessageReceived {
@@ -1005,6 +1041,66 @@ mod tests {
     };
     use cgka_traits::types::{EpochId, MemberId, MessageId};
     use rusqlite::params;
+
+    #[test]
+    fn state_filtered_visitor_stops_before_reading_remaining_payloads() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut expected = Vec::new();
+        for index in 0_u64..128 {
+            let mut record = sample_message(
+                MessageId::new(index.to_be_bytes().to_vec()),
+                gid(1),
+                index % 3,
+            );
+            record.state = if index % 2 == 0 {
+                MessageState::Created
+            } else {
+                MessageState::Processed
+            };
+            record.payload = vec![0x5a; 4096];
+            if record.state == MessageState::Created && record.epoch.0 >= 1 {
+                expected.push(record.id.clone());
+            }
+            store.put_message(&record).unwrap();
+        }
+        super::FULL_MESSAGE_READS.with(|stats| stats.set((0, 0)));
+        let mut visited = Vec::new();
+        store
+            .visit_messages_in_states(
+                &gid(1),
+                &[MessageState::Created],
+                EpochId(1),
+                &mut |record| {
+                    visited.push(record.id);
+                    false
+                },
+            )
+            .unwrap();
+        assert_eq!(visited, expected[..1]);
+        assert_eq!(
+            super::FULL_MESSAGE_READS.with(|stats| stats.get()),
+            (1, 4096)
+        );
+        visited.clear();
+        store
+            .visit_messages_in_states(
+                &gid(1),
+                &[MessageState::Created],
+                EpochId(1),
+                &mut |record| {
+                    visited.push(record.id);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(visited, expected);
+        store
+            .visit_messages_in_states(&gid(1), &[], EpochId(0), &mut |_| {
+                panic!("empty filter visited a row")
+            })
+            .unwrap();
+    }
 
     #[test]
     fn released_transport_receipt_journal_does_not_limit_standalone_engine_lifetime() {

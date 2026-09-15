@@ -13,8 +13,8 @@ use cgka_traits::types::MemberId;
 use openmls::extensions::Extensions;
 use openmls::group::MlsGroup;
 use openmls::prelude::{
-    BasicCredential, Credential, CredentialWithKey, LeafNode, LeafNodeIndex, Sender,
-    SignatureScheme,
+    BasicCredential, Credential, CredentialWithKey, LeafNode, LeafNodeIndex, ProcessedMessage,
+    ProcessedMessageContent, Sender, SignatureScheme,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
@@ -208,6 +208,30 @@ pub(crate) fn validated_member_id(credential: &Credential) -> Result<MemberId, E
 /// in-tree leaf). Returns the validated `MemberId`.
 pub(crate) fn validated_member_id_of_leaf(leaf: &LeafNode) -> Result<MemberId, EngineError> {
     validated_member_id(leaf.credential())
+}
+
+/// Resolve a sender only after OpenMLS has authenticated the message.
+///
+/// Applications can arrive after removal or reuse of their sender's leaf. The
+/// processed credential is authenticated against the message's source-epoch
+/// tree; looking up that index in the live tree would lose or misattribute the
+/// author. Keep non-member applications rejected and preserve the current-tree
+/// lookup for proposals and commits, whose authorization uses that tree.
+pub(crate) fn member_id_of_processed_message(
+    processed: &ProcessedMessage,
+    group: &MlsGroup,
+) -> Option<MemberId> {
+    if matches!(
+        processed.content(),
+        ProcessedMessageContent::ApplicationMessage(_)
+    ) {
+        match processed.sender() {
+            Sender::Member(_) => validated_member_id(processed.credential()).ok(),
+            _ => None,
+        }
+    } else {
+        member_id_of_sender(processed.sender(), group)
+    }
 }
 
 pub(crate) fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {

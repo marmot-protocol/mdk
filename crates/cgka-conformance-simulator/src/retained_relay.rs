@@ -226,6 +226,7 @@ impl RetainedRelaySubject {
             SubjectCapability::ParticipantConnectivity,
             SubjectCapability::RetainedRelayHistory,
             SubjectCapability::RetainedRelayControl,
+            SubjectCapability::RetainedRelayConfiguration,
         ]);
         Ok(Self {
             descriptor: SubjectDescriptor {

@@ -46,6 +46,8 @@ use std::sync::Arc;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
+#[path = "distributed_convergence/historical_application_sender.rs"]
+mod historical_application_sender;
 mod support;
 use support::proof_signer;
 
@@ -5226,10 +5228,20 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
 /// forever without this re-arm.
 #[tokio::test]
 async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window() {
-    let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    // Every participant below is advanced to explicit timestamps. Keep their
+    // admission clocks in that same domain even under a slow parallel test run.
     let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build_client_with_storage_and_clock(
+        b"alice",
+        SqliteAccountStorage::in_memory().unwrap(),
+        clock.clone(),
+    );
+    let mut bob = build_client_with_storage_and_clock(
+        b"bob",
+        SqliteAccountStorage::in_memory().unwrap(),
+        clock.clone(),
+    );
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
 
@@ -8451,6 +8463,11 @@ async fn undecodable_convergence_row_does_not_gate_sends() {
             .unwrap()
             .is_empty()
     );
+    assert!(!carol.has_pending_convergence_inputs(&group_id).unwrap());
+    let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(1));
+    assert!(!restarted.has_pending_convergence_inputs(&group_id).unwrap());
 }
 
 /// mdk#752 review: the fail-open gate has three branches — decode failure
@@ -10982,4 +10999,416 @@ async fn reinvite_reports_unapplied_admin_grants_without_losing_missing_recipien
             }
         }
     }
+}
+
+/// Catch-up can advance one epoch beyond the frozen batch admission ceiling.
+/// That suffix must drain without redelivery or another commit.
+#[tokio::test]
+async fn buffered_app_at_catchup_horizon_drains_without_another_commit() {
+    for (commit_count, early) in [(5, true), (6, false), (6, true)] {
+        let (mut alice, _) = build_client(b"alice");
+        let (mut carol, storage) = build_client(b"carol");
+        let group =
+            create_reservation_test_group(&mut alice, &mut carol, "horizon diagnostic").await;
+        carol.drain_events();
+        let mut commits = Vec::new();
+        for index in 0..commit_count {
+            commits.push(alice_rename_commit(&mut alice, &group, &format!("step-{index}")).await);
+        }
+        let app = send_app(&mut alice, &group, b"horizon application".to_vec()).await;
+        for commit in commits {
+            carol
+                .buffer_openmls_convergence_message_at(&group, commit, 1_000)
+                .unwrap();
+        }
+        if early {
+            carol
+                .buffer_openmls_convergence_message_at(&group, app.clone(), 1_000)
+                .unwrap();
+        }
+        let before = storage.convergence_pass(&group).unwrap().unwrap();
+        let admitted = before
+            .members
+            .iter()
+            .any(|m| m.message_id == content_id(&app));
+        let result = carol
+            .converge_stored_openmls_messages_at(&group, 1_000_000)
+            .unwrap();
+        assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+        assert_eq!(carol.epoch(&group).unwrap(), EpochId(1 + commit_count));
+        if !early {
+            carol.ingest(app.clone()).await.unwrap();
+        }
+        for tick in 0..3 {
+            assert!(
+                carol
+                    .advance_convergence_inputs_until_settled(&group, 2_000_000 + tick * 10_000)
+                    .await
+                    .unwrap()
+            );
+        }
+        let state = storage.get_message(&content_id(&app)).unwrap().state;
+        let pending = carol.has_pending_convergence_inputs(&group).unwrap();
+        let received = carol.drain_events().iter().filter(|e| matches!(e, GroupEvent::MessageReceived { payload, .. } if app_content(payload)==b"horizon application")).count();
+        assert_eq!(
+            state,
+            MessageState::Processed,
+            "commits={commit_count}, early={early}, admitted={admitted}"
+        );
+        assert_eq!(received, 1);
+        assert!(!pending);
+        carol.ingest(app.clone()).await.unwrap();
+        carol
+            .advance_convergence_inputs_until_settled(&group, 3_000_000)
+            .await
+            .unwrap();
+        assert!(
+            !carol
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+        );
+        assert_eq!(
+            storage
+                .list_pending_application_events()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn canonical_application_backlog_resumes_after_restart_in_bounded_turns_without_gating_send()
+{
+    let (mut alice, _) = build_client(b"alice");
+    let (mut carol, storage) = build_client(b"carol");
+    let group = create_reservation_test_group(&mut alice, &mut carol, "application backlog").await;
+    for index in 0..67 {
+        let app = send_app(&mut alice, &group, format!("backlog-{index}").into_bytes()).await;
+        carol
+            .buffer_openmls_convergence_message_at(&group, app.clone(), 1_000)
+            .unwrap();
+        if index % 3 != 0 {
+            storage
+                .update_message_state(
+                    &content_id(&app),
+                    if index % 3 == 1 {
+                        MessageState::Retryable
+                    } else {
+                        MessageState::ConvergenceDeferred
+                    },
+                )
+                .unwrap();
+        }
+    }
+    assert!(storage.convergence_pass(&group).unwrap().is_none());
+    drop(carol);
+    let mut carol = build_client_with_storage(b"carol", storage.clone());
+    carol.hydrate_all_stored_groups().unwrap();
+    assert!(carol.drain_pending_convergence_groups().contains(&group));
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    carol.drain_events();
+    // Background app work does not create branch ambiguity or delay this send.
+    let own = send_app(&mut carol, &group, b"send with backlog".to_vec()).await;
+    let own_record = storage.get_message(&own.id).unwrap();
+    assert!(
+        StoredMessagePayload::decode(&own_record.payload)
+            .unwrap()
+            .own_application_stamp()
+            .is_some()
+    );
+    storage
+        .update_message_state(&own_record.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+    queue_intent(
+        &storage,
+        &group,
+        b"send-during-application-drain",
+        SendIntent::AppMessage {
+            expected_epoch: None,
+            group_id: group.clone(),
+            payload: app_payload_for(&carol, b"queued with backlog"),
+        },
+        1_000,
+    );
+    let prepared = carol
+        .converge_and_drain_queued_outbound_intents(&group, 2_000_000)
+        .await
+        .unwrap();
+    assert_eq!(prepared.len(), 1);
+    assert!(matches!(
+        &prepared[0],
+        SendResult::ApplicationMessage { .. }
+    ));
+    assert_eq!(
+        carol
+            .drain_events()
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+            .count(),
+        64
+    );
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group, 3_000_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        carol
+            .drain_events()
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+            .count(),
+        3
+    );
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
+    assert!(storage.convergence_pass(&group).unwrap().is_none());
+    assert_eq!(
+        storage.get_message(&own_record.id).unwrap().state,
+        MessageState::ConvergenceDeferred
+    );
+}
+
+#[tokio::test]
+async fn canonical_application_drain_waits_for_future_epoch_and_rejects_unreadable_branch() {
+    let (mut alice, _) = build_client(b"alice");
+    let (mut carol, storage) = build_client(b"carol");
+    let group = create_reservation_test_group(&mut alice, &mut carol, "canonical only").await;
+    let _ = alice_rename_commit(&mut alice, &group, "alice branch").await;
+    let app = send_app(&mut alice, &group, b"other branch".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group, app.clone(), 1_000)
+        .unwrap();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group, 2_000_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        storage.get_message(&content_id(&app)).unwrap().state,
+        MessageState::Created
+    );
+    // Move to the same epoch number on a different branch. No competing commit
+    // is known here; the app must authenticate under the actual canonical keys.
+    let _ = alice_rename_commit(&mut carol, &group, "carol branch").await;
+    carol.drain_events();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group, 3_000_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        storage.get_message(&content_id(&app)).unwrap().state,
+        MessageState::EpochInvalidated
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+    );
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. }))
+    );
+}
+
+#[tokio::test]
+async fn canonical_application_drain_preserves_sender_validation_and_retained_horizon() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, storage) = build_client(b"carol");
+    let group =
+        create_reservation_test_group(&mut alice, &mut carol, "application validation").await;
+    let forged_payload = MarmotAppEvent::new(
+        "",
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "forged",
+    )
+    .encode()
+    .unwrap();
+    let forged =
+        raw_app_message_with_payload(&alice_storage, &alice.self_id(), &group, &forged_payload);
+    carol
+        .buffer_openmls_convergence_message_at(&group, forged.clone(), 1_000)
+        .unwrap();
+    carol.drain_events();
+    carol
+        .advance_convergence_inputs_until_settled(&group, 2_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_message(&content_id(&forged)).unwrap().state,
+        MessageState::EpochInvalidated
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+    );
+    let old_app = send_app(&mut alice, &group, b"too old at delivery".to_vec()).await;
+    for index in 0..6 {
+        let commit = alice_rename_commit(&mut alice, &group, &format!("step-{index}")).await;
+        carol
+            .buffer_openmls_convergence_message_at(&group, commit, 3_000_000)
+            .unwrap();
+    }
+    carol
+        .converge_stored_openmls_messages_at(&group, 4_000_000)
+        .unwrap();
+    assert_eq!(carol.epoch(&group).unwrap(), EpochId(7));
+    carol
+        .buffer_openmls_convergence_message_at(&group, old_app.clone(), 5_000_000)
+        .unwrap();
+    carol.drain_events();
+    carol
+        .advance_convergence_inputs_until_settled(&group, 6_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_message(&content_id(&old_app)).unwrap().state,
+        MessageState::EpochInvalidated
+    );
+    let events = carol.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::AppMessageInvalidated {
+        message_id, reason: AppMessageInvalidationReason::BeyondAnchor, ..
+    } if message_id == &content_id(&old_app)))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+    );
+    let current = send_app(&mut alice, &group, b"valid after drain".to_vec()).await;
+    carol.ingest(current).await.unwrap();
+    assert_eq!(
+        carol
+            .drain_events()
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn canonical_application_work_excludes_terminal_and_unknown_groups() {
+    let (mut alice, _) = build_client(b"alice");
+    let (mut carol, storage) = build_client(b"carol");
+    let group =
+        create_reservation_test_group(&mut alice, &mut carol, "terminal application work").await;
+    let app = send_app(&mut alice, &group, b"retained".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group, app, 1_000)
+        .unwrap();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    let mut record = storage.get_group(&group).unwrap();
+    record.removed = true;
+    storage.put_group(&record).unwrap();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
+    record.removed = false;
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
+    assert!(
+        !carol
+            .has_pending_convergence_inputs(&GroupId::new(b"unknown".to_vec()))
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn canonical_application_backlog_survives_an_epoch_advancing_send() {
+    let (mut alice, _) = build_client(b"alice");
+    let (mut carol, storage) = build_client(b"carol");
+    let group =
+        create_reservation_test_group(&mut alice, &mut carol, "backlog and self update").await;
+    let app = send_app(&mut alice, &group, b"before self update".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group, app.clone(), 1_000)
+        .unwrap();
+    carol.drain_events();
+    assert!(!carol.has_pending_convergence_inputs(&group).unwrap());
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    let before = carol.epoch(&group).unwrap();
+    let (_, pending) = evolution(
+        carol
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    carol.confirm_published(pending).await.unwrap();
+    assert_eq!(carol.epoch(&group).unwrap(), EpochId(before.0 + 1));
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group, 3_000_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        storage.get_message(&content_id(&app)).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(carol.drain_events().iter().filter(|event| matches!(event,
+        GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"before self update"
+    )).count(), 1);
+    assert_eq!(
+        carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
+        None
+    );
 }

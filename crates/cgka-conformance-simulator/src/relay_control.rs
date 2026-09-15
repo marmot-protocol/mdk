@@ -150,6 +150,10 @@ impl RelayControl {
         self.publication_log.lock().await.len()
     }
 
+    pub async fn diagnostic_publications(&self) -> Vec<Event> {
+        self.publication_log.lock().await.clone()
+    }
+
     pub async fn record_action_events(
         &self,
         action_events: &mut RelayActionEvents,

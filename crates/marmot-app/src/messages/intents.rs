@@ -28,7 +28,8 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// plaintext. The sender stores the full content, but p-tag derivation only
 /// parses this bounded prefix so one hostile message cannot force unbounded
 /// synchronous Markdown work before send/classification (mdk#654).
-const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize =
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 /// Reactions are display metadata that flow into timelines and notification
 /// previews. Keep them compact and free of terminal/control sequences while
@@ -259,6 +260,17 @@ pub(crate) fn build_inner_event(
     sender_pubkey_hex: &str,
     created_at: u64,
 ) -> Result<MarmotInnerEvent, AppError> {
+    build_inner_event_with_media_reply(intent, sender_pubkey_hex, created_at, None)
+}
+
+/// The draft-only media reply context keeps the public Media intent compatible.
+/// Tags and validation still belong to this single event builder.
+pub(crate) fn build_inner_event_with_media_reply(
+    intent: &AppMessageIntent,
+    sender_pubkey_hex: &str,
+    created_at: u64,
+    media_reply: Option<&str>,
+) -> Result<MarmotInnerEvent, AppError> {
     let event = |kind, tags, content| {
         MarmotInnerEvent::new(
             sender_pubkey_hex.to_owned(),
@@ -369,6 +381,11 @@ pub(crate) fn build_inner_event(
                 .collect();
             if let Some(caption) = caption {
                 tags.extend(mention_p_tags(caption));
+            }
+            if let Some(target) = media_reply {
+                validate_message_ref(target)?;
+                tags.push(event_ref_tag(target));
+                tags.push(vec![QUOTE_REF_TAG.to_owned(), target.to_owned()]);
             }
             Ok(event(
                 MARMOT_APP_EVENT_KIND_CHAT,

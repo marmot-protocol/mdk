@@ -206,7 +206,16 @@ async fn crash_child_runs_late_commit_convergence() {
         return;
     }
     let path = PathBuf::from(std::env::var_os(DATABASE_ENV).expect("child database path"));
-    run_child_case(&path).await;
+    if std::env::var(CRASH_POINT_ENV).is_ok_and(|point| point.starts_with("canonical-application-"))
+    {
+        run_application_child(&path).await;
+    } else if std::env::var(CRASH_POINT_ENV)
+        .is_ok_and(|point| point.starts_with("candidate-replay-"))
+    {
+        run_probe_child(&path).await;
+    } else {
+        run_child_case(&path).await;
+    }
     panic!("selected crash point was not reached");
 }
 
@@ -670,6 +679,54 @@ async fn run_child_case(database: &Path) {
 
     let _ = alice_seed;
     let crash_point = std::env::var(CRASH_POINT_ENV).ok();
+    #[cfg(feature = "test-policy-overrides")]
+    if crash_point
+        .as_deref()
+        .is_some_and(|p| p.contains("-slice-"))
+    {
+        carol.set_replay_slice_probe_limit_for_tests(1);
+        if crash_point
+            .as_deref()
+            .is_some_and(|p| p.starts_with("candidate-peel-slice-"))
+        {
+            let deferred = TransportMessage {
+                id: MessageId::new(b"slice-deferred".to_vec()),
+                payload: b"opaque retained traffic".to_vec(),
+                timestamp: Timestamp(2_200),
+                causal_deps: vec![],
+                source: TransportSource("crash-test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+            };
+            carol_storage
+                .put_message(&MessageRecord {
+                    id: deferred.id.clone(),
+                    group_id: group_id.clone(),
+                    epoch: EpochId(2),
+                    state: MessageState::PeelDeferred,
+                    payload: StoredMessagePayload::raw_transport(deferred)
+                        .encode()
+                        .unwrap(),
+                    deferred_peel: None,
+                })
+                .unwrap();
+            cgka_traits::storage::DeferredPeelGenerationStorage::put_deferred_peel_generation(
+                &carol_storage,
+                &cgka_traits::storage::DeferredPeelGeneration {
+                    group_id: group_id.clone(),
+                    context_fingerprint: [0; 32],
+                },
+            )
+            .unwrap();
+        }
+        write_slice_expected(database, &carol_storage, &group_id);
+        for _ in 0..8 {
+            carol.advance_convergence_inputs(&group_id).await.unwrap();
+        }
+        panic!("resumable crash point not reached");
+    }
+
     if crash_point.as_deref() == Some(H5_POINT) {
         let policy = CanonicalizationPolicy::default();
         let state = CanonicalizationState {
@@ -764,7 +821,19 @@ fn build_client_with_peeler(
     storage: SqliteAccountStorage,
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(storage)
+    let builder = EngineBuilder::new(storage);
+    #[cfg(feature = "test-policy-overrides")]
+    let builder = if std::env::var(CRASH_POINT_ENV).is_ok_and(|p| p.contains("-slice-")) {
+        builder.convergence_clock(std::sync::Arc::new(
+            cgka_engine::convergence_clock::ManualConvergenceClock::new(
+                3_000_000,
+                1_800_000_000_000,
+            ),
+        ))
+    } else {
+        builder
+    };
+    builder
         .legacy_compatibility_profile()
         .identity(identity(seed))
         .account_identity_proof_signer(proof_signer(seed))
@@ -860,4 +929,503 @@ fn wal_path(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push("-wal");
     PathBuf::from(path)
+}
+
+fn probe_state(storage: &SqliteAccountStorage, group: &GroupId) -> serde_json::Value {
+    use cgka_traits::storage::StorageProvider;
+    let mls = openmls::group::MlsGroup::load(
+        storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    serde_json::json!({
+        "group": storage.get_group(group).unwrap(),
+        "epoch_authenticator": hex::encode(mls.epoch_authenticator().as_slice()),
+        "snapshots": storage.list_group_snapshots(group).unwrap(),
+        "messages": storage.list_messages(group, EpochId(0)).unwrap(),
+        "queue": storage.list_queued_outbound_intents(group).unwrap(),
+    })
+}
+
+#[test]
+fn candidate_replay_kill_restores_preprobe_state_without_hydration() {
+    for point in [
+        "candidate-replay-after-processing",
+        "candidate-replay-after-restoration",
+    ] {
+        for nested in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("probe.sqlite3");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "crash_child_runs_late_commit_convergence",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(DATABASE_ENV, &database)
+                .env(CRASH_POINT_ENV, point)
+                .env("MDK_CGKA_REPLAY_NESTED", if nested { "1" } else { "0" })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let (send, receive) = mpsc::channel();
+            let stdout = child.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    if send.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let ready = loop {
+                match receive.recv_timeout(Duration::from_secs(60)) {
+                    Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            drop(receive);
+            reader.join().unwrap();
+            assert!(ready, "probe child never reached {point}, nested={nested}");
+            assert!(!status.success());
+            let key = SqlCipherKey::new(DATABASE_KEY).unwrap();
+            let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+            let group = storage.list_groups().unwrap().pop().unwrap();
+            let expected: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(database.with_extension("expected.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                probe_state(&storage, &group) == expected,
+                "crash changed live state or work at {point}, nested={nested}"
+            );
+            let mut engine = build_client_with_storage(CAROL_SEED, storage.clone());
+            engine.hydrate_all_stored_groups().unwrap();
+            assert_eq!(engine.epoch(&group).unwrap(), EpochId(1));
+        }
+    }
+}
+
+async fn run_probe_child(database: &Path) {
+    use cgka_engine::openmls_projection::replay_openmls_messages;
+    use cgka_traits::storage::StorageProvider;
+    let (mut alice, _) = build_memory_client(b"probe-alice");
+    let storage =
+        SqliteAccountStorage::open_encrypted(database, &SqlCipherKey::new(DATABASE_KEY).unwrap())
+            .unwrap();
+    let mut carol = build_client_with_storage(CAROL_SEED, storage.clone());
+    let kp = carol.fresh_key_package().await.unwrap();
+    let (group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "transaction crash".into(),
+            description: String::new(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("legacy fixture");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+    let (commit, _) = evolution(
+        alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    storage
+        .put_message(&MessageRecord {
+            id: commit.id.clone(),
+            group_id: group.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Created,
+            payload: StoredMessagePayload::openmls_wire(commit.clone())
+                .encode()
+                .unwrap(),
+            deferred_peel: None,
+        })
+        .unwrap();
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(QUEUED_INTENT_ID.to_vec()),
+            group_id: group.clone(),
+            intent: SendIntent::AppMessage {
+                expected_epoch: None,
+                group_id: group.clone(),
+                payload: app_payload_for(&carol, b"retained work"),
+            },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    // The parent-owned temp directory is private; create the evidence file
+    // owner-only too, before entering the transaction selected for termination.
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut expected = options
+        .open(database.with_extension("expected.json"))
+        .unwrap();
+    expected
+        .write_all(&serde_json::to_vec(&probe_state(&storage, &group)).unwrap())
+        .unwrap();
+    expected.sync_all().unwrap();
+    let probe = || replay_openmls_messages(&storage, &group, std::slice::from_ref(&commit));
+    if std::env::var("MDK_CGKA_REPLAY_NESTED").as_deref() == Ok("1") {
+        storage.with_transaction(|_| probe()).unwrap();
+    } else {
+        probe().unwrap();
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn slice_state(storage: &SqliteAccountStorage, group: &GroupId) -> serde_json::Value {
+    let mut state = probe_state(storage, group);
+    // Normalizing a retained raw row's clock is legitimate durable progress
+    // before the first peel slice. Its payload, disposition, and presence must
+    // still survive exactly; no actual row attempt has started at this pause.
+    for row in state["messages"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("deferred_peel");
+    }
+    state
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn write_slice_expected(database: &Path, storage: &SqliteAccountStorage, group: &GroupId) {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(database.with_extension("slice-expected.json"))
+        .unwrap();
+    file.write_all(&serde_json::to_vec(&slice_state(storage, group)).unwrap())
+        .unwrap();
+    file.sync_all().unwrap();
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn resumable_slices_kill_with_live_state_restored_and_restart_from_durable_inputs() {
+    for point in [
+        "canonical-replay-slice-restored",
+        "candidate-peel-slice-restored",
+        "canonical-replay-slice-rewound",
+        "candidate-peel-slice-rewound",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("slice.sqlite3");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "crash_child_runs_late_commit_convergence",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(DATABASE_ENV, &database)
+            .env(CRASH_POINT_ENV, point)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (send, receive) = mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let ready = loop {
+            match receive
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        drop(receive);
+        reader.join().unwrap();
+        assert!(ready, "child did not reach {point}");
+        assert!(!status.success());
+        let storage = SqliteAccountStorage::open_encrypted(
+            &database,
+            &SqlCipherKey::new(DATABASE_KEY).unwrap(),
+        )
+        .unwrap();
+        let group = storage.list_groups().unwrap().pop().unwrap();
+        let expected: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(database.with_extension("slice-expected.json")).unwrap(),
+        )
+        .unwrap();
+        if point.ends_with("-restored") {
+            assert!(
+                slice_state(&storage, &group) == expected,
+                "slice exposed speculative state or changed retained work before hydration"
+            );
+        } else {
+            assert_eq!(
+                storage.get_group(&group).unwrap().epoch,
+                EpochId(1),
+                "kill must actually strand the historical rewind"
+            );
+        }
+        let mut restarted = build_client_with_storage(CAROL_SEED, storage.clone());
+        restarted.hydrate_all_stored_groups().unwrap();
+        assert!(
+            slice_state(&storage, &group) == expected,
+            "hydration must restore the pre-slice live state and retained work"
+        );
+        assert_eq!(restarted.epoch(&group).unwrap(), EpochId(2));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for _ in 0..16 {
+                restarted
+                    .advance_convergence_inputs_until_settled(&group, 4_000_000)
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = restarted
+            .converge_stored_openmls_messages_at(&group, 4_000_000)
+            .unwrap();
+        assert!(result.errors.is_empty());
+        let final_group = storage.get_group(&group).unwrap();
+        assert!(
+            final_group
+                .members
+                .iter()
+                .any(|m| m.id == MemberId::new(identity(b"eve-crash")))
+        );
+        assert!(
+            !final_group
+                .members
+                .iter()
+                .any(|m| m.id == MemberId::new(identity(b"david-crash")))
+        );
+        assert_eq!(
+            storage.list_queued_outbound_intents(&group).unwrap().len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn canonical_application_kill_keeps_ratchet_disposition_and_outbox_atomic() {
+    use cgka_traits::engine::GroupEvent;
+    for point in [
+        "canonical-application-before-commit",
+        "canonical-application-completed-durable",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("application.sqlite3");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "crash_child_runs_late_commit_convergence",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(DATABASE_ENV, &database)
+            .env(CRASH_POINT_ENV, point)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let (send, receive) = mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let ready = loop {
+            match receive
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        drop(receive);
+        reader.join().unwrap();
+        assert!(ready, "child did not reach {point}");
+        assert!(!status.success());
+        let storage = SqliteAccountStorage::open_encrypted(
+            &database,
+            &SqlCipherKey::new(DATABASE_KEY).unwrap(),
+        )
+        .unwrap();
+        let group = storage.list_groups().unwrap().pop().unwrap();
+        let app = storage
+            .list_messages(&group, EpochId(7))
+            .unwrap()
+            .into_iter()
+            .find(|row| matches!(row.state, MessageState::Created | MessageState::Processed))
+            .unwrap();
+        let committed = point.ends_with("completed-durable");
+        assert_eq!(
+            app.state,
+            if committed {
+                MessageState::Processed
+            } else {
+                MessageState::Created
+            }
+        );
+        let outbox = || {
+            storage
+                .list_pending_application_events()
+                .unwrap()
+                .into_iter()
+                .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outbox().len(), usize::from(committed));
+        let mut restarted = build_client_with_storage(CAROL_SEED, storage.clone());
+        restarted.hydrate_all_stored_groups().unwrap();
+        assert_eq!(restarted.epoch(&group).unwrap(), EpochId(7));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for _ in 0..3 {
+                assert!(
+                    restarted
+                        .advance_convergence_inputs_until_settled(&group, 3_000_000)
+                        .await
+                        .unwrap()
+                );
+            }
+        });
+        assert_eq!(
+            storage.get_message(&app.id).unwrap().state,
+            MessageState::Processed
+        );
+        let events = outbox();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], GroupEvent::MessageReceived { message_id, payload, .. }
+            if message_id == &app.id && MarmotAppEvent::decode(payload).unwrap().content == "crash application")
+        );
+        // Acknowledgement represents a committed app projection. Restarting
+        // once more must not recreate its output from the processed input.
+        storage
+            .delete_pending_application_events(std::slice::from_ref(&app.id))
+            .unwrap();
+        drop(restarted);
+        let mut restarted = build_client_with_storage(CAROL_SEED, storage.clone());
+        restarted.hydrate_all_stored_groups().unwrap();
+        runtime
+            .block_on(restarted.advance_convergence_inputs_until_settled(&group, 4_000_000))
+            .unwrap();
+        assert!(outbox().is_empty());
+    }
+}
+
+async fn run_application_child(database: &Path) {
+    let (mut alice, _) = build_memory_client(b"alice-app-crash");
+    let storage =
+        SqliteAccountStorage::open_encrypted(database, &SqlCipherKey::new(DATABASE_KEY).unwrap())
+            .unwrap();
+    let mut carol = build_client_with_storage(CAROL_SEED, storage.clone());
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "application crash".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("group creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, CAROL_SEED))
+        .await
+        .unwrap();
+    for index in 0..6 {
+        let (commit, pending) = evolution(
+            alice
+                .send(SendIntent::UpdateGroupData {
+                    group_id: group.clone(),
+                    name: Some(format!("step-{index}")),
+                    description: None,
+                })
+                .await
+                .unwrap(),
+        );
+        alice.confirm_published(pending).await.unwrap();
+        carol
+            .buffer_openmls_convergence_message_at(&group, route(commit, &group), 1_000)
+            .unwrap();
+    }
+    let payload = app_payload_for(&alice, b"crash application");
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            expected_epoch: None,
+            group_id: group.clone(),
+            payload,
+        })
+        .await
+        .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = sent else {
+        panic!("application send")
+    };
+    carol
+        .buffer_openmls_convergence_message_at(&group, route(msg, &group), 1_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group, 1_000_000)
+        .unwrap();
+    assert_eq!(carol.epoch(&group).unwrap(), EpochId(7));
+    for _ in 0..3 {
+        carol
+            .advance_convergence_inputs_until_settled(&group, 2_000_000)
+            .await
+            .unwrap();
+    }
 }

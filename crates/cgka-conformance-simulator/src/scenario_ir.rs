@@ -22,7 +22,13 @@ pub const SCENARIO_IR_V3_VERSION: &str = "3";
 /// Newest Scenario IR version emitted when newly authored actions require it.
 pub const SCENARIO_IR_LATEST_VERSION: &str = SCENARIO_IR_V3_VERSION;
 /// Action kinds introduced after Scenario IR v2.
-pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &["update_group_profile", "expect_tick_error"];
+pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &[
+    "update_group_profile",
+    "expect_tick_error",
+    "interrupt_relay",
+    "race_invite_profile",
+    "race_group_profiles",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioActionScheduleV2 {
@@ -211,6 +217,8 @@ fn is_group_scoped(step: &ScenarioStep) -> bool {
             | ScenarioStep::SelfUpdate { .. }
             | ScenarioStep::UpdateGroupData { .. }
             | ScenarioStep::UpdateGroupProfile { .. }
+            | ScenarioStep::RaceInviteProfile { .. }
+            | ScenarioStep::RaceGroupProfiles { .. }
             | ScenarioStep::UpdateAdminPolicy { .. }
             | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
             | ScenarioStep::SendAppMessage { .. }
@@ -250,7 +258,24 @@ fn step_requires_v3(step: &ScenarioStep) -> bool {
         ScenarioStep::InGroup { action, .. } => action.as_ref(),
         step => step,
     };
-    SCENARIO_IR_V3_ONLY_STEP_KINDS.contains(&executable.kind())
+    let public_history = matches!(
+        executable,
+        ScenarioStep::Assert {
+            assertion: crate::ScenarioAssertionV2::Exactly {
+                predicate: crate::ScenarioPredicateV2::PublicPayloadMultiset { .. }
+            } | crate::ScenarioAssertionV2::Eventually {
+                predicate: crate::ScenarioPredicateV2::PublicPayloadMultiset { .. },
+                ..
+            } | crate::ScenarioAssertionV2::Within {
+                predicate: crate::ScenarioPredicateV2::PublicPayloadMultiset { .. },
+                ..
+            } | crate::ScenarioAssertionV2::Never {
+                predicate: crate::ScenarioPredicateV2::PublicPayloadMultiset { .. },
+                ..
+            }
+        }
+    );
+    public_history || SCENARIO_IR_V3_ONLY_STEP_KINDS.contains(&executable.kind())
 }
 
 fn validate_step(
@@ -368,6 +393,51 @@ fn validate_step(
             ..
         } => {
             validate_nonempty_clients(step_index, sync_clients, clients, "relay sync")?;
+        }
+        ScenarioStep::InterruptRelay { relay, outage_ms } => {
+            validate_relay(step_index, relay, topology)?;
+            if *outage_ms == 0 || *outage_ms > 30_000 {
+                return Err(compile_error(
+                    Some(step_index),
+                    "relay outage must be 1..=30000 ms".into(),
+                ));
+            }
+        }
+        ScenarioStep::RaceInviteProfile {
+            actors,
+            invitee,
+            name,
+            ..
+        } => {
+            validate_nonempty_clients(step_index, actors, clients, "invite/profile race")?;
+            validate_client(step_index, invitee, clients, "invite/profile race")?;
+            if actors.len() != 2
+                || actors[0] == actors[1]
+                || actors.contains(invitee)
+                || name.is_empty()
+            {
+                return Err(compile_error(Some(step_index), "invite/profile race requires two distinct actors, a separate invitee and a name".into()));
+            }
+        }
+        ScenarioStep::RaceGroupProfiles { updates } => {
+            if !(2..=8).contains(&updates.len()) {
+                return Err(compile_error(
+                    Some(step_index),
+                    "profile race requires 2..=8 callers".into(),
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for update in updates {
+                validate_client(step_index, &update.client, clients, "profile race")?;
+                if !seen.insert(&update.client)
+                    || (update.name.is_none() && update.description.is_none())
+                {
+                    return Err(compile_error(
+                        Some(step_index),
+                        "profile race requires distinct clients and nonempty edits".into(),
+                    ));
+                }
+            }
         }
         ScenarioStep::ConfigureRelay {
             relay,
@@ -617,6 +687,7 @@ fn validate_predicate(
     }
     let labels = match predicate {
         crate::ScenarioPredicateV2::ClientState { client, .. }
+        | crate::ScenarioPredicateV2::PublicPayloadMultiset { client, .. }
         | crate::ScenarioPredicateV2::PayloadCount { client, .. } => std::slice::from_ref(client),
         crate::ScenarioPredicateV2::ClientsExactlyEquivalent { clients }
         | crate::ScenarioPredicateV2::PublicGroupState { clients, .. }

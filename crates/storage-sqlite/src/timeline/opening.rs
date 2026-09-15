@@ -38,6 +38,18 @@ impl Default for ConversationOpenQuery {
         }
     }
 }
+/// Re-read a bounded live window around its retained viewport anchor. The runtime
+/// owns the anchor token and row budget; clients retain pixel offsets separately.
+#[derive(Clone, Default)]
+pub struct ConversationWindowQuery {
+    pub opening: ConversationOpenQuery,
+    /// Desired rows before the anchor. None preserves the centered opening policy.
+    /// Must be smaller than the row limit; missing context is filled from the other side.
+    /// Latest (including Automatic without a first unread) always selects the tail
+    /// and ignores placement. Explicit Message/Anchor targets honor placement.
+    pub before_anchor: Option<usize>,
+}
+
 /// Raw retained read state. These are not C4 account-attention totals.
 /// This narrow projection deliberately avoids `chat_list_row_tx` and its
 /// account-wide leave/disband scans. Keep opening bounded when integrating
@@ -75,6 +87,8 @@ pub struct ConversationOpenSnapshot {
 pub enum ConversationOpenError {
     #[error("conversation opening limit must be between 1 and 200")]
     InvalidLimit,
+    #[error("conversation anchor position must be smaller than the row limit")]
+    InvalidAnchorPosition,
     #[error("conversation read projection requires preparation")]
     ReadStateNotReady,
     #[error("conversation anchor belongs to a different account store or group")]
@@ -94,20 +108,26 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         query: ConversationOpenQuery,
     ) -> Result<ConversationOpenSnapshot, ConversationOpenError> {
-        if !(1..=MAX_TIMELINE_LIMIT).contains(&query.limit) {
-            return Err(ConversationOpenError::InvalidLimit);
-        }
-        let conn = self.lock()?;
-        let transaction = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let snapshot = opening_tx(&conn, group_id_hex, query)?;
-        if let Some(transaction) = transaction {
-            transaction.commit().storage()?;
-        }
-        Ok(snapshot)
+        self.conversation_window(
+            group_id_hex,
+            ConversationWindowQuery {
+                opening: query,
+                before_anchor: None,
+            },
+        )
+    }
+
+    /// Reuse opening's canonical ordering, recovery and readiness under one read
+    /// transaction. Paging changes placement, never appends an independently read page.
+    pub fn conversation_window(
+        &self,
+        group_id_hex: &str,
+        query: ConversationWindowQuery,
+    ) -> Result<ConversationOpenSnapshot, ConversationOpenError> {
+        validate_window_query(&query)?;
+        self.connection.with_deferred_read(|conn| {
+            opening_tx(conn, group_id_hex, query.opening, query.before_anchor)
+        })
     }
 }
 
@@ -184,10 +204,11 @@ fn opening_read_state_tx(
     })
 }
 
-fn opening_tx(
+pub(super) fn opening_tx(
     conn: &Connection,
     group: &str,
     query: ConversationOpenQuery,
+    before_anchor: Option<usize>,
 ) -> Result<ConversationOpenSnapshot, ConversationOpenError> {
     let pending_confirmation: bool = conn
         .query_row_cached(
@@ -260,9 +281,9 @@ fn opening_tx(
         }
     };
     let (mut messages, has_more_before, has_more_after, index) = if let Some(key) = key {
-        // Include the target and at most half the budget before it. Fill any
-        // unused newer-history space with older context; hydrate only once.
-        let left_limit = 1 + (query.limit - 1) / 2;
+        // Keep the requested viewport placement, or center the initial opening.
+        // Fill missing context from the other side; hydrate reply previews once.
+        let left_limit = 1 + before_anchor.unwrap_or((query.limit - 1) / 2);
         let (mut left, mut more_before) =
             slice(conn, group, Some(&key), CursorDirection::Before, left_limit)?;
         let (right, more_after) = slice(
@@ -389,6 +410,21 @@ fn neighbor_key(
         Ok((class, i64_to_u64(primary)?, phase, i64_to_u64(at)?, id))
     })
     .transpose()
+}
+
+pub(super) fn validate_window_query(
+    query: &ConversationWindowQuery,
+) -> Result<(), ConversationOpenError> {
+    if !(1..=MAX_TIMELINE_LIMIT).contains(&query.opening.limit) {
+        return Err(ConversationOpenError::InvalidLimit);
+    }
+    if query
+        .before_anchor
+        .is_some_and(|before| before >= query.opening.limit)
+    {
+        return Err(ConversationOpenError::InvalidAnchorPosition);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

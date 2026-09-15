@@ -486,25 +486,15 @@ fn opening_and_retained_tokens_survive_encrypted_reopen() {
 thread_local! {
     static AFTER_SOURCE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
-#[test]
-fn opening_read_state_and_history_share_one_wal_snapshot() {
+
+fn read_with_concurrent_writer<T>(
+    reader: &SqliteAccountStorage,
+    writer: SqliteAccountStorage,
+    write: impl FnOnce(SqliteAccountStorage) + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("account.sqlite");
-    let key = crate::SqlCipherKey::new("09".repeat(32)).unwrap();
-    let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    seed(&reader);
-    add(&reader, "a", 1, 1);
-    let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    AFTER_SOURCE_READ.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || {
-            add(&writer, "b", 2, 2);
-            writer
-                .mark_timeline_message_read(LOCAL, GROUP, "b", &no_mentions)
-                .unwrap();
-            writer.close().unwrap();
-        }))
-    });
+    AFTER_SOURCE_READ.with(|hook| *hook.borrow_mut() = Some(Box::new(move || write(writer))));
     reader.lock().unwrap().trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(|event| {
@@ -512,20 +502,44 @@ fn opening_read_state_and_history_share_one_wal_snapshot() {
                 && statement
                     .sql()
                     .starts_with("SELECT pending_confirmation FROM account_groups")
+                && let Some(hook) = AFTER_SOURCE_READ.with(|slot| slot.borrow_mut().take())
             {
-                let hook = AFTER_SOURCE_READ.with(|slot| slot.borrow_mut().take());
-                if let Some(hook) = hook {
-                    hook();
-                }
+                hook();
             }
         }),
     );
-    let during = open(&reader, ConversationOpenTarget::Automatic, 50);
+    let value = read();
     reader
         .lock()
         .unwrap()
         .trace_v2(TraceEventCodes::empty(), None);
+    // Fail if the statement hook stops matching: an unexecuted writer must
+    // never turn these race tests into ordinary single-connection reads.
     assert!(AFTER_SOURCE_READ.with(|hook| hook.borrow().is_none()));
+    value
+}
+
+#[test]
+fn opening_read_state_and_history_share_one_wal_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = crate::SqlCipherKey::new("09".repeat(32)).unwrap();
+    let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&reader);
+    add(&reader, "a", 1, 1);
+    let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let during = read_with_concurrent_writer(
+        &reader,
+        writer,
+        |writer| {
+            add(&writer, "b", 2, 2);
+            writer
+                .mark_timeline_message_read(LOCAL, GROUP, "b", &no_mentions)
+                .unwrap();
+            writer.close().unwrap();
+        },
+        || open(&reader, ConversationOpenTarget::Automatic, 50),
+    );
     assert_eq!(ids(&during), ["a"]);
     assert_eq!(during.read_state.unread_count, 1);
     assert!(during.read_state.last_read_message_id_hex.is_none());
@@ -581,6 +595,26 @@ fn opening_query_work_is_bounded_for_deep_anchors_and_unrelated_groups() {
                 "{count} rows: {steps} VM steps for a 50-row window"
             );
         }
+        let (captured, steps) = measure(&store, || {
+            store
+                .conversation_account_snapshot(
+                    GROUP,
+                    ConversationWindowQuery {
+                        opening: ConversationOpenQuery {
+                            target: ConversationOpenTarget::Anchor(saved.clone()),
+                            limit: 50,
+                        },
+                        before_anchor: Some(10),
+                    },
+                )
+                .unwrap()
+        });
+        assert_eq!(captured.page.page().messages.len(), 50);
+        eprintln!("history={count}, account_capture_vm_steps={steps}");
+        assert!(
+            steps < 14_000,
+            "{count} rows: capture used {steps} VM steps"
+        );
         remove(&store, &middle);
         let (recovered, steps) = measure(&store, || {
             open(&store, ConversationOpenTarget::Anchor(saved), 50)
@@ -593,5 +627,372 @@ fn opening_query_work_is_bounded_for_deep_anchors_and_unrelated_groups() {
             steps < 12_000,
             "{count} rows: recovery used {steps} VM steps"
         );
+    }
+}
+
+#[test]
+fn live_window_placement_pages_both_ways_without_moving_the_retained_anchor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    for i in 0..12 {
+        add(&store, &format!("m{i:02}"), i, i);
+    }
+    let opened = store
+        .conversation_open(
+            GROUP,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Message("m05".into()),
+                limit: 3,
+            },
+        )
+        .unwrap();
+    let anchor = opened.anchors[1].clone();
+    for (limit, before, first, last) in [
+        (5, 3, "m02", "m06"),
+        (7, 3, "m02", "m08"),
+        (7, 5, "m00", "m06"),
+    ] {
+        let read = store
+            .conversation_window(
+                GROUP,
+                ConversationWindowQuery {
+                    opening: ConversationOpenQuery {
+                        target: ConversationOpenTarget::Anchor(anchor.clone()),
+                        limit,
+                    },
+                    before_anchor: Some(before),
+                },
+            )
+            .unwrap();
+        assert_eq!(read.page.messages.len(), limit);
+        assert_eq!(ids(&read).first().copied(), Some(first));
+        assert_eq!(ids(&read).last().copied(), Some(last));
+        assert_eq!(
+            read.anchor,
+            ConversationOpenAnchorOutcome::Retained { index: before }
+        );
+        assert_eq!(read.anchors[before].message_id_hex(), "m05");
+    }
+    // Window navigation does not acknowledge any messages.
+    assert_eq!(
+        store
+            .conversation_open(GROUP, ConversationOpenQuery::default())
+            .unwrap()
+            .read_state
+            .unread_count,
+        opened.read_state.unread_count
+    );
+}
+
+#[test]
+fn live_window_placement_fills_edges_and_recovers_deleted_anchor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    for i in 0..8 {
+        add(&store, &format!("m{i}"), i, i);
+    }
+    let opened = store
+        .conversation_open(
+            GROUP,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Message("m1".into()),
+                limit: 3,
+            },
+        )
+        .unwrap();
+    let anchor = opened.anchors[1].clone();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Anchor(anchor),
+            limit: 5,
+        },
+        before_anchor: Some(4),
+    };
+    let read = store.conversation_window(GROUP, query.clone()).unwrap();
+    assert_eq!(ids(&read), ["m0", "m1", "m2", "m3", "m4"]);
+    assert_eq!(
+        read.anchor,
+        ConversationOpenAnchorOutcome::Retained { index: 1 }
+    );
+    remove(&store, "m1");
+    let read = store.conversation_window(GROUP, query).unwrap();
+    assert_eq!(ids(&read), ["m0", "m2", "m3", "m4", "m5"]);
+    assert_eq!(
+        read.anchor,
+        ConversationOpenAnchorOutcome::RecoveredNext { index: 1 }
+    );
+    let error = store.conversation_window(
+        GROUP,
+        ConversationWindowQuery {
+            opening: ConversationOpenQuery {
+                limit: 5,
+                ..Default::default()
+            },
+            before_anchor: Some(5),
+        },
+    );
+    assert!(matches!(
+        error,
+        Err(ConversationOpenError::InvalidAnchorPosition)
+    ));
+}
+
+#[test]
+fn account_capture_keeps_prepared_rows_controls_and_draft_descriptors_together() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    let message_id = "ab".repeat(32);
+    add(&store, &message_id, 1, 1);
+    store
+        .save_message_draft(GROUP, "unsent", Some(message_id.as_str()), &[])
+        .unwrap();
+    store.lock().unwrap().execute(
+        "UPDATE account_groups SET archived = 1, profile_name = 'Selected title', admin_keys_hex = 'aa' WHERE group_id_hex = ?1",
+        [GROUP],
+    ).unwrap();
+    let before = store
+        .conversation_open(GROUP, Default::default())
+        .unwrap()
+        .read_state;
+    let captured = store
+        .conversation_account_snapshot(GROUP, Default::default())
+        .unwrap();
+    assert_eq!(captured.page.page().messages.len(), 1);
+    assert_eq!(captured.page.page().messages[0].message_id_hex, message_id);
+    assert_eq!(captured.presentation_input.group_name, "Selected title");
+    assert_eq!(
+        captured.page.store_epoch(),
+        captured.presentation_input.source_version.store_epoch
+    );
+    assert!(captured.archived);
+    assert!(!captured.leave_request_pending);
+    assert_eq!(captured.admin_keys_hex, "aa");
+    assert_eq!(captured.draft.draft.as_ref().unwrap().content, "unsent");
+    assert_eq!(
+        captured
+            .draft
+            .draft
+            .as_ref()
+            .unwrap()
+            .reply_to_message_id_hex
+            .as_deref(),
+        Some(message_id.as_str())
+    );
+    assert!(captured.read_state == before);
+    assert!(
+        store
+            .conversation_open(GROUP, Default::default())
+            .unwrap()
+            .read_state
+            == before
+    );
+}
+
+#[test]
+fn account_capture_joins_a_caller_transaction_without_committing_it() {
+    use cgka_traits::StorageProvider;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    let original = store.selected_message_draft(GROUP).unwrap();
+    let result: Result<(), StorageError> = store.with_transaction(|store| {
+        store.save_message_draft(GROUP, "rolled back", None, &[])?;
+        let captured = store
+            .conversation_account_snapshot(GROUP, Default::default())
+            .unwrap();
+        assert_eq!(captured.draft.draft.unwrap().content, "rolled back");
+        assert!(!store.lock()?.is_autocommit());
+        Err(StorageError::NotFound)
+    });
+    assert!(matches!(result, Err(StorageError::NotFound)));
+    let after = store.selected_message_draft(GROUP).unwrap();
+    assert!(after.draft.is_none());
+    assert!(after.revision == original.revision);
+    assert!(store.lock().unwrap().is_autocommit());
+}
+
+#[test]
+fn account_capture_rejects_unprepared_state_without_writing() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM chat_list_unread_ready_groups WHERE group_id_hex = ?1",
+            [GROUP],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.conversation_account_snapshot(GROUP, Default::default()),
+        Err(ConversationOpenError::ReadStateNotReady)
+    ));
+    assert!(store.lock().unwrap().is_autocommit());
+}
+
+#[test]
+fn account_capture_keeps_all_fields_on_one_snapshot_while_another_connection_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = crate::SqlCipherKey::new("0a".repeat(32)).unwrap();
+    let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&reader);
+    add(&reader, "a", 1, 1);
+    reader
+        .save_message_draft(GROUP, "before", None, &[])
+        .unwrap();
+    let original_draft = reader.selected_message_draft(GROUP).unwrap();
+    let original_input = reader.chat_presentation_input(GROUP).unwrap().unwrap();
+    let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let during = read_with_concurrent_writer(
+        &reader,
+        writer,
+        |writer| {
+            add(&writer, "b", 2, 2);
+            writer
+                .mark_timeline_message_read(LOCAL, GROUP, "b", &no_mentions)
+                .unwrap();
+            writer
+                .save_message_draft(GROUP, "after", None, &[])
+                .unwrap();
+            writer.lock().unwrap().execute(
+                "UPDATE account_groups SET archived = 1, profile_name = 'new name', admin_keys_hex = 'new admins', pending_confirmation = 1 WHERE group_id_hex = ?1",
+                [GROUP],
+            ).unwrap();
+            writer.close().unwrap();
+        },
+        || {
+            reader
+                .conversation_account_snapshot(GROUP, Default::default())
+                .unwrap()
+        },
+    );
+    assert_eq!(during.page.page().messages.len(), 1);
+    assert_eq!(during.read_state.unread_count, 1);
+    assert!(during.read_state.last_read_message_id_hex.is_none());
+    assert!(!during.archived && !during.pending_confirmation);
+    assert!(during.admin_keys_hex.is_empty());
+    assert_eq!(
+        during.presentation_input.group_name,
+        original_input.group_name
+    );
+    assert!(during.presentation_input.source_version == original_input.source_version);
+    assert_eq!(during.draft.draft.unwrap().content, "before");
+    assert!(during.draft.revision == original_draft.revision);
+
+    let after = reader
+        .conversation_account_snapshot(GROUP, Default::default())
+        .unwrap();
+    assert_eq!(after.page.page().messages.len(), 2);
+    assert_eq!(after.read_state.unread_count, 0);
+    assert_eq!(
+        after.read_state.last_read_message_id_hex.as_deref(),
+        Some("b")
+    );
+    assert!(after.archived && after.pending_confirmation);
+    assert_eq!(after.admin_keys_hex, "new admins");
+    assert_eq!(after.presentation_input.group_name, "new name");
+    assert_eq!(after.draft.draft.unwrap().content, "after");
+    assert!(after.draft.revision != original_draft.revision);
+}
+
+#[test]
+fn account_capture_and_selected_input_work_on_a_query_only_connection() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    add(&store, "a", 1, 1);
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA query_only = ON")
+        .unwrap();
+    let changes = store.lock().unwrap().total_changes();
+    let snapshot = store
+        .conversation_account_snapshot(GROUP, Default::default())
+        .unwrap();
+    assert_eq!(snapshot.page.page().messages.len(), 1);
+    assert!(store.chat_presentation_input(GROUP).unwrap().is_some());
+    assert_eq!(store.lock().unwrap().total_changes(), changes);
+    assert!(store.lock().unwrap().is_autocommit());
+    store.close().unwrap();
+    assert!(matches!(
+        store.conversation_account_snapshot(GROUP, Default::default()),
+        Err(ConversationOpenError::Storage(StorageError::Closed(_)))
+    ));
+}
+
+#[test]
+fn account_capture_tracks_only_its_groups_durable_leave_request() {
+    use crate::storage::test_support::sample_group;
+    use cgka_traits::{
+        GroupId,
+        storage::{GroupStorage, LeaveRequest, LeaveRequestStorage},
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    let group = GroupId::new(hex::decode(GROUP).unwrap());
+    let other = GroupId::new(vec![0x99; 16]);
+    for id in [&group, &other] {
+        store.put_group(&sample_group(id.clone(), 1, 2)).unwrap();
+    }
+    let request = |id| LeaveRequest {
+        group_id: id,
+        requested_at_ms: 123,
+        last_proposed_epoch: None,
+    };
+    store.put_leave_request(&request(other)).unwrap();
+    assert!(
+        !store
+            .conversation_account_snapshot(GROUP, Default::default())
+            .unwrap()
+            .leave_request_pending
+    );
+    store.put_leave_request(&request(group.clone())).unwrap();
+    assert!(
+        store
+            .conversation_account_snapshot(GROUP, Default::default())
+            .unwrap()
+            .leave_request_pending
+    );
+    store.clear_leave_request(&group).unwrap();
+    assert!(
+        !store
+            .conversation_account_snapshot(GROUP, Default::default())
+            .unwrap()
+            .leave_request_pending
+    );
+}
+
+#[test]
+fn latest_targets_keep_the_tail_regardless_of_requested_anchor_placement() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store);
+    for i in 1..=6 {
+        add(&store, &format!("m{i}"), 1, i);
+    }
+    for target in [
+        ConversationOpenTarget::Latest,
+        ConversationOpenTarget::Automatic,
+    ] {
+        if matches!(target, ConversationOpenTarget::Automatic) {
+            store
+                .mark_timeline_message_read(LOCAL, GROUP, "m6", &no_mentions)
+                .unwrap();
+        }
+        let snapshot = store
+            .conversation_window(
+                GROUP,
+                ConversationWindowQuery {
+                    opening: ConversationOpenQuery { target, limit: 3 },
+                    before_anchor: Some(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(ids(&snapshot), ["m4", "m5", "m6"]);
+        assert_eq!(
+            snapshot.anchor,
+            ConversationOpenAnchorOutcome::Latest { index: 2 }
+        );
+        assert!(snapshot.page.has_more_before);
+        assert!(!snapshot.page.has_more_after);
     }
 }

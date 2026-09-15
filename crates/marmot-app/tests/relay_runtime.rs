@@ -4417,17 +4417,26 @@ async fn removed_member_triggers_local_push_token_cleanup() {
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
 
-    let bob_view_after = runtime
-        .group_push_debug_info(&bob.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
-    assert!(
-        bob_view_after
-            .tokens
-            .iter()
-            .all(|t| t.member_id_hex != carol.account.account_id_hex),
-        "MemberRemoved engine event should drop carol's tokens from bob's projection"
-    );
+    // The mutation refreshes its own account. Bob applies the peer removal
+    // through his independent worker, so await that observable cleanup.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let view = runtime
+                .group_push_debug_info(&bob.account.account_id_hex, &group_id)
+                .await
+                .unwrap();
+            if view
+                .tokens
+                .iter()
+                .all(|token| token.member_id_hex != carol.account.account_id_hex)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("MemberRemoved must eventually clear carol's tokens from bob's projection");
 
     runtime.shutdown().await;
 }

@@ -18,6 +18,7 @@ not "fix" it into the per-account database.
 | `src/migrations.rs` | Rust migration runner and migration tests. |
 | `src/migrations/` | Numbered Rust migration bodies. |
 | `src/storage/` | Marmot storage tables by concern. |
+| `src/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
 | `src/openmls_storage/` | Custom OpenMLS storage adapter. |
 | `src/account_projection.rs` | Account-level event projection. |
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |

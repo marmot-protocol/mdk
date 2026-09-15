@@ -1,3 +1,4 @@
+mod draft_lifecycle;
 mod key_package_inventory;
 mod message_journeys;
 
@@ -1163,6 +1164,72 @@ pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
 }
 
 const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn cancelled_sync_keeps_profile() {
+    run_composed_app_runtime_test("cancelled-sync-profile", || async {
+        use cgka_traits::storage::GroupStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob_account = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig::default().with_dev_settlement_quiescence_ms(0),
+        )
+        .with_test_relay_client(relay.clone());
+        remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+        let mut bob = client_on_app_relay_plane(&app, "bob").await;
+        bob.publish_key_package().await.unwrap();
+        bob.prepare_transport().await.unwrap();
+        let mut alice = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = alice
+            .create_group("before", &[bob_account.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        bob.sync().await.unwrap();
+        drop(eose);
+        let storage = app.account_storage("bob").unwrap();
+        let epoch = storage.get_group(&group_id).unwrap().epoch;
+        alice
+            .update_group_profile(&group_id, Some("after"), None)
+            .await
+            .unwrap();
+
+        // Freeze receive timers and cancel on the first pending poll after
+        // ingest. No sleep can race the drain through its final checkpoint.
+        tokio::time::pause();
+        {
+            let sync = bob.sync();
+            tokio::pin!(sync);
+            std::future::poll_fn(|cx| {
+                use std::future::Future as _;
+
+                assert!(
+                    sync.as_mut().poll(cx).is_pending(),
+                    "drain ended before cancellation"
+                );
+                if storage.get_group(&group_id).unwrap().epoch != epoch {
+                    return std::task::Poll::Ready(());
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+        }
+        tokio::time::resume();
+        drop(bob);
+        let group = app
+            .group("bob", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.profile.name, "after");
+    });
+}
 
 fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> NostrTransportEvent {
     let mut envelope = vec![0_u8; 12];
@@ -20252,7 +20319,7 @@ fn pending_group_invites_skips_malformed_rows() {
 #[test]
 fn account_unread_summary_includes_badge_attention_without_session_load() {
     // mdk#1460: one cheap summary must return unread totals plus
-    // attention-only rows (manual unread, excluding pending invites) for accounts that
+    // attention-only rows (manual unread and pending invites) for accounts that
     // have never been started.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -20357,8 +20424,8 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
         .find(|summary| summary.account_id_hex == alice.account_id_hex)
         .expect("seeded account");
     assert_eq!(summary.unread_count, 1);
-    assert_eq!(summary.unread_conversations, 2);
-    assert_eq!(summary.attention_only_conversations, 1);
+    assert_eq!(summary.unread_conversations, 3);
+    assert_eq!(summary.attention_only_conversations, 2);
     assert!(summary.has_unread);
 }
 
@@ -21742,4 +21809,19 @@ async fn runtime_forget_group_local_body() {
     );
     assert!(!runtime.forget_group_local("alice", &group).await.unwrap());
     runtime.shutdown().await;
+}
+#[test]
+fn legacy_directory_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.remember_directory_user_with_reason(&account.account_id_hex, "test")
+        .unwrap();
+    let entry = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.local_account.unwrap().label, "alice");
 }

@@ -89,6 +89,9 @@ SEND_MEDIA_RETRY_BACKOFF_S = (0.1, 0.3)
 # Ten sequential uploads may each consume the connector's 60-second media
 # operation budget. Leave headroom for publication while bounding staged-file
 # and descriptor retention if the connector never reaches a terminal result.
+# Best-effort current-name lookup for Hermes chat/session display. Covers account
+# resolution plus one group_info control request; fallback is deterministic.
+CHAT_INFO_TIMEOUT_S = 2.0
 STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_PREVIEW_RETRY_BACKOFF_S = (0.1, 0.3)
@@ -260,6 +263,9 @@ class KeyedAsyncQueue:
         """Wait until all currently scheduled tasks (and any they chain to) have finished."""
         while self._pending:
             await asyncio.gather(*list(self._pending), return_exceptions=True)
+            # Already-finished tasks can make gather return without yielding.
+            # Let their done callbacks remove them before checking again.
+            await asyncio.sleep(0)
 
     async def cancel_all(self) -> None:
         """Cancel every in-flight task and wait for them to unwind."""
@@ -1511,10 +1517,54 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = _normalize_hex(chat_id, "chat_id")
         return {
-            "name": f"Marmot {chat_id[:12]}",
+            "name": await self._resolve_chat_name(chat_id),
             "type": "group",
             "id": chat_id,
         }
+
+    async def _resolve_chat_name(
+        self,
+        group_id_hex: str,
+        *,
+        account_id_hex: Optional[str] = None,
+    ) -> str:
+        try:
+            normalized_group = _normalize_hex(group_id_hex, "group_id_hex")
+        except Exception:
+            normalized_group = str(group_id_hex or "")
+        fallback = _fallback_chat_name(normalized_group)
+        try:
+            return await asyncio.wait_for(
+                self._lookup_current_chat_name(
+                    group_id_hex,
+                    account_id_hex=account_id_hex,
+                ),
+                timeout=CHAT_INFO_TIMEOUT_S,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return fallback
+
+    async def _lookup_current_chat_name(
+        self,
+        group_id_hex: str,
+        *,
+        account_id_hex: Optional[str] = None,
+    ) -> str:
+        group_id_hex = _normalize_hex(group_id_hex, "group_id_hex")
+        fallback = _fallback_chat_name(group_id_hex)
+        if account_id_hex:
+            resolved_account = _normalize_hex(account_id_hex, "account_id_hex")
+        else:
+            resolved_account = await self._ensure_account_id()
+        response = await self.client.group_info(resolved_account, group_id_hex)
+        subject = _accepted_group_info_subject(
+            response,
+            account_id_hex=resolved_account,
+            group_id_hex=group_id_hex,
+        )
+        return subject if subject is not None else fallback
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._inbound_spool_admission_enabled = False
@@ -3134,10 +3184,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
             sender_display_name = str(event.get("sender_display_name") or "").strip()
             user_name = sender_display_name or f"Marmot {sender_account_id_hex[:12]}"
+            event_account = str(event.get("account_id_hex") or "").strip() or self.account_id_hex
+            chat_name = await self._resolve_chat_name(
+                group_id_hex,
+                account_id_hex=event_account,
+            )
 
             source = self.build_source(
                 chat_id=group_id_hex,
-                chat_name=f"Marmot {group_id_hex[:12]}",
+                chat_name=chat_name,
                 chat_type="group",
                 user_id=sender_account_id_hex,
                 user_name=user_name,
@@ -4704,6 +4759,40 @@ def _log_scheduled_activity_error(future) -> None:
         future.result()
     except Exception:
         logger.debug("Marmot scheduled agent activity failed", exc_info=True)
+
+
+def _fallback_chat_name(group_id_hex: str) -> str:
+    return f"Marmot {group_id_hex[:12]}"
+
+
+def _accepted_group_info_subject(
+    response: Any,
+    *,
+    account_id_hex: str,
+    group_id_hex: str,
+) -> Optional[str]:
+    if not isinstance(response, dict):
+        return None
+    if response.get("type") != "group_info":
+        return None
+    response_account_raw = response.get("account_id_hex")
+    response_group_raw = response.get("group_id_hex")
+    if not isinstance(response_account_raw, str) or not isinstance(response_group_raw, str):
+        return None
+    try:
+        response_account = _normalize_hex(response_account_raw, "account_id_hex")
+        response_group = _normalize_hex(response_group_raw, "group_id_hex")
+    except Exception:
+        return None
+    if response_account != account_id_hex or response_group != group_id_hex:
+        return None
+    subject = response.get("subject")
+    if not isinstance(subject, str):
+        return None
+    subject = subject.strip()
+    if not subject:
+        return None
+    return subject
 
 
 if _HermesMediaKind is not None:

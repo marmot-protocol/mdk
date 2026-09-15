@@ -1,9 +1,13 @@
+mod capture;
+pub use capture::ConversationAccountSnapshot;
 mod opening;
+mod presentation;
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenSnapshot,
-    ConversationOpenTarget,
+    ConversationOpenTarget, ConversationWindowQuery,
 };
+pub use presentation::ConversationPresentationPage;
 
 use crate::connection::CachedSql;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

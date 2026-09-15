@@ -1,9 +1,11 @@
 set shell := ["bash", "-cu"]
 
 diagnostics-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,marmot-c/otlp-export,wn-cli/otlp-export,agent-connector/otlp-export,marmot-app/product-analytics-export,marmot-uniffi/product-analytics-export,marmot-c/product-analytics-export,wn-cli/product-analytics-export,agent-connector/product-analytics-export"
-test-features := "wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks"
+test-features := "wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks"
 simulator-dedicated-filter := "not binary(adversarial_reliability_campaigns) and not binary(policy_sweeps) and not binary(independent_reference_model) and not binary(lifecycle_model) and not binary(mutation_adequacy) and not binary(protocol_decision_gate) and not binary(process_orchestrator)"
 simulator-smoke-filter := simulator-dedicated-filter + " and not (binary(canonical_scenarios) & (test(=convergence_chaos_family_generates_specs_with_semantic_expectations) | test(=convergence_chaos_family_seed_changes_scenarios) | test(=convergence_e2e_delivery_family_runs_generated_variants) | test(=bounded_convergence_pressure_family_settles_every_seeded_permutation)))"
+
+simulator-process-filter := "test(=engine_app_runtime_and_process_adapters_reach_equivalent_public_state) | test(=process_kill_disconnect_reconnect_and_restart_agree_with_uninterrupted_execution) | test(=four_party_cross_route_recovery_app_runtime_matches_unified_route) | test(=four_party_cross_route_recovery_processes_match_unified_route)"
 
 default:
     @just --list
@@ -330,12 +332,12 @@ conformance-slow:
     cargo nextest run -p cgka-conformance-simulator --features conformance-slow
 
 # Fast PR feedback: ordinary simulator coverage without dedicated verification
-# binaries or the generated multi-minute reliability batches. Keep two
-# production-shaped process canaries in PR CI; the complete serialized process
-# suite runs in the nightly lane below.
+# binaries or the generated multi-minute reliability batches. Keep baseline
+# process canaries and both cross-route regressions in PR CI; the complete
+# serialized process suite runs in the nightly lane below.
 simulator-smoke:
     cargo nextest run -p cgka-conformance-simulator --locked --profile ci -E '{{simulator-smoke-filter}}'
-    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci -E 'test(=engine_app_runtime_and_process_adapters_reach_equivalent_public_state) | test(=process_kill_disconnect_reconnect_and_restart_agree_with_uninterrupted_execution)'
+    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci -E '{{simulator-process-filter}}'
 
 # Complete generic simulator coverage for the nightly lane. Dedicated
 # adversarial and independent-verification binaries run in later recipes.
@@ -348,6 +350,13 @@ simulator-full: simulator-filter-contract
 # Public app self-update journey with the maintenance quiet window and jitter zeroed.
 simulator-fast-maintenance:
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --locked --profile ci --test app_runtime_interaction_journeys -E 'test(=public_app_11_manual_self_update_advances_every_member)'
+
+# Production-policy public app catalog, including explicitly ignored journeys.
+app-stack-campaign out *args:
+    python3 scripts/app_stack_campaign.py {{quote(out)}} {{args}}
+
+app-stack-campaign-contract:
+    python3 -m unittest discover -s scripts/tests -p 'test_app_stack_campaign.py'
 
 # Prove that the generic nightly lane restores exactly the generated batches
 # intentionally removed from the PR smoke lane.
@@ -615,6 +624,6 @@ test-convergence-policy-pin:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate check clippy test-convergence-policy-pin test

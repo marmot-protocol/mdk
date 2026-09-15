@@ -1,7 +1,7 @@
 ---
 title: "Chat screen contracts: C1 working draft"
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-15
 tags: [marmot, architecture, projections, chat]
 ---
 
@@ -35,7 +35,7 @@ Shared derivation belongs in `marmot-app` and storage helpers; UniFFI/C expose t
 | Invitation and membership | Account confirmation state and authoritative group lifecycle | Expose independent typed state plus current permitted actions; revalidate at mutation time | Welcome, accept/decline, leave/remove/disband, recovery |
 | Draft summary and composer | Existing encrypted draft and attachment records | Join bounded summary into list; include selected draft descriptors in conversation; bytes through separate local access | Draft version changes; durable send acceptance clears only the submitted version |
 | Delivery and operation state | Durable send/receipt/operation owners | Reuse their typed states; never infer failure from time elapsed or equate relay ACK with peer receipt | Acceptance, publication, receipt, failure/retry and reconciliation |
-| Account attention | Main-list eligible rows and independent manual-unread intent | Cheap per-account aggregate; no timeline/session load just to switch accounts | Same transactions/maintenance as contributing rows; exclude archived/pending invites |
+| Account attention | Main-list eligible rows and independent manual-unread intent | Cheap per-account aggregate; no timeline/session load just to switch accounts | Same transactions/maintenance as contributing rows; one item per active unarchived pending invite, exclude archived/departed/departing chats (#1847) |
 | Conversation header/capabilities | Shared resolved row, current group/self membership and policy | Compose with existing group snapshot helpers; no full roster required for ordinary conversation open | Group/profile/lifecycle changes; policy changes; identity refresh |
 | Timeline window and anchors | Existing canonical materialized timeline | Retain paged window manager; add complete presentation to each resulting window | Canonical timeline changes, paging, lag refresh and identity changes |
 | Avatar availability | Validated cached bytes and current selected avatar descriptor | Durable bounded cache; descriptor/local-access state in envelope; no decoded bitmap persistence | Acquisition, source replacement, refresh, eviction, account cleanup |

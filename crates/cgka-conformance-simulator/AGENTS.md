@@ -39,6 +39,14 @@ Git commit; require a clean build and retain the exact source revision plus comm
 
 ## Pieces
 
+- **Module:** `src/app_runtime.rs` and `src/app_runtime/`
+  - **Role:** Public app scenario actions and assertions over separate participant processes with private SQLCipher
+    roots and a separate real local relay. `process_backend.rs` bridges public app calls; `process_io.rs` owns bounded
+    RPC, build-policy matching and child cleanup; `process_relay.rs` owns relay/history/fault commands;
+    `process_server.rs` dispatches node service modes. The older `ProcessOrchestrator` shares the relay child while
+    retaining its own capability-declared participant protocol. See [`APP_SCENARIO_INVENTORY.md`](APP_SCENARIO_INVENTORY.md)
+    for ordinary, feature-specific and explicit slow acceptance gates. `new_in_process_stress` is a diagnostic control.
+
 - **Module:** `src/bus.rs`
   - **Role:** `TransportBus`, the in-memory bus. Owns delivery policy, the queue, partition state, and the address book
     that maps `MemberId` to `ClientId` for welcome routing.
@@ -61,7 +69,9 @@ Git commit; require a clean build and retain the exact source revision plus comm
 - **Module:** `src/cross_route_scenario.rs`
   - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The
     engine-capable form adds exact state and active decryptability; app-runtime, process, container, and VM adapters
-    reuse the public form and must not privately reconstruct its action schedule or terminal assertions.
+    reuse the public form and must not privately reconstruct its action schedule or terminal assertions. The public
+    branch-witness boundary uses a bounded `Eventually(ClientState)` assertion; preserve its process-report evidence
+    and publication correlation checks instead of relying on relay drain timing.
 
 - **Module:** `src/scenario_input_ledger.rs`
   - **Role:** Simulator-owned per-client commit, proposal, and application-input accounting. Joins stable scenario

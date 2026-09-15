@@ -16,6 +16,9 @@ from stored group records, and returns app events plus publishable transport wor
 - Preserves the publish-before-apply contract: callers confirm or fail pending group operations after transport publish,
   including auto-publish work created while ingesting inbound messages.
 - Exposes convergence advancement so queued outbound work can be regenerated from canonical state.
+- Provides compact `group_authority` reads and `with_group_authority_snapshot` for composing host-owned
+  persisted reads with current engine facts on this session's store. The callback is synchronous and read-only;
+  unhydrated groups return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work.
 
 ## What it does not do
 

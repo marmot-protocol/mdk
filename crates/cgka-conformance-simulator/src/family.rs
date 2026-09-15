@@ -205,6 +205,23 @@ pub fn generate_family_case(
     case_index: u64,
 ) -> Result<GeneratedScenarioCase, UnsupportedGeneratedFamily> {
     let case = match family {
+        "public-app-invite-profile-recovery/v1" => {
+            crate::stateful_generator::generate_public_app_invite_profile_case(seed, case_index)
+        }
+        "public-app-longevity/v1"
+        | "public-app-longevity-extended/v1"
+        | "public-app-retained-traffic/v1" => {
+            crate::stateful_generator::generate_public_app_activity_case(family, seed, case_index)
+        }
+        crate::PUBLIC_APP_LARGE_GROUP_FAMILY => {
+            crate::generate_public_app_large_group_case(seed, case_index)
+        }
+        crate::PUBLIC_APP_STATEFUL_RECOVERY_FAMILY => {
+            crate::generate_public_app_stateful_recovery_case(seed, case_index)
+        }
+        crate::PUBLIC_APP_BACKLOG_RECOVERY_FAMILY => {
+            crate::generate_public_app_backlog_case(seed, case_index)
+        }
         crate::PUBLIC_APP_ADMIN_CHURN_FAMILY | crate::PUBLIC_APP_LATE_JOIN_FAMILY => {
             crate::generate_public_app_pressure_case(family, seed, case_index)
         }
@@ -230,6 +247,15 @@ pub fn generate_family_case(
         }
         crate::MEMBERSHIP_REENTRY_FAMILY => {
             crate::generate_membership_reentry_case(seed, case_index)
+        }
+        crate::PUBLIC_APP_RECOVERY_SCHEDULES_FAMILY => {
+            let mut case = generate_cross_route_restart_permutation_case(seed, case_index);
+            case.family_name = "public-app-recovery-schedules/v1".into();
+            case.scenario = crate::cross_route_seeded_recovery_scenario(seed, case_index);
+            case.expected_outcomes
+                .retain(|e| !matches!(e, TraceExpectation::PendingResolution { .. }));
+            push_labelled_confirmation_expectations(&case.scenario, &mut case.expected_outcomes);
+            case
         }
         "cross-route-restart-permutations/v1" => {
             generate_cross_route_restart_permutation_case(seed, case_index)
@@ -473,7 +499,7 @@ pub fn generate_cross_route_restart_permutation_case(
     push_labelled_confirmation_expectations(&scenario, &mut expected_outcomes);
     GeneratedScenarioCase {
         family_name: "cross-route-restart-permutations/v1".into(),
-        generator_version: "1".into(),
+        generator_version: "2".into(),
         seed,
         case_index,
         workload_profile: None,
@@ -824,7 +850,7 @@ pub(crate) async fn run_generated_case_report_with_capture_on_subject_before_min
                 &mut subject,
             )
             .await;
-            subject.shutdown().await;
+            subject.shutdown().await.map_err(subject_setup_error)?;
             (
                 result?,
                 ScenarioFailureCaptureV1 {
@@ -1220,7 +1246,7 @@ async fn run_generated_scenario(
                 &mut app,
             )
             .await;
-            app.shutdown().await;
+            app.shutdown().await.map_err(subject_setup_error)?;
             result
         }
     }

@@ -25,8 +25,17 @@ struct NodeOptions {
     relay_proxy: Option<RelayProxyOptions>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> ExitCode {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let [mode, role] = args.as_slice()
+        && mode == "--app-harness"
+    {
+        return match cgka_conformance_simulator::app_runtime::run_app_process_stdio(role).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     init_diagnostics();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,

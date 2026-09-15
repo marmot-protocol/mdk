@@ -1,7 +1,7 @@
 ---
 title: "Independent account attention"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 status: implementation
 ---
 
@@ -10,8 +10,8 @@ status: implementation
 C4 M3 in [#1777](https://github.com/marmot-protocol/mdk/issues/1777) adds
 `MarmotAppRuntime::subscribe_account_attention()`. An account switcher can receive
 current badges without opening a chat list or starting that account's worker.
-This reuses the durable chat counters and M1 eligibility keys; it adds no migration
-or second counter store. [Native bindings and handoff](chat-projections-native.md) are provided by M4.
+This reuses durable chat counters and eligibility keys, with no second counter store.
+Migration 0074 adds an indexed invitation key maintained from authoritative account state. [Native bindings and handoff](chat-projections-native.md) are provided by M4.
 
 ## Snapshot contract
 
@@ -24,7 +24,7 @@ transaction across account databases.
 Each signed-in local or external-signing account has either:
 
 - `Ready`: unread messages, unread mentions, conversations needing attention, and
-  manual-only conversations. `has_unread()` means at least one eligible conversation.
+  attention-only conversations (pending invitations and manual-only reminders). `has_unread()` means at least one eligible conversation.
 - `Unavailable`: `Preparing` for incomplete base rows or onboarding, `Resetting` during
   account teardown, or `ReadFailed`. These states carry no invented zero or stale total.
 
@@ -42,18 +42,26 @@ a new generation. Low-level callers that mutate `AccountHome` directly must call
 
 ## Eligibility and work
 
-One SQLite statement checks missing base rows and aggregates the same predicate as
-Unread: `list_scope = 0 AND list_unread = 1`. It explicitly uses the existing partial
-Unread index, so work scales with eligible unread conversations, not all conversations
-or retained history. It sums stored counts without converting chat rows, loading
-rosters, opening MLS sessions, or reading message DTOs.
+One SQLite statement checks missing base rows and aggregates two disjoint indexed sets:
+Unread rows (`list_scope = 0 AND list_unread = 1`) and active pending invitations
+(`list_scope = 0 AND list_pending_invite = 1`). Work scales with eligible attention
+rows, not quiet/archived/Left conversations or retained history. No rosters, MLS
+sessions, message DTOs or selected presentation are loaded.
 
-Pending invitations, archived chats, and Left conversations do not contribute.
-Durably queued leave/disband requests use the same suppression as the four-list
-contract; cancellation/failure restores eligibility when the existing operation
-state permits it. Muted active conversations still count. Manual unread can add
-one attention-only conversation but never a message or mention. Acceptance reveals
-retained eligible counts without marking history read.
+Each unarchived pending invitation adds **one** `attention_only_conversations` item,
+even with retained messages or a manual reminder. Its message and mention counts
+remain suppressed until acceptance. The **Unread filtered list still excludes invites**.
+`unread_conversations` counts all eligible attention rows and `has_unread()` includes
+invitation-only accounts. The application badge is
+`unread_count + attention_only_conversations`.
+
+Archived chats and Left conversations contribute nothing. Durably queued leave/disband
+requests use the same suppression as the four-list contract; cancellation/failure
+restores eligibility when existing operation state permits it. Muted active
+conversations still count. An accepted manual reminder adds one attention-only item
+only when there are no unread messages. Acceptance replaces invitation attention with
+retained eligible counts without marking history read. Source-state changes update
+the invitation key transactionally, even before a display-row refresh.
 
 Cold account-state import remains a one-time prerequisite. Missing base rows use
 one existing bounded preparation batch per attempt, then report `Preparing` until
@@ -69,7 +77,7 @@ account; catalog-only changes do not reread unchanged ready accounts.
 | Committed change | Notification consumed |
 | --- | --- |
 | Messages, mentions, edits/deletes, read markers, manual unread | Runtime projection updates |
-| Invite acceptance, archive, membership, queued departure and reversal | Runtime projection/group-state updates |
+| Invite arrival/acceptance, archive, membership, queued departure and reversal | Runtime projection/group-state updates |
 | Base-row preparation and presentation maintenance | Account-scoped presentation invalidations |
 | Creation/import, external login, sign-in/out, removal/reset, onboarding | Catalog notification and account-reset notifications |
 
@@ -86,12 +94,12 @@ mute does not change attention eligibility.
 ## Compatibility and evidence
 
 The existing `account_unread_summary()` and its native record layouts remain. Their
-counters now share Unread eligibility, intentionally suppressing pending invitations
-and queued departures. The old getter retains local-signing account enumeration,
+counters use the same attention policy, including pending invitations and suppressing
+archived chats and queued departures. The old getter retains local-signing account enumeration,
 legacy readiness, and omission of failed account reads. Consumers needing explicit
 availability and independent live updates should adopt this additive API through M4.
 
-Storage tests compare totals with Unread across invite/archive/membership/manual/mute
+Storage tests distinguish attention totals from Unread across invite/archive/membership/manual/mute
 combinations, exercise departure rollback, and count SQL VM work with 4,096 chats and
 5,000 retained messages. Runtime tests cover isolated account refreshes, initial-read
 races, message/mention changes, account lifecycle, lag recovery, unavailable states,

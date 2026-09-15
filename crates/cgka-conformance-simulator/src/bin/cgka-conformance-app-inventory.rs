@@ -12,6 +12,13 @@ use sha2::{Digest, Sha256};
 
 // Bounded first inventory: small/catalog arms; pressure blocks remain opt-in.
 const FAMILIES: &[(&str, u64)] = &[
+    ("public-app-invite-profile-recovery/v1", 2),
+    ("public-app-longevity/v1", 2),
+    ("public-app-retained-traffic/v1", 2),
+    ("public-app-large-group/v1", 6),
+    ("public-app-stateful-recovery/v1", 6),
+    ("public-app-recovery-schedules/v1", 6),
+    ("public-app-backlog-recovery/v1", 6),
     ("public-app-send-leave/v1", 6),
     ("public-app-membership-reentry/v1", 6),
     ("public-app-offline-recovery/v1", 6),
@@ -75,7 +82,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // Obtain the actual adapter descriptor. No participants or workload execute.
     let mut subject = AppRuntimeHarness::new(&[]).await?;
     let descriptor = subject.descriptor();
-    subject.shutdown().await;
+    subject.shutdown().await?;
     drop(subject);
     let mut rows = Vec::new();
     for &(family, cases) in FAMILIES {

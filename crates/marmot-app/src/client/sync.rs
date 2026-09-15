@@ -53,6 +53,29 @@ const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
 
+/// Overall explicit repair budget, distinct from each checkpointed drain quantum.
+/// Checked at safe boundaries; an admitted ingest/checkpoint is always finished.
+/// Leave headroom inside the public worker RPC deadline for setup and cleanup.
+const FULL_HISTORY_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct FullHistoryRepairControl<'a> {
+    started: Instant,
+    timeout: Duration,
+    cancelled: &'a (dyn Fn() -> bool + Sync),
+}
+
+impl FullHistoryRepairControl<'_> {
+    fn stopped(&self) -> Option<DrainVerdict> {
+        if (self.cancelled)() {
+            Some(DrainVerdict::RepairCancelled)
+        } else if self.started.elapsed() >= self.timeout {
+            Some(DrainVerdict::RepairDeadline)
+        } else {
+            None
+        }
+    }
+}
+
 // One ingest or convergence pass can release several previously retained events.
 // Their durable identities belong to the events, not to the triggering envelope.
 fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback: &str) -> String {
@@ -287,6 +310,10 @@ enum DrainVerdict {
     /// is armed, but this drain's (possibly floored) subscription cannot close
     /// the gap; the caller must issue a fresh unfloored replay.
     Overflow,
+    /// Explicit repair exhausted its overall budget across checkpointed slices.
+    RepairDeadline,
+    /// Caller or runtime stopped the explicit repair at a safe boundary.
+    RepairCancelled,
 }
 
 impl DrainVerdict {
@@ -299,6 +326,8 @@ impl DrainVerdict {
             Self::NovelProgressQuantumYield => Some("backfill_drain_novel_progress_quantum_yield"),
             Self::NoProgressQuantumYield => Some("backfill_drain_no_progress_quantum_yield"),
             Self::Overflow => Some("account_delivery_queue_overflow"),
+            Self::RepairDeadline => Some("full_history_repair_deadline"),
+            Self::RepairCancelled => Some("full_history_repair_cancelled"),
         }
     }
 
@@ -310,7 +339,9 @@ impl DrainVerdict {
             | Self::NoRelayEose
             | Self::Overflow
             | Self::NovelProgressQuantumYield
-            | Self::NoProgressQuantumYield => None,
+            | Self::NoProgressQuantumYield
+            | Self::RepairDeadline
+            | Self::RepairCancelled => None,
         }
     }
 
@@ -347,6 +378,12 @@ fn incomplete_full_history_repair(
     let error_kind = verdict
         .error_kind()
         .unwrap_or("full_history_repair_unconfirmed");
+    tracing::debug!(
+        target: "marmot_app::history_repair",
+        method = "incomplete_full_history_repair",
+        error_kind,
+        "full-history repair remains incomplete"
+    );
     ClassifiedSyncFailure::at_stage(
         summary,
         AppError::BlockingTask(format!("full-history repair incomplete: {error_kind}")),
@@ -1287,7 +1324,7 @@ impl AppClient {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
-        let display_names = self.app.display_names_by_id()?;
+        let display_names = self.display_names_for_events(&effects.events);
         let source_received_at = unix_now_seconds();
         // Hydration replays a stored group's `GroupDisbanded` once ever
         // (`restore_disband_tombstone`), as the belt-and-braces reconciler for a
@@ -1462,7 +1499,6 @@ impl AppClient {
         if effects.events.is_empty() {
             return Ok(());
         }
-        let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         // Synthetic source identity: these events have no single inbound
         // transport message (see `drain_pending_session_events`).
@@ -1471,7 +1507,6 @@ impl AppClient {
         let routes_dirty = self
             .observe_account_device_effects(
                 effects,
-                &display_names,
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
@@ -1605,16 +1640,10 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, AppError> {
         let cursor_before_secs = self.state.last_transport_timestamp;
-        let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let ingested = Self::ingest_delivery(
-            self.transport_receipts()?,
-            delivery,
-            &display_names,
-            &mut summary,
-        )
-        .await?;
+        let ingested =
+            Self::ingest_delivery(self.transport_receipts()?, delivery, &mut summary).await?;
         if self.adapter.pending_delivery_overflow().is_some() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -1708,6 +1737,45 @@ impl AppClient {
         self.drain_sdk_relay(counts, completion).await
     }
 
+    /// Keep one activation and its frozen endpoint coverage across quantum yields.
+    /// The client stays exclusively owned; this loop never reactivates transport.
+    /// Prefixes are durable before cancellation, deadline checks, or runtime yields.
+    async fn drain_full_history_repair(
+        &mut self,
+        counts: &mut DrainCounts,
+        control: &FullHistoryRepairControl<'_>,
+    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
+        let mut retained = SyncSummary::default();
+        loop {
+            if let Some(verdict) = control.stopped() {
+                return Ok((retained, verdict));
+            }
+            let completion = DrainCompletion::EndOfStoredEvents {
+                silence_budget: self.epoch_backfill_eose_wait(),
+                execution_quantum: self
+                    .epoch_backfill_execution_quantum()
+                    .min(control.timeout.saturating_sub(control.started.elapsed())),
+            };
+            let (summary, verdict) = match self.drain_sdk_relay(counts, completion).await {
+                Ok(result) => result,
+                Err(mut failure) => {
+                    retained.merge(failure.partial_summary);
+                    failure.partial_summary = retained;
+                    return Err(failure);
+                }
+            };
+            retained.merge(summary);
+            if !matches!(
+                verdict,
+                DrainVerdict::NovelProgressQuantumYield | DrainVerdict::NoProgressQuantumYield
+            ) {
+                return Ok((retained, verdict));
+            }
+            // No storage transaction or claimed delivery survives this yield.
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Resolve a durable per-account delivery gap with a fresh, unfloored
     /// account-wide replay. Only EOSE for subscriptions issued by this attempt
     /// can clear the marker, and a second queue overflow during the replay
@@ -1720,12 +1788,19 @@ impl AppClient {
                 SyncSummary::default(),
             ));
         }
+        self.recover_delivery_overflow_controlled(None).await
+    }
+
+    async fn recover_delivery_overflow_controlled(
+        &mut self,
+        repair: Option<&FullHistoryRepairControl<'_>>,
+    ) -> Result<DeliveryOverflowRecoveryOutcome, ClassifiedSyncFailure> {
         let observation = self.app.product_analytics.begin(
             crate::ProductFamily::Recovery,
             "overflow",
             crate::ProductUnit::Attempt,
         );
-        let result = self.recover_delivery_overflow_unobserved().await;
+        let result = self.recover_delivery_overflow_unobserved(repair).await;
         if let Some(observation) = observation {
             observation.finish(match &result {
                 Ok(DeliveryOverflowRecoveryOutcome::Completed(_)) => "success",
@@ -1738,6 +1813,7 @@ impl AppClient {
 
     async fn recover_delivery_overflow_unobserved(
         &mut self,
+        repair: Option<&FullHistoryRepairControl<'_>>,
     ) -> Result<DeliveryOverflowRecoveryOutcome, ClassifiedSyncFailure> {
         if !self.delivery_overflow_recovery_pending {
             return Ok(DeliveryOverflowRecoveryOutcome::Completed(
@@ -1779,8 +1855,20 @@ impl AppClient {
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut counts = DrainCounts::default();
-        let (summary, verdict) = match self
-            .drain_sdk_relay(
+        if repair.is_some()
+            && let Err(source) = self.reconcile_transport_history(unix_now_seconds()).await
+        {
+            self.adapter.fail_delivery_overflow_recovery();
+            return Err(ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                source,
+                SyncFailureStage::Unknown,
+            ));
+        }
+        let drained = if let Some(control) = repair {
+            self.drain_full_history_repair(&mut counts, control).await
+        } else {
+            self.drain_sdk_relay(
                 &mut counts,
                 DrainCompletion::EndOfStoredEvents {
                     silence_budget: self.delivery_overflow_eose_wait(),
@@ -1788,7 +1876,8 @@ impl AppClient {
                 },
             )
             .await
-        {
+        };
+        let (summary, verdict) = match drained {
             Ok(result) => result,
             Err(error) => {
                 self.adapter.fail_delivery_overflow_recovery();
@@ -1869,6 +1958,36 @@ impl AppClient {
             }
             Err(mut failure) => {
                 failure.partial_summary.merge(std::mem::take(summary));
+                Err(failure)
+            }
+        }
+    }
+
+    async fn recover_full_history_overflow_and_merge(
+        &mut self,
+        summary: &mut SyncSummary,
+        control: &FullHistoryRepairControl<'_>,
+    ) -> Result<(), ClassifiedSyncFailure> {
+        if let Some(verdict) = control.stopped() {
+            return Err(incomplete_full_history_repair(
+                std::mem::take(summary),
+                verdict,
+            ));
+        }
+        match self
+            .recover_delivery_overflow_controlled(Some(control))
+            .await
+        {
+            Ok(
+                DeliveryOverflowRecoveryOutcome::Completed(recovered)
+                | DeliveryOverflowRecoveryOutcome::Incomplete(recovered),
+            ) => {
+                summary.merge(recovered);
+                Ok(())
+            }
+            Err(mut failure) => {
+                summary.merge(failure.partial_summary);
+                failure.partial_summary = std::mem::take(summary);
                 Err(failure)
             }
         }
@@ -1977,15 +2096,6 @@ impl AppClient {
         counts: &mut DrainCounts,
         completion: DrainCompletion,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
-        // These are local app-state reads before the relay receive loop. They
-        // are not failures of the account-worker command boundary.
-        let display_names = self.app.display_names_by_id().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::Unknown,
-            )
-        })?;
         let mut summary = SyncSummary::default();
         let mut first_wait = true;
         // Forensic drain accounting: wall-clock span, deliveries actually
@@ -2162,28 +2272,22 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
-            let ingested = match Self::ingest_delivery(
-                receipts,
-                *delivery,
-                &display_names,
-                &mut delivery_summary,
-            )
-            .await
-            {
-                Ok(ingested) => ingested,
-                Err(error) => {
-                    return Err(self
-                        .finish_failed_sync_drain(
-                            summary,
-                            routes_dirty,
-                            counts.clone(),
-                            StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
-                            drain_started,
-                            cursor_before_secs,
-                        )
-                        .await);
-                }
-            };
+            let ingested =
+                match Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await {
+                    Ok(ingested) => ingested,
+                    Err(error) => {
+                        return Err(self
+                            .finish_failed_sync_drain(
+                                summary,
+                                routes_dirty,
+                                counts.clone(),
+                                StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
+                                drain_started,
+                                cursor_before_secs,
+                            )
+                            .await);
+                    }
+                };
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);
             }
@@ -2204,6 +2308,27 @@ impl AppClient {
             counts.deliveries = counts.deliveries.saturating_add(1);
             summary.merge(delivery_summary);
             routes_dirty |= ingested.routes_dirty;
+            // A cancelled drain cannot replay an already-applied commit's
+            // group effects. Save them before waiting for another delivery.
+            if !self.pending_group_projection_updates.is_empty() {
+                // Persist group fields without acknowledging replayable output:
+                // the caller has not received this drain's summary yet.
+                let pending_acks = std::mem::take(&mut self.pending_application_event_acks);
+                let saved = self.save_state_with_pending_local_group_deletion_frontier_clears();
+                self.pending_application_event_acks = pending_acks;
+                if let Err(error) = saved {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            counts.clone(),
+                            StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            }
         };
 
         if verdict != DrainVerdict::Overflow
@@ -2249,6 +2374,26 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
+        if matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
+            && tracing::enabled!(target: "marmot_app::history_repair", tracing::Level::DEBUG)
+        {
+            let eose = self.adapter.account_subscription_eose().await;
+            tracing::debug!(
+                target: "marmot_app::history_repair",
+                method = "drain_sdk_relay",
+                verdict = verdict.error_kind().unwrap_or("complete"),
+                duration_ms = drain_started.elapsed().as_millis() as u64,
+                deliveries = counts.deliveries,
+                durable_deliveries = counts.durable_deliveries(),
+                skipped = counts.skipped,
+                refused = counts.refused,
+                subscriptions = eose.subscriptions,
+                subscriptions_with_eose = eose.with_eose,
+                relay_attempts = eose.relay_subscription_attempts,
+                relay_attempts_with_eose = eose.relay_subscription_attempts_with_eose,
+                "history drain checkpointed"
+            );
+        }
         Ok((summary, verdict))
     }
 
@@ -2284,6 +2429,14 @@ impl AppClient {
             counts,
             cursor_before_secs,
             cursor_after_secs,
+        );
+        tracing::debug!(
+            target: "marmot_app::history_repair",
+            method = "finish_failed_sync_drain",
+            failure_stage = stage.as_str(),
+            error_kind = source.privacy_safe_kind(),
+            error_class = source.sync_error_class().as_str(),
+            "sync drain failed"
         );
         ClassifiedSyncFailure::at_stage(summary, source, stage)
     }
@@ -2414,7 +2567,6 @@ impl AppClient {
     async fn ingest_delivery(
         receipts: super::receipts::SynchronizedTransportReceipts<'_>,
         delivery: cgka_traits::TransportDelivery,
-        display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
         let client = receipts.into_client();
@@ -2533,7 +2685,6 @@ impl AppClient {
         let routes_dirty = match client
             .observe_account_device_effects(
                 &effects.effects,
-                display_names,
                 summary,
                 &source_message_id_hex,
                 source_received_at,
@@ -3905,9 +4056,35 @@ impl AppClient {
     /// participant that has no new traffic capable of arming epoch-stall
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
+    #[cfg(test)]
     pub(crate) async fn repair_full_history(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.repair_full_history_cancellable(&|| false).await
+    }
+
+    pub(crate) async fn repair_full_history_cancellable(
+        &mut self,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.repair_full_history_with_control(&FullHistoryRepairControl {
+            started: Instant::now(),
+            timeout: FULL_HISTORY_REPAIR_TIMEOUT,
+            cancelled,
+        })
+        .await
+    }
+
+    async fn repair_full_history_with_control(
+        &mut self,
+        control: &FullHistoryRepairControl<'_>,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        if let Some(verdict) = control.stopped() {
+            return Err(incomplete_full_history_repair(
+                SyncSummary::default(),
+                verdict,
+            ));
+        }
         let refresh = self.refresh_group_routes().map_err(|error| {
             ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
@@ -3957,7 +4134,7 @@ impl AppClient {
                     })? {
                     EpochBackfillRunOutcome::Completed(mut summary) => {
                         if self.delivery_overflow_recovery_pending {
-                            self.recover_delivery_overflow_and_merge(&mut summary)
+                            self.recover_full_history_overflow_and_merge(&mut summary, control)
                                 .await?;
                             if self.delivery_overflow_recovery_pending {
                                 return Err(incomplete_full_history_repair(
@@ -3980,6 +4157,23 @@ impl AppClient {
                     EpochBackfillRunOutcome::NotPending => break,
                 }
             }
+        }
+        if let Some(verdict) = control.stopped() {
+            return Err(incomplete_full_history_repair(
+                SyncSummary::default(),
+                verdict,
+            ));
+        }
+        if self.delivery_overflow_recovery_pending {
+            let mut summary = SyncSummary::default();
+            self.recover_full_history_overflow_and_merge(&mut summary, control)
+                .await?;
+            let verdict = if self.delivery_overflow_recovery_pending {
+                DrainVerdict::Overflow
+            } else {
+                DrainVerdict::Complete
+            };
+            return self.finish_full_history_repair(summary, verdict).await;
         }
         self.runtime
             .activate_transport(None)
@@ -4010,10 +4204,22 @@ impl AppClient {
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
+        // Reconcile SDK-cached history once. Later slices drain the same query;
+        // reissuing it would replace the EOSE evidence we are waiting for.
+        self.reconcile_transport_history(unix_now_seconds())
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::Unknown,
+                )
+            })?;
         let mut counts = DrainCounts::default();
-        let (mut summary, mut verdict) = self.backfill_sdk_relay(&mut counts).await?;
+        let (mut summary, mut verdict) =
+            self.drain_full_history_repair(&mut counts, control).await?;
         if verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
-            self.recover_delivery_overflow_and_merge(&mut summary)
+            self.recover_full_history_overflow_and_merge(&mut summary, control)
                 .await?;
             verdict = if self.delivery_overflow_recovery_pending {
                 DrainVerdict::Overflow
@@ -4021,6 +4227,14 @@ impl AppClient {
                 DrainVerdict::Complete
             };
         }
+        self.finish_full_history_repair(summary, verdict).await
+    }
+
+    async fn finish_full_history_repair(
+        &mut self,
+        mut summary: SyncSummary,
+        verdict: DrainVerdict,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
             Err(error) => {
@@ -4106,7 +4320,6 @@ impl AppClient {
             });
         self.refresh_group(group_id);
 
-        let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
         summary.projection_updates.extend(failed_updates);
@@ -4115,7 +4328,6 @@ impl AppClient {
         let routes_dirty = self
             .observe_account_device_effects(
                 effects,
-                &display_names,
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
@@ -4283,7 +4495,14 @@ impl AppClient {
         }
         let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
             && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
-        self.app.remember_directory_message_sender(&message)?;
+        if let Err(error) = self.app.remember_directory_message_sender(&message) {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "project_received_message",
+                error_kind = error.privacy_safe_kind(),
+                "projecting message without directory enrichment",
+            );
+        }
         let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
             && self.delete_moderation_grant(&message.group_id, &message.sender);
         let message_projection = AppMessageProjection {
@@ -4565,14 +4784,42 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
+    fn display_names_for_events(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+    ) -> HashMap<String, String> {
+        let senders = events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::MessageReceived { sender, .. } => {
+                    Some(hex::encode(sender.as_slice()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Enrichment must not discard effects the engine already consumed.
+        match self.app.display_names_for_account_ids(&senders) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "display_names_for_events",
+                    error_kind = error.privacy_safe_kind(),
+                    "projecting events without display names",
+                );
+                HashMap::new()
+            }
+        }
+    }
+
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
-        display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
     ) -> Result<bool, AppError> {
+        let display_names = self.display_names_for_events(&effects.events);
         self.note_superseded_intent_reports(effects);
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
@@ -4628,7 +4875,7 @@ impl AppClient {
                 .transpose()?;
             if let Some(message) = observe_event(
                 &mut self.state,
-                display_names,
+                &display_names,
                 summary,
                 event,
                 group_projection.as_ref(),
@@ -5402,6 +5649,27 @@ mod tests {
                     retention: None,
                 });
         }
+        // A corrupt sender profile must not lose any already-ingested message,
+        // including during drained-event replay below.
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&storage_sqlite::PublicDirectoryUserRecord {
+                account_id_hex: account.account_id_hex.clone(),
+                npub: String::new(),
+                profile_json: Some("{".into()),
+                relay_lists_json: serde_json::to_string(&crate::AccountRelayListStatus::empty())
+                    .unwrap(),
+                key_package_json: None,
+                event_id_hex: None,
+                event_kind: None,
+                event_created_at: None,
+                follows: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            app.display_names_for_account_ids(std::slice::from_ref(&account.account_id_hex))
+                .is_err()
+        );
         match observation {
             ReleasedBatchObservation::Scheduled => {
                 client
@@ -5437,7 +5705,6 @@ mod tests {
                     client
                         .observe_account_device_effects(
                             &effects,
-                            &app.display_names_by_id().unwrap(),
                             &mut SyncSummary::default(),
                             &sources["released message 2"],
                             unix_now_seconds(),
@@ -6537,6 +6804,46 @@ mod tests {
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
 
+    #[tokio::test]
+    async fn idle_drain_skips_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&storage_sqlite::PublicDirectoryUserRecord {
+                account_id_hex: "ab".repeat(32),
+                npub: String::new(),
+                profile_json: Some("{".into()),
+                relay_lists_json: serde_json::to_string(&crate::AccountRelayListStatus::empty())
+                    .unwrap(),
+                key_package_json: None,
+                event_id_hex: None,
+                event_kind: None,
+                event_created_at: None,
+                follows: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            app.directory_entries().is_err(),
+            "unrelated profile is corrupt"
+        );
+        tokio::time::pause();
+        let (summary, verdict) = client
+            .drain_sdk_relay(
+                &mut DrainCounts::default(),
+                super::DrainCompletion::Quiescence,
+            )
+            .await
+            .unwrap();
+        assert!(summary.messages.is_empty());
+        assert_eq!(verdict, DrainVerdict::Complete);
+    }
+
     #[test]
     fn explicit_full_history_repair_requires_end_of_stored_events() {
         for verdict in [
@@ -6595,8 +6902,12 @@ mod tests {
         let source = failure.source.to_string();
         assert!(
             source.contains("backfill_drain_no_relay_eose")
-                || source.contains("backfill_drain_no_progress_quantum_yield"),
+                || source.contains("backfill_drain_no_progress_quantum_yield")
+                || source.contains("full_history_repair_deadline"),
             "the public failure must preserve the incomplete-drain cause; actual: {source}"
         );
     }
 }
+
+#[cfg(test)]
+mod full_history_tests;

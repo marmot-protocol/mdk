@@ -27,6 +27,10 @@ class ClassifyCiChangesTests(unittest.TestCase):
                 "run_conformance": False,
                 "run_ios": False,
                 "run_formal": False,
+                "run_binaries": False,
+                "run_hermes": False,
+                "run_openclaw": False,
+                "run_installers": False,
             },
         )
 
@@ -149,6 +153,54 @@ class ClassifyCiChangesTests(unittest.TestCase):
     def test_ci_workflow_change_runs_every_lane(self) -> None:
         result = classify([".github/workflows/ci.yml"])
         self.assertTrue(all(result.values()))
+
+    def test_plugin_only_changes_skip_native_binary_builds(self) -> None:
+        paths = [
+            "integrations/hermes/marmot/plugin.py",
+            "integrations/openclaw/marmot/src/index.ts",
+            "scripts/install-hermes-marmot.sh",
+        ]
+        self.assertFalse(classify(paths)["run_binaries"])
+        for native_input in [
+            "Cargo.lock",
+            "crates/agent-connector/src/main.rs",
+            "integrations/terminal-harness/src/lib.rs",
+            "scripts/package-binary-bundle.sh",
+            "scripts/classify_ci_changes.py",
+        ]:
+            with self.subTest(path=native_input):
+                self.assertTrue(classify(paths + [native_input])["run_binaries"])
+
+    def test_plugins_select_only_their_integration_jobs(self) -> None:
+        for path, lane in [
+            ("integrations/hermes/marmot/adapter.py", "run_hermes"),
+            ("scripts/hermes_marmot_deterministic_e2e.sh", "run_hermes"),
+            ("integrations/openclaw/marmot/src/index.ts", "run_openclaw"),
+            ("integrations/openclaw/marmot/README.md", "run_openclaw"),
+        ]:
+            with self.subTest(path=path):
+                selected = {key for key, run in classify([path]).items() if run}
+                self.assertEqual(selected, {lane})
+
+    def test_shared_control_contract_preserves_plugin_checks(self) -> None:
+        for path in [
+            "crates/agent-control/src/lib.rs",
+            "crates/agent-connector/src/main.rs",
+            "Cargo.toml",
+            ".github/workflows/wn-agent-binaries.yml",
+        ]:
+            with self.subTest(path=path):
+                lanes = classify([path])
+                self.assertTrue(lanes["run_binaries"])
+                self.assertTrue(lanes["run_hermes"])
+                self.assertTrue(lanes["run_openclaw"])
+
+    def test_engine_change_skips_unrelated_installer_and_plugin_jobs(self) -> None:
+        lanes = classify(["crates/cgka-engine/src/lib.rs"])
+        self.assertTrue(lanes["run_full"])
+        self.assertFalse(lanes["run_hermes"])
+        self.assertFalse(lanes["run_openclaw"])
+        self.assertFalse(lanes["run_installers"])
 
     def test_empty_or_manual_classification_fails_open_to_full_ci(self) -> None:
         self.assertTrue(all(classify([]).values()))

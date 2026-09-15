@@ -35,8 +35,8 @@ c_mirror! {
         copy unread_count: u64,
         /// Number of eligible conversations that require badge attention.
         copy unread_conversations: u64,
-        /// Conversations with badge attention solely from a manual-unread
-        /// reminder (no unread messages). Pending invitations are excluded.
+        /// Active unarchived pending invitations (one each) and accepted manual
+        /// reminders with no unread messages. Invite message counts stay suppressed.
         copy attention_only_conversations: u64,
         /// Whether the account has any badge-worthy conversation.
         copy has_unread: bool,

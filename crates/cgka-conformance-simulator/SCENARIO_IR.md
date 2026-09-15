@@ -23,7 +23,9 @@ An executor accepts only canonical `ScenarioSpec` JSON. It compiles the entire d
 derives `declared_virtual_time_ms` as the sum of explicit `advance_time` deltas before every action, and preflights all
 adapter capabilities before executing action zero. A run report records that exact compiled schedule. Assertions and
 quiescence may advance the subject clock while an action executes, so the declared schedule is not described as the
-adapter's observed clock. Adapters do not interpret loops, concurrency, rates, or barriers.
+adapter's observed clock. Adapters do not interpret authoring loops, `parallel` blocks, rates, or barriers.
+Explicit canonical race actions define their own adapter execution semantics, including shared-barrier
+concurrent profile updates.
 
 Scenario IR v2's `update_group_data` action is the stable name-only operation. Scenario IR v3's
 `update_group_profile` action carries optional `name` and `description` fields and requires at least one of them. A
@@ -111,7 +113,7 @@ adapter and is not used as evidence of offline recovery.
 `assert` actions are executable and write samples to the common report/capsule schema:
 
 - `exactly` samples once at the current action boundary;
-- `eventually` samples now and after at most `max_iterations` deterministic participant tick rounds;
+- `eventually` samples now and after at most `max_iterations` participant tick rounds (deterministic for engine subjects; paced against wall time for real app subjects);
 - `within` samples now, then advances virtual time and ticks participants until the predicate matches or the deadline;
 - `never` requires the predicate to remain false at every sample through the virtual-time window; and
 - `resource` compares a structural-progress metric to an exact, upper, or lower bound.
@@ -124,6 +126,33 @@ are watchdogs rather than a redefinition of success. Predicate samples are non-d
 does not drain the event window that a later `observe` action records. Predicates that require exact canonical state add
 the exact-observation capability during compilation, so a semantic-only adapter rejects the complete schedule before
 action zero.
+
+For real app subjects, each unsuccessful `eventually` round includes catch-up and lasts at least one
+second. A total wall-clock watchdog of `(max_iterations + 1)` seconds includes the initial sample;
+slow remote operations consume that same budget. This keeps parallel catch-up from spending all
+polls before production convergence timers can fire. A matching initial sample still returns
+immediately, predicates remain unchanged, and exceeding either budget fails the assertion. Reports
+include `wall_timeout_ms` and `elapsed_wall_ms`; older reports deserialize without these optional
+fields. Deterministic engine subjects keep unpaced tick counts and omit wall-clock evidence.
+
+The process adapter supports `exactly` and `eventually` with `client_state` through the narrow
+`client_state_assertion` capability. It reads the public epoch/member count, samples once before ticking,
+and performs at most the declared number of catch-up rounds across running participants. An exhausted
+assertion stops the scenario with a failure capsule; `assertion_observations` records the predicate,
+source step, sample count and final public state separately from ordinary checkpoints. Virtual-time and
+private-state assertions remain subject to their separate capability checks before launch.
+
+A wall-clock deadline can expire before the first process `Observe` RPC completes. Such a failed report
+records `samples: 0`, `final_actual: null`, `passed: false`, and the elapsed/allowed wall time; it never
+invents a public state. With earlier completed samples, `final_actual` retains the last observed state.
+The failure capsule uses `scenario_assertion_timeout` for an elapsed wall deadline and
+`scenario_assertion_failed` for a sampled mismatch that exhausts the iteration allowance. Both stop
+execution and retain the private failure report. The strict cross-route validator accepts only successful
+execution evidence, so it must reject these reports; rejection does not make the diagnostic report malformed.
+
+The public cross-route scenario uses this bounded assertion before sending its branch witness: Yankee
+must have epoch 4 and four members before the scenario partitions the participants. Relay EOSE alone
+does not establish that state because app convergence can continue after a relay drain ends.
 
 ## Initial adapters
 
@@ -140,3 +169,37 @@ Canonical JSON is the portable artifact stored in vectors, failure capsules, and
 only an authoring convenience: parsing YAML must produce `ScenarioAuthoringSpec`, and the resulting canonical JSON is
 the reviewed/replayable input. Changing expansion semantics requires a new authoring version; changing canonical action
 meaning or serialization requires a new Scenario IR version.
+
+
+## Real app-runtime stimuli (v3)
+
+- `interrupt_relay { relay, outage_ms }` requires `relay_interruption`. The local app harness cuts live
+  sockets and refuses connections for 1–30,000 ms, restores service, and records actual socket and
+  running-runtime counts. Zero interrupted connections fails the stimulus check. This is real wall
+  time; it does not advertise virtual-clock control or replace `set_client_offline`.
+- `race_group_profiles { updates: [{ client, name?, description? }, ...] }` requires
+  `concurrent_group_mutation`. Preflight requires 2–8 distinct clients with nonempty edits. The app
+  harness validates the batch, releases callers from a shared barrier and records each outcome. All
+  requests must be accepted to exercise this action; scenario expectations separately assert the
+  surviving effects. The generated disjoint-field race requires both edits to survive.
+
+Reports add optional `stimulus_observations`, bound to compiler action IDs. Missing evidence, zero
+socket cuts, or refused concurrent inputs cannot turn into a green assurance report. Older report
+JSON remains readable because the field defaults to an empty array. V2 documents cannot select
+these v3 actions; incapable adapters refuse them before action zero.
+
+The v3 `public_payload_multiset` predicate takes `client` and `payloads`. It compares the complete
+visible public history, including multiplicity, from one participant snapshot. Empty expectations
+are valid. It requires the public app observation capability and supports the existing assertion
+modes; virtual-time modes still require an adapter with virtual time. Large app families use bounded
+`eventually` checks and independent terminal trace expectations. V2 rejects this predicate.
+
+### Generated invite/profile recovery
+
+`race_invite_profile` (v3) takes two distinct `actors`, a separate `invitee`,
+a nonempty `name`, and `restart_at_offer`. The app subject chooses the higher
+credential identity as inviter and releases invitation/rename calls together.
+The action requires a validated explicit rejoin offer, consent and durable
+confirmation after reopen. Optional offer-boundary restart also checks offer
+persistence. Refused or unexercised races retain their evidence and fail coverage.
+Final roster/profile and communication assertions remain separate IR actions.

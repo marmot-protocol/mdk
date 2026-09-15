@@ -1,4 +1,4 @@
-//! Account aggregates over the same durable eligibility keys as the Unread list.
+//! Account badges combine Unread-list attention with active pending invitations.
 use super::ChatListView;
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
@@ -10,7 +10,9 @@ pub struct AccountAttentionTotal {
     pub unread_count: u64,
     pub unread_mention_count: u64,
     pub unread_conversations: u64,
-    /// Manual reminders with no unread messages; never fabricates message counts.
+    /// Active pending invitations and accepted manual reminders with no unread messages.
+    /// Each invite contributes one, regardless of retained messages or manual intent.
+    /// `unread_count + attention_only_conversations` is the application badge.
     pub attention_only_conversations: u64,
 }
 impl AccountAttentionTotal {
@@ -34,15 +36,22 @@ impl SqliteAccountStorage {
         &self,
     ) -> StorageResult<(bool, AccountAttentionTotal)> {
         let conn = self.lock()?;
-        // Without the index constraint SQLite can prefer the broad Chats index,
-        // making even a two-chat unread total scan every quiet conversation.
+        // Pin both partial indexes so quiet/archived/Left rows cannot turn this into
+        // a full-list scan. The branches are disjoint: Unread suppresses invitations.
+        // Invites add one attention item, never their retained message/mention counts.
         conn.query_row_cached(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work),
                 COALESCE(SUM(unread_count), 0),
                 COALESCE(SUM(unread_mention_count), 0), COUNT(*),
                 COUNT(CASE WHEN unread_count = 0 THEN 1 END)
-                FROM chat_list_rows INDEXED BY idx_chat_list_unread_page WHERE {}",
+                FROM (
+                    SELECT unread_count, unread_mention_count
+                    FROM chat_list_rows INDEXED BY idx_chat_list_unread_page WHERE {}
+                    UNION ALL
+                    SELECT 0, 0 FROM chat_list_rows INDEXED BY idx_chat_list_invite_attention
+                    WHERE list_scope = 0 AND list_pending_invite = 1
+                )",
                 ChatListView::Unread.predicate()
             ),
             [],
@@ -57,16 +66,18 @@ impl SqliteAccountStorage {
             },
         )
         .storage()
-        .and_then(|(missing, unread, mentions, conversations, manual)| {
-            Ok((
-                missing,
-                AccountAttentionTotal {
-                    unread_count: i64_to_u64(unread)?,
-                    unread_mention_count: i64_to_u64(mentions)?,
-                    unread_conversations: i64_to_u64(conversations)?,
-                    attention_only_conversations: i64_to_u64(manual)?,
-                },
-            ))
-        })
+        .and_then(
+            |(missing, unread, mentions, conversations, attention_only)| {
+                Ok((
+                    missing,
+                    AccountAttentionTotal {
+                        unread_count: i64_to_u64(unread)?,
+                        unread_mention_count: i64_to_u64(mentions)?,
+                        unread_conversations: i64_to_u64(conversations)?,
+                        attention_only_conversations: i64_to_u64(attention_only)?,
+                    },
+                ))
+            },
+        )
     }
 }

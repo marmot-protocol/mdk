@@ -3,7 +3,8 @@
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
     AgentControlInvitePolicy, AgentControlProfileLookupStatus, AgentControlRequest,
-    AgentControlResponse, AgentControlSendMaintenanceDisposition, read_envelope, write_frame,
+    AgentControlResponse, AgentControlSendMaintenanceDisposition, decode_frame, encode_frame,
+    read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -3200,6 +3201,277 @@ async fn connector_socket_sends_final_message() {
     assert!(!message_ids_hex[0].is_empty());
 
     server.await.unwrap().unwrap();
+}
+
+fn assert_group_info(
+    response: AgentControlResponse,
+    account_id_hex: &str,
+    group_id_hex: &str,
+    member_count: u32,
+    is_direct: bool,
+    subject: Option<&str>,
+) {
+    let AgentControlResponse::GroupInfo {
+        account_id_hex: got_account,
+        group_id_hex: got_group,
+        member_count: got_members,
+        is_direct: got_direct,
+        subject: got_subject,
+    } = response
+    else {
+        panic!("expected group_info response, got {response:?}");
+    };
+    assert_eq!(got_account, account_id_hex);
+    assert_eq!(got_group, group_id_hex);
+    assert_eq!(got_members, member_count);
+    assert_eq!(got_direct, is_direct);
+    assert_eq!(got_subject.as_deref(), subject);
+}
+
+fn round_trip_group_info(response: AgentControlResponse) -> AgentControlResponse {
+    let encoded = encode_frame(&response).unwrap();
+    decode_frame(&encoded).unwrap()
+}
+
+#[test]
+fn group_info_subject_mapping_ignores_missing_blank_and_projection_errors() {
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(Some("  Café ☕  "))),
+        Some("Café ☕".to_owned())
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(Some("   \t"))),
+        None
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(Some(""))),
+        None
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(None::<String>)),
+        None
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection(Err::<Option<&str>, _>(
+            AppError::UnknownGroup("missing-row".to_owned())
+        )),
+        None
+    );
+}
+
+#[test]
+fn group_info_framing_preserves_named_subject_and_omits_absent_subject() {
+    let named = AgentControlResponse::GroupInfo {
+        account_id_hex: "aa".repeat(32),
+        group_id_hex: "bb".repeat(16),
+        member_count: 3,
+        is_direct: false,
+        subject: Some("Café ☕".to_owned()),
+    };
+    let decoded = round_trip_group_info(named.clone());
+    assert_eq!(decoded, named);
+    let named_json = String::from_utf8(encode_frame(&named).unwrap()).unwrap();
+    assert!(named_json.contains("\"subject\":\"Café ☕\""));
+
+    let absent = AgentControlResponse::GroupInfo {
+        account_id_hex: "aa".repeat(32),
+        group_id_hex: "bb".repeat(16),
+        member_count: 2,
+        is_direct: true,
+        subject: None,
+    };
+    let absent_json = String::from_utf8(encode_frame(&absent).unwrap()).unwrap();
+    assert!(
+        !absent_json.contains("subject"),
+        "absent subject must stay omitted for backward compatibility: {absent_json}"
+    );
+    assert_eq!(round_trip_group_info(absent.clone()), absent);
+
+    let legacy = format!(
+        r#"{{"type":"group_info","account_id_hex":"{}","group_id_hex":"{}","member_count":2,"is_direct":true}}"#,
+        "aa".repeat(32),
+        "bb".repeat(16)
+    );
+    let decoded: AgentControlResponse = decode_frame(legacy.as_bytes()).unwrap();
+    assert_group_info(decoded, &"aa".repeat(32), &"bb".repeat(16), 2, true, None);
+}
+
+#[tokio::test]
+async fn group_info_reads_current_chat_list_group_name_without_using_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let other_agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let other_human = setup_runtime.create_identity(setup).await.unwrap();
+    let named_group = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "  Café ☕  ",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let unnamed_group = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "   ",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let other_group = setup_runtime
+        .create_group(
+            &other_agent.account.account_id_hex,
+            "Other Room",
+            std::slice::from_ref(&other_human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let named_group_hex = hex::encode(named_group.as_slice());
+    let unnamed_group_hex = hex::encode(unnamed_group.as_slice());
+    let other_group_hex = hex::encode(other_group.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket,
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let named = connector
+        .group_info_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    assert_group_info(
+        named.clone(),
+        &agent.account.account_id_hex,
+        &named_group_hex,
+        2,
+        true,
+        Some("Café ☕"),
+    );
+    assert_eq!(round_trip_group_info(named.clone()), named);
+
+    let unnamed = connector
+        .group_info_response(&agent.account.account_id_hex, &unnamed_group_hex)
+        .await
+        .unwrap();
+    let unnamed_row = connector
+        .runtime
+        .chat_list_row(&agent.account.label, &unnamed_group_hex)
+        .unwrap()
+        .expect("unnamed chat-list row");
+    assert_eq!(unnamed_row.title, unnamed_group_hex);
+    assert!(unnamed_row.group_name.trim().is_empty());
+    assert_group_info(
+        unnamed.clone(),
+        &agent.account.account_id_hex,
+        &unnamed_group_hex,
+        2,
+        true,
+        None,
+    );
+    assert_eq!(round_trip_group_info(unnamed.clone()), unnamed);
+
+    let other = connector
+        .group_info_response(&other_agent.account.account_id_hex, &other_group_hex)
+        .await
+        .unwrap();
+    assert_group_info(
+        other,
+        &other_agent.account.account_id_hex,
+        &other_group_hex,
+        2,
+        true,
+        Some("Other Room"),
+    );
+
+    connector
+        .runtime
+        .update_group_profile(
+            &agent.account.account_id_hex,
+            &named_group,
+            Some("Bridge".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let renamed = connector
+        .group_info_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    assert_group_info(
+        renamed,
+        &agent.account.account_id_hex,
+        &named_group_hex,
+        2,
+        true,
+        Some("Bridge"),
+    );
+
+    connector
+        .runtime
+        .update_group_profile(
+            &agent.account.account_id_hex,
+            &named_group,
+            Some(String::new()),
+            None,
+        )
+        .await
+        .unwrap();
+    let cleared = connector
+        .group_info_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    let cleared_row = connector
+        .runtime
+        .chat_list_row(&agent.account.label, &named_group_hex)
+        .unwrap()
+        .expect("cleared chat-list row");
+    assert_eq!(cleared_row.title, named_group_hex);
+    assert_group_info(
+        cleared,
+        &agent.account.account_id_hex,
+        &named_group_hex,
+        2,
+        true,
+        None,
+    );
+
+    let missing_group = hex::encode([0xab; 16]);
+    let missing = connector
+        .group_info_response(&agent.account.account_id_hex, &missing_group)
+        .await;
+    assert!(
+        missing.is_err(),
+        "unknown group must keep failing as a membership error"
+    );
 }
 
 #[tokio::test]

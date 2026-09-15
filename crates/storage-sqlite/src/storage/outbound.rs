@@ -1,5 +1,6 @@
 use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
+use crate::message_drafts::revisioned::{DraftAcceptance, accept_submission_tx};
 use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
 use cgka_traits::OutboundFanout;
 use cgka_traits::storage::{
@@ -13,12 +14,12 @@ impl OutboundIntentStorage for SqliteAccountStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
         // #484: the queued-outbound path is taken by `Engine::do_send` when
         // convergence is unsettled, so this is a real user message-send write.
-        // It is a single autocommit statement, so the whole statement is safe
-        // to retry on transient lock contention from a concurrent writer.
+        // Accepting the queue and releasing its submitted draft share one transaction.
         let serialized = serialize(record)?;
         let created_at = created_at_to_i64(record.created_at_ms)?;
         let write = || {
-            let conn = self.lock()?;
+            let mut connection = self.lock()?;
+            let conn = connection.savepoint().storage()?;
             conn.execute_cached(
                 "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
                  VALUES (?1, ?2, ?3, ?4)
@@ -34,13 +35,24 @@ impl OutboundIntentStorage for SqliteAccountStorage {
                 ],
             )
             .storage()?;
-            Ok(())
+            let changed =
+                if let cgka_traits::SendIntent::AppMessage { payload, .. } = &record.intent {
+                    accept_submission_tx(
+                        &conn,
+                        &hex::encode(record.group_id.as_slice()),
+                        DraftAcceptance::Payload(payload),
+                    )
+                } else {
+                    Ok(false)
+                }?;
+            conn.commit().storage()?;
+            Ok(changed)
         };
-        if self.connection.is_current_thread_transaction_owner() {
-            write()
-        } else {
-            retry_on_busy(write)
+        let changed = self.connection.with_transaction(write)?;
+        if changed {
+            self.notify_message_draft_committed(&hex::encode(record.group_id.as_slice()));
         }
+        Ok(())
     }
 
     fn list_queued_outbound_intents(
@@ -189,7 +201,8 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
     fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()> {
         let serialized = serialize(fanout)?;
         let write = || {
-            let conn = self.lock()?;
+            let mut connection = self.lock()?;
+            let conn = connection.savepoint().storage()?;
             let previous = conn
                 .query_row_cached(
                     "SELECT record FROM cgka_outbound_fanout WHERE message_id = ?1",
@@ -220,13 +233,23 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
                 ],
             )
             .storage()?;
-            Ok(())
+            let changed = if let Some(message) = fanout.application_message() {
+                accept_submission_tx(
+                    &conn,
+                    &hex::encode(message.group_id.as_slice()),
+                    DraftAcceptance::Event(&message.app_event_id),
+                )
+            } else {
+                Ok(false)
+            }?;
+            conn.commit().storage()?;
+            Ok(changed)
         };
-        if self.connection.is_current_thread_transaction_owner() {
-            write()
-        } else {
-            retry_on_busy(write)
+        let changed = self.connection.with_transaction(write)?;
+        if changed && let Some(message) = fanout.application_message() {
+            self.notify_message_draft_committed(&hex::encode(message.group_id.as_slice()));
         }
+        Ok(())
     }
 
     fn outbound_fanout(&self, message_id: &MessageId) -> StorageResult<Option<OutboundFanout>> {

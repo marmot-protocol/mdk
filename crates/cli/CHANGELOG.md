@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- WN Agent `group_info` now returns the current Marmot chat-list group name as `subject`
+  when that name is nonempty, and Hermes uses it for `get_chat_info` and activated inbound
+  display. Missing, blank, or unusable names still fall back to
+  `Marmot <first 12 hex characters>`. Display names are read fresh each lookup and never
+  become routing ids, authorization facts, or cache keys.
+
 - Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
   commands and independent live account-attention summaries across Swift/Kotlin and C.
   Existing list/read APIs and C record layouts remain; new typed window errors append
@@ -99,11 +105,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   the backend in that group no longer survive the turn; run long-lived services
   under a separate supervisor. Output draining after backend exit is limited to
   two seconds so inherited pipe handles cannot stall a completed turn.
-- MarmotKit `accountUnreadSummary()` now follows the Unread chat-list eligibility:
-  pending invitations, archived chats, and departed or departing groups do not
-  contribute to account attention. Muted active chats still count; manual unread
-  reminders add conversation attention without inventing message or mention counts.
-  Existing binding layouts are unchanged; invitation badges remain a separate source.
+- MarmotKit `accountUnreadSummary()` and live account-attention totals include one
+  `attentionOnlyConversations` item per active unarchived pending invitation. Use
+  `unreadCount + attentionOnlyConversations` for the application badge; do not add
+  invitations separately. Invite messages/mentions remain suppressed until acceptance.
+  Archived and departed/departing chats contribute nothing. Muted active chats and
+  accepted manual-only reminders still count. Unread-list membership and binding
+  layouts are unchanged.
 
 - The runtime's `send_media_attachments` (MarmotKit and `wn media send`) refuses a media reference whose
   `source_epoch` differs from the group's current epoch with the new typed `AppError::MediaReferenceStaleEpoch`
@@ -146,7 +154,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   slot. `wn keys list` follows that current-slot inventory; `wn keys delete-all
   --confirm` still publishes deletions for every observed relay event, including
   superseded same-slot members. Sign-out and wipe use the same all-event cleanup.
-- Account storage advances through migrations 70–71. Back up before upgrading;
+- Account storage advances through migrations 70–74 (local group reset boundaries,
+  chat navigation, revisioned drafts and invitation attention). Back up before upgrading;
   downgrade is unsupported. Restore a pre-upgrade backup or re-upgrade instead.
   Keep native libraries and generated bindings on matching versions.
 - Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
@@ -215,7 +224,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   fixed sleeps, and fails closed if delete or factory registration is missing. The probe's fake
   control endpoint runs on a private thread so pinned Hermes 0.19.0 can acknowledge progress
   without deadlocking the host event loop.
-
+- Hermes chat metadata now rejects non-string `group_info` account and group identities before
+  accepting a subject, so a JSON integer whose decimal spelling matches an all-digit hex id
+  falls back to `Marmot <first 12 hex characters>` instead of using the supplied name.
 - `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
   directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran
   the wn-home directory helper against that directory and chmod-ed it to `0700`, removing other users' access to a

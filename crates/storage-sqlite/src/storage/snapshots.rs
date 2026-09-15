@@ -5,6 +5,8 @@ mod lifecycle;
 mod restore;
 mod rows;
 
+pub(crate) use capture::replay_fingerprint;
+
 use crate::SqliteAccountStorage;
 use cgka_traits::storage::StorageResult;
 use cgka_traits::types::GroupId;
@@ -115,6 +117,150 @@ mod tests {
     };
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+    #[test]
+    fn replay_fingerprint_ignores_foreign_work_writes_but_tracks_secret_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let key = crate::SqlCipherKey::new("replay fingerprint fixture").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        let mls_id = openmls::group::GroupId::from_slice(group.id.as_slice());
+        store
+            .mls_storage()
+            .write_group_state(&mls_id, &TestGroupState(vec![1]))
+            .unwrap();
+        store
+            .create_group_state_snapshot(&group.id, "anchor")
+            .unwrap();
+        let fingerprint = store.group_replay_state_fingerprint(&group.id).unwrap();
+        let generation = store.mls_write_generation();
+        writer
+            .put_message(&sample_message(mid(1), group.id.clone(), 1))
+            .unwrap();
+        writer
+            .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
+            .unwrap();
+        assert_ne!(generation, store.mls_write_generation());
+        assert!(fingerprint == store.group_replay_state_fingerprint(&group.id).unwrap());
+        writer
+            .mls_storage()
+            .write_group_state(&mls_id, &TestGroupState(vec![2]))
+            .unwrap();
+        assert!(fingerprint != store.group_replay_state_fingerprint(&group.id).unwrap());
+        store
+            .rollback_group_state_to_snapshot(&group.id, "anchor")
+            .unwrap();
+        assert!(fingerprint == store.group_replay_state_fingerprint(&group.id).unwrap());
+        let generation = store.mls_write_generation();
+        store
+            .with_transaction(|store| {
+                assert!(fingerprint == store.group_replay_state_fingerprint(&group.id)?);
+                Ok::<(), StorageError>(())
+            })
+            .unwrap();
+        assert_eq!(
+            generation,
+            store.mls_write_generation(),
+            "fingerprinting must be read-only"
+        );
+    }
+
+    #[test]
+    fn replay_fingerprint_tracks_retained_snapshot_and_checkpoint_contents() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        store
+            .create_group_state_snapshot(&group.id, "anchor")
+            .unwrap();
+        let checkpoint = GroupStateCheckpointRef {
+            id: "own-commit".into(),
+            resulting_epoch: EpochId(1),
+        };
+        store
+            .create_group_state_checkpoint(&group.id, &checkpoint)
+            .unwrap();
+        let baseline = store.group_replay_state_fingerprint(&group.id).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE cgka_group_snapshots SET snapshot = x'01'", [])
+            .unwrap();
+        let changed_anchor = store.group_replay_state_fingerprint(&group.id).unwrap();
+        assert!(
+            baseline != changed_anchor,
+            "same snapshot name must not hide replacement bytes"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cgka_group_state_checkpoints SET resulting_epoch = 2",
+                [],
+            )
+            .unwrap();
+        let changed_epoch = store.group_replay_state_fingerprint(&group.id).unwrap();
+        assert!(changed_anchor != changed_epoch);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cgka_group_state_checkpoints SET checkpoint = x'02'",
+                [],
+            )
+            .unwrap();
+        assert!(changed_epoch != store.group_replay_state_fingerprint(&group.id).unwrap());
+    }
+
+    #[test]
+    fn replay_fingerprint_reads_one_consistent_cross_connection_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let key = crate::SqlCipherKey::new("replay fingerprint atomic fixture").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let group_id = gid(1);
+        let set_state = |storage: &SqliteAccountStorage, value: u8| {
+            storage
+                .with_transaction(|storage| {
+                    let mut group = sample_group(gid(1), 1, 1);
+                    group.name = value.to_string();
+                    storage.put_group(&group)?;
+                    storage
+                        .mls_storage()
+                        .write_group_state(
+                            &openmls::group::GroupId::from_slice(group.id.as_slice()),
+                            &TestGroupState(vec![value]),
+                        )
+                        .unwrap();
+                    storage.create_group_state_snapshot(&group.id, "anchor")?;
+                    Ok::<(), StorageError>(())
+                })
+                .unwrap();
+        };
+        set_state(&writer, 0);
+        let a = store.group_replay_state_fingerprint(&group_id).unwrap();
+        set_state(&writer, 1);
+        let b = store.group_replay_state_fingerprint(&group_id).unwrap();
+        assert!(a != b);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..100 {
+                    set_state(&writer, i % 2);
+                }
+            });
+            for _ in 0..200 {
+                let observed = store.group_replay_state_fingerprint(&group_id).unwrap();
+                assert!(
+                    observed == a || observed == b,
+                    "fingerprint mixed two committed states"
+                );
+            }
+        });
+    }
 
     #[test]
     fn snapshot_rollback_restores_group_messages_queue_caps_and_openmls_group_state() {

@@ -68,19 +68,17 @@ pub struct AccountUnreadTotal {
     /// Unread messages in eligible active, accepted, unarchived conversations.
     pub unread_count: u64,
     /// Number of eligible conversations that require badge attention:
-    /// unread messages, or an independent manual-unread reminder.
+    /// unread messages, a manual-unread reminder, or a pending invitation.
     pub unread_conversations: u64,
-    /// Unarchived conversations that contribute badge attention solely because
-    /// they are manually marked unread. A row that
-    /// already has `unread_count > 0` is omitted so
+    /// Active unarchived pending invitations (one each) and accepted manual
+    /// reminders with no unread messages. Invite message counts stay suppressed.
     /// `unread_count + attention_only_conversations` is the application badge.
     pub attention_only_conversations: u64,
 }
 
 impl AccountUnreadTotal {
     /// Whether the account has any badge-worthy conversation, including a
-    /// manual-only reminder with no unread incoming
-    /// messages.
+    /// pending invitation or manual-only reminder with no unread messages.
     pub fn has_unread(&self) -> bool {
         self.unread_conversations > 0
     }
@@ -618,9 +616,10 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Unread aggregate over the same durable eligibility keys as `ChatListView::Unread`.
-    /// Excludes invitations, archived chats and departed or departing groups.
-    /// Manual-only reminders contribute attention without adding message counts.
+    /// Badge aggregate combining `ChatListView::Unread` with active pending invitations.
+    /// Archived chats and departed or departing groups contribute nothing.
+    /// Each invite and each accepted manual-only reminder contributes one attention
+    /// item without adding message counts.
     /// This legacy getter assumes base rows are ready; `account_attention_total`
     /// reports missing base rows explicitly. Neither getter materializes timelines.
     pub fn account_unread_total(&self) -> StorageResult<AccountUnreadTotal> {

@@ -1,7 +1,7 @@
 ---
 title: "Bounded conversation opening"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 status: implementation
 ---
 
@@ -30,6 +30,13 @@ Results are in ascending canonical order with exact `has_more_before` and `has_m
 uses the existing source epoch/phase/time/identity key, not timestamp alone. Reply previews use the existing bounded
 hydration path. The limit bounds row count and SQL work, not the total bytes of message content.
 
+M4's storage preparation adds `conversation_window(ConversationWindowQuery)`. It reuses this same read and
+recovery path but accepts an explicit number of rows before the retained anchor. The future actor can extend
+older/newer context or trim at the 200-row cap while preserving a client-reported viewport identity. A placement
+outside the row budget returns `InvalidAnchorPosition`; missing edge context is filled from the other side.
+Latest targets (including Automatic without a first unread) always read the tail and ignore placement.
+The legacy opening API retains centered placement. This primitive alone is not a live subscription.
+
 Tokens are opaque Rust values scoped to a database's durable store epoch and a group. They survive reopening the
 same database while held by the caller; they have no serialization or cross-process/native wire contract yet.
 Copying a database also copies its scope identity. A different store or group returns `AnchorScopeMismatch`.
@@ -43,7 +50,19 @@ network work. Closed storage remains closed.
 The read requires the group's unread membership to be prepared, without pending dirty message entries, and aligned
 with its durable read marker and chat-list summary. `ReadStateNotReady` asks the existing projection owner to prepare
 or refresh that group before retrying. It does not trigger a history scan on the opening path. Raw unread counters
-are deliberately distinct from C4 attention eligibility, which suppresses pending/archived/departed conversations.
+are deliberately distinct from C4 account attention: each active unarchived pending invitation adds one
+attention-only item, while archived and departed/departing conversations contribute nothing. Invitation
+message/mention counts remain suppressed until acceptance; the Unread filtered list still excludes invitations.
+
+M4 also adds `conversation_account_snapshot`: the opening page and read state, authenticated system-row
+provenance, selected title/avatar inputs, revisioned draft descriptors, and persisted archive/admin/leave controls
+share the same deferred transaction. It moves the timeline into the immutable provenance page, without copying a
+second transcript. The keyed presentation-input getter now uses a deferred read as well. A second WAL connection
+can commit during either read; those changes appear on the next snapshot.
+
+This is the account-data boundary, not an engine authority capture. In-memory lifecycle and MLS-backed capability
+facts must still be captured coherently by the worker before the live screen API can compose them. Directory
+identity enrichment remains a separate consistency domain.
 
 ## Inputs to later screen composition
 

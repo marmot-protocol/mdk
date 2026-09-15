@@ -267,26 +267,25 @@ fn ensure_can_remove_members(
     member_refs: &[String],
 ) -> Result<(), MarmotKitError> {
     ensure_group_admin(state, group_id_hex)?;
+    let admin_count = state
+        .member_actions
+        .iter()
+        .filter(|member| member.is_admin)
+        .count();
     for member_ref in member_refs {
-        let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
+        let (action, _) = group_member_action(state, group_id_hex, member_ref)?;
         if action.is_self {
             return Err(MarmotKitError::AdminCannotSelfRemove {
                 group_id_hex: group_id_hex.to_string(),
             });
         }
-        if !action.can_remove && action.is_admin {
+        if action.is_admin && admin_count == 1 {
             return Err(MarmotKitError::WouldRemoveLastAdmin {
                 group_id_hex: group_id_hex.to_string(),
             });
         }
-        if !action.can_remove {
-            return Err(MarmotKitError::Runtime {
-                details: format!(
-                    "member {} cannot be removed from group {}",
-                    normalized.account_id_hex, group_id_hex
-                ),
-            });
-        }
+        // Display gates (pending invitation, frozen/disbanding state) do not
+        // establish a command refusal. The runtime validates current policy.
     }
     Ok(())
 }
@@ -324,6 +323,40 @@ fn ensure_can_demote_admin(
     if state.is_last_admin {
         return Err(MarmotKitError::WouldRemoveLastAdmin {
             group_id_hex: group_id_hex.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_can_request_leave(
+    state: &GroupManagementStateFfi,
+    group_id_hex: &str,
+) -> Result<(), MarmotKitError> {
+    // A fast-path reject only, not the source of correctness: this read and
+    // the worker command that acts on it are not atomic, so two concurrent
+    // leaves can both pass here. The engine settles it under its own lock and
+    // returns `EngineError::LeaveAlreadyRequested`, which maps to this same
+    // variant — see `MarmotKitError::from_engine_error`.
+    //
+    // Keep pending intent ahead of the roster/admin preflight: a durable
+    // leave can coexist with a locally classified departure.
+    if state.leave_request_pending {
+        return Err(MarmotKitError::LeaveAlreadyRequested {
+            group_id_hex: group_id_hex.to_owned(),
+        });
+    }
+    if state.requires_self_demote_before_leave {
+        return Err(MarmotKitError::AdminCannotSelfRemove {
+            group_id_hex: group_id_hex.to_owned(),
+        });
+    }
+    // `can_leave` is a display hint and is also false for invitations or
+    // frozen/disbanding groups. It cannot prove missing membership. Let
+    // the runtime report its current lifecycle/policy refusal for those.
+    if !state.member_actions.iter().any(|member| member.is_self) {
+        return Err(MarmotKitError::MemberNotInGroup {
+            group_id_hex: group_id_hex.to_owned(),
+            member_id_hex: state.my_account_id_hex.clone(),
         });
     }
     Ok(())
@@ -777,31 +810,7 @@ impl Marmot {
         let group_id_hex = hex::encode(group_id.as_slice());
         let state =
             group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
-        // A fast-path reject only, not the source of correctness: this read and
-        // the worker command that acts on it are not atomic, so two concurrent
-        // leaves can both pass here. The engine settles it under its own lock and
-        // returns `EngineError::LeaveAlreadyRequested`, which maps to this same
-        // variant — see `MarmotKitError::from_engine_error`.
-        //
-        // Checked before the two below because a pending leave also clears
-        // `can_leave`, so letting them run would report a wrong reason
-        // (`MemberNotInGroup`) for a group the account is very much still in.
-        if state.leave_request_pending {
-            return Err(MarmotKitError::LeaveAlreadyRequested {
-                group_id_hex: group_id_hex.clone(),
-            });
-        }
-        if state.requires_self_demote_before_leave {
-            return Err(MarmotKitError::AdminCannotSelfRemove {
-                group_id_hex: group_id_hex.clone(),
-            });
-        }
-        if !state.can_leave {
-            return Err(MarmotKitError::MemberNotInGroup {
-                group_id_hex: group_id_hex.clone(),
-                member_id_hex: state.my_account_id_hex,
-            });
-        }
+        ensure_can_request_leave(&state, &group_id_hex)?;
         let summary = self.runtime.leave_group(&account_ref, &group_id).await?;
         Ok(summary.into())
     }
@@ -1556,12 +1565,49 @@ mod tests {
     }
 
     #[test]
+    fn remove_preflight_uses_role_and_target_not_display_capabilities() {
+        let mut state = state(true, false);
+        let target = state.member_actions[1].member_id_hex.clone();
+        for is_admin in [false, true] {
+            state.member_actions[1].is_admin = is_admin;
+            state.member_actions[1].can_remove = false;
+            assert!(
+                ensure_can_remove_members(&state, "group", std::slice::from_ref(&target)).is_ok()
+            );
+        }
+        let own = state.my_account_id_hex.clone();
+        assert!(matches!(
+            ensure_can_remove_members(&state, "group", &[own]),
+            Err(MarmotKitError::AdminCannotSelfRemove { .. })
+        ));
+    }
+
+    #[test]
     fn promote_preflight_returns_already_admin() {
         let group_id_hex = "01".repeat(32);
         let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let err = ensure_can_promote_admin(&state(true, false), &group_id_hex, member_id)
             .expect_err("promoting an admin should fail");
         assert!(matches!(err, MarmotKitError::AlreadyAdmin { .. }));
+    }
+
+    #[test]
+    fn leave_preflight_does_not_confuse_disabled_display_with_missing_membership() {
+        let mut state = state(false, false);
+        state.can_leave = false;
+        // Frozen/pending groups retain a self roster entry. The runtime owns
+        // the lifecycle refusal (or the explicit pending-invite departure).
+        assert!(ensure_can_request_leave(&state, "group").is_ok());
+        state.member_actions.retain(|member| !member.is_self);
+        assert!(matches!(
+            ensure_can_request_leave(&state, "group"),
+            Err(MarmotKitError::MemberNotInGroup { .. })
+        ));
+        state.leave_request_pending = true;
+        assert!(matches!(
+            ensure_can_request_leave(&state, "group"),
+            Err(MarmotKitError::LeaveAlreadyRequested { .. })
+        ));
     }
 
     #[test]

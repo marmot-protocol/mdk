@@ -258,3 +258,5 @@ use, and coverage across the boundary while keeping the authenticated input and 
 The practical success criterion is not “no failures in a very large number.” It is that high-risk interactions are
 reachable, strict oracles would detect their relevant defects, failures replay and minimize, operating envelopes are
 measured, and the same representative semantics survive increasingly production-shaped subjects.
+
+See [app recovery expansion](APP_RECOVERY_EXPANSION.md) for generated contracts and weekly/manual campaign selection.

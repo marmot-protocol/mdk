@@ -190,6 +190,24 @@ pub enum ScenarioStep {
         allow: Vec<String>,
     },
     ClearPartition,
+    /// Cut live relay sockets while all app runtimes remain alive, then restore service.
+    InterruptRelay {
+        relay: String,
+        outage_ms: u64,
+    },
+    /// Force the higher-identity invitation to compete with a profile edit,
+    /// then require durable explicit recipient recovery through public APIs.
+    RaceInviteProfile {
+        actors: Vec<String>,
+        invitee: String,
+        name: String,
+        restart_at_offer: bool,
+    },
+    /// Release independent public profile calls at one barrier. All must be accepted;
+    /// semantic expected outcomes still decide whether their effects survive.
+    RaceGroupProfiles {
+        updates: Vec<crate::ScenarioProfileUpdate>,
+    },
     RestartClient {
         client: String,
     },
@@ -270,6 +288,9 @@ impl ScenarioStep {
         "reorder_messages",
         "set_partition",
         "clear_partition",
+        "interrupt_relay",
+        "race_invite_profile",
+        "race_group_profiles",
         "restart_client",
         "set_client_offline",
         "reconnect_client",
@@ -336,6 +357,9 @@ impl ScenarioStep {
             ScenarioStep::ReorderMessages { .. } => "reorder_messages",
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
+            ScenarioStep::InterruptRelay { .. } => "interrupt_relay",
+            ScenarioStep::RaceInviteProfile { .. } => "race_invite_profile",
+            ScenarioStep::RaceGroupProfiles { .. } => "race_group_profiles",
             ScenarioStep::RestartClient { .. } => "restart_client",
             ScenarioStep::SetClientOffline { .. } => "set_client_offline",
             ScenarioStep::ReconnectClient { .. } => "reconnect_client",
@@ -369,6 +393,8 @@ pub struct ScenarioReport {
     pub assertion_observations: Vec<crate::ScenarioAssertionObservationV2>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_sync_observations: Vec<crate::RelaySyncObservationV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stimulus_observations: Vec<crate::ScenarioStimulusObservation>,
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
@@ -411,6 +437,8 @@ pub struct ScenarioReportMetadata {
     pub storage_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<SubjectDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_layout: Option<serde_json::Value>,
     pub generated: Option<GeneratedScenarioMetadata>,
     pub fixture: Option<VectorFixtureMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1133,6 +1161,23 @@ async fn execute_scenario_step(
         ScenarioStep::ClearPartition => subject_faults(subject, step_index)?
             .clear_partition()
             .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::InterruptRelay { relay, outage_ms } => subject
+            .interrupt_relay(action_id, relay, *outage_ms)
+            .await
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RaceInviteProfile {
+            actors,
+            invitee,
+            name,
+            restart_at_offer,
+        } => subject
+            .race_invite_profile(action_id, actors, invitee, name, *restart_at_offer)
+            .await
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RaceGroupProfiles { updates } => subject
+            .race_group_profiles(action_id, updates)
+            .await
+            .map_err(|error| subject_step_error(step_index, error))?,
         ScenarioStep::RestartClient { client } => {
             subject
                 .restart(client)
@@ -1207,6 +1252,8 @@ async fn execute_assertion(
     let mut samples = 0_usize;
     let mut elapsed_virtual_ms = 0_u64;
     let mut final_actual = serde_json::Value::Null;
+    let mut wall_timeout_ms = None;
+    let mut elapsed_wall_ms = None;
     let passed = match assertion {
         ScenarioAssertionV2::Exactly { predicate } => {
             let observation = subject.evaluate_predicate(predicate)?;
@@ -1218,19 +1265,28 @@ async fn execute_assertion(
             predicate,
             max_iterations,
         } => {
+            let wait = crate::assertion_wait::AssertionWait::new(
+                *max_iterations,
+                subject.uses_wall_clock_assertions(),
+            );
             let mut matched = false;
             for iteration in 0..=*max_iterations {
                 let observation = subject.evaluate_predicate(predicate)?;
                 samples += 1;
                 final_actual = observation.actual;
-                if observation.matched {
+                if observation.matched && !wait.expired() {
                     matched = true;
                     break;
                 }
-                if iteration < *max_iterations {
-                    subject.tick(clients).await?;
+                if wait.expired()
+                    || iteration == *max_iterations
+                    || !wait.tick(subject.tick(clients)).await?
+                {
+                    break;
                 }
             }
+            wall_timeout_ms = wait.timeout_ms();
+            elapsed_wall_ms = wait.elapsed_ms();
             matched
         }
         ScenarioAssertionV2::Within {
@@ -1303,6 +1359,8 @@ async fn execute_assertion(
         passed,
         samples,
         elapsed_virtual_ms,
+        wall_timeout_ms,
+        elapsed_wall_ms,
         final_actual,
     })
 }
@@ -1318,6 +1376,7 @@ async fn run_scenario_report_inner(
     let descriptor = subject.descriptor();
     let compiled = compile_scenario(spec)?;
     preflight_compiled_scenario(&compiled, &descriptor)?;
+    let stimulus_start = subject.stimulus_observations().len();
     let mut outputs = ScenarioStepOutputs::default();
     let mut step_log = Vec::new();
     let mut sampled_max_queue_depth = 0_usize;
@@ -1326,6 +1385,16 @@ async fn run_scenario_report_inner(
         let step_started = std::time::Instant::now();
         let step_index = action.schedule.source_step_index;
         let step = &action.step;
+        // Opt-in harness diagnostics contain only schedule metadata, never payloads or identities.
+        if std::env::var_os("MDK_SCENARIO_PROGRESS").is_some() {
+            tracing::debug!(
+                target: "cgka_conformance_simulator::progress",
+                method = "run_scenario",
+                step_index,
+                step_kind = step.kind(),
+                "scenario action"
+            );
+        }
         let step_result = if let Some(group) = action.scenario_group.as_deref() {
             subject
                 .select_scenario_group(group, matches!(step, ScenarioStep::CreateGroup { .. }))
@@ -1442,6 +1511,20 @@ async fn run_scenario_report_inner(
             });
         }
     }
+    let stimulus_observations = subject
+        .stimulus_observations()
+        .into_iter()
+        .skip(stimulus_start)
+        .collect::<Vec<_>>();
+    if let Err(message) = crate::validate_scenario_stimulus_evidence(spec, &stimulus_observations) {
+        expectation_failures.push(ExpectationFailure {
+            kind: "runtime_stimulus_not_exercised".into(),
+            message,
+            expected: serde_json::json!("all requested runtime stimuli exercised"),
+            actual: serde_json::to_value(&stimulus_observations)
+                .expect("stimulus evidence serializes"),
+        });
+    }
     let invariant_failures = invariant_failures(&expectation_failures);
     let oracle = build_scenario_oracle_report(
         spec,
@@ -1462,6 +1545,7 @@ async fn run_scenario_report_inner(
             step_count: compiled.actions.len(),
             storage_backend: descriptor.storage_backend.clone(),
             subject: Some(descriptor),
+            execution_layout: subject.execution_layout(),
             generated: None,
             fixture,
             input_provenance: None,
@@ -1471,6 +1555,7 @@ async fn run_scenario_report_inner(
         expanded_schedule: compiled.expanded_schedule(),
         assertion_observations,
         relay_sync_observations,
+        stimulus_observations,
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),
@@ -1519,7 +1604,12 @@ fn scenario_initial_admins(
             spec.steps
                 .iter()
                 .skip(create_step_index + 1)
-                .any(|step| admin_gated_actor(step).is_some_and(|actor| actor == invitee.as_str()))
+                .any(|step| match step {
+                    ScenarioStep::RaceGroupProfiles { updates } => {
+                        updates.iter().any(|update| update.client == **invitee)
+                    }
+                    _ => admin_gated_actor(step).is_some_and(|actor| actor == invitee.as_str()),
+                })
         })
         .cloned()
         .collect()
@@ -1629,6 +1719,164 @@ mod tests {
     use crate::{SubjectCapability, SubjectSendApplication};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn inferred_admins_include_every_profile_race_caller() {
+        let spec = ScenarioSpec {
+            name: "race admin inference".into(),
+            spec_version: "3".into(),
+            clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            topology: Default::default(),
+            steps: vec![
+                ScenarioStep::Barrier {
+                    name: "create boundary".into(),
+                },
+                ScenarioStep::RaceGroupProfiles {
+                    updates: vec![
+                        crate::ScenarioProfileUpdate {
+                            client: "bob".into(),
+                            name: Some("name".into()),
+                            description: None,
+                        },
+                        crate::ScenarioProfileUpdate {
+                            client: "carol".into(),
+                            name: None,
+                            description: Some("description".into()),
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(
+            scenario_initial_admins(&spec, 0, &["bob".into(), "carol".into()]),
+            vec!["bob", "carol"]
+        );
+    }
+
+    struct AssertionTimingSubject {
+        started: tokio::time::Instant,
+        ready_after: Option<std::time::Duration>,
+        tick_delay: std::time::Duration,
+        wall_clock: bool,
+        ticks: usize,
+    }
+
+    #[async_trait]
+    impl ConvergenceSubject for AssertionTimingSubject {
+        fn descriptor(&self) -> SubjectDescriptor {
+            SubjectDescriptor {
+                adapter: "assertion-timing-test".into(),
+                adapter_version: "1".into(),
+                storage_backend: "none".into(),
+                capabilities: BTreeSet::new(),
+            }
+        }
+
+        fn uses_wall_clock_assertions(&self) -> bool {
+            self.wall_clock
+        }
+
+        async fn tick(&mut self, _clients: &[String]) -> Result<(), SubjectError> {
+            self.ticks += 1;
+            tokio::time::sleep(self.tick_delay).await;
+            Ok(())
+        }
+
+        fn evaluate_predicate(
+            &mut self,
+            _predicate: &crate::ScenarioPredicateV2,
+        ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
+            let elapsed = self.started.elapsed();
+            Ok(crate::ScenarioPredicateObservationV2 {
+                matched: self.ready_after.is_some_and(|ready| elapsed >= ready),
+                actual: serde_json::json!({"elapsed_ms": elapsed.as_millis()}),
+            })
+        }
+    }
+
+    async fn timed_assertion(
+        tick_ms: u64,
+        ready_ms: Option<u64>,
+        iterations: usize,
+        wall_clock: bool,
+    ) -> (crate::ScenarioAssertionObservationV2, usize) {
+        let mut subject = AssertionTimingSubject {
+            started: tokio::time::Instant::now(),
+            ready_after: ready_ms.map(std::time::Duration::from_millis),
+            tick_delay: std::time::Duration::from_millis(tick_ms),
+            wall_clock,
+            ticks: 0,
+        };
+        let observation = execute_assertion(
+            &crate::ScenarioAssertionV2::Eventually {
+                predicate: crate::ScenarioPredicateV2::ClientState {
+                    client: "alice".into(),
+                    epoch: Some(2),
+                    member_count: None,
+                },
+                max_iterations: iterations,
+            },
+            &mut subject,
+            &["alice".into()],
+            0,
+        )
+        .await
+        .unwrap();
+        (observation, subject.ticks)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_parallel_polling_keeps_the_same_recovery_window() {
+        // Simulate fast parallel and slower serial catch-up. Recovery needs
+        // more time than four unpaced polls provide in the fast case.
+        for tick_ms in [10, 800] {
+            let (observation, ticks) = timed_assertion(tick_ms, Some(2_500), 4, true).await;
+            assert!(observation.passed);
+            assert_eq!(ticks, 3);
+            assert_eq!(observation.samples, 4);
+            assert_eq!(observation.elapsed_wall_ms, Some(3_000));
+            assert_eq!(observation.wall_timeout_ms, Some(5_000));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_still_fails_when_recovery_never_happens() {
+        let (observation, ticks) = timed_assertion(10, None, 3, true).await;
+        assert!(!observation.passed);
+        assert_eq!(ticks, 3);
+        assert_eq!(observation.samples, 4);
+        assert_eq!(observation.elapsed_wall_ms, Some(3_000));
+        assert_eq!(observation.final_actual["elapsed_ms"], 3_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_deadline_bounds_a_stalled_tick_and_rejects_late_success() {
+        let (observation, ticks) = timed_assertion(60_000, Some(5_000), 3, true).await;
+        assert!(!observation.passed);
+        assert_eq!(ticks, 1);
+        assert_eq!(observation.samples, 1);
+        assert_eq!(observation.elapsed_wall_ms, Some(4_000));
+        assert_eq!(observation.wall_timeout_ms, Some(4_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_engine_rounds_remain_unpaced() {
+        let (observation, ticks) = timed_assertion(10, Some(15), 2, false).await;
+        assert!(observation.passed);
+        assert_eq!(ticks, 2);
+        assert_eq!(observation.final_actual["elapsed_ms"], 20);
+        assert_eq!(observation.wall_timeout_ms, None);
+        assert_eq!(observation.elapsed_wall_ms, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eventual_assertion_ready_state_does_not_wait() {
+        let (observation, ticks) = timed_assertion(10, Some(0), 3, true).await;
+        assert!(observation.passed);
+        assert_eq!(ticks, 0);
+        assert_eq!(observation.samples, 1);
+        assert_eq!(observation.elapsed_wall_ms, Some(0));
+    }
 
     struct RecordingSubject {
         descriptor: SubjectDescriptor,

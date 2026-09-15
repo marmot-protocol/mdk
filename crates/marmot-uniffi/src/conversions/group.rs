@@ -48,7 +48,8 @@ pub struct AppGroupRecordFfi {
     pub relays: Vec<String>,
     pub nostr_group_id_hex: String,
     /// URL-based group avatar (`marmot.group.avatar-url.v1`), `None` when absent.
-    /// When set it takes precedence over a Blossom image avatar.
+    /// Used when no valid encrypted Blossom image is available. See the shared
+    /// [presentation contract](https://github.com/marmot-protocol/mdk/blob/master/docs/marmot-architecture/further-context/conversation-presentation.md#sources-and-ownership).
     pub avatar_url: Option<String>,
     pub avatar_dim: Option<String>,
     pub avatar_thumbhash: Option<String>,
@@ -495,77 +496,60 @@ pub(crate) fn group_management_state_ffi(
         .members
         .iter()
         .find(|member| member.member_id_hex == my_account_id_hex);
-    let is_self_admin = self_member.is_some_and(|member| member.is_admin);
-    let is_last_admin = is_self_admin && admin_count == 1;
-    let lifecycle_terminal = matches!(
-        details.mls_state.lifecycle_state,
-        GroupLifecycleStateFfi::Disbanded
-    );
-    let ordinary_actions_enabled = !details.mls_state.disbanding && !lifecycle_terminal;
-    let can_invite = is_self_admin && ordinary_actions_enabled;
-    // A leave already in flight suppresses `can_leave` so hosts do not offer a
-    // second Leave that the engine would reject: the durable request is not
-    // epoch-bound, but the SelfRemove proposal backing it is, and re-requesting
-    // inside the same epoch returns `EngineError::LeaveAlreadyRequested`, which
-    // reaches the host as `MarmotKitError::LeaveAlreadyRequested`. Suppressing
-    // the affordance keeps that error off the happy path; it does not prevent it,
-    // since this state is not read atomically with the leave it guards.
-    let leave_request_pending = details.group.leave_request_pending;
-    let can_leave = self_member.is_some()
-        && !is_self_admin
-        && !leave_request_pending
-        && ordinary_actions_enabled;
-    let requires_self_demote_before_leave =
-        self_member.is_some() && is_self_admin && ordinary_actions_enabled;
+    let authority = marmot_app::conversation_presentation::ConversationAuthority {
+        is_member: self_member.is_some(),
+        self_membership: match details.group.self_membership {
+            SelfMembershipFfi::Member => marmot_app::SelfMembership::Member,
+            SelfMembershipFfi::Left => marmot_app::SelfMembership::Left,
+            SelfMembershipFfi::Removed => marmot_app::SelfMembership::Removed,
+        },
+        is_admin: self_member.is_some_and(|member| member.is_admin),
+        admin_count,
+        pending_confirmation: details.group.pending_confirmation,
+        leave_request_pending: details.group.leave_request_pending,
+        lifecycle: match details.mls_state.lifecycle_state {
+            GroupLifecycleStateFfi::Stable => AppGroupLifecycleState::Stable,
+            GroupLifecycleStateFfi::PendingPublish => AppGroupLifecycleState::PendingPublish,
+            GroupLifecycleStateFfi::Merging => AppGroupLifecycleState::Merging,
+            GroupLifecycleStateFfi::Recovering => AppGroupLifecycleState::Recovering,
+            GroupLifecycleStateFfi::Unrecoverable => AppGroupLifecycleState::Unrecoverable,
+            GroupLifecycleStateFfi::Disbanded => AppGroupLifecycleState::Disbanded,
+        },
+        unrecoverable: details.group.unrecoverable || details.mls_state.unrecoverable,
+        disbanding: details.mls_state.disbanding,
+        disbanding_enabled: details.mls_state.disbanding_enabled,
+        has_disbanding_blockers: !details.mls_state.disbanding_blockers.is_empty(),
+    };
+    let capabilities = authority.capabilities();
     let member_actions = details
         .members
         .iter()
         .map(|member| {
-            let would_remove_last_admin = member.is_admin && admin_count == 1;
+            let actions = authority.member_actions(member.is_self, member.is_admin);
             GroupMemberActionStateFfi {
                 member_id_hex: member.member_id_hex.clone(),
                 is_self: member.is_self,
                 is_admin: member.is_admin,
-                can_remove: is_self_admin
-                    && ordinary_actions_enabled
-                    && !member.is_self
-                    && !would_remove_last_admin,
-                can_promote: is_self_admin && ordinary_actions_enabled && !member.is_admin,
-                can_demote: is_self_admin
-                    && ordinary_actions_enabled
-                    && member.is_admin
-                    && !member.is_self
-                    && !would_remove_last_admin,
+                can_remove: actions.can_remove,
+                can_promote: actions.can_promote,
+                can_demote: actions.can_demote,
             }
         })
         .collect();
     GroupManagementStateFfi {
         my_account_id_hex: my_account_id_hex.to_string(),
-        is_self_admin,
-        is_last_admin,
-        can_invite,
-        can_leave,
-        requires_self_demote_before_leave,
-        leave_request_pending,
+        is_self_admin: capabilities.is_self_admin,
+        is_last_admin: capabilities.is_last_admin,
+        can_invite: capabilities.can_invite,
+        can_leave: capabilities.can_leave,
+        requires_self_demote_before_leave: capabilities.requires_self_demote_before_leave,
+        leave_request_pending: authority.leave_request_pending,
         leave_requested_at_ms: details.group.leave_requested_at_ms,
         lifecycle_state: details.mls_state.lifecycle_state,
         disbanding_enabled: details.mls_state.disbanding_enabled,
         disbanding: details.mls_state.disbanding,
-        can_enable_disbanding: is_self_admin
-            && ordinary_actions_enabled
-            && matches!(
-                details.mls_state.lifecycle_state,
-                GroupLifecycleStateFfi::Stable
-            )
-            && !details.mls_state.disbanding_enabled
-            && details.mls_state.disbanding_blockers.is_empty(),
-        can_disband: is_self_admin
-            && ordinary_actions_enabled
-            && matches!(
-                details.mls_state.lifecycle_state,
-                GroupLifecycleStateFfi::Stable
-            )
-            && details.mls_state.disbanding_enabled,
+        can_enable_disbanding: capabilities.can_enable_disbanding,
+        can_disband: capabilities.can_disband,
         disbanding_blockers: details.mls_state.disbanding_blockers.clone(),
         disband_request: details.mls_state.disband_request.clone(),
         member_actions,
