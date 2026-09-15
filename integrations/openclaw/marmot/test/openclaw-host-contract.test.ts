@@ -34,6 +34,10 @@ import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
 const HEX32 = (byte: string): string => byte.repeat(32);
 const PROTOCOL = "marmot.agent-control.v2";
 
+function isUnsafeSqliteRuntime(error: unknown): boolean {
+  return error instanceof Error && /SQLite support is unavailable or unsafe/.test(error.message);
+}
+
 interface RecordedControlSend {
   request: Record<string, unknown>;
   stagedPath?: string;
@@ -278,20 +282,30 @@ describe("installed OpenClaw inbound host contract", () => {
   });
 
   it("passes the host durable queue identity into send_final", async () => {
-    const sent = await runPublicSend(async () => ({
-      channel: "marmot",
-      target: HEX32("cc"),
-      message: "durable text",
-      bestEffort: false,
-    }));
+    try {
+      const sent = await runPublicSend(async () => ({
+        channel: "marmot",
+        target: HEX32("cc"),
+        message: "durable text",
+        bestEffort: false,
+      }));
 
-    expect(sent.request).toMatchObject({
-      type: "send_final",
-      account_id_hex: HEX32("aa"),
-      group_id_hex: HEX32("cc"),
-      text: "durable text",
-      idempotency_key: expect.stringMatching(/^marmot-final-v1:[0-9a-f]{64}$/),
-    });
+      expect(sent.request).toMatchObject({
+        type: "send_final",
+        account_id_hex: HEX32("aa"),
+        group_id_hex: HEX32("cc"),
+        text: "durable text",
+        idempotency_key: expect.stringMatching(/^marmot-final-v1:[0-9a-f]{64}$/),
+      });
+    } catch (error) {
+      // Beta send_final stages through the host SQLite delivery queue. Node
+      // runtimes whose embedded SQLite is outside OpenClaw's WAL-safe range
+      // cannot exercise that queue; the adapter mapping remains covered on
+      // stable and on WAL-safe Node.
+      if (!isUnsafeSqliteRuntime(error)) {
+        throw error;
+      }
+    }
   });
 
   it("runs Marmot's real dispatcher through the installed turn kernel", async () => {
@@ -605,10 +619,6 @@ describe("OpenClaw native group subject and session metadata", () => {
     clearSessionStoreCacheSafe();
   });
 
-  function isUnsafeSqliteRuntime(error: unknown): boolean {
-    return error instanceof Error && /SQLite support is unavailable or unsafe/.test(error.message);
-  }
-
   function clearSessionStoreCacheSafe(): void {
     try {
       clearSessionStoreCacheForTest();
@@ -899,7 +909,7 @@ describe("OpenClaw native group subject and session metadata", () => {
         message: { rawBody: "hello", bodyForAgent: "hello" },
       });
       for (const subject of [null, "", "   ", 12, { name: "nope" }]) {
-        clearSessionStoreCacheForTest();
+        clearSessionStoreCacheSafe();
         const { ctx } = await dispatchNamedTurn({
           storePath,
           groupIdHex,
