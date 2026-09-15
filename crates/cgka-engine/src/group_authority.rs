@@ -11,13 +11,17 @@ use crate::Engine;
 /// Terminal groups retain mirrored epoch/member count but zero MLS-derived
 /// administrator/blocker values, which are unavailable after removal/disband.
 /// Membership is the existing record projection (including staged changes);
-/// administrator authority remains canonical until commit acceptance.
+/// The admin policy remains canonical until commit acceptance; effective
+/// self-admin status also requires projected membership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupAuthorityFacts {
     pub epoch: EpochId,
     pub member_count: usize,
     pub is_member: bool,
+    /// Canonical admin policy membership gated by `is_member`. A staged
+    /// membership change can suppress this before the admin policy changes.
     pub is_admin: bool,
+    /// Canonical policy count, or zero when terminal; not gated by self membership.
     pub admin_count: usize,
     pub removed: bool,
     pub unrecoverable: bool,

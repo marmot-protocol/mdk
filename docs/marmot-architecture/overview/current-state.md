@@ -34,8 +34,9 @@ See [shared conversation presentation](../further-context/conversation-presentat
 
 C5 M4 foundations include explicit viewport placement, atomic account-window reads and compact live engine
 capture of membership, roles and capabilities. The session callback keeps persisted reads on the session's
-exact SQLite connection and combines them with live engine facts; startup seeds remain unavailable until hydration. The live actor, recovery protocol and native
-handles remain unfinished. See the [live conversation implementation plan](../further-context/conversation-live-window-plan.md).
+exact SQLite connection and combines them with live engine facts; startup seeds remain unavailable until
+hydration. The live actor, recovery protocol and native handles remain unfinished.
+See the [live conversation implementation plan](../further-context/conversation-live-window-plan.md).
 
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only

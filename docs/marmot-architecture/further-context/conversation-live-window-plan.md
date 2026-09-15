@@ -76,8 +76,9 @@ storage can advance. Zipping its MLS state with a fresh account capture is there
 
 The next actor PR must wire the session capture callback during ordinary operation and explicitly
 retain a retry obligation while startup or recovery owns the mutable client; it must not substitute
-`GroupReadSnapshot` while catch-up runs. Pin the worker response and retry behavior in those paths. Prototype against both live and
-startup-snapshot paths. Cached facts must be invalidated by role/membership/capability/lifecycle
+`GroupReadSnapshot` while catch-up runs. Pin the worker response and retry behavior in those paths.
+Prototype against both live and startup-snapshot paths.
+Cached facts must be invalidated by role/membership/capability/lifecycle
 changes, must not survive a store replacement, and cannot be combined with a different account
 frontier. Do not use a generic `Stable` fallback for unknown epoch state or silently omit a
 permission because it is expensive to compute. Command validation remains authoritative.

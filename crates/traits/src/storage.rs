@@ -980,9 +980,12 @@ pub trait StorageProvider:
 
     /// Compose read-only provider calls within the backend's transaction
     /// boundary. Transactional backends should use a deferred read transaction;
-    /// an enclosing transaction remains caller-owned. The default preserves
-    /// the backend's existing transaction guarantees. Do not await or mutate
-    /// through the callback. Engine callers also hold the live engine borrow.
+    /// an enclosing transaction remains caller-owned. The default only inherits
+    /// `with_transaction`'s boundary and does not reject callback writes. A
+    /// backend must override this method to enforce read-only access (SQLite
+    /// does so with query-only mode). Callers must not await or mutate through
+    /// the callback regardless of backend enforcement. Engine callers also
+    /// hold the live engine borrow.
     fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
     where
         Self: Sized,
