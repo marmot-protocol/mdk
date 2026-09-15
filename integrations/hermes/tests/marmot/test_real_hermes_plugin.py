@@ -439,27 +439,55 @@ def _module_matches_path(module, expected: Path) -> bool:
 
 
 def _pinned_source_checkout(mdk_source: Path, mdk_ref: str, temp_root: Path) -> Path:
-    """Clone MDK locally and detach at the exact revision used by old Hermes."""
+    """Export the exact MDK plugin tree for Hermes 0.19.0 source install.
+
+    Older Hermes can install a monorepo subdirectory but has no ``--ref``.
+    Cloning the caller checkout over ``file://`` fails on worktrees, shallow
+    checkouts, and restricted Git ownership. Archive the plugin path at the
+    pinned revision into a tiny fixture repository instead.
+    """
 
     checkout = temp_root / "mdk-plugin-source"
-    subprocess.run(
-        ["git", "clone", "-q", "--no-checkout", f"file://{mdk_source}", str(checkout)],
+    plugin_dir = checkout / "integrations" / "hermes" / "marmot"
+    plugin_dir.parent.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "archive",
+            "--format=tar",
+            mdk_ref,
+            "integrations/hermes/marmot",
+        ],
+        cwd=mdk_source,
         check=True,
+        capture_output=True,
     )
     subprocess.run(
-        ["git", "checkout", "-q", "--detach", mdk_ref],
+        ["tar", "-C", str(checkout), "-xf", "-"],
+        input=archive.stdout,
+        check=True,
+    )
+    if not (plugin_dir / "adapter.py").is_file():
+        raise AssertionError("pinned MDK archive missing the Marmot plugin")
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(["git", "add", "integrations/hermes/marmot"], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=MDK compatibility test",
+            "-c",
+            "user.email=compatibility-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "Pin Marmot plugin fixture",
+        ],
         cwd=checkout,
         check=True,
     )
-    installed_ref = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"],
-        cwd=checkout,
-        text=True,
-    ).strip()
-    if installed_ref != mdk_ref:
-        raise AssertionError(
-            f"pinned MDK checkout resolved to {installed_ref}, expected {mdk_ref}"
-        )
     return checkout
 
 

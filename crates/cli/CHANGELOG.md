@@ -223,7 +223,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   with an explicit short-path scenario control socket, waits for acknowledged progress instead of
   fixed sleeps, and fails closed if delete or factory registration is missing. The probe's fake
   control endpoint runs on a private thread so pinned Hermes 0.19.0 can acknowledge progress
-  without deadlocking the host event loop.
+  without deadlocking the host event loop. The supported-floor install exports the plugin tree
+  at the exact MDK revision instead of cloning the host checkout over ``file://``.
 - Hermes chat metadata now rejects non-string `group_info` account and group identities before
   accepting a subject, so a JSON integer whose decimal spelling matches an all-digit hex id
   falls back to `Marmot <first 12 hex characters>` instead of using the supplied name.
