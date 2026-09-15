@@ -193,3 +193,13 @@ visible public history, including multiplicity, from one participant snapshot. E
 are valid. It requires the public app observation capability and supports the existing assertion
 modes; virtual-time modes still require an adapter with virtual time. Large app families use bounded
 `eventually` checks and independent terminal trace expectations. V2 rejects this predicate.
+
+### Generated invite/profile recovery
+
+`race_invite_profile` (v3) takes two distinct `actors`, a separate `invitee`,
+a nonempty `name`, and `restart_at_offer`. The app subject chooses the higher
+credential identity as inviter and releases invitation/rename calls together.
+The action requires a validated explicit rejoin offer, consent and durable
+confirmation after reopen. Optional offer-boundary restart also checks offer
+persistence. Refused or unexercised races retain their evidence and fail coverage.
+Final roster/profile and communication assertions remain separate IR actions.

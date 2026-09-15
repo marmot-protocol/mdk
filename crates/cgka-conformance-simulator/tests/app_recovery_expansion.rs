@@ -22,6 +22,19 @@ fn expansion_replay_prefix_diversity_and_reachability() {
                 case,
                 serde_json::from_slice(&serde_json::to_vec(&case).unwrap()).unwrap()
             );
+            for expectation in &case.expected_outcomes {
+                if let cgka_conformance_simulator::TraceExpectation::PendingResolution {
+                    step_index,
+                    client,
+                    pending,
+                    ..
+                } = expectation
+                {
+                    assert!(
+                        matches!(&case.scenario.steps[*step_index], ScenarioStep::AcknowledgeOutbound { client: actor, publication: Some(label), .. } if actor == client && label == pending)
+                    );
+                }
+            }
             let oracle = cgka_conformance_simulator::build_scenario_oracle_report(
                 &case.scenario,
                 None,

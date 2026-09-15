@@ -1571,7 +1571,12 @@ pub fn generate_public_app_invite_profile_case(
         initial_admins: Some(vec!["alice".into(), "bob".into(), "carol".into()]),
         pending: "create".into(),
     });
-    model.steps.push(accept_all_outbound("alice"));
+    model.steps.push(ScenarioStep::AcknowledgeOutbound {
+        client: "alice".into(),
+        publication: Some("create".into()),
+        selection: ScenarioOutboundSelection::All,
+        outcome: SubjectOutboundOutcome::Accepted,
+    });
     model.admins = BTreeSet::from(["alice".into(), "bob".into(), "carol".into()]);
     model.public_state_checkpoint();
     let mut founders = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
@@ -1624,7 +1629,7 @@ pub fn generate_public_app_invite_profile_case(
     }
     model.compact_public_payload_checks = true;
     let mut case = model.finish_public("public-app-invite-profile-recovery/v1", seed);
-    case.generator_version = "1".into();
+    case.generator_version = "2".into();
     case
 }
 

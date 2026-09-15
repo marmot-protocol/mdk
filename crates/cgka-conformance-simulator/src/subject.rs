@@ -688,6 +688,15 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         }
         return capabilities;
     }
+    if matches!(step, ScenarioStep::RaceInviteProfile { .. }) {
+        return vec![
+            SubjectCapability::ConcurrentGroupMutation,
+            SubjectCapability::GroupMutation,
+            SubjectCapability::CrashReopen,
+            SubjectCapability::TransportDelivery,
+            SubjectCapability::PublicGroupStateObservation,
+        ];
+    }
     if let ScenarioStep::AwaitQuiescence { policy } = step {
         let mut capabilities = vec![
             SubjectCapability::StructuralProgress,

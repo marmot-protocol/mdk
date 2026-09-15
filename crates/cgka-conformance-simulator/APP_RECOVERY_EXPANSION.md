@@ -18,7 +18,7 @@ actor's rename, and requires a validated explicit rejoin offer. Acceptance of bo
 alone is insufficient. Refusals remain classified outcomes in a failed coverage report;
 there is no automatic retry or conversion of an unexercised race into a pass.
 
-## Version-1 generators
+## Versioned generators
 
 | Family | Bounded selection | Meaningful variation |
 | --- | --- | --- |
@@ -27,7 +27,9 @@ there is no automatic retry or conversion of an unexercised race into a pass.
 | `public-app-retained-traffic/v1` | 2 cases/seed | Same cycles with 16–24-message bursts, repeated real membership/profile operations, duplicate history and one hidden historical message per cycle |
 | `public-app-longevity-extended/v1` | explicit only | 48 cycles in one harness, using the same identities and databases; not a wall-clock duration guarantee |
 
-Each family starts at generator version `1`. Existing families and their versions are
+The invite/profile generator is version `2`; the other new generators are version `1`.
+The version-1 race input omitted the named creation acknowledgement and correctly
+failed its pending-resolution oracle; saved version-1 inputs remain unchanged. Existing families and their versions are
 unchanged. Indices are independently seeded, so increasing case count preserves prefixes.
 OS scheduling and cryptographic identities remain nondeterministic; saved inputs pin the
 schedule, not a promise that a race will occur. The runtime evidence must prove recovery.
