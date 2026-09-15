@@ -9905,8 +9905,11 @@ void marmot_account_attention_snapshot_free(struct MarmotAccountAttentionSnapsho
 
 /**
  * Deep-free a selected draft and its opaque revision. NULL is allowed.
+ * Only for drafts returned directly by this library. A snapshot's embedded
+ * draft is freed by `marmot_conversation_window_snapshot_free`.
  * # Safety
- * p must be NULL or a library-owned unfreed selected draft.
+ * p must be NULL or a library-owned unfreed selected-draft root pointer,
+ * never the address of a snapshot's embedded draft.
  */
 void marmot_selected_message_draft_free(struct MarmotSelectedMessageDraft *p);
 

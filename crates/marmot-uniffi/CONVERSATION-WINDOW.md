@@ -27,6 +27,14 @@ operations; the screen never downloads them. Low-level timeline queries still
 provide their original raw fields and collections, including raw media JSON when
 a caller needs to inspect a rejected attachment beyond its typed rejection outcome.
 
+The window currently does **not** expose whether the viewing account reacted.
+Its compatibility `reactions.user_reactions` is empty, and each sidecar reactor
+preview contains at most two identities without prioritizing the viewer. Absence
+from that preview does not mean the viewer did not react. Apps needing highlighted
+reaction chips must temporarily retain their existing timeline query for own-reaction
+state. Before C9 adoption, #1838 tracks adding a viewer-scoped signal to the shared
+presentation and native bindings so this state needs no per-message lookup.
+
 ## Paging and lifetime
 
 Commands can run while `next()` waits. Supply the revision from the installed
@@ -74,6 +82,9 @@ revision for `save_message_draft_if_revision`, `clear_message_draft_if_revision`
 `message_draft_attachment_if_revision` and `send_message_draft`. Revision conflicts
 have a distinct error. C revision pointers are borrowed from the owning snapshot
 or selected-draft result; retain that owner while calling these methods.
+Call `marmot_selected_message_draft_free` only for a directly returned selected-draft
+root pointer. Never pass `&snapshot->draft`: that inline field and its children are
+released by `marmot_conversation_window_snapshot_free`.
 
 Use `send_message_draft` with the prepared attachment references matching the
 selected descriptors. MDK clears only that revision on durable acceptance; never
