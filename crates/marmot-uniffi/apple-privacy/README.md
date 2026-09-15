@@ -148,6 +148,11 @@ release, White Noise should:
 4. Keep the host's manifest and review its app/app-group file access, app-owned
    collection and extensions separately. Keep MDK's root in an app/app-group
    container. Verify each app/extension that links the SDK contains the resource.
+   **The SDK manifest does not declare DiskSpace:** SQLCipher's `statfs`/`fstatfs`
+   purpose remains unresolved. Resolve that before App Store submission; a green
+   resource check does not close it. Adding a host declaration is valid only if
+   its approved reason actually covers those native calls. Do not substitute a
+   host low-disk-space feature for SQLCipher's unrelated locking/filesystem use.
 5. Run `validate-apple-privacy.py <new.xcframework> --archive <host.xcarchive>`.
    In Organizer choose **Generate Privacy Report** and compare its aggregated
    collection to consent screens, policy, configured services and App Store
