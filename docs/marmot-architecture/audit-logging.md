@@ -87,6 +87,7 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 | --- | --- | --- |
 | `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id` and included as `source.device_id` in the recorder source row. |
 | `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
+| `local_member_ref` | First 16 bytes of `SHA-256("marmot-audit-member-ref/v1" + account_id)`, hex encoded. Same domain and width as `group_state_changed` actor/subject member refs. | Optional `kind.source.local_member_ref` on `source_context` rows (also permitted on `context.source`). |
 | `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
 | File path | `<account_dir>/audit-<engine_id>-v4.jsonl`. | Listed and uploaded by app APIs. |
 
@@ -95,8 +96,9 @@ The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<di
 Identity properties:
 
 - `account_ref` is stable for the same account id.
+- `local_member_ref` is stable for the same account/member identity bytes and uses a different hash domain from `account_ref`. Equality between them is not meaningful.
 - `engine_id` is stable for the same account id plus the account directory's stored `audit-device-id`.
-- Both are 16-byte hex strings derived from hashes/randomness, not raw account ids.
+- These are 16-byte hex strings derived from hashes/randomness, not raw account ids. `local_member_ref` is a diagnostic join key, not authentication or a membership verdict. Absence means unknown or unavailable, including older rows; it is never evidence that a producer was removed.
 - `group_ref` and `msg_id` fields are raw hex forms of group/message identifiers. Uploaded logs retain these identifiers and remain sensitive.
 
 ## JSONL envelope
@@ -1162,15 +1164,23 @@ can reintroduce legacy files later. Removing the scan requires an explicit chang
 | `authorization_bearer_token` | Bearer token supplied by the host app. |
 | `source` | Optional system metadata (`hardware_model`, `platform`, `app_version`). |
 
-At recorder open the app writes a `source_context` JSONL row with stable `device_id` and the host-supplied
-platform, app version and optional hardware model. Hardware model must be an OS-provided model identifier, not
+At recorder open the app writes a `source_context` JSONL row with stable `device_id`, the host-supplied
+platform, app version and optional hardware model, and an optional `local_member_ref` derived from the
+already-available account `MemberId`. Hardware model must be an OS-provided model identifier, not
 a hostname, serial number, or user-assigned name; omit it when unavailable. Hosts must update their Swift/Kotlin
 config construction to `AuditLogTrackerConfigV4Ffi` / `AuditLogUploadSourceV4Ffi` and replace `deviceLabel` with
 `hardwareModel` explicitly. The versioned config changes the UniFFI setter checksum so old generated bindings fail
 the compatibility check instead of reinterpreting a device label. The legacy C config ignores and returns NULL
 for `device_label`; C hosts use `marmot_set_audit_log_tracker_config_v4` for hardware-model support.
-Source rows are emitted on recorder opening, not on each segment roll. A valid uploaded segment may therefore
-lack source metadata; analyzers may associate it with validated source rows for the same engine or leave it unknown.
+The producer member reference is derived internally; hosts do not supply it. Destructive live rotation
+(`JsonlRecorder::rotate`, including app delete of the active file) emits `recorder_started` and then the most
+recently recorded `source_context` into the fresh file. Size-based segment rolls stay one continuous session and
+do not replay lifecycle or source rows, so an isolated segment may lack the mapping. Current recording and upload
+are v4-only; historical v2/v3 source rows remain valid under their original schemas and do not carry this field.
+A valid uploaded segment may therefore lack source metadata; analyzers may associate it with validated source rows
+for the same producer/session or leave identity unknown. Joining `local_member_ref` to a later
+`group_state_changed.subject_member_ref` is a diagnostic correlation, not a membership interval or
+removed-versus-stale classification. External consumers must adopt the optional field before using that join.
 
 Compiled/default endpoint source:
 
@@ -1276,7 +1286,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 
 | Question | Current audit coverage |
 | --- | --- |
-| Which recorder/session/account/device produced the row? | Top-level `recorder_session_id`, `account_ref`, `engine_id`, `seq`, and `wall_time_ms`. |
+| Which recorder/session/account/device produced the row? | Top-level `recorder_session_id`, `account_ref`, `engine_id`, `seq`, and `wall_time_ms`. Optional `source_context.local_member_ref` joins that producer to member-ref subjects when present. |
 | What operation was running? | `context.operation_id`, `context.human_action`, `send_*`, `create_group_*`, and app-level `human_action` rows. |
 | What inbound/outbound message entered the engine? | `ingest_entry`, `ingest_outcome`, `ingest_error`, `send_entry`, `send_outcome`, `send_error`, and `message_state_changed`. |
 | How did publish-before-apply resolve? | `publish_attempt`, `publish_outcome`, `publish_failure`, `epoch_confirmed`, `epoch_rolled_back`, and `epoch_state_changed`. |
@@ -1284,7 +1294,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | How did MLS-authenticated group state change? | `group_state_changed` rows for membership, self-leave, admin, rename, avatar, and message-retention deltas, including epoch and origin commit id when attributable. |
 | Why did a fork/convergence decision happen? | `snapshot_created`, `fork_resolution`, `convergence_decision`, `peeler_outcome`, `auto_commit_decision`, and message-state invalidation rows. |
 | Which app-level state changed outside core membership/profile/admin deltas? | Observed/local `human_action` rows cover message retention, encrypted-media endpoints, avatar URL/image updates, and profile/admin projection deltas. |
-| Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. |
+| Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:
 
@@ -1303,7 +1313,7 @@ Audit JSONL can include:
 
 - raw hex group ids (`group_ref`);
 - raw hex message ids (`msg_id`, `outbound_msg_id`, `outbound_welcome_msg_ids`, `invalidated_msg_id`);
-- stable account/device-derived audit identities (`account_ref`, `engine_id`);
+- stable account/device-derived audit identities (`account_ref`, `engine_id`) and optional producer `local_member_ref`;
 - payload length and SHA-256 digest for inbound transport payloads;
 - transport source, delivery plane, subscription id, and full relay URL for inbound delivery context when supplied;
 - full relay URLs selected for publish attempts, successful publish acknowledgements, and endpoint failures;

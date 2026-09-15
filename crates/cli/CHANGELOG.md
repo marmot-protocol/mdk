@@ -17,6 +17,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Opt-in forensic audit `source_context` rows now include an optional `local_member_ref` so a producing
+  engine can be joined to membership-change subjects. Absence remains unknown or unavailable, including older
+  rows. Account and member hashes stay on separate domains; this is a diagnostic join, not a membership verdict.
 - WN Agent `group_info` now returns the current Marmot chat-list group name as `subject`
   when that name is nonempty, and Hermes uses it for `get_chat_info` and activated inbound
   display. Missing, blank, or unusable names still fall back to
