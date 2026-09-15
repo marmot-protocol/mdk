@@ -680,12 +680,14 @@ describe("OpenClaw native group subject and session metadata", () => {
       return { status: "unavailable" };
     }
     try {
+      // storePath is already agent-resolved. Passing agentId again makes the
+      // beta host prefer the default isolated home store and return ok/undefined
+      // for the file the turn just wrote.
       return {
         status: "ok",
         session: getSessionEntry({
           storePath,
           sessionKey,
-          agentId: NATIVE_SESSION_AGENT_ID,
         }) as NativeSessionRecord | undefined,
       };
     } catch (error) {
