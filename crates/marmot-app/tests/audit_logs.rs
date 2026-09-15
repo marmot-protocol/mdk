@@ -1731,6 +1731,25 @@ fn source_events(path: &str) -> Vec<Value> {
         .collect()
 }
 
+async fn wait_for_audit_file_quiesce(path: &str) -> String {
+    let mut body = std::fs::read_to_string(path).unwrap();
+    let mut unchanged = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let next = std::fs::read_to_string(path).unwrap();
+        if next == body {
+            unchanged += 1;
+            if unchanged >= 10 {
+                return body;
+            }
+        } else {
+            unchanged = 0;
+            body = next;
+        }
+    }
+    body
+}
+
 #[tokio::test]
 async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1753,6 +1772,15 @@ async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
     assert!(!body.contains("\"account_label\""));
 }
 
+fn assert_source_linkage(actual: &Value, expected: &Value) {
+    assert_eq!(
+        actual["kind"]["source"]["local_member_ref"],
+        expected["kind"]["source"]["local_member_ref"]
+    );
+    assert_eq!(actual["account_ref"], expected["account_ref"]);
+    assert_eq!(actual["engine_id"], expected["engine_id"]);
+}
+
 #[tokio::test]
 async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1764,32 +1792,72 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     let client = app.client(&account.label).await.unwrap();
     let path = app.audit_log_files().unwrap()[0].path.clone();
     let first = source_events(&path);
+    assert_eq!(first.len(), 1, "startup should write one source row");
     drop(client);
 
     let client = app.client(&account.label).await.unwrap();
     let reopened = source_events(&path);
-    assert!(reopened.len() >= first.len());
     assert_eq!(
-        reopened.last().unwrap()["kind"]["source"]["local_member_ref"],
-        first[0]["kind"]["source"]["local_member_ref"]
+        reopened.len(),
+        first.len() + 1,
+        "reopen must append a new source_context"
+    );
+    assert_source_linkage(reopened.last().unwrap(), &first[0]);
+    assert_ne!(
+        reopened.last().unwrap()["recorder_session_id"],
+        first[0]["recorder_session_id"]
     );
     drop(client);
 
-    app.set_audit_log_settings(AuditLogSettings { enabled: false })
+    let live_tmp = tempfile::tempdir().unwrap();
+    let live_home = AccountHome::open(live_tmp.path());
+    let live_account = live_home.create_account("alice").unwrap();
+    let live_app = MarmotApp::with_relay(live_tmp.path(), "wss://relay.example");
+    live_app
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
-    let disabled_client = app.client(&account.label).await.unwrap();
-    let after_disable = std::fs::read_to_string(&path).unwrap();
-    drop(disabled_client);
-    assert_eq!(after_disable, std::fs::read_to_string(&path).unwrap());
-
-    app.set_audit_log_settings(AuditLogSettings { enabled: true })
-        .unwrap();
-    let _enabled = app.client(&account.label).await.unwrap();
-    let restored = source_events(&path);
+    let runtime = MarmotAppRuntime::new(live_app);
+    runtime.start().await.unwrap();
+    runtime.sign_in_account(&live_account.label).await.unwrap();
+    let live_path = runtime.audit_log_files().unwrap()[0].path.clone();
+    let before_disable_body = wait_for_audit_file_quiesce(&live_path).await;
+    let before_toggle = source_events(&live_path);
     assert_eq!(
-        restored.last().unwrap()["kind"]["source"]["local_member_ref"],
-        first[0]["kind"]["source"]["local_member_ref"]
+        before_toggle.len(),
+        1,
+        "live worker startup should write one source row"
     );
+    let before_toggle_row = before_toggle[0].clone();
+
+    runtime
+        .set_audit_log_settings(AuditLogSettings { enabled: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(source_events(&live_path).len(), before_toggle.len());
+    assert_eq!(
+        std::fs::read_to_string(&live_path).unwrap(),
+        before_disable_body,
+        "live disable must stop further audit rows"
+    );
+
+    runtime
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let restored = source_events(&live_path);
+    assert_eq!(
+        restored.len(),
+        before_toggle.len() + 1,
+        "live re-enable must append a new source_context"
+    );
+    let latest = restored.last().unwrap();
+    assert_source_linkage(latest, &before_toggle_row);
+    assert_ne!(
+        latest["recorder_session_id"],
+        before_toggle_row["recorder_session_id"]
+    );
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

@@ -1363,27 +1363,19 @@ mod tests {
         let first_engine = audit_engine_id_hex(&account_id, &first_device);
         let second_engine = audit_engine_id_hex(&account_id, &second_device);
 
-        assert_eq!(account_ref.len(), 32);
-        assert_eq!(account_ref, audit_account_ref_hex(&account_id));
+        assert_eq!(account_ref, "c27882eb80e58cbc3c5daddd0b0ab806");
+        assert_eq!(member_ref, "58cedb13787381c2bd910fa2ec7a1c64");
         assert_ne!(account_ref, hex::encode(&account_id.as_slice()[..16]));
         assert_ne!(account_ref, member_ref);
-        assert_eq!(
-            member_ref,
-            marmot_forensics::member_ref_hex(account_id.as_slice())
-        );
         assert_ne!(
             member_ref,
             marmot_forensics::member_ref_hex(other.as_slice())
         );
         assert_eq!(
-            audit_account_ref_hex(&account_id),
-            audit_account_ref_hex(&account_id)
+            marmot_forensics::member_ref_hex(other.as_slice()),
+            "006db2679a7e3260a8eaba11ab3bbb1c"
         );
         assert_ne!(first_engine, second_engine);
-        assert_eq!(
-            marmot_forensics::member_ref_hex(account_id.as_slice()),
-            marmot_forensics::member_ref_hex(account_id.as_slice())
-        );
     }
 
     #[test]
