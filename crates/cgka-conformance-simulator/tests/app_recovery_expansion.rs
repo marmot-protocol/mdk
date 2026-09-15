@@ -197,3 +197,26 @@ async fn expansion_preflights_and_rejects_unsupported_relay_configuration() {
             .is_err()
     );
 }
+
+#[test]
+fn extended_activity_keeps_one_group_and_a_continuously_running_founder() {
+    let case = generate_family_case("public-app-longevity-extended/v1", 7, 0).unwrap();
+    let actions = compile_scenario(&case.scenario).unwrap().actions;
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a.step, ScenarioStep::CreateGroup { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a.step, ScenarioStep::SetClientOffline { .. }))
+            .count(),
+        48
+    );
+    assert!(!actions.iter().any(|a| matches!(&a.step,
+        ScenarioStep::SetClientOffline { client } | ScenarioStep::RestartClient { client } if client == "alice")));
+    assert_eq!(case.generator_version, "1");
+}

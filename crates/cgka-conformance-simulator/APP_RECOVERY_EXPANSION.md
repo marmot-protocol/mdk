@@ -12,7 +12,8 @@ This increment is an independent opt-in selection, not a rerun of that baseline.
 
 The existing shared process runner, separate SQLCipher participant roots, real local
 relay, socket interruption, history visibility and public projection assertions are reused.
-New harness support is limited to the invite/profile action and its append-only evidence.
+New harness support adds the invite/profile action and its append-only evidence,
+the default shared-relay alias, and a separate relay-configuration capability.
 It chooses the higher credential identity as inviter, races that call with the other
 actor's rename, and requires a validated explicit rejoin offer. Acceptance of both calls
 alone is insufficient. Refusals remain classified outcomes in a failed coverage report;
@@ -102,3 +103,54 @@ preserve late arrivals, replacement, cross-connection writes and restart behavio
 - Latency attribution across scan work, relay retry, settlement and background scheduling.
 
 Short canaries do not establish full-catalog, long-duration or production-service success.
+
+## Local validation, 15 September 2026
+
+Nine bounded process canaries passed, all case index 0, serial catch-up and an
+unoptimized test/dev build with production timing policy. This is evidence across
+explicitly recorded builds, not nine executions on one final source revision.
+
+| Family | Seed 7 | Seed 42 | Seed 17001 |
+| --- | ---: | ---: | ---: |
+| Invite/profile, generator 2 | 52.760 s (`94df78ec`) | 60.859 s (`ac42d4a1`) | 62.489 s (`ac42d4a1`) |
+| Longevity, generator 1 | 50.339 s (`1978ad07`) | 48.925 s (`ac42d4a1`) | 45.385 s (`ac42d4a1`) |
+| Retained traffic, generator 3 | 59.512 s (`ac42d4a1`) | 55.478 s (`ac42d4a1`) | 58.540 s (`ac42d4a1`) |
+
+Times are isolated-worker wall times, not end-to-end campaign startup or product
+latency thresholds. The passed cases contain 1,406 completed actions and 511
+assertion samples. Pressure cases send 55–58 distinct public messages; longevity
+cases send 16–19 across two cycles. Each family has three distinct operation
+schedules after dropping assertions, observations, labels and payload values.
+All race cases exercised explicit recipient recovery and offer-boundary restart.
+The odd-index no-offer-restart arm and three-cycle arm remain unexecuted.
+
+Three earlier failed verdicts remain preserved: the version-1 race missing its named
+creation acknowledgement (51.724 s); pressure version 1 requesting unsupported
+relay configuration (5.285 s); pressure version 2 using an unsupported selector
+filter (6.755 s). These are authoring/harness-contract failures, not production
+recovery failures. Corrected generator executions use new evidence roots and versions.
+
+Private evidence roots are `target/recovery-expansion-{1978ad07,94df78ec,fcd767e3,ac42d4a1}-debug`.
+The last root contains `verified-validation.json`, source/binary hash receipts,
+commands, test/gate logs, and the verification script. Exact inputs, reports, fixtures
+and capsules remain under each original root. Independent verification checked all
+12 reports against input SHA-256, generated metadata, frozen binary hashes, artifact
+integrity, completed actions, nonempty passing assertion samples and strict oracles.
+No failed verdict was removed or reclassified as a pass.
+
+Local contracts: 27 targeted tests passed across `app_recovery_expansion`,
+`app_generated_variance` and `scenario_ir`; one existing slow test stayed ignored.
+The expansion contracts also generate (but do not execute) the 48-cycle profile and
+verify one group creation and no offline/restart action for Alice. Python campaign
+contracts passed 19 tests. `just fast-ci` passed, including telemetry feature checks,
+Clippy and five convergence-policy tests. The final code-only change after
+`ac42d4a1` moved generator definitions before the test module; later changes add
+contract coverage and this validation record. Remote CI is a separate result.
+
+Recommended next campaign: run the opt-in full expansion with fresh seeds 101, 211
+and 307 (two cases per family), recording the deliberately repeated canary phase
+separately. That reaches the odd-index restart and third-cycle arms. Inspect those
+results before executing the 48-cycle profile. Continuous overlapping traffic,
+inside-recovery fault placement, beyond-anchor public terminal dispositions and
+long-duration acceptance remain separate work; these short canaries establish none
+of those claims.
