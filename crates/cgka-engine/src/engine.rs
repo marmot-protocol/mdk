@@ -145,7 +145,6 @@ pub struct Engine<S: StorageProvider> {
     /// allocation, and fork-detection marker flows through this struct.
     pub(crate) epoch_manager: crate::epoch_manager::EpochManager,
     pub(crate) mls_group_cache: crate::mls_group_cache::MlsGroupCache,
-    pub(crate) group_authority_cache: crate::group_authority::GroupAuthorityCache,
 
     /// Storage-layer identity of the origin commit behind each in-flight
     /// pending publish, so `do_confirm_published` can mark the sent commit
@@ -605,7 +604,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             maintenance_random: self.maintenance_random,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             mls_group_cache: crate::mls_group_cache::MlsGroupCache::default(),
-            group_authority_cache: crate::group_authority::GroupAuthorityCache::default(),
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
             auto_publish_buf: VecDeque::new(),
@@ -2913,7 +2911,6 @@ impl<S: StorageProvider> Engine<S> {
             .forget_group_local(group_id, self.wall_clock.now())?;
         self.epoch_manager.forget_group(group_id);
         self.mls_group_cache.forget_group(group_id);
-        self.group_authority_cache.forget_group(group_id);
         self.transport_group_id_index
             .retain(|_, group| group != group_id);
         self.route_backfill_pending.remove(group_id);

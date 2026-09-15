@@ -1029,17 +1029,33 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
         GroupLifecycleState::PendingPublish
     );
     session.confirm_published(pending).await.unwrap();
+    let foreign = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let original = foreign.get_group(&group).unwrap();
     let before = session
         .with_group_authority_snapshot(&group, |storage, authority| -> Result<_, SessionError> {
-            // A nested public storage read uses the exact session connection.
+            // Commit through a second connection after authority pinned the
+            // snapshot. Both the callback store and nested engine capture must
+            // retain the old record, which would fail with separate snapshots.
+            let mut changed = original.clone();
+            changed.removed = true;
+            foreign.put_group(&changed)?;
+            assert_eq!(session.group_authority(&group)?, authority);
             let record = storage.with_read_snapshot(|same| same.get_group(&group))?;
             assert_eq!(record.epoch, authority.facts.epoch);
             assert_eq!(record.members.len(), authority.facts.member_count);
             assert!(authority.facts.is_admin);
+            assert!(!record.removed);
+            assert!(
+                storage.put_group(&changed).is_err(),
+                "host writes must be rejected"
+            );
             Ok(authority)
         })
         .unwrap();
     assert_eq!(before.lifecycle, GroupLifecycleState::Stable);
+    assert!(session.group_authority(&group).unwrap().facts.removed);
+    foreign.put_group(&original).unwrap();
+    drop(foreign);
     drop(session);
     let mut reopened =
         AccountDeviceSession::open(config(&path, &key, b"alice").defer_group_hydration()).unwrap();

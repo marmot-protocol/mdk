@@ -46,8 +46,8 @@ for the existing owner to refresh. See the [opening contract](../../docs/marmot-
 `conversation_window` adds explicit context placement around a retained anchor; latest targets always read the tail.
 `conversation_account_snapshot` captures that window, system provenance, presentation inputs, draft descriptors and
 persisted controls in one deferred read. `StorageProvider::with_read_snapshot` also composes public storage calls
-under one deferred transaction. Migration 0075 tracks group-specific authority input revisions without reading
-roster/tree blobs on a cache hit; the engine owns their scalar projection. The combined live screen remains C5 M4 work.
+under one deferred transaction, enforcing and restoring SQLite query-only mode even for nested calls.
+The engine reuses its existing MLS cache for authority capture. The combined live screen remains C5 M4 work.
 
 Selected composer reads and revision-checked mutations share the existing encrypted draft tables. Migration 0073
 tracks legacy writes too; queued/fanout acceptance clears only its submitted revision atomically. See the

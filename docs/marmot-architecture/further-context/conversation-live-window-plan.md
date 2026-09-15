@@ -9,7 +9,7 @@ status: implementation-plan
 
 M1–M3 are merged through #1844 (`1fcb060b6`). M4 in #1838 composes their Rust foundations;
 M5 exports native handles. The independent account badge correction #1847 is merged.
-#1849 merged the viewport and account-read foundations; M4 is not yet complete.
+The viewport and account-read foundations merged in #1849; M4 is not yet complete.
 
 ## Contract to implement
 
@@ -39,13 +39,13 @@ M5 exports native handles. The independent account badge correction #1847 is mer
    read state, revisioned draft descriptors and persisted archive/admin/leave controls in one
    deferred read. A concurrent WAL writer test verifies that every field stays on the same
    snapshot. `Engine::group_authority` now returns compact role, membership and capability facts;
-   lifecycle and pending disband gates remain fresh. Migration 0075 supplies group-local tokens
-   covering the mirrored record and canonical MLS tree/context/state/own index. Ratchet messages,
-   drafts, profiles and unrelated groups do not invalidate these facts. Cache misses may load MLS;
-   steady unchanged-authority reads return scalars without a roster decode.
+   lifecycle and pending disband gates remain fresh. It reuses the existing MLS cache and derives
+   compact scalars on each capture. No new durable revision/cache table is introduced; measure
+   actual actor refresh costs before adding finer-grained invalidation. Membership includes the
+   existing staged record projection, while admin authority changes at canonical acceptance.
    `AccountDeviceSession::with_group_authority_snapshot` composes host-owned account reads on the
-   session's exact connection, under one deferred transaction and live engine borrow. Startup
-   seeds fail with `GroupNotHydrated` until validated; they never default to Stable.
+   session's exact connection, under one enforced read-only transaction and live engine borrow. Startup
+   seeds fail with `GroupNotHydrated` until validated; missing live epoch state returns `UnknownGroup`.
 3. **Actor and handles.** Attach projection/group, draft, relevant profile, presentation and reset
    sources; serialize page/anchor/latest requests; deliver complete replacements with retries.
 4. **Adversarial integration coverage.** Race initial read vs mutations, concurrent receive/page,

@@ -1,18 +1,17 @@
 //! Compact live-engine facts for conversation capture. This is advisory
 //! presentation data; mutation entry points still validate current authority.
-use std::collections::HashMap;
-use std::sync::Mutex;
-
 use cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::{EngineError, EpochId, GroupId, GroupLifecycleState};
-use openmls::group::MlsGroup;
-use openmls_traits::OpenMlsProvider;
 
 use crate::Engine;
 
-/// Canonical membership/capability scalars. No roster, administrator list,
+/// Compact membership/capability scalars. No roster, administrator list,
 /// unsupported-member identities, profile strings or MLS secrets escape.
+/// Terminal groups retain mirrored epoch/member count but zero MLS-derived
+/// administrator/blocker values, which are unavailable after removal/disband.
+/// Membership is the existing record projection (including staged changes);
+/// administrator authority remains canonical until commit acceptance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupAuthorityFacts {
     pub epoch: EpochId,
@@ -23,6 +22,8 @@ pub struct GroupAuthorityFacts {
     pub removed: bool,
     pub unrecoverable: bool,
     pub disbanded: bool,
+    /// Whether the lifecycle component is enabled, matching the existing
+    /// shared group projection; self permissions are gated separately.
     pub disbanding_enabled: bool,
     pub has_disbanding_blockers: bool,
 }
@@ -37,73 +38,25 @@ pub struct GroupAuthoritySnapshot {
     pub disbanding: bool,
 }
 
-#[derive(Default)]
-pub(crate) struct GroupAuthorityCache {
-    entries: Mutex<HashMap<GroupId, ([u8; 32], GroupAuthorityFacts)>>,
-    #[cfg(test)]
-    misses: std::sync::atomic::AtomicU64,
-}
-
-impl GroupAuthorityCache {
-    pub(crate) fn forget_group(&self, group: &GroupId) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(group);
-    }
-}
-
 impl<S: StorageProvider> Engine<S> {
-    /// Capture compact authority from the live, validated engine. Scalar facts
-    /// are reused only with a backend token covering their exact group/MLS
-    /// sources. Lifecycle and durable disband gates are read on every call.
-    /// Unknown or unhydrated engine state never becomes a fabricated Stable.
-    /// No network, readiness work or read acknowledgement is performed.
+    /// Capture compact authority from the live, validated engine within one
+    /// backend read snapshot. Reuse the engine's existing MLS cache; derive
+    /// scalars and read lifecycle/disband gates on every capture. No network,
+    /// readiness work or read acknowledgement is performed.
     pub fn group_authority(
         &self,
         group_id: &GroupId,
     ) -> Result<GroupAuthoritySnapshot, EngineError> {
         self.ensure_group_live(group_id)?;
-        self.storage.with_read_snapshot(|storage| {
-            let revision = storage.group_authority_revision(group_id)?;
-            let cached = revision.and_then(|revision| {
-                self.group_authority_cache
-                    .entries
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(group_id)
-                    .filter(|(stored, _)| *stored == revision)
-                    .map(|(_, facts)| *facts)
-            });
-            let facts = match cached {
-                Some(facts) => facts,
-                None => {
-                    #[cfg(test)]
-                    self.group_authority_cache
-                        .misses
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let facts = self.capture_group_authority_facts(group_id)?;
-                    if let Some(revision) = revision {
-                        let mut entries = self
-                            .group_authority_cache
-                            .entries
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner());
-                        if entries.len() >= 32 && !entries.contains_key(group_id) {
-                            entries.clear();
-                        }
-                        entries.insert(group_id.clone(), (revision, facts));
-                    }
-                    facts
-                }
-            };
+        self.storage.with_read_snapshot(|_| {
+            let facts = self.capture_group_authority_facts(group_id)?;
             let lifecycle = if facts.disbanded {
                 GroupLifecycleState::Disbanded
             } else {
                 self.epoch_manager
                     .state(group_id)
                     .map(GroupLifecycleState::from)
-                    .ok_or_else(|| EngineError::GroupNotHydrated(group_id.clone()))?
+                    .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?
             };
             Ok(GroupAuthoritySnapshot {
                 facts,
@@ -131,7 +84,7 @@ impl<S: StorageProvider> Engine<S> {
             removed: group.removed,
             unrecoverable: group.unrecoverable,
             disbanded: group.disbanded.is_some(),
-            disbanding_enabled: !group.is_terminal()
+            disbanding_enabled: group.disbanded.is_none()
                 && group
                     .required_capabilities
                     .app_components
@@ -141,30 +94,21 @@ impl<S: StorageProvider> Engine<S> {
         if group.is_terminal() {
             return Ok(facts);
         }
-        // Deliberately load within this read boundary, rather than consulting
-        // the ratchet cache's connection/data_version token (a different
-        // consistency domain). This only happens when authority inputs change.
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_group = MlsGroup::load(
-            provider.storage(),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        let mut admins = crate::app_components::admins_of_group(&mls_group)?;
-        admins.sort();
-        admins.dedup();
-        facts.admin_count = admins.len();
-        facts.is_admin = facts.is_member
-            && admins
-                .iter()
-                .any(|key| key.as_slice() == self.identity.self_id().as_slice());
-        facts.has_disbanding_blockers = !facts.disbanding_enabled
-            && !crate::app_components::lifecycle_support_blockers(&mls_group)?.is_empty();
-        Ok(facts)
+        // The enclosing read pins both the mirrored record and data_version,
+        // so existing MLS cache generation checks use this account snapshot.
+        self.with_mls_group(group_id, |mls_group| {
+            let mut admins = crate::app_components::admins_of_group(mls_group)?;
+            admins.sort();
+            admins.dedup();
+            facts.admin_count = admins.len();
+            facts.is_admin = facts.is_member
+                && admins
+                    .iter()
+                    .any(|key| key.as_slice() == self.identity.self_id().as_slice());
+            facts.has_disbanding_blockers = !facts.disbanding_enabled
+                && !crate::app_components::lifecycle_support_blockers(mls_group)?.is_empty();
+            Ok(facts)
+        })
     }
 }
 
@@ -175,7 +119,6 @@ mod tests {
     use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
     use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
     use cgka_traits::storage::GroupStorage;
-    use std::sync::atomic::Ordering;
 
     async fn fixture() -> (Engine<storage_sqlite::SqliteAccountStorage>, GroupId) {
         let mut engine = test_engine();
@@ -201,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_authority_reuses_facts_across_message_ratchets_and_other_groups() {
+    async fn group_authority_stays_consistent_across_message_ratchets_and_other_groups() {
         let (mut engine, group) = fixture().await;
         let first = engine.group_authority(&group).unwrap();
         assert!(first.facts.is_member);
@@ -216,7 +159,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let misses = engine.group_authority_cache.misses.load(Ordering::Relaxed);
         let payload = MarmotAppEvent::new(
             hex::encode(engine.self_id().as_slice()),
             1_700_000_000,
@@ -246,14 +188,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.group_authority(&group).unwrap(), first);
-        assert_eq!(
-            engine.group_authority_cache.misses.load(Ordering::Relaxed),
-            misses
-        );
     }
 
     #[tokio::test]
-    async fn group_authority_never_reuses_aborted_or_replaced_facts() {
+    async fn group_authority_reads_aborted_and_replaced_records_consistently() {
         let (engine, group) = fixture().await;
         let initial = engine.group_authority(&group).unwrap();
         let mut record = engine.storage.get_group(&group).unwrap();
@@ -286,7 +224,7 @@ mod tests {
         engine.epoch_manager.clear_group_state(&group);
         assert!(matches!(
             engine.group_authority(&group),
-            Err(EngineError::GroupNotHydrated(_))
+            Err(EngineError::UnknownGroup(_))
         ));
         engine.unhydrated_groups.insert(group.clone());
         assert!(matches!(
@@ -295,21 +233,36 @@ mod tests {
         ));
         engine.storage.close().unwrap();
         engine.unhydrated_groups.remove(&group);
-        assert!(engine.group_authority(&group).is_err());
+        assert!(matches!(
+            engine.group_authority(&group),
+            Err(EngineError::Storage(cgka_traits::StorageError::Closed(_)))
+        ));
     }
     #[tokio::test]
-    async fn group_authority_reads_lifecycle_again_without_reloading_scalar_facts() {
+    async fn group_authority_reads_lifecycle_again() {
         let (mut engine, group) = fixture().await;
         engine.group_authority(&group).unwrap();
-        let misses = engine.group_authority_cache.misses.load(Ordering::Relaxed);
         engine.epoch_manager.mark_unrecoverable(&group);
         assert_eq!(
             engine.group_authority(&group).unwrap().lifecycle,
             GroupLifecycleState::Unrecoverable
         );
-        assert_eq!(
-            engine.group_authority_cache.misses.load(Ordering::Relaxed),
-            misses
-        );
+    }
+    #[tokio::test]
+    async fn group_authority_preserves_enabled_component_after_removal() {
+        let (engine, group) = fixture().await;
+        let mut record = engine.storage.get_group(&group).unwrap();
+        record
+            .required_capabilities
+            .app_components
+            .insert(GROUP_LIFECYCLE_COMPONENT_ID);
+        record.removed = true;
+        engine.storage.put_group(&record).unwrap();
+        let facts = engine.group_authority(&group).unwrap().facts;
+        assert!(facts.disbanding_enabled);
+        assert!(!facts.is_member);
+        assert!(!facts.is_admin);
+        assert_eq!(facts.admin_count, 0);
+        assert!(!facts.has_disbanding_blockers);
     }
 }

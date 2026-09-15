@@ -1,5 +1,4 @@
 mod account_device_signer;
-pub(crate) mod authority_revision;
 mod capabilities;
 mod convergence_passes;
 mod convergence_policy;
