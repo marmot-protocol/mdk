@@ -789,10 +789,11 @@ pub(crate) fn retire_commits_superseded_by_replacement_welcome<S: StorageProvide
 /// redelivery could never rescue such a row either. Releasing drops the
 /// retained bytes WITHOUT a terminal deduplication verdict
 /// (`MessageStorage::release_message_for_replay`), so exact-id redelivery
-/// processes the message normally. That is the same footing #1840's traceless
-/// refusal already leaves every raced-ahead message on, which is what the
-/// bound's remainder owes them. No cap accounting is involved: a `Failed` row
-/// holds no deferred-peel slot.
+/// processes the message normally. That is the same footing the removed copy's
+/// retention ring leaves its own evicted rows on
+/// (`Engine::evict_oldest_retained_row_past_the_removed_ring`), which is what
+/// the bound's remainder owes these. No cap accounting is involved: a `Failed`
+/// row holds no deferred-peel slot.
 ///
 /// Release is per-row and monotone, so a mid-sweep error is not a torn write.
 /// The backend records the host receipt BEFORE it deletes any bytes, so a

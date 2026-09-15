@@ -241,9 +241,13 @@ pub struct TransportGroupRoute {
 /// one before entering a risky transition and either commits (`release_*`)
 /// or rewinds (`rollback_*`). Invariant: snapshots capture every piece of
 /// backend state needed to reload the group at the snapshot epoch, including
-/// OpenMLS group state. `list_messages` must return a deterministic replay
-/// order for a given backend; insertion order is preferred when the backend
-/// can retain it.
+/// OpenMLS group state.
+///
+/// Every message listing and visitor MUST return rows in insertion (arrival)
+/// order. The engine's correctness depends on that order, not merely on
+/// determinism: the re-join replay applies retained commits as a chain in it,
+/// and the removed copy's retention ring treats the first row visited as the
+/// oldest. A backend that cannot retain arrival order is not conforming.
 pub trait MessageStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()>;
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord>;
@@ -300,9 +304,9 @@ pub trait MessageStorage {
             .collect())
     }
 
-    /// Visit matching rows in replay order, stopping as soon as `visitor` returns
-    /// false. Backends should stream rows so early termination avoids reading or
-    /// decoding the remainder. The callback must not call back into storage:
+    /// Visit matching rows in insertion order (see the trait doc), stopping as
+    /// soon as `visitor` returns false. Backends should stream rows so early
+    /// termination avoids reading or decoding the remainder. The callback must not call back into storage:
     /// implementations may hold their connection lock while visiting a row.
     fn visit_messages_in_states(
         &self,
