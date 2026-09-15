@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Native C4 screen DTO lift/lower round trips. This does not package Apple/Android artifacts.
+# Native C4/C5 screen DTO lift/lower round trips. This does not package Apple/Android artifacts.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 smoke_language="${1:-swift}"

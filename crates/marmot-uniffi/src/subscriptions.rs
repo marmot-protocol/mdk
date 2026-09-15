@@ -482,3 +482,6 @@ impl PresentedChatListSubscription {
 
 mod chat_window;
 pub use chat_window::{AccountAttentionSubscription, ChatListWindowSubscription};
+
+pub(crate) mod conversation_window;
+pub use conversation_window::ConversationWindowSubscription;

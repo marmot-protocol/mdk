@@ -113,6 +113,15 @@ int main(int argc, char **argv) {
     marmot_string_free(NULL);
     marmot_account_summary_list_free(NULL);
     marmot_markdown_document_free(NULL);
+    marmot_conversation_window_snapshot_free(NULL);
+    marmot_selected_message_draft_free(NULL);
+    marmot_conversation_window_subscription_free(NULL);
+    check(marmot_open_conversation_window(NULL, NULL, NULL, 0, NULL, NULL, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "conversation open preflights outputs");
+    check(marmot_conversation_window_subscription_page(NULL, NULL, 0, 1, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "conversation page preflights outputs");
+    check(marmot_conversation_window_subscription_cancel(NULL) == MARMOT_STATUS_NULL_POINTER,
+          "conversation cancel rejects NULL handle");
     marmot_chat_list_window_snapshot_free(NULL);
     marmot_account_attention_snapshot_free(NULL);
     marmot_chat_list_window_subscription_free(NULL);

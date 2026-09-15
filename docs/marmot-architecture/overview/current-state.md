@@ -35,7 +35,8 @@ See [shared conversation presentation](../further-context/conversation-presentat
 C5 M4 adds a combined Rust conversation handle: initial/live history, header and identities, read state and draft,
 with serialized paging, retained anchors, timed retries and terminal account-store teardown. Its worker capture
 combines compact live engine authority with persisted fields on the exact session connection. Frozen startup/
-recovery snapshots return a retry requirement. Native handles remain M5; publication and adoption remain C9.
+recovery snapshots return a retry requirement. M5 exposes additive UniFFI/C handles with finite operation deadlines,
+cancellation, revisioned draft operations and native parity checks; publication and adoption remain C9.
 See the [live conversation implementation plan](../further-context/conversation-live-window-plan.md).
 
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.

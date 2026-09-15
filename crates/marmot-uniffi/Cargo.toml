@@ -33,7 +33,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 keyring-core.workspace = true
 nostr-relay-builder.workspace = true
 

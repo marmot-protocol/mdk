@@ -36,3 +36,5 @@ mod product_analytics;
 mod presentation;
 
 mod chat_window;
+
+mod conversation_window;

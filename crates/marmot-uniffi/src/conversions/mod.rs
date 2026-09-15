@@ -774,3 +774,6 @@ pub use presentation::*;
 
 mod chat_window;
 pub use chat_window::*;
+
+pub mod conversation_window;
+pub use conversation_window::*;

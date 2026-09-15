@@ -17,7 +17,8 @@ fun main() {
     val value = AccountAttentionSnapshotFfi("summary", ULong.MAX_VALUE, states.map { AccountAttentionEntryFfi("account", it) })
     val copy = FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
     check(copy == value)
-    println("Kotlin C4 window and attention round trips passed")
+    conversationRoundTrips()
+    println("Kotlin C4/C5 projection round trips passed")
 }
 
 suspend fun compileScreenCommands(marmot: Marmot, account: String) {
@@ -34,5 +35,39 @@ suspend fun compileScreenCommands(marmot: Marmot, account: String) {
     marmot.subscribeAccountAttention().use { summary ->
         summary.snapshot()
         summary.next()
+    }
+}
+
+fun conversationRoundTrips() {
+    val revision = ConversationWindowRevisionFfi("window", ULong.MAX_VALUE)
+    check(FfiConverterTypeConversationWindowRevisionFfi.lift(FfiConverterTypeConversationWindowRevisionFfi.lower(revision)) == revision)
+    for (kind in ConversationAnchorKindFfi.entries) {
+        val value = ConversationAnchorOutcomeFfi(kind, if (kind == ConversationAnchorKindFfi.EMPTY) null else 199u)
+        check(FfiConverterTypeConversationAnchorOutcomeFfi.lift(FfiConverterTypeConversationAnchorOutcomeFfi.lower(value)) == value)
+    }
+    val reactions = ConversationReactionsFfi(ULong.MAX_VALUE, 10u,
+        listOf(ConversationReactionFfi("👍", ULong.MAX_VALUE, listOf("author"))), 9u)
+    val refs = ConversationMessageReferencesFfi("message", "author", null, listOf("author"), true,
+        emptyList(), false, ConversationSystemReferencesFfi("member_removed", "author", null), reactions)
+    check(FfiConverterTypeConversationMessageReferencesFfi.lift(FfiConverterTypeConversationMessageReferencesFfi.lower(refs)) == refs)
+    val attachment = SelectedMessageDraftAttachmentFfi("a", "voice.ogg", "audio/ogg", ULong.MAX_VALUE,
+        null, "thumb", 1.5, listOf(0.2, 0.5))
+    val draft = SelectedMessageDraftContentFfi("group", "unsent", null, listOf(attachment), 1L, 2L)
+    check(FfiConverterTypeSelectedMessageDraftContentFfi.lift(FfiConverterTypeSelectedMessageDraftContentFfi.lower(draft)) == draft)
+}
+suspend fun compileConversationCommands(marmot: Marmot, account: String, group: String) {
+    marmot.openConversationWindow(account, group, ConversationOpenModeFfi.AUTOMATIC, null, 50u, 0u).use { window ->
+        window.snapshot()?.let { initial ->
+            val page = window.page(initial.revision, ConversationPageDirectionFfi.OLDER, 50u, 0u)
+            page.messages.firstOrNull()?.let { row ->
+                val anchor = window.setVisibleAnchor(page.revision, row.timeline.messageIdHex, 0u)
+                val jumped = window.jumpToMessage(anchor.revision, row.timeline.messageIdHex, 0u)
+                window.returnToLatest(jumped.revision, 0u)
+            }
+            marmot.messageDraftAttachmentIfRevision(account, initial.draft.revision, "a")
+            marmot.saveMessageDraftIfRevision(account, initial.draft.revision, "draft", null, emptyList())
+        }
+        window.next()
+        window.cancel()
     }
 }

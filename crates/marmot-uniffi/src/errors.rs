@@ -283,6 +283,28 @@ pub enum MarmotKitError {
     ChatWindowClosed,
     #[error("chat window query failed: {details}")]
     ChatWindowQuery { details: String },
+    #[error("conversation window requests require 1 to 200 rows")]
+    ConversationWindowInvalidLimit,
+    #[error("selected draft changed; refresh before retrying")]
+    MessageDraftRevisionConflict,
+    #[error("conversation changed; refresh the sequence before retrying")]
+    ConversationWindowStale,
+    #[error("revision belongs to another conversation window generation")]
+    ConversationWindowWrongGeneration,
+    #[error("visible anchor must belong to the retained conversation window")]
+    ConversationWindowAnchorOutside,
+    #[error("conversation window closed; reopen it")]
+    ConversationWindowClosed,
+    #[error("conversation capture temporarily unavailable; retry pending")]
+    ConversationWindowNotReady,
+    #[error("conversation operation timed out; accepted commands may still complete")]
+    ConversationWindowTimedOut,
+    #[error("conversation opening mode and message target disagree")]
+    ConversationWindowInvalidTarget,
+    #[error("conversation query failed: {details}")]
+    ConversationWindowQuery { details: String },
+    #[error("conversation presentation failed: {details}")]
+    ConversationWindowPresentation { details: String },
 }
 
 impl From<AppError> for MarmotKitError {
@@ -377,6 +399,7 @@ impl From<&AppError> for MarmotKitError {
             AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved {
                 group_id_hex: group_id_hex.clone(),
             },
+            AppError::MessageDraftRevisionConflict => Self::MessageDraftRevisionConflict,
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft {
                 details: details.clone(),
             },
@@ -1023,5 +1046,25 @@ mod screen_error_tests {
             MarmotKitError::from(error.as_ref()),
             MarmotKitError::RuntimeStopping
         ));
+    }
+}
+
+impl From<marmot_app::ConversationWindowError> for MarmotKitError {
+    fn from(v: marmot_app::ConversationWindowError) -> Self {
+        use marmot_app::ConversationWindowError as E;
+        match v {
+            E::InvalidLimit => Self::ConversationWindowInvalidLimit,
+            E::StaleWindow => Self::ConversationWindowStale,
+            E::AnchorOutsideWindow => Self::ConversationWindowAnchorOutside,
+            E::Closed => Self::ConversationWindowClosed,
+            E::NotReady => Self::ConversationWindowNotReady,
+            E::App(e) => Self::from(e.as_ref()),
+            E::Query(e) => Self::ConversationWindowQuery {
+                details: e.to_string(),
+            },
+            E::Presentation(e) => Self::ConversationWindowPresentation {
+                details: e.to_string(),
+            },
+        }
     }
 }

@@ -179,3 +179,9 @@ for version ordering, localization, readiness, and account-switch behavior.
 C4 adds live Chats/Unread/Archived/Left windows and independent account attention.
 See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
 for paging, sequence handling, cancellation, C ownership, and compatibility.
+
+## Prepared conversation windows
+
+The additive C5 screen API combines history, header/capabilities, visible identities,
+read state and revisioned draft descriptors. See the [native conversation contract](../marmot-uniffi/CONVERSATION-WINDOW.md)
+for opening, paging, cancellation, timeout, ownership and draft migration.

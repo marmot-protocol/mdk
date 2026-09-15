@@ -2343,7 +2343,7 @@ unsafe fn borrowed<'a, T>(ptr: *const T) -> Result<&'a T, MarmotStatus> {
 /// Read a borrowed `(ptr, len)` array of input structs through a per-item
 /// `to_ffi` conversion. `(NULL, 0)` is empty; NULL with nonzero length is
 /// an error.
-unsafe fn struct_array<T, F, R>(
+pub(crate) unsafe fn struct_array<T, F, R>(
     ptr: *const T,
     len: usize,
     convert: F,

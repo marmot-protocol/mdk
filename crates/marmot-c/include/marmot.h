@@ -154,6 +154,17 @@ enum MarmotStatus
   MARMOT_STATUS_CHAT_WINDOW_ANCHOR_OUTSIDE = 75,
   MARMOT_STATUS_CHAT_WINDOW_CLOSED = 76,
   MARMOT_STATUS_CHAT_WINDOW_QUERY = 77,
+  MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_LIMIT = 78,
+  MARMOT_STATUS_CONVERSATION_WINDOW_STALE = 79,
+  MARMOT_STATUS_CONVERSATION_WINDOW_WRONG_GENERATION = 80,
+  MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE = 81,
+  MARMOT_STATUS_CONVERSATION_WINDOW_CLOSED = 82,
+  MARMOT_STATUS_CONVERSATION_WINDOW_NOT_READY = 83,
+  MARMOT_STATUS_CONVERSATION_WINDOW_TIMED_OUT = 84,
+  MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_TARGET = 85,
+  MARMOT_STATUS_CONVERSATION_WINDOW_QUERY = 86,
+  MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 87,
+  MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 88,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -716,6 +727,26 @@ typedef enum MarmotAccountAttentionUnavailable {
   MARMOT_ACCOUNT_ATTENTION_UNAVAILABLE_RESETTING,
 } MarmotAccountAttentionUnavailable;
 
+typedef enum MarmotConversationParticipation {
+  MARMOT_CONVERSATION_PARTICIPATION_PENDING_INVITATION,
+  MARMOT_CONVERSATION_PARTICIPATION_ACTIVE,
+  MARMOT_CONVERSATION_PARTICIPATION_LEAVING,
+  MARMOT_CONVERSATION_PARTICIPATION_LEFT,
+  MARMOT_CONVERSATION_PARTICIPATION_REMOVED,
+  MARMOT_CONVERSATION_PARTICIPATION_DISBANDED,
+  MARMOT_CONVERSATION_PARTICIPATION_UNAVAILABLE,
+} MarmotConversationParticipation;
+
+typedef enum MarmotConversationAnchorKind {
+  MARMOT_CONVERSATION_ANCHOR_KIND_EMPTY,
+  MARMOT_CONVERSATION_ANCHOR_KIND_LATEST,
+  MARMOT_CONVERSATION_ANCHOR_KIND_FIRST_UNREAD,
+  MARMOT_CONVERSATION_ANCHOR_KIND_MESSAGE,
+  MARMOT_CONVERSATION_ANCHOR_KIND_RETAINED,
+  MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_NEXT,
+  MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
+} MarmotConversationAnchorKind;
+
 typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
   MARMOT_CHAT_LIST_PAGE_DIRECTION_BACKWARD,
@@ -903,6 +934,11 @@ typedef struct MarmotChatsSubscription MarmotChatsSubscription;
 typedef struct MarmotClient MarmotClient;
 
 /**
+ * Free before its client. Concurrent next and commands are supported; never free during a call.
+ */
+typedef struct MarmotConversationWindowSubscription MarmotConversationWindowSubscription;
+
+/**
  * Opaque handle to the top-level event firehose: one subscription,
  * every account, every event type. Broadcast lag is skipped
  * silently — catch back up via the per-account subscriptions.
@@ -914,6 +950,11 @@ typedef struct MarmotEventsSubscription MarmotEventsSubscription;
  * then the full record after each member/profile/roster change.
  */
 typedef struct MarmotGroupStateSubscription MarmotGroupStateSubscription;
+
+/**
+ * Opaque token owned by its SelectedMessageDraft; borrow only while that draft remains live.
+ */
+typedef struct MarmotMessageDraftRevision MarmotMessageDraftRevision;
 
 /**
  * Opaque handle to a message stream: an initial record snapshot,
@@ -4376,6 +4417,159 @@ typedef struct MarmotAccountAttentionSnapshot {
   struct MarmotAccountAttentionEntry *accounts;
   uintptr_t accounts_len;
 } MarmotAccountAttentionSnapshot;
+
+typedef struct MarmotConversationWindowRevision {
+  char *generation;
+  uint64_t sequence;
+} MarmotConversationWindowRevision;
+
+typedef struct MarmotConversationCapabilities {
+  enum MarmotConversationParticipation participation;
+  bool is_self_admin;
+  bool is_last_admin;
+  bool can_send;
+  bool can_invite;
+  bool can_edit_group;
+  bool can_leave;
+  bool requires_self_demote_before_leave;
+  bool can_enable_disbanding;
+  bool can_disband;
+} MarmotConversationCapabilities;
+
+typedef struct MarmotConversationHeader {
+  struct MarmotConversationPresentation selected;
+  bool has_member_count;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t member_count;
+  bool archived;
+  bool has_epoch;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t epoch;
+  enum MarmotGroupLifecycleState lifecycle;
+  bool disbanding;
+  bool unrecoverable;
+  struct MarmotConversationCapabilities capabilities;
+} MarmotConversationHeader;
+
+typedef struct MarmotConversationSystemReferences {
+  char *system_type;
+  char *actor;
+  char *subject;
+} MarmotConversationSystemReferences;
+
+typedef struct MarmotConversationReaction {
+  char *emoji;
+  uint64_t count;
+  char **reactors;
+  uintptr_t reactors_len;
+} MarmotConversationReaction;
+
+typedef struct MarmotConversationReactions {
+  uint64_t total_count;
+  uint64_t total_kinds;
+  struct MarmotConversationReaction *items;
+  uintptr_t items_len;
+  uint64_t omitted_kinds;
+} MarmotConversationReactions;
+
+typedef struct MarmotConversationMessageReferences {
+  char *message_id_hex;
+  char *sender;
+  char *reply_author;
+  char **mentions;
+  uintptr_t mentions_len;
+  bool mentions_truncated;
+  char **reply_mentions;
+  uintptr_t reply_mentions_len;
+  bool reply_mentions_truncated;
+  struct MarmotConversationSystemReferences *system;
+  struct MarmotConversationReactions reactions;
+} MarmotConversationMessageReferences;
+
+typedef struct MarmotConversationMessage {
+  struct MarmotTimelineMessageRecord timeline;
+  struct MarmotConversationMessageReferences references;
+} MarmotConversationMessage;
+
+typedef struct MarmotConversationIdentity {
+  char *account_id_hex;
+  char *display_name;
+  struct MarmotSelectedAvatar avatar;
+  bool has_cached_profile;
+} MarmotConversationIdentity;
+
+typedef struct MarmotConversationOpenReadState {
+  bool initialized;
+  char *last_read_message_id_hex;
+  bool has_last_read_timeline_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_read_timeline_at;
+  bool manually_marked_unread;
+  uint64_t unread_count;
+  uint64_t unread_mention_count;
+  char *first_unread_message_id_hex;
+} MarmotConversationOpenReadState;
+
+typedef struct MarmotSelectedMessageDraftAttachment {
+  char *id;
+  char *file_name;
+  char *media_type;
+  uint64_t plaintext_size;
+  char *dim;
+  char *thumbhash;
+  bool has_duration_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  double duration_seconds;
+  double *waveform_samples;
+  uintptr_t waveform_samples_len;
+} MarmotSelectedMessageDraftAttachment;
+
+typedef struct MarmotSelectedMessageDraftContent {
+  char *group_id_hex;
+  char *content;
+  char *reply_to_message_id_hex;
+  struct MarmotSelectedMessageDraftAttachment *media_attachments;
+  uintptr_t media_attachments_len;
+  int64_t created_at_ms;
+  int64_t updated_at_ms;
+} MarmotSelectedMessageDraftContent;
+
+typedef struct MarmotSelectedMessageDraft {
+  struct MarmotMessageDraftRevision *revision;
+  struct MarmotSelectedMessageDraftContent *draft;
+} MarmotSelectedMessageDraft;
+
+typedef struct MarmotConversationAnchorOutcome {
+  enum MarmotConversationAnchorKind kind;
+  bool has_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t index;
+} MarmotConversationAnchorOutcome;
+
+typedef struct MarmotConversationWindowSnapshot {
+  struct MarmotConversationWindowRevision revision;
+  struct MarmotConversationHeader header;
+  struct MarmotConversationMessage *messages;
+  uintptr_t messages_len;
+  struct MarmotConversationIdentity *identities;
+  uintptr_t identities_len;
+  struct MarmotConversationOpenReadState read_state;
+  struct MarmotSelectedMessageDraft draft;
+  bool pending_confirmation;
+  struct MarmotConversationAnchorOutcome anchor;
+  bool has_more_before;
+  bool has_more_after;
+} MarmotConversationWindowSnapshot;
 
 #ifdef __cplusplus
 extern "C" {
@@ -8477,6 +8671,169 @@ MarmotStatus marmot_chat_list_window_subscription_return_to_top(const struct Mar
                                                                 struct MarmotChatListWindowSnapshot **out);
 
 /**
+ * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
+ * # Safety
+ * sub must be live and out writable.
+ */
+MarmotStatus marmot_conversation_window_subscription_snapshot(const struct MarmotConversationWindowSubscription *sub,
+                                                              struct MarmotConversationWindowSnapshot **out);
+
+/**
+ * Receive a complete replacement. Zero timeout waits indefinitely. Timeout/error/closed leaves
+ * out NULL. Timeout does not consume an update. Free results with the matching snapshot_free.
+ * # Safety
+ * sub must remain live throughout the call; out must be writable. Use one receiver per handle.
+ */
+MarmotStatus marmot_conversation_window_subscription_next(const struct MarmotConversationWindowSubscription *sub,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotConversationWindowSnapshot **out);
+
+/**
+ * Cancel and free. NULL is a no-op; does not free previously returned snapshots.
+ * # Safety
+ * sub must be NULL or a library-owned handle with no active calls.
+ */
+void marmot_conversation_window_subscription_free(struct MarmotConversationWindowSubscription *sub);
+
+/**
+ * Close and wake pending receivers/commands. Idempotent; does not free this handle or snapshots.
+ * # Safety
+ * sub must remain live throughout all calls; free only after active calls return.
+ */
+MarmotStatus marmot_conversation_window_subscription_cancel(const struct MarmotConversationWindowSubscription *sub);
+
+/**
+ * Open one account/group. mode is a MarmotConversationOpenMode discriminant.
+ * Message mode requires message_id_hex; other modes require NULL. initial_rows NULL uses 50.
+ * Zero timeout uses 30 seconds; opening timeout abandons the opening. No mark-read occurs.
+ * # Safety
+ * client/strings must be valid; optional pointers readable or NULL, out_sub writable.
+ */
+MarmotStatus marmot_open_conversation_window(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *group_id_hex,
+                                             uint32_t mode,
+                                             const char *message_id_hex,
+                                             const uint32_t *initial_rows,
+                                             uint32_t timeout_ms,
+                                             struct MarmotConversationWindowSubscription **out_sub);
+
+/**
+ * Apply against the installed revision. May run while next waits; deduplicate completions by
+ * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
+ * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * # Safety
+ * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
+ */
+MarmotStatus marmot_conversation_window_subscription_page(const struct MarmotConversationWindowSubscription *sub,
+                                                          const struct MarmotConversationWindowRevision *revision,
+                                                          uint32_t direction,
+                                                          uint32_t count,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotConversationWindowSnapshot **out);
+
+/**
+ * Apply against the installed revision. May run while next waits; deduplicate completions by
+ * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
+ * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * # Safety
+ * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
+ */
+MarmotStatus marmot_conversation_window_subscription_set_visible_anchor(const struct MarmotConversationWindowSubscription *sub,
+                                                                        const struct MarmotConversationWindowRevision *revision,
+                                                                        const char *message_id_hex,
+                                                                        uint32_t timeout_ms,
+                                                                        struct MarmotConversationWindowSnapshot **out);
+
+/**
+ * Apply against the installed revision. May run while next waits; deduplicate completions by
+ * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
+ * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * # Safety
+ * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
+ */
+MarmotStatus marmot_conversation_window_subscription_jump_to_message(const struct MarmotConversationWindowSubscription *sub,
+                                                                     const struct MarmotConversationWindowRevision *revision,
+                                                                     const char *message_id_hex,
+                                                                     uint32_t timeout_ms,
+                                                                     struct MarmotConversationWindowSnapshot **out);
+
+/**
+ * Apply against the installed revision. May run while next waits; deduplicate completions by
+ * generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after
+ * timeout through next; refresh before retrying. Paging preserves the visible anchor at its cap.
+ * # Safety
+ * sub and borrowed revision/strings must remain live; out writable. Never free during a call.
+ */
+MarmotStatus marmot_conversation_window_subscription_return_to_latest(const struct MarmotConversationWindowSubscription *sub,
+                                                                      const struct MarmotConversationWindowRevision *revision,
+                                                                      uint32_t timeout_ms,
+                                                                      struct MarmotConversationWindowSnapshot **out);
+
+/**
+ * Descriptor-only draft; result owns the revision handle and must be deep-freed.
+ * # Safety
+ * client and strings valid; out writable.
+ */
+MarmotStatus marmot_selected_message_draft(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *group_id_hex,
+                                           struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Clear only this selected revision; later edits are preserved.
+ * # Safety
+ * client, account and revision valid; revision's owning snapshot/draft must remain live; out writable.
+ */
+MarmotStatus marmot_clear_message_draft_if_revision(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    const struct MarmotMessageDraftRevision *revision,
+                                                    struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Save only if the selected revision still matches. Attachment inputs are copied, never retained.
+ * # Safety
+ * client, account, content and revision valid; reply nullable; attachments points to len readable
+ * items (or NULL with zero len). Revision's owner stays live; out writable.
+ */
+MarmotStatus marmot_save_message_draft_if_revision(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const struct MarmotMessageDraftRevision *revision,
+                                                   const char *content,
+                                                   const char *reply,
+                                                   const struct MarmotMessageDraftAttachmentInput *attachments,
+                                                   uintptr_t attachments_len,
+                                                   struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Read one selected attachment. found=0 distinguishes absence from an empty acquired attachment.
+ * Free returned bytes with marmot_bytes_free; revision conflicts return an error.
+ * # Safety
+ * client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
+ */
+MarmotStatus marmot_message_draft_attachment_if_revision(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const struct MarmotMessageDraftRevision *revision,
+                                                         const char *attachment_id,
+                                                         uint8_t *out_found,
+                                                         uint8_t **out_data,
+                                                         uintptr_t *out_len);
+
+/**
+ * Send the exact selected revision; successful durable acceptance clears it atomically.
+ * Hosts must not independently delete the draft on delivery. Prepared media must match descriptors.
+ * # Safety
+ * client, account, revision valid; revision owner stays live; attachments readable for length,
+ * or NULL with zero length; out writable. Free result with marmot_send_summary_free.
+ */
+MarmotStatus marmot_send_message_draft(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const struct MarmotMessageDraftRevision *revision,
+                                       const struct MarmotMediaAttachmentReference *attachments,
+                                       uintptr_t attachments_len,
+                                       struct MarmotSendSummary **out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -9376,6 +9733,23 @@ void marmot_chat_list_window_snapshot_free(struct MarmotChatListWindowSnapshot *
  * this library.
  */
 void marmot_account_attention_snapshot_free(struct MarmotAccountAttentionSnapshot *ptr);
+
+/**
+ * Deep-free a selected draft and its opaque revision. NULL is allowed.
+ * # Safety
+ * p must be NULL or a library-owned unfreed selected draft.
+ */
+void marmot_selected_message_draft_free(struct MarmotSelectedMessageDraft *p);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_conversation_window_snapshot_free(struct MarmotConversationWindowSnapshot *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

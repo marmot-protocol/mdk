@@ -32,3 +32,5 @@ pub mod product_analytics;
 pub mod presentation;
 
 pub mod chat_window;
+
+pub mod conversation_window;

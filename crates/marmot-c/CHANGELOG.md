@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Prepared conversation windows with initial/live history, header/capabilities, visible
+  identities, read state and revisioned draft descriptors. Add independent paging,
+  anchor/jump/tail commands, finite operation deadlines, explicit cancellation and
+  conditional draft save/clear/attachment/send operations. New statuses append 78–88;
+  use matching regenerated headers/libraries. Publication and client adoption are separate.
+
 - Additive bounded live chat-list windows (Chats, Unread, Archived, Left), paging/anchor
   commands and independent live account-attention summaries across Swift/Kotlin and C.
   Existing list/read APIs and C record layouts remain; new typed window errors append
