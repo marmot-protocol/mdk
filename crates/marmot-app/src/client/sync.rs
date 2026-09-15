@@ -2331,6 +2331,27 @@ impl AppClient {
             counts.deliveries = counts.deliveries.saturating_add(1);
             summary.merge(delivery_summary);
             routes_dirty |= ingested.routes_dirty;
+            // A cancelled drain cannot replay an already-applied commit's
+            // group effects. Save them before waiting for another delivery.
+            if !self.pending_group_projection_updates.is_empty() {
+                if self.adapter.pending_delivery_overflow().is_some() {
+                    self.state.last_transport_timestamp = cursor_before_secs;
+                }
+                if let Err(error) =
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()
+                {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            counts.clone(),
+                            StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            }
         };
 
         if verdict != DrainVerdict::Overflow

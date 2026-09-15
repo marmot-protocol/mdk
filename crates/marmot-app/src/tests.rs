@@ -1165,6 +1165,71 @@ pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
 
 const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
 
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn cancelled_sync_keeps_profile() {
+    run_composed_app_runtime_test("cancelled-sync-profile", || async {
+        use cgka_traits::storage::GroupStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob_account = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig::default().with_dev_settlement_quiescence_ms(0),
+        )
+        .with_test_relay_client(relay.clone());
+        remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+        let mut bob = client_on_app_relay_plane(&app, "bob").await;
+        bob.publish_key_package().await.unwrap();
+        bob.prepare_transport().await.unwrap();
+        let mut alice = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = alice
+            .create_group("before", &[bob_account.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        bob.sync().await.unwrap();
+        drop(eose);
+        let storage = app.account_storage("bob").unwrap();
+        let epoch = storage.get_group(&group_id).unwrap().epoch;
+        alice
+            .update_group_profile(&group_id, Some("after"), None)
+            .await
+            .unwrap();
+
+        // Stop after the engine applies the commit, while the drain is still
+        // waiting for EOSE. Shutdown must not lose the matching projection.
+        {
+            let sync = bob.sync();
+            tokio::pin!(sync);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        _ = &mut sync => panic!("drain ended before cancellation"),
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                            if storage.get_group(&group_id).unwrap().epoch != epoch {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the rename must reach the engine");
+        }
+        drop(bob);
+        let group = app
+            .group("bob", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.profile.name, "after");
+    });
+}
+
 fn epoch_gap_probe(nostr_group_id_hex: &str, created_at: u64, marker: &str) -> NostrTransportEvent {
     let mut envelope = vec![0_u8; 12];
     envelope.extend_from_slice(format!("explicit-catch-up-probe:{marker}").as_bytes());
