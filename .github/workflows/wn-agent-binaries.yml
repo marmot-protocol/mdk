@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - .github/workflows/wn-agent-binaries.yml
+      - scripts/classify_ci_changes.py
+      - scripts/test_classify_ci_changes.py
+      - .cargo/config.toml
       - scripts/install-hermes-marmot.sh
       - scripts/hermes_marmot_configure_gateway.py
       - scripts/hermes_marmot_dev_setup.sh
@@ -31,8 +34,11 @@ on:
       - crates/agent-stream-compose/**
       - crates/cgka-engine/**
       - crates/cgka-session/**
+      - crates/fs-private/**
       - crates/marmot-account/**
       - crates/marmot-app/**
+      - crates/marmot-forensics/**
+      - crates/marmot-markdown/**
       - crates/storage-sqlite/**
       - crates/traits/**
       - crates/transport-nostr-adapter/**
@@ -62,7 +68,44 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
+  changes:
+    name: Classify binary build changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_binaries: ${{ steps.classify.outputs.run_binaries }}
+      run_hermes: ${{ steps.classify.outputs.run_hermes }}
+      run_openclaw: ${{ steps.classify.outputs.run_openclaw }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" \
+            || -z "$BASE_SHA" \
+            || "$BASE_SHA" =~ ^0+$ ]] \
+            || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            python3 scripts/classify_ci_changes.py --all --github-output "$GITHUB_OUTPUT" </dev/null
+          else
+            # Disable rename detection so a code-to-Markdown rename exposes
+            # both the removed code path and the added documentation path.
+            git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" \
+              | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: changes
+    if: needs.changes.outputs.run_binaries == 'true'
     name: Build wn-agent and terminal harnesses (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -101,6 +144,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build wn-agent
         run: cargo build --locked --release -p agent-connector --bin wn-agent --features otlp-export,product-analytics-export --target "${{ matrix.rust_target }}"
@@ -108,29 +153,16 @@ jobs:
       - name: Smoke test wn-agent
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
 
-      - name: Build wn-claude
-        run: cargo build --locked --release -p wn-claude --bin wn-claude --target "${{ matrix.rust_target }}"
+      - name: Build terminal harnesses
+        run: cargo build --locked --release -p wn-claude -p wn-codex -p wn-opencode -p wn-pi --bins --target "${{ matrix.rust_target }}"
 
-      - name: Smoke test wn-claude
-        run: ./target/${{ matrix.rust_target }}/release/wn-claude --help
-
-      - name: Build wn-codex
-        run: cargo build --locked --release -p wn-codex --bin wn-codex --target "${{ matrix.rust_target }}"
-
-      - name: Smoke test wn-codex
-        run: ./target/${{ matrix.rust_target }}/release/wn-codex --help
-
-      - name: Build wn-opencode
-        run: cargo build --locked --release -p wn-opencode --bin wn-opencode --target "${{ matrix.rust_target }}"
-
-      - name: Smoke test wn-opencode
-        run: ./target/${{ matrix.rust_target }}/release/wn-opencode --help
-
-      - name: Build wn-pi
-        run: cargo build --locked --release -p wn-pi --bin wn-pi --target "${{ matrix.rust_target }}"
-
-      - name: Smoke test wn-pi
-        run: ./target/${{ matrix.rust_target }}/release/wn-pi --help
+      - name: Smoke test terminal harnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in wn-claude wn-codex wn-opencode wn-pi; do
+            "./target/${{ matrix.rust_target }}/release/$binary" --help
+          done
 
       - name: Package binary bundles
         shell: bash
@@ -179,6 +211,8 @@ jobs:
           if-no-files-found: error
 
   plugin:
+    needs: changes
+    if: needs.changes.outputs.run_hermes == 'true'
     name: Package Hermes plugin
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -267,6 +301,8 @@ jobs:
           if-no-files-found: error
 
   hermes-marmot-integration:
+    needs: changes
+    if: needs.changes.outputs.run_hermes == 'true'
     name: Hermes Marmot integration (${{ matrix.cohort }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -335,8 +371,9 @@ jobs:
             --expect-source-install-mode "${{ matrix.expected_source_install_mode }}"
 
   openclaw-host-compat:
+    needs: changes
     name: OpenClaw beta host compatibility
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: needs.changes.outputs.run_openclaw == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -355,6 +392,8 @@ jobs:
           integrations/openclaw/marmot/test/openclaw-host-compat.sh
 
   openclaw-plugin:
+    needs: changes
+    if: needs.changes.outputs.run_openclaw == 'true'
     name: Package OpenClaw plugin
     runs-on: ubuntu-latest
     timeout-minutes: 15

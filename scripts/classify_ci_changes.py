@@ -8,6 +8,11 @@ import sys
 from pathlib import Path
 
 
+LANES = (
+    "run_full", "run_c", "run_conformance", "run_ios", "run_formal",
+    "run_binaries", "run_hermes", "run_openclaw", "run_installers",
+)
+
 ROOT_BUILD_PATHS = {
     ".cargo/config.toml",
     ".config/nextest.toml",
@@ -21,6 +26,7 @@ ROOT_BUILD_PATHS = {
 # These Markdown files are executable assurance inputs, not documentation-only
 # changes: simulator tests parse them and enforce their contents.
 EXECUTABLE_MARKDOWN = {
+    "integrations/openclaw/marmot/README.md",
     "crates/cgka-conformance-simulator/CONVERGENCE_ROUTE_MATRIX.md",
     "crates/cgka-conformance-simulator/MUTATION_MATRIX.md",
     "crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md",
@@ -106,6 +112,21 @@ SPECIALIST_EXACT_PATHS = {
     "scripts/tests/test_campaign_toolchain.sh",
 }
 
+# These inputs affect plugin packaging/installers, not the native Rust binaries.
+PLUGIN_ONLY_PREFIXES = (
+    "integrations/hermes/",
+    "integrations/openclaw/",
+)
+HERMES_PATHS = {
+    "scripts/install-hermes-marmot.sh",
+    "scripts/hermes_marmot_configure_gateway.py",
+    "scripts/hermes_marmot_dev_setup.sh",
+    "scripts/hermes_marmot_verify_persisted_config.sh",
+    "scripts/hermes_marmot_deterministic_e2e.sh",
+}
+
+PLUGIN_ONLY_PATHS = HERMES_PATHS | {"scripts/install-openclaw-marmot.sh"}
+
 
 def _is_documentation(path: str) -> bool:
     executable_markdown = path in EXECUTABLE_MARKDOWN or path.startswith(
@@ -142,29 +163,22 @@ def _is_recognized_specialist_path(path: str) -> bool:
 def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
     normalized = sorted({path.strip("/") for path in paths if path.strip("/")})
     if force_all or not normalized:
-        return {
-            "run_full": True,
-            "run_c": True,
-            "run_conformance": True,
-            "run_ios": True,
-            "run_formal": True,
-        }
+        return dict.fromkeys(LANES, True)
 
-    run_full = not all(_is_documentation(path) for path in normalized)
-    if not run_full:
-        return {
-            "run_full": False,
-            "run_c": False,
-            "run_conformance": False,
-            "run_ios": False,
-            "run_formal": False,
-        }
+    if all(_is_documentation(path) for path in normalized):
+        return dict.fromkeys(LANES, False)
+
+    core_paths = [
+        path for path in normalized
+        if not path.startswith(PLUGIN_ONLY_PREFIXES) and path not in PLUGIN_ONLY_PATHS
+    ]
+    run_full = any(not _is_documentation(path) for path in core_paths)
 
     workflow_changed = ".github/workflows/ci.yml" in normalized
     root_build_changed = any(path in ROOT_BUILD_PATHS for path in normalized)
     unclassified_path = any(
         not _is_documentation(path) and not _is_recognized_specialist_path(path)
-        for path in normalized
+        for path in core_paths
     )
 
     run_c = unclassified_path or workflow_changed or root_build_changed or any(
@@ -205,12 +219,36 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
         for path in normalized
     )
 
+    plugin_contract_changed = unclassified_path or root_build_changed or any(
+        _crate_name(path) in {"agent-control", "agent-connector"}
+        or path == ".github/workflows/wn-agent-binaries.yml"
+        for path in normalized
+    )
+
     return {
         "run_full": run_full,
         "run_c": run_c,
         "run_conformance": run_conformance,
         "run_ios": run_ios,
         "run_formal": run_formal,
+        "run_binaries": run_full,
+        "run_hermes": plugin_contract_changed or any(
+            path.startswith("integrations/hermes/")
+            or path in HERMES_PATHS
+            for path in normalized
+        ),
+        "run_openclaw": plugin_contract_changed or any(
+            path.startswith("integrations/openclaw/")
+            or path == "scripts/install-openclaw-marmot.sh"
+            for path in normalized
+        ),
+        "run_installers": unclassified_path or root_build_changed or any(
+            path.startswith((
+                "integrations/terminal-harness/", "integrations/claude/",
+                "integrations/codex/", "integrations/pi/", "integrations/opencode/",
+            ))
+            for path in normalized
+        ),
     }
 
 

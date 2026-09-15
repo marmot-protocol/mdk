@@ -18,6 +18,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Match cargo build/check dependencies to the existing test profile.
+  CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
@@ -31,6 +33,8 @@ jobs:
       run_conformance: ${{ steps.classify.outputs.run_conformance }}
       run_ios: ${{ steps.classify.outputs.run_ios }}
       run_formal: ${{ steps.classify.outputs.run_formal }}
+      run_hermes: ${{ steps.classify.outputs.run_hermes }}
+      run_installers: ${{ steps.classify.outputs.run_installers }}
 
     steps:
       - name: Check out repository
@@ -142,7 +146,7 @@ jobs:
   terminal-harness-installers:
     name: Terminal harness installer tests
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.run_installers == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -159,37 +163,6 @@ jobs:
           integrations/terminal-harness/tests/test_installer.sh codex
           integrations/terminal-harness/tests/test_installer.sh pi
           integrations/terminal-harness/tests/test_installer.sh opencode
-
-  rust-check:
-    name: Rust check
-    needs: changes
-    if: needs.changes.outputs.run_full == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal
-          rustup default "$toolchain"
-          rustc --version
-          cargo --version
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Check workspace
-        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --locked
-
-      - name: Check all features
-        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --all-features --locked
 
   rust-wasm-check:
     name: Rust WASM check
@@ -219,6 +192,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # Compile-only regression gate. Browser runtime behavior belongs in
       # downstream headless-browser acceptance tests.
@@ -233,7 +208,9 @@ jobs:
             -p transport-nostr-peeler
 
   rust-clippy:
-    name: Rust clippy
+    name: Rust check and clippy
+    env:
+      RUSTFLAGS: -D warnings
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
@@ -256,6 +233,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -285,6 +264,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install cbindgen
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
@@ -334,6 +315,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Check iOS account keychain code
         run: cargo clippy -p marmot-account --target aarch64-apple-ios --locked -- -D warnings
@@ -365,15 +348,65 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Run default-build convergence policy pin tests
         # Keep in sync with `just test-convergence-policy-pin`.
         run: cargo test -p cgka-engine --test convergence_policy_pin --locked
 
-  rust-test:
-    name: Rust tests (${{ matrix.partition }}/4)
+  rust-test-build:
+    name: Build workspace tests
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: rust-test
+
+      - name: Verify workspace shard coverage
+        run: bash scripts/check_ci_partitions.sh 4 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+
+      - name: Archive workspace tests
+        run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))' --archive-file tests.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-test
+          path: tests.tar.zst
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  rust-test:
+    name: Rust tests (${{ matrix.partition }}/4)
+    needs: rust-test-build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -398,22 +431,51 @@ jobs:
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Download test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rust-test
 
       - name: Run workspace tests
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+
+  rust-test-extras:
+    name: Doctests and diagnostic exporters
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Run doctests
-        if: matrix.partition == 1
         run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
 
       - name: Test consent and both diagnostic exporters
-        if: matrix.partition == 1
         run: |
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
@@ -421,8 +483,8 @@ jobs:
           cargo test -p marmot-c --features otlp-export,product-analytics-export,alloc-audit product_analytics --locked
           cargo test -p agent-connector --features otlp-export,product-analytics-export usage_diagnostics:: --locked
 
-  cli-e2e:
-    name: CLI e2e (mock relay)
+  cli-e2e-build:
+    name: Build CLI tests
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
@@ -445,52 +507,75 @@ jobs:
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: cli-e2e
+
+      - name: Verify CLI shard coverage
+        run: bash scripts/check_ci_partitions.sh 2 -p wn-cli --test cli --features test-policy-overrides --locked -E 'all()'
+
+      - name: Archive CLI tests
+        run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --archive-file tests.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cli-e2e
+          path: tests.tar.zst
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  cli-e2e:
+    name: CLI e2e (mock relay, ${{ matrix.partition }}/2)
+    needs: cli-e2e-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Download test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cli-e2e
 
       - name: Run CLI end-to-end tests
         # Dedicated job: this subprocess-heavy suite is capped by the `cli-e2e`
         # test-group and the `ci` profile adds retries + a hung-test backstop.
         # The real-relay test self-skips here; it has its own `Relay CLI E2E`
         # job with a docker relay stack.
-        run: cargo nextest run -p wn-cli --test cli --features test-policy-overrides --locked --profile ci
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/2 --profile ci
 
-  relay-runtime:
-    name: Relay runtime tests
-    needs: changes
-    if: needs.changes.outputs.run_full == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal
-          rustup default "$toolchain"
-          rustc --version
-          cargo --version
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Run relay runtime tests serially
-        env:
-          RUST_BACKTRACE: "1"
-        run: cargo test -p marmot-app --test relay_runtime --features test-policy-overrides --locked -- --test-threads=1
-
-      - name: Run held peer-index upgrade lookup
-        run: cargo test -p marmot-app --test startup_hydration --features test-policy-overrides --locked -- --exact existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held
-
-  relay-e2e:
-    name: Relay CLI E2E
+  relay-runtime-build:
+    name: Build relay runtime tests
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
@@ -513,9 +598,105 @@ jobs:
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: relay-runtime
+
+      - name: Verify relay runtime shard coverage
+        run: bash scripts/check_ci_partitions.sh 2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked -E 'binary(relay_runtime)'
+
+      - name: Archive relay runtime tests
+        run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --archive-file tests.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: relay-runtime
+          path: tests.tar.zst
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  relay-runtime:
+    name: Relay runtime tests (${{ matrix.partition }}/2)
+    needs: relay-runtime-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Download test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: relay-runtime
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Run relay runtime tests serially
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
+
+      - name: Run held peer-index upgrade lookup
+        if: matrix.partition == 1
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" -E 'binary(startup_hydration) & test(=existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held)'
+
+  relay-e2e:
+    name: Relay CLI E2E
+    needs: cli-e2e-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Download test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cli-e2e
 
       - name: Start local relay stack
         run: docker compose up -d setup nostr-rs-relay strfry-nostr-relay
@@ -528,7 +709,7 @@ jobs:
       - name: Run real relay CLI E2E
         env:
           MDK_E2E_REQUIRE_RELAYS: "1"
-        run: cargo nextest run -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
 
       - name: Dump local relay logs
         if: failure()
@@ -539,11 +720,15 @@ jobs:
         run: docker compose down -v
 
   conformance:
-    name: Simulator and vectors
+    name: Simulator and vectors (${{ matrix.lane }})
     needs: changes
     if: needs.changes.outputs.run_conformance == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [smoke, offline-history]
 
     steps:
       - name: Check out repository
@@ -562,6 +747,8 @@ jobs:
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
@@ -570,26 +757,38 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' && matrix.lane == 'smoke' }}
+
+      - name: Run unchanged offline-history regressions
+        if: matrix.lane == 'offline-history'
+        run: cargo nextest run -p cgka-conformance-simulator --test offline_catchup_regression --locked --profile ci
 
       - name: Run simulator smoke tests
+        if: matrix.lane == 'smoke'
         # Multi-minute generated reliability batches and the adversarial
         # campaign run in the scheduled Simulator Nightly workflow. Independent
         # convergence checks run in their dedicated fast gate below.
-        run: just simulator-smoke
+        run: just --set simulator-smoke-filter "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)" simulator-smoke
 
       - name: Validate convergence execution-lane policy
+        if: matrix.lane == 'smoke'
         run: just convergence-lane-policy
 
       - name: Validate convergence failure-corpus lifecycle
+        if: matrix.lane == 'smoke'
         run: just convergence-failure-corpus
 
       - name: Run focused convergence regressions
+        if: matrix.lane == 'smoke'
         run: just focused-convergence-regressions
 
       - name: Run simulator doctests
+        if: matrix.lane == 'smoke'
         run: cargo test -p cgka-conformance-simulator --doc --locked
 
       - name: Verify convergence with independent models
+        if: matrix.lane == 'smoke'
         run: just convergence-verification-ci
 
   formal:
@@ -648,7 +847,7 @@ jobs:
   hermes-installer-auth:
     name: Hermes installer auth
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.run_hermes == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -732,14 +931,17 @@ jobs:
       - rust-format
       - rust-audit
       - terminal-harness-installers
-      - rust-check
       - rust-wasm-check
       - rust-clippy
       - c-smoke
       - ios-account-clippy
       - convergence-policy-pin
+      - rust-test-build
       - rust-test
+      - rust-test-extras
+      - cli-e2e-build
       - cli-e2e
+      - relay-runtime-build
       - relay-runtime
       - relay-e2e
       - conformance

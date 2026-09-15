@@ -139,6 +139,7 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           workspaces: packaged-source -> target
 
       - name: Build MarmotKit XCFramework
@@ -228,6 +229,7 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           workspaces: packaged-source -> target
 
       - name: Build MarmotKit macOS XCFramework
@@ -349,6 +351,7 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           workspaces: packaged-source -> target
 
       - name: Build MarmotKit Kotlin and JNI bindings
