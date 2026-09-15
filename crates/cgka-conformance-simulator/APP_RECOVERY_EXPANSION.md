@@ -104,4 +104,3 @@ preserve late arrivals, replacement, cross-connection writes and restart behavio
 - Latency attribution across scan work, relay retry, settlement and background scheduling.
 
 Short canaries do not establish full-catalog, long-duration or production-service success.
-
