@@ -163,3 +163,9 @@ the workflow from `master`, so an older reachable source commit cannot substitut
 builder SHA also owns the canonical Rust release profile and compiled-in public endpoint defaults. Source-coupled
 inputs—including the Cargo workspace, UniFFI configuration, and Kotlin support files—come from the packaged source
 SHA so the generated API and JNI libraries remain a matched set.
+
+## Apple privacy resources
+
+Apple exporters use resource-bearing static framework slices. See the
+[privacy audit and adoption guide](apple-privacy/README.md) for declarations,
+archive validation, host integration changes, and unresolved release questions.

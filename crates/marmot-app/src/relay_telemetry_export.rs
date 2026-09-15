@@ -2109,15 +2109,19 @@ mod otlp {
                 tokio::select! {
                     biased;
                     _ = permit.cancelled() => return Err(RelayExportError::Request),
-                    result = host_safety::resolve_with(metrics_url, resolver) => result?,
+                    result = host_safety::resolve_with(metrics_url, resolver) => {
+                        result.map_err(|_| RelayExportError::Request)?
+                    }
                 }
             } else {
-                host_safety::resolve_with(metrics_url, resolver).await?
+                host_safety::resolve_with(metrics_url, resolver)
+                    .await
+                    .map_err(|_| RelayExportError::Request)?
             };
             if permit.is_some_and(|p| !p.valid()) {
                 return Err(RelayExportError::Request);
             }
-            let client = pin.build_client()?;
+            let client = pin.build_client().map_err(|_| RelayExportError::Request)?;
             let request = to_request(
                 batch,
                 resource,

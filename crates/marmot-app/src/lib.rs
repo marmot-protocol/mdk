@@ -76,7 +76,6 @@ pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
 mod app_telemetry;
-#[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
 mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;

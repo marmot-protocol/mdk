@@ -408,3 +408,9 @@ for paging, sequence handling, cancellation, C ownership, and compatibility.
 The additive C5 screen API combines history, header/capabilities, visible identities,
 read state and revisioned draft descriptors. See the [native conversation contract](CONVERSATION-WINDOW.md)
 for opening, paging, cancellation, timeout, ownership and draft migration.
+
+## Apple privacy resources
+
+Apple exporters use resource-bearing static framework slices. See the
+[privacy audit and adoption guide](apple-privacy/README.md) for declarations,
+archive validation, host integration changes, and unresolved release questions.

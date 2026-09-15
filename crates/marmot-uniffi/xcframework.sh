@@ -87,12 +87,18 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"
 # XCFramework expects the modulemap to be named module.modulemap
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.modulemap"
 
+python3 "$TOOL_DIR/apple-framework.py" \
+  "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
+  "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
+python3 "$TOOL_DIR/apple-framework.py" \
+  "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
+  "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
-  -library "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" \
-  -headers "$BUILD_DIR/headers" \
-  -library "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" \
-  -headers "$BUILD_DIR/headers" \
+  -framework "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" \
+  -framework "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" \
   -output "$OUT_DIR/$FRAMEWORK_NAME.xcframework"
 
 echo "==> Copying generated Swift binding to output dir"

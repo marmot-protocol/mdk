@@ -60,6 +60,13 @@ class SourceInstallCapabilityTests(unittest.TestCase):
             PROBE._source_install_supports_subdirectories(SubdirectoryPluginsCommand)
         )
 
+    def test_plugin_test_tempdir_ignores_cleanup_errors(self):
+        temp = PROBE._plugin_test_tempdir()
+        try:
+            self.assertTrue(temp._ignore_cleanup_errors)
+        finally:
+            temp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,8 @@ if [[ ! -d "$XCFRAMEWORK" || ! -f "$SWIFT_BINDING" ]]; then
   exit 1
 fi
 
+python3 "$TOOL_DIR/validate-apple-privacy.py" "$XCFRAMEWORK" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}" --privacy-dir "$CRATE_DIR/apple-privacy"
+
 workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_DIR/Cargo.toml" | head -n 1)"
 lock_sha="$(shasum -a 256 "$WORKSPACE_DIR/Cargo.lock" | awk '{print $1}')"
 rust_version="$(rustc --version)"

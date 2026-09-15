@@ -677,6 +677,11 @@ def prepare_gateway_config(
     platform_config["interim_assistant_messages"] = interim_assistant_messages
     platform_config["long_running_notifications"] = long_running_notifications
     platform_config["busy_ack_detail"] = busy_ack_detail
+    # Durable kind-1202 operation history is not a temporary Hermes
+    # progress bubble. Always pin the platform override so a global
+    # cleanup_progress: true cannot be inherited, and so a stale
+    # Marmot true is repaired on every install/reconfigure.
+    platform_config["cleanup_progress"] = False
 
     return config_path, dump_config(config)
 

@@ -3,12 +3,14 @@
 //!
 //! The audit log is an opt-in, privacy-safe forensic measure recorded per
 //! account-device at `<account_dir>/audit-<engine_id>-v4.jsonl`. This module owns
-//! the audit DTOs, the stable domain-separated hash identity derivation, the upload
-//! client, and the `MarmotApp` methods that drive recording, enumeration,
-//! validation, and upload.
+//! the audit DTOs, the stable domain-separated hash identity derivation, the
+//! per-attempt pinned upload path, and the `MarmotApp` methods that drive
+//! recording, enumeration, validation, and upload.
 
 use std::fs;
+use std::future::Future;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,9 +24,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
+use crate::collector_host_safety;
 use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
 use crate::error::AppError;
-use crate::{MarmotApp, config};
+use crate::{MarmotApp, config, retired_relay_hosts};
 
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
@@ -43,7 +46,6 @@ const KEY_REVEAL_AUDIT_FILE: &str = "audit-key-reveal.jsonl";
 const AUDIT_UPLOAD_CHECKPOINT_FILE: &str = "audit-upload-checkpoint.json";
 pub(crate) const AUDIT_ID_BYTES: usize = 16;
 pub(crate) const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     let schema = serde_json::from_str(include_str!(
@@ -51,13 +53,6 @@ pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLoc
     ))
     .expect("bundled audit schema must be valid JSON");
     jsonschema::validator_for(&schema).expect("bundled audit schema must compile offline")
-});
-static AUDIT_LOG_UPLOAD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
-        .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
-        .build()
-        .expect("audit log upload client configuration should be valid")
 });
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -398,6 +393,13 @@ fn system_time_ms(time: SystemTime) -> Option<u64> {
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
+fn audit_upload_host_is_retired(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    retired_relay_hosts()
+        .iter()
+        .any(|retired| host.eq_ignore_ascii_case(retired))
+}
+
 fn validate_audit_upload_endpoint(
     endpoint: &str,
     authorization_bearer_token: Option<&str>,
@@ -408,9 +410,19 @@ fn validate_audit_upload_endpoint(
             "forensic upload endpoint is empty".to_owned(),
         ));
     }
-    if !config::endpoint_transport_allowed(endpoint) {
+    let Some(url) = config::parse_relay_telemetry_endpoint(endpoint) else {
         return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint must be https, or loopback http for local testing".to_owned(),
+            if config::endpoint_transport_allowed(endpoint) {
+                "forensic upload endpoint is invalid".to_owned()
+            } else {
+                "forensic upload endpoint must be https, or loopback http for local testing"
+                    .to_owned()
+            },
+        ));
+    };
+    if url.host_str().is_some_and(audit_upload_host_is_retired) {
+        return Err(AppError::AuditLogUpload(
+            "forensic upload endpoint is not allowed".to_owned(),
         ));
     }
     if !config::endpoint_host_is_loopback(endpoint)
@@ -422,6 +434,79 @@ fn validate_audit_upload_endpoint(
         ));
     }
     Ok(endpoint.to_owned())
+}
+
+async fn audit_network_attempt<T, Fut>(op: Fut) -> Result<T, AppError>
+where
+    Fut: Future<Output = Result<T, AppError>>,
+{
+    tokio::time::timeout(AUDIT_LOG_UPLOAD_TIMEOUT, op)
+        .await
+        .map_err(|_| AppError::AuditLogUpload("request timed out".into()))?
+}
+
+async fn send_audit_upload<F, Fut>(
+    endpoint: &str,
+    body: Vec<u8>,
+    authorization_bearer_token: Option<&str>,
+    hardware_model: Option<&str>,
+    platform: Option<&str>,
+    app_version: Option<&str>,
+    resolver: F,
+) -> Result<reqwest::Response, AppError>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
+{
+    let pin = collector_host_safety::resolve_with(endpoint, resolver)
+        .await
+        .map_err(|_| AppError::AuditLogUpload("request failed".into()))?;
+    let client = pin
+        .build_client()
+        .map_err(|_| AppError::AuditLogUpload("request failed".into()))?;
+    audit_upload_request(
+        &client,
+        pin.url,
+        body,
+        authorization_bearer_token,
+        hardware_model,
+        platform,
+        app_version,
+    )
+    .send()
+    .await
+    .map_err(audit_log_reqwest_error)
+}
+
+fn audit_upload_request(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    body: Vec<u8>,
+    authorization_bearer_token: Option<&str>,
+    hardware_model: Option<&str>,
+    platform: Option<&str>,
+    app_version: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let bytes_sent = body.len() as u64;
+    let mut request = client
+        .post(url)
+        .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
+        .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
+        .body(body);
+    if let Some(token) = authorization_bearer_token {
+        request = request.bearer_auth(token);
+    }
+    if let Some(value) = hardware_model {
+        request = request.header("X-Goggles-Hardware-Model", value);
+    }
+    if let Some(value) = platform {
+        request = request.header("X-Goggles-Platform", value);
+    }
+    if let Some(value) = app_version {
+        request = request.header("X-Goggles-App-Version", value);
+    }
+    request
 }
 
 fn audit_log_reqwest_error(err: reqwest::Error) -> AppError {
@@ -642,24 +727,16 @@ impl MarmotApp {
             });
         }
         let bytes_sent = snapshot.body.len() as u64;
-        let mut request = AUDIT_LOG_UPLOAD_CLIENT
-            .post(endpoint)
-            .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
-            .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
-            .body(snapshot.body);
-        if let Some(token) = config.authorization_bearer_token.as_deref() {
-            request = request.bearer_auth(token);
-        }
-        if let Some(value) = config.source.hardware_model.as_deref() {
-            request = request.header("X-Goggles-Hardware-Model", value);
-        }
-        if let Some(value) = config.source.platform.as_deref() {
-            request = request.header("X-Goggles-Platform", value);
-        }
-        if let Some(value) = config.source.app_version.as_deref() {
-            request = request.header("X-Goggles-App-Version", value);
-        }
-        let response = request.send().await.map_err(audit_log_reqwest_error)?;
+        let response = audit_network_attempt(send_audit_upload(
+            &endpoint,
+            snapshot.body,
+            config.authorization_bearer_token.as_deref(),
+            config.source.hardware_model.as_deref(),
+            config.source.platform.as_deref(),
+            config.source.app_version.as_deref(),
+            collector_host_safety::system_resolve,
+        ))
+        .await?;
         let status = response.status();
         if !status.is_success() {
             return Ok(AuditUploadAttempt::Rejected {
@@ -979,6 +1056,232 @@ mod tests {
                 "a malformed Retry-After is still a request to retry"
             );
         }
+    }
+
+    fn assert_privacy_safe(error: &AppError) {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for leak in [
+            "secret.example",
+            "secret-query",
+            "bearer-secret",
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "Location",
+            "/stolen",
+        ] {
+            assert!(
+                !display.contains(leak) && !debug.contains(leak),
+                "leaked {leak} via {display} / {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_upload_timeouts_keep_sixty_second_request_and_thirty_second_collector() {
+        assert_eq!(AUDIT_LOG_UPLOAD_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(
+            collector_host_safety::REQUEST_TIMEOUT,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            collector_host_safety::CONNECT_TIMEOUT,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn audit_upload_request_overrides_the_collector_timeout() {
+        let client = reqwest::Client::builder()
+            .timeout(collector_host_safety::REQUEST_TIMEOUT)
+            .build()
+            .expect("collector-default client");
+        let request = audit_upload_request(
+            &client,
+            "https://example.test/ingest".parse().expect("url"),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .build()
+        .expect("audit request");
+        assert_eq!(request.timeout(), Some(&AUDIT_LOG_UPLOAD_TIMEOUT));
+        assert_ne!(
+            request.timeout(),
+            Some(&collector_host_safety::REQUEST_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn audit_endpoint_gate_rejects_structure_retired_hosts_and_missing_tokens() {
+        let retired = retired_relay_hosts()
+            .into_iter()
+            .next()
+            .expect("centralized retired host list");
+        for endpoint in [
+            "",
+            "   ",
+            "http://public.example/ingest",
+            "http://10.0.0.1/ingest",
+            "http://dev.localhost/ingest",
+            "ftp://localhost/ingest",
+            "https://user:password@secret.example/path?token=secret-query",
+            "https://secret.example/path?token=secret-query#frag",
+            "https://secret.example:0/ingest",
+            "https:///",
+            &format!("https://{retired}/ingest"),
+            &format!("https://{}/ingest", retired.to_ascii_uppercase()),
+            &format!("https://{retired}./ingest"),
+        ] {
+            let err = validate_audit_upload_endpoint(endpoint, Some("bearer-secret")).unwrap_err();
+            assert_privacy_safe(&err);
+        }
+        let remote = "https://secret.example/path?token=secret-query";
+        let missing_token = validate_audit_upload_endpoint(remote, None).unwrap_err();
+        assert!(
+            missing_token
+                .to_string()
+                .contains("authorization bearer token")
+        );
+        assert_privacy_safe(&missing_token);
+        let subdomain =
+            validate_audit_upload_endpoint("https://dev.localhost/ingest", None).unwrap_err();
+        assert!(
+            subdomain.to_string().contains("authorization bearer token"),
+            "localhost subdomains are not the local-test exception"
+        );
+        assert_privacy_safe(&subdomain);
+        assert!(
+            validate_audit_upload_endpoint("http://127.0.0.1:9/ingest", None).is_ok(),
+            "literal loopback remains the local-test opt-in"
+        );
+        assert!(validate_audit_upload_endpoint("https://localhost/ingest", None).is_ok());
+        assert!(
+            validate_audit_upload_endpoint(remote, Some("bearer-secret")).is_ok(),
+            "structurally valid public HTTPS with a token is admitted before DNS"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_helper_failures_are_context_free() {
+        let marker = "https://secret.example/path?token=secret-query";
+        let errors = [
+            send_audit_upload(
+                marker,
+                Vec::new(),
+                Some("bearer-secret"),
+                None,
+                None,
+                None,
+                |_, _| async { Ok(Vec::new()) },
+            )
+            .await
+            .unwrap_err(),
+            send_audit_upload(
+                marker,
+                Vec::new(),
+                Some("bearer-secret"),
+                None,
+                None,
+                None,
+                |_, _| async {
+                    Err(std::io::Error::other(
+                        "secret.example secret-query 127.0.0.1 bearer-secret",
+                    ))
+                },
+            )
+            .await
+            .unwrap_err(),
+            send_audit_upload(
+                marker,
+                Vec::new(),
+                Some("bearer-secret"),
+                None,
+                None,
+                None,
+                |_, _| async { Ok(vec!["10.0.0.1".parse().unwrap()]) },
+            )
+            .await
+            .unwrap_err(),
+            send_audit_upload(
+                "https://10.0.0.1/ingest",
+                Vec::new(),
+                Some("bearer-secret"),
+                None,
+                None,
+                None,
+                |_, _| async { panic!("literal address must not use DNS") },
+            )
+            .await
+            .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.to_string(), "audit log upload failed: request failed");
+            assert_privacy_safe(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_structure_never_resolves() {
+        for endpoint in [
+            "http://public.example/ingest",
+            "https://user:password@secret.example/",
+            "https://secret.example/#frag",
+        ] {
+            assert!(
+                send_audit_upload(
+                    endpoint,
+                    Vec::new(),
+                    Some("bearer-secret"),
+                    None,
+                    None,
+                    None,
+                    |_, _| async {
+                        panic!("invalid URL reached DNS");
+                    }
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audit_network_deadline_is_sixty_seconds() {
+        let start = tokio::time::Instant::now();
+        let error = audit_network_attempt(async {
+            std::future::pending::<Result<reqwest::Response, AppError>>().await
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "audit log upload failed: request timed out"
+        );
+        assert_eq!(start.elapsed(), AUDIT_LOG_UPLOAD_TIMEOUT);
+        assert_privacy_safe(&error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audit_resolution_keeps_the_shared_ten_second_dns_bound() {
+        let start = tokio::time::Instant::now();
+        let error = send_audit_upload(
+            "https://secret.example/path?token=secret-query",
+            Vec::new(),
+            Some("bearer-secret"),
+            None,
+            None,
+            None,
+            |_, _| async { std::future::pending().await },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(start.elapsed(), collector_host_safety::CONNECT_TIMEOUT);
+        assert_eq!(error.to_string(), "audit log upload failed: request failed");
+        assert_privacy_safe(&error);
     }
 
     #[tokio::test]

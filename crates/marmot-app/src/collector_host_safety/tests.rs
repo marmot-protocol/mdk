@@ -8,7 +8,7 @@ use tokio::{
     net::TcpListener,
 };
 
-async fn resolve(endpoint: &str, ips: &[&str]) -> Result<PinnedCollector, RelayExportError> {
+async fn resolve(endpoint: &str, ips: &[&str]) -> Result<PinnedCollector, CollectorRequestError> {
     let ips = ips.iter().map(|ip| ip.parse().unwrap()).collect();
     resolve_with(endpoint, |_, _| async { Ok(ips) }).await
 }
@@ -187,11 +187,8 @@ async fn resolution_failures_are_privacy_safe() {
         resolve(endpoint, &["127.0.0.1"]).await.err().unwrap(),
     ];
     for error in errors {
-        assert_eq!(
-            error.to_string(),
-            "relay telemetry export request failed to send"
-        );
-        assert_eq!(format!("{error:?}"), "Request");
+        assert_eq!(error.to_string(), "collector request failed");
+        assert_eq!(format!("{error:?}"), "CollectorRequestError");
         assert!(std::error::Error::source(&error).is_none());
     }
 }

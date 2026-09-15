@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Forensic audit-log uploads now resolve, validate, and pin a fresh client for each attempt, with redirects and
+  system proxies disabled. Private, retired, or redirected collector endpoints fail closed instead of following
+  `Location` or dialing an unchecked address. Local loopback testing and the existing 60-second upload deadline remain.
+
 ### Added
 
 - WN Agent `group_info` now returns the current Marmot chat-list group name as `subject`
@@ -218,6 +224,26 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Hermes Marmot install/reconfigure now pins `display.platforms.marmot.cleanup_progress: false` so a
+  pre-existing global Hermes cleanup policy cannot delete durable kind-1202 tool-operation history after
+  a successful turn. Automatic progress cleanup is unsupported; explicit `delete_marmot_message` is
+  unchanged. Covered by helper/CLI configuration tests and a pinned-Hermes turn-boundary probe that
+  fails closed if installed cleanup is re-enabled, if injected delivery failures are skipped, or if
+  scheduled post-delivery cleanup work is not drained, including on candidate hosts that bind the
+  cleanup scheduler before the delivery callback. The pinned-Hermes lifecycle probe keeps the
+  already-registered plugin home, constructs turn/restart adapters through the platform factory
+  with an explicit short-path scenario control socket, waits for acknowledged progress instead of
+  fixed sleeps, and fails closed if delete or factory registration is missing. The probe's fake
+  control endpoint runs on a private thread so pinned Hermes 0.19.0 can acknowledge progress
+  without deadlocking the host event loop. The supported-floor install exports the plugin tree
+  at the exact MDK revision instead of cloning the host checkout over ``file://``. The probe
+  now requires acknowledgement of the expected final answer, closes the control-server event
+  loop if bind fails, and dispatches a turn through the reconstructed restart adapter so prior
+  durable operation ids cannot be deleted after reload. The reconstructed restart turn persists
+  its live scenario socket and keeps the helper-written config patched for the whole turn so a
+  candidate host that reloads gateway config cannot reconnect to the previous closed socket.
+  The real-plugin fixture also ignores leftover host files during teardown so a successful
+  media-api-candidate run cannot fail after the probe has already passed.
 - Hermes chat metadata now rejects non-string `group_info` account and group identities before
   accepting a subject, so a JSON integer whose decimal spelling matches an all-digit hex id
   falls back to `Marmot <first 12 hex characters>` instead of using the supplied name.

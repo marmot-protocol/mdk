@@ -44,6 +44,15 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _plugin_test_tempdir() -> tempfile.TemporaryDirectory[str]:
+    # Candidate hosts can keep writing into the fixture after the probe
+    # returns. Cleanup must not turn a successful run into a job failure.
+    return tempfile.TemporaryDirectory(
+        prefix="mdk-hermes-plugin-test-",
+        ignore_cleanup_errors=True,
+    )
+
+
 async def _exercise_media_routes(adapter_module, platform_config, temp_root: Path):
     class FakeClient:
         def __init__(self) -> None:
@@ -439,27 +448,55 @@ def _module_matches_path(module, expected: Path) -> bool:
 
 
 def _pinned_source_checkout(mdk_source: Path, mdk_ref: str, temp_root: Path) -> Path:
-    """Clone MDK locally and detach at the exact revision used by old Hermes."""
+    """Export the exact MDK plugin tree for Hermes 0.19.0 source install.
+
+    Older Hermes can install a monorepo subdirectory but has no ``--ref``.
+    Cloning the caller checkout over ``file://`` fails on worktrees, shallow
+    checkouts, and restricted Git ownership. Archive the plugin path at the
+    pinned revision into a tiny fixture repository instead.
+    """
 
     checkout = temp_root / "mdk-plugin-source"
-    subprocess.run(
-        ["git", "clone", "-q", "--no-checkout", f"file://{mdk_source}", str(checkout)],
+    plugin_dir = checkout / "integrations" / "hermes" / "marmot"
+    plugin_dir.parent.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "archive",
+            "--format=tar",
+            mdk_ref,
+            "integrations/hermes/marmot",
+        ],
+        cwd=mdk_source,
         check=True,
+        capture_output=True,
     )
     subprocess.run(
-        ["git", "checkout", "-q", "--detach", mdk_ref],
+        ["tar", "-C", str(checkout), "-xf", "-"],
+        input=archive.stdout,
+        check=True,
+    )
+    if not (plugin_dir / "adapter.py").is_file():
+        raise AssertionError("pinned MDK archive missing the Marmot plugin")
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(["git", "add", "integrations/hermes/marmot"], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=MDK compatibility test",
+            "-c",
+            "user.email=compatibility-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "Pin Marmot plugin fixture",
+        ],
         cwd=checkout,
         check=True,
     )
-    installed_ref = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"],
-        cwd=checkout,
-        text=True,
-    ).strip()
-    if installed_ref != mdk_ref:
-        raise AssertionError(
-            f"pinned MDK checkout resolved to {installed_ref}, expected {mdk_ref}"
-        )
     return checkout
 
 
@@ -617,7 +654,7 @@ def main() -> int:
     if len(resolved_ref) != 40:
         raise SystemExit("MDK ref must resolve to a full commit")
 
-    with tempfile.TemporaryDirectory(prefix="mdk-hermes-plugin-test-") as temp:
+    with _plugin_test_tempdir() as temp:
         home = Path(temp)
         os.environ["HOME"] = str(home)
         os.environ["HERMES_HOME"] = str(home / ".hermes")
@@ -752,11 +789,21 @@ def main() -> int:
 
         busy_session = _exercise_busy_session_process_death(hermes_source, home)
 
+        probe_dir = Path(__file__).resolve().parent
+        if str(probe_dir) not in sys.path:
+            sys.path.insert(0, str(probe_dir))
+        from progress_cleanup_probe import run as run_progress_cleanup_probe
+
+        progress_cleanup = run_progress_cleanup_probe(
+            adapter_module,
+            home / "progress-cleanup",
+        )
+
         print(
             "real-hermes plugin install/discovery/media passed "
             f"(hermes_source={hermes_source}, mdk_ref={resolved_ref}, "
             f"source_install_mode={source_install_mode}, media_calls={media_calls}, "
-            f"busy_session={busy_session})"
+            f"busy_session={busy_session}, progress_cleanup={progress_cleanup})"
         )
     return 0
 

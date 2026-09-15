@@ -40,6 +40,12 @@ fi
 
 XCFRAMEWORK="$(cd "$(dirname "$XCFRAMEWORK")" && pwd)/$(basename "$XCFRAMEWORK")"
 
+PRIVACY_ARGS=(--privacy-dir "${MARMOTKIT_CRATE_DIR:-$(dirname "$0")}/apple-privacy")
+if [[ -n "${PRODUCT_ANALYTICS_EXPORT:-}" ]]; then
+  PRIVACY_ARGS+=(--product-analytics "$PRODUCT_ANALYTICS_EXPORT")
+fi
+python3 "$(dirname "$0")/validate-apple-privacy.py" "$XCFRAMEWORK" "${PRIVACY_ARGS[@]}"
+
 PLIST="$XCFRAMEWORK/Info.plist"
 [[ -f "$PLIST" ]] || { echo "error: missing XCFramework Info.plist" >&2; exit 1; }
 
@@ -59,13 +65,9 @@ while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index
     exit 1
   }
 
-  headers_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:HeadersPath" "$PLIST")"
-  [[ -f "$XCFRAMEWORK/$identifier/$headers_path/module.modulemap" ]] || {
-    echo "error: missing module map for $identifier" >&2
-    exit 1
-  }
-  [[ -f "$XCFRAMEWORK/$identifier/$headers_path/marmot_uniffiFFI.h" ]] || {
-    echo "error: missing generated header for $identifier" >&2
+  library_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryPath" "$PLIST")"
+  [[ -f "$XCFRAMEWORK/$identifier/$library_path/Modules/module.modulemap" ]] || {
+    echo "error: missing framework module map for $identifier" >&2
     exit 1
   }
 

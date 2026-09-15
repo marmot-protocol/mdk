@@ -313,6 +313,88 @@ fn batch_window_override_is_local_to_one_uploader() {
     assert_eq!(second.duration(), Duration::from_secs(30));
 }
 
+#[tokio::test]
+async fn redirected_tracker_upload_is_not_checkpointed_until_direct_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    std::fs::write(
+        home.account_dir("alice").join("audit-a.jsonl"),
+        b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"seq\":0,\"wall_time_ms\":0,\"engine_id\":\"test\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"}}\n",
+    )
+    .unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    let first = app.audit_log_files().unwrap().remove(0);
+
+    let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let location = format!("http://{}/stolen", sink.local_addr().unwrap());
+    let redirect_endpoint = format!("http://{}/ingest", source.local_addr().unwrap());
+    let redirect_server = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, _) = source.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut buf = [0; 2048];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (sink_tx, mut sink_rx) = tokio::sync::oneshot::channel();
+    let sink_server = tokio::spawn(async move {
+        if sink.accept().await.is_ok() {
+            let _ = sink_tx.send(());
+        }
+    });
+
+    let redirected = post_audit_log_tracker_update_for_app(&app, tracker_config(redirect_endpoint))
+        .await
+        .unwrap();
+    assert!(redirected.uploaded.is_empty());
+    assert!(
+        app.audit_upload_checkpoint("alice")
+            .acknowledged(&first)
+            .is_none()
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut sink_rx)
+            .await
+            .is_err(),
+        "redirect sink received a tracker upload"
+    );
+    sink_server.abort();
+    redirect_server.await.unwrap();
+
+    let (server, endpoint, mut observed) = status_server(204, None).await;
+    let uploaded = post_audit_log_tracker_update_for_app(&app, tracker_config(endpoint))
+        .await
+        .unwrap();
+    assert_eq!(uploaded.uploaded.len(), 1);
+    assert!(observed.try_recv().is_ok());
+    assert_eq!(
+        app.audit_upload_checkpoint("alice").acknowledged(&first),
+        Some(crate::audit_log::AuditUploadOutcome::Uploaded)
+    );
+    server.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn batches_preserve_first_trigger_and_label_automatic_retries() {
     let (triggers, commands) = mpsc::channel(1);

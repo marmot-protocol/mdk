@@ -495,6 +495,10 @@ target, effective release profile, and artifact hashes. App repos must pin an ex
 native libraries together, and verify the ordinary SHA-256 (plus SwiftPM checksum for Apple binaries). Existing
 release assets and snapshot tags are never overwritten.
 
+Before an Apple release, review the [MarmotKit privacy audit](crates/marmot-uniffi/apple-privacy/README.md),
+resolve its required-reason/signing questions, and pass both consuming-app archive resource gates.
+A successful binary link alone is insufficient.
+
 ## App Repo Consumption
 
 App repos should pin an exact formal MarmotKit tag or SHA-addressed snapshot, verify its published checksums, and stage
