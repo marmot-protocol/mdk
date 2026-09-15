@@ -531,3 +531,44 @@ fn conversation_input_guards_reject_inconsistent_membership_and_oversized_fields
         Err(ConversationPresentationError::LimitExceeded)
     ));
 }
+
+#[test]
+fn conversation_reply_mentions_have_independent_limits_and_complete_identities() {
+    let (_dir, app, input) = setup();
+    let main = "aa".repeat(32);
+    let reply_author = "cc".repeat(32);
+    let reply_ids: Vec<_> = (1000..1009).rev().map(|i| format!("{i:064x}")).collect();
+    let mut row = message(&input.group_id_hex, &"bb".repeat(32));
+    row.plaintext = format!("@{}", npub_for_account_id(&main).unwrap());
+    row.reply_preview = Some(TimelineReplyPreview {
+        message_id_hex: "03".repeat(32),
+        sender: reply_author.clone(),
+        plaintext: reply_ids
+            .iter()
+            .map(|id| format!("@{}", npub_for_account_id(id).unwrap()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        kind: 9,
+        source_epoch: Some(0),
+        media: None,
+        agent_text_stream: None,
+        deleted: false,
+        invalidation_status: None,
+    });
+    let result = project(&app, &input, &page(vec![row.clone()]));
+    assert_eq!(result.messages[0].mentions, vec![main]);
+    assert!(!result.messages[0].mentions_truncated);
+    assert_eq!(result.messages[0].reply_mentions, reply_ids[..8]);
+    assert!(result.messages[0].reply_mentions_truncated);
+    assert!(result.identities.contains_key(&reply_author));
+    for id in &reply_ids[..8] {
+        assert!(result.identities.contains_key(id));
+        assert!(result.depends_on_profile(id));
+    }
+    assert!(!result.identities.contains_key(&reply_ids[8]));
+    let mention = format!("@{}", npub_for_account_id(&reply_ids[0]).unwrap());
+    row.reply_preview.as_mut().unwrap().plaintext = format!("{mention} {mention}");
+    let complete = project(&app, &input, &page(vec![row]));
+    assert_eq!(complete.messages[0].reply_mentions, reply_ids[..1]);
+    assert!(!complete.messages[0].reply_mentions_truncated);
+}

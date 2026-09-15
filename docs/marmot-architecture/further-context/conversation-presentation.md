@@ -45,7 +45,11 @@ stable raw-identity fallback; truncation never instructs a client to issue addit
 reaction/member screens use the existing narrow APIs. The shared mention parser scans its existing 65,519-byte
 prefix; a longer body reports truncation. Up to 256 raw tags are examined for additional `p` references;
 exceeding that scan budget also reports truncation. Mention selection preserves document order and prioritizes
-visible inline mentions before tag-only references; duplicate identities consume no extra slots.
+visible inline mentions before tag-only references; duplicate identities consume no extra slots. The
+`mentions_truncated` and `reply_mentions_truncated` flags mean resolution may be incomplete because slots overflowed
+or an input scan ended. They do not assert that additional mentions exist, supply an omitted count, or authorize
+client lookups. Reply-body mentions have a separate eight-reference budget so rendering that returned content
+requires no per-mention profile requests; this adds at most 1,600 identities across 200 rows.
 
 A test-only 64 MiB JSON regression budget audits the **presentation sidecar** field and collection limits, including
 worst-case escaping. It is not an exported wire contract or a budget for M4/M5 to enforce by encoding. The production refresh path does not encode the sidecar to
@@ -73,3 +77,16 @@ existing owners and must close M4 handles. Errors do not start network repair or
 Tests cover inactive permission gates, admin transitions, historical/reply/mention identity completeness, profile-only
 commit invalidation, selected title/avatar precedence, scoped provenance, bounded ancillary references, UTF-8/JSON
 byte limits and store/group mismatch. These are contract checks, not device latency measurements.
+
+## Native and media adoption notes
+
+M3 already changes the existing native management projection: `is_self_admin` and `is_last_admin` are false for
+retained Left/Removed membership; `can_leave` is false for pending invitations and unrecoverable groups. C9 client
+adoption should use the appropriate invitation/repair flows and keep display hints separate from command refusal.
+
+Person avatars currently reuse the shipped header cache-key framing, including account store, local identity and
+group. Thus the same person/URL has distinct presentation keys in different conversations. M3 does not define an
+asset-store layout or promise byte-cache deduplication. Native consumers should treat these as opaque presentation
+keys. During C7, settle a reusable person-image acquisition identity (or an explicit key migration) so these keys
+do not accidentally become one download/file per conversation. This follow-up does not gate M5 and remains
+separate from encrypted group-image source selection.

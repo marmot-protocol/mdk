@@ -60,8 +60,13 @@ pub struct ConversationMessageReferences {
     pub sender: Option<String>,
     pub reply_author: Option<String>,
     pub mentions: Vec<String>,
+    /// Resolution may be incomplete: either reference slots overflowed or
+    /// the bounded input scan ended. Does not prove additional mentions exist
+    /// and must not drive a count or a client profile-fetch affordance.
     pub mentions_truncated: bool,
+    /// Inline references in the returned reply body, using their own budget.
     pub reply_mentions: Vec<String>,
+    /// Same conservative completeness meaning as `mentions_truncated`.
     pub reply_mentions_truncated: bool,
     /// Only backed by the stored synthesized-event origin, never arbitrary
     /// kind-1210 JSON. Invalidation remains on the accompanying timeline row.
