@@ -4336,6 +4336,11 @@ typedef struct MarmotAccountAttentionTotal {
   uint64_t unread_count;
   uint64_t unread_mention_count;
   uint64_t unread_conversations;
+  /**
+   * Active unarchived pending invitations (one each) and accepted manual-only reminders.
+   * Application badge = unread_count + attention_only_conversations; do not add invites again.
+   * Invite messages/mentions remain suppressed; archived and departed/departing chats do not count.
+   */
   uint64_t attention_only_conversations;
 } MarmotAccountAttentionTotal;
 

@@ -68,25 +68,27 @@ mod tests {
         run(&mut conn, MIGRATIONS).unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
         let eligible = |conn: &Connection| {
-            conn.query_row(
+            conn.prepare(
                 "SELECT group_id_hex FROM chat_list_rows INDEXED BY idx_chat_list_invite_attention
-                 WHERE list_scope = 0 AND list_pending_invite = 1",
-                [],
-                |r| r.get::<_, String>(0),
+                 WHERE list_scope = 0 AND list_pending_invite = 1 ORDER BY group_id_hex",
             )
             .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
         };
-        assert_eq!(eligible(&conn), "01");
+        assert_eq!(eligible(&conn), ["01"]);
         // Acceptance/reinvitation must win over stale display-row state.
         conn.execute_batch(
             "UPDATE account_groups SET pending_confirmation = 1 - pending_confirmation;",
         )
         .unwrap();
-        assert_eq!(eligible(&conn), "02");
+        assert_eq!(eligible(&conn), ["02"]);
         conn.execute_batch(
             "UPDATE chat_list_rows SET pending_confirmation = 1 - pending_confirmation;",
         )
         .unwrap();
-        assert_eq!(eligible(&conn), "02");
+        assert_eq!(eligible(&conn), ["02"]);
     }
 }

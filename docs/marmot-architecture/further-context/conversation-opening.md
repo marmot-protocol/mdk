@@ -1,7 +1,7 @@
 ---
 title: "Bounded conversation opening"
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 status: implementation
 ---
 
@@ -43,7 +43,9 @@ network work. Closed storage remains closed.
 The read requires the group's unread membership to be prepared, without pending dirty message entries, and aligned
 with its durable read marker and chat-list summary. `ReadStateNotReady` asks the existing projection owner to prepare
 or refresh that group before retrying. It does not trigger a history scan on the opening path. Raw unread counters
-are deliberately distinct from C4 attention eligibility, which suppresses pending/archived/departed conversations.
+are deliberately distinct from C4 account attention: each active unarchived pending invitation adds one
+attention-only item, while archived and departed/departing conversations contribute nothing. Invitation
+message/mention counts remain suppressed until acceptance; the Unread filtered list still excludes invitations.
 
 ## Inputs to later screen composition
 

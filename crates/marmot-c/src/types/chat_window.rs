@@ -65,6 +65,9 @@ c_mirror! { MarmotAccountAttentionTotal from AccountAttentionTotalFfi {
     copy unread_count: u64,
     copy unread_mention_count: u64,
     copy unread_conversations: u64,
+    /// Active unarchived pending invitations (one each) and accepted manual-only reminders.
+    /// Application badge = unread_count + attention_only_conversations; do not add invites again.
+    /// Invite messages/mentions remain suppressed; archived and departed/departing chats do not count.
     copy attention_only_conversations: u64,
 } }
 #[repr(C)]

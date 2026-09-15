@@ -1,7 +1,7 @@
 ---
 title: "Chat and conversation projection inventory"
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-15
 tags: [marmot, architecture, projections, chat]
 ---
 
@@ -297,11 +297,14 @@ matching implementations. The device baseline below uses released bindings, sepa
   sync and projection rebuilds.
 - Unread and Mentions are composable filters, including combinations with archive state. Muting suppresses notifications
   but preserves unread counts, mention badges and filter membership; expose effective mute state and expiry.
-- Account-switcher attention includes muted conversations but excludes archived conversations and pending invitations.
-  Manual unread independently activates attention and the Unread filter without inventing message or mention counts.
-  Current `set_chat_manually_unread` and its regression tests already cover the durable independent flag and summary
-  contribution. Current `account_unread_total` explicitly includes pending invitations as attention, so excluding them is
-  a targeted behavior change, not existing parity. The current native list query does not yet implement these filters.
+- Account-switcher attention includes muted active conversations and one item per active unarchived pending
+  invitation. Archived and departed/departing conversations are excluded. Invitation message/mention counts remain
+  suppressed until acceptance; invitations stay outside the Unread filtered list. Manual unread independently
+  activates attention and the Unread filter without inventing message or mention counts. An accepted manual
+  reminder with no unread messages contributes one attention-only item. The application badge is
+  `unread_count + attention_only_conversations`; clients must not add invitation counts separately.
+  This supersedes the earlier exclude-invites product direction; #1847 records the C4 policy correction.
+
 
 ### Conversation, identities and localization
 
