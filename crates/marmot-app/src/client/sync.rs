@@ -2334,9 +2334,6 @@ impl AppClient {
             // A cancelled drain cannot replay an already-applied commit's
             // group effects. Save them before waiting for another delivery.
             if !self.pending_group_projection_updates.is_empty() {
-                if self.adapter.pending_delivery_overflow().is_some() {
-                    self.state.last_transport_timestamp = cursor_before_secs;
-                }
                 // Persist group fields without acknowledging replayable output:
                 // the caller has not received this drain's summary yet.
                 let pending_acks = std::mem::take(&mut self.pending_application_event_acks);

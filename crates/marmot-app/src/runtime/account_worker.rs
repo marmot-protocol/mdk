@@ -457,21 +457,10 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
-    fn needs_media_slot(&self, client: &AppClient) -> bool {
+    fn needs_media_slot(&self) -> bool {
         match self {
-            Self::UploadPreparedGroupImage { upload_id, .. } => {
-                // Only confirmed completed uploads can bypass HTTP capacity.
-                !client
-                    .prepared_initial_group_image_status(upload_id)
-                    .is_ok_and(|status| {
-                        matches!(
-                            status.state,
-                            crate::AppPreparedGroupImageUploadState::Uploaded
-                                | crate::AppPreparedGroupImageUploadState::Consumed
-                        )
-                    })
-            }
-            Self::DownloadGroupImage { .. }
+            Self::UploadPreparedGroupImage { .. }
+            | Self::DownloadGroupImage { .. }
             | Self::UploadMedia { .. }
             | Self::DownloadMedia { .. } => true,
             #[cfg(test)]
@@ -997,7 +986,7 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &client, &media_http) {
+    while let Some(index) = ready_command_index(&pending, &media_http) {
         let command = pending
             .remove(index)
             .expect("selected pending command exists");
@@ -1086,7 +1075,7 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     'worker: loop {
-        let ready_command = ready_command_index(&pending, &client, &media_http);
+        let ready_command = ready_command_index(&pending, &media_http);
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -2501,17 +2490,20 @@ fn spawn_media_http<T>(
 
 fn ready_command_index(
     pending: &VecDeque<AccountWorkerCommand>,
-    client: &AppClient,
     media_http: &MediaHttpContext,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
     pending
         .iter()
-        .position(|command| has_capacity || !command.needs_media_slot(client))
+        .position(|command| has_capacity || !command.needs_media_slot())
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
+    // Startup replay and the steady loop use ready_command_index; fresh
+    // commands pass handle_account_worker_command. All three gate capacity,
+    // and this worker alone acquires permits without yielding between gates.
+    debug_assert!(media_http.permits.available_permits() != 0);
     media_http
         .permits
         .clone()
@@ -2807,7 +2799,7 @@ async fn handle_account_worker_command(
 ) {
     if (context.media_http.permits.is_closed()
         || context.media_http.permits.available_permits() == 0)
-        && command.needs_media_slot(client)
+        && command.needs_media_slot()
     {
         // Only newly received commands reach this gate; parked media keep their order.
         context.pending.push_back(command);
@@ -5858,7 +5850,7 @@ mod tests {
                 server: None,
                 respond,
             }
-            .needs_media_slot(&client)
+            .needs_media_slot()
         );
         drop(client);
 
@@ -5890,15 +5882,6 @@ mod tests {
         let (respond, drained) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::Drain { respond })
-            .unwrap();
-        let (respond, uploaded) = oneshot::channel();
-        commands
-            .try_send(AccountWorkerCommand::UploadPreparedGroupImage {
-                admission: admission.clone().try_acquire_owned().unwrap(),
-                upload_id: staged.upload_id.clone(),
-                server: None,
-                respond,
-            })
             .unwrap();
         let shared = RuntimeSharedServices::default();
         let startup = Arc::new(tokio::sync::Barrier::new(2));
@@ -5966,15 +5949,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let uploaded = timeout(Duration::from_secs(5), uploaded)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            uploaded.state,
-            crate::AppPreparedGroupImageUploadState::Uploaded
-        );
         assert!(matches!(
             queued.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -6106,6 +6080,19 @@ mod tests {
             .acquire_many_owned(super::super::MEDIA_COMMAND_QUEUE_LIMIT as u32)
             .await
             .unwrap();
+        let mut waiting = Box::pin(manager.media_worker_commands("alice"));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(super::super::APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT).await;
+        assert!(matches!(
+            waiting.await,
+            Err(AppError::AccountWorkerResponseTimedOut)
+        ));
+        tokio::time::resume();
         let mut waiting = Box::pin(manager.media_worker_commands("alice"));
         std::future::poll_fn(|cx| {
             assert!(waiting.as_mut().poll(cx).is_pending());

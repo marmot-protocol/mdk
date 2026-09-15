@@ -1201,26 +1201,27 @@ fn cancelled_sync_keeps_profile() {
             .await
             .unwrap();
 
-        // Stop after the engine applies the commit, while the drain is still
-        // waiting for EOSE. Shutdown must not lose the matching projection.
+        // Freeze receive timers and cancel on the first pending poll after
+        // ingest. No sleep can race the drain through its final checkpoint.
+        tokio::time::pause();
         {
             let sync = bob.sync();
             tokio::pin!(sync);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    tokio::select! {
-                        _ = &mut sync => panic!("drain ended before cancellation"),
-                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                            if storage.get_group(&group_id).unwrap().epoch != epoch {
-                                break;
-                            }
-                        }
-                    }
+            std::future::poll_fn(|cx| {
+                use std::future::Future as _;
+
+                assert!(
+                    sync.as_mut().poll(cx).is_pending(),
+                    "drain ended before cancellation"
+                );
+                if storage.get_group(&group_id).unwrap().epoch != epoch {
+                    return std::task::Poll::Ready(());
                 }
+                std::task::Poll::Pending
             })
-            .await
-            .expect("the rename must reach the engine");
+            .await;
         }
+        tokio::time::resume();
         drop(bob);
         let group = app
             .group("bob", &hex::encode(group_id.as_slice()))

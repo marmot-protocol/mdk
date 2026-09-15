@@ -6195,7 +6195,11 @@ impl AccountManager {
         // Wait outside the shared command lane, without holding the worker map lock.
         let permit = tokio::select! {
             _ = commands.closed() => return Err(AppError::TransportClosed),
-            permit = admission.acquire_owned() => permit.map_err(|_| AppError::TransportClosed)?,
+            acquired = timeout(APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT, admission.acquire_owned()) => {
+                acquired
+                    .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
+                    .map_err(|_| AppError::TransportClosed)?
+            },
         };
         Ok((commands, permit))
     }
