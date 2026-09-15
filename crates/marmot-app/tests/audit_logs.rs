@@ -133,6 +133,29 @@ async fn write_http_response(stream: &mut TcpStream, status: u16) {
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
+async fn write_http_redirect(stream: &mut TcpStream, status: u16, location: &str) {
+    let reason = match status {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        _ => "Redirect",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+const VALID_V4_AUDIT_BODY: &[u8] = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n";
+
+fn write_valid_v4_audit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, VALID_V4_AUDIT_BODY).unwrap();
+    path
+}
+
 #[tokio::test]
 async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1412,4 +1435,188 @@ async fn tracker_skips_legacy_files_without_retry_and_uploads_later_v4_files() {
                 .contains("PRIVATE_SENTINEL")
         );
     }
+}
+
+#[tokio::test]
+async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let audit_path =
+        write_valid_v4_audit(&home.account_dir(&account.label), "audit-redirect.jsonl");
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+
+    let success = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let success_addr = success.local_addr().unwrap();
+    let (success_tx, success_rx) = oneshot::channel();
+    let success_server = tokio::spawn(capture_one_request(success, success_tx));
+    let uploaded = app
+        .post_audit_log_file_with_tracker_config(
+            &audit_path.to_string_lossy(),
+            &AuditLogTrackerConfig {
+                endpoint: Some(format!(
+                    "http://localhost:{}/ingest?exact=one%2Ftwo",
+                    success_addr.port()
+                )),
+                source: AuditLogUploadSource {
+                    hardware_model: Some("iPhone17,3".to_owned()),
+                    platform: Some("ios".to_owned()),
+                    app_version: Some("2026.6.8".to_owned()),
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status, 204);
+    assert_eq!(uploaded.bytes_sent, VALID_V4_AUDIT_BODY.len() as u64);
+    let captured = success_rx.await.unwrap();
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/ingest?exact=one%2Ftwo");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-ndjson")
+    );
+    assert_eq!(captured.hardware_model.as_deref(), Some("iPhone17,3"));
+    assert!(captured.legacy_device_label.is_none());
+    assert_eq!(captured.platform.as_deref(), Some("ios"));
+    assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
+    assert_eq!(captured.body, VALID_V4_AUDIT_BODY);
+    success_server.await.unwrap();
+
+    for (status, location) in [
+        (301, "/stolen".to_owned()),
+        (302, "http://169.254.169.254/stolen".to_owned()),
+        (303, "https://example.invalid/stolen".to_owned()),
+        (307, "::::".to_owned()),
+        (308, "http://127.0.0.1/stolen".to_owned()),
+    ] {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = if status == 308 {
+            format!("http://{}/stolen", sink.local_addr().unwrap())
+        } else {
+            location
+        };
+        let (tx, rx) = oneshot::channel();
+        let redirect_server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = source.accept().await else {
+                return;
+            };
+            let Some(request) = read_captured_request(&mut stream).await else {
+                return;
+            };
+            write_http_redirect(&mut stream, status, &location).await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(request);
+        });
+        let (sink_tx, mut sink_rx) = oneshot::channel();
+        let sink_server = tokio::spawn(capture_one_request(sink, sink_tx));
+        let err = app
+            .post_audit_log_file(
+                &audit_path.to_string_lossy(),
+                &format!("http://{source_addr}/ingest"),
+            )
+            .await
+            .expect_err("redirects must remain non-success");
+        assert!(
+            err.to_string().contains(&format!("HTTP {status}")),
+            "unexpected error for {status}: {err}"
+        );
+        let captured = rx.await.unwrap();
+        assert_eq!(captured.body, VALID_V4_AUDIT_BODY);
+        assert!(captured.legacy_device_label.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut sink_rx)
+                .await
+                .is_err(),
+            "redirect sink received a request for {status}"
+        );
+        sink_server.abort();
+        redirect_server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let audit_path = write_valid_v4_audit(&home.account_dir(&account.label), "audit-unsafe.jsonl");
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let retired = marmot_app::retired_relay_hosts()
+        .into_iter()
+        .next()
+        .expect("centralized retired host list");
+    let configs = [
+        AuditLogTrackerConfig {
+            endpoint: Some("https://10.0.0.1/ingest".into()),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some("https://169.254.169.254/ingest".into()),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some("https://100.64.0.1/ingest".into()),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some("https://[::ffff:127.0.0.1]/ingest".into()),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some(format!("https://{retired}/ingest")),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some(format!("https://{}/ingest", retired.to_ascii_uppercase())),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some("https://secret.example/path?token=secret-query".into()),
+            authorization_bearer_token: None,
+            ..Default::default()
+        },
+        AuditLogTrackerConfig {
+            endpoint: Some("https://user:password@secret.example/ingest".into()),
+            authorization_bearer_token: Some("bearer-secret".into()),
+            ..Default::default()
+        },
+    ];
+    for config in configs {
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.post_audit_log_file_with_tracker_config(&audit_path.to_string_lossy(), &config),
+        )
+        .await
+        .expect("unsafe or retired audit upload must fail closed without hanging")
+        .expect_err("unsafe or retired audit upload must fail");
+        let text = err.to_string();
+        for leak in [
+            "secret.example",
+            "secret-query",
+            "bearer-secret",
+            "10.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            &retired,
+        ] {
+            assert!(!text.contains(leak), "leaked {leak} via {text}");
+        }
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+            .await
+            .is_err(),
+        "rejected uploads must not open a socket"
+    );
 }

@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Forensic audit-log uploads now resolve, validate, and pin a fresh client for each attempt, with redirects and
+  system proxies disabled. Private, retired, or redirected collector endpoints fail closed instead of following
+  `Location` or dialing an unchecked address. Local loopback testing and the existing 60-second upload deadline remain.
+
 ### Added
 
 - WN Agent `group_info` now returns the current Marmot chat-list group name as `subject`

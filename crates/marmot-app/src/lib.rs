@@ -73,7 +73,6 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod agent_streams;
 mod app_telemetry;
-#[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
 mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;

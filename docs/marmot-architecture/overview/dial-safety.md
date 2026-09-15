@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety"
 created: 2026-07-04
-updated: 2026-09-10
+updated: 2026-09-15
 tags: [marmot, overview, security, network, ssrf, transport]
 status: overview
 ---
@@ -48,22 +48,26 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 | --- | --- |
 | Blossom media (reqwest, download + upload) | `crates/marmot-app/src/media/blossom.rs`: `media_http_client_for_url` → `validate_blossom_fetch_url` + `resolve_media_host` (per-address `reject_non_public_ip`, `resolve_to_addrs` pin, connect/read/total timeouts, per-redirect re-validation). |
 | OTLP and product analytics (reqwest, push) | `crates/marmot-app/src/collector_host_safety.rs`: structural URL gate → resolve once per attempt → validate every address → `resolve_to_addrs` pin; redirects and proxies disabled, TLS trust/SNI from the configured URL, 10s connect and 30s overall attempt limits. |
+| Forensic audit-log upload (reqwest, POST) | Same `collector_host_safety.rs` helper from `crates/marmot-app/src/audit_log.rs`: structural URL gate plus retired-host rejection → resolve/validate/pin per attempt → no redirects, proxies, or pooling. TLS verification stays on. Audit keeps a 60s request override and enclosing network deadline instead of the helper's 30s collector default. |
 | Agent-stream broker watch (quinn) | `crates/marmot-app/src/runtime/agent_stream_watch.rs`: `resolve_broker_addr` validates + pins; `broker_trust_for_candidate` keys `InsecureLocal` on the literal candidate host + `insecure_local`. |
 | Agent-connector broker dial (quinn) | `crates/marmot-app/src/runtime/agent_publisher.rs` reuses runtime broker validation + pinning and TLS trust selection, gated on `AgentConnectorConfig::allow_insecure_local_broker` + literal loopback. |
 | CLI stream (quinn) | `crates/cli/src/commands/stream.rs`: `resolve_quic_candidate_addr` (`socket_addr_is_unsafe`); explicit `stream send` `--connect` (direct and `--broker`) uses `broker_trust` / `stream_trust` → `ensure_public_quic_endpoint` (`reject_non_public_socket_addr(addr, false)`) or `ensure_insecure_local_endpoint`. A family-matched unspecified client bind is source routing only, not destination authorization. |
 | Nostr relays (nostr-sdk) | `crates/marmot-app/src/relay_plane/safety.rs`: `RelaySafetyPolicy::sanitize_endpoints` → `reject_unsafe_relay_host`, the single funnel for activation, group sync, publish, and directory routes. |
 | QUIC broker client connect timeout | Shared QUIC-preview hardening (`connect_with_timeout` / `QUIC_PREVIEW_CONNECT_TIMEOUT`, #710), applied at both broker client connects in `crates/transport-quic-broker/src/client.rs`. |
 
-The OTLP exporter rejects missing hosts, unusable ports, credentials, fragments, and unsupported schemes before
-resolution. Public HTTPS names and literal IPs must pass the shared address classifier; a mixed safe/unsafe DNS answer
-or an empty result rejects the whole attempt. Only an explicitly configured exact `localhost` or loopback IP literal
-gets the local-test exception, for either HTTP or HTTPS, and it must resolve exclusively to loopback. HTTP never
-reaches a non-loopback address. TLS verification remains enabled even for local HTTPS collectors. The original path
-and query are retained; bearer auth is attached only after validation and pinning. Automatic redirects are disabled:
-3xx is a non-success status, with no request or bearer token sent to the redirect target. Each retry resolves afresh;
-there is no DNS cache or cross-attempt connection pool. Resolution itself has a 10s bound within the 30s attempt
-limit. Failures expose only the existing generic `Request` error or a numeric HTTP status, without endpoint, address,
-auth, or body material. System proxies are disabled because proxy-side DNS would bypass the pin.
+The OTLP exporter and forensic audit uploader reject missing hosts, unusable ports, credentials, fragments, and
+unsupported schemes before resolution. Public HTTPS names and literal IPs must pass the shared address classifier; a
+mixed safe/unsafe DNS answer or an empty result rejects the whole attempt. Only an explicitly configured exact
+`localhost` or loopback IP literal gets the local-test exception, for either HTTP or HTTPS, and it must resolve
+exclusively to loopback. HTTP never reaches a non-loopback address. TLS verification remains enabled even for local
+HTTPS collectors. The original path and query are retained; bearer auth is attached only after validation and pinning.
+Automatic redirects are disabled: 3xx is a non-success status, with no request or bearer token sent to the redirect
+target. Each retry resolves afresh; there is no DNS cache or cross-attempt connection pool. Resolution itself has a 10s
+bound. Collector export stays inside a 30s attempt limit; audit uploads keep a 60s request override and enclosing
+network-attempt deadline so explicit DNS cannot outlive that budget. Audit also refuses configured hosts on the
+centralized retired-relay list. Failures expose only context-free messages or a numeric HTTP status, without endpoint,
+address, auth, or body material. System proxies are disabled because proxy-side DNS would bypass the pin. This
+inventory does not claim that every other workspace HTTP client has been audited.
 
 The broker TLS client (`crates/transport-quic-broker/src/tls.rs`) keeps a resolved-address backstop
 (`InsecureLocalRequiresLoopback`): even if a caller mis-selects `InsecureLocal`, a non-loopback resolved address is

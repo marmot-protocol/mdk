@@ -53,9 +53,9 @@ App runtime bridge for the first real Marmot app surfaces.
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
-  the upload client, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for
-  audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and HTTP upload. Audit-log
-  unit tests live in its own `#[cfg(test)] mod tests`.
+  the per-attempt pinned upload path, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the
+  `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
+  HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
 - Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
   or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
   by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
@@ -162,8 +162,9 @@ App runtime bridge for the first real Marmot app surfaces.
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/proxies, and retain TLS verification. Only exact `localhost` or a
-  loopback IP literal is a local-test endpoint, and all its addresses must be loopback. See
-  `docs/marmot-architecture/relay-observability.md` and `overview/dial-safety.md`.
+  loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
+  helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. See
+  `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
 
 ## Verification
 

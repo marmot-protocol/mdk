@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-10
+updated: 2026-09-15
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -1065,19 +1065,25 @@ Validation:
 - basename must match `audit-*.jsonl`;
 - canonical path must be inside the app root;
 - file must be at most `64 MiB`;
-- endpoint must be `https`, or loopback `http` for local testing;
-- non-loopback endpoints require a bearer token.
+- the endpoint must pass the shared collector structural parser (`parse_relay_telemetry_endpoint`): `https`, or loopback `http` for local testing; missing hosts, unusable ports, userinfo, fragments, and unsupported schemes are rejected before DNS;
+- configured hosts on the centralized retired-relay list are rejected, including case and trailing-root-dot equivalents;
+- non-loopback endpoints require a bearer token;
+- exact `localhost` or a loopback IP literal remains the local-test opt-in, including a manual loopback upload without a token. Ordinary hostnames, `localhost` subdomains, and trailing-dot aliases do not receive that exception.
 
 HTTP request:
+
+Each upload attempt is a separate chokepoint: resolve once, validate every DNS answer with the shared classifier, reject empty or mixed-unsafe answers, and build a fresh pinned client. Redirects and system proxies are disabled. TLS verification stays enabled, including for local HTTPS. The configured hostname, port, path, and query are retained for Host/SNI; the URL is never rewritten to a resolved IP. There is no process-global client, DNS cache, or connection pool.
 
 | Property | Value |
 | --- | --- |
 | Method | `POST` |
-| Body | Raw JSONL file stream |
+| Body | Captured complete-line JSONL snapshot |
 | `Content-Type` | `application/x-ndjson` |
-| `Content-Length` | File size |
+| `Content-Length` | Snapshot length |
 | Authorization | Optional bearer token, required for non-loopback endpoints |
-| Timeout | `10s` connect, `60s` total request |
+| Timeout | Shared collector `10s` DNS/connect limits; `60s` request override and enclosing network-attempt deadline |
+
+A 3xx response is `AuditUploadAttempt::Rejected` with its numeric status. The client never follows `Location`, so a separate redirect target receives no body or source/auth headers. Failed or refused uploads are not checkpointed.
 
 Optional source headers:
 
