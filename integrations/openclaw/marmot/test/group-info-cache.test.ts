@@ -93,6 +93,20 @@ describe("GroupInfoCache", () => {
     ).resolves.toEqual({ status: "ok", facts: { isDirect: true, label: "Project" } });
     expect(calls).toBe(1);
 
+    const reentrant = new GroupInfoCache();
+    let nested: Promise<unknown> | undefined;
+    const outer = await reentrant.lookup(ACCOUNT_A, GROUP_32, "label", () => {
+      nested = reentrant.lookup(ACCOUNT_A, GROUP_32, "activation", async () => {
+        throw new Error("must share the in-flight fetch");
+      });
+      return Promise.resolve(info({ subject: "Reentrant" }));
+    });
+    await expect(nested).resolves.toEqual({
+      status: "ok",
+      facts: { isDirect: true, label: "Reentrant" },
+    });
+    expect(outer).toEqual({ status: "ok", facts: { isDirect: true, label: "Reentrant" } });
+
     const unnamed = new GroupInfoCache();
     await expect(
       unnamed.lookup(ACCOUNT_A, GROUP_OTHER, "label", async () =>

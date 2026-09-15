@@ -164,17 +164,25 @@ export class GroupInfoCache {
   ): Promise<GroupInfoLookupResult> {
     const generation = this.nextGeneration;
     this.nextGeneration += 1;
+    let settle!: (value: GroupInfoLookupResult) => void;
+    let fail!: (reason: unknown) => void;
     const pending: PendingEntry = {
       kind: "pending",
       generation,
       membershipRequired: purpose === "activation",
-      promise: undefined as unknown as Promise<GroupInfoLookupResult>,
+      promise: new Promise<GroupInfoLookupResult>((resolve, reject) => {
+        settle = resolve;
+        fail = reject;
+      }),
       lastUsed: this.now(),
     };
-    const promise = this.runFetch(key, accountIdHex, groupIdHex, generation, fetch);
-    pending.promise = promise;
     this.entries.set(key, pending);
-    return promise;
+    try {
+      void this.runFetch(key, accountIdHex, groupIdHex, generation, fetch).then(settle, fail);
+    } catch (error) {
+      fail(error);
+    }
+    return pending.promise;
   }
 
   private async runFetch(

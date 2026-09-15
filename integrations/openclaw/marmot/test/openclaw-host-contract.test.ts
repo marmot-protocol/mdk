@@ -8,7 +8,8 @@ import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inb
 import { recordInboundSession } from "openclaw/plugin-sdk/conversation-runtime";
 import {
   clearSessionStoreCacheForTest,
-  loadSessionStore,
+  getSessionEntry,
+  resolveStorePath as resolveHostStorePath,
 } from "openclaw/plugin-sdk/session-store-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -614,6 +615,23 @@ describe("installed OpenClaw inbound host contract", () => {
 
 describe("OpenClaw native group subject and session metadata", () => {
   const HEX16 = (byte: string): string => byte.repeat(16);
+  const NATIVE_SESSION_AGENT_ID = "agent";
+
+  type NativeSessionRecord = {
+    groupId?: string;
+    subject?: string;
+    channel?: string;
+    origin?: { label?: string };
+    delivery?: {
+      channel?: string;
+      context?: { channel?: string };
+      origin?: { label?: string; provider?: string };
+    };
+  };
+
+  type NativeSessionRead =
+    | { status: "ok"; session?: NativeSessionRecord }
+    | { status: "unavailable" };
 
   afterEach(() => {
     clearSessionStoreCacheSafe();
@@ -629,17 +647,35 @@ describe("OpenClaw native group subject and session metadata", () => {
     }
   }
 
-  function loadSessionStoreIfSafe(
-    storePath: string,
-  ): Record<string, { groupId?: string; subject?: string; channel?: string; origin?: { label?: string } }> | undefined {
+  function resolveNativeStorePath(storePath: string): string {
+    return resolveHostStorePath(storePath, { agentId: NATIVE_SESSION_AGENT_ID });
+  }
+
+  function sessionOriginLabel(session: NativeSessionRecord): string | undefined {
+    return session.origin?.label ?? session.delivery?.origin?.label;
+  }
+
+  function sessionChannel(session: NativeSessionRecord): string | undefined {
+    return (
+      session.channel ??
+      session.delivery?.channel ??
+      session.delivery?.context?.channel ??
+      session.delivery?.origin?.provider
+    );
+  }
+
+  function readNativeSession(storePath: string, sessionKey: string): NativeSessionRead {
     try {
-      return loadSessionStore(storePath) as Record<
-        string,
-        { groupId?: string; subject?: string; channel?: string; origin?: { label?: string } }
-      >;
+      return {
+        status: "ok",
+        session: getSessionEntry({
+          storePath,
+          sessionKey,
+        }) as NativeSessionRecord | undefined,
+      };
     } catch (error) {
       if (isUnsafeSqliteRuntime(error)) {
-        return undefined;
+        return { status: "unavailable" };
       }
       throw error;
     }
@@ -655,11 +691,12 @@ describe("OpenClaw native group subject and session metadata", () => {
       id: string;
       chatType: "group";
     };
-  }): Promise<boolean> {
+  }): Promise<NativeSessionRead> {
+    const storePath = resolveNativeStorePath(params.storePath);
     let meta: Promise<unknown> | undefined;
     try {
       await recordInboundSession({
-        storePath: params.storePath,
+        storePath,
         sessionKey: params.sessionKey,
         ctx: params.ctx as never,
         groupResolution: params.groupResolution,
@@ -670,10 +707,10 @@ describe("OpenClaw native group subject and session metadata", () => {
         },
       });
       await meta;
-      return true;
+      return readNativeSession(storePath, params.sessionKey);
     } catch (error) {
       if (isUnsafeSqliteRuntime(error)) {
-        return false;
+        return { status: "unavailable" };
       }
       throw error;
     }
@@ -723,7 +760,11 @@ describe("OpenClaw native group subject and session metadata", () => {
     isDirect?: boolean;
     subject?: unknown;
     client?: MarmotDispatchClient;
-  }): Promise<{ ctx: Record<string, unknown>; session: Record<string, unknown> | undefined }> {
+  }): Promise<{
+    ctx: Record<string, unknown>;
+    session: NativeSessionRecord | undefined;
+    sessionRead: NativeSessionRead;
+  }> {
     let capturedCtx: Record<string, unknown> | undefined;
     const accountIdHex = opts.accountIdHex ?? HEX32("aa");
     const groupIdHex = opts.groupIdHex;
@@ -745,7 +786,11 @@ describe("OpenClaw native group subject and session metadata", () => {
         },
       },
       session: {
-        resolveStorePath: (store) => String(store ?? opts.storePath),
+        resolveStorePath: (store, options) =>
+          resolveHostStorePath(String(store ?? opts.storePath), {
+            agentId:
+              (options as { agentId?: string } | undefined)?.agentId ?? NATIVE_SESSION_AGENT_ID,
+          }),
         recordInboundSession: async (params: unknown) => {
           const input = params as {
             storePath: string;
@@ -813,10 +858,11 @@ describe("OpenClaw native group subject and session metadata", () => {
     if (!capturedCtx) {
       throw new Error("turn did not build a native context");
     }
-    const store = loadSessionStoreIfSafe(opts.storePath);
+    const sessionRead = readNativeSession(resolveNativeStorePath(opts.storePath), sessionKey);
     return {
       ctx: capturedCtx,
-      session: store?.[sessionKey],
+      session: sessionRead.status === "ok" ? sessionRead.session : undefined,
+      sessionRead,
     };
   }
 
@@ -856,7 +902,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       ];
       for (const activation of cases) {
         clearSessionStoreCacheSafe();
-        const { ctx, session } = await dispatchNamedTurn({
+        const { ctx, session, sessionRead } = await dispatchNamedTurn({
           storePath,
           groupIdHex,
           senderAccountIdHex: sender,
@@ -872,11 +918,11 @@ describe("OpenClaw native group subject and session metadata", () => {
         expect(ctx.From).toBe(sender);
         if (session) {
           expect(session.subject).toBe("Project Marmot");
-          expect((session.origin as { label?: string } | undefined)?.label).toBe("Project Marmot");
+          expect(sessionOriginLabel(session)).toBe("Project Marmot");
           expect(session.groupId).toBe(groupIdHex);
-          expect(session.channel).toBe("marmot");
+          expect(sessionChannel(session)).toBe("marmot");
         } else {
-          expect(loadSessionStoreIfSafe(storePath)).toBeUndefined();
+          expect(sessionRead.status).toBe("unavailable");
         }
         expect(unlabeledControl.ConversationLabel).not.toBe("Project Marmot");
       }
@@ -941,13 +987,14 @@ describe("OpenClaw native group subject and session metadata", () => {
       expect(first.ctx.SessionKey).toBe(`agent:marmot:${groupA}`);
       expect(second.ctx.SessionKey).toBe(`agent:marmot:${groupB}`);
       expect(third.ctx.SessionKey).toBe(`agent:marmot:${group16}`);
-      const store = loadSessionStoreIfSafe(storePath);
-      if (store) {
-        expect(store[`agent:marmot:${groupA}`]?.groupId).toBe(groupA);
-        expect(store[`agent:marmot:${groupB}`]?.groupId).toBe(groupB);
-        expect(store[`agent:marmot:${group16}`]?.groupId).toBe(group16);
-        expect(store[`agent:marmot:${groupA}`]?.subject).toBe("Shared");
-        expect(store[`agent:marmot:${groupB}`]?.subject).toBe("Shared");
+      if (first.session && second.session && third.session) {
+        expect(first.session.groupId).toBe(groupA);
+        expect(second.session.groupId).toBe(groupB);
+        expect(third.session.groupId).toBe(group16);
+        expect(first.session.subject).toBe("Shared");
+        expect(second.session.subject).toBe("Shared");
+      } else {
+        expect(first.sessionRead.status).toBe("unavailable");
       }
     } finally {
       clearSessionStoreCacheSafe();
@@ -975,7 +1022,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       if (first.session) {
         expect(first.session.subject).toBe("Name A");
       } else {
-        expect(loadSessionStoreIfSafe(storePath)).toBeUndefined();
+        expect(first.sessionRead.status).toBe("unavailable");
       }
 
       subject = "Name B";
@@ -1042,24 +1089,22 @@ describe("OpenClaw native group subject and session metadata", () => {
           chatType: "group",
         },
       });
-      const withResolution = loadSessionStoreIfSafe(storePath)?.[`agent:marmot:${groupIdHex}`];
-      if (recorded && withResolution) {
-        expect(withResolution.groupId).toBe(groupIdHex);
-        expect(withResolution.groupId).not.toBe(sender);
+      if (recorded.status === "ok") {
+        expect(recorded.session?.groupId).toBe(groupIdHex);
+        expect(recorded.session?.groupId).not.toBe(sender);
       } else {
-        expect(withResolution).toBeUndefined();
+        expect(recorded.status).toBe("unavailable");
       }
 
       clearSessionStoreCacheSafe();
       const defaultStore = join(root, "default-sessions.json");
-      await recordSessionAndWait({
+      const withoutResolution = await recordSessionAndWait({
         storePath: defaultStore,
         sessionKey: `agent:marmot:${groupIdHex}`,
         ctx,
       });
-      const withoutResolution = loadSessionStoreIfSafe(defaultStore)?.[`agent:marmot:${groupIdHex}`];
-      if (withoutResolution) {
-        expect(withoutResolution.groupId).not.toBe(groupIdHex);
+      if (withoutResolution.status === "ok" && withoutResolution.session) {
+        expect(withoutResolution.session.groupId).not.toBe(groupIdHex);
       }
     } finally {
       clearSessionStoreCacheSafe();
