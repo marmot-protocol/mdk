@@ -56,6 +56,8 @@ fi
 pnpm install --ignore-scripts --frozen-lockfile
 pnpm build
 OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR=1 pnpm vitest run \
+  --fileParallelism=false \
+  --maxWorkers=2 \
   test/openclaw-host-contract.test.ts \
   test/dispatch.test.ts \
   test/inbound-runtime.test.ts \

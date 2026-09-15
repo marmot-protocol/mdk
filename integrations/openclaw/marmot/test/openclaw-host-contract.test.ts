@@ -1105,10 +1105,6 @@ describe("OpenClaw native group subject and session metadata", () => {
 
   it("refreshes one live dispatcher native session after rename, resync, and reconnect", async () => {
     const root = await mkdtemp(join(tmpdir(), "marmot-native-live-lifecycle-"));
-    const previousOpenClawHome = process.env.OPENCLAW_HOME;
-    const previousOpenClawStateDir = process.env.OPENCLAW_STATE_DIR;
-    process.env.OPENCLAW_HOME = join(root, "openclaw-home");
-    process.env.OPENCLAW_STATE_DIR = join(root, "openclaw-state");
     const storePath = join(root, "sessions.json");
     const groupIdHex = HEX32("cc");
     const accountIdHex = HEX32("aa");
@@ -1237,25 +1233,32 @@ describe("OpenClaw native group subject and session metadata", () => {
           }) as unknown as MarmotAgentControlClient,
         invalidateGroupActivation: dispatch.invalidateGroupActivation,
         clearGroupActivationCache: dispatch.clearGroupActivationCache,
+        reconnectDelayMs: 1,
+        maxReconnectDelayMs: 1,
       },
     );
 
     const readSession = (): NativeSessionRead =>
       readNativeSession(resolveNativeStorePath(storePath), sessionKey);
-    const expectPersisted = (expectedSubject: string): void => {
-      // WAL-unsafe Node cannot persist; on a supported runtime the planned
+    const expectPersisted = async (expectedSubject: string): Promise<void> => {
+      // WAL-unsafe Node cannot persist. On a supported runtime the planned
       // native-session regression must observe the recorded subject/group id.
-      const sessionRead = readSession();
-      if (sessionStoreUnavailable) {
-        return;
-      }
-      expect(sessionRead.status).toBe("ok");
-      if (sessionRead.status !== "ok") {
-        return;
-      }
-      expect(sessionRead.session).toBeDefined();
-      expect(sessionRead.session?.groupId).toBe(groupIdHex);
-      expect(sessionRead.session?.subject).toBe(expectedSubject);
+      // Poll: the host may finish session meta after the turn is captured.
+      await vi.waitFor(() => {
+        const sessionRead = readSession();
+        if (sessionStoreUnavailable) {
+          return;
+        }
+        expect(sessionRead.status).toBe("ok");
+        if (sessionRead.status !== "ok") {
+          return;
+        }
+        expect(sessionRead.session).toBeDefined();
+        expect(sessionRead.session?.groupId).toBe(groupIdHex);
+        expect(
+          sessionRead.session?.subject ?? sessionOriginLabel(sessionRead.session ?? {}),
+        ).toBe(expectedSubject);
+      }, { timeout: 10_000 });
     };
     const expectIdentity = (ctx: Record<string, unknown>): void => {
       expect(ctx.ChatId).toBe(groupIdHex);
@@ -1273,13 +1276,14 @@ describe("OpenClaw native group subject and session metadata", () => {
     };
 
     try {
+      await vi.waitFor(() => expect(subscriptions).toBe(1), { timeout: 10_000 });
       push(inbound("01"));
       await waitForTurns(1);
       expect(captured[0]?.ctx.ConversationLabel).toBe("Name A");
       expect(captured[0]?.ctx.GroupSubject).toBe("Name A");
       expectIdentity(captured[0]!.ctx);
       expect(groupInfoCalls).toBe(1);
-      expectPersisted("Name A");
+      await expectPersisted("Name A");
 
       push(inbound("02"));
       await waitForTurns(2);
@@ -1304,7 +1308,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       expect(captured[2]?.ctx.GroupSubject).toBe("Name B");
       expectIdentity(captured[2]!.ctx);
       expect(groupInfoCalls).toBe(2);
-      expectPersisted("Name B");
+      await expectPersisted("Name B");
 
       push(inbound("04"));
       await waitForTurns(4);
@@ -1326,7 +1330,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       expect(captured[4]?.ctx.GroupSubject).toBeUndefined();
       expectIdentity(captured[4]!.ctx);
       expect(groupInfoCalls).toBe(3);
-      expectPersisted("Name B");
+      await expectPersisted("Name B");
 
       push(resync());
       await expectNoExtraTurn(5);
@@ -1336,7 +1340,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       expect(captured[5]?.ctx.GroupSubject).toBeUndefined();
       expectIdentity(captured[5]!.ctx);
       expect(groupInfoCalls).toBe(4);
-      expectPersisted("Name B");
+      await expectPersisted("Name B");
 
       push("fail");
       await vi.waitFor(() => expect(subscriptions).toBe(2), { timeout: 10_000 });
@@ -1344,7 +1348,7 @@ describe("OpenClaw native group subject and session metadata", () => {
       await waitForTurns(7);
       expectIdentity(captured[6]!.ctx);
       expect(groupInfoCalls).toBe(5);
-      expectPersisted("Name B");
+      await expectPersisted("Name B");
 
       push("eof");
       await vi.waitFor(() => expect(subscriptions).toBe(3), { timeout: 10_000 });
@@ -1353,20 +1357,10 @@ describe("OpenClaw native group subject and session metadata", () => {
       expectIdentity(captured[7]!.ctx);
       expect(captured[7]?.ctx.ChatId).toBe(groupIdHex);
       expect(groupInfoCalls).toBe(6);
-      expectPersisted("Name B");
+      await expectPersisted("Name B");
     } finally {
       stop();
       clearSessionStoreCacheSafe();
-      if (previousOpenClawHome === undefined) {
-        delete process.env.OPENCLAW_HOME;
-      } else {
-        process.env.OPENCLAW_HOME = previousOpenClawHome;
-      }
-      if (previousOpenClawStateDir === undefined) {
-        delete process.env.OPENCLAW_STATE_DIR;
-      } else {
-        process.env.OPENCLAW_STATE_DIR = previousOpenClawStateDir;
-      }
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
   }, 30_000);

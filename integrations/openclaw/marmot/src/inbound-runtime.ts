@@ -198,6 +198,13 @@ export interface StartMarmotInboundOptions {
    * subject can be trusted.
    */
   clearGroupActivationCache?: () => void;
+  /**
+   * Optional reconnect delay overrides. Production keeps the bridge defaults;
+   * tests inject a short delay so live rename/resync/reconnect coverage does
+   * not sit on the 1s base backoff.
+   */
+  reconnectDelayMs?: number;
+  maxReconnectDelayMs?: number;
 }
 
 // OpenClaw owns one gateway task per configured channel account. Keep one
@@ -558,6 +565,8 @@ export function startMarmotInbound(
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
+      reconnectDelayMs: options.reconnectDelayMs,
+      maxReconnectDelayMs: options.maxReconnectDelayMs,
       onReady: () => {
         if (readyLogged) {
           // Clean EOF or post-error reconnect can miss a rename while the
