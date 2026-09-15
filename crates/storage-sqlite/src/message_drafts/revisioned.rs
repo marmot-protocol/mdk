@@ -53,17 +53,8 @@ pub enum MessageDraftRevisionError {
 impl SqliteAccountStorage {
     /// One read snapshot, keyed by group; never hydrates attachment plaintext.
     pub fn selected_message_draft(&self, group: &str) -> StorageResult<SelectedMessageDraft> {
-        let conn = self.lock()?;
-        let owned = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let result = selected_tx(&conn, group)?;
-        if let Some(tx) = owned {
-            tx.commit().storage()?;
-        }
-        Ok(result)
+        self.connection
+            .with_deferred_read(|conn| selected_tx(conn, group))
     }
 
     pub fn save_message_draft_if_revision(
@@ -106,26 +97,19 @@ impl SqliteAccountStorage {
         expected: &MessageDraftRevision,
         attachment_id: &str,
     ) -> Result<Option<Vec<u8>>, MessageDraftRevisionError> {
-        let conn = self.lock()?;
-        let owned = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        check_revision_tx(&conn, expected)?;
-        let bytes = conn
-            .query_row_cached(
-                "SELECT plaintext FROM message_draft_attachments
-            WHERE group_id_hex = ?1 AND attachment_id = ?2",
-                params![expected.group_id_hex, attachment_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()?;
-        if let Some(tx) = owned {
-            tx.commit().storage()?;
-        }
-        Ok(bytes)
+        self.connection.with_deferred_read(|conn| {
+            check_revision_tx(conn, expected)?;
+            let bytes = conn
+                .query_row_cached(
+                    "SELECT plaintext FROM message_draft_attachments
+                WHERE group_id_hex = ?1 AND attachment_id = ?2",
+                    params![expected.group_id_hex, attachment_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?;
+            Ok(bytes)
+        })
     }
 
     /// Install the app owner's coalesced wakeup. The callback must not panic.

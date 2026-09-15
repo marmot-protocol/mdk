@@ -465,6 +465,30 @@ impl SharedConnection {
         )
     }
 
+    /// Compose reads on one locked connection and one deferred snapshot. `lock`
+    /// waits for any other thread's transaction owner, so an existing transaction
+    /// here belongs to this thread and stays caller-owned, including on error.
+    /// The callback must use the supplied connection, not re-enter storage APIs.
+    pub(crate) fn with_deferred_read<T, E>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StorageError>,
+    {
+        let conn = self.lock()?;
+        let owned = if conn.is_autocommit() {
+            Some(conn.unchecked_transaction().storage()?)
+        } else {
+            None
+        };
+        let value = read(&conn)?;
+        if let Some(tx) = owned {
+            tx.commit().storage()?;
+        }
+        Ok(value)
+    }
+
     pub(crate) fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,

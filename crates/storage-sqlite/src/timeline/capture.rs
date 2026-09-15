@@ -20,6 +20,7 @@ pub struct ConversationAccountSnapshot {
     pub admin_keys_hex: String,
 }
 
+// Deliberately omit identities, content, draft data and image key material.
 impl std::fmt::Debug for ConversationAccountSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversationAccountSnapshot")
@@ -42,17 +43,8 @@ impl SqliteAccountStorage {
         opening::validate_window_query(&query)?;
         let group_bytes = hex::decode(group)
             .map_err(|_| StorageError::Serialization("invalid conversation group id".into()))?;
-        let conn = self.lock()?;
-        let owned = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let snapshot = capture_tx(&conn, group, &group_bytes, query)?;
-        if let Some(tx) = owned {
-            tx.commit().storage()?;
-        }
-        Ok(snapshot)
+        self.connection
+            .with_deferred_read(|conn| capture_tx(conn, group, &group_bytes, query))
     }
 }
 

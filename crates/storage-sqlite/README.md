@@ -43,6 +43,10 @@ connection. The older `mls_write_generation` contract remains unchanged for cach
 It supports first-unread/latest opening and scoped anchor recovery; dirty projections return `ReadStateNotReady`
 for the existing owner to refresh. See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
 
+`conversation_window` adds explicit context placement around a retained anchor; latest targets always read the tail.
+`conversation_account_snapshot` captures that window, system provenance, presentation inputs, draft descriptors and
+persisted controls in one deferred read. Engine authority and a combined live screen remain C5 M4 work.
+
 Selected composer reads and revision-checked mutations share the existing encrypted draft tables. Migration 0073
 tracks legacy writes too; queued/fanout acceptance clears only its submitted revision atomically. See the
 [draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).

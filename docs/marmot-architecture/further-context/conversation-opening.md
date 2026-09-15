@@ -34,6 +34,7 @@ M4's storage preparation adds `conversation_window(ConversationWindowQuery)`. It
 recovery path but accepts an explicit number of rows before the retained anchor. The future actor can extend
 older/newer context or trim at the 200-row cap while preserving a client-reported viewport identity. A placement
 outside the row budget returns `InvalidAnchorPosition`; missing edge context is filled from the other side.
+Latest targets (including Automatic without a first unread) always read the tail and ignore placement.
 The legacy opening API retains centered placement. This primitive alone is not a live subscription.
 
 Tokens are opaque Rust values scoped to a database's durable store epoch and a group. They survive reopening the

@@ -217,17 +217,8 @@ impl SqliteAccountStorage {
         if !(1..=100).contains(&query.limit) {
             return Err(ChatListPageError::InvalidLimit);
         }
-        let conn = self.lock()?;
-        let owned_tx = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let page = read_page_tx(&conn, query, anchor)?;
-        if let Some(tx) = owned_tx {
-            tx.commit().storage()?;
-        }
-        Ok(page)
+        self.connection
+            .with_deferred_read(|conn| read_page_tx(conn, query, anchor))
     }
 }
 

@@ -45,6 +45,8 @@ pub struct ConversationWindowQuery {
     pub opening: ConversationOpenQuery,
     /// Desired rows before the anchor. None preserves the centered opening policy.
     /// Must be smaller than the row limit; missing context is filled from the other side.
+    /// Latest (including Automatic without a first unread) always selects the tail
+    /// and ignores placement. Explicit Message/Anchor targets honor placement.
     pub before_anchor: Option<usize>,
 }
 
@@ -123,17 +125,9 @@ impl SqliteAccountStorage {
         query: ConversationWindowQuery,
     ) -> Result<ConversationOpenSnapshot, ConversationOpenError> {
         validate_window_query(&query)?;
-        let conn = self.lock()?;
-        let transaction = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let snapshot = opening_tx(&conn, group_id_hex, query.opening, query.before_anchor)?;
-        if let Some(transaction) = transaction {
-            transaction.commit().storage()?;
-        }
-        Ok(snapshot)
+        self.connection.with_deferred_read(|conn| {
+            opening_tx(conn, group_id_hex, query.opening, query.before_anchor)
+        })
     }
 }
 

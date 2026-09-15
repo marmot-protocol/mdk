@@ -230,17 +230,8 @@ impl SqliteAccountStorage {
         &self,
         group: &str,
     ) -> StorageResult<Option<ChatPresentationInput>> {
-        let conn = self.lock()?;
-        let owned = if conn.is_autocommit() {
-            Some(conn.unchecked_transaction().storage()?)
-        } else {
-            None
-        };
-        let input = presentation_input_tx(&conn, group)?;
-        if let Some(tx) = owned {
-            tx.commit().storage()?;
-        }
-        Ok(input)
+        self.connection
+            .with_deferred_read(|conn| presentation_input_tx(conn, group))
     }
 
     /// Account orchestration supplies the complete authoritative two-member roster, including named groups.
