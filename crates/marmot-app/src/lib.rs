@@ -81,6 +81,7 @@ mod audit_log;
 mod chat_presentation;
 mod client;
 mod config;
+pub mod conversation_presentation;
 mod conversions;
 mod directory;
 mod drafts;

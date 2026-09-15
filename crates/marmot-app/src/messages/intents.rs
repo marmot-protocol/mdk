@@ -28,7 +28,8 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// plaintext. The sender stores the full content, but p-tag derivation only
 /// parses this bounded prefix so one hostile message cannot force unbounded
 /// synchronous Markdown work before send/classification (mdk#654).
-const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize =
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 /// Reactions are display metadata that flow into timelines and notification
 /// previews. Keep them compact and free of terminal/control sequences while

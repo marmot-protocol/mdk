@@ -37,6 +37,11 @@ revision-bound sends. Post-commit invalidations let conversation owners reload t
 outbox acceptance clears only the submitted revision. See the
 [draft lifecycle contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
 
+C5's shared conversation presentation builds a compact header, shared capability hints and a complete dictionary
+for its bounded visible identity references from local caches. Native management policy delegates to the same
+Rust selector. The combined live screen is a later slice; see the
+[conversation presentation contract](../../docs/marmot-architecture/further-context/conversation-presentation.md).
+
 New-account bootstrap publishes the required NIP-65 kind `10002` and inbox kind `10050` relay-list events, a
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. KeyPackages are
 published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay list. Import flows

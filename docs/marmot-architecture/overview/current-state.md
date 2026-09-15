@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-14
+updated: 2026-09-15
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -27,6 +27,10 @@ return a typed preparation requirement. Live screen composition and native bindi
 C5 M2 adds selected draft metadata, revision-checked mutations and a send handoff that clears the submitted
 revision atomically with existing outbox acceptance. Newer edits survive; attachment bytes remain keyed reads.
 See [revision-safe conversation drafts](../further-context/conversation-drafts.md).
+
+C5 M3 adds shared Rust conversation capabilities and a bounded identity presentation sidecar, including historical
+authors and commit-attributed system references. The combined live window/native screen API remains M4/M5.
+See [shared conversation presentation](../further-context/conversation-presentation.md).
 
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only

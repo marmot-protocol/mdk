@@ -198,14 +198,14 @@ pub(crate) fn select_chat_presentation(
     }
 }
 
-fn canonical_identity(raw: &str) -> Option<String> {
+pub(crate) fn canonical_identity(raw: &str) -> Option<String> {
     let raw = raw.trim();
     valid_hex(raw, 32).then(|| raw.to_ascii_lowercase())
 }
 fn valid_hex(raw: &str, bytes: usize) -> bool {
     raw.len() == bytes * 2 && raw.bytes().all(|b| b.is_ascii_hexdigit())
 }
-fn safe_name(raw: &str) -> Option<String> {
+pub(crate) fn safe_name(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .filter(|c| {
@@ -218,7 +218,7 @@ fn safe_name(raw: &str) -> Option<String> {
     let trimmed = cleaned.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
-fn safe_image_url(raw: &str) -> Option<String> {
+pub(crate) fn safe_image_url(raw: &str) -> Option<String> {
     let normalized =
         cgka_traits::app_components::validate_and_normalize_group_avatar_url(raw).ok()?;
     // Both remote-image sources match the existing loader's contact/port policy, without DNS or I/O.

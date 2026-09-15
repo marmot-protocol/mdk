@@ -1,4 +1,5 @@
 mod opening;
+mod presentation;
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenSnapshot,

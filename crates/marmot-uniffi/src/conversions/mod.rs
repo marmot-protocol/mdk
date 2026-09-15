@@ -176,6 +176,32 @@ mod tests {
     }
 
     #[test]
+    fn conversation_management_suppresses_actions_for_inactive_projection() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        for scenario in 0..4 {
+            let mut group = group(vec![self_id]);
+            match scenario {
+                0 => group.pending_confirmation = true,
+                1 => group.self_membership = SelfMembershipFfi::Left,
+                2 => group.self_membership = SelfMembershipFfi::Removed,
+                _ => group.unrecoverable = true,
+            }
+            let state = group_management_state_ffi(
+                self_id,
+                &GroupDetailsFfi {
+                    group,
+                    // Retained historical roster is not current mutation authority.
+                    members: vec![member(self_id, true, true)],
+                    mls_state: mls_state(),
+                },
+            );
+            assert!(!state.can_invite, "inactive scenario {scenario}");
+            assert!(!state.requires_self_demote_before_leave);
+            assert!(!state.can_disband);
+        }
+    }
+
+    #[test]
     fn group_management_state_marks_last_admin_self_demote_requirement() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
