@@ -9,7 +9,7 @@ use transport_quic_stream::{AgentTextStreamReceiveAccumulator, AgentTextStreamRe
 
 use crate::control::QuicBrokerControlTypeV1;
 use crate::error::QuicBrokerError;
-use crate::frame::{read_control_frame, read_record_frame, write_record_frame};
+use crate::frame::{read_control_frame, read_record_frame, write_record_frame_with_deadline};
 use crate::protocol::{MAX_FRAME_SIZE, RECORD_QUIET_GAP_DEADLINE};
 use crate::state::BrokerState;
 
@@ -18,6 +18,8 @@ use crate::state::BrokerState;
 pub(crate) struct BrokerStreamPolicy {
     pub(crate) max_streams_per_connection: usize,
     pub(crate) read_timeout: Duration,
+    /// Whole-record bound for backlog and live subscriber writes.
+    pub(crate) write_timeout: Duration,
     pub(crate) publish_limits: PublishForwardLimits,
 }
 
@@ -81,7 +83,7 @@ pub(crate) async fn handle_connection(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handle_subscribe_stream(state, send, recv, policy.read_timeout).await;
+                    let _ = handle_subscribe_stream(state, send, recv, policy).await;
                 });
             }
         }
@@ -141,9 +143,9 @@ async fn handle_subscribe_stream(
     state: Arc<BrokerState>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    read_timeout: Duration,
+    policy: BrokerStreamPolicy,
 ) -> Result<(), QuicBrokerError> {
-    let control = match read_control_frame(&mut recv, read_timeout).await {
+    let control = match read_control_frame(&mut recv, policy.read_timeout).await {
         Ok(control) => control,
         Err(err) => {
             // Reset the return direction so the client observes the rejection
@@ -163,15 +165,23 @@ async fn handle_subscribe_stream(
     let (subscriber_id, backlog, mut rx) = state.subscribe(key.clone()).await?;
     let result = async {
         for record in backlog {
-            write_record_frame(&mut send, &record).await?;
+            write_record_frame_with_deadline(&mut send, &record, policy.write_timeout).await?;
         }
         while let Some(record) = rx.recv().await {
-            write_record_frame(&mut send, &record).await?;
+            write_record_frame_with_deadline(&mut send, &record, policy.write_timeout).await?;
         }
         send.finish()?;
         Ok::<_, QuicBrokerError>(())
     }
     .await;
+    if result.is_err() {
+        // A timed-out or failed frame may already be partial; reset rather
+        // than finish/retry so the client cannot treat leftover bytes as the
+        // next record. Ignore reset/stop failures so they cannot mask the
+        // original forwarding error.
+        let _ = send.reset(0_u32.into());
+        let _ = recv.stop(0_u32.into());
+    }
     state.unsubscribe(&key, subscriber_id).await;
     result
 }

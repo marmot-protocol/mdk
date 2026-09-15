@@ -13,12 +13,13 @@ use cgka_traits::agent_text_stream::{
 };
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId, SecretBytes};
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits,
-    EphemeralPublisherSequenceStore, stream_record_text,
+    EphemeralPublisherSequenceStore, QuicPreviewTransportProfile, stream_record_text,
 };
 
 use crate::client::{
@@ -31,18 +32,22 @@ use crate::control::BrokerStreamKey;
 use crate::control::QuicBrokerControlEnvelopeV1;
 use crate::error::QuicBrokerError;
 use crate::frame::{
-    broker_read_deadline, read_record_frame, validate_frame_len, write_control_frame,
-    write_record_frame,
+    broker_read_deadline, broker_write_deadline, read_record_frame, validate_frame_len,
+    write_control_frame, write_record_frame, write_record_frame_with_deadline,
 };
+use crate::handlers::{BrokerStreamPolicy, PublishForwardLimits, handle_connection};
 use crate::protocol::{
     DEFAULT_BROKER_BACKLOG_DEPTH, DEFAULT_BROKER_MAX_BACKLOG_BYTES, DEFAULT_BROKER_MAX_ROOMS,
     DEFAULT_BROKER_REPLAY_TTL, DEFAULT_SUBSCRIBER_QUEUE_DEPTH, FINISHED_ROOM_TTL,
-    LOCAL_SERVER_BIND, MAX_BROKER_REPLAY_TTL, MAX_FRAME_SIZE, QUIC_BROKER_ALPN_V1, SEND_STOP_WAIT,
-    UNFINISHED_ROOM_TTL,
+    LOCAL_SERVER_BIND, MAX_BROKER_REPLAY_TTL, MAX_FRAME_SIZE, QUIC_BROKER_ALPN_V1,
+    RECORD_QUIET_GAP_DEADLINE, SEND_STOP_WAIT, SUBSCRIBER_WRITE_DEADLINE, UNFINISHED_ROOM_TTL,
 };
 use crate::server::{QuicBrokerServer, certificate_sha256_fingerprint_hex};
 use crate::state::BrokerState;
-use crate::tls::{SkipServerVerification, client_bind_addr_for_broker, client_endpoint};
+use crate::tls::{
+    SkipServerVerification, broker_rustls_client_config, client_bind_addr_for_broker,
+    client_endpoint, configure_server,
+};
 
 /// State helper with replay retention enabled (the profile cap) so the
 /// pre-existing backlog tests keep exercising retention; replay-TTL
@@ -2200,4 +2205,750 @@ async fn broker_publish_frame_byte_limit_counts_wire_bytes_for_encrypted_records
 
     let _ = shutdown_tx.send(());
     broker_task.await.unwrap().unwrap();
+}
+
+const TEST_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const TEST_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_KEEP_ALIVE: Duration = Duration::from_millis(400);
+const STALL_SEND_WINDOW: u64 = 2048;
+const STALL_STREAM_RECEIVE_WINDOW: u32 = 1024;
+const HANDSHAKE_RECEIVE_WINDOW: u32 = 1_250_000;
+const STALL_PAYLOAD_LEN: usize = 32_768;
+
+fn stall_record(stream_id: &[u8], seq: u64) -> AgentTextStreamRecordV1 {
+    AgentTextStreamRecordV1::text_delta(stream_id.to_vec(), seq, vec![b'x'; STALL_PAYLOAD_LEN])
+}
+
+fn small_record(stream_id: &[u8], seq: u64, payload: &[u8]) -> AgentTextStreamRecordV1 {
+    AgentTextStreamRecordV1::text_delta(stream_id.to_vec(), seq, payload.to_vec())
+}
+
+fn injected_write_policy(max_streams: usize) -> BrokerStreamPolicy {
+    BrokerStreamPolicy {
+        max_streams_per_connection: max_streams,
+        read_timeout: Duration::from_secs(5),
+        write_timeout: TEST_WRITE_TIMEOUT,
+        publish_limits: PublishForwardLimits {
+            max_records: 4096,
+            max_frame_bytes: 64 * 1024 * 1024,
+        },
+    }
+}
+
+fn client_writer_stall_transport() -> TransportConfig {
+    let mut transport = QuicPreviewTransportProfile::client()
+        .transport_config()
+        .expect("client transport");
+    transport
+        .max_idle_timeout(Some(TEST_IDLE_TIMEOUT.try_into().expect("idle timeout")))
+        .keep_alive_interval(Some(TEST_KEEP_ALIVE))
+        .send_window(STALL_SEND_WINDOW)
+        .receive_window(VarInt::from_u32(HANDSHAKE_RECEIVE_WINDOW));
+    transport
+}
+
+fn client_unread_receiver_transport() -> TransportConfig {
+    let mut transport = QuicPreviewTransportProfile::client()
+        .transport_config()
+        .expect("client transport");
+    transport
+        .max_idle_timeout(Some(TEST_IDLE_TIMEOUT.try_into().expect("idle timeout")))
+        .keep_alive_interval(Some(TEST_KEEP_ALIVE))
+        .stream_receive_window(VarInt::from_u32(STALL_STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(HANDSHAKE_RECEIVE_WINDOW));
+    transport
+}
+
+fn server_writer_stall_transport() -> TransportConfig {
+    let mut transport =
+        QuicPreviewTransportProfile::broker_server(8, TEST_IDLE_TIMEOUT, TEST_KEEP_ALIVE)
+            .transport_config()
+            .expect("broker transport");
+    transport.send_window(STALL_SEND_WINDOW);
+    transport
+}
+
+fn server_unread_receiver_transport() -> TransportConfig {
+    let mut transport =
+        QuicPreviewTransportProfile::broker_server(8, TEST_IDLE_TIMEOUT, TEST_KEEP_ALIVE)
+            .transport_config()
+            .expect("broker transport");
+    transport.stream_receive_window(VarInt::from_u32(STALL_STREAM_RECEIVE_WINDOW));
+    transport
+}
+
+fn flow_controlled_client_endpoint(server_cert: Vec<u8>, broker_addr: SocketAddr) -> Endpoint {
+    let crypto =
+        broker_rustls_client_config(BrokerServerTrust::CertificateDer(server_cert), broker_addr)
+            .unwrap();
+    let mut client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("quic client config"),
+    ));
+    client_config.transport_config(Arc::new(client_unread_receiver_transport()));
+    let mut endpoint = Endpoint::client(client_bind_addr_for_broker(broker_addr)).unwrap();
+    endpoint.set_default_client_config(client_config);
+    endpoint
+}
+
+struct FlowControlledBroker {
+    state: Arc<BrokerState>,
+    server_endpoint: Endpoint,
+    client_endpoint: Endpoint,
+    reading_client_endpoint: Endpoint,
+    broker_addr: SocketAddr,
+    accept_task: JoinHandle<()>,
+}
+
+async fn spawn_flow_controlled_broker(
+    state: Arc<BrokerState>,
+    policy: BrokerStreamPolicy,
+) -> FlowControlledBroker {
+    let (mut server_config, server_cert) =
+        configure_server(&QuicBrokerTlsConfig::GenerateSelfSigned {
+            subject_alt_names: vec!["localhost".to_owned()],
+        })
+        .unwrap();
+    server_config.transport_config(Arc::new(server_writer_stall_transport()));
+    let server_endpoint = Endpoint::server(server_config, LOCAL_SERVER_BIND).unwrap();
+    let broker_addr = server_endpoint.local_addr().unwrap();
+    let stalled_client = flow_controlled_client_endpoint(server_cert.clone(), broker_addr);
+    let reading_client =
+        client_endpoint(BrokerServerTrust::CertificateDer(server_cert), broker_addr).unwrap();
+    let accept_endpoint = server_endpoint.clone();
+    let accept_state = Arc::clone(&state);
+    let accept_task = tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            let Ok(connecting) = incoming.await else {
+                continue;
+            };
+            let state = Arc::clone(&accept_state);
+            tokio::spawn(async move {
+                let _ = handle_connection(state, connecting, policy).await;
+            });
+        }
+    });
+    FlowControlledBroker {
+        state,
+        server_endpoint,
+        client_endpoint: stalled_client,
+        reading_client_endpoint: reading_client,
+        broker_addr,
+        accept_task,
+    }
+}
+
+impl FlowControlledBroker {
+    async fn connect_stalled(&self) -> quinn::Connection {
+        self.client_endpoint
+            .connect(self.broker_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap()
+    }
+
+    async fn connect_reading(&self) -> quinn::Connection {
+        self.reading_client_endpoint
+            .connect(self.broker_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap()
+    }
+
+    async fn shutdown(self) {
+        self.client_endpoint.close(0_u32.into(), b"done");
+        self.reading_client_endpoint.close(0_u32.into(), b"done");
+        self.server_endpoint.close(0_u32.into(), b"done");
+        let _ = timeout(Duration::from_secs(2), self.client_endpoint.wait_idle()).await;
+        let _ = timeout(
+            Duration::from_secs(2),
+            self.reading_client_endpoint.wait_idle(),
+        )
+        .await;
+        let _ = timeout(Duration::from_secs(2), self.server_endpoint.wait_idle()).await;
+        self.accept_task.abort();
+        let _ = self.accept_task.await;
+    }
+}
+
+async fn subscribe_unread(
+    connection: &quinn::Connection,
+    stream_id: &[u8],
+    start_event_id: &MessageId,
+) -> (quinn::SendStream, quinn::RecvStream) {
+    let (mut send, recv) = connection.open_bi().await.unwrap();
+    write_control_frame(
+        &mut send,
+        &QuicBrokerControlEnvelopeV1::subscribe(stream_id.to_vec(), start_event_id),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    (send, recv)
+}
+
+async fn wait_live_subscribers(state: &BrokerState, key: &BrokerStreamKey, expected: usize) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if state.live_subscriber_count_for_test(key).await == expected {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("timed out waiting for {expected} live subscriber(s)");
+    });
+}
+
+struct FlowControlledWritePair {
+    server_endpoint: Endpoint,
+    client_endpoint: Endpoint,
+    server_connection: quinn::Connection,
+    client_connection: quinn::Connection,
+    send: quinn::SendStream,
+    accept:
+        Option<JoinHandle<Result<(quinn::SendStream, quinn::RecvStream), quinn::ConnectionError>>>,
+}
+
+async fn connected_flow_controlled_pair() -> FlowControlledWritePair {
+    let (mut server_config, server_cert) =
+        configure_server(&QuicBrokerTlsConfig::GenerateSelfSigned {
+            subject_alt_names: vec!["localhost".to_owned()],
+        })
+        .unwrap();
+    server_config.transport_config(Arc::new(server_unread_receiver_transport()));
+    let server_endpoint = Endpoint::server(server_config, LOCAL_SERVER_BIND).unwrap();
+    let broker_addr = server_endpoint.local_addr().unwrap();
+    let writer_crypto =
+        broker_rustls_client_config(BrokerServerTrust::CertificateDer(server_cert), broker_addr)
+            .unwrap();
+    let mut writer_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(writer_crypto).expect("quic client config"),
+    ));
+    writer_config.transport_config(Arc::new(client_writer_stall_transport()));
+    let mut client_endpoint = Endpoint::client(client_bind_addr_for_broker(broker_addr)).unwrap();
+    client_endpoint.set_default_client_config(writer_config);
+    let incoming = server_endpoint.accept();
+    let connecting = client_endpoint.connect(broker_addr, "localhost").unwrap();
+    let (server_connection, client_connection) = timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            async { incoming.await.expect("incoming").await.unwrap() },
+            async { connecting.await.unwrap() }
+        )
+    })
+    .await
+    .expect("flow-controlled handshake");
+    let accept_connection = server_connection.clone();
+    let accept = tokio::spawn(async move { accept_connection.accept_bi().await });
+    let (send, _client_recv) = timeout(Duration::from_secs(2), client_connection.open_bi())
+        .await
+        .expect("open bi")
+        .unwrap();
+    FlowControlledWritePair {
+        server_endpoint,
+        client_endpoint,
+        server_connection,
+        client_connection,
+        send,
+        accept: Some(accept),
+    }
+}
+
+impl FlowControlledWritePair {
+    async fn shutdown(mut self) {
+        self.client_connection.close(0_u32.into(), b"done");
+        self.server_connection.close(0_u32.into(), b"done");
+        if let Some(accept) = self.accept.take() {
+            accept.abort();
+        }
+        let _ = timeout(Duration::from_secs(2), self.client_endpoint.wait_idle()).await;
+        let _ = timeout(Duration::from_secs(2), self.server_endpoint.wait_idle()).await;
+    }
+}
+
+#[test]
+fn subscriber_write_deadline_reuses_record_quiet_gap() {
+    assert_eq!(SUBSCRIBER_WRITE_DEADLINE, RECORD_QUIET_GAP_DEADLINE);
+    assert_eq!(SUBSCRIBER_WRITE_DEADLINE, Duration::from_secs(120));
+}
+
+#[tokio::test]
+async fn broker_write_deadline_times_out_stalled_writes() {
+    let err = broker_write_deadline(Duration::from_millis(5), async {
+        sleep(Duration::from_millis(50)).await;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, QuicBrokerError::WriteTimeout));
+    assert!(!matches!(err, QuicBrokerError::ReadTimeout));
+}
+
+#[tokio::test]
+async fn broker_write_deadline_uses_one_budget_across_incremental_progress() {
+    // Two 60ms phases finish inside a restarted 100ms per-phase window, but
+    // one budget covering prefix plus body must fire at 100ms.
+    let err = broker_write_deadline(Duration::from_millis(100), async {
+        sleep(Duration::from_millis(60)).await;
+        sleep(Duration::from_millis(60)).await;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, QuicBrokerError::WriteTimeout));
+}
+
+#[tokio::test]
+async fn write_record_frame_with_deadline_round_trips_record() {
+    let mut pair = connected_flow_controlled_pair().await;
+    let record = small_record(&[0x51; 32], 1, b"round-trip");
+    let write = write_record_frame_with_deadline(&mut pair.send, &record, TEST_WRITE_TIMEOUT);
+    let accept = pair.accept.take().expect("accept task");
+    let (write_result, accept_result) = tokio::join!(write, accept);
+    write_result.unwrap();
+    let (_, mut recv) = accept_result.unwrap().unwrap();
+    pair.send.finish().unwrap();
+    let received = read_record_frame(&mut recv, Some(Duration::from_secs(2)), MAX_FRAME_SIZE)
+        .await
+        .unwrap()
+        .expect("record");
+    assert_eq!(received.encode().unwrap(), record.encode().unwrap());
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn unbounded_record_write_stays_pending_when_peer_does_not_read() {
+    // Baseline: the pre-fix helper has no application deadline, so a
+    // flow-controlled write stays pending past a bounded watchdog.
+    let mut pair = connected_flow_controlled_pair().await;
+    let record = stall_record(&[0x52; 32], 1);
+    let write = timeout(
+        TEST_WRITE_TIMEOUT,
+        write_record_frame(&mut pair.send, &record),
+    );
+    let accept = timeout(
+        Duration::from_secs(2),
+        pair.accept.take().expect("accept task"),
+    );
+    let (pending, _accepted) = tokio::join!(write, accept);
+    assert!(
+        pending.is_err(),
+        "unbounded write_record_frame must still be pending while the peer does not read"
+    );
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn write_record_frame_with_deadline_returns_write_timeout_when_peer_does_not_read() {
+    let mut pair = connected_flow_controlled_pair().await;
+    let record = stall_record(&[0x53; 32], 1);
+    let write = write_record_frame_with_deadline(&mut pair.send, &record, TEST_WRITE_TIMEOUT);
+    let accept = timeout(
+        Duration::from_secs(2),
+        pair.accept.take().expect("accept task"),
+    );
+    let (result, _accepted) = tokio::join!(write, accept);
+    let err = timeout(Duration::from_secs(2), async { result })
+        .await
+        .expect("write deadline must return")
+        .unwrap_err();
+    assert!(matches!(err, QuicBrokerError::WriteTimeout));
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn write_record_frame_with_deadline_preserves_non_timeout_write_errors() {
+    let mut pair = connected_flow_controlled_pair().await;
+    pair.server_connection.close(0_u32.into(), b"closed");
+    let _ = timeout(Duration::from_secs(2), pair.server_endpoint.wait_idle()).await;
+    let err = write_record_frame_with_deadline(
+        &mut pair.send,
+        &small_record(&[0x54; 32], 1, b"closed"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !matches!(
+            err,
+            QuicBrokerError::WriteTimeout | QuicBrokerError::ReadTimeout
+        ),
+        "closed-stream write must stay a transport error, got {err:?}"
+    );
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_resets_stalled_live_subscriber_and_releases_stream_permit() {
+    let key = BrokerStreamKey::new(vec![0x61; 32], MessageId::new(vec![0x71; 32]));
+    let broker = spawn_flow_controlled_broker(
+        Arc::new(BrokerState::new(
+            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            DEFAULT_BROKER_BACKLOG_DEPTH,
+            DEFAULT_BROKER_MAX_ROOMS,
+            DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+            Duration::ZERO,
+        )),
+        injected_write_policy(1),
+    )
+    .await;
+    let connection = broker.connect_stalled().await;
+    let (_send, mut recv) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&broker.state, &key, 1).await;
+    broker
+        .state
+        .publish(&key, stall_record(&key.stream_id, 1))
+        .await
+        .unwrap();
+    wait_live_subscribers(&broker.state, &key, 0).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("stalled subscriber stream must be reset");
+
+    let (_send2, mut recv2) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&broker.state, &key, 1).await;
+    broker
+        .state
+        .publish(&key, small_record(&key.stream_id, 2, b"next"))
+        .await
+        .unwrap();
+    let received = timeout(
+        Duration::from_secs(2),
+        read_record_frame(&mut recv2, Some(Duration::from_secs(2)), MAX_FRAME_SIZE),
+    )
+    .await
+    .expect("eviction must release the stream permit")
+    .unwrap()
+    .expect("second subscriber record");
+    assert_eq!(received.plaintext_frame, b"next");
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_resets_stalled_backlog_replay_and_unsubscribes() {
+    let key = BrokerStreamKey::new(vec![0x62; 32], MessageId::new(vec![0x72; 32]));
+    let state = Arc::new(BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        MAX_BROKER_REPLAY_TTL,
+    ));
+    state
+        .publish(&key, stall_record(&key.stream_id, 1))
+        .await
+        .unwrap();
+    let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(1)).await;
+    let connection = broker.connect_stalled().await;
+    let (_send, mut recv) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&state, &key, 1).await;
+    wait_live_subscribers(&state, &key, 0).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("stalled backlog write must reset the subscriber");
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_resets_stalled_finished_room_backlog_replay() {
+    let key = BrokerStreamKey::new(vec![0x63; 32], MessageId::new(vec![0x73; 32]));
+    let state = Arc::new(BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        MAX_BROKER_REPLAY_TTL,
+    ));
+    state
+        .publish(&key, stall_record(&key.stream_id, 1))
+        .await
+        .unwrap();
+    // Mark finished without the 60s expiry task so the test runtime can exit.
+    assert!(state.mark_room_finished_for_test(&key).await);
+    let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(1)).await;
+    let connection = timeout(Duration::from_secs(2), broker.connect_stalled())
+        .await
+        .expect("finished-room connect");
+    let (_send, mut recv) = timeout(
+        Duration::from_secs(2),
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id),
+    )
+    .await
+    .expect("finished-room subscribe");
+    // Do not read: consuming bytes would slide flow control and let the
+    // backlog write finish instead of proving the deadline.
+    sleep(TEST_WRITE_TIMEOUT * 3).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finished-room backlog stall must reset the subscriber");
+    assert_eq!(state.live_subscriber_count_for_test(&key).await, 0);
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_unsubscribes_when_queue_eviction_races_a_pending_write() {
+    let key = BrokerStreamKey::new(vec![0x64; 32], MessageId::new(vec![0x74; 32]));
+    let state = Arc::new(BrokerState::new(
+        1,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        Duration::ZERO,
+    ));
+    let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(1)).await;
+    let connection = broker.connect_stalled().await;
+    let (_send, mut recv) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&state, &key, 1).await;
+    state
+        .publish(&key, stall_record(&key.stream_id, 1))
+        .await
+        .unwrap();
+    timeout(Duration::from_millis(100), async {
+        loop {
+            if state.live_subscriber_count_for_test(&key).await == 1 {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .ok();
+    state
+        .publish(&key, small_record(&key.stream_id, 2, b"queued"))
+        .await
+        .unwrap();
+    state
+        .publish(&key, small_record(&key.stream_id, 3, b"evict"))
+        .await
+        .unwrap();
+    assert_eq!(state.live_subscriber_count_for_test(&key).await, 0);
+    sleep(TEST_WRITE_TIMEOUT * 3).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pending write must still time out after queue eviction");
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_keeps_healthy_subscriber_when_peer_times_out() {
+    let key = BrokerStreamKey::new(vec![0x65; 32], MessageId::new(vec![0x75; 32]));
+    let state = Arc::new(BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        Duration::ZERO,
+    ));
+    let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(2)).await;
+    let stalled = broker.connect_stalled().await;
+    let healthy = broker.connect_reading().await;
+    let (_stalled_send, mut stalled_recv) =
+        subscribe_unread(&stalled, &key.stream_id, &key.start_event_id).await;
+    let (_healthy_send, mut healthy_recv) =
+        subscribe_unread(&healthy, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&state, &key, 2).await;
+
+    state
+        .publish(&key, stall_record(&key.stream_id, 1))
+        .await
+        .unwrap();
+    let first = timeout(
+        Duration::from_secs(2),
+        read_record_frame(
+            &mut healthy_recv,
+            Some(Duration::from_secs(2)),
+            MAX_FRAME_SIZE,
+        ),
+    )
+    .await
+    .expect("healthy subscriber must receive the first record")
+    .unwrap()
+    .expect("first record");
+    assert_eq!(first.seq, 1);
+
+    wait_live_subscribers(&state, &key, 1).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if read_record_frame(
+                &mut stalled_recv,
+                Some(Duration::from_millis(50)),
+                MAX_FRAME_SIZE,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("stalled sibling must be reset");
+
+    state
+        .publish(&key, small_record(&key.stream_id, 2, b"still-here"))
+        .await
+        .unwrap();
+    let second = timeout(
+        Duration::from_secs(2),
+        read_record_frame(
+            &mut healthy_recv,
+            Some(Duration::from_secs(2)),
+            MAX_FRAME_SIZE,
+        ),
+    )
+    .await
+    .expect("healthy subscriber must survive sibling eviction")
+    .unwrap()
+    .expect("second record");
+    assert_eq!(second.plaintext_frame, b"still-here");
+    assert_eq!(state.live_subscriber_count_for_test(&key).await, 1);
+    stalled.close(0_u32.into(), b"done");
+    healthy.close(0_u32.into(), b"done");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_write_deadline_does_not_evict_quiet_subscriber() {
+    let key = BrokerStreamKey::new(vec![0x66; 32], MessageId::new(vec![0x76; 32]));
+    let state = Arc::new(BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        Duration::ZERO,
+    ));
+    let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(1)).await;
+    let connection = broker.connect_reading().await;
+    let (_send, mut recv) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&state, &key, 1).await;
+    state
+        .publish(&key, small_record(&key.stream_id, 1, b"before"))
+        .await
+        .unwrap();
+    let first = timeout(
+        Duration::from_secs(2),
+        read_record_frame(&mut recv, Some(Duration::from_secs(2)), MAX_FRAME_SIZE),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("first record");
+    assert_eq!(first.plaintext_frame, b"before");
+    sleep(TEST_WRITE_TIMEOUT * 2).await;
+    assert_eq!(state.live_subscriber_count_for_test(&key).await, 1);
+    state
+        .publish(&key, small_record(&key.stream_id, 2, b"after"))
+        .await
+        .unwrap();
+    let second = timeout(
+        Duration::from_secs(2),
+        read_record_frame(&mut recv, Some(Duration::from_secs(2)), MAX_FRAME_SIZE),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("quiet subscriber must still receive later records");
+    assert_eq!(second.plaintext_frame, b"after");
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
+}
+
+#[tokio::test]
+async fn broker_allows_timely_writes_whose_total_exceeds_one_window() {
+    let key = BrokerStreamKey::new(vec![0x67; 32], MessageId::new(vec![0x77; 32]));
+    let state = Arc::new(BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        Duration::ZERO,
+    ));
+    let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(1)).await;
+    let connection = broker.connect_reading().await;
+    let (_send, mut recv) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&state, &key, 1).await;
+
+    let mut received = Vec::new();
+    for seq in 1..=4_u64 {
+        state
+            .publish(
+                &key,
+                small_record(&key.stream_id, seq, format!("c{seq}").as_bytes()),
+            )
+            .await
+            .unwrap();
+        let record = timeout(
+            Duration::from_secs(2),
+            read_record_frame(&mut recv, Some(Duration::from_secs(2)), MAX_FRAME_SIZE),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("timely record");
+        received.push(record.plaintext_frame.clone());
+        sleep(TEST_WRITE_TIMEOUT / 2).await;
+    }
+    assert_eq!(
+        received,
+        vec![
+            b"c1".to_vec(),
+            b"c2".to_vec(),
+            b"c3".to_vec(),
+            b"c4".to_vec()
+        ]
+    );
+    assert_eq!(state.live_subscriber_count_for_test(&key).await, 1);
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
 }

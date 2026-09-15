@@ -40,6 +40,18 @@ pub(crate) async fn write_record_frame(
     write_bytes_frame(send, &bytes).await
 }
 
+/// Write one record with a single deadline across encoding plus both the
+/// length-prefix and body writes. Incremental byte progress must not restart
+/// the window: a flow-controlled peer could otherwise stretch one frame
+/// indefinitely. Callers must not retry or resume a timed-out frame.
+pub(crate) async fn write_record_frame_with_deadline(
+    send: &mut quinn::SendStream,
+    record: &AgentTextStreamRecordV1,
+    write_timeout: Duration,
+) -> Result<(), QuicBrokerError> {
+    broker_write_deadline(write_timeout, write_record_frame(send, record)).await
+}
+
 pub(crate) async fn read_record_frame(
     recv: &mut quinn::RecvStream,
     read_timeout: Option<Duration>,
@@ -115,6 +127,19 @@ where
     timeout(read_timeout, read)
         .await
         .map_err(|_| QuicBrokerError::ReadTimeout)?
+        .map_err(Into::into)
+}
+
+pub(crate) async fn broker_write_deadline<T, E>(
+    write_timeout: Duration,
+    write: impl Future<Output = Result<T, E>>,
+) -> Result<T, QuicBrokerError>
+where
+    QuicBrokerError: From<E>,
+{
+    timeout(write_timeout, write)
+        .await
+        .map_err(|_| QuicBrokerError::WriteTimeout)?
         .map_err(Into::into)
 }
 

@@ -77,6 +77,8 @@ pub enum QuicBrokerError {
     BacklogRecordTooLarge { record_bytes: usize, limit: usize },
     #[error("broker frame read timed out")]
     ReadTimeout,
+    #[error("broker frame write timed out")]
+    WriteTimeout,
     #[error("broker QUIC connect timed out")]
     ConnectTimeout,
     #[error("broker control frame is missing")]
