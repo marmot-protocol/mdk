@@ -172,6 +172,11 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Detailed comparison of the `wnd` and `marmot.agent-control.v2` local socket protocols and the
     narrow boundary for any future shared framing helper.
 
+- **Doc:** [`further-context/dial-safety-collector-inventory.md`](./further-context/dial-safety-collector-inventory.md)
+  - **What it covers:** Per-attempt collector and forensic-audit HTTP inventory behind the dial-safety overview:
+    structural URL gates, resolve/validate/pin, disabled redirects and proxies, timeout budgets, and privacy-safe
+    errors.
+
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.
 

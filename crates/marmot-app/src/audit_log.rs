@@ -464,9 +464,32 @@ where
     let client = pin
         .build_client()
         .map_err(|_| AppError::AuditLogUpload("request failed".into()))?;
+    audit_upload_request(
+        &client,
+        pin.url,
+        body,
+        authorization_bearer_token,
+        hardware_model,
+        platform,
+        app_version,
+    )
+    .send()
+    .await
+    .map_err(audit_log_reqwest_error)
+}
+
+fn audit_upload_request(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    body: Vec<u8>,
+    authorization_bearer_token: Option<&str>,
+    hardware_model: Option<&str>,
+    platform: Option<&str>,
+    app_version: Option<&str>,
+) -> reqwest::RequestBuilder {
     let bytes_sent = body.len() as u64;
     let mut request = client
-        .post(pin.url)
+        .post(url)
         .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
         .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
         .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
@@ -483,7 +506,7 @@ where
     if let Some(value) = app_version {
         request = request.header("X-Goggles-App-Version", value);
     }
-    request.send().await.map_err(audit_log_reqwest_error)
+    request
 }
 
 fn audit_log_reqwest_error(err: reqwest::Error) -> AppError {
@@ -1065,6 +1088,30 @@ mod tests {
         assert_eq!(
             collector_host_safety::CONNECT_TIMEOUT,
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn audit_upload_request_overrides_the_collector_timeout() {
+        let client = reqwest::Client::builder()
+            .timeout(collector_host_safety::REQUEST_TIMEOUT)
+            .build()
+            .expect("collector-default client");
+        let request = audit_upload_request(
+            &client,
+            "https://example.test/ingest".parse().expect("url"),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .build()
+        .expect("audit request");
+        assert_eq!(request.timeout(), Some(&AUDIT_LOG_UPLOAD_TIMEOUT));
+        assert_ne!(
+            request.timeout(),
+            Some(&collector_host_safety::REQUEST_TIMEOUT)
         );
     }
 

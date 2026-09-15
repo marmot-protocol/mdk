@@ -1484,20 +1484,53 @@ async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect()
     assert_eq!(captured.body, VALID_V4_AUDIT_BODY);
     success_server.await.unwrap();
 
-    for (status, location) in [
-        (301, "/stolen".to_owned()),
-        (302, "http://169.254.169.254/stolen".to_owned()),
-        (303, "https://example.invalid/stolen".to_owned()),
-        (307, "::::".to_owned()),
-        (308, "http://127.0.0.1/stolen".to_owned()),
-    ] {
+    {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        let redirect_server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = source.accept().await else {
+                return;
+            };
+            let Some(request) = read_captured_request(&mut stream).await else {
+                return;
+            };
+            write_http_redirect(&mut stream, 301, "/stolen").await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(request);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), source.accept())
+                    .await
+                    .is_err(),
+                "relative same-origin redirect was followed"
+            );
+        });
+        let err = app
+            .post_audit_log_file(
+                &audit_path.to_string_lossy(),
+                &format!("http://{source_addr}/ingest"),
+            )
+            .await
+            .expect_err("redirects must remain non-success");
+        assert!(
+            err.to_string().contains("HTTP 301"),
+            "unexpected error for 301: {err}"
+        );
+        let captured = rx.await.unwrap();
+        assert_eq!(captured.body, VALID_V4_AUDIT_BODY);
+        assert!(captured.legacy_device_label.is_none());
+        redirect_server.await.unwrap();
+    }
+
+    for status in [302, 303, 307, 308] {
         let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let source_addr = source.local_addr().unwrap();
         let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let location = if status == 308 {
-            format!("http://{}/stolen", sink.local_addr().unwrap())
+        let sink_addr = sink.local_addr().unwrap();
+        let location = if status == 303 {
+            format!("https://{sink_addr}/stolen")
         } else {
-            location
+            format!("http://{sink_addr}/stolen")
         };
         let (tx, rx) = oneshot::channel();
         let redirect_server = tokio::spawn(async move {
@@ -1536,6 +1569,35 @@ async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect()
         sink_server.abort();
         redirect_server.await.unwrap();
     }
+
+    let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_addr = source.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let redirect_server = tokio::spawn(async move {
+        let Ok((mut stream, _)) = source.accept().await else {
+            return;
+        };
+        let Some(request) = read_captured_request(&mut stream).await else {
+            return;
+        };
+        write_http_redirect(&mut stream, 307, "::::").await;
+        let _ = stream.shutdown().await;
+        let _ = tx.send(request);
+    });
+    let err = app
+        .post_audit_log_file(
+            &audit_path.to_string_lossy(),
+            &format!("http://{source_addr}/ingest"),
+        )
+        .await
+        .expect_err("malformed redirect targets must remain non-success");
+    assert!(
+        err.to_string().contains("HTTP 307"),
+        "unexpected error for malformed 307: {err}"
+    );
+    let captured = rx.await.unwrap();
+    assert_eq!(captured.body, VALID_V4_AUDIT_BODY);
+    redirect_server.await.unwrap();
 }
 
 #[tokio::test]
@@ -1546,6 +1608,7 @@ async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing
     let audit_path = write_valid_v4_audit(&home.account_dir(&account.label), "audit-unsafe.jsonl");
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let trap_port = listener.local_addr().unwrap().port();
     let retired = marmot_app::retired_relay_hosts()
         .into_iter()
         .next()
@@ -1557,7 +1620,7 @@ async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing
             ..Default::default()
         },
         AuditLogTrackerConfig {
-            endpoint: Some("https://169.254.169.254/ingest".into()),
+            endpoint: Some("https://169.254.169.254:9/ingest".into()),
             authorization_bearer_token: Some("bearer-secret".into()),
             ..Default::default()
         },
@@ -1567,7 +1630,7 @@ async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing
             ..Default::default()
         },
         AuditLogTrackerConfig {
-            endpoint: Some("https://[::ffff:127.0.0.1]/ingest".into()),
+            endpoint: Some(format!("https://[::ffff:127.0.0.1]:{trap_port}/ingest")),
             authorization_bearer_token: Some("bearer-secret".into()),
             ..Default::default()
         },

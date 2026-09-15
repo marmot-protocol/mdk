@@ -55,19 +55,9 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 | Nostr relays (nostr-sdk) | `crates/marmot-app/src/relay_plane/safety.rs`: `RelaySafetyPolicy::sanitize_endpoints` → `reject_unsafe_relay_host`, the single funnel for activation, group sync, publish, and directory routes. |
 | QUIC broker client connect timeout | Shared QUIC-preview hardening (`connect_with_timeout` / `QUIC_PREVIEW_CONNECT_TIMEOUT`, #710), applied at both broker client connects in `crates/transport-quic-broker/src/client.rs`. |
 
-The OTLP exporter and forensic audit uploader reject missing hosts, unusable ports, credentials, fragments, and
-unsupported schemes before resolution. Public HTTPS names and literal IPs must pass the shared address classifier; a
-mixed safe/unsafe DNS answer or an empty result rejects the whole attempt. Only an explicitly configured exact
-`localhost` or loopback IP literal gets the local-test exception, for either HTTP or HTTPS, and it must resolve
-exclusively to loopback. HTTP never reaches a non-loopback address. TLS verification remains enabled even for local
-HTTPS collectors. The original path and query are retained; bearer auth is attached only after validation and pinning.
-Automatic redirects are disabled: 3xx is a non-success status, with no request or bearer token sent to the redirect
-target. Each retry resolves afresh; there is no DNS cache or cross-attempt connection pool. Resolution itself has a 10s
-bound. Collector export stays inside a 30s attempt limit; audit uploads keep a 60s request override and enclosing
-network-attempt deadline so explicit DNS cannot outlive that budget. Audit also refuses configured hosts on the
-centralized retired-relay list. Failures expose only context-free messages or a numeric HTTP status, without endpoint,
-address, auth, or body material. System proxies are disabled because proxy-side DNS would bypass the pin. This
-inventory does not claim that every other workspace HTTP client has been audited.
+Collector and forensic-audit HTTP details — structural URL gates, per-attempt resolve/validate/pin, disabled
+redirects and proxies, timeout budgets, retired-host rejection, and context-free errors — live in
+[Dial Safety Collector Inventory](../further-context/dial-safety-collector-inventory.md).
 
 The broker TLS client (`crates/transport-quic-broker/src/tls.rs`) keeps a resolved-address backstop
 (`InsecureLocalRequiresLoopback`): even if a caller mis-selects `InsecureLocal`, a non-loopback resolved address is
