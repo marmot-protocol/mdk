@@ -1682,3 +1682,65 @@ async fn non_admin_can_self_remove_freely() {
         .unwrap();
     assert!(matches!(res, SendResult::Proposal { .. }));
 }
+
+#[tokio::test]
+async fn compact_authority_tracks_self_demotion_only_after_canonical_acceptance() {
+    use cgka_traits::GroupLifecycleState;
+    let (mut alice, _) = build_with_storage(b"alice");
+    let mut bob = build(b"bob");
+    let bob_id = bob.self_id();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "authority demotion".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("founding commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let initial = alice.group_authority(&group_id).unwrap();
+    assert!(initial.facts.is_admin);
+    assert_eq!(initial.facts.admin_count, 2);
+    let mut policy = Vec::new();
+    encode_quic_varint(32, &mut policy);
+    policy.extend_from_slice(bob_id.as_slice());
+    for accept in [false, true] {
+        let sent = alice
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![AppComponentData {
+                    component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    data: policy.clone(),
+                }],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupEvolution { pending, .. } = sent else {
+            panic!("admin update commit");
+        };
+        let staged = alice.group_authority(&group_id).unwrap();
+        assert_eq!(staged.lifecycle, GroupLifecycleState::PendingPublish);
+        assert!(
+            staged.facts.is_admin,
+            "a staged policy is not canonical authority"
+        );
+        assert_eq!(staged.facts.admin_count, 2);
+        if accept {
+            alice.confirm_published(pending).await.unwrap();
+            let committed = alice.group_authority(&group_id).unwrap();
+            assert_eq!(committed.lifecycle, GroupLifecycleState::Stable);
+            assert!(committed.facts.is_member);
+            assert!(!committed.facts.is_admin);
+            assert_eq!(committed.facts.admin_count, 1);
+        } else {
+            alice.publish_failed(pending).await.unwrap();
+            assert_eq!(alice.group_authority(&group_id).unwrap(), initial);
+        }
+    }
+}

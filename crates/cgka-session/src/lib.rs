@@ -1261,6 +1261,36 @@ impl AccountDeviceSession {
         self.engine.epoch_state(group_id)
     }
 
+    /// Compact, current engine facts for a worker-owned conversation capture.
+    pub fn group_authority(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<cgka_engine::group_authority::GroupAuthoritySnapshot> {
+        Ok(self.engine.group_authority(group_id)?)
+    }
+
+    /// Compose host-owned persisted reads with compact live authority using
+    /// this session's exact store and one deferred snapshot. The callback is
+    /// synchronous/read-only; it must not access a different account store or
+    /// use a startup/recovery copy of engine facts. No engine hydration runs.
+    pub fn with_group_authority_snapshot<T, E>(
+        &self,
+        group_id: &GroupId,
+        read: impl FnOnce(
+            &SqliteAccountStorage,
+            cgka_engine::group_authority::GroupAuthoritySnapshot,
+        ) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<cgka_traits::StorageError> + From<SessionError>,
+    {
+        use cgka_traits::StorageProvider;
+        self.storage.with_read_snapshot(|storage| {
+            let authority = self.group_authority(group_id).map_err(E::from)?;
+            read(storage, authority)
+        })
+    }
+
     pub fn disband_request(
         &self,
         group_id: &GroupId,

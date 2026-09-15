@@ -978,6 +978,30 @@ pub trait StorageProvider:
         Ok(None)
     }
 
+    /// Optional opaque revision of one group's authority inputs: the mirrored
+    /// Group record and canonical MLS tree, group context, group state and own
+    /// leaf index. Equal revisions must mean equal inputs, including after
+    /// rollback, delete/recreate, snapshot restore and foreign writes. Message
+    /// ratchets and unrelated groups need not invalidate it. `None` disables
+    /// scalar authority caching. This is a cache token, never command authority.
+    fn group_authority_revision(&self, _group_id: &GroupId) -> StorageResult<Option<[u8; 32]>> {
+        Ok(None)
+    }
+
+    /// Compose read-only provider calls within the backend's transaction
+    /// boundary. Transactional backends should use a deferred read transaction;
+    /// an enclosing transaction remains caller-owned. The default preserves
+    /// the backend's existing transaction guarantees. Do not await or mutate
+    /// through the callback. Engine callers also hold the live engine borrow.
+    fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        self.with_transaction(f)
+    }
+
     /// Optional account-device maintenance store.
     ///
     /// This is accessor composition for the same reason as `mls_storage()`:

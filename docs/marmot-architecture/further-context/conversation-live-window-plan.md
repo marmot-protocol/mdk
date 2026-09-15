@@ -8,7 +8,8 @@ status: implementation-plan
 # C5 M4: one live conversation handle
 
 M1–M3 are merged through #1844 (`1fcb060b6`). M4 in #1838 composes their Rust foundations;
-M5 exports native handles. The account badge correction #1847 is independent.
+M5 exports native handles. The independent account badge correction #1847 is merged.
+#1849 merged the viewport and account-read foundations; M4 is not yet complete.
 
 ## Contract to implement
 
@@ -33,19 +34,27 @@ M5 exports native handles. The account badge correction #1847 is independent.
 1. **Viewport placement primitive — implemented.** `conversation_window` adds explicit context before
    a retained anchor over M1's read/recovery implementation. Test extension in both directions,
    edge filling, anchor removal and unchanged read intent; retain M1's bounded-query tests.
-2. **Coherent capture — account boundary implemented; engine authority remains.**
+2. **Coherent capture — account boundary merged; compact engine foundation implemented.**
    `conversation_account_snapshot` captures timeline/provenance, selected presentation inputs,
    read state, revisioned draft descriptors and persisted archive/admin/leave controls in one
    deferred read. A concurrent WAL writer test verifies that every field stays on the same
-   snapshot. The combined screen still needs compact, revision-bound engine authority.
+   snapshot. `Engine::group_authority` now returns compact role, membership and capability facts;
+   lifecycle and pending disband gates remain fresh. Migration 0075 supplies group-local tokens
+   covering the mirrored record and canonical MLS tree/context/state/own index. Ratchet messages,
+   drafts, profiles and unrelated groups do not invalidate these facts. Cache misses may load MLS;
+   steady unchanged-authority reads return scalars without a roster decode.
+   `AccountDeviceSession::with_group_authority_snapshot` composes host-owned account reads on the
+   session's exact connection, under one deferred transaction and live engine borrow. Startup
+   seeds fail with `GroupNotHydrated` until validated; they never default to Stable.
 3. **Actor and handles.** Attach projection/group, draft, relevant profile, presentation and reset
    sources; serialize page/anchor/latest requests; deliver complete replacements with retries.
 4. **Adversarial integration coverage.** Race initial read vs mutations, concurrent receive/page,
    draft acceptance vs newer edits, permission changes, quiet contention recovery, lag, retention,
    store eviction and teardown. Record row/source-work bounds separately from payload byte size.
 
-These are implementation checkpoints, not new tracking children or promises of independently
-shippable screen APIs. The combined contract must pass before the M4 PR is ready.
+These are implementation checkpoints within #1838, not promises of independently shippable screen
+APIs. Foundation PRs can merge on their own tested contracts; M4 is complete only when the combined
+live handle and adversarial integration coverage pass.
 
 ## Source audit and the capture gap
 
@@ -65,8 +74,9 @@ invalidates it for title/avatar/member presentation changes, not admin policy or
 The startup/recovery `GroupReadSnapshot` freezes engine facts before network work while account
 storage can advance. Zipping its MLS state with a fresh account capture is therefore not coherent.
 
-Before the actor is wired, pin how the account worker supplies compact authority and its
-frontier during startup, ordinary operation and recovery. Prototype against both live and
+The next actor PR must wire the session capture callback during ordinary operation and explicitly
+retain a retry obligation while startup or recovery owns the mutable client; it must not substitute
+`GroupReadSnapshot` while catch-up runs. Pin the worker response and retry behavior in those paths. Prototype against both live and
 startup-snapshot paths. Cached facts must be invalidated by role/membership/capability/lifecycle
 changes, must not survive a store replacement, and cannot be combined with a different account
 frontier. Do not use a generic `Stable` fallback for unknown epoch state or silently omit a

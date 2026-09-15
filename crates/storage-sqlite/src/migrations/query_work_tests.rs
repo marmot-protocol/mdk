@@ -1,6 +1,6 @@
 use crate::SqliteAccountStorage;
 use crate::encrypted_media_secrets::retire_unreferenced_encrypted_media_secret_epochs_tx;
-use crate::query_work_test_support::{QUERY_MEASUREMENT, measured};
+use crate::query_work_test_support::{QUERY_MEASUREMENT, measure, measured};
 use std::collections::BTreeSet;
 
 fn seed_query_history(conn: &rusqlite::Connection, count: i64) {
@@ -208,10 +208,23 @@ fn replay_query_work() {
                 .all(|package| package.value.as_slice() == [0])
         );
 
-        measured(&store, "proposal queue cleanup", 90, || {
+        let group = cgka_traits::GroupId::new(vec![0xaa]);
+        let before = crate::storage::authority_revision::read(&store, &group).unwrap();
+        let (_, cleanup_steps) = measure(&store, || {
             store.openmls.clear_proposal_queue::<openmls::group::GroupId,
                 openmls::ciphersuite::hash_ref::ProposalRef>(&openmls::group::GroupId::from_slice(&[0xaa])).unwrap();
         });
+        // 0075 adds a constant per-deleted-row authority trigger guard. Queue
+        // rows must neither advance the revision nor scan retained epoch keys.
+        assert_eq!(
+            crate::storage::authority_revision::read(&store, &group).unwrap(),
+            before
+        );
+        assert!(
+            cleanup_steps < 140,
+            "{count} retained keys: {cleanup_steps} cleanup steps"
+        );
+        eprintln!("retained_keys={count}, proposal_cleanup_vm_steps={cleanup_steps}");
         let remaining: i64 = store
             .lock()
             .unwrap()

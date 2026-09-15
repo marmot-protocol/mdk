@@ -494,6 +494,14 @@ impl SharedConnection {
         E: From<StorageError>,
         F: FnOnce() -> Result<T, E>,
     {
+        self.with_transaction_mode(false, f)
+    }
+
+    fn with_transaction_mode<T, E, F>(&self, deferred: bool, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
         let current = std::thread::current().id();
         let mut owner = self
             .inner
@@ -524,7 +532,12 @@ impl SharedConnection {
         *owner = Some(current);
         drop(owner);
 
-        if let Err(err) = self.begin_immediate_with_retry() {
+        let begin = if deferred {
+            self.execute_transaction_boundary_with_retry("BEGIN DEFERRED")
+        } else {
+            self.begin_immediate_with_retry()
+        };
+        if let Err(err) = begin {
             self.clear_transaction_owner();
             return Err(E::from(err));
         }
@@ -1166,6 +1179,21 @@ impl StorageProvider for SqliteAccountStorage {
             .ok()?;
         let own = self.connection.openmls_write_generation() & 0xffff_ffff;
         Some(((data_version as u64) << 32) | own)
+    }
+
+    fn group_authority_revision(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        crate::storage::authority_revision::read(self, group_id).map(Some)
+    }
+
+    fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        self.connection.with_transaction_mode(true, || f(self))
     }
 
     fn maintenance_storage(&self) -> Option<&dyn cgka_traits::storage::MaintenanceStorage> {

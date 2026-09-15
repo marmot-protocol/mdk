@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-12
+updated: 2026-09-15
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -29,6 +29,13 @@ Tracking issue: marmot-protocol/mdk#381.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `Engine::canonical_replays`, `Engine::peel_replays` | At most one continuation of each kind per pending group. Each owns one input graph; frontier and completed paths are bounded by the existing cumulative replay-probe budget, with path depth limited by the retained graph. Peel output remains capped at eight contexts. This is an input-relative bound, not a fixed account-wide byte cap. | Removed on completion/error, relevant state or policy invalidation, hydration/repair/removal, or engine drop. Exact source identity and replay-state content fingerprint (or strict MLS mutation generation on other tracking backends) are checked before reuse; a new canonical pass discards the old cursor. No transaction, snapshot guard, or durable scratch row survives a slice. |
+
+### `cgka-engine` compact authority (`src/group_authority.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `Engine::group_authority_cache` | 32 groups; scalar facts and one 32-byte token per entry, no roster, profile or key material | Replaced on group/MLS authority source changes. Clears at capacity, on engine drop, and for a locally forgotten group. Unhydrated/quarantined reads stay gated; lifecycle and pending disband gates are read fresh. Losing a cache entry only causes a fresh capture. |
+| `group_authority_revisions` in SQLCipher | At most two 16-byte revision tokens per distinct group key ever written by the authority sources | Durable deletion tokens prevent stale cache reuse after delete/recreate. Revisions change transactionally with source writes, including snapshot restore. Random tokens avoid reusing an aborted revision for a later different write. No transcript or roster copies; destroyed with the account database. |
 
 ### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
 

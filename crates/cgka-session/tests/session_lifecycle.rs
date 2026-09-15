@@ -999,3 +999,64 @@ async fn a_disband_request_carries_no_publish_work() {
         "the disband request must be durably persisted as Pending"
     );
 }
+
+#[tokio::test]
+async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_store() {
+    use cgka_session::SessionError;
+    use cgka_traits::storage::GroupStorage;
+    use cgka_traits::{GroupLifecycleState, StorageProvider};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("authority.sqlite");
+    let key = SqlCipherKey::new("authority session fixture").unwrap();
+    let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "authority".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let PublishWork::GroupCreated { pending, .. } = created.effects.publish[0] else {
+        panic!("legacy founding commit");
+    };
+    assert_eq!(
+        session.group_authority(&group).unwrap().lifecycle,
+        GroupLifecycleState::PendingPublish
+    );
+    session.confirm_published(pending).await.unwrap();
+    let before = session
+        .with_group_authority_snapshot(&group, |storage, authority| -> Result<_, SessionError> {
+            // A nested public storage read uses the exact session connection.
+            let record = storage.with_read_snapshot(|same| same.get_group(&group))?;
+            assert_eq!(record.epoch, authority.facts.epoch);
+            assert_eq!(record.members.len(), authority.facts.member_count);
+            assert!(authority.facts.is_admin);
+            Ok(authority)
+        })
+        .unwrap();
+    assert_eq!(before.lifecycle, GroupLifecycleState::Stable);
+    drop(session);
+    let mut reopened =
+        AccountDeviceSession::open(config(&path, &key, b"alice").defer_group_hydration()).unwrap();
+    let mut called = false;
+    let result =
+        reopened.with_group_authority_snapshot(&group, |_, _| -> Result<(), SessionError> {
+            called = true;
+            Ok(())
+        });
+    assert!(matches!(
+        result,
+        Err(SessionError::Engine(EngineError::GroupNotHydrated(_)))
+    ));
+    assert!(
+        !called,
+        "an unvalidated startup seed must not be combined with account rows"
+    );
+    assert!(reopened.ensure_group_hydrated(&group).unwrap());
+    assert_eq!(reopened.group_authority(&group).unwrap(), before);
+}
