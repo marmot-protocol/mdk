@@ -7050,6 +7050,21 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter_module = load_adapter_module()
 
+    async def test_join_yields_to_completed_task_cleanup(self):
+        queue = self.adapter_module.KeyedAsyncQueue()
+
+        async def finish():
+            return
+
+        task = queue.enqueue("group-a", finish)
+        await asyncio.sleep(0)
+        self.assertTrue(task.done())
+        self.assertIn(task, queue._pending)
+
+        await queue.join()
+        self.assertFalse(queue._pending)
+        self.assertFalse(queue._tails)
+
     async def test_queue_sheds_incoming_turn_at_depth_cap(self):
         queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=2)
         started = asyncio.Event()

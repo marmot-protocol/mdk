@@ -659,13 +659,14 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Run relay runtime tests serially
+        # Preserve the former cargo-test lane's no-retry behavior.
         env:
           RUST_BACKTRACE: "1"
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile default --retries 0 --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
 
       - name: Run held peer-index upgrade lookup
         if: matrix.partition == 1
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" -E 'binary(startup_hydration) & test(=existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held)'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" --profile default --retries 0 -E 'binary(startup_hydration) & test(=existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held)'
 
   relay-e2e:
     name: Relay CLI E2E
@@ -893,11 +894,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
 
-      - name: Hermes configure_gateway Python unit tests
+      - name: Hermes Python unit tests
+        timeout-minutes: 3
         run: |
           set -euo pipefail
           env -i HOME="$HOME" PATH="$PATH" USER="${USER:-runner}" \
-            python3 -m unittest discover -s integrations/hermes/tests/marmot -v
+            python3 -c 'import faulthandler, unittest; faulthandler.dump_traceback_later(120, exit=True); unittest.main(module=None)' discover -s integrations/hermes/tests/marmot -v
 
       - name: Prepare isolated Hermes environment for authorization E2E
         run: |

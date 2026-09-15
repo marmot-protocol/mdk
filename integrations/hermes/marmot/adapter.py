@@ -260,6 +260,9 @@ class KeyedAsyncQueue:
         """Wait until all currently scheduled tasks (and any they chain to) have finished."""
         while self._pending:
             await asyncio.gather(*list(self._pending), return_exceptions=True)
+            # Already-finished tasks can make gather return without yielding.
+            # Let their done callbacks remove them before checking again.
+            await asyncio.sleep(0)
 
     async def cancel_all(self) -> None:
         """Cancel every in-flight task and wait for them to unwind."""

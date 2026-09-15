@@ -91,7 +91,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" \
+          if [[ "$GITHUB_REF_TYPE" == "tag" \
+            || "$EVENT_NAME" == "workflow_dispatch" \
             || -z "$BASE_SHA" \
             || "$BASE_SHA" =~ ^0+$ ]] \
             || ! git cat-file -e "${BASE_SHA}^{commit}"; then
@@ -122,7 +123,8 @@ jobs:
           - runner: macos-latest
             target: darwin-aarch64
             rust_target: aarch64-apple-darwin
-          - runner: macos-15-intel
+          # Cross-compile on Apple Silicon; run the bundles on Intel below.
+          - runner: macos-15
             target: darwin-x86_64
             rust_target: x86_64-apple-darwin
 
@@ -146,17 +148,20 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
+          shared-key: wn-agent-${{ matrix.rust_target }}
 
       - name: Build wn-agent
         run: cargo build --locked --release -p agent-connector --bin wn-agent --features otlp-export,product-analytics-export --target "${{ matrix.rust_target }}"
 
       - name: Smoke test wn-agent
+        if: matrix.target != 'darwin-x86_64'
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
 
       - name: Build terminal harnesses
         run: cargo build --locked --release -p wn-claude -p wn-codex -p wn-opencode -p wn-pi --bins --target "${{ matrix.rust_target }}"
 
       - name: Smoke test terminal harnesses
+        if: matrix.target != 'darwin-x86_64'
         shell: bash
         run: |
           set -euo pipefail
@@ -209,6 +214,33 @@ jobs:
           name: wn-pi-${{ matrix.target }}
           path: dist/wn-pi-${{ matrix.target }}/*
           if-no-files-found: error
+
+  darwin-intel-smoke:
+    name: Smoke test packaged binaries (darwin-x86_64)
+    needs: build
+    runs-on: macos-15-intel
+    timeout-minutes: 5
+
+    steps:
+      - name: Download Intel macOS bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: wn-*-darwin-x86_64
+          merge-multiple: true
+          path: bundles
+
+      - name: Verify and run every packaged binary on Intel
+        working-directory: bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c ./*.sha256
+          for archive in ./*.tar.gz; do
+            tar -xzf "$archive"
+          done
+          for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi; do
+            "./$binary-darwin-x86_64/$binary" --help
+          done
 
   plugin:
     needs: changes
@@ -330,7 +362,8 @@ jobs:
           persist-credentials: false
 
       - name: Run Hermes Marmot unit tests
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
+        timeout-minutes: 3
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -c 'import faulthandler, unittest; faulthandler.dump_traceback_later(120, exit=True); unittest.main(module=None)' discover -s integrations/hermes/tests/marmot -v
 
       - name: Run Hermes dev-script smoke test
         run: integrations/hermes/tests/marmot/test_dev_scripts.sh
@@ -479,6 +512,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - build
+      - darwin-intel-smoke
       - plugin
       - hermes-marmot-integration
       - openclaw-plugin
