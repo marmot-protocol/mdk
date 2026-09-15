@@ -84,6 +84,94 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         finally:
             probe._restore_home_env(original_home, original_hermes)
 
+    def test_plugin_entries_drop_install_source_and_transport(self):
+        entries = probe._plugin_entries_for_probe(
+            {
+                "plugins": {
+                    "entries": {
+                        "marmot": {
+                            "enabled": True,
+                            "source": "file:///tmp/mdk#integrations/hermes/marmot",
+                            "settings": {
+                                "socket_path": "/tmp/parent-marmot-agent.sock",
+                                "home": "/tmp/parent-home",
+                                "home_channel": "22" * 32,
+                            },
+                        }
+                    }
+                }
+            }
+        )
+        marmot = entries["entries"]["marmot"]
+        self.assertTrue(marmot["enabled"])
+        self.assertNotIn("source", marmot)
+        self.assertEqual(marmot["settings"], {"home_channel": "22" * 32})
+
+    def test_materialize_registered_home_copies_plugin_and_fails_closed(self):
+        helper = probe._load_helper()
+        with tempfile.TemporaryDirectory() as raw:
+            installed = Path(raw) / "installed"
+            dest = Path(raw) / "isolated"
+            with self.assertRaisesRegex(AssertionError, "installed Marmot plugin"):
+                probe._materialize_registered_home(dest, installed, helper)
+            plugin = installed / "plugins" / "marmot"
+            plugin.mkdir(parents=True)
+            (plugin / "adapter.py").write_text("# fixture\n", encoding="utf-8")
+            (installed / "config.yaml").write_text(
+                "\n".join(
+                    [
+                        "plugins:",
+                        "  entries:",
+                        "    marmot:",
+                        "      enabled: true",
+                        "      source: file:///tmp/mdk#integrations/hermes/marmot",
+                        "      settings:",
+                        "        socket_path: /tmp/parent-marmot-agent.sock",
+                        "        home_channel: keep-me",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            materialized = probe._materialize_registered_home(dest, installed, helper)
+            self.assertEqual(materialized, dest)
+            self.assertTrue((dest / "plugins" / "marmot" / "adapter.py").is_file())
+            config = helper.load_config(dest / "config.yaml")
+            marmot = config["plugins"]["entries"]["marmot"]
+            self.assertTrue(marmot["enabled"])
+            self.assertNotIn("source", marmot)
+            self.assertNotIn("socket_path", marmot.get("settings") or {})
+            self.assertEqual(marmot["settings"]["home_channel"], "keep-me")
+
+    def test_apply_scenario_transport_overrides_loaded_extra(self):
+        config = types.SimpleNamespace(enabled=False, extra={"socket_path": "/tmp/stale.sock"})
+        with tempfile.TemporaryDirectory() as raw:
+            socket_path = Path(raw) / "wn-agent.sock"
+            agent_home = Path(raw) / "agent"
+            applied = probe._apply_scenario_transport(
+                config,
+                socket_path=socket_path,
+                agent_home=agent_home,
+            )
+        self.assertIs(applied, config)
+        self.assertTrue(applied.enabled)
+        self.assertEqual(applied.extra["socket_path"], str(socket_path))
+        self.assertEqual(applied.extra["home"], str(agent_home))
+        self.assertEqual(applied.extra["account_id_hex"], probe.ACCOUNT_ID_HEX)
+
+    def test_bind_home_env_points_at_registered_home(self):
+        original_home = os.environ.get("HOME")
+        original_hermes = os.environ.get("HERMES_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as raw:
+                registered = Path(raw) / "registered"
+                registered.mkdir()
+                probe._bind_home_env(registered)
+                self.assertEqual(os.environ["HERMES_HOME"], str(registered))
+                self.assertEqual(os.environ["HOME"], str(registered.parent))
+        finally:
+            probe._restore_home_env(original_home, original_hermes)
+
     def test_seed_preserves_existing_plugin_entries(self):
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
         spec_name = "hermes_marmot_configure_gateway"

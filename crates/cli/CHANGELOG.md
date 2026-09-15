@@ -209,9 +209,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   unchanged. Covered by helper/CLI configuration tests and a pinned-Hermes turn-boundary probe that
   fails closed if installed cleanup is re-enabled, if injected delivery failures are skipped, or if
   scheduled post-delivery cleanup work is not drained, including on candidate hosts that bind the
-  cleanup scheduler before the delivery callback. The pinned-Hermes lifecycle probe now keeps the
-  installed plugin registered, constructs turn/restart adapters through the platform factory, and
-  fails closed if delete or factory registration is missing.
+  cleanup scheduler before the delivery callback.   The pinned-Hermes lifecycle probe now keeps a copied registered plugin home,
+  constructs turn/restart adapters through the platform factory with the scenario
+  control socket, and fails closed if delete or factory registration is missing.
 
 - `wn media download` and `wn groups download-image` no longer change the permissions of an existing destination
   directory. Resolving a bare or omitted `--output` against the caller's working directory meant every download ran

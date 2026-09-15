@@ -18,6 +18,7 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -282,6 +283,11 @@ def _preserve_home_env():
         _restore_home_env(original_home, original_hermes_home)
 
 
+def _bind_home_env(hermes_home: Path) -> None:
+    os.environ["HERMES_HOME"] = str(hermes_home)
+    os.environ["HOME"] = str(hermes_home.parent)
+
+
 def _registered_hermes_home() -> Path:
     raw = os.environ.get("HERMES_HOME")
     if not raw:
@@ -290,6 +296,61 @@ def _registered_hermes_home() -> Path:
     if not (home / "plugins" / "marmot" / "adapter.py").is_file():
         raise AssertionError("registered HERMES_HOME does not contain an installed Marmot plugin")
     return home
+
+
+def _plugin_entries_for_probe(installed_config: dict[str, Any]) -> dict[str, Any]:
+    installed_entry = (
+        ((installed_config.get("plugins") or {}).get("entries") or {}).get("marmot") or {}
+    )
+    settings = dict(installed_entry.get("settings") or {})
+    for key in ("socket_path", "home", "agent_home", "agent_socket"):
+        settings.pop(key, None)
+    marmot_entry: dict[str, Any] = {"enabled": True}
+    if settings:
+        marmot_entry["settings"] = settings
+    return {"entries": {"marmot": marmot_entry}}
+
+
+def _materialize_registered_home(dest: Path, installed: Path, helper) -> Path:
+    plugin_src = installed / "plugins" / "marmot" / "adapter.py"
+    if not plugin_src.is_file():
+        raise AssertionError("installed HERMES_HOME does not contain an installed Marmot plugin")
+    dest.mkdir(parents=True, exist_ok=True)
+    dest_plugins = dest / "plugins"
+    if dest_plugins.exists():
+        shutil.rmtree(dest_plugins)
+    shutil.copytree(installed / "plugins", dest_plugins, symlinks=True)
+    if not (dest / "plugins" / "marmot" / "adapter.py").is_file():
+        raise AssertionError("isolated registered home is missing the installed Marmot plugin")
+    installed_config: dict[str, Any] = {}
+    if (installed / "config.yaml").is_file():
+        installed_config = helper.load_config(installed / "config.yaml")
+    dest_config: dict[str, Any] = {}
+    if (dest / "config.yaml").is_file():
+        dest_config = helper.load_config(dest / "config.yaml")
+    dest_config["plugins"] = _plugin_entries_for_probe(installed_config)
+    (dest / "config.yaml").write_text(helper.dump_config(dest_config), encoding="utf-8")
+    return dest
+
+
+def _apply_scenario_transport(platform_config, *, socket_path: Path, agent_home: Path):
+    extra = dict(getattr(platform_config, "extra", {}) or {})
+    extra["socket_path"] = str(socket_path)
+    extra["home"] = str(agent_home)
+    extra["account_id_hex"] = ACCOUNT_ID_HEX
+    extra["profile_name_onboarding"] = False
+    try:
+        platform_config.extra = extra
+    except AttributeError:
+        from gateway.config import PlatformConfig
+
+        return PlatformConfig(enabled=True, extra=extra)
+    if hasattr(platform_config, "enabled"):
+        try:
+            platform_config.enabled = True
+        except AttributeError:
+            pass
+    return platform_config
 
 
 def _quiet_helper_kwargs(
@@ -597,6 +658,7 @@ def _fresh_persisted_gateway(hermes_home: Path, helper):
     import gateway.run as gateway_run
 
     with _preserve_home_env():
+        _bind_home_env(hermes_home)
         persisted = helper.load_config(hermes_home / "config.yaml")
         if resolve_display_setting(persisted, "marmot", "cleanup_progress") is not False:
             raise AssertionError("reconfigured persisted cleanup_progress did not remain false")
@@ -658,6 +720,7 @@ async def _run_gateway_turn_body(
     stagger_after_first: bool,
 ) -> dict[str, Any]:
     registered_home = _registered_hermes_home()
+    _bind_home_env(registered_home)
     hermes_home.mkdir(parents=True, exist_ok=True)
     agent_home = hermes_home / "marmot-agent"
     _write_seed_with_global_cleanup(registered_home, helper, agent_home=agent_home)
@@ -705,6 +768,11 @@ async def _run_gateway_turn_body(
         platform_config = loaded.platforms.get(Platform("marmot"))
         if platform_config is None:
             raise AssertionError("persisted gateway load missing marmot platform")
+        platform_config = _apply_scenario_transport(
+            platform_config,
+            socket_path=socket_path,
+            agent_home=agent_home,
+        )
         adapter = _create_registered_adapter(platform_config)
         delete_attempts: list[str] = []
         _wrap_delete(adapter, delete_attempts)
@@ -892,6 +960,13 @@ def _assert_partial_retry(result: dict[str, Any]) -> None:
 
 async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
     helper = _load_helper()
+    installed_home = _registered_hermes_home()
+    registered_home = _materialize_registered_home(
+        hermes_home / "registered",
+        installed_home,
+        helper,
+    )
+    _bind_home_env(registered_home)
     defaults_home = hermes_home / "defaults"
     _write_seed_with_global_cleanup(defaults_home, helper)
     defaults_config = helper.load_config(defaults_home / "config.yaml")
