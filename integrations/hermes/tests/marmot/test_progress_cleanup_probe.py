@@ -100,6 +100,78 @@ class TestProgressCleanupProbeFailClosed(unittest.TestCase):
         server.operation_sends = 1
         server.wait_until_idle(min_operations=1, quiet_s=0.01, timeout=0.2)
 
+    def test_control_server_closes_loop_when_bind_fails(self):
+        server = probe.RecordingControlServer(Path("/tmp/progress-cleanup-bind-fail.sock"))
+        loop = asyncio.new_event_loop()
+        server._loop = loop
+
+        async def boom():
+            raise OSError("bind failed")
+
+        server._bind = boom
+        server._thread_main()
+        self.assertTrue(loop.is_closed())
+        self.assertIsInstance(server._error, OSError)
+        self.assertTrue(server._ready.is_set())
+        server.close_sync()
+        self.assertTrue(loop.is_closed())
+
+    def test_probe_final_ack_tracks_expected_answer_only(self):
+        server = probe.RecordingControlServer(Path("/tmp/progress-cleanup-final.sock"))
+        notice = server._response_for(
+            {"id": "1", "type": "send_final", "text": "unrelated notice"},
+            "send_final",
+        )
+        self.assertEqual(notice["type"], "final_sent")
+        self.assertEqual(server.final_sends, 1)
+        self.assertEqual(server.probe_final_acks, 0)
+        ack = server._response_for(
+            {"id": "2", "type": "send_final", "text": probe.PROBE_FINAL_TEXT},
+            "send_final",
+        )
+        self.assertEqual(ack["type"], "final_sent")
+        self.assertEqual(server.final_sends, 2)
+        self.assertEqual(server.probe_final_acks, 1)
+
+    def test_retained_success_requires_probe_final_ack(self):
+        result = {
+            "resolved_cleanup": False,
+            "operation_sends": 3,
+            "logical_send_ids": ["marmot-tool-progress:1"],
+            "durable_operation_ids": ["aa" * 32],
+            "final_sends": 2,
+            "probe_final_acks": 0,
+            "delivery_boundary_observed": True,
+            "scheduled_work_drained": True,
+            "delete_attempts": [],
+            "wire_deletes": 0,
+            "delete_targets": [],
+        }
+        with self.assertRaisesRegex(AssertionError, "probe-final-ok"):
+            probe._assert_retained_success(result, label="accumulate")
+        result["probe_final_acks"] = 1
+        probe._assert_retained_success(result, label="accumulate")
+
+    def test_reconstructed_adapter_rejects_prior_durable_deletes(self):
+        prior = ["cc" * 32]
+        probe._assert_no_prior_durable_deletes(
+            prior_durable_ids=prior,
+            delete_attempts=[],
+            delete_targets=[],
+        )
+        with self.assertRaisesRegex(AssertionError, "prior durable id"):
+            probe._assert_no_prior_durable_deletes(
+                prior_durable_ids=prior,
+                delete_attempts=[prior[0]],
+                delete_targets=[],
+            )
+        with self.assertRaisesRegex(AssertionError, "prior durable id"):
+            probe._assert_no_prior_durable_deletes(
+                prior_durable_ids=prior,
+                delete_attempts=[],
+                delete_targets=[prior[0]],
+            )
+
     def test_control_server_answers_blocking_client_without_caller_loop(self):
         with tempfile.TemporaryDirectory() as raw:
             socket_path = Path(raw) / "control.sock"

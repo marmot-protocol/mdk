@@ -36,6 +36,7 @@ PROTOCOL = "marmot.agent-control.v2"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HELPER_PATH = REPO_ROOT / "scripts" / "hermes_marmot_configure_gateway.py"
 TOOL_PROGRESS_PREFIX = "marmot-tool-progress:"
+PROBE_FINAL_TEXT = "probe-final-ok"
 SCHEDULED_WORK_TIMEOUT_S = 8.0
 PROGRESS_WAIT_TIMEOUT_S = 8.0
 PROGRESS_QUIET_S = 2.0
@@ -79,6 +80,7 @@ class RecordingControlServer:
         self.requests: list[str] = []
         self.operation_sends = 0
         self.final_sends = 0
+        self.probe_final_acks = 0
         self.final_failures = 0
         self.wire_deletes = 0
         self.durable_operation_ids: list[str] = []
@@ -128,6 +130,9 @@ class RecordingControlServer:
         if loop is not None and thread is not None and thread.is_alive():
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5.0)
+        thread_done = thread is None or not thread.is_alive()
+        if loop is not None and thread_done and not loop.is_closed():
+            loop.close()
         self._loop = None
         self._thread = None
         self.server = None
@@ -144,17 +149,18 @@ class RecordingControlServer:
             return
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._bind())
-        except BaseException as exc:
-            self._error = exc
-            self._ready.set()
-            return
-        self._ready.set()
-        try:
+            try:
+                loop.run_until_complete(self._bind())
+            except BaseException as exc:
+                self._error = exc
+                return
+            finally:
+                self._ready.set()
             loop.run_forever()
             loop.run_until_complete(self._shutdown_server())
         finally:
-            loop.close()
+            if not loop.is_closed():
+                loop.close()
 
     async def _bind(self) -> None:
         self.server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
@@ -250,6 +256,8 @@ class RecordingControlServer:
                         "message": "injected final-delivery failure",
                     }
                 self.final_sends += 1
+                if str(request.get("text") or "") == PROBE_FINAL_TEXT:
+                    self.probe_final_acks += 1
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
@@ -363,7 +371,7 @@ class DeterministicAIAgent:
             }
             return self.last_result
         self.last_result = {
-            "final_response": "probe-final-ok",
+            "final_response": PROBE_FINAL_TEXT,
             "messages": [],
             "api_calls": 1,
             "tools": list(self.tool_names),
@@ -740,7 +748,13 @@ async def _dispatch_registered_delete() -> dict[str, Any]:
     return payload
 
 
-def _fresh_persisted_gateway(hermes_home: Path, helper):
+def _fresh_persisted_gateway(
+    hermes_home: Path,
+    helper,
+    *,
+    socket_path: Path | None = None,
+    agent_home: Path | None = None,
+):
     from gateway.config import Platform, load_gateway_config
     from gateway.display_config import resolve_display_setting
     import gateway.run as gateway_run
@@ -754,9 +768,108 @@ def _fresh_persisted_gateway(hermes_home: Path, helper):
         platform_config = loaded.platforms.get(Platform("marmot"))
         if platform_config is None:
             raise AssertionError("persisted gateway load missing marmot platform")
+        if socket_path is not None:
+            if agent_home is None:
+                raise AssertionError("fresh persisted gateway transport override requires agent_home")
+            platform_config = _apply_scenario_transport(
+                platform_config,
+                socket_path=socket_path,
+                agent_home=agent_home,
+            )
         adapter = _create_registered_adapter(platform_config)
         runner = gateway_run.GatewayRunner(config=loaded)
         return persisted, runner, adapter
+
+
+def _assert_no_prior_durable_deletes(
+    *,
+    prior_durable_ids: list[str],
+    delete_attempts: list[str],
+    delete_targets: list[str],
+    label: str = "reconstructed",
+) -> None:
+    prior = set(prior_durable_ids)
+    if any(target in prior for target in delete_attempts):
+        raise AssertionError(f"{label}: delete_message targeted a prior durable id")
+    if any(target in prior for target in delete_targets):
+        raise AssertionError(f"{label}: a prior durable id reached the wire")
+
+
+async def _stop_runner(runner) -> None:
+    if runner is None:
+        return
+    stop = getattr(runner, "stop", None)
+    if not callable(stop):
+        return
+    try:
+        result = stop()
+        if asyncio.iscoroutine(result):
+            await asyncio.wait_for(result, timeout=2.0)
+    except Exception:
+        pass
+
+
+async def _exercise_reconstructed_adapter(
+    *,
+    hermes_home: Path,
+    helper,
+    agent_home: Path,
+    prior_durable_ids: list[str],
+) -> None:
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
+    import run_agent
+
+    socket_path = _scenario_control_socket("fresh")
+    fake = RecordingControlServer(socket_path)
+    delete_attempts: list[str] = []
+    await fake.start()
+    previous_progress_server = DeterministicAIAgent.progress_server
+    DeterministicAIAgent.progress_server = fake
+    runner = None
+    try:
+        _persisted, runner, adapter = _fresh_persisted_gateway(
+            hermes_home,
+            helper,
+            socket_path=socket_path,
+            agent_home=agent_home,
+        )
+        _assert_fresh_progress_state(adapter)
+        _wrap_delete(adapter, delete_attempts)
+        DeterministicAIAgent.instances.clear()
+
+        def agent_factory(*args: Any, **kwargs: Any):
+            return DeterministicAIAgent(*args, **kwargs)
+
+        scheduled: list[Any] = []
+        with mock.patch.object(run_agent, "AIAgent", agent_factory):
+            runner._resolve_session_agent_runtime = lambda **_kwargs: (
+                "probe-model",
+                {"provider": "local"},
+            )
+            runner.adapters[Platform("marmot")] = adapter
+            adapter.set_message_handler(runner._handle_message)
+            event = _build_event(SessionSource, MessageEvent, Platform)
+            with _capture_safe_schedules(scheduled):
+                await asyncio.wait_for(adapter.handle_message(event), timeout=30.0)
+                await _await_host_turn(adapter, timeout=30.0)
+                await _await_scheduled_work(scheduled, timeout=SCHEDULED_WORK_TIMEOUT_S)
+        _assert_no_prior_durable_deletes(
+            prior_durable_ids=prior_durable_ids,
+            delete_attempts=delete_attempts,
+            delete_targets=list(fake.delete_targets),
+        )
+        if delete_attempts:
+            raise AssertionError("reconstructed adapter attempted automatic deletes")
+        if fake.wire_deletes:
+            raise AssertionError("reconstructed adapter issued automatic wire deletes")
+        if fake.operation_sends < 1:
+            raise AssertionError("reconstructed adapter turn produced no operation events")
+    finally:
+        await _stop_runner(runner)
+        await fake.close()
+        DeterministicAIAgent.progress_server = previous_progress_server
 
 
 async def _run_gateway_turn(
@@ -940,6 +1053,7 @@ async def _run_gateway_turn_body(
         "operation_failures": fake._operation_failures,
         "operation_attempts": list(fake.operation_attempts),
         "final_sends": fake.final_sends,
+        "probe_final_acks": fake.probe_final_acks,
         "final_failures": fake.final_failures,
         "wire_deletes": fake.wire_deletes,
         "delete_targets": list(fake.delete_targets),
@@ -986,6 +1100,8 @@ def _assert_retained_success(
         raise AssertionError(f"{label}: produced no durable event ids")
     if result["final_sends"] < 1:
         raise AssertionError(f"{label}: expected final delivery did not succeed")
+    if result["probe_final_acks"] < 1:
+        raise AssertionError(f"{label}: expected probe-final-ok acknowledgement was missing")
     if not result["delivery_boundary_observed"]:
         raise AssertionError(f"{label}: host delivery-finally boundary was not observed")
     if not result["scheduled_work_drained"]:
@@ -1110,7 +1226,7 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
     )
     if not failed_final["fail_final_injected"] or failed_final["final_failures"] < 1:
         raise AssertionError("failed-final did not observe a failed send_final")
-    if failed_final["final_sends"]:
+    if failed_final["final_sends"] or failed_final["probe_final_acks"]:
         raise AssertionError("failed-final unexpectedly acknowledged a final")
     if failed_final["agent_failed"]:
         raise AssertionError("failed-final unexpectedly marked the agent as failed")
@@ -1138,18 +1254,12 @@ async def _run_scenarios(adapter_module, hermes_home: Path) -> dict[str, Any]:
             agent_home=restart_home / "marmot-agent",
         )
     )
-    _persisted, fresh_runner, fresh = _fresh_persisted_gateway(registered_home, helper)
-    try:
-        _assert_fresh_progress_state(fresh)
-    finally:
-        stop = getattr(fresh_runner, "stop", None)
-        if callable(stop):
-            try:
-                result = stop()
-                if asyncio.iscoroutine(result):
-                    await asyncio.wait_for(result, timeout=2.0)
-            except Exception:
-                pass
+    await _exercise_reconstructed_adapter(
+        hermes_home=registered_home,
+        helper=helper,
+        agent_home=restart_home / "marmot-agent",
+        prior_durable_ids=list(restart["durable_operation_ids"]),
+    )
     _assert_retained_success(restart, label="restart")
 
     explicit = await _run_gateway_turn(
