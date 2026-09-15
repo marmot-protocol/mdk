@@ -237,17 +237,19 @@ async fn account_read_failure_is_not_zero_or_removal_and_recovers_without_notifi
 async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);
-    f.runtime
-        .set_chat_manually_unread("alice", "0000", true)
-        .unwrap();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
-    let mut was_eligible = true;
+    assert_eq!(
+        ready(&sub.snapshot, &f.alice.account_id_hex),
+        AccountAttentionTotal::default()
+    );
+    let mut was_eligible = false;
     for (pending, archived, membership) in [
         (true, false, SelfMembership::Member),
         (false, false, SelfMembership::Member),
-        (false, true, SelfMembership::Member),
-        (false, false, SelfMembership::Left),
-        (false, false, SelfMembership::Member),
+        (true, true, SelfMembership::Member),
+        (true, false, SelfMembership::Member),
+        (true, false, SelfMembership::Left),
+        (true, false, SelfMembership::Member),
     ] {
         let mut account = storage.load_account_projection_state("alice", 100).unwrap();
         account.groups[0].pending_confirmation = pending;
@@ -270,12 +272,16 @@ async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
                     version: storage.chat_presentation_version().unwrap(),
                 });
         }
-        let eligible = !archived && membership == SelfMembership::Member;
-        // Equal totals (invite vs manual reminder, or two suppressed states) coalesce.
+        let eligible = pending && !archived && membership == SelfMembership::Member;
+        // The invitation is the sole attention source; equal suppressed totals coalesce.
         if eligible != was_eligible {
             assert_eq!(
-                ready(&next(&mut sub).await, &f.alice.account_id_hex).has_unread(),
-                eligible
+                ready(&next(&mut sub).await, &f.alice.account_id_hex),
+                AccountAttentionTotal {
+                    unread_conversations: u64::from(eligible),
+                    attention_only_conversations: u64::from(eligible),
+                    ..Default::default()
+                }
             );
         } else {
             assert!(
@@ -287,7 +293,7 @@ async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
         was_eligible = eligible;
     }
     assert!(
-        storage
+        !storage
             .chat_list_row("0000")
             .unwrap()
             .unwrap()
