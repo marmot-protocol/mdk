@@ -54,12 +54,26 @@ remain available. Other `ConversationWindowQuery` errors are terminal and requir
 reopening. Opening on a missing explicit target returns the same missing-message
 error without creating a handle.
 
+`ConversationWindowNotReady` (C `MARMOT_STATUS_CONVERSATION_WINDOW_NOT_READY`)
+is retryable, not a terminal query error. Keep the installed window and keep
+receiving: MDK repairs dirty read state and retries accepted work in the background.
+Reassess a failed command after the next successful replacement instead of opening
+another handle or immediately repeating it. Opening itself waits through this state
+until it succeeds, is cancelled, or reaches its deadline.
+`ConversationWindowAnchorOutside` (C `MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE`)
+rejects an anchor outside the current retained rows without closing or changing the
+window. Use the latest installed replacement and report an actually visible retained
+row with its revision; use an explicit jump if navigation outside that window is intended.
+
 Opening and each window command take a deadline: zero selects **30 seconds**,
 otherwise milliseconds. Cancelling/timing out opening abandons it. A command that
 was already accepted may complete after its waiter times out or is cancelled;
 consume the stream and refresh before retrying. `next()` is cancellable without
 consuming a pending update. C `next` uses its existing timeout convention: zero
 waits indefinitely; a timeout returns `MARMOT_STATUS_TIMEOUT` with a NULL result.
+Thus the same C value `timeout_ms = 0` means a 30-second deadline for open/page/anchor/
+jump/latest commands, but unlimited waiting for `next`; it is not a universal
+"disable deadlines" value.
 
 Call and await `cancel()` to wake waiting operations and release the runtime
 window. Then release/destroy the native object. Kotlin's generated `close()`/`use`
@@ -115,6 +129,11 @@ regenerates host bindings, round-trips the new records and compiles the command
 surface. These are host binding checks, not device or published-artifact evidence.
 
 The window retains at most 200 rows and uses M3's bounded identity/reaction sidecar.
-Conversion is local and proportional to returned content. The binding layer owns
+Conversion is local and proportional to returned content **on every replacement**:
+all retained chat rows are converted and their Markdown is parsed again, even if
+only one message or a header/draft field changed. At the 200-row cap this is
+full-window work per update. C9 must measure native conversion wall time per
+replacement during message bursts at 50 and 200 rows, including long Markdown;
+see #1838. No incremental-conversion or device-latency guarantee is implied. The binding layer owns
 an initial converted snapshot and the runtime subscription; do not open duplicate
 handles for one screen. No new durable projection or media cache is introduced.
