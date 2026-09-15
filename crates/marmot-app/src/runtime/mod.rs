@@ -18,9 +18,9 @@ use marmot_account::{
     NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use tokio::sync::Semaphore;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{
+    Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch,
+};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
@@ -57,6 +57,8 @@ use crate::{
     TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
     unix_now_seconds,
 };
+
+const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
 
 pub(crate) mod account_worker;
 mod agent_publisher;
@@ -5884,6 +5886,7 @@ impl AccountManager {
                         ManagedAccountWorker {
                             handle,
                             commands: command_tx,
+                            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
                         },
                     );
@@ -6165,7 +6168,9 @@ impl AccountManager {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.require_onboarding_complete_for(&account)?;
-        self.worker_commands_for_account(account).await
+        self.worker_commands_for_account(account)
+            .await
+            .map(|(commands, _)| commands)
     }
 
     async fn worker_commands_for_setup(
@@ -6174,12 +6179,31 @@ impl AccountManager {
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        self.worker_commands_for_account(account).await
+        self.worker_commands_for_account(account)
+            .await
+            .map(|(commands, _)| commands)
     }
+
+    async fn media_worker_commands(
+        &self,
+        account_ref: &str,
+    ) -> Result<(mpsc::Sender<AccountWorkerCommand>, OwnedSemaphorePermit), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        self.require_onboarding_complete_for(&account)?;
+        let (commands, admission) = self.worker_commands_for_account(account).await?;
+        // Wait outside the shared command lane, without holding the worker map lock.
+        let permit = tokio::select! {
+            _ = commands.closed() => return Err(AppError::TransportClosed),
+            permit = admission.acquire_owned() => permit.map_err(|_| AppError::TransportClosed)?,
+        };
+        Ok((commands, permit))
+    }
+
     async fn worker_commands_for_account(
         &self,
         account: AccountSummary,
-    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+    ) -> Result<(mpsc::Sender<AccountWorkerCommand>, Arc<Semaphore>), AppError> {
         if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
@@ -6190,7 +6214,7 @@ impl AccountManager {
         let workers = self.workers.lock().await;
         workers
             .get(&account.account_id_hex)
-            .map(|worker| worker.commands.clone())
+            .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
             .ok_or_else(|| {
                 AppError::RelayDirectory(
                     "managed account worker is not running for local signing account".into(),

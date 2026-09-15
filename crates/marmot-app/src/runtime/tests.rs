@@ -571,6 +571,9 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         std::future::pending::<()>().await;
     });
     let worker = ManagedAccountWorker {
+        media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
+        )),
         handle,
         commands,
         shutdown,
@@ -2054,6 +2057,9 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
         workers.lock().await.insert(
             "replacement".to_owned(),
             ManagedAccountWorker {
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
                 handle,
                 commands,
                 shutdown: shutdown_tx,

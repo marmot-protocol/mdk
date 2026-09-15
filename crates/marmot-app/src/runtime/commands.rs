@@ -311,10 +311,21 @@ impl AccountManager {
         upload_id: String,
         server: Option<String>,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
-        let command = self.worker_commands(account_ref).await?;
+        let status = self
+            .prepared_group_image_status(account_ref, upload_id.clone())
+            .await?;
+        if matches!(
+            status.state,
+            crate::AppPreparedGroupImageUploadState::Uploaded
+                | crate::AppPreparedGroupImageUploadState::Consumed
+        ) {
+            return Ok(status);
+        }
+        let (command, admission) = self.media_worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::UploadPreparedGroupImage {
+                admission,
                 upload_id,
                 server,
                 respond,
@@ -1123,10 +1134,11 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Vec<u8>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
+        let (command, admission) = self.media_worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::DownloadGroupImage {
+                admission,
                 group_id: group_id.clone(),
                 respond,
             })
@@ -1626,10 +1638,11 @@ impl AccountManager {
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<MediaUploadResult, AppError> {
-        let command = self.worker_commands(account_ref).await?;
+        let (command, admission) = self.media_worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::UploadMedia {
+                admission,
                 group_id: group_id.clone(),
                 request,
                 respond,
@@ -1668,13 +1681,15 @@ impl AccountManager {
         group_id: &GroupId,
         reference: MediaAttachmentReference,
     ) -> Result<MediaDownloadResult, AppError> {
-        let command = self.worker_commands(account_ref).await?;
+        let enqueued_at = Instant::now();
+        let (command, admission) = self.media_worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::DownloadMedia {
+                admission,
                 group_id: group_id.clone(),
                 reference,
-                enqueued_at: Instant::now(),
+                enqueued_at,
                 respond,
             })
             .await
