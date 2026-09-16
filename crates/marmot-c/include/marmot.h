@@ -4873,6 +4873,8 @@ void marmot_string_free(char *s);
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
 
 /**
+ * Register up to 16 visible avatar targets without awaiting HTTP.
+ * Free the returned list with `marmot_avatar_asset_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4887,6 +4889,8 @@ MarmotStatus marmot_request_avatar_assets(const struct MarmotClient *client,
                                           struct MarmotAvatarAssetList **out);
 
 /**
+ * Read up to 16 local avatar references with a 1-byte..16-MiB aggregate byte budget.
+ * Budget-deferred entries are explicit. Free with `marmot_avatar_bytes_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4902,6 +4906,7 @@ MarmotStatus marmot_read_avatar_assets(const struct MarmotClient *client,
                                        struct MarmotAvatarBytesList **out);
 
 /**
+ * Remove this account's local avatar bytes and demand. Later visible requests may reacquire them.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

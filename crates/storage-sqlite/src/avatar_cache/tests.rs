@@ -1331,7 +1331,12 @@ fn avatar_screen_targets_reject_another_account_or_recreated_conversation() {
 fn avatar_target_lookup_uses_the_conversation_incarnation_index() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let conn = store.lock().unwrap();
-    let mut query = conn.prepare("EXPLAIN QUERY PLAN SELECT group_id_hex FROM chat_list_rows CROSS JOIN chat_presentation_meta m WHERE presentation_row_epoch = ?1 AND m.id = 1 AND m.store_epoch = ?2").unwrap();
+    let mut query = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            access::AVATAR_TARGET_LOOKUP_SQL
+        ))
+        .unwrap();
     let plan = query
         .query_map(params![vec![0_u8; 16], vec![0_u8; 16]], |r| {
             r.get::<_, String>(3)
@@ -1344,4 +1349,36 @@ fn avatar_target_lookup_uses_the_conversation_incarnation_index() {
             .any(|line| line.contains("chat_avatar_target_lookup"))
     );
     assert!(!plan.iter().any(|line| line.contains("SCAN chat_list_rows")));
+}
+
+#[test]
+fn avatar_screen_and_byte_read_availability_agree_at_freshness_boundary() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed_avatar_group(&store);
+    let selected = selected_url("a");
+    let version = crate::ChatPresentationVersion {
+        store_epoch: vec![9; 16],
+        revision: 1,
+    };
+    let reference = store
+        .request_identity_avatar_acquisition("group", "member", &selected, &version)
+        .unwrap()
+        .unwrap();
+    let screen = |now| {
+        store
+            .avatar_target_presentation("group", Some("member"), &selected, now)
+            .unwrap()
+            .unwrap()
+            .status
+    };
+    assert_eq!(screen(0), store.read_avatar(&reference, 0).unwrap().status);
+    store
+        .publish_avatar(&reference, 0, &image(1, 16), Some(10))
+        .unwrap();
+    for now in [9, 10, 11] {
+        assert_eq!(
+            screen(now),
+            store.read_avatar(&reference, now).unwrap().status
+        );
+    }
 }

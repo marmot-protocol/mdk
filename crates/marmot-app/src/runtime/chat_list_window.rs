@@ -441,7 +441,7 @@ impl Sources {
             || chat_list_event_route(event).is_some_and(|(account, _)| account == reader.account_id)
     }
     fn drain(&mut self) {
-        for _ in 0..self.avatars.len().min(64) {
+        for _ in 0..self.avatars.len().min(INVALIDATION_DRAIN_LIMIT) {
             let _ = self.avatars.try_recv();
         }
         // Drain only the bounded queued prefix. Events arriving during a read stay queued.

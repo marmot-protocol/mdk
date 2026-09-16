@@ -170,7 +170,8 @@ impl MarmotAppRuntime {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let app = self.accounts.app.clone();
-        blocking_app_task(move || {
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let work = blocking_app_task(move || {
             if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
             {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
@@ -178,7 +179,11 @@ impl MarmotAppRuntime {
             app.account_storage(&account.label)?.clear_avatar_cache()?;
             let _ = app.presentation_signals.avatars.send(account.label);
             Ok(())
-        })
-        .await
+        });
+        tokio::select! {
+            biased;
+            _ = wait_for_runtime_shutdown(&mut stopping) => Err(AppError::RuntimeStopping),
+            result = work => result,
+        }
     }
 }

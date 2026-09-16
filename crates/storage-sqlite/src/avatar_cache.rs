@@ -456,6 +456,33 @@ fn reference_for_owner(conn: &Connection, owner: &str) -> StorageResult<Option<A
         [owner], |r| Ok(AvatarAssetRef { store_epoch: r.get(0)?, token: r.get(1)? }),
     ).optional().storage()
 }
+// Both screen metadata and byte reads derive availability from the same columns.
+fn status_columns(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+    now: u64,
+) -> rusqlite::Result<AvatarAssetStatus> {
+    let content_revision = nonnegative(row, first)?;
+    let byte_count = nonnegative(row, first + 1)?;
+    let refresh_at = row
+        .get::<_, Option<i64>>(first + 2)?
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(first + 2, value))
+        })
+        .transpose()?;
+    Ok(AvatarAssetStatus {
+        availability: if byte_count == 0 {
+            AvatarAvailability::Missing
+        } else if refresh_at.is_some_and(|deadline| now >= deadline) {
+            AvatarAvailability::Stale
+        } else {
+            AvatarAvailability::Ready
+        },
+        content_revision,
+        byte_count,
+    })
+}
 fn status(
     conn: &Connection,
     reference: &AvatarAssetRef,
@@ -466,28 +493,7 @@ fn status(
             "SELECT content_revision, coalesce(length(bytes), 0), refresh_at FROM avatar_assets
          WHERE token = ?1 AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?2",
             params![reference.token, reference.store_epoch],
-            |r| {
-                let content_revision = nonnegative(r, 0)?;
-                let byte_count = nonnegative(r, 1)?;
-                let refresh_at = r
-                    .get::<_, Option<i64>>(2)?
-                    .map(|v| {
-                        u64::try_from(v).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, v))
-                    })
-                    .transpose()?;
-                let availability = if byte_count == 0 {
-                    AvatarAvailability::Missing
-                } else if refresh_at.is_some_and(|deadline| now >= deadline) {
-                    AvatarAvailability::Stale
-                } else {
-                    AvatarAvailability::Ready
-                };
-                Ok(AvatarAssetStatus {
-                    availability,
-                    content_revision,
-                    byte_count,
-                })
-            },
+            |r| status_columns(r, 0, now),
         )
         .optional()
         .storage()?;

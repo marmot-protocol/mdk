@@ -895,7 +895,7 @@ struct Sources {
 }
 impl Sources {
     fn drain(&mut self) {
-        for _ in 0..self.avatars.len().min(64) {
+        for _ in 0..self.avatars.len().min(DRAIN_LIMIT) {
             let _ = self.avatars.try_recv();
         }
         for _ in 0..self.events.len().min(DRAIN_LIMIT) {

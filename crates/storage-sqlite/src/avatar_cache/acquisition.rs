@@ -278,6 +278,18 @@ impl SqliteAccountStorage {
             .transpose()
     }
 
+    /// Current binding for a conversation identity, including its previous source.
+    pub fn avatar_identity_reference(
+        &self,
+        group: &str,
+        member: &str,
+    ) -> StorageResult<Option<AvatarAssetRef>> {
+        let Some(chat) = self.avatar_chat_owner(group)? else {
+            return Ok(None);
+        };
+        self.avatar_reference(&format!("identity:{chat}:{member}"))
+    }
+
     /// Register only an explicitly requested conversation identity. Placeholder
     /// registrations survive until profile data arrives; capacity eviction drops
     /// registration too, so background maintenance cannot refill evicted images.

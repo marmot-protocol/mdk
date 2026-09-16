@@ -1,5 +1,6 @@
 //! Native-facing opaque locators and local metadata. No network work.
 use super::*;
+pub(super) const AVATAR_TARGET_LOOKUP_SQL: &str = "SELECT group_id_hex FROM chat_list_rows CROSS JOIN chat_presentation_meta m WHERE presentation_row_epoch = ?1 AND m.id = 1 AND m.store_epoch = ?2";
 use crate::{ChatPresentationVersion, SelectedAvatar};
 
 /// Stable request locator for one selected source and conversation incarnation.
@@ -148,7 +149,14 @@ impl SqliteAccountStorage {
         &self,
         target: &AvatarAssetTarget,
     ) -> StorageResult<Option<String>> {
-        self.lock()?.query_row("SELECT group_id_hex FROM chat_list_rows CROSS JOIN chat_presentation_meta m WHERE presentation_row_epoch = ?1 AND m.id = 1 AND m.store_epoch = ?2", params![target.row, target.epoch], |r| r.get(0)).optional().storage()
+        self.lock()?
+            .query_row(
+                AVATAR_TARGET_LOOKUP_SQL,
+                params![target.row, target.epoch],
+                |r| r.get(0),
+            )
+            .optional()
+            .storage()
     }
     /// Revalidate the target under the same transaction as demand registration.
     pub fn request_avatar_target(
@@ -217,9 +225,7 @@ pub(crate) fn target_presentation(
         let epoch: Vec<u8> = r.get(0)?;
         let row: Vec<u8> = r.get(1)?;
         let token: Option<Vec<u8>> = r.get(2)?;
-        let content_revision = nonnegative(r, 3)?;
-        let byte_count = nonnegative(r, 4)?;
-        let refresh_at: Option<i64> = r.get(5)?;
+        let status = status_columns(r, 3, now)?;
         let acquisition: Option<i64> = r.get(6)?;
         Ok(AvatarAssetPresentation {
             target: AvatarAssetTarget {
@@ -232,18 +238,7 @@ pub(crate) fn target_presentation(
                 store_epoch: epoch,
                 token,
             }),
-            status: AvatarAssetStatus {
-                availability: if byte_count == 0 {
-                    AvatarAvailability::Missing
-                } else if refresh_at.is_some_and(|deadline| deadline >= 0 && now >= deadline as u64)
-                {
-                    AvatarAvailability::Stale
-                } else {
-                    AvatarAvailability::Ready
-                },
-                content_revision,
-                byte_count,
-            },
+            status,
             acquisition: acquisition.map(|state| match state {
                 0 => AvatarAcquisitionState::Idle,
                 1 => AvatarAcquisitionState::Queued,

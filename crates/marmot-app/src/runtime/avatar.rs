@@ -20,10 +20,13 @@ impl MarmotApp {
         })?;
         let (selected, version) =
             selected_identity(self, &input, &account.account_id_hex, &member)?;
+        let before = storage.avatar_identity_reference(group, &member)?;
         let reference =
             storage.request_identity_avatar_acquisition(group, &member, &selected, &version)?;
         self.presentation_signals.wake();
-        let _ = self.presentation_signals.avatars.send(label.to_owned());
+        if before != storage.avatar_identity_reference(group, &member)? {
+            let _ = self.presentation_signals.avatars.send(label.to_owned());
+        }
         Ok(reference)
     }
 }
@@ -219,6 +222,18 @@ mod tests {
                 .reference,
             reference
         );
+        let mut changes = app.presentation_signals.avatars.subscribe();
+        for _ in 0..3 {
+            assert_eq!(
+                app.request_identity_avatar("alice", &group, &member)
+                    .unwrap(),
+                Some(reference.clone())
+            );
+        }
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         // Removal during the shared-profile preparation gap must not recreate demand.
         storage.remove_avatar_source(&reference).unwrap();
         IdentityAvatarMaintenance::default()
