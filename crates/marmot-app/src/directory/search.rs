@@ -928,6 +928,7 @@ async fn partition_locally_known(
     blocking_app_task(move || {
         let caches = app.directory_caches()?;
         let shared_storage = app.shared_storage()?;
+        let local_accounts = app.local_accounts_by_id()?;
         let mut known = Vec::new();
         let mut missing = Vec::new();
         for account_id_hex in frontier {
@@ -935,6 +936,7 @@ async fn partition_locally_known(
                 &account_id_hex,
                 &caches,
                 &shared_storage,
+                &local_accounts,
             )?;
             let record = match promoted {
                 Some(record) if record.profile.is_some() => Some(record),
