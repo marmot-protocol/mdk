@@ -3308,6 +3308,26 @@ fn logical_message_fields(payload: &[u8]) -> (String, String) {
     )
 }
 
+/// Wall-clock second the harness authors its application events from.
+///
+/// The harness has exactly one clock, and it is the system clock: welcomes are
+/// minted by the real `NostrMlsPeeler`, whose rumor `created_at` is
+/// `SystemTime::now()`. Application events must be authored on that same clock,
+/// because the engine compares an unopenable message's envelope time against
+/// the Welcome that installed the local copy (`Group::local_copy_welcome_created_at`).
+/// A fixed fixture epoch put every harness application event years behind every
+/// harness Welcome, which is not a world any deployment can be in. Captured once
+/// per process so a run's events stay mutually ordered by `sequence` alone.
+fn harness_clock_base() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default()
+    })
+}
+
 pub fn encode_harness_app_payload(sender: &MemberId, sequence: u64, payload: Vec<u8>) -> Vec<u8> {
     let (content, tags) = match String::from_utf8(payload) {
         Ok(content) => (content, Vec::new()),
@@ -3321,7 +3341,7 @@ pub fn encode_harness_app_payload(sender: &MemberId, sequence: u64, payload: Vec
     };
     MarmotAppEvent::new(
         hex::encode(sender.as_slice()),
-        1_700_000_000 + sequence,
+        harness_clock_base() + sequence,
         MARMOT_APP_EVENT_KIND_CHAT,
         tags,
         content,
