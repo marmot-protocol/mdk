@@ -4,6 +4,7 @@
 # Outputs:
 #   <crate>/output/MarmotKit.xcframework
 #   <crate>/output/MarmotKit.swift   (generated Swift bindings, separate from the xcframework)
+#   <crate>/output/PrivacyInfo.xcprivacy (feature-selected SDK declaration)
 #
 # Targets:
 #   aarch64-apple-ios       (device, arm64)
@@ -60,7 +61,7 @@ fi
 cd "$WORKSPACE_DIR"
 
 echo "==> Cleaning previous build artifacts"
-rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift"
+rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift" "$OUT_DIR/PrivacyInfo.xcprivacy"
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
 
 echo "==> Ensuring iOS targets are installed"
@@ -87,24 +88,19 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"
 # XCFramework expects the modulemap to be named module.modulemap
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.modulemap"
 
-python3 "$TOOL_DIR/apple-framework.py" \
-  "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
-  "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
-  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
-python3 "$TOOL_DIR/apple-framework.py" \
-  "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
-  "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" ios "$IPHONEOS_DEPLOYMENT_TARGET" \
-  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
-  -framework "$BUILD_DIR/aarch64-apple-ios/marmot_uniffiFFI.framework" \
-  -framework "$BUILD_DIR/aarch64-apple-ios-sim/marmot_uniffiFFI.framework" \
+  -library "$TARGET_DIR/aarch64-apple-ios/release/lib${LIB_BASENAME}.a" -headers "$BUILD_DIR/headers" \
+  -library "$TARGET_DIR/aarch64-apple-ios-sim/release/lib${LIB_BASENAME}.a" -headers "$BUILD_DIR/headers" \
   -output "$OUT_DIR/$FRAMEWORK_NAME.xcframework"
+python3 "$TOOL_DIR/apple-privacy.py" "$OUT_DIR/PrivacyInfo.xcprivacy" \
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 
 echo "==> Copying generated Swift binding to output dir"
 cp "$BUILD_DIR/swift/${LIB_BASENAME}.swift" "$OUT_DIR/${FRAMEWORK_NAME}.swift"
 
 echo ""
 echo "Done."
+echo "  SDK privacy:    $OUT_DIR/PrivacyInfo.xcprivacy"
 echo "  XCFramework:    $OUT_DIR/$FRAMEWORK_NAME.xcframework"
 echo "  Swift binding:  $OUT_DIR/$FRAMEWORK_NAME.swift"

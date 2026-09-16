@@ -24,6 +24,11 @@ previews. Compact metadata is part of native conversation rows; accepted edit hi
 Migration 76 repairs existing projections. Raw edit events remain available, but edits are no longer transcript rows.
 See the [native edit contract](../../../crates/marmot-uniffi/CONVERSATION-WINDOW.md#accepted-edits-c6a).
 
+C7-A adds protected avatar-byte storage and bounded local reads in `storage-sqlite`, with source-generation
+fencing and separate narrow LRU bookkeeping. Download maintenance and native integration remain C7-B/C;
+existing clients should keep their image-loading paths until that handoff.
+See [avatar cache storage](../further-context/avatar-cache-storage.md).
+
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
 return a typed preparation requirement. Live screen composition is C5 M4; native bindings remain M5. See

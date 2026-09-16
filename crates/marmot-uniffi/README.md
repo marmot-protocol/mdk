@@ -5,10 +5,12 @@ UniFFI bindings for the Marmot app runtime.
 The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
 package that shared surface:
 
-- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` for iOS.
+- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
+  `output/PrivacyInfo.xcprivacy` for iOS.
 - `./crates/marmot-uniffi/xcframework-macos.sh` builds `output/macos/MarmotKit.xcframework` plus
-  `output/macos/MarmotKit.swift` for macOS on Apple Silicon (`aarch64-apple-darwin`). Its output directory is separate
-  from the iOS one so building both in one workspace cannot clobber either artifact.
+  `output/macos/MarmotKit.swift` and `output/macos/PrivacyInfo.xcprivacy` for macOS on Apple Silicon
+  (`aarch64-apple-darwin`). Its output directory is separate from the iOS one so building both in one workspace
+  cannot clobber either artifact.
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
   `jniLibs` shared libraries.
 
@@ -452,7 +454,7 @@ for opening, paging, cancellation, timeout, ownership and draft migration.
 
 ## Apple privacy resources
 
-Apple exporters use resource-bearing static framework slices. See the
+Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target. See the
 [privacy audit and adoption guide](apple-privacy/README.md) for declarations,
 archive validation, host integration changes, and unresolved release questions.
 

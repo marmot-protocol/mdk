@@ -54,8 +54,8 @@ cannot gain admin deletion privileges.
 
 ## Persistence and retention
 
-Migration 0077 introduced source-authority metadata and a durable backfill cursor.
-Migration 0078 replaces its logical-report and aggregate-summary tables with one
+Migration 0078 introduced source-authority metadata and a durable backfill cursor.
+Migration 0079 replaces its logical-report and aggregate-summary tables with one
 indexed row per report event. It preserves account history and established
 source-authority verdicts, drops the former group-eligibility flag, and resets the
 bounded backfill cursor over the existing prefix. Old eligibility denials for

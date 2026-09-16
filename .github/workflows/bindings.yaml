@@ -186,14 +186,17 @@ jobs:
         shell: bash
         env:
           PRIVACY_BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
         run: |
           set -euo pipefail
           command -v xcodegen >/dev/null || brew install xcodegen
           python3 crates/marmot-uniffi/test-apple-privacy.py
           python3 crates/marmot-uniffi/validate-apple-archive.py ios \
             "dist/$PRIVACY_BINARY_NAME" \
-            packaged-source/crates/marmot-uniffi/output/MarmotKit.swift \
+            "dist/MarmotKit-$RELEASE_ID.swift" \
             "$RUNNER_TEMP/marmotkit-ios-privacy-archive" \
+            --privacy-manifest "dist/PrivacyInfo-ios-$RELEASE_ID.xcprivacy" \
+            --release-manifest "dist/marmotkit-ios-$RELEASE_ID.manifest.json" \
             --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
             --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
 
@@ -292,14 +295,18 @@ jobs:
         shell: bash
         env:
           PRIVACY_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
         run: |
           set -euo pipefail
           command -v xcodegen >/dev/null || brew install xcodegen
           python3 crates/marmot-uniffi/test-apple-privacy.py
+          cp packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift "$RUNNER_TEMP/MarmotKit-$RELEASE_ID.swift"
           python3 crates/marmot-uniffi/validate-apple-archive.py macos \
             "dist/$PRIVACY_BINARY_NAME" \
-            packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift \
+            "$RUNNER_TEMP/MarmotKit-$RELEASE_ID.swift" \
             "$RUNNER_TEMP/marmotkit-macos-privacy-archive" \
+            --privacy-manifest "dist/PrivacyInfo-macos-$RELEASE_ID.xcprivacy" \
+            --release-manifest "dist/marmotkit-macos-$RELEASE_ID.manifest.json" \
             --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
             --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
 
@@ -592,16 +599,14 @@ jobs:
           MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.
 
           iOS assets:
-          - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive.
+          - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive; its SwiftPM checksum is \`$checksum\`.
           - \`marmotkit-ios-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
-
-          iOS SwiftPM checksum: \`$checksum\`
+          - \`PrivacyInfo-ios-$version.xcprivacy\`: SDK privacy declaration; verify its sibling \`.sha256\` and copy it into the Swift wrapper as \`PrivacyInfo.xcprivacy\`.
 
           macOS assets (arm64):
-          - \`$MACOS_BINARY_NAME\`: SwiftPM-compatible binary target archive.
+          - \`$MACOS_BINARY_NAME\`: SwiftPM-compatible binary target archive; its SwiftPM checksum is \`$macos_checksum\`.
           - \`marmotkit-macos-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
-
-          macOS SwiftPM checksum: \`$macos_checksum\`
+          - \`PrivacyInfo-macos-$version.xcprivacy\`: SDK privacy declaration; verify its sibling \`.sha256\` and copy it into the Swift wrapper as \`PrivacyInfo.xcprivacy\`.
 
           Android assets:
           - \`marmotkit-android-$version.zip\`: generated Kotlin bindings and JNI libraries for all supported ABIs.
@@ -614,6 +619,12 @@ jobs:
           \`marmotkit-macos-$version.manifest.json\`, and the matching \`.checksums.txt\` assets.
           Verify the Android archive with its sibling \`.sha256\`; its embedded \`manifest.json\` records the exact
           source and workflow builder commits.
+          Migration required: Apple XCFrameworks now contain raw static-library slices. Keep the remote binary target,
+          update the matching Swift binding, and copy the platform privacy asset into that Swift target as
+          \`PrivacyInfo.xcprivacy\`; declare \`resources: [.copy("PrivacyInfo.xcprivacy")]\` in its \`Package.swift\`.
+          Updating only a binary URL loses SDK privacy delivery. Assign the wrapper product to each app/extension.
+          The existing provenance bundle ZIPs include all three inputs. No additional complete-package ZIP is published.
+          These checks validate local archives, not App Store export or upload. The Rust debug policy is unchanged.
           Assets on this release are immutable.
           EOF
 

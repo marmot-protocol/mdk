@@ -12,6 +12,7 @@ pub use group_system::{
 
 mod account_projection;
 mod agent_stream_sequences;
+mod avatar_cache;
 mod chat_list;
 mod chat_presentation;
 mod codec;
@@ -39,6 +40,11 @@ pub use account_projection::{
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
+};
+pub use avatar_cache::{
+    AvatarAssetRead, AvatarAssetRef, AvatarAssetStatus, AvatarAvailability, AvatarCacheUsage,
+    AvatarImage, AvatarImageFormat, AvatarPublishResult, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES,
+    MAX_AVATAR_CACHE_ENTRIES, MAX_AVATAR_DIMENSION,
 };
 pub use chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,

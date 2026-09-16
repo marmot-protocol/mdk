@@ -162,10 +162,13 @@ mod migration_0074_chat_list_invite_attention;
 mod migration_0075_user_blocks;
 #[path = "migrations/0076_accepted_edits.rs"]
 mod migration_0076_accepted_edits;
-#[path = "migrations/0077_content_reports.rs"]
-mod migration_0077_content_reports;
-#[path = "migrations/0078_simple_content_reports.rs"]
-mod migration_0078_simple_content_reports;
+#[path = "migrations/0078_content_reports.rs"]
+mod migration_0078_content_reports;
+#[path = "migrations/0079_simple_content_reports.rs"]
+mod migration_0079_simple_content_reports;
+
+#[path = "migrations/0077_avatar_cache.rs"]
+mod migration_0077_avatar_cache;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -556,13 +559,18 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 77,
-        name: "0077_content_reports",
-        apply: migration_0077_content_reports::apply,
+        name: "0077_avatar_cache",
+        apply: migration_0077_avatar_cache::apply,
     },
     Migration {
         version: 78,
-        name: "0078_simple_content_reports",
-        apply: migration_0078_simple_content_reports::apply,
+        name: "0078_content_reports",
+        apply: migration_0078_content_reports::apply,
+    },
+    Migration {
+        version: 79,
+        name: "0079_simple_content_reports",
+        apply: migration_0079_simple_content_reports::apply,
     },
 ];
 
@@ -990,6 +998,50 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn avatar_cache_upgrade_preserves_existing_account_and_store_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avatar-upgrade.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..76]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count)
+             VALUES('aabb', 'fixture', 'Retained group', 7, 2);"
+        ).unwrap();
+        let before: Vec<u8> = conn
+            .query_row(
+                "SELECT store_epoch FROM chat_presentation_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        run_all(&mut conn).unwrap();
+        assert_eq!(run_all(&mut conn).unwrap(), 0);
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM avatar_assets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+        let mut reopened = keyed_connection(&path);
+        assert_eq!(run_all(&mut reopened).unwrap(), 0);
+        let after: Vec<u8> = reopened
+            .query_row(
+                "SELECT store_epoch FROM chat_presentation_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        let name: String = reopened
+            .query_row(
+                "SELECT profile_name FROM account_groups WHERE group_id_hex='aabb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Retained group");
+    }
+
     fn keyed_connection(path: &Path) -> rusqlite::Connection {
         let connection = rusqlite::Connection::open(path).unwrap();
         let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
@@ -1334,9 +1386,9 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 78,
+                found,
                 latest_supported: 46,
-            }
+            } if found == MIGRATIONS.last().unwrap().version
         ));
         let after: i64 = older_connection
             .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
@@ -1390,9 +1442,9 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 78,
+                found,
                 latest_supported: 46,
-            }
+            } if found == MIGRATIONS.last().unwrap().version
         ));
     }
 
@@ -1694,9 +1746,9 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 78,
+                found,
                 latest_supported: 46,
-            }
+            } if found == MIGRATIONS.last().unwrap().version
         ));
         assert_eq!(
             applied_migrations_from_connection(&connection),
@@ -3136,7 +3188,7 @@ mod simple_content_reports_tests {
     fn simplifies_populated_schema_without_resetting_history_or_legacy_deletions() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-        run(&mut conn, &MIGRATIONS[..77]).unwrap();
+        run(&mut conn, &MIGRATIONS[..78]).unwrap();
         for (id, kind, grant, allowed, state) in [
             ("chat", 9, 0, 1, 0),
             ("report", 1984, 0, 1, 2),
