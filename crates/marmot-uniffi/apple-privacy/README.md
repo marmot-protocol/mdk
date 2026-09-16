@@ -100,17 +100,19 @@ python3 crates/marmot-uniffi/validate-apple-archive.py macos /path/marmotkit-swi
 Pass `--privacy-dir` for the packaged source checkout and select the actual build's analytics feature. The validator
 checks real Rust calls, privacy resources in each consumer, static linkage and matching executable/dSYM UUIDs,
 and rejects any embedded Marmot framework stub. It writes `archive-checks.json`. It does not require new Rust source
-line information: that policy change belongs in a separate PR. Complete-package adoption replaces steps 2–3 and the
-framework-specific command in step 5 below. Run the complete-package fixture commands above; do not pass raw-library
-slices to `validate-apple-privacy.py --archive`, which expects the legacy framework layout.
+line information: that policy change belongs in a separate PR. Follow the White Noise adoption checklist below.
+Do not pass raw-library slices to `validate-apple-privacy.py --archive`, which expects the legacy framework layout.
 
 The fixture validates SDK packaging, not White Noise's integration. In the actual host archive, verify the reviewed
 declarations in `MarmotKit_MarmotKit.bundle/PrivacyInfo.xcprivacy` within both the iOS app and each consuming extension
 (macOS: `Contents/Resources/MarmotKit_MarmotKit.bundle/Contents/Resources/PrivacyInfo.xcprivacy`). Check that the empty
 FFI framework is absent and each executable has its matching dSYM. The host privacy assessment, Organizer privacy
-report and signed export/upload checks in steps 4–5 still apply.
+report and signed export/upload checks in the adoption checklist still apply.
 
-Raw `.a` slices cannot carry resources. Each exporter now stages a static
+## Legacy framework layout and validation
+
+This compatibility path retains the Xcode 27 empty-stub behavior. Raw `.a` slices cannot carry resources.
+The legacy exporter stages a static
 `marmot_uniffiFFI.framework` around the **byte-identical Cargo archive**, with
 the generated header and a framework-form module map preserving the C module
 name. It does not regenerate or edit Swift API declarations. `xcodebuild
@@ -130,7 +132,7 @@ Xcode 15+ supports linking and embedding static frameworks while omitting the
 static binary from the embedded resource bundle. A standalone `.a`, copied ZIP,
 or a successful SwiftPM library link is not archive evidence.
 
-## Validation and host adoption
+### Legacy artifact and archive checks
 
 Run the resource-loss tests and both platform validators. For full artifact and
 app-archive checks (XcodeGen is required; local validation used 2.44.1):
@@ -160,30 +162,35 @@ requires a certificate/profile; a signed host archive remains a release check. T
 in the archive and compares the embedded SDK manifest to the artifact's manifest.
 It fails if resources exist only in the input XCFramework or DerivedData.
 
-After resolving the release questions above and publishing a **new immutable**
-release, White Noise should:
+## White Noise adoption
 
-1. Update its existing binding synchronization flow to pin the new exact tag,
-   verify ZIP SHA-256/SwiftPM checksums and source/builder provenance, and update
-   Swift source and platform binary together. Do not reuse a 0.9.21 URL/checksum.
-2. Preserve the complete XCFramework and its versioned macOS symlinks. Do not
-   extract just the archive or copy a manifest beside the library.
-3. For direct Xcode integration, link and **Embed & Sign** the static framework
-   using Xcode 15+. For SwiftPM, validate the final app archive; do not assume
-   the source target's successful link proves resource propagation. Update any
-   consumer scripts that assume `HeadersPath` or a `.a` slice layout.
-4. Keep the host's manifest and review its app/app-group file access, app-owned
-   collection and extensions separately. Keep MDK's root in an app/app-group
-   container. Verify each app/extension that links the SDK contains the resource.
-   **The SDK manifest does not declare DiskSpace:** SQLCipher's `statfs`/`fstatfs`
-   purpose remains unresolved. Resolve that before App Store submission; a green
-   resource check does not close it. Adding a host declaration is valid only if
-   its approved reason actually covers those native calls. Do not substitute a
-   host low-disk-space feature for SQLCipher's unrelated locking/filesystem use.
-5. Run `validate-apple-privacy.py <new.xcframework> --archive <host.xcarchive>`.
-   In Organizer choose **Generate Privacy Report** and compare its aggregated
-   collection to consent screens, policy, configured services and App Store
-   privacy answers. A local archive/report does not validate an App Store upload.
+After resolving the release questions above and publishing a **new immutable** release:
+
+1. Pin its exact tag and download `marmotkit-swiftpm-ios-<id>.zip` (or `marmotkit-swiftpm-macos-<id>.zip`)
+   plus its sibling `.sha256`. In the download directory, run `shasum -a 256 -c <filename>.sha256` before extracting.
+   Verify the source/builder provenance in the package manifest. Update the complete package as one unit in the
+   binding synchronization flow; do not apply a legacy binary-target checksum to this ZIP.
+2. Add the extracted `MarmotKit` directory as a local Swift package and assign its product to the app and notification
+   extension. Replace the old wrapper dependency and remove the extra host-compiled `MarmotKit.swift` copy. Preserve
+   the package's `Package.swift`, raw-library XCFramework, generated Swift, and target-owned `PrivacyInfo.xcprivacy`.
+3. Run the complete-package fixture commands above with the matching source privacy declarations and build features.
+   Archive the actual host app and check the SDK bundle in every consuming app/extension, absence of the empty FFI
+   framework, and matching executable/dSYM UUIDs. Fixture success alone does not verify host integration.
+4. Keep the host's manifest and review its app/app-group file access, app-owned collection and extensions separately.
+   Keep MDK's root in an app/app-group container. **The SDK manifest does not declare DiskSpace:** SQLCipher's
+   `statfs`/`fstatfs` purpose remains unresolved. Resolve that before App Store submission; a green resource check does
+   not close it. Adding a host declaration is valid only if its approved reason actually covers those native calls.
+   Do not substitute a host low-disk-space feature for SQLCipher's unrelated locking/filesystem use.
+5. In Organizer choose **Generate Privacy Report** and compare its aggregated collection to consent screens, policy,
+   configured services and App Store privacy answers. Validate a signed distribution export, then perform a staging
+   App Store Connect/TestFlight upload. Record each result separately; a local archive/report does not establish
+   upload acceptance. Track migration evidence in [#1874](https://github.com/marmot-protocol/mdk/issues/1874).
+
+For consumers temporarily retaining the legacy format, preserve the whole resource-bearing XCFramework and versioned
+macOS symlinks, update the binary/checksum/generated Swift together, and use the legacy validator commands above.
+Direct Xcode integrations still link and **Embed & Sign** that framework. For an existing host archive use
+`validate-apple-privacy.py <new.xcframework> --archive <host.xcarchive>`. These compatibility steps preserve its privacy
+resource but do not implement the empty-stub fix; they are not the White Noise migration path.
 
 ## Official sources verified 2026-09-15
 

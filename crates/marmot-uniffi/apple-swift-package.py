@@ -155,6 +155,8 @@ def check_archive(archive, package, privacy_dir=HERE / "apple-privacy", analytic
         resources = bundle / "Contents/Resources" if macos else bundle
         resource_bundle = resources / "MarmotKit_MarmotKit.bundle"
         resource = resource_bundle / ("Contents/Resources" if macos else "") / "PrivacyInfo.xcprivacy"
+        if not resource.is_file():
+            raise ValueError(f"MarmotKit privacy resource did not reach {bundle.name}: {resource}")
         if privacy.check_manifest(resource, privacy_dir, analytics) != expected:
             raise ValueError("archived SDK privacy declarations differ from packaged source")
     if list(products.rglob(NAME + ".framework")):
@@ -207,6 +209,10 @@ def check_archive(archive, package, privacy_dir=HERE / "apple-privacy", analytic
 
 
 def build_package(artifact, binding, provenance, output, privacy_dir, analytics):
+    """Build the ZIP and update the platform release manifest with its package hash.
+
+    Callers must hash/copy provenance after this function returns.
+    """
     expected = privacy.check_xcframework(artifact, privacy_dir, analytics)
     original = json.loads(provenance.read_text())
     platform = original["name"].removeprefix("marmotkit-")
@@ -278,7 +284,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
     parser.add_argument("binding", type=Path)
-    parser.add_argument("provenance", type=Path)
+    parser.add_argument("provenance", type=Path,
+                        help="platform release manifest; updated in place with the package hash")
     parser.add_argument("output", type=Path)
     parser.add_argument("--privacy-dir", type=Path, required=True)
     parser.add_argument("--product-analytics", choices=["0", "1", "true", "false"], required=True)

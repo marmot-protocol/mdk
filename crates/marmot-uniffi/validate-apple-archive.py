@@ -70,7 +70,11 @@ let package = Package(name: "MarmotKit", platforms: [.iOS(.v18), .macOS(.v15)],
     products: [.library(name: "MarmotKit", targets: ["MarmotKit"])],
     targets: [
         .binaryTarget(name: "MarmotKitFFI", path: "MarmotKit.xcframework"),
-        .target(name: "MarmotKit", dependencies: ["MarmotKitFFI"])
+        .target(name: "MarmotKit", dependencies: ["MarmotKitFFI"],
+            linkerSettings: [
+                .linkedFramework("Security", .when(platforms: [.macOS])),
+                .linkedFramework("SystemConfiguration", .when(platforms: [.macOS]))
+            ])
     ])
 ''')
     app = work / "App"

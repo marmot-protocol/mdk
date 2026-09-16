@@ -69,22 +69,14 @@ version resolution or automatic binary-download checksum verification. Host sync
 SHA-256 and pin provenance on every update. The extracted package can be an ignored, reproducibly downloaded build
 input; committing binary blobs to the host repository is not required.
 
-Two other distribution shapes can also move resources out of the framework:
-
-- A raw-library binary-target ZIP plus separate Swift and privacy assets lets the host keep a remote binary target.
-  It adds another independently copied input and makes the host responsible for declaring and preserving the SDK
-  resource. Replacing the existing framework ZIP with that layout would silently remove privacy delivery for hosts
-  that only update their binary URL. Publishing it under a new name still requires an explicit migration. This PR
-  chooses a complete package to keep those inputs and their resource declaration together.
-- A tagged remote Swift wrapper package could own Swift/privacy resources and reference a raw-library release ZIP
-  by URL and checksum. This preserves SwiftPM resolution and is a viable follow-up for automated consumption.
-  It requires a distribution repository, platform-specific artifact selection, coordinated tag/asset publication
-  and consumer validation. This PR does not establish that additional publishing contract.
+Alternative distribution designs and the reason for choosing a complete package are recorded in
+[PR #1872](https://github.com/marmot-protocol/mdk/pull/1872).
 
 Existing framework assets remain available during migration, including for direct Xcode integrations. Retire them
 only in a future announced release after White Noise and other known consumers have migrated, host privacy reports
 and signed uploads have been checked, and any required remote-wrapper replacement is available. No removal version
-is set here, and already-published assets remain immutable.
+is set here; [migration and retirement issue #1874](https://github.com/marmot-protocol/mdk/issues/1874) tracks
+consumer adoption, release evidence, and the eventual removal version. Already-published assets remain immutable.
 
 Release CI archives the complete package on both Apple platforms. iOS checks the app and notification extension;
 macOS checks the app and its ad-hoc signature. The checks require correct SDK resources, unchanged static linkage,
@@ -120,6 +112,11 @@ https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha
 These URLs always contain an exact tag or snapshot identifier. Do not use a `latest` URL for SwiftPM artifacts.
 
 ### SwiftPM
+
+Use the [complete local Swift package](#complete-apple-swiftpm-packages) for the privacy-resource migration.
+The compatibility recipe below retains the framework layout and can still produce the Xcode 27 empty-stub warning.
+
+#### Legacy framework binary target
 
 Download the sibling `.swiftpm-checksum` asset or read the `swiftpm` record in
 `marmotkit-ios-<identifier>.checksums.txt`, then declare:
@@ -166,6 +163,11 @@ https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha
 ```
 
 ### SwiftPM
+
+Use the [complete local Swift package](#complete-apple-swiftpm-packages) for the privacy-resource migration.
+The compatibility recipe below retains the framework layout and can still produce the Xcode 27 empty-stub warning.
+
+#### Legacy framework binary target
 
 Download the sibling `.swiftpm-checksum` asset or read the `swiftpm` record in
 `marmotkit-macos-<identifier>.checksums.txt`, then declare:

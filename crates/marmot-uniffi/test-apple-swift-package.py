@@ -238,7 +238,7 @@ class SwiftPackageTests(unittest.TestCase):
         resource = app / "MarmotKit_MarmotKit.bundle/PrivacyInfo.xcprivacy"
         resource.parent.mkdir()
         shutil.copyfile(package / package_tools.RESOURCE, resource)
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaisesRegex(ValueError, "privacy resource did not reach Notification.appex"):
             package_tools.check_archive(archive, package)
 
     def test_codeless_framework_is_rejected_with_privacy_present(self):
