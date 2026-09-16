@@ -191,14 +191,16 @@ def check_archive(archive, package, privacy_dir=HERE / "apple-privacy", analytic
         if not macos and bundle != app:
             if info.get("NSExtension", {}).get("NSExtensionPointIdentifier") != "com.apple.usernotifications.service":
                 raise ValueError("expected a notification service extension")
-        matched = [path for path, ids in symbol_ids.items() if uuids(binary) == ids]
+        binary_ids = uuids(binary)
+        matched = [path for path, ids in symbol_ids.items() if binary_ids == ids]
         if len(matched) != 1:
             raise ValueError("consumer dSYM missing or ambiguous")
         names = run("xcrun", "nm", "-nm", matched[0])
         if not re.search(r"^[0-9a-fA-F]+ .* _uniffi_marmot_uniffi_fn_func_parse_media_imeta_tag$", names, re.M):
             raise ValueError("real Rust parser was not linked into the consumer")
-        dependencies = run("xcrun", "otool", "-L", binary)
-        if "marmot_uniffi" in dependencies or "MarmotKit" in dependencies:
+        # otool's first line names the inspected binary, not a dependency.
+        dependencies = run("xcrun", "otool", "-L", binary).splitlines()[1:]
+        if any("marmot_uniffi" in line or "MarmotKit" in line for line in dependencies):
             raise ValueError("MarmotKit must remain statically linked")
     return dict(validation="local archive only; export and upload not validated", images=images,
                 privacy_resources="matched in every consumer", linking="static", rust_debug_policy="unchanged")
@@ -247,7 +249,9 @@ def build_package(artifact, binding, provenance, output, privacy_dir, analytics)
                         "-output", str(package / XCFRAMEWORK)], check=True)
         # This is a distinct distribution manifest. Retain source/build/profile
         # identity, replace the old framework payload inventory with this one.
-        manifest = {k: v for k, v in original.items() if k not in ("artifacts", "contents", "swiftpm_package")}
+        # distribution versions this contract independently of the framework schema.
+        manifest = {k: v for k, v in original.items()
+                    if k not in ("schema_version", "artifacts", "contents", "swiftpm_package")}
         manifest.update(name="marmotkit-swiftpm-" + platform, platform=platform,
                         distribution="swiftpm-resources-v1", source_library_sha256=library_hashes,
                         generated_swift_sha256=digest(binding), files=file_hashes(package))

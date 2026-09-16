@@ -32,6 +32,7 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
   Stage those unchanged archives inside resource-bearing static frameworks; preserve macOS versioned symlinks.
   Validate privacy declarations against the packaged source and build features, then validate resources in a
   consuming app archived from the packaged ZIP. Existing binary-target assets keep their framework layout.
+  Both legacy-framework and complete-package archive fixtures call real Rust code so resource checks also exercise linking.
   Complete `marmotkit-swiftpm-<platform>-<id>.zip` packages use byte-identical raw-library slices and a Swift
   target-owned privacy resource. Treat that entire package as the distribution unit; never ship only its raw library.
   Validate its app/notification-extension resources and reject embedded codeless framework stubs. Keep the Rust

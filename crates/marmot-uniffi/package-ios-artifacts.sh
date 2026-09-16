@@ -59,6 +59,8 @@ manifest_name="marmotkit-ios-${RELEASE_ID}.manifest.json"
 bundle_name="marmotkit-ios-${RELEASE_ID}.zip"
 checksums_name="marmotkit-ios-${RELEASE_ID}.checksums.txt"
 
+swiftpm_package_name="marmotkit-swiftpm-ios-${RELEASE_ID}.zip"
+
 stage_parent="$(mktemp -d)"
 trap 'rm -rf "$stage_parent"' EXIT
 bundle_dir="$stage_parent/marmotkit-ios-$RELEASE_ID"
@@ -66,6 +68,8 @@ bundle_dir="$stage_parent/marmotkit-ios-$RELEASE_ID"
 mkdir -p "$DIST_DIR" "$bundle_dir"
 DIST_DIR="$(cd "$DIST_DIR" && pwd)"
 rm -f \
+  "$DIST_DIR/$swiftpm_package_name" \
+  "$DIST_DIR/$swiftpm_package_name.sha256" \
   "$DIST_DIR/$binary_name" \
   "$DIST_DIR/$binary_name.sha256" \
   "$DIST_DIR/$binary_name.swiftpm-checksum" \
@@ -167,7 +171,6 @@ EOF
 
 # Complete local Swift package: raw static libraries plus wrapper-owned privacy.
 # Keep existing framework assets intact for consumers that have not migrated.
-swiftpm_package_name="marmotkit-swiftpm-ios-${RELEASE_ID}.zip"
 python3 "$TOOL_DIR/apple-swift-package.py" \
   "$XCFRAMEWORK" "$SWIFT_BINDING" "$DIST_DIR/$manifest_name" \
   "$DIST_DIR/$swiftpm_package_name" \

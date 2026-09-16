@@ -100,8 +100,15 @@ python3 crates/marmot-uniffi/validate-apple-archive.py macos /path/marmotkit-swi
 Pass `--privacy-dir` for the packaged source checkout and select the actual build's analytics feature. The validator
 checks real Rust calls, privacy resources in each consumer, static linkage and matching executable/dSYM UUIDs,
 and rejects any embedded Marmot framework stub. It writes `archive-checks.json`. It does not require new Rust source
-line information: that policy change belongs in a separate PR. Complete-package adoption replaces steps 2–3 in the
-framework host-adoption checklist below; the remaining host privacy and release checks still apply.
+line information: that policy change belongs in a separate PR. Complete-package adoption replaces steps 2–3 and the
+framework-specific command in step 5 below. Run the complete-package fixture commands above; do not pass raw-library
+slices to `validate-apple-privacy.py --archive`, which expects the legacy framework layout.
+
+The fixture validates SDK packaging, not White Noise's integration. In the actual host archive, verify the reviewed
+declarations in `MarmotKit_MarmotKit.bundle/PrivacyInfo.xcprivacy` within both the iOS app and each consuming extension
+(macOS: `Contents/Resources/MarmotKit_MarmotKit.bundle/Contents/Resources/PrivacyInfo.xcprivacy`). Check that the empty
+FFI framework is absent and each executable has its matching dSYM. The host privacy assessment, Organizer privacy
+report and signed export/upload checks in steps 4–5 still apply.
 
 Raw `.a` slices cannot carry resources. Each exporter now stages a static
 `marmot_uniffiFFI.framework` around the **byte-identical Cargo archive**, with

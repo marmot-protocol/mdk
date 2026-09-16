@@ -50,15 +50,41 @@ stub. No privacy declaration is removed or changed. The generated Swift and arch
 framework distribution; Rust release/debug settings are unchanged. Crash source maps are separate work.
 
 The package's `manifest.json` retains source/builder SHA, feature selection, toolchain and profile provenance, and
-adds hashes of every payload file and the original static archives. The platform release manifest records the package
+adds hashes of every payload file and the original static archives. Its `distribution: swiftpm-resources-v1` field
+versions this contract; it does not inherit the framework manifest's `schema_version`. The platform release manifest records the package
 ZIP SHA-256 under `swiftpm_package`; its checksums file also lists that ZIP. macOS embeds the same generated Swift
 source in this complete package, while the standalone `.swift` release asset remains owned by the iOS job.
 
 A complete package is the unit of integration. A raw library cannot carry resources by itself; copying only its
 XCFramework loses the privacy resource. Keep the host's own privacy manifest and declarations too. The framework
 assets documented below retain their current formats and manifests for compatibility, but their codeless resource
-framework can still trigger a missing-dSYM warning on Xcode 27. Adopting this new package is required to avoid that
-stub; updating only an old binary URL is not the migration.
+framework can still trigger a missing-dSYM warning on Xcode 27. Adopting this package is the migration provided by
+this release to avoid that stub; updating only an old binary URL does not change resource ownership.
+
+### Distribution tradeoffs and compatibility
+
+The complete ZIP keeps generated Swift, unchanged native code and the SDK-owned privacy declaration together in
+one verifiable release asset. The cost is an explicit download/update step: a local package has no remote SwiftPM
+version resolution or automatic binary-download checksum verification. Host synchronization must verify the sibling
+SHA-256 and pin provenance on every update. The extracted package can be an ignored, reproducibly downloaded build
+input; committing binary blobs to the host repository is not required.
+
+Two other distribution shapes can also move resources out of the framework:
+
+- A raw-library binary-target ZIP plus separate Swift and privacy assets lets the host keep a remote binary target.
+  It adds another independently copied input and makes the host responsible for declaring and preserving the SDK
+  resource. Replacing the existing framework ZIP with that layout would silently remove privacy delivery for hosts
+  that only update their binary URL. Publishing it under a new name still requires an explicit migration. This PR
+  chooses a complete package to keep those inputs and their resource declaration together.
+- A tagged remote Swift wrapper package could own Swift/privacy resources and reference a raw-library release ZIP
+  by URL and checksum. This preserves SwiftPM resolution and is a viable follow-up for automated consumption.
+  It requires a distribution repository, platform-specific artifact selection, coordinated tag/asset publication
+  and consumer validation. This PR does not establish that additional publishing contract.
+
+Existing framework assets remain available during migration, including for direct Xcode integrations. Retire them
+only in a future announced release after White Noise and other known consumers have migrated, host privacy reports
+and signed uploads have been checked, and any required remote-wrapper replacement is available. No removal version
+is set here, and already-published assets remain immutable.
 
 Release CI archives the complete package on both Apple platforms. iOS checks the app and notification extension;
 macOS checks the app and its ad-hoc signature. The checks require correct SDK resources, unchanged static linkage,

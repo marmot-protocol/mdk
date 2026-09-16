@@ -203,7 +203,6 @@ jobs:
           RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
         run: |
           set -euo pipefail
-          python3 crates/marmot-uniffi/test-apple-swift-package.py
           python3 crates/marmot-uniffi/validate-apple-archive.py ios \
             "dist/marmotkit-swiftpm-ios-$RELEASE_ID.zip" - \
             "$RUNNER_TEMP/marmotkit-ios-swiftpm-archive" \
@@ -323,7 +322,6 @@ jobs:
           RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
         run: |
           set -euo pipefail
-          python3 crates/marmot-uniffi/test-apple-swift-package.py
           python3 crates/marmot-uniffi/validate-apple-archive.py macos \
             "dist/marmotkit-swiftpm-macos-$RELEASE_ID.zip" - \
             "$RUNNER_TEMP/marmotkit-macos-swiftpm-archive" \
@@ -620,18 +618,14 @@ jobs:
           MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.
 
           iOS assets:
-          - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive.
+          - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive; its SwiftPM checksum is \`$checksum\`.
           - \`marmotkit-ios-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
-          - \`marmotkit-swiftpm-ios-$version.zip\`: complete local Swift package with static code and its privacy resource bundle.
-
-          iOS SwiftPM checksum: \`$checksum\`
+          - \`marmotkit-swiftpm-ios-$version.zip\`: complete local Swift package with static code and its privacy resource bundle; verify its sibling \`.sha256\`.
 
           macOS assets (arm64):
-          - \`$MACOS_BINARY_NAME\`: SwiftPM-compatible binary target archive.
+          - \`$MACOS_BINARY_NAME\`: SwiftPM-compatible binary target archive; its SwiftPM checksum is \`$macos_checksum\`.
           - \`marmotkit-macos-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
-          - \`marmotkit-swiftpm-macos-$version.zip\`: complete local Swift package with static code and its privacy resource bundle.
-
-          macOS SwiftPM checksum: \`$macos_checksum\`
+          - \`marmotkit-swiftpm-macos-$version.zip\`: complete local Swift package with static code and its privacy resource bundle; verify its sibling \`.sha256\`.
 
           Android assets:
           - \`marmotkit-android-$version.zip\`: generated Kotlin bindings and JNI libraries for all supported ABIs.

@@ -9,6 +9,7 @@ import shutil
 import stat
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 HERE = Path(__file__).resolve().parent
@@ -125,6 +126,88 @@ class SwiftPackageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             package_tools.check_package(package)
         package_tools.check_package(package, source, False)
+
+    def test_slice_contract_rejects_frameworks_and_invalid_metadata(self):
+        for field, value, message in [
+            ("LibraryPath", "marmot_uniffiFFI.framework", "raw static-library"),
+            ("HeadersPath", "marmot_uniffiFFI.framework/Headers", "raw static-library"),
+            ("LibraryIdentifier", "../outside", "slice identifier"),
+            ("SupportedArchitectures", ["x86_64"], "architecture/platform"),
+        ]:
+            with self.subTest(field=field):
+                package = self.fixture()
+                path = package / "MarmotKit.xcframework/Info.plist"
+                info = plistlib.loads(path.read_bytes())
+                info["AvailableLibraries"][0][field] = value
+                path.write_bytes(plistlib.dumps(info))
+                self.refresh_payload_hashes(package)
+                with self.assertRaisesRegex(ValueError, message):
+                    package_tools.check_package(package)
+                shutil.rmtree(package)
+
+    def test_duplicate_platform_is_rejected(self):
+        package = self.fixture()
+        path = package / "MarmotKit.xcframework/Info.plist"
+        info = plistlib.loads(path.read_bytes())
+        info["AvailableLibraries"].append(info["AvailableLibraries"][0])
+        path.write_bytes(plistlib.dumps(info))
+        self.refresh_payload_hashes(package)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            package_tools.check_package(package)
+
+    def test_payload_contract_survives_refreshed_inventory(self):
+        for relative, contents, message in [
+            ("MarmotKit.xcframework/ios-arm64/libmarmot_uniffi.a", b"dynamic!", "remain static"),
+            ("MarmotKit.xcframework/ios-arm64/Headers/module.modulemap",
+             b"framework module marmot_uniffiFFI {}", "original C module"),
+            (package_tools.BINDING, b"// wrong generated binding", "binding mismatch"),
+        ]:
+            with self.subTest(path=relative):
+                package = self.fixture()
+                (package / relative).write_bytes(contents)
+                self.refresh_payload_hashes(package)
+                with self.assertRaisesRegex(ValueError, message):
+                    package_tools.check_package(package)
+                shutil.rmtree(package)
+
+    def test_extracted_package_symlink_is_rejected(self):
+        package = self.fixture()
+        (package / "alias.swift").symlink_to(package_tools.BINDING)
+        self.refresh_payload_hashes(package)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            package_tools.check_package(package)
+
+    def test_archive_linkage_ignores_own_path_but_rejects_dynamic_dependency(self):
+        package = self.fixture("macos")
+        archive = self.root / "MarmotKit-validation/Consumer.xcarchive"
+        app = archive / "Products/Applications/Consumer.app"
+        resource = app / "Contents/Resources/MarmotKit_MarmotKit.bundle/Contents/Resources/PrivacyInfo.xcprivacy"
+        resource.parent.mkdir(parents=True)
+        shutil.copyfile(package / package_tools.RESOURCE, resource)
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "Consumer"}))
+        binary = app / "Contents/MacOS/Consumer"
+        binary.parent.mkdir()
+        binary.write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        dsym = archive / "dSYMs/Consumer.app.dSYM/Contents/Resources/DWARF/Consumer"
+        dsym.parent.mkdir(parents=True)
+        dsym.write_bytes(b"fixture")
+        dependency = "/usr/lib/libSystem.B.dylib"
+
+        def output(args, **kwargs):
+            if args[1] == "dwarfdump":
+                return "UUID: 11111111-1111-1111-1111-111111111111 (arm64) fixture\n"
+            if args[1] == "nm":
+                return "00000001 T _uniffi_marmot_uniffi_fn_func_parse_media_imeta_tag\n"
+            if args[1] == "otool":
+                return f"{binary}:\n\t{dependency} (compatibility version 1.0.0)\n"
+            self.fail(f"unexpected command: {args}")
+
+        with mock.patch.object(package_tools.subprocess, "check_output", side_effect=output):
+            self.assertEqual(package_tools.check_archive(archive, package)["linking"], "static")
+            for dependency in ["@rpath/MarmotKit.framework/MarmotKit",
+                               "@rpath/marmot_uniffiFFI.framework/marmot_uniffiFFI"]:
+                with self.subTest(dependency=dependency), self.assertRaisesRegex(ValueError, "statically linked"):
+                    package_tools.check_archive(archive, package)
 
     def test_zip_round_trip_and_unsafe_entries(self):
         package = self.fixture()

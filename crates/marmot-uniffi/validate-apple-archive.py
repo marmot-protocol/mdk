@@ -100,7 +100,7 @@ func rustProbe(_ input: String) -> String {
                        settings={"base": dict(PRODUCT_BUNDLE_IDENTIFIER="org.marmot-protocol.privacy-consumer",
                            GENERATE_INFOPLIST_FILE="YES",
                            SWIFT_VERSION="6.0", ENABLE_USER_SCRIPT_SANDBOXING="YES",
-                           DEBUG_INFORMATION_FORMAT="dwarf-with-dsym", LD_GENERATE_MAP_FILE="YES")})})
+                           DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")})})
     if args.swiftpm_package and args.platform == "ios":
         extension = work / "Extension"
         extension.mkdir()
@@ -119,7 +119,7 @@ final class NotificationService: UNNotificationServiceExtension {
             dependencies=[{"package": "MarmotKit"}], settings={"base": dict(
                 PRODUCT_BUNDLE_IDENTIFIER="org.marmot-protocol.privacy-consumer.notification",
                 GENERATE_INFOPLIST_FILE="YES", SWIFT_VERSION="6.0", APPLICATION_EXTENSION_API_ONLY="YES",
-                SKIP_INSTALL="YES", DEBUG_INFORMATION_FORMAT="dwarf-with-dsym", LD_GENERATE_MAP_FILE="YES")},
+                SKIP_INSTALL="YES", DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")},
             info={"path": "Extension/Info.plist", "properties": {"NSExtension": {
                 "NSExtensionPointIdentifier": "com.apple.usernotifications.service",
                 "NSExtensionPrincipalClass": "$(PRODUCT_MODULE_NAME).NotificationService"}}})
