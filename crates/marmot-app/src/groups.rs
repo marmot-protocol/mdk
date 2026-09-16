@@ -20,12 +20,7 @@ use cgka_traits::app_components::{
     encode_encrypted_media_policy_v1, encode_encrypted_media_policy_v2, encode_group_avatar_url_v1,
     encode_nostr_routing_v1, encode_quic_varint,
 };
-use cgka_traits::app_event::{
-    GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS,
-    GROUP_SYSTEM_DATA_OLD_NAME, GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS, GROUP_SYSTEM_DATA_SUBJECT,
-    GROUP_SYSTEM_EVENT_VERSION, GroupSystemEvent, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MarmotAppEvent as MarmotInnerEvent,
-};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::{GroupId, MemberId, TransportEndpoint, TransportGroupSubscription};
@@ -445,53 +440,10 @@ impl From<cgka_traits::DisbandRequest> for AppDisbandRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AppGroupSystemEvent {
-    pub system_type: String,
-    pub text: String,
-    pub actor_account_id_hex: Option<String>,
-    pub subject_account_id_hex: Option<String>,
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_retention_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_retention_seconds: Option<u64>,
-}
-
-pub fn group_system_event_from_message(kind: u64, plaintext: &str) -> Option<AppGroupSystemEvent> {
-    if kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
-        return None;
-    }
-    let event = GroupSystemEvent::parse(plaintext).ok()?;
-    if event.v != GROUP_SYSTEM_EVENT_VERSION {
-        return None;
-    }
-    let actor_account_id_hex = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_ACTOR);
-    let subject_account_id_hex = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_SUBJECT);
-    let name = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_NAME);
-    let old_name = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_OLD_NAME);
-    let old_retention_seconds = event.data_u64(GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS);
-    let new_retention_seconds = event.data_u64(GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS);
-    Some(AppGroupSystemEvent {
-        system_type: event.system_type,
-        text: event.text,
-        actor_account_id_hex,
-        subject_account_id_hex,
-        name,
-        old_name,
-        old_retention_seconds,
-        new_retention_seconds,
-    })
-}
-
-fn non_empty_group_system_data(event: &GroupSystemEvent, key: &str) -> Option<String> {
-    event
-        .data_str(key)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
+pub use storage_sqlite::{
+    GroupSystemEventProjection as AppGroupSystemEvent, GroupSystemEventProvenance,
+    group_system_event_from_message,
+};
 
 /// Coarse, app-facing classification of why a stored group failed session-open
 /// hydration and was quarantined (mdk#151 / #417). Mirrors

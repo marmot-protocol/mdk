@@ -4,9 +4,9 @@ use crate::types::moderation::MarmotMessageModerationSummary;
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    GroupSystemEventFfi, RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi,
-    TimelineEditSummaryFfi, TimelineEditVersionFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    GroupSystemEventFfi, GroupSystemEventProvenanceFfi, RuntimeProjectionUpdateFfi,
+    TimelineEditHistoryPageFfi, TimelineEditSummaryFfi, TimelineEditVersionFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
     TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
@@ -80,9 +80,20 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Storage-verified origin of a kind-1210 row.
+    MarmotGroupSystemEventProvenance from GroupSystemEventProvenanceFfi {
+        AuthenticatedGroupState,
+        MemberAuthored,
+    }
+}
+
 c_mirror! {
     /// Parsed view of a kind-1210 group system row.
     MarmotGroupSystemEvent from GroupSystemEventFfi {
+        copy provenance: MarmotGroupSystemEventProvenance,
+        opt_str actor_display_name,
+        opt_str subject_display_name,
         str system_type,
         /// Human-readable fallback. Prefer rendering from `system_type`
         /// plus the structured fields so clients can localize.

@@ -496,6 +496,7 @@ mod tests {
         let record = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            group_system: None,
             edit: None,
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
@@ -622,6 +623,12 @@ mod tests {
         let record = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            group_system: Some({
+                let mut event =
+                    marmot_app::group_system_event_from_message(1210, &content).unwrap();
+                event.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
+                event
+            }),
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
@@ -671,6 +678,7 @@ mod tests {
         let record = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            group_system: None,
             edit: None,
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,

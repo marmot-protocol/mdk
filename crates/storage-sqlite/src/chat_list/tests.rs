@@ -4652,3 +4652,236 @@ fn accepted_edit_changes_selected_preview_without_activity_or_unread() {
     older_edit_row.updated_at = after.updated_at;
     assert_eq!(older_edit_row, after);
 }
+
+#[test]
+fn system_preview_carries_exact_subject_and_authenticated_provenance() {
+    let store = setup_store();
+    let payload = r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"actor":"bb","subject":"cc"}}"#;
+    store
+        .record_app_event(&group_system(
+            "system-subject",
+            REMOTE,
+            50,
+            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            payload,
+        ))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    let preview = serde_json::to_value(row.last_message.unwrap()).unwrap();
+    assert_eq!(
+        preview["group_system"]["provenance"],
+        "authenticated_group_state"
+    );
+    assert_eq!(preview["group_system"]["subject_account_id_hex"], "cc");
+    let message = store
+        .timeline_message(GROUP, "system-subject")
+        .unwrap()
+        .unwrap();
+    let message = serde_json::to_value(message).unwrap();
+    assert_eq!(message["group_system"], preview["group_system"]);
+}
+
+#[test]
+fn system_preview_provenance_does_not_trust_member_claims_or_stale_payloads() {
+    let store = setup_store();
+    let payload = r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"actor":"forged","subject":"victim"}}"#;
+    let mut event = group_system("spoof", REMOTE, 50, GROUP_SYSTEM_TYPE_MEMBER_ADDED, payload);
+    event.direction = "received".into();
+    event.source_message_id_hex = Some("inner".into());
+    event.origin_commit_id = None;
+    store.record_app_event(&event).unwrap();
+    let message = store.timeline_message(GROUP, "spoof").unwrap().unwrap();
+    let system = message.group_system.unwrap();
+    assert_eq!(
+        system.provenance,
+        crate::GroupSystemEventProvenance::MemberAuthored
+    );
+    assert!(system.actor_account_id_hex.is_none());
+    assert!(system.subject_account_id_hex.is_none());
+    // Existing activity selection may retain this assertion, but the preview
+    // must carry the same explicit untrusted verdict as the timeline.
+    let preview = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    assert_eq!(preview.group_system.as_ref(), Some(&system));
+    event.message_id_hex = "real".into();
+    event.direction = "system".into();
+    event.source_message_id_hex = None;
+    event.origin_commit_id = Some("commit".into());
+    store.record_app_event(&event).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store.lock().unwrap().execute("UPDATE chat_list_rows SET last_message_preview = replace(last_message_preview, 'victim', 'tampered') WHERE group_id_hex = ?1", [GROUP]).unwrap();
+    let system = store
+        .chat_list_row(GROUP)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap()
+        .group_system
+        .unwrap();
+    assert_eq!(
+        system.provenance,
+        crate::GroupSystemEventProvenance::MemberAuthored
+    );
+    assert!(system.subject_account_id_hex.is_none());
+}
+
+#[test]
+fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("systems.db");
+    let key = SqlCipherKey::new("system preview test key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![group()],
+                ..Default::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    for (i, kind) in [
+        GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+        GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+        GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for subject in ["cc", "dd"] {
+            let payload = serde_json::json!({"v":1,"system_type":kind,"text":"changed","data":{"actor":REMOTE,"subject":subject}}).to_string();
+            let id = format!("{i}-{subject}");
+            let mut event = group_system(&id, REMOTE, 100 + i as u64, kind, &payload);
+            event.origin_commit_id = Some("multi".into());
+            store.record_app_event(&event).unwrap();
+            let row = store
+                .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+                .unwrap()
+                .unwrap();
+            let preview = row.last_message.unwrap();
+            assert_eq!(preview.message_id_hex, id);
+            assert_eq!(
+                preview
+                    .group_system
+                    .as_ref()
+                    .unwrap()
+                    .subject_account_id_hex
+                    .as_deref(),
+                Some(subject)
+            );
+            assert_eq!(
+                preview.group_system,
+                store
+                    .timeline_message(GROUP, &id)
+                    .unwrap()
+                    .unwrap()
+                    .group_system
+            );
+        }
+    }
+    let before = store
+        .chat_list_row(GROUP)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap(),
+        before
+    );
+    store
+        .invalidate_app_event_by_message_id(GROUP, "4-dd", "SupersededByBranchSelection")
+        .unwrap();
+    let after = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    assert_eq!(after.message_id_hex, "4-cc");
+    assert_eq!(
+        after
+            .group_system
+            .unwrap()
+            .subject_account_id_hex
+            .as_deref(),
+        Some("cc")
+    );
+    store
+        .clear_branch_selection_withdrawal_by_origin_commit("multi")
+        .unwrap();
+    assert_eq!(
+        store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn authenticated_system_preview_without_commit_attribution_keeps_subject() {
+    let store = setup_store();
+    let payload = r#"{"v":1,"system_type":"member_removed","text":"You were removed","data":{"subject":"aa"}}"#;
+    let mut event = group_system(
+        "self-removal-no-commit",
+        "",
+        70,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+        payload,
+    );
+    event.origin_commit_id = None;
+    store.record_app_event(&event).unwrap();
+    let preview = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    let system = preview.group_system.unwrap();
+    assert_eq!(
+        system.provenance,
+        crate::GroupSystemEventProvenance::AuthenticatedGroupState
+    );
+    assert_eq!(system.subject_account_id_hex.as_deref(), Some(LOCAL));
+    assert!(system.actor_account_id_hex.is_none());
+    let row = store
+        .timeline_message(GROUP, &preview.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.group_system.as_ref(), Some(&system));
+    let captured = store
+        .conversation_presentation_page(crate::TimelinePage {
+            messages: vec![row],
+            has_more_before: false,
+            has_more_after: false,
+        })
+        .unwrap();
+    assert_eq!(captured.authenticated_system_content(0), Some(payload));
+    assert_eq!(
+        captured.page().messages[0].group_system.as_ref(),
+        Some(&system)
+    );
+}

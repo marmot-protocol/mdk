@@ -53,6 +53,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
         revision_id_hex: String::new(),
         moderation: storage_sqlite::MessageModerationSummary::default(),
+        group_system: None,
         edit: None,
         message_id_hex: "01".repeat(32),
         source_message_id_hex: Some("02".repeat(32)),
@@ -347,6 +348,22 @@ fn conversation_system_references_require_matching_stored_commit_provenance() {
             moderation_grant: false,
         })
         .unwrap();
+    // Public row DTOs cannot smuggle a different typed subject into a capture.
+    let mut fake = crate::group_system_event_from_message(row.kind, &row.plaintext).unwrap();
+    fake.subject_account_id_hex = Some("ee".repeat(32));
+    row.group_system = Some(fake);
+    let captured = store
+        .conversation_presentation_page(page(vec![row.clone()]))
+        .unwrap();
+    assert_eq!(
+        captured.page().messages[0]
+            .group_system
+            .as_ref()
+            .unwrap()
+            .subject_account_id_hex
+            .as_ref(),
+        Some(&subject)
+    );
     let trusted = project(&app, &input, &page(vec![row.clone()]));
     let system = trusted.messages[0]
         .system

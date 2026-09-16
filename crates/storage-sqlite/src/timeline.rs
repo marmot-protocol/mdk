@@ -17,6 +17,7 @@ pub use opening::{
 pub use presentation::ConversationPresentationPage;
 
 use crate::connection::CachedSql;
+use crate::group_system::AUTHENTICATED_TIMELINE_SYSTEM_SQL;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
@@ -185,6 +186,8 @@ pub struct TimelineMessageQuery {
 pub struct TimelineMessageRecord {
     pub revision_id_hex: String,
     pub moderation: MessageModerationSummary,
+    #[serde(default)]
+    pub group_system: Option<crate::GroupSystemEventProjection>,
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
     pub source_epoch: Option<u64>,
@@ -1520,20 +1523,21 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         let mut message = conn
             .query_row_cached(
-                "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                &format!("SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
                         source.retention_seconds, source.retention_expires_at,
                         timeline.direction, timeline.group_id_hex, timeline.sender,
                         timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
+                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
                  FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
                    ON source.group_id_hex = timeline.group_id_hex
                   AND source.message_id_hex = timeline.message_id_hex
                  WHERE timeline.group_id_hex = ?1
                    AND timeline.message_id_hex = ?2
-                 LIMIT 1",
+                 LIMIT 1"),
                 params![group_id_hex, message_id_hex],
                 timeline_record_from_row,
             )
@@ -3257,7 +3261,8 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3517,7 +3522,8 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3896,6 +3902,12 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
     Ok(TimelineMessageRecord {
         revision_id_hex: row.get(0)?,
         moderation: MessageModerationSummary::default(),
+        group_system: crate::group_system::projected_group_system(
+            row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+            &row.get::<_, String>(8)?,
+            row.get("authenticated_group_system")?,
+            row.get::<_, bool>(17)?,
+        ),
         message_id_hex: row.get(0)?,
         source_message_id_hex: row.get(1)?,
         source_epoch: row

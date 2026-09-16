@@ -367,6 +367,14 @@ typedef enum MarmotPushRegistrationShareStatus {
 } MarmotPushRegistrationShareStatus;
 
 /**
+ * Storage-verified origin of a kind-1210 row.
+ */
+typedef enum MarmotGroupSystemEventProvenance {
+  MARMOT_GROUP_SYSTEM_EVENT_PROVENANCE_AUTHENTICATED_GROUP_STATE,
+  MARMOT_GROUP_SYSTEM_EVENT_PROVENANCE_MEMBER_AUTHORED,
+} MarmotGroupSystemEventProvenance;
+
+/**
  * Safety classification of a link/image/autolink destination.
  */
 typedef enum MarmotMarkdownLinkDestinationKind {
@@ -1879,6 +1887,41 @@ typedef struct MarmotChatListAvatar {
 } MarmotChatListAvatar;
 
 /**
+ * Parsed view of a kind-1210 group system row.
+ */
+typedef struct MarmotGroupSystemEvent {
+  enum MarmotGroupSystemEventProvenance provenance;
+  char *actor_display_name;
+  char *subject_display_name;
+  char *system_type;
+  /**
+   * Human-readable fallback. Prefer rendering from `system_type`
+   * plus the structured fields so clients can localize.
+   */
+  char *text;
+  char *actor_account_id_hex;
+  char *subject_account_id_hex;
+  char *name;
+  char *old_name;
+  /**
+   * Previous disappearing-message retention seconds; `0` means off.
+   */
+  bool has_old_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t old_retention_seconds;
+  /**
+   * New disappearing-message retention seconds; `0` means off.
+   */
+  bool has_new_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t new_retention_seconds;
+} MarmotGroupSystemEvent;
+
+/**
  * One referenced Nostr entity.
  */
 typedef struct MarmotMarkdownNostrEntity {
@@ -2167,6 +2210,7 @@ typedef struct MarmotMarkdownDocument {
  * Preview of a chat row's last message.
  */
 typedef struct MarmotChatListMessagePreview {
+  struct MarmotGroupSystemEvent *group_system;
   char *message_id_hex;
   char *sender;
   char *sender_display_name;
@@ -3197,38 +3241,6 @@ typedef struct MarmotTimelineReplyPreview {
    */
   char *invalidation_status;
 } MarmotTimelineReplyPreview;
-
-/**
- * Parsed view of a kind-1210 group system row.
- */
-typedef struct MarmotGroupSystemEvent {
-  char *system_type;
-  /**
-   * Human-readable fallback. Prefer rendering from `system_type`
-   * plus the structured fields so clients can localize.
-   */
-  char *text;
-  char *actor_account_id_hex;
-  char *subject_account_id_hex;
-  char *name;
-  char *old_name;
-  /**
-   * Previous disappearing-message retention seconds; `0` means off.
-   */
-  bool has_old_retention_seconds;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t old_retention_seconds;
-  /**
-   * New disappearing-message retention seconds; `0` means off.
-   */
-  bool has_new_retention_seconds;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t new_retention_seconds;
-} MarmotGroupSystemEvent;
 
 /**
  * One emoji tally, pre-sorted by count desc then emoji asc.

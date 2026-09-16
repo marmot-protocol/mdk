@@ -5,7 +5,7 @@ use marmot_app::{
     AppGroupSystemEvent, AppProjectionUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, TimelineMessageChange, TimelineMessageRecord, TimelinePage,
     TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction, group_system_event_from_message,
+    TimelineUserReaction,
 };
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
@@ -124,8 +124,19 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     }
 }
 
+/// Claims in member-authored rows are not authenticated group-state changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupSystemEventProvenanceFfi {
+    AuthenticatedGroupState,
+    MemberAuthored,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct GroupSystemEventFfi {
+    pub provenance: GroupSystemEventProvenanceFfi,
+    /// MDK-prepared labels on chat previews; clients own localized wording.
+    pub actor_display_name: Option<String>,
+    pub subject_display_name: Option<String>,
     pub system_type: String,
     /// Human-readable fallback from the row content. Prefer rendering from
     /// `system_type` plus the structured fields so clients can localize and
@@ -141,9 +152,28 @@ pub struct GroupSystemEventFfi {
     pub new_retention_seconds: Option<u64>,
 }
 
+impl From<marmot_app::GroupSystemEventProvenance> for GroupSystemEventProvenanceFfi {
+    fn from(value: marmot_app::GroupSystemEventProvenance) -> Self {
+        match value {
+            marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState => {
+                Self::AuthenticatedGroupState
+            }
+            marmot_app::GroupSystemEventProvenance::MemberAuthored => Self::MemberAuthored,
+        }
+    }
+}
 impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
-    fn from(value: AppGroupSystemEvent) -> Self {
+    fn from(mut value: AppGroupSystemEvent) -> Self {
+        if value.provenance == marmot_app::GroupSystemEventProvenance::MemberAuthored {
+            value.actor_account_id_hex = None;
+            value.subject_account_id_hex = None;
+            value.actor_display_name = None;
+            value.subject_display_name = None;
+        }
         Self {
+            provenance: value.provenance.into(),
+            actor_display_name: value.actor_display_name,
+            subject_display_name: value.subject_display_name,
             system_type: value.system_type,
             text: value.text,
             actor_account_id_hex: value.actor_account_id_hex,
@@ -223,7 +253,7 @@ pub struct TimelineMessageRecordFfi {
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
-        let group_system = group_system_event_from_message(value.kind, &value.plaintext);
+        let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         Self {
             revision_id_hex: value.revision_id_hex,
@@ -624,6 +654,7 @@ mod tests {
         TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            group_system: None,
             edit: None,
             message_id_hex: "msg".to_owned(),
             source_message_id_hex: None,
@@ -815,5 +846,24 @@ impl From<marmot_app::TimelineEditHistoryPage> for TimelineEditHistoryPageFfi {
                 .collect(),
             has_more_before: v.has_more_before,
         }
+    }
+}
+
+#[cfg(test)]
+mod system_provenance_tests {
+    use super::*;
+    #[test]
+    fn raw_kind_1210_claims_cannot_become_native_attribution() {
+        let event = marmot_app::group_system_event_from_message(1210,
+            r#"{"v":1,"system_type":"admin_added","text":"claimed","data":{"actor":"forged","subject":"victim"}}"#).unwrap();
+        let ffi = GroupSystemEventFfi::from(event);
+        assert_eq!(
+            ffi.provenance,
+            GroupSystemEventProvenanceFfi::MemberAuthored
+        );
+        assert!(ffi.actor_account_id_hex.is_none());
+        assert!(ffi.subject_account_id_hex.is_none());
+        assert!(ffi.actor_display_name.is_none());
+        assert!(ffi.subject_display_name.is_none());
     }
 }
