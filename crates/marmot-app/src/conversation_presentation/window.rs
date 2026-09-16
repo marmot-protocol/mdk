@@ -276,6 +276,24 @@ fn bounded_text(text: &str, limit: usize) -> String {
     text[..end].to_owned()
 }
 
+/// Shared by conversation identities and text-only system preview attribution.
+pub(crate) fn identity_display_name(
+    id: &str,
+    profile: Option<&crate::UserProfileMetadata>,
+    local_label: Option<&str>,
+) -> String {
+    let name = profile.and_then(|p| {
+        p.display_name
+            .as_deref()
+            .and_then(safe_name)
+            .or_else(|| p.name.as_deref().and_then(safe_name))
+    });
+    let name = name
+        .or_else(|| local_label.and_then(safe_name))
+        .unwrap_or_else(|| crate::profile_pseudonyms::default_profile_pseudonym(id));
+    bounded_text(&name, MAX_NAME_BYTES)
+}
+
 fn identity(
     id: &str,
     profile: Option<&crate::UserProfileMetadata>,
@@ -283,15 +301,7 @@ fn identity(
     input: &ChatPresentationInput,
     local_id: &str,
 ) -> ConversationIdentity {
-    let name = profile.and_then(|p| {
-        p.display_name
-            .as_deref()
-            .and_then(safe_name)
-            .or_else(|| p.name.as_deref().and_then(safe_name))
-    });
-    let display_name = name
-        .or_else(|| local_label.and_then(safe_name))
-        .unwrap_or_else(|| crate::profile_pseudonyms::default_profile_pseudonym(id));
+    let display_name = identity_display_name(id, profile, local_label);
     let avatar = profile
         .and_then(|p| p.picture.as_deref())
         .and_then(safe_image_url)
@@ -317,7 +327,7 @@ fn identity(
         });
     ConversationIdentity {
         account_id_hex: id.to_owned(),
-        display_name: bounded_text(&display_name, MAX_NAME_BYTES),
+        display_name,
         avatar,
         has_cached_profile: profile.is_some(),
     }

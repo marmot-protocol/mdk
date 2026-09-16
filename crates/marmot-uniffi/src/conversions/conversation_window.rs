@@ -380,7 +380,7 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
         media: super::media::timeline_media_outcomes_ffi(&row.media, row.source_epoch),
         agent_text_stream_json: row.agent_text_stream.as_ref().map(ToString::to_string),
         group_system: if trusted {
-            app::group_system_event_from_message(row.kind, &row.plaintext).map(Into::into)
+            row.group_system.clone().map(Into::into)
         } else {
             None
         },
@@ -558,6 +558,12 @@ mod tests {
         .to_content()
         .unwrap();
         let mut record = app::TimelineMessageRecord {
+            group_system: Some({
+                let mut event =
+                    marmot_app::group_system_event_from_message(1210, &content).unwrap();
+                event.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
+                event
+            }),
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,

@@ -47,7 +47,7 @@ impl SqliteAccountStorage {
 
 pub(super) fn presentation_page_tx(
     conn: &Connection,
-    page: TimelinePage,
+    mut page: TimelinePage,
 ) -> StorageResult<ConversationPresentationPage> {
     if page.messages.len() > MAX_TIMELINE_LIMIT {
         return Err(StorageError::Serialization(
@@ -126,6 +126,16 @@ pub(super) fn presentation_page_tx(
         }
     }
     drop(eligible);
+    // Caller-supplied typed metadata is not evidence. Reconstruct it from the
+    // exact payload checked above before making this page immutable.
+    for (message, authenticated) in page.messages.iter_mut().zip(&system_rows) {
+        message.group_system = crate::group_system::projected_group_system(
+            message.kind,
+            &message.plaintext,
+            *authenticated,
+            message.deleted,
+        );
+    }
     Ok(ConversationPresentationPage {
         page,
         store_epoch,

@@ -20,6 +20,24 @@ same UniFFI surface, and releases publish it once.
 bindings to handle the new tag; older generated sources cannot render it.
 No generated Swift or Kotlin files are committed here.
 
+## Group-system previews
+
+`ChatListMessagePreviewFfi.groupSystem` and timeline `groupSystem` now carry
+`GroupSystemEventProvenanceFfi`. Render authenticated membership/admin changes
+only for `AuthenticatedGroupState`; `MemberAuthored` is an assertion and carries
+no trusted actor/subject IDs on projected records. Malformed, oversized and deleted
+payloads have no typed event. Provenance records origin; timeline invalidation
+status still applies. Raw plaintext remains available to narrow consumers.
+
+Chat previews include separate actor/subject IDs and MDK-prepared display names
+from local caches, with the same safe-name/pseudonym fallback used by conversation
+identities. Subject profile updates refresh live chat lists without changing message
+identity or activity order. Clients own localized wording and the viewer's “you” label.
+Conversation windows continue to supply their bounded identity dictionary.
+This adds no wire format or database migration. Regenerate Swift/Kotlin bindings
+and use the matching native library; Android follow-through is tracked in
+[whitenoise-android#1581](https://github.com/marmot-protocol/whitenoise-android/issues/1581).
+
 ## Identity references and profile pseudonyms
 
 `accountIdHex` / `normalizeMemberRef` now accept `nprofile` and

@@ -10750,6 +10750,7 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
 #[test]
 fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_sender() {
     let preview = ChatListMessagePreview {
+        group_system: None,
         message_id_hex: "11".repeat(32),
         sender: String::new(),
         sender_display_name: None,
@@ -21844,4 +21845,117 @@ fn legacy_directory_label() {
         .unwrap()
         .unwrap();
     assert_eq!(entry.local_account.unwrap().label, "alice");
+}
+
+#[tokio::test]
+async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_identity() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("system previews", &[]).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(vec![0xbb; 32]);
+    let peer = MemberId::new(vec![0xcc; 32]);
+    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let changes = vec![
+        GroupStateChange::MemberAdded {
+            member: peer.clone(),
+        },
+        GroupStateChange::MemberRemoved {
+            member: peer.clone(),
+        },
+        GroupStateChange::MemberLeft {
+            member: peer.clone(),
+        },
+        GroupStateChange::AdminAdded {
+            member: peer.clone(),
+        },
+        GroupStateChange::AdminRemoved {
+            member: peer.clone(),
+        },
+        GroupStateChange::MemberRemoved { member: local },
+    ];
+    for (i, change) in changes.into_iter().enumerate() {
+        let epoch = i as u64 + 2;
+        let event = GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(epoch),
+            actor: Some(actor.clone()),
+            change: change.clone(),
+            origin_commit_id: Some(cgka_traits::MessageId::new(vec![i as u8; 32])),
+        };
+        assert_eq!(
+            client
+                .project_group_system_rows(std::slice::from_ref(&event), 100 + epoch)
+                .len(),
+            1
+        );
+        let material = cgka_traits::app_event::group_system_event_material(
+            &group_id,
+            epoch,
+            Some(&actor),
+            &change,
+        )
+        .unwrap();
+        let preview = app
+            .chat_list_row("alice", &group_hex)
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap();
+        assert_eq!(preview.message_id_hex, material.message_id_hex);
+        let typed = preview.group_system.unwrap();
+        assert_eq!(
+            typed.provenance,
+            GroupSystemEventProvenance::AuthenticatedGroupState
+        );
+        assert!(typed.subject_display_name.is_some());
+        // Duplicate synthesis retains the same row instead of appending activity.
+        client.project_group_system_rows(&[event], 100 + epoch);
+        assert_eq!(
+            app.chat_list_row("alice", &group_hex)
+                .unwrap()
+                .unwrap()
+                .last_message
+                .unwrap()
+                .message_id_hex,
+            material.message_id_hex
+        );
+    }
+    let commit = cgka_traits::MessageId::new(vec![0x99; 32]);
+    let events = [peer, MemberId::new(vec![0xdd; 32])]
+        .into_iter()
+        .map(|member| GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(20),
+            actor: Some(actor.clone()),
+            change: GroupStateChange::MemberAdded { member },
+            origin_commit_id: Some(commit.clone()),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(client.project_group_system_rows(&events, 120).len(), 2);
+    let preview = app
+        .chat_list_row("alice", &group_hex)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    let store = app.account_storage("alice").unwrap();
+    let selected = store
+        .timeline_message(&group_hex, &preview.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        preview
+            .group_system
+            .as_ref()
+            .unwrap()
+            .subject_account_id_hex,
+        selected.group_system.unwrap().subject_account_id_hex
+    );
 }

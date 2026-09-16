@@ -1015,3 +1015,65 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     assert!(next(&mut left).await.rows.is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_new_activity() {
+    let f = Fixture::new(1);
+    let actor = "bb".repeat(32);
+    let subject = "cc".repeat(32);
+    f.store.record_app_event(&storage_sqlite::StoredAppEvent {
+        group_id_hex: "0000".into(), message_id_hex: "system-preview".into(),
+        source_message_id_hex: None, source_epoch: Some(2), direction: "system".into(),
+        sender: actor.clone(), kind: 1210,
+        plaintext: serde_json::json!({"v":1,"system_type":"member_added","text":"Member added", "data":{"actor":actor,"subject":subject}}).to_string(),
+        tags: vec![vec!["system".into(), "member_added".into()]],
+        recorded_at: 100, received_at: 100, origin_commit_id: Some("commit".into()), moderation_grant: false,
+    }).unwrap();
+    f.store
+        .refresh_chat_list_row(&f.account_id, "0000", &|_, _| false)
+        .unwrap();
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(10))
+        .await
+        .unwrap();
+    let preview = sub.snapshot.rows[0].row.last_message.as_ref().unwrap();
+    let system = preview.group_system.as_ref().unwrap();
+    assert_eq!(
+        system.provenance,
+        GroupSystemEventProvenance::AuthenticatedGroupState
+    );
+    assert_eq!(
+        system.subject_account_id_hex.as_deref(),
+        Some(subject.as_str())
+    );
+    assert_eq!(
+        system.subject_display_name.as_deref(),
+        Some(crate::profile_pseudonyms::default_profile_pseudonym(&subject).as_str())
+    );
+    let activity = sub.snapshot.rows[0].row.activity_sort_at;
+    f.app
+        .save_directory_entry(&UserDirectoryRecord {
+            account_id_hex: subject.clone(),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                display_name: Some("  New member  ".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    let updated = next(&mut sub).await;
+    let preview = updated.rows[0].row.last_message.as_ref().unwrap();
+    let system = preview.group_system.as_ref().unwrap();
+    assert_eq!(system.subject_display_name.as_deref(), Some("New member"));
+    assert_eq!(system.actor_account_id_hex.as_deref(), Some(actor.as_str()));
+    assert_eq!(preview.message_id_hex, "system-preview");
+    assert_eq!(updated.rows[0].row.activity_sort_at, activity);
+    f.runtime.shutdown_and_close().await.unwrap();
+}

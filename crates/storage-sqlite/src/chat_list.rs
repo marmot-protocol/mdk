@@ -276,6 +276,8 @@ impl ChatListMessageDeliveryState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListMessagePreview {
+    #[serde(default)]
+    pub group_system: Option<crate::GroupSystemEventProjection>,
     pub message_id_hex: String,
     pub sender: String,
     pub sender_display_name: Option<String>,
@@ -2237,6 +2239,7 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         ChatListMessageDeliveryState::Pending
     };
     Ok(ChatListMessagePreview {
+        group_system: None,
         message_id_hex: row.get(0)?,
         sender: row.get(1)?,
         sender_display_name: None,
@@ -2496,7 +2499,17 @@ macro_rules! chat_list_columns {
                 SELECT 1 FROM cgka_disband_tombstones AS tomb
                 WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
             ),
-            pin.group_id_hex IS NOT NULL,"
+            pin.group_id_hex IS NOT NULL,
+            CASE WHEN row.last_message_kind = 1210 THEN EXISTS (SELECT 1 FROM app_events AS system_source
+              WHERE system_source.group_id_hex = row.group_id_hex
+                AND system_source.message_id_hex = row.last_message_id_hex
+                AND system_source.kind = 1210
+                AND system_source.direction = 'system'
+                AND system_source.source_message_id_hex IS NULL
+                AND length(system_source.origin_commit_id) > 0
+                AND system_source.plaintext = row.last_message_preview
+                AND system_source.recorded_at = row.last_message_timeline_at
+            ) ELSE 0 END AS authenticated_group_system,"
         )
     };
 }
@@ -2544,7 +2557,17 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         || !image_upload_key_hex.is_empty()
         || media_type.is_some();
     let last_message_id_hex: Option<String> = row.get(11)?;
+    let group_system = crate::group_system::projected_group_system(
+        row.get::<_, Option<i64>>(14)?
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or_default(),
+        &row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        row.get("authenticated_group_system")?,
+        row.get::<_, bool>(16)?,
+    );
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
+        group_system,
         message_id_hex,
         sender: row.get(12).unwrap_or_default(),
         sender_display_name: None,
@@ -2589,7 +2612,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
     let pinned = row.get::<_, i64>(33)? != 0;
     let pinned_position = row
-        .get::<_, Option<i64>>(34)?
+        .get::<_, Option<i64>>(35)?
         .and_then(|value| u32::try_from(value).ok());
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,

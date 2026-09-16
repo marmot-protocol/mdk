@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Typed group-system chat previews and explicit `MarmotGroupSystemEventProvenance`
+  on timeline and preview events. Authenticated actor/subject IDs remain distinct;
+  chat previews include locally prepared names, while clients localize wording.
+  Regenerate headers and use the matching library: both output record layouts changed.
+
 - Accepted-edit presentation: `MarmotTimelineMessageRecord.edit` carries a nullable
   `MarmotTimelineEditSummary`; `marmot_message_edit_history` returns a
   `MarmotTimelineEditHistoryPage`, released with

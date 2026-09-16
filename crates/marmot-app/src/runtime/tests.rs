@@ -607,6 +607,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
 
 fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        group_system: None,
         edit: None,
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
@@ -1645,6 +1646,7 @@ fn chat_list_fingerprint_preserves_serialized_deduplication_semantics() {
 
     let mut internal_media_changed = base.clone();
     internal_media_changed.last_message = Some(crate::ChatListMessagePreview {
+        group_system: None,
         message_id_hex: "message".to_owned(),
         sender: "sender".to_owned(),
         sender_display_name: None,

@@ -494,6 +494,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_preserves_materialized_metadata() {
         let record = TimelineMessageRecord {
+            group_system: None,
             edit: None,
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
@@ -618,6 +619,12 @@ mod tests {
         .to_content()
         .unwrap();
         let record = TimelineMessageRecord {
+            group_system: Some({
+                let mut event =
+                    marmot_app::group_system_event_from_message(1210, &content).unwrap();
+                event.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
+                event
+            }),
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
@@ -665,6 +672,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
         let record = TimelineMessageRecord {
+            group_system: None,
             edit: None,
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,

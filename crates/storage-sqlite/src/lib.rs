@@ -5,6 +5,11 @@
 //! same database so group snapshot and rollback can be atomic across both
 //! layers.
 
+mod group_system;
+pub use group_system::{
+    GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
+};
+
 mod account_projection;
 mod agent_stream_sequences;
 mod chat_list;

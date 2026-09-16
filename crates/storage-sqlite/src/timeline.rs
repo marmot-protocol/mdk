@@ -183,6 +183,8 @@ pub struct TimelineMessageQuery {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
+    #[serde(default)]
+    pub group_system: Option<crate::GroupSystemEventProjection>,
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
     pub source_epoch: Option<u64>,
@@ -1450,7 +1452,14 @@ impl SqliteAccountStorage {
                         timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
+                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
+                      AND timeline.source_message_id_hex IS NULL
+                      AND source.kind = timeline.kind AND source.direction = 'system'
+                      AND source.source_message_id_hex IS NULL
+                      AND length(source.origin_commit_id) > 0
+                      AND source.plaintext = timeline.plaintext
+                      AND source.source_epoch IS timeline.source_epoch, 0) AS authenticated_group_system
                  FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
                    ON source.group_id_hex = timeline.group_id_hex
@@ -3043,7 +3052,14 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
+                      AND timeline.source_message_id_hex IS NULL
+                      AND source.kind = timeline.kind AND source.direction = 'system'
+                      AND source.source_message_id_hex IS NULL
+                      AND length(source.origin_commit_id) > 0
+                      AND source.plaintext = timeline.plaintext
+                      AND source.source_epoch IS timeline.source_epoch, 0) AS authenticated_group_system
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3303,7 +3319,14 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
+                      AND timeline.source_message_id_hex IS NULL
+                      AND source.kind = timeline.kind AND source.direction = 'system'
+                      AND source.source_message_id_hex IS NULL
+                      AND length(source.origin_commit_id) > 0
+                      AND source.plaintext = timeline.plaintext
+                      AND source.source_epoch IS timeline.source_epoch, 0) AS authenticated_group_system
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3677,6 +3700,12 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     Ok(TimelineMessageRecord {
+        group_system: crate::group_system::projected_group_system(
+            row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
+            &row.get::<_, String>(8)?,
+            row.get("authenticated_group_system")?,
+            row.get::<_, bool>(17)?,
+        ),
         message_id_hex: row.get(0)?,
         source_message_id_hex: row.get(1)?,
         source_epoch: row

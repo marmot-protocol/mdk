@@ -3,6 +3,16 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        for provenance in [GroupSystemEventProvenanceFfi.authenticatedGroupState, .memberAuthored] {
+            let event = GroupSystemEventFfi(provenance: provenance, actorDisplayName: "Actor", subjectDisplayName: "Subject",
+                systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
+                name: nil, oldName: nil, oldRetentionSeconds: nil, newRetentionSeconds: nil)
+            let preview = ChatListMessagePreviewFfi(groupSystem: event, messageIdHex: "selected", sender: "actor", senderDisplayName: nil,
+                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false,
+                attachmentKind: nil, attachmentCount: 0, deliveryState: .notApplicable)
+            let copy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
+            precondition(copy == preview && copy.groupSystem?.provenance == provenance)
+        }
         let blocks = BlockListSnapshotFfi(revision: UInt64.max, users: [BlockedUserFfi(publicKey: "key", isPrivate: true, createdAtMs: 123)])
         let blockCopy = try FfiConverterTypeBlockListSnapshotFfi.lift(FfiConverterTypeBlockListSnapshotFfi.lower(blocks))
         precondition(blockCopy == blocks)
