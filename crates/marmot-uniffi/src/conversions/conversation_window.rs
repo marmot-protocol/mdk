@@ -608,6 +608,7 @@ mod edit_contract_tests {
     fn prepared_and_legacy_rows_share_effective_content_and_edit_metadata() {
         let row: marmot_app::TimelineMessageRecord = serde_json::from_value(serde_json::json!({
             "message_id_hex":"target","direction":"received","group_id_hex":"11","sender":"alice",
+            "revision_id_hex":"edit","moderation":marmot_app::MessageModerationSummary::default(),
             "plaintext":"**replacement**","kind":9,"tags":[],"timeline_at":1,"received_at":1,
             "reactions":{"by_emoji":{},"user_reactions":[]},"deleted":false,
             "edit":{"edit_count":2,"latest_edit_message_id_hex":"edit","edited_at":5}
@@ -617,6 +618,8 @@ mod edit_contract_tests {
         let prepared = super::presented_timeline(&row, false);
         assert_eq!(legacy.plaintext, prepared.plaintext);
         assert_eq!(legacy.content_tokens, prepared.content_tokens);
+        assert_eq!(legacy.revision_id_hex, prepared.revision_id_hex);
+        assert_eq!(prepared.revision_id_hex, "edit");
         assert_eq!(prepared.edit.unwrap().latest_edit_message_id_hex, "edit");
         assert_eq!(legacy.edit.unwrap().edit_count, 2);
     }
