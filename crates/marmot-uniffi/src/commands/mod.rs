@@ -40,5 +40,5 @@ mod chat_window;
 mod conversation_window;
 pub mod user_blocks;
 
-pub mod moderation;
 mod avatar;
+pub mod moderation;
