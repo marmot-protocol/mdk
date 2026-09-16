@@ -583,8 +583,10 @@ c_cmd! {
     /// with `marmot_account_key_package_list_free`.
     async fn marmot_account_key_packages(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageList) = account_key_packages;
 
-    /// Local-storage KeyPackage inventory with typed durable provenance. Free
-    /// with `marmot_account_key_package_inventory_entry_list_free`.
+    /// Local-storage KeyPackage inventory with typed durable provenance.
+    /// Synchronous SQLCipher I/O on the calling thread; keep it off a UI or
+    /// main thread. Free with
+    /// `marmot_account_key_package_inventory_entry_list_free`.
     sync fn marmot_local_account_key_packages(account_ref: str) -> rec(MarmotAccountKeyPackageInventoryEntryList) = local_account_key_packages;
 
     /// Fetch validated relay observations, then merge a fresh local snapshot.

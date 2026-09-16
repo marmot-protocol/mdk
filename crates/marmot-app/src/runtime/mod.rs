@@ -3407,7 +3407,9 @@ impl MarmotAppRuntime {
     }
 
     /// Local-storage KeyPackage inventory. Does not wait for network startup,
-    /// issue a worker RPC, or start a directory query.
+    /// issue a worker RPC, or start a directory query. The read is synchronous
+    /// SQLCipher I/O on the caller's thread; hosts should keep it off a UI or
+    /// main thread.
     pub fn local_account_key_packages(
         &self,
         account_ref: &str,
@@ -3427,6 +3429,20 @@ impl MarmotAppRuntime {
         self.accounts
             .refresh_account_key_packages(account_ref, bootstrap_relays)
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.accounts
+            .set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
+        self.accounts.app_for_test()
     }
 
     pub async fn account_key_package_relay_events(
@@ -5523,6 +5539,19 @@ impl AccountManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.app.set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
+        &self.app
+    }
+
+    #[cfg(test)]
     pub(crate) fn register_reconcile_rollback_waiter(&self, notify: std::sync::mpsc::Sender<()>) {
         self.reconcile_rollback_waiters
             .lock()
@@ -6171,13 +6200,8 @@ impl AccountManager {
         account_ref: &str,
     ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.resolve(account_ref)?;
-        let owned = cgka_engine::key_package::durably_owned_key_packages(
-            &self.app.account_storage(&account.label)?,
-            cgka_traits::group::ProtocolProfile::Current,
-        )
-        .map_err(cgka_session::SessionError::from)?;
         self.app
-            .local_account_key_package_inventory(&account.label, owned)
+            .local_account_key_package_inventory_snapshot(&account.label)
     }
 
     pub async fn refresh_account_key_packages(
@@ -6198,14 +6222,9 @@ impl AccountManager {
                 "refresh_account_key_packages",
             )
             .await?;
-        let owned = cgka_engine::key_package::durably_owned_key_packages(
-            &self.app.account_storage(&account.label)?,
-            cgka_traits::group::ProtocolProfile::Current,
-        )
-        .map_err(cgka_session::SessionError::from)?;
         let locals = self
             .app
-            .local_account_key_package_inventory(&account.label, owned)?;
+            .local_account_key_package_inventory_snapshot(&account.label)?;
         Ok(crate::key_package_records::merge_key_package_inventory(
             locals, relays,
         ))

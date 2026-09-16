@@ -573,6 +573,54 @@ fn assert_local_only_invariants(entries: &[crate::AccountKeyPackageInventoryEntr
     );
 }
 
+fn current_ref(entries: &[crate::AccountKeyPackageInventoryEntry]) -> Option<&str> {
+    entries
+        .iter()
+        .find(|entry| entry.local_state == AccountKeyPackageLocalState::Current)
+        .map(|entry| entry.record.key_package_ref_hex.as_str())
+}
+
+fn is_mixed_retained_without_new_current(
+    entries: &[crate::AccountKeyPackageInventoryEntry],
+    previous_current_ref: &str,
+) -> bool {
+    let retained_previous = entries.iter().any(|entry| {
+        entry.local_state == AccountKeyPackageLocalState::RetainedPrivateMaterial
+            && entry.record.key_package_ref_hex == previous_current_ref
+    });
+    retained_previous && current_ref(entries).is_none()
+}
+
+fn assert_coherent_rotation_inventory(
+    entries: &[crate::AccountKeyPackageInventoryEntry],
+    previous_current_ref: &str,
+) {
+    assert!(
+        !is_mixed_retained_without_new_current(entries, previous_current_ref),
+        "previously current package must not be retained while the new current owned package is missing"
+    );
+    let Some(current) = current_ref(entries) else {
+        panic!("coherent inventory must include exactly one Current package");
+    };
+    if current == previous_current_ref {
+        assert!(
+            entries.iter().all(|entry| {
+                entry.local_state != AccountKeyPackageLocalState::RetainedPrivateMaterial
+                    || entry.record.key_package_ref_hex != previous_current_ref
+            }),
+            "pre-rotation snapshot must still classify the previous package as Current"
+        );
+    } else {
+        assert!(
+            entries.iter().any(|entry| {
+                entry.local_state == AccountKeyPackageLocalState::RetainedPrivateMaterial
+                    && entry.record.key_package_ref_hex == previous_current_ref
+            }),
+            "post-rotation snapshot must retain the previous current package"
+        );
+    }
+}
+
 #[tokio::test]
 async fn local_inventory_reports_current_then_retained_after_rotation() {
     let (_dir, runtime, account, fetcher, _relay) = runtime_inventory_fixture().await;
@@ -795,6 +843,136 @@ async fn concurrent_refresh_uses_post_rotation_local_snapshot() {
         .find(|entry| entry.local_state == AccountKeyPackageLocalState::RetainedPrivateMaterial)
         .expect("pre-rotation package is retained");
     assert_eq!(retained.record.key_package_ref_hex, original_ref);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inventory_stays_coherent_when_rotation_interleaves_ownership_and_lifecycle() {
+    let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
+    let before = runtime
+        .local_account_key_packages(&account.account_id_hex)
+        .unwrap();
+    let original_ref = before[0].record.key_package_ref_hex.clone();
+    let owned_before = runtime
+        .app_for_test()
+        .capture_durably_owned_key_packages_for_test(&account.label)
+        .unwrap();
+
+    runtime
+        .rotate_key_package(&account.account_id_hex)
+        .await
+        .unwrap();
+    let lifecycle_after = runtime
+        .app_for_test()
+        .capture_key_package_lifecycle_for_test(&account.label)
+        .unwrap();
+    let mixed = runtime
+        .app_for_test()
+        .project_local_account_key_package_inventory_for_test(
+            &account.label,
+            owned_before,
+            lifecycle_after,
+        )
+        .unwrap();
+    assert!(
+        is_mixed_retained_without_new_current(&mixed, &original_ref),
+        "split ownership/lifecycle reads must be able to drop the new current package"
+    );
+
+    let local_after_split = runtime
+        .local_account_key_packages(&account.account_id_hex)
+        .unwrap();
+    assert_coherent_rotation_inventory(&local_after_split, &original_ref);
+    assert_ne!(
+        current_ref(&local_after_split).expect("snapshot current"),
+        original_ref.as_str()
+    );
+
+    let previous_current = current_ref(&local_after_split)
+        .expect("post-rotation current")
+        .to_owned();
+    let published = published_key_package_events(&relay);
+    seed_fetcher(&fetcher, &account, published, &[DIRECTORY]);
+
+    let between_local = Arc::new(tokio::sync::Notify::new());
+    let local_signal = between_local.clone();
+    runtime.set_inventory_snapshot_between_reads_for_test(Some(Arc::new(move || {
+        local_signal.notify_one();
+    })));
+
+    let local_account = account.account_id_hex.clone();
+    let local_runtime = runtime.clone();
+    let local_read = tokio::task::spawn_blocking(move || {
+        local_runtime.local_account_key_packages(&local_account)
+    });
+    tokio::time::timeout(Duration::from_secs(2), between_local.notified())
+        .await
+        .expect("local snapshot must reach the ownership/lifecycle seam");
+    let rotate_during_local = tokio::spawn({
+        let runtime = runtime.clone();
+        let account_id = account.account_id_hex.clone();
+        async move { runtime.rotate_key_package(&account_id).await }
+    });
+    let local = tokio::time::timeout(Duration::from_secs(5), local_read)
+        .await
+        .expect("local snapshot must finish")
+        .unwrap()
+        .unwrap();
+    assert_coherent_rotation_inventory(&local, &previous_current);
+    let _ = tokio::time::timeout(Duration::from_secs(5), rotate_during_local)
+        .await
+        .expect("rotation after the local snapshot must finish")
+        .unwrap()
+        .unwrap();
+
+    runtime.set_inventory_snapshot_between_reads_for_test(None);
+    let refresh_previous = current_ref(
+        &runtime
+            .local_account_key_packages(&account.account_id_hex)
+            .unwrap(),
+    )
+    .expect("current after local interleave")
+    .to_owned();
+    seed_fetcher(
+        &fetcher,
+        &account,
+        published_key_package_events(&relay),
+        &[DIRECTORY],
+    );
+
+    let between_refresh = Arc::new(tokio::sync::Notify::new());
+    let refresh_signal = between_refresh.clone();
+    runtime.set_inventory_snapshot_between_reads_for_test(Some(Arc::new(move || {
+        refresh_signal.notify_one();
+    })));
+
+    let refresh_account = account.account_id_hex.clone();
+    let refresh_runtime = runtime.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_runtime
+            .refresh_account_key_packages(&refresh_account, vec![endpoint(DIRECTORY)])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), between_refresh.notified())
+        .await
+        .expect("refresh snapshot must reach the ownership/lifecycle seam");
+    let rotate_during_refresh = tokio::spawn({
+        let runtime = runtime.clone();
+        let account_id = account.account_id_hex.clone();
+        async move { runtime.rotate_key_package(&account_id).await }
+    });
+    let refreshed = tokio::time::timeout(Duration::from_secs(5), refresh)
+        .await
+        .expect("refresh snapshot must finish")
+        .unwrap()
+        .unwrap();
+    assert_coherent_rotation_inventory(&refreshed, &refresh_previous);
+    let _ = tokio::time::timeout(Duration::from_secs(5), rotate_during_refresh)
+        .await
+        .expect("rotation after the refresh snapshot must finish")
+        .unwrap()
+        .unwrap();
+
     runtime.shutdown().await;
 }
 

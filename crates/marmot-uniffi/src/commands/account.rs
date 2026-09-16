@@ -384,6 +384,8 @@ impl Marmot {
 
     /// Local-storage KeyPackage inventory with typed durable provenance.
     /// Does not wait for network startup or issue a directory query.
+    /// Synchronous SQLCipher I/O on the calling thread; keep it off a UI or
+    /// main thread.
     pub fn local_account_key_packages(
         &self,
         account_ref: String,

@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `marmot_local_account_key_packages` and `marmot_refresh_account_key_packages`
+  now project ownership and lifecycle from one consistent storage snapshot, so a
+  concurrent rotation cannot drop the newly current owned package.
+
 ### Added
 
 - `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,

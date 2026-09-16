@@ -5081,8 +5081,10 @@ MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
                                          struct MarmotAccountKeyPackageList **out);
 
 /**
- * Local-storage KeyPackage inventory with typed durable provenance. Free
- * with `marmot_account_key_package_inventory_entry_list_free`.
+ * Local-storage KeyPackage inventory with typed durable provenance.
+ * Synchronous SQLCipher I/O on the calling thread; keep it off a UI or
+ * main thread. Free with
+ * `marmot_account_key_package_inventory_entry_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

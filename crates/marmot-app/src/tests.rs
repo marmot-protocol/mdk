@@ -579,7 +579,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             }
         };
         if let Some((entered, release)) = gate {
-            entered.notify_waiters();
+            entered.notify_one();
             release.notified().await;
         }
         if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) {

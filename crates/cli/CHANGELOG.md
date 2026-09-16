@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Local and refresh KeyPackage inventory now read durable ownership and lifecycle
+  from one consistent storage snapshot, so a concurrent rotation cannot retain a
+  previous current package while omitting the newly current owned package.
+
 ## [0.10.0] - 2026-09-16
 
 This minor release establishes a new compatibility cohort. Update generated Swift/Kotlin source and native libraries together; review changed records, enums, and CLI JSON before upgrading. Account storage advances through migration 75. Back up before upgrade; downgrade is unsupported (re-upgrade or restore a pre-upgrade backup). See [0.10.0 release notes](../../docs/release/0.10.0.md).

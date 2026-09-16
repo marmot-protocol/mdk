@@ -50,15 +50,18 @@ This does not change the Published-list filter (`relay == true`) and does not
 replace Android history UI work.
 
 `localAccountKeyPackages` is the local-first inventory: render it immediately.
-`refreshAccountKeyPackages` is the explicit network merge; replace the displayed
-snapshot with its result. On refresh failure or cancellation, keep the local
-result. Both return `AccountKeyPackageInventoryEntryFfi` (`record` plus
-`localState`). Existing `AccountKeyPackageFfi` is unchanged. `localState` and
-`record.relay` are the authoritative display distinctions; empty event IDs and
-`publishedAt` are not publication proof. A retained package stays
-`RetainedPrivateMaterial` unless that exact event was observed. Empty bootstrap
-relays remain network-enabled. After a mutation, re-read the local inventory
-instead of applying an out-of-order refresh.
+It is a synchronous SQLCipher read on the calling thread; do not invoke it on a
+UI or main thread. `refreshAccountKeyPackages` is the explicit network merge;
+replace the displayed snapshot with its result. On refresh failure or
+cancellation, keep the local result. Both return
+`AccountKeyPackageInventoryEntryFfi` (`record` plus `localState`). Existing
+`AccountKeyPackageFfi` is unchanged. `localState` and `record.relay` are the
+authoritative display distinctions; empty event IDs and `publishedAt` are not
+publication proof. A retained package stays `RetainedPrivateMaterial` even when
+that exact event is observed; `record.relay` becomes true while `localState`
+remains retained. Empty bootstrap relays remain network-enabled. After a
+mutation, re-read the local inventory instead of applying an out-of-order
+refresh.
 
 Regenerate Swift/Kotlin bindings after pulling this surface. Hosts must use a
 matching library: the new methods and enum are additive, but older generated
