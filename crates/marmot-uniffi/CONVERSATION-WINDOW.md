@@ -18,6 +18,19 @@ structured text, and index `identities` by `account_id_hex`. Every identity refe
 in `messages[*].references` is resolved there or explicitly absent. These are
 window-scoped display identities, not a roster or a source of mutation authority.
 
+The first snapshot reads the durable account projection directly, without waiting
+for worker startup, group hydration or relay catch-up. Render its messages immediately.
+`header.epoch == None` means live authority is not yet available: membership and
+invitation/departure display come from that same local read, all send/management
+capabilities are false, and non-disbanded lifecycle is conservatively `Recovering`.
+Do not interpret this as removal, wait for `can_send` to display history, or restore
+an independent client timeline cache. MDK retries authority in the background and
+publishes a complete replacement with an epoch and current capabilities when ready.
+Paging and local updates remain available during catch-up. A worker capture gets a
+50 ms wait budget before falling back to a fresh local snapshot; a blocked worker
+queue cannot hold the screen open indefinitely. A missing/dirty local read projection
+still uses the existing keyed preparation/retry path.
+
 Timeline content uses the existing Markdown/media converters. For this screen,
 raw tags, full reactor lists and raw `media_json` are omitted from the compatibility timeline record;
 use the bounded `references.reactions` tallies/previews and truncation flags.

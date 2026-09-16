@@ -157,7 +157,7 @@ impl Fixture {
         target: ConversationOpenTarget,
         limit: usize,
     ) -> RuntimeConversationWindowSubscription {
-        timeout(
+        let mut subscription = timeout(
             Duration::from_secs(10),
             self.runtime.open_conversation_window(
                 "alice",
@@ -167,7 +167,13 @@ impl Fixture {
         )
         .await
         .unwrap()
-        .unwrap()
+        .unwrap();
+        // Existing tests exercise the live-authority contract; dedicated cold
+        // tests assert the immediately returned local-only initial snapshot.
+        while subscription.snapshot.presentation.header.epoch.is_none() {
+            subscription.snapshot = next(&mut subscription).await;
+        }
+        subscription
     }
     async fn close(self) {
         self.runtime.shutdown_and_close().await.unwrap();
@@ -202,7 +208,18 @@ async fn open_combines_first_unread_draft_identity_and_permissions_without_marki
         .mark_timeline_message_read(&f.account, &f.group_hex(), &id(3), &|_, _| false)
         .unwrap();
     f.draft("unsent");
-    let sub = f.open(ConversationOpenTarget::Automatic, 5).await;
+    let mut sub = f
+        .runtime
+        .open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Automatic,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         sub.snapshot.anchor,
         ConversationOpenAnchorOutcome::FirstUnread { .. }
@@ -211,7 +228,7 @@ async fn open_combines_first_unread_draft_identity_and_permissions_without_marki
     assert_eq!(sub.snapshot.anchors[index].message_id_hex(), id(4));
     assert_eq!(sub.snapshot.read_state.unread_count, 8);
     assert_eq!(sub.snapshot.draft.draft.as_ref().unwrap().content, "unsent");
-    assert!(sub.snapshot.presentation.header.capabilities.is_self_admin);
+    assert!(!sub.snapshot.presentation.header.capabilities.is_self_admin);
     assert!(
         sub.snapshot
             .presentation
@@ -219,6 +236,10 @@ async fn open_combines_first_unread_draft_identity_and_permissions_without_marki
             .contains_key(&"bb".repeat(32))
     );
     assert_eq!(sub.snapshot.page.page().messages.len(), 5);
+    while sub.snapshot.presentation.header.epoch.is_none() {
+        sub.snapshot = next(&mut sub).await;
+    }
+    assert!(sub.snapshot.presentation.header.capabilities.is_self_admin);
     let handle = sub.window_handle();
     let page = handle
         .page(&sub.snapshot.revision, ConversationPageDirection::Older, 3)
@@ -302,7 +323,14 @@ async fn mutations_during_initial_capture_are_reconciled_after_delivery() {
     let (sub, ()) = tokio::join!(open, mutate);
     let mut sub = sub.unwrap();
     assert!(sub.snapshot.draft.draft.is_none());
-    let updated = next(&mut sub).await;
+    // A coherent live-authority upgrade captured before the mutation may
+    // arrive first. It must not consume invalidations queued during capture.
+    let updated = loop {
+        let update = next(&mut sub).await;
+        if update.draft.draft.is_some() {
+            break update;
+        }
+    };
     assert_eq!(
         updated.draft.draft.as_ref().unwrap().content,
         "arrived during capture"
@@ -356,16 +384,16 @@ async fn quiet_busy_retries_keep_cancelled_command_position() {
 async fn transient_command_failure_keeps_target_until_quiet_retry() {
     let f = Fixture::new(20).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
-    f.mode.store(1, Ordering::SeqCst);
+    f.mode.store(2, Ordering::SeqCst);
     assert!(matches!(
         sub.window_handle()
             .jump_to_message(&sub.snapshot.revision, &id(3))
             .await,
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     assert!(matches!(
         sub.recv().await,
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     f.mode.store(0, Ordering::SeqCst);
     let recovered = next(&mut sub).await;
@@ -597,12 +625,12 @@ async fn eviction_and_lost_reset_are_terminal_even_if_same_store_can_reopen() {
 async fn closed_session_storage_terminates_retry_and_missing_jump_recovers_original_viewport() {
     let f = Fixture::new(20).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
-    f.mode.store(1, Ordering::SeqCst);
+    f.mode.store(2, Ordering::SeqCst);
     assert!(matches!(
         sub.window_handle()
             .jump_to_message(&sub.snapshot.revision, &id(3))
             .await,
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     assert!(sub.recv().await.is_err());
     f.store
@@ -768,11 +796,11 @@ async fn saturated_history_paging_continues_after_reporting_the_new_visible_anch
 async fn terminal_task_failure_after_transient_failure_is_reported_and_stops_retrying() {
     let f = Fixture::new(3).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
-    f.mode.store(1, Ordering::SeqCst);
+    f.mode.store(2, Ordering::SeqCst);
     f.signal();
     assert!(matches!(
         timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     f.mode.store(4, Ordering::SeqCst);
     assert!(
@@ -919,5 +947,132 @@ async fn conversation_viewer_reaction_updates_after_add_and_remove() {
         vec![peer]
     );
     drop(sub);
+    f.close().await;
+}
+
+// The window must render retained local rows even when a live capture cannot
+// run. This is the public first-open boundary, not just a SQL paging test.
+#[tokio::test]
+async fn cold_open_returns_stored_history_while_authority_is_not_ready() {
+    let f = Fixture::new(200).await;
+    f.store
+        .refresh_chat_list_row(&f.account, &f.group_hex(), &|_, _| false)
+        .unwrap();
+    f.mode.store(1, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let result = timeout(
+        Duration::from_millis(500),
+        f.runtime.open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 50,
+            },
+        ),
+    )
+    .await;
+    eprintln!(
+        "cold local open: history=200 elapsed_ms={} completed={}",
+        started.elapsed().as_millis(),
+        result.is_ok()
+    );
+    let mut sub = result
+        .expect("stored messages must not wait for engine/relay readiness")
+        .unwrap();
+    assert_eq!(sub.snapshot.page.page().messages.len(), 50);
+    assert_eq!(ids(&sub.snapshot).last(), Some(&id(199)));
+    assert!(!sub.snapshot.presentation.header.capabilities.can_send);
+    assert!(sub.snapshot.presentation.header.epoch.is_none());
+    // Wait for the first authority attempt to settle into quiet retry, then
+    // ensure local draft invalidation is not held behind that one-second timer.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.draft("local update during catch-up");
+    let local = timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        local.draft.draft.as_ref().unwrap().content,
+        "local update during catch-up"
+    );
+    assert!(local.presentation.header.epoch.is_none());
+    f.mode.store(0, Ordering::SeqCst);
+    let ready = next(&mut sub).await;
+    assert!(ready.presentation.header.capabilities.can_send);
+    assert!(ready.presentation.header.epoch.is_some());
+    assert_eq!(ids(&ready), ids(&sub.snapshot));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn cold_capture_does_not_force_group_hydration() {
+    let f = Fixture::new(200).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let plane = f.runtime.shared_services().relay_plane().clone();
+    let mut client = f
+        .app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.runtime.session().unhydrated_group_ids(),
+        vec![f.group.clone()]
+    );
+    let result = capture_conversation(
+        &mut client,
+        &f.group,
+        Default::default(),
+        &f.store.chat_presentation_version().unwrap().store_epoch,
+    );
+    assert!(matches!(result, Err(ConversationWindowError::NotReady)));
+    assert_eq!(
+        client.runtime.session().unhydrated_group_ids(),
+        vec![f.group.clone()]
+    );
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn local_fallback_never_reuses_old_permissions_with_new_membership() {
+    let f = Fixture::new(8).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    assert!(sub.snapshot.presentation.header.capabilities.can_send);
+    f.mode.store(3, Ordering::SeqCst);
+    let handle = sub.window_handle();
+    let revision = sub.snapshot.revision.clone();
+    let read = tokio::spawn(async move { handle.return_to_latest(&revision).await });
+    timeout(Duration::from_secs(5), f.captured.notified())
+        .await
+        .unwrap();
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    let local = read.await.unwrap().unwrap();
+    assert!(local.presentation.header.epoch.is_none());
+    assert!(!local.presentation.header.capabilities.can_send);
+    assert_eq!(
+        local.presentation.header.capabilities.participation,
+        crate::conversation_presentation::ConversationParticipation::Removed
+    );
+    f.mode.store(0, Ordering::SeqCst);
+    f.release.notify_one();
+    loop {
+        let update = next(&mut sub).await;
+        assert!(!update.presentation.header.capabilities.can_send);
+        if update.presentation.header.epoch.is_some() {
+            break;
+        }
+    }
     f.close().await;
 }

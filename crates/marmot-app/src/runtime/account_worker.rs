@@ -2384,7 +2384,9 @@ async fn handle_startup_hydration_command(
             store_epoch,
             respond,
         } => {
-            let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            if !respond.is_closed() {
+                let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            }
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let _ = client
@@ -3293,7 +3295,9 @@ fn account_worker_command_future<'a>(
             store_epoch,
             respond,
         } => Box::pin(async move {
-            let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            if !respond.is_closed() {
+                let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            }
             true
         }),
         AccountWorkerCommand::GroupMlsState { group_id, respond } => Box::pin(async move {

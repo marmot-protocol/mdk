@@ -527,6 +527,20 @@ mod tests {
             );
             assert_eq!((*initial).messages_len, 2);
             let mut update = ptr::null_mut();
+            // The initial local snapshot may precede the authority upgrade.
+            // Install that replacement before asserting quiet command/revision
+            // behavior, as a native consumer must do for any live update.
+            while !(*initial).header.has_epoch {
+                assert!(!(*initial).header.capabilities.can_send);
+                assert_eq!(
+                    marmot_conversation_window_subscription_next(window, 5000, &mut update),
+                    MarmotStatus::Ok
+                );
+                marmot_conversation_window_snapshot_free(initial);
+                initial = update;
+                update = ptr::null_mut();
+            }
+            assert!((*initial).header.capabilities.can_send);
             let missing = CString::new("00".repeat(32)).unwrap();
             assert_eq!(
                 marmot_conversation_window_subscription_jump_to_message(

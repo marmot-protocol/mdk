@@ -1,5 +1,5 @@
-//! One worker capture and one actor per conversation. Account-owned fields share
-//! a read boundary; directory enrichment is a separate consistency domain.
+//! Local-first bounded windows with optional coherent live-authority capture.
+//! Account-owned fields share a read boundary; directory enrichment is separate.
 use super::account_worker::AccountWorkerCommand;
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
 use super::{MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
@@ -12,7 +12,7 @@ use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use cgka_engine::group_authority::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use storage_sqlite::{ConversationAccountSnapshot, ConversationOpenError, ConversationWindowQuery};
 pub use storage_sqlite::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenQuery,
@@ -21,6 +21,9 @@ pub use storage_sqlite::{
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+// A busy worker may enrich a local window later; never put its queue or
+// network work on the unbounded display path. This is not a command deadline.
+const AUTHORITY_WAIT: Duration = Duration::from_millis(50);
 const DRAIN_LIMIT: usize = 1024;
 pub const CONVERSATION_WINDOW_MAX_ROWS: usize = 200;
 
@@ -151,7 +154,7 @@ impl ConversationWindowSnapshot {
 
 pub(crate) struct CapturedConversation {
     account: ConversationAccountSnapshot,
-    authority: GroupAuthoritySnapshot,
+    authority: Option<GroupAuthoritySnapshot>,
 }
 /// Only called with the live client. Frozen startup/recovery snapshots return
 /// NotReady at their dispatch sites instead of entering this path.
@@ -161,7 +164,6 @@ pub(super) fn capture_conversation(
     query: ConversationWindowQuery,
     epoch: &[u8],
 ) -> Result<CapturedConversation, ConversationWindowError> {
-    client.runtime.session_mut().ensure_group_hydrated(group)?;
     let group_hex = hex::encode(group.as_slice());
     let capture = || {
         client
@@ -185,10 +187,25 @@ pub(super) fn capture_conversation(
                 {
                     account.presentation_input.self_membership = crate::SelfMembership::Removed;
                 }
-                Ok(CapturedConversation { account, authority })
+                Ok(CapturedConversation {
+                    account,
+                    authority: Some(authority),
+                })
             })
     };
     match capture() {
+        Err(ConversationWindowError::App(error))
+            if matches!(
+                error.as_ref(),
+                AppError::Session(cgka_session::SessionError::Engine(
+                    cgka_traits::EngineError::GroupNotHydrated(_)
+                ))
+            ) =>
+        {
+            // Background hydration owns recovery; no projection repair or
+            // full-history work is needed merely because authority is cold.
+            Err(ConversationWindowError::NotReady)
+        }
         Err(ConversationWindowError::NotReady) => {
             // Readiness belongs to the existing keyed projection owner. Repair
             // outside the read boundary, only when missing/dirty; never mark read.
@@ -316,31 +333,131 @@ struct Command {
     action: Action,
     reply: oneshot::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 }
+type WorkerReady =
+    Pin<Box<dyn Future<Output = Result<mpsc::Sender<AccountWorkerCommand>, AppError>> + Send>>;
+
+enum WorkerConnection {
+    // Retain this future across bounded polls; cancellation must not restart
+    // account reconciliation or silently replace the pinned worker. The mutex
+    // makes the erased future Sync for borrowed readers; only get_mut polls it.
+    // There is no detached initialization task to outlive the window.
+    Connecting(tokio::sync::Mutex<WorkerReady>),
+    Ready(mpsc::Sender<AccountWorkerCommand>),
+    Failed(Arc<AppError>),
+}
+
 struct Reader {
     app: MarmotApp,
     label: String,
     account_id: String,
     group: GroupId,
     store_epoch: Vec<u8>,
-    worker: mpsc::Sender<AccountWorkerCommand>,
+    worker: WorkerConnection,
 }
 impl Reader {
-    async fn read(
-        &self,
+    async fn capture_live(
+        &mut self,
         query: &ConversationWindowQuery,
-        revision: ConversationWindowRevision,
-    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
+    ) -> Result<CapturedConversation, ConversationWindowError> {
+        if let WorkerConnection::Connecting(ready) = &mut self.worker {
+            self.worker = match ready.get_mut().await {
+                Ok(worker) => WorkerConnection::Ready(worker),
+                Err(error) => WorkerConnection::Failed(Arc::new(error)),
+            };
+        }
+        let worker = match &self.worker {
+            WorkerConnection::Ready(worker) => worker,
+            WorkerConnection::Failed(error) => {
+                return Err(ConversationWindowError::App(error.clone()));
+            }
+            WorkerConnection::Connecting(_) => unreachable!(),
+        };
         let (respond, rx) = oneshot::channel();
-        self.worker
-            .send(AccountWorkerCommand::CaptureConversation {
+        worker
+            .try_send(AccountWorkerCommand::CaptureConversation {
                 group_id: self.group.clone(),
                 query: query.clone(),
                 store_epoch: self.store_epoch.clone(),
                 respond,
             })
-            .await
-            .map_err(|_| ConversationWindowError::Closed)?;
-        let captured = rx.await.map_err(|_| ConversationWindowError::Closed)??;
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ConversationWindowError::NotReady,
+                mpsc::error::TrySendError::Closed(_) => ConversationWindowError::Closed,
+            })?;
+        rx.await.map_err(|_| ConversationWindowError::Closed)?
+    }
+
+    async fn read(
+        &mut self,
+        query: &ConversationWindowQuery,
+        revision: ConversationWindowRevision,
+    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
+        match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query)).await {
+            Ok(Ok(captured)) => self.present(captured, revision).await,
+            Ok(Err(ConversationWindowError::NotReady)) | Err(_) => {
+                self.read_local(query, revision).await
+            }
+            Ok(Err(error)) => Err(error),
+        }
+    }
+
+    async fn read_local(
+        &self,
+        query: &ConversationWindowQuery,
+        revision: ConversationWindowRevision,
+    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
+        let app = self.app.clone();
+        let label = self.label.clone();
+        let group = hex::encode(self.group.as_slice());
+        let local = self.account_id.clone();
+        let query = query.clone();
+        let epoch = self.store_epoch.clone();
+        let expected_epoch = epoch.clone();
+        let captured = blocking_app_task(move || {
+            if app.account_home().account(&label)?.account_id_hex != local {
+                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+            }
+            let store = app.account_storage(&label)?;
+            if store.chat_presentation_version()?.store_epoch != expected_epoch {
+                return Ok(Err(ConversationOpenError::Storage(StorageError::Closed(
+                    "conversation store replaced".into(),
+                ))));
+            }
+            let read = || store.conversation_account_snapshot(&group, query.clone());
+            let account = match read() {
+                Err(ConversationOpenError::ReadStateNotReady) => {
+                    // Reuse the keyed durable projection owner. Never hydrate
+                    // MLS or mark read merely to render retained local content.
+                    store.refresh_chat_list_row(
+                        &local,
+                        &group,
+                        &MarmotApp::chat_list_mention_classifier(&local),
+                    )?;
+                    read()
+                }
+                result => result,
+            };
+            Ok(account)
+        })
+        .await??;
+        if captured.page.store_epoch() != epoch {
+            return Err(ConversationWindowError::Closed);
+        }
+        self.present(
+            CapturedConversation {
+                account: captured,
+                authority: None,
+            },
+            revision,
+        )
+        .await
+    }
+
+    async fn present(
+        &self,
+        captured: CapturedConversation,
+        revision: ConversationWindowRevision,
+    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
         let app = self.app.clone();
         let label = self.label.clone();
         let account_id = self.account_id.clone();
@@ -349,24 +466,51 @@ impl Reader {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
             let account = captured.account;
-            let authority = captured.authority;
-            let facts = authority.facts;
-            let state = ConversationHeaderState {
-                archived: account.archived,
-                epoch: Some(facts.epoch.0),
-                authority: ConversationAuthority {
-                    is_member: facts.is_member,
-                    self_membership: account.presentation_input.self_membership,
-                    is_admin: facts.is_admin,
-                    admin_count: facts.admin_count,
-                    pending_confirmation: account.pending_confirmation,
-                    leave_request_pending: account.leave_request_pending,
-                    lifecycle: authority.lifecycle.into(),
-                    unrecoverable: facts.unrecoverable,
-                    disbanding: authority.disbanding,
-                    disbanding_enabled: facts.disbanding_enabled,
-                    has_disbanding_blockers: facts.has_disbanding_blockers,
-                },
+            let state = if let Some(authority) = captured.authority {
+                let facts = authority.facts;
+                ConversationHeaderState {
+                    archived: account.archived,
+                    epoch: Some(facts.epoch.0),
+                    authority: ConversationAuthority {
+                        is_member: facts.is_member,
+                        self_membership: account.presentation_input.self_membership,
+                        is_admin: facts.is_admin,
+                        admin_count: facts.admin_count,
+                        pending_confirmation: account.pending_confirmation,
+                        leave_request_pending: account.leave_request_pending,
+                        lifecycle: authority.lifecycle.into(),
+                        unrecoverable: facts.unrecoverable,
+                        disbanding: authority.disbanding,
+                        disbanding_enabled: facts.disbanding_enabled,
+                        has_disbanding_blockers: facts.has_disbanding_blockers,
+                    },
+                }
+            } else {
+                // Membership is a durable display fact, not engine authority.
+                // epoch=None explicitly denotes local-only capture; the shared
+                // presenter suppresses every live permission in this state.
+                ConversationHeaderState {
+                    archived: account.archived,
+                    epoch: None,
+                    authority: ConversationAuthority {
+                        is_member: account.presentation_input.self_membership
+                            == crate::SelfMembership::Member,
+                        self_membership: account.presentation_input.self_membership,
+                        is_admin: false,
+                        admin_count: 0,
+                        pending_confirmation: account.pending_confirmation,
+                        leave_request_pending: account.leave_request_pending,
+                        lifecycle: if account.disbanded {
+                            crate::AppGroupLifecycleState::Disbanded
+                        } else {
+                            crate::AppGroupLifecycleState::Recovering
+                        },
+                        unrecoverable: false,
+                        disbanding: false,
+                        disbanding_enabled: false,
+                        has_disbanding_blockers: false,
+                    },
+                }
             };
             let presentation = app.conversation_window_presentation(
                 &label,
@@ -404,6 +548,18 @@ impl MarmotAppRuntime {
             return Err(ConversationWindowError::InvalidLimit);
         }
         let account = self.accounts.resolve(account_ref)?;
+        self.accounts.require_onboarding_complete_for(&account)?;
+        if !account.can_sign() {
+            return Err(
+                AppError::from(marmot_account::AccountHomeError::SecretNotFound(
+                    account.account_id_hex,
+                ))
+                .into(),
+            );
+        }
+        if account.signed_out {
+            return Err(ConversationWindowError::Closed);
+        }
         let app = &self.accounts.app;
         let mut sources = Sources {
             events: self.events.subscribe(),
@@ -431,7 +587,16 @@ impl MarmotAppRuntime {
                     .store_epoch)
             })
             .await?;
-            let worker = self.accounts.worker_commands(account_ref).await?;
+            let accounts = self.accounts.clone();
+            let account_ref = account.label.clone();
+            let expected_account_id = account.account_id_hex.clone();
+            let worker =
+                WorkerConnection::Connecting(tokio::sync::Mutex::new(Box::pin(async move {
+                    if accounts.resolve(&account_ref)?.account_id_hex != expected_account_id {
+                        return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+                    }
+                    accounts.worker_commands(&account_ref).await
+                })));
             let reader = Reader {
                 app: self.accounts.app.clone(),
                 label: account.label.clone(),
@@ -441,7 +606,7 @@ impl MarmotAppRuntime {
                 worker,
             };
             loop {
-                match reader.read(&position, revision.clone()).await {
+                match reader.read_local(&position, revision.clone()).await {
                     Err(ConversationWindowError::NotReady) => tokio::time::sleep(RETRY_DELAY).await,
                     result => return result.map(|snapshot| (reader, snapshot)),
                 }
@@ -609,7 +774,7 @@ impl Sources {
     }
 }
 async fn run(
-    reader: Reader,
+    mut reader: Reader,
     mut position: ConversationWindowQuery,
     mut current: ConversationWindowSnapshot,
     mut sources: Sources,
@@ -617,7 +782,8 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     updates: watch::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 ) {
-    let mut dirty = false;
+    let mut dirty = true; // enrich the initial local snapshot without delaying it
+    let mut authority_pending = false;
     let mut failed = false;
     let mut last_good_position = position.clone();
     loop {
@@ -628,7 +794,7 @@ async fn run(
             _ = wait_for_account_reset(&mut resets, &reader.label) => return,
             _ = updates.closed() => return,
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
-            _ = tokio::time::sleep(if failed { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty => None,
+            _ = tokio::time::sleep(if failed || (authority_pending && !dirty) { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty || authority_pending => None,
             _ = sources.invalidated(&reader, &current), if !dirty => { dirty = true; continue; },
         };
         let next = match command
@@ -645,10 +811,11 @@ async fn run(
             }
         };
         sources.drain(); // only the queued prefix; mutations during capture remain queued
+        let reset_label = reader.label.clone();
         let result = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return,
-            _ = wait_for_account_reset(&mut resets, &reader.label) => return,
+            _ = wait_for_account_reset(&mut resets, &reset_label) => return,
             _ = updates.closed() => return,
             result = reader.read(&next, current.revision.clone()) => result,
         };
@@ -671,11 +838,13 @@ async fn run(
                 if let Some(command) = command {
                     let _ = command.reply.send(Ok(current.clone()));
                 }
-                dirty = false;
+                authority_pending = current.presentation.header.epoch.is_none();
+                dirty = false; // local invalidations stay prompt during quiet authority retries
                 failed = false;
             }
             Err(error) => {
-                let terminal = error.terminal();
+                let terminal =
+                    error.terminal() || matches!(reader.worker, WorkerConnection::Failed(_));
                 let query_error = matches!(error, ConversationWindowError::Query(_));
                 if terminal || (!failed && !query_error) || (query_error && command.is_none()) {
                     let _ = updates.send_replace(Err(error.clone()));

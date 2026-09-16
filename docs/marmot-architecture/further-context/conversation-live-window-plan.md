@@ -1,7 +1,7 @@
 ---
 title: "C5 M4 live conversation implementation plan"
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-09-16
 status: implementation-contract
 ---
 
@@ -75,11 +75,16 @@ invalidates it for title/avatar/member presentation changes, not admin policy or
 The startup/recovery `GroupReadSnapshot` freezes engine facts before network work while account
 storage can advance. Zipping its MLS state with a fresh account capture is therefore not coherent.
 
-The actor uses the session capture callback during ordinary operation and retains a timed retry
-while startup or recovery owns the mutable client. All three frozen-snapshot dispatch paths return
-`NotReady`; they never combine `GroupReadSnapshot` with newer persisted fields. Startup hydration
-and ordinary command dispatch use the live capture. Tests cover unavailable frozen snapshots,
-quiet retries and an ordinary managed worker.
+Opening first reads the durable account snapshot directly. `header.epoch = None` marks local-only
+presentation and suppresses all live permissions, preserving persisted membership/invitation/departure
+status. The actor then acquires the worker and uses its session capture callback for coherent live
+authority. It retains a 50 ms capture wait budget and a one-second quiet retry when authority is
+unavailable; paging and updates fall back to fresh local snapshots. The pending worker acquisition
+future is retained across polls and dropped with the actor, rather than spawning an unowned task.
+Frozen-snapshot dispatch paths still return `NotReady`; no old `GroupReadSnapshot` is combined
+with newer persisted fields. Live capture never forces group hydration: background recovery owns
+that work. Tests cover stalled production relay sync at 200/5,000 retained messages, seeded but
+unhydrated groups, quiet authority upgrades, local paging, resets and worker replacement.
 Cached facts must be invalidated by role/membership/capability/lifecycle
 changes, must not survive a store replacement, and cannot be combined with a different account
 frontier. Do not use a generic `Stable` fallback for unknown epoch state or silently omit a
@@ -141,3 +146,31 @@ this work introduces no new absolute byte cap and makes no device-speed claim. S
 M5 adds UniFFI/C DTOs and ownership/error mapping over this Rust contract, with generated native
 parity tests and client migration examples. Bindings publication, app adoption and device timings
 remain C9.
+
+## Cold-opening regression checks
+
+Run `cargo test -p marmot-app --features test-policy-overrides --lib cold_ -- --nocapture`.
+The fixtures store 200/5,000 projected messages plus synthetic retained engine records
+(4 KiB each). They hold a production worker at relay subscription, verify local
+paging before release, and reconstruct the runtime with startup hydration held.
+Opening must leave that group unhydrated and upgrade permissions after readiness
+without needing a second window. Separate actor tests reject stale permissions
+when a delayed capture races membership changes. Timed assertions are generous
+hang-detection ceilings; printed host timings are not iOS frame-time guarantees.
+
+The initial pre-fix public-window regression exceeded its 500 ms deadline with
+only 200 retained messages while live capture returned `NotReady`. The local-first
+implementation returned the 50-row page in 1–6 ms in initial host runs, including
+5,000-row storage while relay sync remained stalled. The device's reported
+10–15 seconds has not been apportioned between worker waits, hydration, native
+conversion and first layout by these tests; repeat on the same device/build before
+claiming that UI latency or a device speedup. This fix removes explicit engine and
+network dependencies from the first snapshot; database contention and host
+rendering still have their own costs.
+
+For a separate phase comparison, run the ignored diagnostic:
+`cargo test -p marmot-app --features test-policy-overrides --lib cold_open_storage_and_hydration_timings -- --ignored --nocapture`.
+One arm64 macOS host run measured storage capture at 1,791/1,748 microseconds
+for 200/5,000 rows, versus explicit hydration at 10,147/109,380 microseconds.
+This separates the retained-history recovery scan from local capture; it does not
+measure native conversion, actual encrypted relay replay, or UI layout.
