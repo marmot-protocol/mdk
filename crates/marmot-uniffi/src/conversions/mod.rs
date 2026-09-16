@@ -792,3 +792,6 @@ pub use chat_window::*;
 
 pub mod conversation_window;
 pub use conversation_window::*;
+
+mod avatar;
+pub use avatar::*;

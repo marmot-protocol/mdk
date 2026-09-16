@@ -202,6 +202,7 @@ impl MarmotAppRuntime {
             .profile_updates
             .subscribe();
         let presentation = self.accounts.app.presentation_signals.updates.subscribe();
+        let avatars = self.accounts.app.presentation_signals.avatars.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let mut resets = self
             .accounts
@@ -243,6 +244,7 @@ impl MarmotAppRuntime {
             position,
             snapshot.clone(),
             Sources {
+                avatars,
                 profiles,
                 events,
                 presentation,
@@ -427,6 +429,7 @@ fn snapshot(
     }
 }
 struct Sources {
+    avatars: broadcast::Receiver<String>,
     profiles: broadcast::Receiver<String>,
     events: broadcast::Receiver<MarmotAppEvent>,
     presentation: broadcast::Receiver<PresentationInvalidation>,
@@ -438,6 +441,9 @@ impl Sources {
             || chat_list_event_route(event).is_some_and(|(account, _)| account == reader.account_id)
     }
     fn drain(&mut self) {
+        for _ in 0..self.avatars.len().min(64) {
+            let _ = self.avatars.try_recv();
+        }
         // Drain only the bounded queued prefix. Events arriving during a read stay queued.
         for _ in 0..self.events.len().min(INVALIDATION_DRAIN_LIMIT) {
             let _ = self.events.try_recv();
@@ -457,6 +463,7 @@ impl Sources {
     ) {
         loop {
             tokio::select! {
+                event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 profile = self.profiles.recv() => match profile {
                     Ok(profile) if rows.iter().any(|r| {
                         r.row.last_message.as_ref().is_some_and(|m| {

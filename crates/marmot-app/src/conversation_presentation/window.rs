@@ -33,6 +33,7 @@ pub struct ConversationHeaderState {
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationHeader {
+    pub avatar_asset: Option<storage_sqlite::AvatarAssetPresentation>,
     pub selected: ConversationPresentation,
     pub member_count: Option<u64>,
     pub archived: bool,
@@ -47,6 +48,7 @@ pub struct ConversationHeader {
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct ConversationIdentity {
+    pub avatar_asset: Option<storage_sqlite::AvatarAssetPresentation>,
     pub account_id_hex: String,
     pub display_name: String,
     pub avatar: SelectedAvatar,
@@ -265,8 +267,27 @@ impl MarmotApp {
         {
             capabilities.can_send = false;
         }
+        for identity in identities.values_mut() {
+            identity.avatar_asset = storage
+                .avatar_target_presentation(
+                    &input.group_id_hex,
+                    Some(&identity.account_id_hex),
+                    &identity.avatar,
+                    crate::unix_now_seconds(),
+                )
+                .map_err(AppError::from)?;
+        }
+        let avatar_asset = storage
+            .avatar_target_presentation(
+                &input.group_id_hex,
+                None,
+                &selected.avatar,
+                crate::unix_now_seconds(),
+            )
+            .map_err(AppError::from)?;
         let result = ConversationWindowPresentation {
             header: ConversationHeader {
+                avatar_asset,
                 selected,
                 member_count: input.member_count,
                 archived: state.archived,
@@ -342,6 +363,7 @@ fn identity(
             source: crate::PresentationSource::PeerFallback,
         });
     ConversationIdentity {
+        avatar_asset: None,
         account_id_hex: id.to_owned(),
         display_name,
         avatar,
@@ -490,6 +512,7 @@ mod budget_tests {
             cache_key: id.clone(),
         };
         let identity = ConversationIdentity {
+            avatar_asset: None,
             account_id_hex: id.clone(),
             display_name: "\"".repeat(MAX_NAME_BYTES),
             avatar: avatar.clone(),
@@ -537,6 +560,7 @@ mod budget_tests {
             has_disbanding_blockers: false,
         };
         let header = ConversationHeader {
+            avatar_asset: None,
             selected: ConversationPresentation {
                 // safe_name takes <=4096 Unicode scalars (<=16384 UTF-8
                 // bytes), with <=2x escaping after stripping controls.

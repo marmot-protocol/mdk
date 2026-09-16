@@ -27,7 +27,7 @@ const MAX_KEY_BYTES: usize = 512;
 /// A source generation, scoped to the existing account store epoch. Neither the
 /// owner key nor image material is exposed. A reference is not an authorization
 /// grant: callers must still select the correct account using the host contract.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AvatarAssetRef {
     store_epoch: Vec<u8>,
     token: Vec<u8>,
@@ -122,7 +122,7 @@ impl fmt::Debug for AvatarImage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AvatarAvailability {
     Missing,
     Ready,
@@ -130,7 +130,7 @@ pub enum AvatarAvailability {
     Invalidated,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AvatarAssetStatus {
     pub availability: AvatarAvailability,
     /// Use together with the source reference to key a decoded-image cache.
@@ -312,9 +312,26 @@ impl SqliteAccountStorage {
         reference: &AvatarAssetRef,
         now: u64,
     ) -> StorageResult<AvatarAssetRead> {
+        self.read_avatar_bounded(reference, now, MAX_AVATAR_BYTES as u64)
+    }
+
+    /// A budget miss returns ready/stale metadata with no image and does not
+    /// read the BLOB, touch recency, or invalidate usable bytes.
+    pub fn read_avatar_bounded(
+        &self,
+        reference: &AvatarAssetRef,
+        now: u64,
+        max_bytes: u64,
+    ) -> StorageResult<AvatarAssetRead> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let mut state = status(&tx, reference, now)?;
+        if state.byte_count > max_bytes && state.byte_count <= MAX_AVATAR_BYTES as u64 {
+            return Ok(AvatarAssetRead {
+                status: state,
+                image: None,
+            });
+        }
         let mut image = None;
         if matches!(
             state.availability,
@@ -516,3 +533,6 @@ mod tests;
 
 mod acquisition;
 pub use acquisition::{AvatarAcquisition, AvatarAcquisitionState, AvatarIdentityDemand};
+
+pub(crate) mod access;
+pub use access::{AvatarAssetPresentation, AvatarAssetTarget};

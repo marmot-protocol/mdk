@@ -474,6 +474,8 @@ mod tests;
 /// A complete existing row with MDK-selected display; callers need no peer lookup.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresentedChatRow {
+    #[serde(default)]
+    pub avatar_asset: Option<crate::AvatarAssetPresentation>,
     pub row: crate::ChatListRow,
     pub presentation: ConversationPresentation,
 }
@@ -552,7 +554,18 @@ impl SqliteAccountStorage {
                 return Ok(None);
             };
             let presentation = decode_retained(&bytes, dirty)?.presentation;
-            presented.push(PresentedChatRow { row, presentation });
+            let avatar_asset = crate::avatar_cache::access::target_presentation(
+                &tx,
+                &row.group_id_hex,
+                None,
+                &presentation.avatar,
+                crate::avatar_cache::access::now(),
+            )?;
+            presented.push(PresentedChatRow {
+                row,
+                presentation,
+                avatar_asset,
+            });
         }
         let presentation_version = tx
             .query_row(

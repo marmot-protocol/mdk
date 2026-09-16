@@ -715,6 +715,7 @@ impl MarmotAppRuntime {
         }
         let app = &self.accounts.app;
         let mut sources = Sources {
+            avatars: app.presentation_signals.avatars.subscribe(),
             events: self.events.subscribe(),
             profiles: app.presentation_signals.profile_updates.subscribe(),
             presentation: app.presentation_signals.updates.subscribe(),
@@ -885,6 +886,7 @@ fn command_position(
     Ok(next)
 }
 struct Sources {
+    avatars: broadcast::Receiver<String>,
     events: broadcast::Receiver<MarmotAppEvent>,
     profiles: broadcast::Receiver<String>,
     presentation: broadcast::Receiver<PresentationInvalidation>,
@@ -893,6 +895,9 @@ struct Sources {
 }
 impl Sources {
     fn drain(&mut self) {
+        for _ in 0..self.avatars.len().min(64) {
+            let _ = self.avatars.try_recv();
+        }
         for _ in 0..self.events.len().min(DRAIN_LIMIT) {
             let _ = self.events.try_recv();
         }
@@ -910,6 +915,7 @@ impl Sources {
         let group_hex = hex::encode(reader.group.as_slice());
         loop {
             tokio::select! {
+                event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 event = self.events.recv() => match event {
                     Ok(event) if projection_update_from_event(&event).is_some_and(|u|u.account_id_hex == reader.account_id && u.update.group_id_hex == group_hex)
                         || chat_list_event_route(&event).is_some_and(|(account,group)| account == reader.account_id && group == &reader.group) => return,

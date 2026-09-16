@@ -8,6 +8,7 @@ pub(crate) struct PresentationInvalidation {
     pub(crate) version: ChatPresentationVersion,
 }
 pub(crate) struct PresentationSignals {
+    pub(crate) avatars: broadcast::Sender<String>,
     pub(crate) drafts: broadcast::Sender<crate::drafts::MessageDraftInvalidation>,
     /// Terminal invalidation for handles using an evicted account store.
     pub(crate) account_resets: broadcast::Sender<String>,
@@ -20,6 +21,7 @@ pub(crate) struct PresentationSignals {
 impl Default for PresentationSignals {
     fn default() -> Self {
         Self {
+            avatars: broadcast::channel(64).0,
             drafts: broadcast::channel(64).0,
             account_resets: broadcast::channel(64).0,
             profile_updates: broadcast::channel(64).0,

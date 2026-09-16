@@ -1186,6 +1186,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
         send_capture: capture,
     };
     let sources = Sources {
+        avatars: f.app.presentation_signals.avatars.subscribe(),
         events: f.runtime.events.subscribe(),
         profiles: f.app.presentation_signals.profile_updates.subscribe(),
         presentation: f.app.presentation_signals.updates.subscribe(),
@@ -1481,5 +1482,65 @@ async fn live_window_waits_for_queue_capacity_without_a_display_retry_delay() {
         Err(ConversationWindowError::Closed)
     ));
     drop(permits);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn avatar_identity_sidecar_tracks_local_bytes_without_new_timeline_activity() {
+    let f = Fixture::new(2).await;
+    let member = "bb".repeat(32);
+    let mut record = f.app.empty_directory_record(&member);
+    record.profile = Some(crate::UserProfileMetadata {
+        picture: Some("https://example.com/avatar.png".into()),
+        created_at: 42,
+        ..Default::default()
+    });
+    f.app.save_directory_entry(&record).unwrap();
+    let mut sub = f.open(ConversationOpenTarget::Latest, 2).await;
+    let asset = sub.snapshot.presentation.identities[&member]
+        .avatar_asset
+        .clone()
+        .unwrap();
+    assert!(asset.reference.is_none());
+    let requested = f
+        .runtime
+        .request_avatar_assets("alice", vec![asset.target])
+        .await
+        .unwrap();
+    let reference = requested[0].reference.clone().unwrap();
+    let image =
+        storage_sqlite::AvatarImage::new(vec![1; 8], storage_sqlite::AvatarImageFormat::Png, 1, 1)
+            .unwrap();
+    f.store.publish_avatar(&reference, 0, &image, None).unwrap();
+    for _ in 0..100 {
+        let _ = f.app.presentation_signals.avatars.send("alice".into());
+    }
+    let update = next(&mut sub).await;
+    assert_eq!(
+        update.presentation.identities[&member]
+            .avatar_asset
+            .as_ref()
+            .unwrap()
+            .status
+            .availability,
+        storage_sqlite::AvatarAvailability::Ready
+    );
+    assert_eq!(update.page.page(), sub.snapshot.page.page());
+    let bytes = f
+        .runtime
+        .read_avatar_assets("alice", vec![reference.clone()], 8)
+        .await
+        .unwrap();
+    assert_eq!(bytes[0].result.image, Some(image));
+    f.runtime.clear_avatar_cache("alice").await.unwrap();
+    let removed = next(&mut sub).await;
+    assert!(
+        removed.presentation.identities[&member]
+            .avatar_asset
+            .as_ref()
+            .unwrap()
+            .reference
+            .is_none()
+    );
     f.close().await;
 }

@@ -1,4 +1,5 @@
 //! Owned C mirrors of the prepared conversation contract.
+use super::avatar::MarmotAvatarAsset;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, boxed, free_boxed};
 use crate::types::{group::*, presentation::*, timeline::*};
@@ -38,6 +39,7 @@ copy can_enable_disbanding: bool,
 copy can_disband: bool,
 } }
 c_mirror! { MarmotConversationHeader from ConversationHeaderFfi {
+    opt_rec avatar_asset: MarmotAvatarAsset,
 rec selected: MarmotConversationPresentation,
 opt_copy has_member_count/member_count: u64,
 copy archived: bool,
@@ -48,6 +50,7 @@ copy unrecoverable: bool,
 rec capabilities: MarmotConversationCapabilities,
 } }
 c_mirror! { MarmotConversationIdentity from ConversationIdentityFfi {
+    opt_rec avatar_asset: MarmotAvatarAsset,
 str account_id_hex,
 str display_name,
 rec avatar: MarmotSelectedAvatar,

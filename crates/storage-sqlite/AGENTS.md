@@ -23,7 +23,7 @@ not "fix" it into the per-account database.
 | `src/account_projection.rs` | Account-level event projection. |
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |
 | `src/timeline.rs` | Materialized message-timeline aggregation. |
-| `src/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state. |
+| `src/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |
 | `src/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
 | `src/shared/error.rs` | Shared-store redacting SQLite error mapper and result extension. |
 | `src/shared/migrations.rs`, `src/shared/v1.sql`, `src/shared/legacy.sql` | Independent `shared_schema_migrations` runner, frozen v1 schema and recognized retired columns. |

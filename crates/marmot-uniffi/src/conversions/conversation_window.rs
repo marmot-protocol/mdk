@@ -76,6 +76,7 @@ impl From<app::conversation_presentation::ConversationCapabilities>
 }
 #[derive(Clone, uniffi::Record)]
 pub struct ConversationHeaderFfi {
+    pub avatar_asset: Option<AvatarAssetFfi>,
     pub selected: ConversationPresentationFfi,
     pub member_count: Option<u64>,
     pub archived: bool,
@@ -88,6 +89,7 @@ pub struct ConversationHeaderFfi {
 impl From<app::conversation_presentation::ConversationHeader> for ConversationHeaderFfi {
     fn from(v: app::conversation_presentation::ConversationHeader) -> Self {
         Self {
+            avatar_asset: v.avatar_asset.map(Into::into),
             selected: v.selected.into(),
             member_count: v.member_count,
             archived: v.archived,
@@ -101,6 +103,7 @@ impl From<app::conversation_presentation::ConversationHeader> for ConversationHe
 }
 #[derive(Clone, uniffi::Record)]
 pub struct ConversationIdentityFfi {
+    pub avatar_asset: Option<AvatarAssetFfi>,
     pub account_id_hex: String,
     pub display_name: String,
     pub avatar: SelectedAvatarFfi,
@@ -109,6 +112,7 @@ pub struct ConversationIdentityFfi {
 impl From<app::conversation_presentation::ConversationIdentity> for ConversationIdentityFfi {
     fn from(v: app::conversation_presentation::ConversationIdentity) -> Self {
         Self {
+            avatar_asset: v.avatar_asset.map(Into::into),
             account_id_hex: v.account_id_hex,
             display_name: v.display_name,
             avatar: v.avatar.into(),

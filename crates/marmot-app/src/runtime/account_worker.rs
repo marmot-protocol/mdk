@@ -2532,10 +2532,19 @@ fn schedule_avatar_acquisition(
 ) -> Result<bool, AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let transport = client.blossom_http_transport.clone();
-    dispatch_avatar_acquisition(&storage, media_http, resumed, move |descriptor| {
+    let before = media_http.permits.available_permits();
+    let result = dispatch_avatar_acquisition(&storage, media_http, resumed, move |descriptor| {
         let transport = transport.clone();
         async move { crate::media::avatar::fetch(&descriptor, &transport).await }
-    })
+    });
+    if media_http.permits.available_permits() < before {
+        let _ = client
+            .app
+            .presentation_signals
+            .avatars
+            .send(client.state.label.clone());
+    }
+    result
 }
 
 fn dispatch_avatar_acquisition<F, Fut>(
@@ -2698,6 +2707,11 @@ async fn complete_media_http(
                         "avatar completion could not be committed");
                 }
             }
+            let _ = client
+                .app
+                .presentation_signals
+                .avatars
+                .send(client.state.label.clone());
         }
         MediaHttpCompletion::Upload {
             finish,

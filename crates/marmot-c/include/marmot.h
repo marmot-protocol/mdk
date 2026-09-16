@@ -178,6 +178,21 @@ typedef int32_t MarmotStatus;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
+typedef enum MarmotAvatarAvailability {
+  MARMOT_AVATAR_AVAILABILITY_MISSING,
+  MARMOT_AVATAR_AVAILABILITY_READY,
+  MARMOT_AVATAR_AVAILABILITY_STALE,
+  MARMOT_AVATAR_AVAILABILITY_INVALIDATED,
+} MarmotAvatarAvailability;
+
+typedef enum MarmotAvatarAcquisitionState {
+  MARMOT_AVATAR_ACQUISITION_STATE_IDLE,
+  MARMOT_AVATAR_ACQUISITION_STATE_QUEUED,
+  MARMOT_AVATAR_ACQUISITION_STATE_FETCHING,
+  MARMOT_AVATAR_ACQUISITION_STATE_RETRY_SCHEDULED,
+  MARMOT_AVATAR_ACQUISITION_STATE_BLOCKED,
+} MarmotAvatarAcquisitionState;
+
 typedef enum MarmotOnboardingStep {
   MARMOT_ONBOARDING_STEP_PROFILE,
   MARMOT_ONBOARDING_STEP_FOLLOWS,
@@ -675,16 +690,6 @@ typedef enum MarmotProductRecordResult {
   MARMOT_PRODUCT_RECORD_RESULT_DROPPED_CAPACITY,
 } MarmotProductRecordResult;
 
-typedef enum MarmotReportReason {
-  MARMOT_REPORT_REASON_NUDITY,
-  MARMOT_REPORT_REASON_MALWARE,
-  MARMOT_REPORT_REASON_PROFANITY,
-  MARMOT_REPORT_REASON_ILLEGAL,
-  MARMOT_REPORT_REASON_SPAM,
-  MARMOT_REPORT_REASON_IMPERSONATION,
-  MARMOT_REPORT_REASON_OTHER,
-} MarmotReportReason;
-
 /**
  * Why a timeline delta fired.
  */
@@ -1104,6 +1109,48 @@ typedef struct MarmotSecretStore {
    */
   MarmotSecretStoreDestroyFn destroy;
 } MarmotSecretStore;
+
+typedef struct MarmotAvatarAsset {
+  char *target;
+  char *reference;
+  enum MarmotAvatarAvailability availability;
+  bool has_acquisition;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotAvatarAcquisitionState acquisition;
+  uint64_t content_revision;
+  uint64_t byte_count;
+} MarmotAvatarAsset;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAvatarAssetList {
+  struct MarmotAvatarAsset *items;
+  uintptr_t len;
+} MarmotAvatarAssetList;
+
+typedef struct MarmotAvatarBytes {
+  char *reference;
+  enum MarmotAvatarAvailability availability;
+  uint64_t content_revision;
+  uint64_t byte_count;
+  bool deferred;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+  char *media_type;
+  uint32_t width;
+  uint32_t height;
+} MarmotAvatarBytes;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAvatarBytesList {
+  struct MarmotAvatarBytes *items;
+  uintptr_t len;
+} MarmotAvatarBytesList;
 
 /**
  * One signed-in (or signed-out but known) account.
@@ -2389,6 +2436,7 @@ typedef struct MarmotConversationPresentation {
 } MarmotConversationPresentation;
 
 typedef struct MarmotPresentedChatRow {
+  struct MarmotAvatarAsset *avatar_asset;
   struct MarmotChatListRow row;
   struct MarmotConversationPresentation presentation;
 } MarmotPresentedChatRow;
@@ -3289,7 +3337,6 @@ typedef struct MarmotTimelineEditSummary {
  */
 typedef struct MarmotTimelineMessageRecord {
   char *message_id_hex;
-  bool has_reports;
   /**
    * Delivery marker for own (`direction == "sent"`) messages: NULL
    * while committed-but-undelivered (render as pending/failed),
@@ -3755,36 +3802,6 @@ typedef struct MarmotTimelineEditHistoryPage {
   uintptr_t versions_len;
   bool has_more_before;
 } MarmotTimelineEditHistoryPage;
-
-typedef struct MarmotContentReport {
-  char *report_id_hex;
-  char *message_id_hex;
-  char *message_author;
-  char *reporter;
-  enum MarmotReportReason reason;
-  char *explanation;
-  uint64_t reported_at;
-  bool dismissed;
-} MarmotContentReport;
-
-typedef struct MarmotContentReportPage {
-  struct MarmotContentReport *reports;
-  uintptr_t reports_len;
-  char *next_cursor;
-} MarmotContentReportPage;
-
-typedef struct MarmotReportDismissal {
-  char *event_id_hex;
-  char *admin;
-  char *explanation;
-  uint64_t created_at;
-} MarmotReportDismissal;
-
-typedef struct MarmotReportDismissalPage {
-  struct MarmotReportDismissal *labels;
-  uintptr_t labels_len;
-  char *next_cursor;
-} MarmotReportDismissalPage;
 
 /**
  * Stable stream and start-message identifiers.
@@ -4565,6 +4582,7 @@ typedef struct MarmotConversationCapabilities {
 } MarmotConversationCapabilities;
 
 typedef struct MarmotConversationHeader {
+  struct MarmotAvatarAsset *avatar_asset;
   struct MarmotConversationPresentation selected;
   bool has_member_count;
   /**
@@ -4625,6 +4643,7 @@ typedef struct MarmotConversationMessage {
 } MarmotConversationMessage;
 
 typedef struct MarmotConversationIdentity {
+  struct MarmotAvatarAsset *avatar_asset;
   char *account_id_hex;
   char *display_name;
   struct MarmotSelectedAvatar avatar;
@@ -4852,6 +4871,45 @@ void marmot_string_free(char *s);
  * been freed already.
  */
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_request_avatar_assets(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *const *targets,
+                                          uintptr_t targets_len,
+                                          struct MarmotAvatarAssetList **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_read_avatar_assets(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *const *references,
+                                       uintptr_t references_len,
+                                       uint64_t max_bytes,
+                                       struct MarmotAvatarBytesList **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_clear_avatar_cache(const struct MarmotClient *client, const char *account_ref);
 
 /**
  * List every account known to this device. Free the result with
@@ -7882,81 +7940,6 @@ MarmotStatus marmot_message_edit_history(const struct MarmotClient *client,
                                          struct MarmotTimelineEditHistoryPage **out);
 
 /**
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_dismiss_reports(const struct MarmotClient *client,
-                                    const char *account_ref,
-                                    const char *group_id_hex,
-                                    const char *const *report_ids,
-                                    uintptr_t report_ids_len,
-                                    const char *explanation,
-                                    struct MarmotSendSummary **out);
-
-/**
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_reported_message(const struct MarmotClient *client,
-                                     const char *account_ref,
-                                     const char *group_id_hex,
-                                     const char *message_id,
-                                     struct MarmotTimelineMessageRecord **out);
-
-/**
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_content_reports(const struct MarmotClient *client,
-                                    const char *account_ref,
-                                    const char *group_id_hex,
-                                    const char *message_id,
-                                    const char *after,
-                                    uint32_t limit,
-                                    struct MarmotContentReportPage **out);
-
-/**
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_report_dismissals(const struct MarmotClient *client,
-                                      const char *account_ref,
-                                      const char *group_id_hex,
-                                      const char *report_id,
-                                      const char *after,
-                                      uint32_t limit,
-                                      struct MarmotReportDismissalPage **out);
-
-/**
- * Report one group message. Reason is a MarmotReportReason discriminant.
- * # Safety
- * Client, strings and output pointer must be valid. Inputs are borrowed.
- */
-MarmotStatus marmot_report_message(const struct MarmotClient *client,
-                                   const char *account_ref,
-                                   const char *group_id_hex,
-                                   const char *message_id,
-                                   uint32_t reason,
-                                   const char *explanation,
-                                   struct MarmotSendSummary **out);
-
-/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -10135,7 +10118,16 @@ void marmot_block_list_snapshot_free(struct MarmotBlockListSnapshot *ptr);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
-void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
+void marmot_avatar_asset_free(struct MarmotAvatarAsset *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_avatar_asset_list_free(struct MarmotAvatarAssetList *list);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -10145,7 +10137,16 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
-void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+void marmot_avatar_bytes_free(struct MarmotAvatarBytes *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_avatar_bytes_list_free(struct MarmotAvatarBytesList *list);
 
 #ifdef __cplusplus
 }  // extern "C"

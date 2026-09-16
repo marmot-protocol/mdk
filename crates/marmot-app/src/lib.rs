@@ -6704,3 +6704,8 @@ mod tests;
 
 pub use cgka_traits::reporting::ReportReason;
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
+pub use runtime::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
+pub use storage_sqlite::{
+    AvatarAcquisitionState, AvatarAssetPresentation, AvatarAssetRef, AvatarAssetStatus,
+    AvatarAssetTarget, AvatarAvailability,
+};

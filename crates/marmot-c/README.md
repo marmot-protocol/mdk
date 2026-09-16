@@ -185,3 +185,10 @@ for paging, sequence handling, cancellation, C ownership, and compatibility.
 The additive C5 screen API combines history, header/capabilities, visible identities,
 read state and revisioned draft descriptors. See the [native conversation contract](../marmot-uniffi/CONVERSATION-WINDOW.md)
 for opening, paging, cancellation, timeout, ownership and draft migration.
+
+
+Avatar screen metadata is mirrored as `MarmotAvatarAsset`. Use `marmot_request_avatar_assets` for up to 16 visible
+opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 references / 16 MiB), and
+`marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
+`marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions. Regenerate/recompile consumers against the
+matching header and library; the resolved chat/conversation records now contain an optional avatar metadata pointer.

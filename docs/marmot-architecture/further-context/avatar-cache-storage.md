@@ -47,8 +47,8 @@ it is not a replacement for SQLCipher page authentication or image validation. B
 10 MiB while holding the account connection. The C7-B optimized, file-backed SQLCipher host probe (20 warm reads per
 size) measured p50/p95 of 0.79/2.42 ms at 256 KiB, 2.55/2.84 ms at 1 MiB and 36.95/38.76 ms at 10 MiB. These are total
 local-read durations, including checksum/recency, not isolated SHA timings or device evidence. Keep verification for
-now; C7-C must bound visible batches, retain client decoded caches and validate account-lock latency on flagship devices
-before adoption. Read-time bounds protect the allocation/typed decoding boundary even though valid writes satisfy schema checks.
+now; C7-C bounds visible batches and retains client decoded caches. C9 must validate account-lock latency on flagship
+devices before adoption. Read-time bounds protect the allocation/typed decoding boundary even though valid writes satisfy schema checks.
 
 Account references retain explicit store-epoch scoping, consistent with other projection handles. Production does
 not rotate `chat_presentation_meta.store_epoch` in place: account recreation gets a fresh store, and explicit cache
@@ -64,8 +64,8 @@ batches of 64. It is consumed durably, so restart and unrelated title changes do
 
 `MarmotApp::request_identity_avatar` explicitly registers a conversation identity using local profile evidence.
 Maintenance revisits at most 64 registered identities per batch after shared profile versions change, never historical
-rosters. Unchanged directory versions skip the scan. Native demand producers remain C7-C work; Rust callers can
-already use the explicit request API. Placeholder registrations
+rosters. Unchanged directory versions skip the scan. C7-C supplies native visible-demand batches alongside the explicit
+Rust request API. Placeholder registrations
 can acquire a later profile picture. Profile versions reject stale maintenance, and eviction deletes registration;
 local conversation deletion removes its chat/identity assets, and account cache clear drops registrations and unfinished
 upgrade demand. Registrations are capped at 2,048.
@@ -101,9 +101,38 @@ client-owned. Malformed stored job envelopes become blocked so later jobs can pr
 errors to the enclosing transaction; combined source/presentation and publication/job-state rollback tests cover
 that composition. `read_avatar` still owns its read/recency transaction and must not be nested in a snapshot.
 
-## Remaining C7-C integration
+## C7-C screen and native access
 
-C7-C must publish committed source/acquisition/repair/eviction changes, add versioned asset references and availability
-to screen/native DTOs, provide bounded/batched visible-byte access, and cover snapshot/update recovery. Decoded-image
-caches must include content revision, not only source reference. Do not embed every avatar in screen payloads or
-remove host persistent caches before native replacement is integrated and verified.
+Resolved chat rows, conversation headers and conversation identities carry optional `avatar_asset` metadata alongside
+the existing selected descriptor. Placeholders have no asset. The metadata contains an opaque request `target`, an
+optional byte `reference`, availability, acquisition state, content revision and encoded byte count. These are local
+account/store and conversation-incarnation locators, not URLs, filesystem paths or authorization capabilities. Migration
+0079 adds an index on the existing chat-row incarnation, so resolving a visible target does not scan the account chat list.
+
+- Pass targets for **visible** images to `request_avatar_assets`. MDK revalidates the current source and registers
+  demand without awaiting HTTP. This also restores an evicted visible image. It does not enumerate historical rosters
+  or automatically register every identity in a potentially large sidecar.
+- Call `read_avatar_assets` with returned references. It reads SQLCipher on the blocking pool, without engine hydration,
+  account-worker startup, relay synchronization or an HTTP prerequisite. Ready and stale bytes are both usable.
+- Both batches accept at most **16 items**. A byte read requires a budget of **1 byte through 16 MiB**; each image must
+  fit in the remaining budget in full. Results preserve input order. `deferred` means usable bytes did not fit; retry
+  that reference in a later batch with enough room. Metadata-only budget checks never load that BLOB or evict it.
+- Key decoded pixels by **reference plus content revision**. The returned byte result is authoritative for its own
+  revision. Missing and invalidated results contain no bytes; obtain a fresh target/reference from current screen
+  metadata. A reference from a different account, reset store or replaced source cannot return old bytes.
+- Existing chat-list and conversation window subscriptions deliver replacement metadata after committed acquisition,
+  cache clear and local corruption repair. Receivers attach before the initial read; channel lag reloads current local
+  state instead of replaying lossy individual transitions. No image bytes travel in subscription payloads.
+- `clear_avatar_cache` removes local bytes and retained demand. Existing references invalidate. Background maintenance
+  does not refill the cache; a later explicit visible request may do so. It does not remove message attachments.
+
+Batches are bounded collections of independent per-asset operations, not a cross-asset transaction. Each returned
+image/status pair is consistent; source changes between items can invalidate later references. If a request batch
+fails after some registrations commit, retrying the batch is idempotent. Account removal and shutdown retain the
+existing terminal-handle rules. Availability is evaluated at read time; hosts need not schedule freshness polling.
+
+Swift and Kotlin use generated `AvatarAssetFfi` / `AvatarBytesFfi`; C mirrors both records and supplies matching list
+free functions and commands. Regenerate bindings and link the matching library/header as one artifact cohort. No
+version is bumped by this feature. Existing stateless image helpers remain available. Hosts should retain their
+persistent image caches until this path is integrated and device-tested, and retain decoded/render caches afterward.
+Host round trips and local SQL tests are not evidence of iOS/Android first-frame performance; C9 owns that handoff.

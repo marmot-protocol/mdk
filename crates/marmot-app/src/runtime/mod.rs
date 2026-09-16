@@ -82,6 +82,8 @@ pub use conversation_window::{
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
 mod avatar;
+mod avatar_access;
+pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
 mod event_routing;
 mod onboarding;

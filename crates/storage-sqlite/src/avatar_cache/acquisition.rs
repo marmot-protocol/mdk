@@ -9,7 +9,7 @@ struct DescriptorEnvelope {
 }
 
 /// Acquisition state is independent of whether stale bytes are still usable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AvatarAcquisitionState {
     Idle,
     Queued,

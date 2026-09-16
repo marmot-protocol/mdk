@@ -23,11 +23,12 @@ impl MarmotApp {
         let reference =
             storage.request_identity_avatar_acquisition(group, &member, &selected, &version)?;
         self.presentation_signals.wake();
+        let _ = self.presentation_signals.avatars.send(label.to_owned());
         Ok(reference)
     }
 }
 
-fn selected_identity(
+pub(super) fn selected_identity(
     app: &MarmotApp,
     input: &ChatPresentationInput,
     account: &str,
@@ -99,18 +100,28 @@ impl IdentityAvatarMaintenance {
             String::new()
         };
         let mut failure = None;
+        let mut changed = false;
         for identity in &identities {
             let result = (|| -> Result<(), AppError> {
                 if let Some(input) = storage.chat_presentation_input(&identity.group)? {
                     let (selected, version) =
                         selected_identity(&client.app, &input, account, &identity.member)?;
+                    let before = storage.avatar_reference(&identity.owner)?;
                     storage.maintain_identity_avatar_acquisition(identity, &selected, &version)?;
+                    changed |= before != storage.avatar_reference(&identity.owner)?;
                 }
                 Ok(())
             })();
             if let Err(error) = result {
                 failure = Some(error);
             }
+        }
+        if changed {
+            let _ = client
+                .app
+                .presentation_signals
+                .avatars
+                .send(client.state.label.clone());
         }
         if let Some(error) = failure {
             self.directory_version = None;

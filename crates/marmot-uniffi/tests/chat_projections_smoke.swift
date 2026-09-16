@@ -3,6 +3,16 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        for state in [AvatarAvailabilityFfi.missing, .ready, .stale, .invalidated] {
+            for acquisition in [AvatarAcquisitionStateFfi.idle, .queued, .fetching, .retryScheduled, .blocked] {
+                let asset = AvatarAssetFfi(target: "opaque-target", reference: "opaque-reference", availability: state, acquisition: acquisition, contentRevision: 7, byteCount: 4)
+                let copy = try FfiConverterTypeAvatarAssetFfi.lift(FfiConverterTypeAvatarAssetFfi.lower(asset))
+                precondition(copy == asset)
+            }
+            let image = AvatarBytesFfi(reference: "opaque-reference", availability: state, contentRevision: 7, byteCount: 4, deferred: false, bytes: Data([1,2,3,4]), mediaType: "image/png", width: 1, height: 1)
+            let copy = try FfiConverterTypeAvatarBytesFfi.lift(FfiConverterTypeAvatarBytesFfi.lower(image))
+            precondition(copy == image)
+        }
         for provenance in [GroupSystemEventProvenanceFfi.authenticatedGroupState, .memberAuthored] {
             let event = GroupSystemEventFfi(provenance: provenance, actorDisplayName: "Actor", subjectDisplayName: "Subject",
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
@@ -140,4 +150,10 @@ func compileEditHistory(_ marmot: Marmot, account: String, group: String, target
     if let oldest = page.versions.first {
         _ = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: oldest.editedAt, beforeMessageIdHex: oldest.messageIdHex, limit: 50)
     }
+}
+
+func compileAvatarCommands(_ marmot: Marmot, account: String, asset: AvatarAssetFfi) async throws {
+    let requested = try await marmot.requestAvatarAssets(accountRef: account, targets: [asset.target])
+    _ = try await marmot.readAvatarAssets(accountRef: account, references: requested.compactMap(\.reference), maxBytes: 1024 * 1024)
+    try await marmot.clearAvatarCache(accountRef: account)
 }

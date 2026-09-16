@@ -1077,3 +1077,105 @@ async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_
     assert_eq!(updated.rows[0].row.activity_sort_at, activity);
     f.runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag() {
+    let f = Fixture::new(3);
+    let mut sub = f
+        .runtime
+        .open_chat_list_window("alice", ChatListView::Chats, Some(3))
+        .await
+        .unwrap();
+    let asset = sub
+        .snapshot
+        .rows
+        .iter()
+        .find_map(|r| r.avatar_asset.clone())
+        .unwrap();
+    let requested = f
+        .runtime
+        .request_avatar_assets("alice", vec![asset.target.clone()])
+        .await
+        .unwrap();
+    let reference = requested[0].reference.clone().unwrap();
+    let image =
+        storage_sqlite::AvatarImage::new(vec![8; 16], storage_sqlite::AvatarImageFormat::Png, 1, 1)
+            .unwrap();
+    f.store.publish_avatar(&reference, 0, &image, None).unwrap();
+    // A paused consumer loses individual notifications, then converges from storage.
+    for _ in 0..100 {
+        let _ = f.app.presentation_signals.avatars.send("alice".into());
+    }
+    let update = next(&mut sub).await;
+    assert!(update.rows.iter().any(|r| {
+        r.avatar_asset
+            .as_ref()
+            .is_some_and(|a| a.status.availability == AvatarAvailability::Ready)
+    }));
+    let reads = f
+        .runtime
+        .read_avatar_assets("alice", vec![reference.clone(), reference.clone()], 16)
+        .await
+        .unwrap();
+    assert_eq!(reads[0].result.image, Some(image.clone()));
+    assert!(reads[1].deferred);
+    assert!(reads[1].result.image.is_none());
+    assert_eq!(
+        reads[1].result.status.availability,
+        AvatarAvailability::Ready
+    );
+    assert!(
+        f.runtime
+            .read_avatar_assets("alice", vec![reference.clone(); 17], 16)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .read_avatar_assets("alice", vec![], MAX_AVATAR_BATCH_BYTES + 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .request_avatar_assets("alice", vec![asset.target.clone(); 17])
+            .await
+            .is_err()
+    );
+    f.runtime.clear_avatar_cache("alice").await.unwrap();
+    let cleared = next(&mut sub).await;
+    assert!(
+        cleared
+            .rows
+            .iter()
+            .filter_map(|r| r.avatar_asset.as_ref())
+            .all(|a| a.reference.is_none())
+    );
+    assert_eq!(
+        f.runtime
+            .read_avatar_assets("alice", vec![reference], 16)
+            .await
+            .unwrap()[0]
+            .result
+            .status
+            .availability,
+        AvatarAvailability::Invalidated
+    );
+    let new = f
+        .runtime
+        .request_avatar_assets("alice", vec![asset.target])
+        .await
+        .unwrap();
+    let restored = new[0].reference.clone().unwrap();
+    f.store.publish_avatar(&restored, 0, &image, None).unwrap();
+    f.runtime.shutdown_and_close().await.unwrap();
+    assert!(sub.recv().await.unwrap().is_none());
+    // Reconstruct only the local app/runtime. No worker or relay is started.
+    let reopened = MarmotApp::with_relay(f._dir.path(), "wss://relay.example").runtime();
+    let retained = reopened
+        .read_avatar_assets("alice", vec![restored], 16)
+        .await
+        .unwrap();
+    assert_eq!(retained[0].result.image, Some(image));
+    reopened.shutdown_and_close().await.unwrap();
+}

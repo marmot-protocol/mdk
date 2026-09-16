@@ -369,3 +369,8 @@ Usage and diagnostics now has a shared consent receipt and independent OTLP and
 stock-Aptabase exporter paths; see [the host contract](../usage-diagnostics.md).
 Native consent UI adoption and deployed Aptabase retention verification remain
 separate rollout work.
+
+
+C7-C adds screen avatar metadata, bounded local encoded-byte batches and acquisition/cache invalidation delivery to
+resolved chat and conversation subscriptions, with matching UniFFI/C surfaces. C7-B's durable worker remains the
+network owner. Client cache migration and flagship-device evidence remain C9 follow-through; this is not a release.

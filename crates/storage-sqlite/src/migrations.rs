@@ -168,6 +168,8 @@ mod migration_0077_avatar_cache;
 mod migration_0078_avatar_acquisition;
 #[path = "migrations/0079_content_reports.rs"]
 mod migration_0079_content_reports;
+#[path = "migrations/0080_avatar_target_lookup.rs"]
+mod migration_0080_avatar_target_lookup;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -570,6 +572,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 79,
         name: "0079_content_reports",
         apply: migration_0079_content_reports::apply,
+    },
+    Migration {
+        version: 80,
+        name: "0080_avatar_target_lookup",
+        apply: migration_0080_avatar_target_lookup::apply,
     },
 ];
 
