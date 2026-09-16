@@ -14,6 +14,8 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
+#[cfg(feature = "test-policy-overrides")]
+use marmot_app::AccountKeyPackageLocalState;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, ChatListRow, MarmotApp,
@@ -2654,6 +2656,95 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     restarted.shutdown().await;
     second_runtime.shutdown().await;
     drop(relay);
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn local_account_key_packages_are_readable_while_startup_is_held() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let app = MarmotApp::with_relay_and_config(first_dir.path(), url.clone(), config.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let created = runtime
+        .create_or_import_account(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let account_id = created.account.account_id_hex.clone();
+    runtime.rotate_key_package(&account_id).await.unwrap();
+    let current_ref = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .and_then(|lifecycle| lifecycle.current_key_package_ref)
+        .map(hex::encode)
+        .expect("rotation must promote a current locally owned package");
+
+    runtime.catch_up_accounts().await.unwrap();
+    let startup_sync_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup_sync_barrier.clone());
+    timeout(Duration::from_secs(5), runtime.restart_account(&account_id))
+        .await
+        .expect("restart must not wait for initial catch-up")
+        .unwrap();
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("restarted worker must reach initial sync");
+
+    let local = timeout(Duration::from_secs(2), async {
+        runtime.local_account_key_packages(&account_id)
+    })
+    .await
+    .expect("local inventory must not wait for startup")
+    .unwrap();
+    let current = local
+        .iter()
+        .find(|entry| entry.record.key_package_ref_hex == current_ref)
+        .expect("committed current package is visible locally");
+    assert_eq!(current.local_state, AccountKeyPackageLocalState::Current);
+    assert!(current.record.local);
+    assert!(!current.record.relay);
+
+    let refresh = runtime.refresh_account_key_packages(&account_id, vec![endpoint(&url)]);
+    tokio::pin!(refresh);
+    assert!(
+        timeout(Duration::from_millis(150), &mut refresh)
+            .await
+            .is_err(),
+        "refresh must remain pending while startup is held"
+    );
+    let local_again = runtime.local_account_key_packages(&account_id).unwrap();
+    assert_eq!(
+        local_again
+            .iter()
+            .find(|entry| entry.record.key_package_ref_hex == current_ref)
+            .map(|entry| entry.local_state),
+        Some(AccountKeyPackageLocalState::Current)
+    );
+
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("initial sync must remain held during local reads");
+    let refreshed = timeout(Duration::from_secs(10), refresh)
+        .await
+        .expect("refresh completes after startup release")
+        .unwrap();
+    assert!(
+        refreshed
+            .iter()
+            .any(|entry| entry.record.key_package_ref_hex == current_ref
+                && entry.local_state == AccountKeyPackageLocalState::Current)
+    );
+
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

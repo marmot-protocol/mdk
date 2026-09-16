@@ -531,6 +531,32 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
+    fetch_gate: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    >,
+    fail_all: std::sync::atomic::AtomicBool,
+}
+
+impl MemberResolutionDirectoryFetcher {
+    pub(crate) fn hold_fetches(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self.fetch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (entered, release)
+    }
+
+    pub(crate) fn fail_all_fetches(&self) {
+        self.fail_all
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -540,6 +566,25 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         request: crate::relay_plane::DirectoryFetchRequest,
     ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
+        let gate = {
+            let mut fetch_gate = self.fetch_gate.lock().unwrap();
+            if request
+                .queries
+                .iter()
+                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+            {
+                fetch_gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((entered, release)) = gate {
+            entered.notify_waiters();
+            release.notified().await;
+        }
+        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("directory fetch failed".to_owned());
+        }
         if self
             .reject_multi_author
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -652,7 +697,7 @@ impl ScriptedPushRelayClient {
             .collect()
     }
 
-    fn block_next_publish(&self) {
+    pub(crate) fn block_next_publish(&self) {
         self.block_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -775,7 +820,7 @@ impl ScriptedPushRelayClient {
         self.fail_publish_kind.lock().unwrap().take();
     }
 
-    async fn wait_for_blocked_publish(&self) {
+    pub(crate) async fn wait_for_blocked_publish(&self) {
         self.publish_started.notified().await;
     }
 
@@ -794,7 +839,7 @@ impl ScriptedPushRelayClient {
         }
     }
 
-    fn release_publish(&self) {
+    pub(crate) fn release_publish(&self) {
         self.publish_release.notify_waiters();
     }
 

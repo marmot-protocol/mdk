@@ -1072,6 +1072,47 @@ pub struct AccountKeyPackageRecord {
     pub relay: bool,
 }
 
+/// Durable ownership classification for one inventory row.
+///
+/// Classification comes from durable lifecycle references, never an empty
+/// event ID, timestamp, or pubkey match. `AccountKeyPackageRecord::local` is
+/// true exactly when this is not [`NotLocal`](Self::NotLocal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountKeyPackageLocalState {
+    /// No corresponding durably owned private bundle.
+    NotLocal,
+    /// Owned ref equals the durable current ref.
+    Current,
+    /// Owned ref equals the durable pending replacement ref.
+    PendingReplacement,
+    /// Owned ref occurs in durable retained material.
+    RetainedPrivateMaterial,
+    /// Genuinely owned, but not classified by the durable lifecycle
+    /// (including legacy or unclassified cases).
+    OtherOwned,
+}
+
+impl AccountKeyPackageLocalState {
+    /// True for every state that has a usable local private bundle.
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        !matches!(self, Self::NotLocal)
+    }
+}
+
+/// One KeyPackage inventory row plus its typed local provenance.
+///
+/// `record.local` and `record.relay` remain orthogonal facts.
+/// `record.relay` means a validated relay observation, never merely an
+/// authored event or a configured relay. `local_state` and `record.relay`
+/// are the authoritative display distinctions; `published_at` and
+/// `source_relays` keep their legacy semantics and are not publication proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageInventoryEntry {
+    pub record: AccountKeyPackageRecord,
+    pub local_state: AccountKeyPackageLocalState,
+}
+
 /// Observed relay history for an account's kind-30443 KeyPackage events.
 ///
 /// This is the validated, event-ID-deduplicated window returned by a single
@@ -4109,16 +4150,36 @@ impl MarmotApp {
         label: &str,
         owned_key_packages: Vec<KeyPackage>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        Ok(self
+            .local_account_key_package_inventory(label, owned_key_packages)?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    /// Metadata-only projection of durably owned KeyPackages.
+    ///
+    /// Every returned row is local and `relay == false`. Classification uses
+    /// the unchanged durable-ownership reader plus lifecycle references.
+    pub fn local_account_key_package_inventory(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.account_home().account(label)?;
         let legacy_record = read_json::<KeyPackageRecord>(self.key_package_record_path(label)).ok();
         let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
         let source_relays = self.account_nip65_relays(label).unwrap_or_default();
-        let mut records = Vec::with_capacity(owned_key_packages.len());
+        let mut entries = Vec::with_capacity(owned_key_packages.len());
 
         for key_package in owned_key_packages {
             let metadata = key_package_metadata(&key_package)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             let key_package_ref = hex::decode(&metadata.key_package_ref_hex)?;
+            let local_state = crate::key_package_records::owned_key_package_local_state(
+                &key_package_ref,
+                lifecycle.as_ref(),
+            );
             let mut key_package_id = metadata.key_package_ref_hex.clone();
             let mut key_package_event_id = String::new();
             let mut published_at = 0;
@@ -4176,23 +4237,26 @@ impl MarmotApp {
                 }
             }
 
-            records.push(AccountKeyPackageRecord {
-                account_label: Some(account.label.clone()),
-                account_id_hex: account.account_id_hex.clone(),
-                key_package_id,
-                key_package_ref_hex: metadata.key_package_ref_hex,
-                key_package_event_id,
-                published_at,
-                key_package_bytes: key_package.bytes().len(),
-                source_relays: source_relays.clone(),
-                local: true,
-                relay: false,
+            entries.push(AccountKeyPackageInventoryEntry {
+                record: AccountKeyPackageRecord {
+                    account_label: Some(account.label.clone()),
+                    account_id_hex: account.account_id_hex.clone(),
+                    key_package_id,
+                    key_package_ref_hex: metadata.key_package_ref_hex,
+                    key_package_event_id,
+                    published_at,
+                    key_package_bytes: key_package.bytes().len(),
+                    source_relays: source_relays.clone(),
+                    local: true,
+                    relay: false,
+                },
+                local_state,
             });
         }
-        Ok(records)
+        Ok(entries)
     }
 
-    async fn fetch_validated_account_key_package_records(
+    pub(crate) async fn fetch_validated_account_key_package_records(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,

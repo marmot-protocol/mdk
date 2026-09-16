@@ -9,6 +9,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,
+  `MarmotAccountKeyPackageInventoryEntryList`,
+  `marmot_account_key_package_inventory_entry_list_free`,
+  `marmot_local_account_key_packages`, and
+  `marmot_refresh_account_key_packages` for local-first KeyPackage inventory
+  with typed durable provenance. Existing `MarmotAccountKeyPackage` layout is
+  unchanged. Regenerate headers and use a matching library.
 - `MarmotConversationReaction.viewer_reacted` identifies the viewing account's
   active reaction independently of the bounded reactor preview. Regenerate headers
   and use the matching library: the output record layout has changed.

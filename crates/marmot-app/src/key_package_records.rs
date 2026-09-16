@@ -23,10 +23,10 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::error::AppError;
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
-    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountRelayListBootstrap,
-    AccountRelayListStatus, DirectoryFreshness, DirectoryKeyPackage, DirectorySelection,
-    FetchedKeyPackage, UserDirectoryRecord, push_unique_strings, relay_list_state_from_event,
-    sort_directory_records,
+    AccountKeyPackageInventoryEntry, AccountKeyPackageLocalState, AccountKeyPackageRecord,
+    AccountKeyPackageRelayEvent, AccountRelayListBootstrap, AccountRelayListStatus,
+    DirectoryFreshness, DirectoryKeyPackage, DirectorySelection, FetchedKeyPackage,
+    UserDirectoryRecord, push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 
 pub(crate) fn merge_relay_list_status(
@@ -567,6 +567,74 @@ fn sort_inventory_records(records: &mut [AccountKeyPackageRecord]) {
             .then_with(|| left.key_package_ref_hex.cmp(&right.key_package_ref_hex))
             .then_with(|| left.key_package_id.cmp(&right.key_package_id))
     });
+}
+
+pub(crate) fn owned_key_package_local_state(
+    key_package_ref: &[u8],
+    lifecycle: Option<&cgka_traits::KeyPackageLifecycleState>,
+) -> AccountKeyPackageLocalState {
+    let Some(lifecycle) = lifecycle else {
+        return AccountKeyPackageLocalState::OtherOwned;
+    };
+    if lifecycle.current_key_package_ref.as_deref() == Some(key_package_ref) {
+        return AccountKeyPackageLocalState::Current;
+    }
+    if lifecycle
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| pending.key_package_ref == key_package_ref)
+    {
+        return AccountKeyPackageLocalState::PendingReplacement;
+    }
+    if lifecycle
+        .retained_private_material
+        .iter()
+        .any(|retained| retained.key_package_ref == key_package_ref)
+    {
+        return AccountKeyPackageLocalState::RetainedPrivateMaterial;
+    }
+    AccountKeyPackageLocalState::OtherOwned
+}
+
+pub(crate) fn merge_key_package_inventory(
+    locals: impl IntoIterator<Item = AccountKeyPackageInventoryEntry>,
+    relays: impl IntoIterator<Item = AccountKeyPackageRecord>,
+) -> Vec<AccountKeyPackageInventoryEntry> {
+    let locals = locals.into_iter().collect::<Vec<_>>();
+    let mut records = locals
+        .iter()
+        .map(|entry| entry.record.clone())
+        .collect::<Vec<_>>();
+    records.extend(relays);
+    attach_local_state(merge_key_package_records(records), &locals)
+}
+
+fn attach_local_state(
+    records: Vec<AccountKeyPackageRecord>,
+    locals: &[AccountKeyPackageInventoryEntry],
+) -> Vec<AccountKeyPackageInventoryEntry> {
+    records
+        .into_iter()
+        .map(|record| {
+            let local_state = if record.local {
+                locals
+                    .iter()
+                    .find(|entry| {
+                        entry.record.account_id_hex == record.account_id_hex
+                            && !entry.record.key_package_ref_hex.is_empty()
+                            && entry.record.key_package_ref_hex == record.key_package_ref_hex
+                    })
+                    .map(|entry| entry.local_state)
+                    .unwrap_or(AccountKeyPackageLocalState::OtherOwned)
+            } else {
+                AccountKeyPackageLocalState::NotLocal
+            };
+            AccountKeyPackageInventoryEntry {
+                record,
+                local_state,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn merge_key_package_records(
@@ -1192,5 +1260,214 @@ mod merge_tests {
         let expected = merge_key_package_records(input.clone());
         let actual = merge_key_package_records(input.into_iter().rev().collect());
         assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::{
+        KeyPackageLifecycleState, PendingKeyPackageReplacement, RetainedKeyPackagePrivateMaterial,
+        Timestamp,
+    };
+
+    fn entry(
+        event: &str,
+        reference: &str,
+        local: bool,
+        relay: bool,
+        local_state: AccountKeyPackageLocalState,
+    ) -> AccountKeyPackageInventoryEntry {
+        AccountKeyPackageInventoryEntry {
+            record: record(event, reference, local, relay),
+            local_state,
+        }
+    }
+
+    fn record(event: &str, reference: &str, local: bool, relay: bool) -> AccountKeyPackageRecord {
+        AccountKeyPackageRecord {
+            account_label: local.then(|| "device".to_owned()),
+            account_id_hex: "account".to_owned(),
+            key_package_id: format!("slot-{event}-{reference}"),
+            key_package_ref_hex: reference.to_owned(),
+            key_package_event_id: event.to_owned(),
+            published_at: event.len() as u64,
+            key_package_bytes: 123,
+            source_relays: if relay {
+                vec!["wss://relay.example".to_owned()]
+            } else {
+                Vec::new()
+            },
+            local,
+            relay,
+        }
+    }
+
+    #[test]
+    fn owned_lifecycle_refs_map_to_exact_local_states() {
+        let current = vec![1_u8, 2, 3];
+        let pending = vec![4_u8, 5, 6];
+        let retained = vec![7_u8, 8, 9];
+        let other = vec![10_u8, 11, 12];
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("stable-slot".into());
+        lifecycle.current_key_package_ref = Some(current.clone());
+        lifecycle.pending_replacement = Some(PendingKeyPackageReplacement {
+            generation_revision: 1,
+            key_package: KeyPackage::new(vec![0]),
+            key_package_ref: pending.clone(),
+            authored_created_at: Timestamp(1),
+            not_before: Timestamp(1),
+            not_after: Timestamp(2),
+            refresh_at: Timestamp(2),
+            signed_event: None,
+            targets: Vec::new(),
+            attempt_count: 0,
+            last_failure_code: None,
+        });
+        lifecycle.retained_private_material = vec![RetainedKeyPackagePrivateMaterial {
+            key_package: KeyPackage::new(vec![1]),
+            key_package_ref: retained.clone(),
+            not_after: Timestamp(2),
+            replaced_at: Timestamp(1),
+        }];
+
+        assert_eq!(
+            owned_key_package_local_state(&current, Some(&lifecycle)),
+            AccountKeyPackageLocalState::Current
+        );
+        assert_eq!(
+            owned_key_package_local_state(&pending, Some(&lifecycle)),
+            AccountKeyPackageLocalState::PendingReplacement
+        );
+        assert_eq!(
+            owned_key_package_local_state(&retained, Some(&lifecycle)),
+            AccountKeyPackageLocalState::RetainedPrivateMaterial
+        );
+        assert_eq!(
+            owned_key_package_local_state(&other, Some(&lifecycle)),
+            AccountKeyPackageLocalState::OtherOwned
+        );
+        assert_eq!(
+            owned_key_package_local_state(&current, None),
+            AccountKeyPackageLocalState::OtherOwned
+        );
+    }
+
+    #[test]
+    fn typed_merge_keeps_current_echo_retained_and_relay_only_states() {
+        let locals = vec![
+            entry(
+                "event-current",
+                "ref-current",
+                true,
+                false,
+                AccountKeyPackageLocalState::Current,
+            ),
+            entry(
+                "",
+                "ref-retained",
+                true,
+                false,
+                AccountKeyPackageLocalState::RetainedPrivateMaterial,
+            ),
+            entry(
+                "",
+                "ref-other",
+                true,
+                false,
+                AccountKeyPackageLocalState::OtherOwned,
+            ),
+        ];
+        let relays = vec![
+            record("event-current", "ref-current", false, true),
+            record("event-foreign", "ref-foreign", false, true),
+        ];
+        let merged = merge_key_package_inventory(locals, relays);
+        let by_ref = merged
+            .iter()
+            .map(|entry| {
+                (
+                    entry.record.key_package_ref_hex.as_str(),
+                    entry.local_state,
+                    entry.record.local,
+                    entry.record.relay,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(by_ref.contains(&(
+            "ref-current",
+            AccountKeyPackageLocalState::Current,
+            true,
+            true
+        )));
+        assert!(by_ref.contains(&(
+            "ref-retained",
+            AccountKeyPackageLocalState::RetainedPrivateMaterial,
+            true,
+            false
+        )));
+        assert!(by_ref.contains(&(
+            "ref-other",
+            AccountKeyPackageLocalState::OtherOwned,
+            true,
+            false
+        )));
+        assert!(by_ref.contains(&(
+            "ref-foreign",
+            AccountKeyPackageLocalState::NotLocal,
+            false,
+            true
+        )));
+        assert!(!merged.iter().any(|entry| entry.local_state
+            == AccountKeyPackageLocalState::NotLocal
+            && entry.record.local));
+        assert!(!merged.iter().any(|entry| {
+            entry.local_state == AccountKeyPackageLocalState::RetainedPrivateMaterial
+                && entry.record.relay
+        }));
+    }
+
+    #[test]
+    fn observed_retained_material_keeps_retained_state_and_relay_fact() {
+        let locals = vec![entry(
+            "",
+            "ref-retained",
+            true,
+            false,
+            AccountKeyPackageLocalState::RetainedPrivateMaterial,
+        )];
+        let relays = vec![record("event-retained", "ref-retained", false, true)];
+        let merged = merge_key_package_inventory(locals, relays);
+        let retained = merged
+            .iter()
+            .find(|entry| entry.record.key_package_ref_hex == "ref-retained")
+            .expect("retained row remains");
+        assert_eq!(
+            retained.local_state,
+            AccountKeyPackageLocalState::RetainedPrivateMaterial
+        );
+        assert!(retained.record.local);
+        assert!(retained.record.relay);
+        assert_eq!(retained.record.key_package_event_id, "event-retained");
+    }
+
+    #[test]
+    fn unsigned_pending_stays_pending_and_does_not_claim_publication() {
+        let pending = entry(
+            "",
+            "ref-pending",
+            true,
+            false,
+            AccountKeyPackageLocalState::PendingReplacement,
+        );
+        let merged = merge_key_package_inventory(vec![pending], Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].local_state,
+            AccountKeyPackageLocalState::PendingReplacement
+        );
+        assert!(merged[0].record.local);
+        assert!(!merged[0].record.relay);
+        assert!(merged[0].record.key_package_event_id.is_empty());
     }
 }
