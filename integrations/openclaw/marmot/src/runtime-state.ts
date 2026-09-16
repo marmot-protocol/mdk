@@ -209,6 +209,11 @@ export function markMarmotInboundSetupFailed(
 ): ChannelAccountSnapshot {
   const nextAccountId = accountIdOrDefault(accountId);
   const prev = live.get(nextAccountId) ?? emptyFacts(nextAccountId, "unmanaged");
+  // A replaced generation that already acknowledged must not be stopped by a
+  // stale setup failure from the previous attempt.
+  if (prev.running && prev.inboundAcknowledged) {
+    return project(prev);
+  }
   return write({
     ...prev,
     running: false,

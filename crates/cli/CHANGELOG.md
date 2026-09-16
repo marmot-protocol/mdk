@@ -13,7 +13,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
   managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
-  no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch.
+  no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch. Failed
+  inbound setup attempts dispose their abort listeners and reservations before retry, so a replaced
+  generation cannot be stopped by a late account lookup from the previous attempt.
 
 ### Added
 

@@ -182,16 +182,25 @@ export async function startMarmotGatewayAccount(
     allowlistRetryPending = true;
     const waitMs = allowlistRetryDelayMs(allowlistAttempt, random);
     allowlistAttempt += 1;
-    void delay(waitMs, abortController.signal).then(async () => {
-      allowlistRetryPending = false;
-      if (!isCurrent()) {
-        return;
-      }
-      const result = await enqueueSync();
-      if (result?.state === "failed") {
-        scheduleAllowlistRetry();
-      }
-    });
+    void delay(waitMs, abortController.signal)
+      .then(async () => {
+        allowlistRetryPending = false;
+        if (!isCurrent()) {
+          return;
+        }
+        try {
+          const result = await enqueueSync();
+          if (result?.state === "failed") {
+            scheduleAllowlistRetry();
+          }
+        } catch {
+          // Typed sync results cannot throw; swallow unexpected hook failures
+          // so a voided retry cannot become an unhandled rejection.
+        }
+      })
+      .catch(() => {
+        allowlistRetryPending = false;
+      });
   };
 
   const cancelRetries = (): void => {
@@ -246,6 +255,9 @@ export async function startMarmotGatewayAccount(
       if (!isCurrent()) {
         return;
       }
+      const previousStop = inboundStop;
+      inboundStop = () => {};
+      previousStop();
       inboundStop = startInbound(api, dispatch, {
         signal: abortController.signal,
         channelAccountId: ctx.accountId,
@@ -265,13 +277,22 @@ export async function startMarmotGatewayAccount(
           inboundRetrying = true;
           const waitMs = allowlistRetryDelayMs(inboundAttempt, random);
           inboundAttempt += 1;
-          void delay(waitMs, abortController.signal).then(() => {
-            inboundRetrying = false;
-            if (!isCurrent()) {
-              return;
-            }
-            startInboundOnce();
-          });
+          void delay(waitMs, abortController.signal)
+            .then(() => {
+              inboundRetrying = false;
+              if (!isCurrent()) {
+                return;
+              }
+              try {
+                startInboundOnce();
+              } catch {
+                // Defense-in-depth: startMarmotInbound catches known setup
+                // failures. Do not surface an injected throw as unhandled.
+              }
+            })
+            .catch(() => {
+              inboundRetrying = false;
+            });
         },
       });
     };

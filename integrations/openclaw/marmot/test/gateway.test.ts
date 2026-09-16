@@ -1,7 +1,9 @@
+import { getEventListeners } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
 
+import type { MarmotAgentControlClient } from "../src/client.js";
 import type { ResolvedMarmotAccount } from "../src/config.js";
 import {
   allowlistRetryDelayMs,
@@ -11,6 +13,7 @@ import {
 } from "../src/gateway.js";
 import {
   resetMarmotInboundAccountsForTests,
+  startMarmotInbound as startMarmotInboundExport,
   type InboundPluginApi,
   type MarmotAllowlistSyncResult,
 } from "../src/inbound-runtime.js";
@@ -82,8 +85,15 @@ vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
   },
 }));
 
+const { inboundRuntimeActual } = vi.hoisted(() => ({
+  inboundRuntimeActual: {} as {
+    startMarmotInbound?: typeof startMarmotInboundExport;
+  },
+}));
+
 vi.mock("../src/inbound-runtime.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/inbound-runtime.js")>();
+  inboundRuntimeActual.startMarmotInbound = actual.startMarmotInbound;
   return {
     ...actual,
     syncMarmotAllowlist: vi.fn(async (_api: InboundPluginApi, options = {}) => {
@@ -379,5 +389,234 @@ describe("startMarmotGatewayAccount", () => {
     });
     await alpha.stop();
     await alphaRun;
+  });
+
+  it("ignores a replaced generation's late accountList failure", async () => {
+    const realStart = inboundRuntimeActual.startMarmotInbound;
+    if (!realStart) {
+      throw new Error("expected unmocked startMarmotInbound");
+    }
+    const hex = (byte: string) => byte.repeat(32);
+    let rejectOld!: (error: Error) => void;
+    const oldAccountList = new Promise<never>((_resolve, reject) => {
+      rejectOld = reject;
+    });
+    let replacementSubscribes = 0;
+    const startWithClient =
+      (client: MarmotAgentControlClient): typeof realStart =>
+      (api, dispatch, options = {}) =>
+        realStart(api, dispatch, {
+          ...options,
+          clientFactory: () => client,
+        });
+
+    const abortOld = new AbortController();
+    const oldRun = startMarmotGatewayAccount(
+      gatewayContext(account(), { accountId: "work", abortSignal: abortOld.signal }),
+      {
+        startInbound: startWithClient({
+          async accountList() {
+            return oldAccountList;
+          },
+          async *subscribeInbound() {
+            throw new Error("old generation must not subscribe");
+          },
+        } as unknown as MarmotAgentControlClient),
+      },
+    );
+    const oldLifecycle = await waitForLifecycle("work");
+    abortOld.abort();
+    await oldLifecycle.stop();
+    await oldRun;
+
+    lifecycleByAccount.delete("work");
+    const abortReplacement = new AbortController();
+    const replacementRun = startMarmotGatewayAccount(
+      gatewayContext(account(), { accountId: "work", abortSignal: abortReplacement.signal }),
+      {
+        startInbound: startWithClient({
+          async accountList() {
+            return {
+              type: "account_list",
+              accounts: [{ account_id_hex: hex("aa"), label: "agent", local_signing: true }],
+            };
+          },
+          async *subscribeInbound(
+            _filter?: unknown,
+            _signal?: AbortSignal,
+            hooks?: { onReady?: () => void },
+          ) {
+            replacementSubscribes += 1;
+            hooks?.onReady?.();
+            await new Promise<void>(() => undefined);
+          },
+        } as unknown as MarmotAgentControlClient),
+      },
+    );
+    const replacement = await waitForLifecycle("work");
+    await vi.waitFor(() => {
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+        running: true,
+        connected: true,
+      });
+    });
+    const hostAfterAck = statusPatches.at(-1);
+    expect(hostAfterAck).toMatchObject({ running: true, connected: true });
+
+    rejectOld(new Error("secret stale account lookup"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
+    expect(statusPatches.at(-1)).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
+    expect(JSON.stringify(statusPatches)).not.toContain("secret stale");
+
+    let extraSubscribes = 0;
+    realStart(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: { info: () => {}, warn: () => {} },
+      },
+      () => undefined,
+      {
+        channelAccountId: "work",
+        clientFactory: () =>
+          ({
+            async *subscribeInbound() {
+              extraSubscribes += 1;
+            },
+          }) as unknown as MarmotAgentControlClient,
+      },
+    );
+    await Promise.resolve();
+    expect(replacementSubscribes).toBe(1);
+    expect(extraSubscribes).toBe(0);
+
+    abortReplacement.abort();
+    await replacement.stop();
+    await replacementRun;
+  });
+
+  it("releases failed inbound attempts before retrying through the real runtime", async () => {
+    const realStart = inboundRuntimeActual.startMarmotInbound;
+    if (!realStart) {
+      throw new Error("expected unmocked startMarmotInbound");
+    }
+    const hex = (byte: string) => byte.repeat(32);
+    const abort = new AbortController();
+    let constructionFailures = 0;
+    let accountListFailures = 0;
+    let subscribeCalls = 0;
+    let mode: "construct" | "accountList" | "ready" = "construct";
+    const startCounts: number[] = [];
+
+    const running = startMarmotGatewayAccount(
+      gatewayContext(account(), { accountId: "work", abortSignal: abort.signal }),
+      {
+        random: () => 0,
+        delay: async () => undefined,
+        startInbound: (api, dispatch, options) => {
+          const started = realStart(api, dispatch, {
+            ...options,
+            clientFactory: () => {
+              if (mode === "construct") {
+                constructionFailures += 1;
+                if (constructionFailures < 6) {
+                  throw new Error("secret socket detail");
+                }
+                mode = "accountList";
+              }
+              return {
+                async accountList() {
+                  if (mode === "accountList") {
+                    accountListFailures += 1;
+                    if (accountListFailures < 6) {
+                      throw new Error("secret account lookup");
+                    }
+                    mode = "ready";
+                  }
+                  return {
+                    type: "account_list",
+                    accounts: [{ account_id_hex: hex("aa"), label: "agent", local_signing: true }],
+                  };
+                },
+                async *subscribeInbound(
+                  _filter?: unknown,
+                  _signal?: AbortSignal,
+                  hooks?: { onReady?: () => void },
+                ) {
+                  subscribeCalls += 1;
+                  hooks?.onReady?.();
+                  await new Promise<void>(() => undefined);
+                },
+              } as unknown as MarmotAgentControlClient;
+            },
+          });
+          startCounts.push(getEventListeners(options?.signal ?? abort.signal, "abort").length);
+          return started;
+        },
+      },
+    );
+    const lifecycle = await waitForLifecycle("work");
+    await vi.waitFor(() => {
+      expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+        running: true,
+        connected: true,
+      });
+    });
+    expect(constructionFailures).toBe(6);
+    expect(accountListFailures).toBe(6);
+    expect(subscribeCalls).toBe(1);
+    expect(Math.max(...startCounts)).toBeLessThanOrEqual(1);
+
+    const patchesAfterReady = statusPatches.length;
+    abort.abort();
+    await lifecycle.stop();
+    await running;
+    await Promise.resolve();
+    expect(subscribeCalls).toBe(1);
+    expect(statusPatches.length).toBeGreaterThanOrEqual(patchesAfterReady);
+    expect(statusPatches.at(-1)).toMatchObject({ running: false, connected: false });
+    expect(JSON.stringify(statusPatches)).not.toContain("secret socket");
+    expect(JSON.stringify(statusPatches)).not.toContain("secret account");
+  });
+
+  it("swallows unexpected retry continuation throws", async () => {
+    const { syncMarmotAllowlist } = await import("../src/inbound-runtime.js");
+    let calls = 0;
+    vi.mocked(syncMarmotAllowlist).mockImplementation(async (_api, options = {}) => {
+      syncCalls.push(options);
+      calls += 1;
+      if (calls === 1) {
+        return { state: "failed", reason: "control" };
+      }
+      throw new Error("secret retry boom");
+    });
+    const rejections: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    const running = startMarmotGatewayAccount(
+      gatewayContext(account({ allowFrom: ["aa"] }), { accountId: "work" }),
+      { random: () => 0, delay: async () => undefined },
+    );
+    const lifecycle = await waitForLifecycle("work");
+    await vi.waitFor(() => {
+      expect(calls).toBeGreaterThanOrEqual(2);
+    });
+    await Promise.resolve();
+    process.off("unhandledRejection", onUnhandled);
+    expect(rejections).toEqual([]);
+    await lifecycle.stop();
+    await running;
   });
 });

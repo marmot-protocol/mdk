@@ -223,8 +223,8 @@ export interface StartMarmotInboundOptions {
 
 // OpenClaw owns one gateway task per configured channel account. Keep one
 // subscription per account even if a host accidentally starts the same task
-// twice.
-const inboundActiveAccounts = new Set<string>();
+// twice. The reservation token lets a replaced attempt release only itself.
+const inboundActiveAccounts = new Map<string, symbol>();
 
 export function resetMarmotInboundAccountsForTests(): void {
   inboundActiveAccounts.clear();
@@ -254,12 +254,17 @@ export function startMarmotInbound(
       return () => {};
     }
     statusAccountId = resolved.accountId ?? inboundAccountKey;
-    inboundActiveAccounts.add(inboundAccountKey);
+    inboundActiveAccounts.set(inboundAccountKey, Symbol("marmot-inbound-attempt"));
   } catch {
     api.logger.warn("marmot: could not resolve an agent account for the inbound subscription");
+    const failedAccountId =
+      options.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+    markMarmotInboundSetupFailed(failedAccountId);
+    options.statusSink?.(marmotInboundRuntimeSnapshot(failedAccountId));
     options.onSetupFailed?.();
     return () => {};
   }
+  const attemptId = inboundActiveAccounts.get(inboundAccountKey)!;
   const publishStatus = (): void => {
     options.statusSink?.(marmotInboundRuntimeSnapshot(statusAccountId));
   };
@@ -267,41 +272,66 @@ export function startMarmotInbound(
   publishStatus();
   const controller = new AbortController();
   let stopping = false;
+  let disposed = false;
   let cancelPendingDebounce = (): void => undefined;
-  const stopInbound = (): void => {
-    if (stopping) {
-      return;
+  let stopInbound: () => void = () => {};
+  const ownsReservation = (): boolean =>
+    inboundActiveAccounts.get(inboundAccountKey) === attemptId;
+  const onExternalAbort = (): void => {
+    stopInbound();
+  };
+  const dispose = (mode: "stop" | "setup-failed"): boolean => {
+    if (disposed) {
+      return false;
     }
+    disposed = true;
     stopping = true;
     cancelPendingDebounce();
-    controller.abort();
+    options.signal?.removeEventListener("abort", onExternalAbort);
+    const owned = ownsReservation();
+    if (owned) {
+      inboundActiveAccounts.delete(inboundAccountKey);
+    }
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+    if (!owned) {
+      return false;
+    }
+    if (mode === "setup-failed") {
+      markMarmotInboundSetupFailed(statusAccountId);
+    } else {
+      markMarmotInboundStopped(statusAccountId);
+    }
+    publishStatus();
+    return true;
+  };
+  stopInbound = (): void => {
+    dispose("stop");
   };
   const failSetup = (): void => {
-    inboundActiveAccounts.delete(inboundAccountKey);
-    markMarmotInboundSetupFailed(statusAccountId);
-    publishStatus();
-    if (!stopping) {
+    const alreadyStopping = stopping;
+    dispose("setup-failed");
+    if (!alreadyStopping) {
       options.onSetupFailed?.();
     }
   };
-  // Release the guard when the loop is stopped so a clean restart can re-subscribe.
+  // Always drive the loop off the internal controller so the returned stop() is
+  // authoritative. Route external aborts through that same idempotent dispose
+  // path so a failed or replaced attempt cannot leak listeners or mutate a
+  // newer reservation.
   controller.signal.addEventListener(
     "abort",
     () => {
-      inboundActiveAccounts.delete(inboundAccountKey);
-      markMarmotInboundStopped(statusAccountId);
-      publishStatus();
+      dispose("stop");
     },
     { once: true },
   );
-  // Always drive the loop off the internal controller so the returned stop() is
-  // authoritative. Route external aborts through that same idempotent stop path
-  // so startup races also mark the runtime stopping before async setup resumes.
   if (options.signal) {
     if (options.signal.aborted) {
       stopInbound();
     } else {
-      options.signal.addEventListener("abort", stopInbound, { once: true });
+      options.signal.addEventListener("abort", onExternalAbort);
     }
   }
   const signal = controller.signal;
@@ -327,7 +357,7 @@ export function startMarmotInbound(
       failSetup();
       return;
     }
-    if (stopping) {
+    if (stopping || !ownsReservation()) {
       return;
     }
     let readyLogged = false;
@@ -594,6 +624,9 @@ export function startMarmotInbound(
       reconnectDelayMs: options.reconnectDelayMs,
       maxReconnectDelayMs: options.maxReconnectDelayMs,
       onReady: () => {
+        if (stopping || !ownsReservation()) {
+          return;
+        }
         if (readyLogged) {
           // Clean EOF or post-error reconnect can miss a rename while the
           // socket was down; drop every fact and pending generation.

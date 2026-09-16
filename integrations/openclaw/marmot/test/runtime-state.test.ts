@@ -148,4 +148,17 @@ describe("per-account composed readiness", () => {
       lastError: null,
     });
   });
+
+  it("ignores a stale setup failure after the current generation is acknowledged", () => {
+    beginMarmotAccountLifecycle("work");
+    markMarmotAllowlistSyncResult("work", { state: "reconciled" });
+    markMarmotInboundStarting("work");
+    markMarmotInboundReady("work");
+    markMarmotInboundSetupFailed("work");
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
+  });
 });

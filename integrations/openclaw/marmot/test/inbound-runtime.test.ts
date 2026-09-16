@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -190,8 +191,8 @@ describe("startMarmotInbound", () => {
       running: false,
       connected: false,
     });
+    // Failed attempts release their reservation without requiring stop().
     first();
-
     const dispatched: MarmotInboundMessage[] = [];
     const second = startMarmotInbound(
       api,
@@ -205,6 +206,311 @@ describe("startMarmotInbound", () => {
     await waitFor(() => dispatched.length === 1);
     expect(dispatched).toHaveLength(1);
     second();
+  });
+
+  it("publishes a privacy-safe inbound error when synchronous account resolution fails", () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const warnings: string[] = [];
+    let setupFailures = 0;
+    const previousToken = process.env.MARMOT_AGENT_AUTH_TOKEN;
+    const previousTokenFile = process.env.MARMOT_AGENT_AUTH_TOKEN_FILE;
+    delete process.env.MARMOT_AGENT_AUTH_TOKEN;
+    delete process.env.MARMOT_AGENT_AUTH_TOKEN_FILE;
+    try {
+      const stop = startMarmotInbound(
+        {
+          config: {
+            channels: {
+              marmot: { dm: { allowFrom: [] }, authTokenFile: "/secret/token-file" },
+            },
+          },
+          logger: {
+            info: () => {},
+            warn: (message: string) => warnings.push(message),
+          },
+        },
+        () => undefined,
+        {
+          statusSink: (patch) => {
+            patches.push(patch);
+          },
+          onSetupFailed: () => {
+            setupFailures += 1;
+          },
+        },
+      );
+      expect(setupFailures).toBe(1);
+      expect(patches.at(-1)).toMatchObject({
+        running: false,
+        connected: false,
+        lastError: "could not resolve agent account",
+      });
+      expect(patches.at(-1)?.lastError).not.toBe(MARMOT_ALLOWLIST_SYNC_FAILED);
+      expect(JSON.stringify({ patches, warnings })).not.toContain("/secret/token-file");
+      stop();
+    } finally {
+      if (previousToken === undefined) {
+        delete process.env.MARMOT_AGENT_AUTH_TOKEN;
+      } else {
+        process.env.MARMOT_AGENT_AUTH_TOKEN = previousToken;
+      }
+      if (previousTokenFile === undefined) {
+        delete process.env.MARMOT_AGENT_AUTH_TOKEN_FILE;
+      } else {
+        process.env.MARMOT_AGENT_AUTH_TOKEN_FILE = previousTokenFile;
+      }
+    }
+  });
+
+  it("ignores a late accountList failure after a replacement is acknowledged", async () => {
+    let rejectOld!: (error: Error) => void;
+    const oldAccountList = new Promise<never>((_resolve, reject) => {
+      rejectOld = reject;
+    });
+    const hostPatches: Array<Record<string, unknown>> = [];
+    const oldStop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: noopLogger,
+      },
+      () => undefined,
+      {
+        channelAccountId: "work",
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return oldAccountList;
+            },
+            async *subscribeInbound() {
+              throw new Error("old generation must not subscribe");
+            },
+          }) as unknown as MarmotAgentControlClient,
+        statusSink: (patch) => {
+          hostPatches.push({ ...patch, source: "old" });
+        },
+      },
+    );
+    oldStop();
+    await Promise.resolve();
+
+    const replacementHost: Array<Record<string, unknown>> = [];
+    let replacementSubscribes = 0;
+    const replacementStop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: noopLogger,
+      },
+      () => undefined,
+      {
+        channelAccountId: "work",
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return {
+                type: "account_list",
+                accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+              };
+            },
+            async *subscribeInbound(
+              _filter?: unknown,
+              _signal?: AbortSignal,
+              hooks?: { onReady?: () => void },
+            ) {
+              replacementSubscribes += 1;
+              hooks?.onReady?.();
+              await new Promise<void>(() => undefined);
+            },
+          }) as unknown as MarmotAgentControlClient,
+        statusSink: (patch) => {
+          replacementHost.push(patch);
+        },
+      },
+    );
+    await waitFor(() => replacementHost.some((patch) => patch.connected === true));
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+    });
+
+    rejectOld(new Error("secret stale account lookup"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
+    expect(replacementHost.at(-1)).toMatchObject({
+      running: true,
+      connected: true,
+    });
+    expect(JSON.stringify({ hostPatches, replacementHost })).not.toContain("secret stale");
+
+    let extraSubscribes = 0;
+    const extraStop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: noopLogger,
+      },
+      () => undefined,
+      {
+        channelAccountId: "work",
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return {
+                type: "account_list",
+                accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+              };
+            },
+            async *subscribeInbound() {
+              extraSubscribes += 1;
+            },
+          }) as unknown as MarmotAgentControlClient,
+      },
+    );
+    await Promise.resolve();
+    expect(replacementSubscribes).toBe(1);
+    expect(extraSubscribes).toBe(0);
+    extraStop();
+    replacementStop();
+  });
+
+  it("ignores a late accountList success after a replacement is acknowledged", async () => {
+    let resolveOld!: () => void;
+    const oldAccountList = new Promise<{
+      type: "account_list";
+      accounts: Array<{ account_id_hex: string; label: string; local_signing: boolean }>;
+    }>((resolve) => {
+      resolveOld = () =>
+        resolve({
+          type: "account_list",
+          accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+        });
+    });
+    let oldSubscribes = 0;
+    const oldStop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: noopLogger,
+      },
+      () => undefined,
+      {
+        channelAccountId: "work",
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return oldAccountList;
+            },
+            async *subscribeInbound() {
+              oldSubscribes += 1;
+            },
+          }) as unknown as MarmotAgentControlClient,
+      },
+    );
+    oldStop();
+
+    let replacementSubscribes = 0;
+    const replacementStop = startMarmotInbound(
+      {
+        config: { channels: { marmot: { profileNameOnboarding: false } } },
+        logger: noopLogger,
+      },
+      () => undefined,
+      {
+        channelAccountId: "work",
+        clientFactory: () =>
+          ({
+            async accountList() {
+              return {
+                type: "account_list",
+                accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+              };
+            },
+            async *subscribeInbound(
+              _filter?: unknown,
+              _signal?: AbortSignal,
+              hooks?: { onReady?: () => void },
+            ) {
+              replacementSubscribes += 1;
+              hooks?.onReady?.();
+              await new Promise<void>(() => undefined);
+            },
+          }) as unknown as MarmotAgentControlClient,
+      },
+    );
+    await waitFor(() => marmotInboundRuntimeSnapshot("work").connected === true);
+    resolveOld();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(oldSubscribes).toBe(0);
+    expect(replacementSubscribes).toBe(1);
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      running: true,
+      connected: true,
+    });
+    replacementStop();
+  });
+
+  it("disposes failed attempts so a shared abort signal stays bounded", async () => {
+    const signal = new AbortController();
+    const abortCount = (): number => getEventListeners(signal.signal, "abort").length;
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+
+    for (let index = 0; index < 12; index += 1) {
+      startMarmotInbound(api, () => undefined, {
+        signal: signal.signal,
+        clientFactory: () => {
+          throw new Error("secret socket detail");
+        },
+      });
+      expect(abortCount()).toBeLessThanOrEqual(1);
+    }
+
+    let pendingReject!: (error: Error) => void;
+    startMarmotInbound(api, () => undefined, {
+      signal: signal.signal,
+      clientFactory: () =>
+        ({
+          async accountList() {
+            return new Promise<never>((_resolve, reject) => {
+              pendingReject = reject;
+            });
+          },
+          async *subscribeInbound() {
+            throw new Error("pending failure must not subscribe");
+          },
+        }) as unknown as MarmotAgentControlClient,
+    });
+    expect(abortCount()).toBe(1);
+    pendingReject(new Error("secret account lookup"));
+    await waitFor(() => abortCount() === 0);
+
+    const readyPatches: Array<Record<string, unknown>> = [];
+    const recovered = startMarmotInbound(api, () => undefined, {
+      signal: signal.signal,
+      statusSink: (patch) => {
+        readyPatches.push(patch);
+      },
+      clientFactory: () => inboundStubClient([]),
+    });
+    await waitFor(() => readyPatches.some((patch) => patch.connected === true));
+    expect(abortCount()).toBe(1);
+    const patchesAfterReady = readyPatches.length;
+    signal.abort();
+    recovered();
+    await Promise.resolve();
+    expect(abortCount()).toBe(0);
+    expect(readyPatches.length).toBe(patchesAfterReady + 1);
+    expect(readyPatches.at(-1)).toMatchObject({ running: false, connected: false });
+    expect(marmotInboundRuntimeSnapshot("default")).toMatchObject({
+      running: false,
+      connected: false,
+    });
   });
 
   it("coalesces debounced bursts without dropping media, mentions, or reply context", async () => {
