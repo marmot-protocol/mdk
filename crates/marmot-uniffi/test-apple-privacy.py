@@ -188,11 +188,11 @@ class PrivacyPackagingTests(unittest.TestCase):
             self.fail(f"unexpected command: {args}")
 
         with mock.patch.object(privacy.subprocess, "check_output", side_effect=output):
-            self.assertEqual(privacy.check_archive(archive, package / "PrivacyInfo.xcprivacy", "macos")["linking"], "static")
+            self.assertEqual(privacy.check_fixture_archive(archive, package / "PrivacyInfo.xcprivacy", "macos")["linking"], "static")
             for dependency in ["@rpath/MarmotKit.framework/MarmotKit",
                                "@rpath/marmot_uniffiFFI.framework/marmot_uniffiFFI"]:
                 with self.subTest(dependency=dependency), self.assertRaisesRegex(ValueError, "statically linked"):
-                    privacy.check_archive(archive, package / "PrivacyInfo.xcprivacy", "macos")
+                    privacy.check_fixture_archive(archive, package / "PrivacyInfo.xcprivacy", "macos")
 
     def test_zip_roundtrip_and_unsafe_members(self):
         package = self.fixture()
@@ -224,7 +224,7 @@ class PrivacyPackagingTests(unittest.TestCase):
         resource.parent.mkdir()
         shutil.copyfile(package / "PrivacyInfo.xcprivacy", resource)
         with self.assertRaisesRegex(ValueError, "privacy resource did not reach Notification.appex"):
-            privacy.check_archive(archive, package / "PrivacyInfo.xcprivacy", "ios")
+            privacy.check_fixture_archive(archive, package / "PrivacyInfo.xcprivacy", "ios")
 
     def test_codeless_framework_is_rejected_with_privacy_present(self):
         package = self.fixture()
@@ -237,7 +237,7 @@ class PrivacyPackagingTests(unittest.TestCase):
             shutil.copyfile(package / "PrivacyInfo.xcprivacy", resource)
         (app / "Frameworks/marmot_uniffiFFI.framework").mkdir(parents=True)
         with self.assertRaisesRegex(ValueError, "stub"):
-            privacy.check_archive(archive, package / "PrivacyInfo.xcprivacy", "ios")
+            privacy.check_fixture_archive(archive, package / "PrivacyInfo.xcprivacy", "ios")
 
 
 if __name__ == "__main__":

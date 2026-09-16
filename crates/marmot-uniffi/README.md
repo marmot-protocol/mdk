@@ -5,10 +5,12 @@ UniFFI bindings for the Marmot app runtime.
 The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
 package that shared surface:
 
-- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and `output/PrivacyInfo.xcprivacy` for iOS.
+- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
+  `output/PrivacyInfo.xcprivacy` for iOS.
 - `./crates/marmot-uniffi/xcframework-macos.sh` builds `output/macos/MarmotKit.xcframework` plus
-  `output/macos/MarmotKit.swift` for macOS on Apple Silicon (`aarch64-apple-darwin`). Its output directory is separate
-  from the iOS one so building both in one workspace cannot clobber either artifact.
+  `output/macos/MarmotKit.swift` and `output/macos/PrivacyInfo.xcprivacy` for macOS on Apple Silicon
+  (`aarch64-apple-darwin`). Its output directory is separate from the iOS one so building both in one workspace
+  cannot clobber either artifact.
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
   `jniLibs` shared libraries.
 

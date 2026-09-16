@@ -96,6 +96,8 @@ Run `python3 crates/marmot-uniffi/test-apple-privacy.py` for resource-loss, raw-
 The existing artifact validators check ARM64 slices and native-object deployment targets. The archive fixture consumes
 three release assets, checks their hashes against the release manifest, then creates a Swift wrapper with
 `resources: [.copy("PrivacyInfo.xcprivacy")]`. It invokes real Rust in the app and iOS notification extension.
+The archive checker is internal to this generated fixture and assumes its targets and bundle names; it is not a
+general host-archive validator. Use the host adoption checks below for a consuming application.
 
 ```sh
 python3 crates/marmot-uniffi/validate-apple-archive.py ios \

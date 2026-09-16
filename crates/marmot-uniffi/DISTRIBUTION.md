@@ -67,6 +67,8 @@ Formal release `marmotkit-v<version>`:
 ```text
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/MarmotKitFFI-<version>.xcframework.zip
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/MarmotKit-<version>.swift
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/PrivacyInfo-ios-<version>.xcprivacy
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/PrivacyInfo-ios-<version>.xcprivacy.sha256
 ```
 
 Snapshot for a full 40-character commit SHA `<sha>` reachable from `master`:
@@ -74,6 +76,8 @@ Snapshot for a full 40-character commit SHA `<sha>` reachable from `master`:
 ```text
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/MarmotKitFFI-snapshot-<sha>.xcframework.zip
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/MarmotKit-snapshot-<sha>.swift
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/PrivacyInfo-ios-snapshot-<sha>.xcprivacy
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/PrivacyInfo-ios-snapshot-<sha>.xcprivacy.sha256
 ```
 
 These URLs always contain an exact tag or snapshot identifier. Do not use a `latest` URL for SwiftPM artifacts.
@@ -119,12 +123,16 @@ Formal release `marmotkit-v<version>`:
 
 ```text
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/MarmotKitFFI-macos-<version>.xcframework.zip
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/PrivacyInfo-macos-<version>.xcprivacy
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-v<version>/PrivacyInfo-macos-<version>.xcprivacy.sha256
 ```
 
 Snapshot for a full 40-character commit SHA `<sha>` reachable from `master`:
 
 ```text
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/MarmotKitFFI-macos-snapshot-<sha>.xcframework.zip
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/PrivacyInfo-macos-snapshot-<sha>.xcprivacy
+https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/PrivacyInfo-macos-snapshot-<sha>.xcprivacy.sha256
 ```
 
 ### SwiftPM

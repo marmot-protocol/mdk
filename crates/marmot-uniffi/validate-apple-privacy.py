@@ -122,8 +122,8 @@ def extract_xcframework(archive, destination):
         zipped.extractall(destination)
     return destination / "MarmotKit.xcframework"
 
-def check_archive(archive, resource_file, platform, privacy_dir=HERE / "apple-privacy", analytics=None):
-    """Check resource ownership, static linkage and UUIDs; not Rust source lines."""
+def check_fixture_archive(archive, resource_file, platform, privacy_dir=HERE / "apple-privacy", analytics=None):
+    """Check the generated fixture only: resources, static linkage and UUIDs; not Rust source lines."""
     expected = check_manifest(resource_file, privacy_dir, analytics)
     macos = platform == "macos"
     products = archive / "Products/Applications"
@@ -194,18 +194,13 @@ def check_archive(archive, resource_file, platform, privacy_dir=HERE / "apple-pr
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
-    parser.add_argument("--archive", type=Path)
-    parser.add_argument("--platform", choices=["ios", "macos"])
     parser.add_argument("--product-analytics", choices=["0", "1", "true", "false"])
     parser.add_argument("--privacy-dir", type=Path, default=HERE / "apple-privacy")
     args = parser.parse_args()
     analytics = None if args.product_analytics is None else args.product_analytics in ("1", "true")
-    if args.archive:
-        if args.artifact.suffix != ".xcprivacy" or not args.platform:
-            parser.error("--archive requires the released privacy file and --platform")
-        print(json.dumps(check_archive(args.archive, args.artifact, args.platform, args.privacy_dir, analytics), indent=2))
-    elif args.artifact.suffix == ".xcprivacy":
+    if args.artifact.suffix == ".xcprivacy":
         check_manifest(args.artifact, args.privacy_dir, analytics)
+        print("Validated SDK privacy declarations (not resource delivery or App Store upload validation)")
     else:
         check_xcframework(args.artifact)
-    print("Validated Apple artifact/privacy resources (not App Store upload validation)")
+        print("Validated raw-library XCFramework (not privacy declarations or App Store upload validation)")

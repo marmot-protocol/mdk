@@ -102,8 +102,7 @@ jobs:
           ./scripts/tests/test_campaign_toolchain.sh
 
       - name: Apple privacy packaging gate
-        run: |
-          python3 crates/marmot-uniffi/test-apple-privacy.py
+        run: python3 crates/marmot-uniffi/test-apple-privacy.py
 
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh

@@ -50,6 +50,8 @@ def main():
     artifact = privacy.extract_xcframework(artifact, work / "extracted")
     hashes = privacy.check_xcframework(artifact)
     for name, value in hashes.items():
+        if name not in metadata["artifacts"]:
+            raise ValueError("release manifest does not describe this static-library layout: " + name)
         if metadata["artifacts"][name]["sha256"] != value:
             raise ValueError("static library differs from release provenance")
     package = work / "MarmotKit"
@@ -142,7 +144,7 @@ final class NotificationService: UNNotificationServiceExtension {
         "-configuration", "Release", "-destination", f"generic/platform={platform}",
         "-derivedDataPath", str(work / "DerivedData"), "-archivePath", str(archive),
         "ARCHS=arm64", *signing, "-quiet", "archive", cwd=work)
-    report = privacy.check_archive(archive, resource, args.platform, args.privacy_dir.resolve(), analytics)
+    report = privacy.check_fixture_archive(archive, resource, args.platform, args.privacy_dir.resolve(), analytics)
     (work / "archive-checks.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     if args.platform == "macos":

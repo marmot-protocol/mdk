@@ -44,11 +44,7 @@ fi
 
 XCFRAMEWORK="$(cd "$(dirname "$XCFRAMEWORK")" && pwd)/$(basename "$XCFRAMEWORK")"
 
-PRIVACY_ARGS=(--privacy-dir "${MARMOTKIT_CRATE_DIR:-$(dirname "$0")}/apple-privacy")
-if [[ -n "${PRODUCT_ANALYTICS_EXPORT:-}" ]]; then
-  PRIVACY_ARGS+=(--product-analytics "$PRODUCT_ANALYTICS_EXPORT")
-fi
-python3 "$(dirname "$0")/validate-apple-privacy.py" "$XCFRAMEWORK" "${PRIVACY_ARGS[@]}"
+python3 "$(dirname "$0")/validate-apple-privacy.py" "$XCFRAMEWORK"
 
 PLIST="$XCFRAMEWORK/Info.plist"
 [[ -f "$PLIST" ]] || { echo "error: missing XCFramework Info.plist" >&2; exit 1; }
