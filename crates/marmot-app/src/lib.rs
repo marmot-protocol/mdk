@@ -5633,14 +5633,16 @@ impl MarmotApp {
         let projects_group_system_activity = chat_list_row
             .as_ref()
             .is_some_and(|row| row.conversation_kind == ChatConversationKind::Group);
-        let chat_list_trigger = if content_changed {
-            ChatListUpdateTrigger::LastMessageContentChanged
-        } else {
-            ChatListUpdateTrigger::from_timeline_changes(
-                &storage_update.changes,
-                projects_group_system_activity,
-            )
-        };
+        let chat_list_trigger = ChatListUpdateTrigger::from_timeline_changes(
+            &storage_update.changes,
+            projects_group_system_activity,
+        );
+        let chat_list_trigger =
+            if content_changed && chat_list_trigger == ChatListUpdateTrigger::SnapshotRefresh {
+                ChatListUpdateTrigger::LastMessageContentChanged
+            } else {
+                chat_list_trigger
+            };
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,

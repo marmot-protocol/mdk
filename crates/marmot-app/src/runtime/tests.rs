@@ -2926,6 +2926,36 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
             .plaintext,
         "**edited**"
     );
+    // Catch-up can combine a backfilled message with an edit of the selection.
+    // The content-only refinement must preserve the batch's stronger trigger.
+    let mut backfill = original.clone();
+    backfill.message_id_hex = "0d".repeat(32);
+    backfill.source_message_id_hex = Some("0e".repeat(32));
+    backfill.recorded_at = 0;
+    let backfill_update = storage.record_app_event(&backfill).unwrap();
+    let mut batch_edit = original.clone();
+    batch_edit.message_id_hex = "0f".repeat(32);
+    batch_edit.source_message_id_hex = Some("10".repeat(32));
+    batch_edit.kind = 1009;
+    batch_edit.recorded_at = 4;
+    batch_edit.plaintext = "batch edit".into();
+    batch_edit.tags = vec![vec!["e".into(), original.message_id_hex.clone()]];
+    let mut batch = storage.record_app_event(&batch_edit).unwrap();
+    batch.changes.extend(backfill_update.changes);
+    let update = app.app_projection_update("alice", batch).unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::NewLastMessage
+    );
+    assert_eq!(
+        update
+            .chat_list_row
+            .unwrap()
+            .last_message
+            .unwrap()
+            .plaintext,
+        "batch edit"
+    );
     let update = app
         .invalidate_timeline_source_message(
             "alice",

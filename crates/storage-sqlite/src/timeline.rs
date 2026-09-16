@@ -1594,10 +1594,15 @@ fn secure_prune_selected_app_events_tx(
 
     let mut pruned_message_ids = BTreeSet::new();
     let mut affected_message_ids = BTreeSet::new();
+    let mut retained_edit_targets = BTreeSet::new();
     let mut media_ciphertext_sha256 = BTreeSet::new();
     let mut retiring_media_epochs = BTreeSet::new();
     for event in &pruned_events {
         pruned_message_ids.insert(event.message_id_hex.clone());
+        if event.kind == MARMOT_APP_EVENT_KIND_EDIT {
+            retained_edit_targets
+                .extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+        }
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
         if event.kind == MARMOT_APP_EVENT_KIND_CHAT
             && !encrypted_media_component_ids(&event.tags).is_empty()
@@ -1619,6 +1624,8 @@ fn secure_prune_selected_app_events_tx(
     // `message_timeline.plaintext` is indexed for search; overwriting it
     // under `secure_delete` before DELETE also rewrites the old index key.
     scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    retained_edit_targets.retain(|id| !pruned_message_ids.contains(id));
+    scrub_retained_edit_bodies_tx(tx, group_id_hex, &retained_edit_targets)?;
 
     // Deleting the owning app_events rows cascades to message_modifier_edges
     // and encrypted-media secret references via their ON DELETE CASCADE
@@ -2456,6 +2463,43 @@ fn delete_app_event_rows_by_ids_tx(
         );
     }
     Ok(deleted)
+}
+
+/// Edit bodies also live on retained target rows and in selected chat previews.
+/// Scrub those copies before reprojection, including the timeline search index;
+/// leave the target's raw event and other durable metadata intact.
+fn scrub_retained_edit_bodies_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute_cached(
+            &format!(
+                "UPDATE message_timeline
+                SET plaintext = zeroblob(length(plaintext)), edit_json = NULL
+                WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
+                  AND edit_json IS NOT NULL"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+        tx.execute_cached(
+            &format!(
+                "UPDATE chat_list_rows
+                SET last_message_preview = zeroblob(length(last_message_preview))
+                WHERE group_id_hex = ? AND last_message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+    }
+    Ok(())
 }
 
 fn scrub_timeline_projection_rows_by_ids_tx(
