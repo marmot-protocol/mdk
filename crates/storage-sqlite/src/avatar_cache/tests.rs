@@ -1079,7 +1079,7 @@ fn avatar_idle_maintenance_needs_no_write_transaction() {
 }
 
 #[test]
-fn avatar_retry_budget_eventually_blocks_repeated_failures() {
+fn avatar_retry_budget_enters_daily_probes_and_recovers() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let reference = store
         .request_avatar_acquisition("owner", &selected_url("a"), false)
@@ -1092,18 +1092,119 @@ fn avatar_retry_budget_eventually_blocks_repeated_failures() {
     }
     assert_eq!(
         store.avatar_acquisition_state(&reference).unwrap(),
-        Some(AvatarAcquisitionState::Blocked)
+        Some(AvatarAcquisitionState::RetryScheduled)
+    );
+    let due = 15 * 3600 + 86400;
+    // Restart and repeated visible demand must preserve the full cooldown.
+    store.resume_avatar_acquisition().unwrap();
+    store
+        .request_avatar_acquisition("owner", &selected_url("a"), true)
+        .unwrap();
+    assert!(store.claim_avatar_acquisition(due - 1).unwrap().is_none());
+    let probe = store.claim_avatar_acquisition(due).unwrap().unwrap();
+    store.fail_avatar_acquisition(&probe, due, true).unwrap();
+    assert!(
+        store
+            .claim_avatar_acquisition(due + 86400 - 1)
+            .unwrap()
+            .is_none()
+    );
+    let recovered = store
+        .claim_avatar_acquisition(due + 86400)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_avatar_acquisition(&recovered, &image(1, 8), Some(due + 86401))
+            .unwrap(),
+        AvatarPublishResult::Published {
+            content_revision: 1
+        }
+    );
+    // Successful acquisition resets the fast retry budget for later refreshes.
+    let refresh = store
+        .claim_avatar_acquisition(due + 86401)
+        .unwrap()
+        .unwrap();
+    store
+        .fail_avatar_acquisition(&refresh, due + 86401, true)
+        .unwrap();
+    assert!(
+        store
+            .claim_avatar_acquisition(due + 86460)
+            .unwrap()
+            .is_none()
     );
     assert!(
         store
-            .claim_avatar_acquisition(u32::MAX as u64)
+            .claim_avatar_acquisition(due + 86461)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     store
         .request_avatar_acquisition("owner", &selected_url("new"), false)
         .unwrap();
     assert!(store.claim_avatar_acquisition(0).unwrap().is_some());
+}
+
+#[test]
+fn avatar_bootstrap_survives_unchanged_presentation_rewrite() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed_avatar_group(&store);
+    let value = crate::StoredChatPresentation {
+        presentation: crate::ConversationPresentation {
+            title: crate::PresentationText::Literal("Chat".into()),
+            avatar: selected_url("a"),
+            title_source: crate::PresentationSource::Group,
+            avatar_source: crate::PresentationSource::Group,
+            peer_id: None,
+            resolution: crate::PresentationResolution::Cached,
+        },
+        profile_version: None,
+    };
+    let bytes = serde_json::to_vec(&serde_json::json!({"format": 1, "value": value})).unwrap();
+    store.lock().unwrap().execute("UPDATE chat_list_rows SET presentation_json = ?1, presentation_applied_source_revision = presentation_source_revision WHERE group_id_hex = 'group'", [bytes]).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO avatar_acquisition_bootstrap(group_id_hex) VALUES('group')",
+            [],
+        )
+        .unwrap();
+    // The rename dirties the row but retains its previously selected avatar.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET profile_name = 'Renamed' WHERE group_id_hex = 'group'",
+            [],
+        )
+        .unwrap();
+    let input = store.chat_presentation_input("group").unwrap().unwrap();
+    assert_eq!(
+        store.store_chat_presentation(&input, &value).unwrap(),
+        crate::ChatPresentationWrite::Applied
+    );
+    assert!(!store.bootstrap_avatar_acquisition().unwrap());
+    let job = store
+        .claim_avatar_acquisition(0)
+        .unwrap()
+        .expect("unchanged presentation must not consume upgrade demand");
+    assert!(job.descriptor == value.presentation.avatar);
+    store
+        .complete_avatar_acquisition(&job, &image(1, 8), None)
+        .unwrap();
+    store.remove_avatar_source(&job.reference).unwrap();
+    store
+        .maintain_chat_avatar(
+            "group",
+            Some(&value.presentation.avatar),
+            &value.presentation.avatar,
+        )
+        .unwrap();
+    store.bootstrap_avatar_acquisition().unwrap();
+    assert!(store.claim_avatar_acquisition(0).unwrap().is_none());
 }
 
 #[test]

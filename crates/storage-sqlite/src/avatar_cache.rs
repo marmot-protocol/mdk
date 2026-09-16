@@ -20,6 +20,8 @@ pub const MAX_AVATAR_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Bounds missing source mappings as well as populated images.
 pub const MAX_AVATAR_CACHE_ENTRIES: u64 = 2048;
 pub const MAX_AVATAR_DIMENSION: u32 = 4096;
+/// Maximum explicit identity registrations returned in one maintenance page.
+pub const AVATAR_IDENTITY_BATCH_LIMIT: usize = 64;
 const MAX_KEY_BYTES: usize = 512;
 
 /// A source generation, scoped to the existing account store epoch. Neither the

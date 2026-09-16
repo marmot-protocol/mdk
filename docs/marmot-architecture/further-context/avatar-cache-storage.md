@@ -85,8 +85,10 @@ close remains terminal; completion cannot reopen storage.
 URL images are refresh-eligible after 24 hours. Encrypted content-addressed images have no periodic refresh. Transient
 failures persist exponential backoff from 60 seconds to one hour, in addition to the HTTP helper's bounded attempt
 budget. Integrity/decryption/image-admission failures also retry after backoff because the same URL or endpoint may
-later serve the correct bytes. Unsafe-source policy failures or 16 consecutive failed attempts block until source
-replacement, which resets the budget. Same-source failures retain usable bytes.
+later serve the correct bytes. After 16 consecutive failures, retryable work slows to one probe per 24 hours; failed
+probes retain that cadence until success or source replacement resets the budget. This avoids permanent loss after a
+long outage without returning to hourly attempts against a broken source. Unsafe-source policy failures block until
+source replacement. Same-source failures retain usable bytes.
 Repeated visible demand raises priority but does not defeat retry deadlines or create duplicate fetches.
 
 Fetches retain the existing public-address/DNS-pinning/redirect policy. Encrypted downloads verify the ciphertext

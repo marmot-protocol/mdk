@@ -17,6 +17,8 @@ pub(crate) fn validate(bytes: Vec<u8>, declared: Option<&str>) -> Result<AvatarI
             ));
         }
     };
+    // Transfer the same allocation into AvatarImage's Zeroizing buffer; both
+    // validation errors here and the eventual image drop wipe their owner.
     Ok(AvatarImage::new(
         std::mem::take(&mut *bytes),
         format,

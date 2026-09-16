@@ -106,13 +106,15 @@ impl SqliteAccountStorage {
                 .avatar_chat_owner(group)?
                 .ok_or_else(|| invalid("avatar conversation missing"))?;
             self.request_avatar_acquisition(&owner, selected, false)?;
+            // An unchanged presentation cannot consume upgrade work that has
+            // not created demand yet. Bootstrap itself always passes old=None.
+            self.lock()?
+                .execute(
+                    "DELETE FROM avatar_acquisition_bootstrap WHERE group_id_hex = ?1",
+                    [group],
+                )
+                .storage()?;
         }
-        self.lock()?
-            .execute(
-                "DELETE FROM avatar_acquisition_bootstrap WHERE group_id_hex = ?1",
-                [group],
-            )
-            .storage()?;
         Ok(())
     }
 
@@ -220,8 +222,9 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Finite exponential retry cadence (60s..1h) is persisted, while the HTTP
-    /// helper retains its own bounded per-attempt retry budget. Policy
+    /// Exponential retries (60s..1h) slow to one daily probe after 16 consecutive
+    /// failures, so an extended outage cannot strand a source permanently. The
+    /// HTTP helper retains its own bounded per-attempt retry budget. Policy
     /// failures can block until a source change; existing usable bytes are retained.
     pub fn fail_avatar_acquisition(
         &self,
@@ -233,8 +236,7 @@ impl SqliteAccountStorage {
             if !self.avatar_attempt_current(job)? { return Ok(false); }
             let conn = self.lock()?;
             let failures: u32 = conn.query_row("SELECT failures FROM avatar_acquisition WHERE token = ?1", [&job.reference.token], |r| r.get(0)).storage()?;
-            let delay = (60_u64 << failures.min(6)).min(3600);
-            let retryable = retryable && failures < 15;
+            let delay = if failures >= 15 { 24 * 60 * 60 } else { (60_u64 << failures.min(6)).min(3600) };
             let due = retryable.then(|| now.saturating_add(delay)).map(u64_to_i64).transpose()?;
             conn.execute("UPDATE avatar_acquisition SET state = ?1, due = ?2, failures = min(failures + 1, 16), priority = 0, attempt = NULL WHERE token = ?3",
                 params![if retryable { 3 } else { 4 }, due, job.reference.token]).storage()?;
@@ -313,8 +315,8 @@ impl SqliteAccountStorage {
         &self,
         after: &str,
     ) -> StorageResult<Vec<AvatarIdentityDemand>> {
-        self.lock()?.prepare("SELECT owner_key, group_id_hex, member_id_hex FROM avatar_identity_demand WHERE owner_key > ?1 ORDER BY owner_key LIMIT 64").storage()?
-            .query_map([after], |r| Ok(AvatarIdentityDemand { owner: r.get(0)?, group: r.get(1)?, member: r.get(2)? })).storage()?.collect::<Result<Vec<_>,_>>().storage()
+        self.lock()?.prepare("SELECT owner_key, group_id_hex, member_id_hex FROM avatar_identity_demand WHERE owner_key > ?1 ORDER BY owner_key LIMIT ?2").storage()?
+            .query_map(params![after, AVATAR_IDENTITY_BATCH_LIMIT as i64], |r| Ok(AvatarIdentityDemand { owner: r.get(0)?, group: r.get(1)?, member: r.get(2)? })).storage()?.collect::<Result<Vec<_>,_>>().storage()
     }
 
     /// Recheck registration under the account transaction after reading the

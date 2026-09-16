@@ -93,7 +93,7 @@ impl IdentityAvatarMaintenance {
             self.directory_version = Some(head);
         }
         let identities = storage.requested_avatar_identities_after(&self.after)?;
-        self.after = if identities.len() == 64 {
+        self.after = if identities.len() == storage_sqlite::AVATAR_IDENTITY_BATCH_LIMIT {
             identities.last().unwrap().owner.clone()
         } else {
             String::new()
