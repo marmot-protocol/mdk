@@ -9,8 +9,12 @@ import {
 } from "../src/channel.js";
 import { AgentControlError } from "../src/client.js";
 import {
+  beginMarmotAccountLifecycle,
+  markMarmotAllowlistSyncResult,
   markMarmotInboundReady,
   markMarmotInboundReceived,
+  markMarmotInboundStarting,
+  MARMOT_ALLOWLIST_SYNC_FAILED,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
 
@@ -105,6 +109,7 @@ describe("resolveMarmotChannelAccount", () => {
     const account = resolveMarmotChannelAccount(cfg, "default");
     const probe = { ok: true, accounts: 1, localSigningAccounts: 1 };
 
+    markMarmotInboundStarting("default");
     markMarmotInboundReady("default");
     markMarmotInboundReceived("default");
 
@@ -126,6 +131,7 @@ describe("resolveMarmotChannelAccount", () => {
       probe,
     });
     expect(snapshot.lastInboundAt).toEqual(expect.any(Number));
+    expect(snapshot).not.toHaveProperty("allowFrom");
 
     const summary = await status.buildChannelSummary({
       account,
@@ -140,6 +146,76 @@ describe("resolveMarmotChannelAccount", () => {
       mode: "off",
       probe,
     });
+  });
+
+  it("prefers a supplied host runtime, including a deliberate null lastError", async () => {
+    const cfg = {
+      channels: { marmot: { dm: { allowFrom: [HEX32("11")] }, profileNameOnboarding: false } },
+    } as unknown as Cfg;
+    const plugin = createMarmotChannelPlugin();
+    const status = plugin.status;
+    if (!status?.buildAccountSnapshot || !status.collectStatusIssues) {
+      throw new Error("Marmot plugin should expose channel status hooks");
+    }
+    const account = resolveMarmotChannelAccount(cfg, "default");
+    beginMarmotAccountLifecycle("default");
+    markMarmotAllowlistSyncResult("default", { state: "failed", reason: "unverified" });
+    markMarmotInboundStarting("default");
+    markMarmotInboundReady("default");
+
+    const fallback = await status.buildAccountSnapshot({
+      account,
+      cfg,
+      runtime: undefined,
+      probe: { ok: true, accounts: 1, localSigningAccounts: 1 },
+      audit: undefined,
+    });
+    expect(fallback).toMatchObject({
+      connected: false,
+      lastError: MARMOT_ALLOWLIST_SYNC_FAILED,
+    });
+    expect(fallback).not.toHaveProperty("allowFrom");
+    expect(JSON.stringify(fallback)).not.toContain(HEX32("11"));
+
+    const host = await status.buildAccountSnapshot({
+      account,
+      cfg,
+      runtime: {
+        accountId: "default",
+        running: true,
+        connected: false,
+        lastError: null,
+      },
+      probe: { ok: true, accounts: 1, localSigningAccounts: 1 },
+      audit: undefined,
+    });
+    expect(host).toMatchObject({
+      connected: false,
+      lastError: null,
+    });
+    expect(host).not.toHaveProperty("allowFrom");
+
+    const issues = status.collectStatusIssues([fallback]);
+    expect(JSON.stringify(issues)).toContain(MARMOT_ALLOWLIST_SYNC_FAILED);
+    expect(JSON.stringify(issues)).not.toContain(HEX32("11"));
+  });
+
+  it("keeps security.dm.resolveAllowFrom on the account config", async () => {
+    const cfg = {
+      channels: { marmot: { dm: { allowFrom: [HEX32("11")] }, profileNameOnboarding: false } },
+    } as unknown as Cfg;
+    const account = resolveMarmotChannelAccount(cfg, "default");
+    const plugin = createMarmotChannelPlugin();
+    const snapshot = await plugin.status?.buildAccountSnapshot?.({
+      account,
+      cfg,
+      runtime: undefined,
+      probe: { ok: true, accounts: 1, localSigningAccounts: 1 },
+      audit: undefined,
+    });
+    expect(account.allowFrom).toEqual([HEX32("11")]);
+    expect(snapshot).not.toHaveProperty("allowFrom");
+    expect(JSON.stringify(snapshot)).not.toContain(HEX32("11"));
   });
 });
 

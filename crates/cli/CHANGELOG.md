@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
+  managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
+  no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch.
+
 ### Added
 
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and

@@ -61,6 +61,9 @@ OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR=1 pnpm vitest run \
   test/openclaw-host-contract.test.ts \
   test/dispatch.test.ts \
   test/inbound-runtime.test.ts \
+  test/runtime-state.test.ts \
+  test/gateway.test.ts \
+  test/channel.test.ts \
   test/bounded-keyed-async-queue.test.ts \
   test/outbound.test.ts \
   test/plugin-sdk-surface.test.ts
