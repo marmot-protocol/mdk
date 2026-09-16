@@ -38,7 +38,7 @@ use crate::frame::{
 use crate::handlers::{BrokerStreamPolicy, PublishForwardLimits, handle_connection};
 use crate::protocol::{
     DEFAULT_BROKER_BACKLOG_DEPTH, DEFAULT_BROKER_MAX_BACKLOG_BYTES, DEFAULT_BROKER_MAX_ROOMS,
-    DEFAULT_BROKER_REPLAY_TTL, DEFAULT_SUBSCRIBER_QUEUE_DEPTH, FINISHED_ROOM_TTL,
+    DEFAULT_BROKER_REPLAY_TTL, DEFAULT_SUBSCRIBER_QUEUE_DEPTH, FINISHED_ROOM_TTL, FRAME_LEN_BYTES,
     LOCAL_SERVER_BIND, MAX_BROKER_REPLAY_TTL, MAX_FRAME_SIZE, QUIC_BROKER_ALPN_V1,
     RECORD_QUIET_GAP_DEADLINE, SEND_STOP_WAIT, SUBSCRIBER_WRITE_DEADLINE, UNFINISHED_ROOM_TTL,
 };
@@ -2224,10 +2224,17 @@ fn small_record(stream_id: &[u8], seq: u64, payload: &[u8]) -> AgentTextStreamRe
 }
 
 fn injected_write_policy(max_streams: usize) -> BrokerStreamPolicy {
+    injected_write_policy_with_timeout(max_streams, TEST_WRITE_TIMEOUT)
+}
+
+fn injected_write_policy_with_timeout(
+    max_streams: usize,
+    write_timeout: Duration,
+) -> BrokerStreamPolicy {
     BrokerStreamPolicy {
         max_streams_per_connection: max_streams,
         read_timeout: Duration::from_secs(5),
-        write_timeout: TEST_WRITE_TIMEOUT,
+        write_timeout,
         publish_limits: PublishForwardLimits {
             max_records: 4096,
             max_frame_bytes: 64 * 1024 * 1024,
@@ -2401,6 +2408,53 @@ async fn wait_live_subscribers(state: &BrokerState, key: &BrokerStreamKey, expec
     });
 }
 
+fn is_zero_application_reset(err: &quinn::ReadError) -> bool {
+    matches!(err, quinn::ReadError::Reset(code) if code.into_inner() == 0)
+}
+
+async fn drain_until_zero_application_reset(recv: &mut quinn::RecvStream) {
+    let mut buf = [0_u8; 1024];
+    loop {
+        match recv.read(&mut buf).await {
+            Err(err) if is_zero_application_reset(&err) => return,
+            Err(err) => panic!("expected peer reset with application code 0, got {err:?}"),
+            Ok(None) => panic!("expected peer reset with application code 0, got clean EOF"),
+            Ok(Some(_)) => {}
+        }
+    }
+}
+
+async fn expect_zero_application_reset(recv: &mut quinn::RecvStream) {
+    timeout(
+        Duration::from_secs(2),
+        drain_until_zero_application_reset(recv),
+    )
+    .await
+    .expect("subscriber stream must be reset by the broker with application code 0");
+}
+
+async fn wait_injected_write_deadline() {
+    // Do not drain the stalled body before this returns: consuming those
+    // bytes slides flow control and can let an in-flight write finish.
+    sleep(TEST_WRITE_TIMEOUT * 3).await;
+}
+
+async fn wait_for_frame_prefix(recv: &mut quinn::RecvStream) {
+    timeout(Duration::from_secs(2), async {
+        let mut prefix = [0_u8; FRAME_LEN_BYTES];
+        let mut read = 0;
+        while read < FRAME_LEN_BYTES {
+            match recv.read(&mut prefix[read..]).await {
+                Ok(Some(n)) => read += n,
+                Ok(None) => panic!("expected frame length prefix, got clean EOF"),
+                Err(err) => panic!("expected frame length prefix, got {err:?}"),
+            }
+        }
+    })
+    .await
+    .expect("handler must start the record write before the test proceeds");
+}
+
 struct FlowControlledWritePair {
     server_endpoint: Endpoint,
     client_endpoint: Endpoint,
@@ -2507,7 +2561,11 @@ async fn write_record_frame_with_deadline_round_trips_record() {
     let record = small_record(&[0x51; 32], 1, b"round-trip");
     let write = write_record_frame_with_deadline(&mut pair.send, &record, TEST_WRITE_TIMEOUT);
     let accept = pair.accept.take().expect("accept task");
-    let (write_result, accept_result) = tokio::join!(write, accept);
+    let (write_result, accept_result) = timeout(Duration::from_secs(2), async {
+        tokio::join!(write, accept)
+    })
+    .await
+    .expect("round-trip write must complete under the outer watchdog");
     write_result.unwrap();
     let (_, mut recv) = accept_result.unwrap().unwrap();
     pair.send.finish().unwrap();
@@ -2533,7 +2591,11 @@ async fn unbounded_record_write_stays_pending_when_peer_does_not_read() {
         Duration::from_secs(2),
         pair.accept.take().expect("accept task"),
     );
-    let (pending, _accepted) = tokio::join!(write, accept);
+    let (pending, _accepted) = timeout(Duration::from_secs(2), async {
+        tokio::join!(write, accept)
+    })
+    .await
+    .expect("unbounded pending write must terminate through the outer watchdog");
     assert!(
         pending.is_err(),
         "unbounded write_record_frame must still be pending while the peer does not read"
@@ -2550,13 +2612,62 @@ async fn write_record_frame_with_deadline_returns_write_timeout_when_peer_does_n
         Duration::from_secs(2),
         pair.accept.take().expect("accept task"),
     );
-    let (result, _accepted) = tokio::join!(write, accept);
-    let err = timeout(Duration::from_secs(2), async { result })
-        .await
-        .expect("write deadline must return")
-        .unwrap_err();
+    let (result, _accepted) = timeout(Duration::from_secs(2), async {
+        tokio::join!(write, accept)
+    })
+    .await
+    .expect("write deadline must return under the outer watchdog");
+    let err = result.unwrap_err();
     assert!(matches!(err, QuicBrokerError::WriteTimeout));
     pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn unbounded_subscribe_handler_cannot_satisfy_reset_or_permit_release() {
+    // Negative control: a subscribe handler with no short write bound cannot
+    // meet the reset/permit-release assertions used by the stalled-subscriber
+    // regressions. The helper-only pending-write baseline is not a substitute.
+    let key = BrokerStreamKey::new(vec![0x60; 32], MessageId::new(vec![0x70; 32]));
+    let broker = spawn_flow_controlled_broker(
+        Arc::new(BrokerState::new(
+            DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            DEFAULT_BROKER_BACKLOG_DEPTH,
+            DEFAULT_BROKER_MAX_ROOMS,
+            DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+            Duration::ZERO,
+        )),
+        injected_write_policy_with_timeout(1, Duration::from_secs(30)),
+    )
+    .await;
+    let connection = broker.connect_stalled().await;
+    let (_send, mut recv) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&broker.state, &key, 1).await;
+    broker
+        .state
+        .publish(&key, stall_record(&key.stream_id, 1))
+        .await
+        .unwrap();
+    wait_for_frame_prefix(&mut recv).await;
+    sleep(TEST_WRITE_TIMEOUT * 3).await;
+    assert_eq!(broker.state.live_subscriber_count_for_test(&key).await, 1);
+    assert!(
+        timeout(
+            Duration::from_millis(400),
+            drain_until_zero_application_reset(&mut recv)
+        )
+        .await
+        .is_err(),
+        "unbounded handler must still be pending after the short watchdog"
+    );
+    assert_eq!(broker.state.live_subscriber_count_for_test(&key).await, 1);
+
+    let (_send2, mut recv2) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    expect_zero_application_reset(&mut recv2).await;
+    assert_eq!(broker.state.live_subscriber_count_for_test(&key).await, 1);
+    connection.close(0_u32.into(), b"done");
+    broker.shutdown().await;
 }
 
 #[tokio::test]
@@ -2604,19 +2715,9 @@ async fn broker_resets_stalled_live_subscriber_and_releases_stream_permit() {
         .publish(&key, stall_record(&key.stream_id, 1))
         .await
         .unwrap();
+    wait_for_frame_prefix(&mut recv).await;
     wait_live_subscribers(&broker.state, &key, 0).await;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("stalled subscriber stream must be reset");
+    expect_zero_application_reset(&mut recv).await;
 
     let (_send2, mut recv2) =
         subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
@@ -2658,19 +2759,9 @@ async fn broker_resets_stalled_backlog_replay_and_unsubscribes() {
     let (_send, mut recv) =
         subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
     wait_live_subscribers(&state, &key, 1).await;
+    wait_for_frame_prefix(&mut recv).await;
     wait_live_subscribers(&state, &key, 0).await;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("stalled backlog write must reset the subscriber");
+    expect_zero_application_reset(&mut recv).await;
     connection.close(0_u32.into(), b"done");
     broker.shutdown().await;
 }
@@ -2701,23 +2792,22 @@ async fn broker_resets_stalled_finished_room_backlog_replay() {
     )
     .await
     .expect("finished-room subscribe");
-    // Do not read: consuming bytes would slide flow control and let the
-    // backlog write finish instead of proving the deadline.
-    sleep(TEST_WRITE_TIMEOUT * 3).await;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
-                .await
-                .is_err()
-            {
-                return;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+    // Read only the length prefix so the large body stays flow-controlled.
+    wait_for_frame_prefix(&mut recv).await;
+    wait_injected_write_deadline().await;
+    expect_zero_application_reset(&mut recv).await;
+
+    // Finished rooms never appear in the live subscriber list, so permit
+    // reuse must be proven by a second accepted handler starting its write.
+    let (_send2, mut recv2) = timeout(
+        Duration::from_secs(2),
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id),
+    )
     .await
-    .expect("finished-room backlog stall must reset the subscriber");
-    assert_eq!(state.live_subscriber_count_for_test(&key).await, 0);
+    .expect("finished-room permit reuse subscribe");
+    wait_for_frame_prefix(&mut recv2).await;
+    wait_injected_write_deadline().await;
+    expect_zero_application_reset(&mut recv2).await;
     connection.close(0_u32.into(), b"done");
     broker.shutdown().await;
 }
@@ -2741,16 +2831,7 @@ async fn broker_unsubscribes_when_queue_eviction_races_a_pending_write() {
         .publish(&key, stall_record(&key.stream_id, 1))
         .await
         .unwrap();
-    timeout(Duration::from_millis(100), async {
-        loop {
-            if state.live_subscriber_count_for_test(&key).await == 1 {
-                return;
-            }
-            sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .ok();
+    wait_for_frame_prefix(&mut recv).await;
     state
         .publish(&key, small_record(&key.stream_id, 2, b"queued"))
         .await
@@ -2760,20 +2841,25 @@ async fn broker_unsubscribes_when_queue_eviction_races_a_pending_write() {
         .await
         .unwrap();
     assert_eq!(state.live_subscriber_count_for_test(&key).await, 0);
-    sleep(TEST_WRITE_TIMEOUT * 3).await;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if read_record_frame(&mut recv, Some(Duration::from_millis(50)), MAX_FRAME_SIZE)
-                .await
-                .is_err()
-            {
-                return;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+    wait_injected_write_deadline().await;
+    expect_zero_application_reset(&mut recv).await;
+
+    let (_send2, mut recv2) =
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
+    wait_live_subscribers(&state, &key, 1).await;
+    state
+        .publish(&key, small_record(&key.stream_id, 4, b"reused"))
+        .await
+        .unwrap();
+    let received = timeout(
+        Duration::from_secs(2),
+        read_record_frame(&mut recv2, Some(Duration::from_secs(2)), MAX_FRAME_SIZE),
+    )
     .await
-    .expect("pending write must still time out after queue eviction");
+    .expect("queue-eviction must release the stream permit")
+    .unwrap()
+    .expect("permit-reuse record");
+    assert_eq!(received.plaintext_frame, b"reused");
     connection.close(0_u32.into(), b"done");
     broker.shutdown().await;
 }
@@ -2789,12 +2875,11 @@ async fn broker_keeps_healthy_subscriber_when_peer_times_out() {
         Duration::ZERO,
     ));
     let broker = spawn_flow_controlled_broker(Arc::clone(&state), injected_write_policy(2)).await;
-    let stalled = broker.connect_stalled().await;
-    let healthy = broker.connect_reading().await;
+    let connection = broker.connect_stalled().await;
     let (_stalled_send, mut stalled_recv) =
-        subscribe_unread(&stalled, &key.stream_id, &key.start_event_id).await;
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
     let (_healthy_send, mut healthy_recv) =
-        subscribe_unread(&healthy, &key.stream_id, &key.start_event_id).await;
+        subscribe_unread(&connection, &key.stream_id, &key.start_event_id).await;
     wait_live_subscribers(&state, &key, 2).await;
 
     state
@@ -2816,22 +2901,7 @@ async fn broker_keeps_healthy_subscriber_when_peer_times_out() {
     assert_eq!(first.seq, 1);
 
     wait_live_subscribers(&state, &key, 1).await;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if read_record_frame(
-                &mut stalled_recv,
-                Some(Duration::from_millis(50)),
-                MAX_FRAME_SIZE,
-            )
-            .await
-            .is_err()
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("stalled sibling must be reset");
+    expect_zero_application_reset(&mut stalled_recv).await;
 
     state
         .publish(&key, small_record(&key.stream_id, 2, b"still-here"))
@@ -2851,8 +2921,24 @@ async fn broker_keeps_healthy_subscriber_when_peer_times_out() {
     .expect("second record");
     assert_eq!(second.plaintext_frame, b"still-here");
     assert_eq!(state.live_subscriber_count_for_test(&key).await, 1);
-    stalled.close(0_u32.into(), b"done");
-    healthy.close(0_u32.into(), b"done");
+
+    let _ = state.mark_room_finished_for_test(&key).await;
+    let eof = timeout(
+        Duration::from_secs(2),
+        read_record_frame(
+            &mut healthy_recv,
+            Some(Duration::from_secs(2)),
+            MAX_FRAME_SIZE,
+        ),
+    )
+    .await
+    .expect("healthy sibling must observe a clean finish")
+    .unwrap();
+    assert!(
+        eof.is_none(),
+        "healthy sibling must see clean EOF, not reset"
+    );
+    connection.close(0_u32.into(), b"done");
     broker.shutdown().await;
 }
 
