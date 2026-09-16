@@ -358,13 +358,15 @@ async fn quiet_busy_retries_keep_cancelled_command_position() {
         .unwrap();
     caller.abort();
     let _ = caller.await;
-    f.mode.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await; // exceed the display budget
+    f.mode.store(0, Ordering::SeqCst);
     f.release.notify_one();
     let jumped = next(&mut sub).await;
     assert_eq!(
         jumped.anchors[anchor_index(jumped.anchor).unwrap()].message_id_hex(),
         id(4)
     );
+    f.mode.store(2, Ordering::SeqCst);
     f.draft("retry me");
     assert!(matches!(
         timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
@@ -1044,7 +1046,7 @@ async fn cold_capture_does_not_force_group_hydration() {
 }
 
 #[tokio::test]
-async fn local_fallback_never_reuses_old_permissions_with_new_membership() {
+async fn busy_live_window_keeps_complete_snapshot_until_coherent_membership_update() {
     let f = Fixture::new(8).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
     assert!(sub.snapshot.presentation.header.capabilities.can_send);
@@ -1058,12 +1060,16 @@ async fn local_fallback_never_reuses_old_permissions_with_new_membership() {
     f.app
         .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
         .unwrap();
-    let local = read.await.unwrap().unwrap();
-    assert!(local.presentation.header.epoch.is_none());
-    assert!(!local.presentation.header.capabilities.can_send);
-    assert_eq!(
-        local.presentation.header.capabilities.participation,
-        crate::conversation_presentation::ConversationParticipation::Removed
+    assert!(matches!(
+        read.await.unwrap(),
+        Err(ConversationWindowError::NotReady)
+    ));
+    // A delayed live capture must not publish either downgraded permissions
+    // or fresh membership combined with the old live authority.
+    assert!(
+        timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err()
     );
     f.mode.store(0, Ordering::SeqCst);
     f.release.notify_one();
@@ -1075,4 +1081,153 @@ async fn local_fallback_never_reuses_old_permissions_with_new_membership() {
         }
     }
     f.close().await;
+}
+
+#[tokio::test]
+async fn busy_live_window_does_not_disable_composer() {
+    let f = Fixture::new(8).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    f.mode.store(1, Ordering::SeqCst);
+    f.draft("changed while sync is busy");
+    assert!(
+        timeout(Duration::from_millis(150), sub.recv())
+            .await
+            .is_err()
+    );
+    assert!(sub.snapshot.presentation.header.capabilities.can_send);
+    f.mode.store(2, Ordering::SeqCst);
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
+            Err(ConversationWindowError::App(_))
+        ),
+        "quiet NotReady must not hide a later storage failure"
+    );
+    f.mode.store(0, Ordering::SeqCst);
+    let updated = next(&mut sub).await;
+    assert!(updated.presentation.header.capabilities.can_send);
+    assert!(updated.presentation.header.epoch.is_some());
+    assert_eq!(
+        updated.draft.draft.as_ref().unwrap().content,
+        "changed while sync is busy"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn transient_worker_acquisition_failure_retries_without_closing_local_window() {
+    let f = Fixture::new(8).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    f.runtime
+        .accounts
+        .set_account_tearing_down(&f.account, true);
+    let mut sub = f
+        .runtime
+        .open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
+    // Reconcile deliberately cannot start this account yet. That temporary
+    // missing-worker result must not become a terminal stream error.
+    assert!(
+        timeout(Duration::from_millis(150), sub.recv())
+            .await
+            .is_err()
+    );
+    f.draft("still usable locally");
+    let local = next(&mut sub).await;
+    assert!(local.presentation.header.epoch.is_none());
+    assert_eq!(
+        local.draft.draft.as_ref().unwrap().content,
+        "still usable locally"
+    );
+    f.runtime
+        .accounts
+        .set_account_tearing_down(&f.account, false);
+    let live = next(&mut sub).await;
+    assert!(live.presentation.header.epoch.is_some());
+    assert!(live.presentation.header.capabilities.can_send);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
+    let f = Fixture::new(8).await;
+    let (commands, _rx) = mpsc::channel(8);
+    let (shutdown, stopping) = oneshot::channel();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let entered_task = entered.clone();
+    let release_task = release.clone();
+    let handle = tokio::spawn(async move {
+        let _ = stopping.await;
+        entered_task.notify_one();
+        release_task.notified().await;
+    });
+    f.runtime.accounts.workers.lock().await.insert(
+        "stale account".into(),
+        ManagedAccountWorker {
+            handle,
+            commands,
+            shutdown,
+            media_admission: Arc::new(Semaphore::new(1)),
+        },
+    );
+    let mut sub = f
+        .runtime
+        .open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    // Reconcile is awaiting stale-worker teardown inside worker_transactions.
+    // Local invalidations must stay usable while that lifecycle work progresses.
+    f.draft("local during worker teardown");
+    let local = timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(local.presentation.header.epoch.is_none());
+    assert_eq!(
+        local.draft.draft.as_ref().unwrap().content,
+        "local during worker teardown"
+    );
+    drop(sub);
+    let runtime = f.runtime.clone();
+    let mut closing = tokio::spawn(async move { runtime.shutdown_and_close().await });
+    assert!(
+        timeout(Duration::from_millis(150), &mut closing)
+            .await
+            .is_err(),
+        "shutdown must still own the stale worker until its teardown finishes"
+    );
+    release.notify_one();
+    timeout(Duration::from_secs(10), closing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

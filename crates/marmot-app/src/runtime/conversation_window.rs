@@ -2,7 +2,7 @@
 //! Account-owned fields share a read boundary; directory enrichment is separate.
 use super::account_worker::AccountWorkerCommand;
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
-use super::{MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
+use super::{AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::conversation_presentation::{
     ConversationAuthority, ConversationHeaderState, ConversationPresentationError,
@@ -12,7 +12,7 @@ use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use cgka_engine::group_authority::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use storage_sqlite::{ConversationAccountSnapshot, ConversationOpenError, ConversationWindowQuery};
 pub use storage_sqlite::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenQuery,
@@ -333,17 +333,45 @@ struct Command {
     action: Action,
     reply: oneshot::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 }
-type WorkerReady =
-    Pin<Box<dyn Future<Output = Result<mpsc::Sender<AccountWorkerCommand>, AppError>> + Send>>;
+type WorkerConnection =
+    watch::Receiver<Option<Result<mpsc::Sender<AccountWorkerCommand>, ConversationWindowError>>>;
 
-enum WorkerConnection {
-    // Retain this future across bounded polls; cancellation must not restart
-    // account reconciliation or silently replace the pinned worker. The mutex
-    // makes the erased future Sync for borrowed readers; only get_mut polls it.
-    // There is no detached initialization task to outlive the window.
-    Connecting(tokio::sync::Mutex<WorkerReady>),
-    Ready(mpsc::Sender<AccountWorkerCommand>),
-    Failed(Arc<AppError>),
+// This future is joined with the window actor, not polled under its display
+// timeout. Every admitted reconcile runs to completion, even if the window
+// closes, so worker teardown cannot be abandoned inside worker_transactions.
+async fn acquire_worker(
+    accounts: AccountManager,
+    label: String,
+    account_id: String,
+    ready: watch::Sender<
+        Option<Result<mpsc::Sender<AccountWorkerCommand>, ConversationWindowError>>,
+    >,
+) {
+    while !ready.is_closed() {
+        let result = async {
+            let account = accounts.resolve(&label)?;
+            if account.account_id_hex != account_id {
+                return Err(
+                    AppError::from(marmot_account::AccountHomeError::AccountIdMismatch).into(),
+                );
+            }
+            if account.signed_out {
+                return Err(ConversationWindowError::Closed);
+            }
+            accounts.worker_commands(&label).await.map_err(Into::into)
+        }
+        .await;
+        let finished = result.is_ok() || result.as_ref().is_err_and(|error| error.terminal());
+        if ready.send(Some(result)).is_err() || finished {
+            return;
+        }
+        // A missing worker during account restart is transient. Retry only
+        // after the previous acquisition finished; closing cancels this wait.
+        tokio::select! {
+            _ = ready.closed() => return,
+            _ = tokio::time::sleep(RETRY_DELAY) => {},
+        }
+    }
 }
 
 struct Reader {
@@ -359,18 +387,10 @@ impl Reader {
         &mut self,
         query: &ConversationWindowQuery,
     ) -> Result<CapturedConversation, ConversationWindowError> {
-        if let WorkerConnection::Connecting(ready) = &mut self.worker {
-            self.worker = match ready.get_mut().await {
-                Ok(worker) => WorkerConnection::Ready(worker),
-                Err(error) => WorkerConnection::Failed(Arc::new(error)),
-            };
-        }
-        let worker = match &self.worker {
-            WorkerConnection::Ready(worker) => worker,
-            WorkerConnection::Failed(error) => {
-                return Err(ConversationWindowError::App(error.clone()));
-            }
-            WorkerConnection::Connecting(_) => unreachable!(),
+        let worker = match self.worker.borrow().as_ref() {
+            Some(Ok(worker)) => worker.clone(),
+            Some(Err(error)) if error.terminal() => return Err(error.clone()),
+            _ => return Err(ConversationWindowError::NotReady),
         };
         let (respond, rx) = oneshot::channel();
         worker
@@ -391,11 +411,19 @@ impl Reader {
         &mut self,
         query: &ConversationWindowQuery,
         revision: ConversationWindowRevision,
+        allow_local: bool,
     ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
         match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query)).await {
             Ok(Ok(captured)) => self.present(captured, revision).await,
             Ok(Err(ConversationWindowError::NotReady)) | Err(_) => {
-                self.read_local(query, revision).await
+                if allow_local {
+                    self.read_local(query, revision).await
+                } else {
+                    // Keep the last complete live snapshot while the worker is
+                    // busy. Never attach stale permissions to newer local rows,
+                    // or grey out a live composer on ordinary queue contention.
+                    Err(ConversationWindowError::NotReady)
+                }
             }
             Ok(Err(error)) => Err(error),
         }
@@ -558,7 +586,7 @@ impl MarmotAppRuntime {
             );
         }
         if account.signed_out {
-            return Err(ConversationWindowError::Closed);
+            return Err(AppError::RelayDirectory("account is signed out".into()).into());
         }
         let app = &self.accounts.app;
         let mut sources = Sources {
@@ -587,16 +615,7 @@ impl MarmotAppRuntime {
                     .store_epoch)
             })
             .await?;
-            let accounts = self.accounts.clone();
-            let account_ref = account.label.clone();
-            let expected_account_id = account.account_id_hex.clone();
-            let worker =
-                WorkerConnection::Connecting(tokio::sync::Mutex::new(Box::pin(async move {
-                    if accounts.resolve(&account_ref)?.account_id_hex != expected_account_id {
-                        return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
-                    }
-                    accounts.worker_commands(&account_ref).await
-                })));
+            let (ready, worker) = watch::channel(None);
             let reader = Reader {
                 app: self.accounts.app.clone(),
                 label: account.label.clone(),
@@ -608,11 +627,11 @@ impl MarmotAppRuntime {
             loop {
                 match reader.read_local(&position, revision.clone()).await {
                     Err(ConversationWindowError::NotReady) => tokio::time::sleep(RETRY_DELAY).await,
-                    result => return result.map(|snapshot| (reader, snapshot)),
+                    result => return result.map(|snapshot| (reader, snapshot, ready)),
                 }
             }
         };
-        let (reader, snapshot) = tokio::select! {
+        let (reader, snapshot, ready) = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return Err(ConversationWindowError::Closed),
             _ = wait_for_account_reset(&mut resets, &account.label) => return Err(ConversationWindowError::Closed),
@@ -621,15 +640,24 @@ impl MarmotAppRuntime {
         let position = retain_anchor(position, &snapshot);
         let (updates, rx) = watch::channel(Ok(snapshot.clone()));
         let (commands, command_rx) = mpsc::channel(8);
-        tokio::spawn(run(
-            reader,
-            position,
-            snapshot.clone(),
-            sources,
-            resets,
-            command_rx,
-            updates,
-        ));
+        let snapshot_for_actor = snapshot.clone();
+        let accounts = self.accounts.clone();
+        let label = reader.label.clone();
+        let account_id = reader.account_id.clone();
+        tokio::spawn(async move {
+            tokio::join!(
+                acquire_worker(accounts, label, account_id, ready),
+                run(
+                    reader,
+                    position,
+                    snapshot_for_actor,
+                    sources,
+                    resets,
+                    command_rx,
+                    updates
+                ),
+            );
+        });
         Ok(RuntimeConversationWindowSubscription {
             snapshot,
             handle: ConversationWindowHandle { commands },
@@ -782,9 +810,12 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     updates: watch::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 ) {
+    let mut worker_updates = reader.worker.clone();
+    let mut worker_updates_open = true;
     let mut dirty = true; // enrich the initial local snapshot without delaying it
     let mut authority_pending = false;
     let mut failed = false;
+    let mut retry_delayed = false;
     let mut last_good_position = position.clone();
     loop {
         let mut stopping = sources.stopping.clone();
@@ -794,7 +825,12 @@ async fn run(
             _ = wait_for_account_reset(&mut resets, &reader.label) => return,
             _ = updates.closed() => return,
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
-            _ = tokio::time::sleep(if failed || (authority_pending && !dirty) { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty || authority_pending => None,
+            result = worker_updates.changed(), if worker_updates_open => {
+                if result.is_err() { worker_updates_open = false; }
+                else { dirty = true; }
+                continue;
+            },
+            _ = tokio::time::sleep(if retry_delayed || (authority_pending && !dirty) { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty || authority_pending => None,
             _ = sources.invalidated(&reader, &current), if !dirty => { dirty = true; continue; },
         };
         let next = match command
@@ -817,7 +853,7 @@ async fn run(
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return,
             _ = wait_for_account_reset(&mut resets, &reset_label) => return,
             _ = updates.closed() => return,
-            result = reader.read(&next, current.revision.clone()) => result,
+            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none()) => result,
         };
         match result {
             Ok(mut replacement) => {
@@ -841,12 +877,16 @@ async fn run(
                 authority_pending = current.presentation.header.epoch.is_none();
                 dirty = false; // local invalidations stay prompt during quiet authority retries
                 failed = false;
+                retry_delayed = false;
             }
             Err(error) => {
-                let terminal =
-                    error.terminal() || matches!(reader.worker, WorkerConnection::Failed(_));
+                let terminal = error.terminal();
+                let waiting = matches!(error, ConversationWindowError::NotReady);
                 let query_error = matches!(error, ConversationWindowError::Query(_));
-                if terminal || (!failed && !query_error) || (query_error && command.is_none()) {
+                if terminal
+                    || (!waiting && !failed && !query_error)
+                    || (query_error && command.is_none())
+                {
                     let _ = updates.send_replace(Err(error.clone()));
                 }
                 if let Some(command) = command {
@@ -858,6 +898,7 @@ async fn run(
                     position = last_good_position.clone();
                     dirty = true;
                     failed = true;
+                    retry_delayed = true;
                 }
                 if terminal {
                     return;
@@ -866,7 +907,10 @@ async fn run(
                     // Preserve accepted viewport commands through a quiet failure.
                     position = next;
                     dirty = true;
-                    failed = true;
+                    // Quiet NotReady retries must not suppress a later real
+                    // storage error that the receiver has not yet seen.
+                    failed |= !waiting;
+                    retry_delayed = true;
                 }
             }
         }

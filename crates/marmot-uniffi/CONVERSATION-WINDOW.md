@@ -23,12 +23,19 @@ for worker startup, group hydration or relay catch-up. Render its messages immed
 `header.epoch == None` means live authority is not yet available: membership and
 invitation/departure display come from that same local read, all send/management
 capabilities are false, and non-disbanded lifecycle is conservatively `Recovering`.
+Do not show an MLS recovery warning solely from that local-only lifecycle value.
 Do not interpret this as removal, wait for `can_send` to display history, or restore
 an independent client timeline cache. MDK retries authority in the background and
 publishes a complete replacement with an epoch and current capabilities when ready.
-Paging and local updates remain available during catch-up. A worker capture gets a
-50 ms wait budget before falling back to a fresh local snapshot; a blocked worker
-queue cannot hold the screen open indefinitely. A missing/dirty local read projection
+That upgrade commonly supersedes the initial revision immediately: install it before
+issuing revisioned commands, or handle `StaleWindow` by consuming the latest replacement.
+Before the first live capture, paging and local updates remain available during
+catch-up. A worker capture gets a 50 ms wait budget before falling back to a fresh
+local snapshot. After live authority has arrived, a busy worker retains the last
+complete snapshot and retries; it never downgrades the composer or combines stale
+permissions with newer local rows. A revisioned command can return `NotReady` during
+that wait. Worker acquisition runs to completion outside the capture timeout and
+retries transient failures; closing the window never abandons worker teardown. A missing/dirty local read projection
 still uses the existing keyed preparation/retry path.
 
 Timeline content uses the existing Markdown/media converters. For this screen,

@@ -79,8 +79,14 @@ Opening first reads the durable account snapshot directly. `header.epoch = None`
 presentation and suppresses all live permissions, preserving persisted membership/invitation/departure
 status. The actor then acquires the worker and uses its session capture callback for coherent live
 authority. It retains a 50 ms capture wait budget and a one-second quiet retry when authority is
-unavailable; paging and updates fall back to fresh local snapshots. The pending worker acquisition
-future is retained across polls and dropped with the actor, rather than spawning an unowned task.
+unavailable. Before first authority, paging and updates fall back to fresh local snapshots; after
+first authority, a busy worker retains the last complete snapshot and retries without capability
+flicker or mixing old permissions with new rows. Worker acquisition runs continuously, joined with
+the actor but outside its display timeout. Admitted reconciliation finishes even after window close,
+so worker teardown and its lifecycle lock cannot be abandoned; transient acquisition failures retry.
+The initial read deliberately never spends the 50 ms authority budget, even on a warm open: local
+first paint remains independent of global account reconciliation. This adds one initial read-only
+transition; readiness wakes the actor immediately rather than waiting for the quiet retry timer.
 Frozen-snapshot dispatch paths still return `NotReady`; no old `GroupReadSnapshot` is combined
 with newer persisted fields. Live capture never forces group hydration: background recovery owns
 that work. Tests cover stalled production relay sync at 200/5,000 retained messages, seeded but
