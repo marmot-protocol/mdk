@@ -15,7 +15,7 @@
 //!   configured. No exporter, no resolution, no push.
 //! - **Labels are structurally bounded.** The export batch is a flat list of
 //!   [`ExportMetricPoint`]s. Relay points can carry only `relay`; account
-//!   sync/catch-up failure points can carry only the closed `failure_stage`
+//!   sync/catch-up and invite-acceptance failures carry only closed `failure_stage`
 //!   and `error_class` enums. There is deliberately no field for an
 //!   account, member, device, group, subscription, pubkey, message, event, or
 //!   IP value, so a forbidden label cannot be attached.

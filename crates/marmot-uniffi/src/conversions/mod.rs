@@ -496,6 +496,7 @@ mod tests {
         let record = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            edit: None,
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
             source_epoch: Some(7),
@@ -621,6 +622,7 @@ mod tests {
         let record = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
@@ -669,6 +671,7 @@ mod tests {
         let record = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            edit: None,
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),

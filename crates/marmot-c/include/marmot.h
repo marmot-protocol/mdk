@@ -716,6 +716,7 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_PIN_ORDER_CHANGED,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_SNAPSHOT_REFRESH,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_REMOVED,
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_LAST_MESSAGE_CONTENT_CHANGED,
 } MarmotChatListUpdateTrigger;
 
 typedef enum MarmotChatListView {
@@ -3261,6 +3262,15 @@ typedef struct MarmotTimelineReactionSummary {
 } MarmotTimelineReactionSummary;
 
 /**
+ * Compact accepted-edit metadata on an effective timeline row.
+ */
+typedef struct MarmotTimelineEditSummary {
+  uint64_t edit_count;
+  char *latest_edit_message_id_hex;
+  uint64_t edited_at;
+} MarmotTimelineEditSummary;
+
+/**
  * One materialized timeline row.
  */
 typedef struct MarmotTimelineMessageRecord {
@@ -3335,6 +3345,7 @@ typedef struct MarmotTimelineMessageRecord {
    */
   struct MarmotGroupSystemEvent *group_system;
   struct MarmotTimelineReactionSummary reactions;
+  struct MarmotTimelineEditSummary *edit;
   bool deleted;
   char *deleted_by_message_id_hex;
   /**
@@ -3713,6 +3724,24 @@ typedef struct MarmotProductEvent {
   struct MarmotProductEventProperty *properties;
   uintptr_t properties_len;
 } MarmotProductEvent;
+
+/**
+ * One accepted replacement version.
+ */
+typedef struct MarmotTimelineEditVersion {
+  char *message_id_hex;
+  uint64_t edited_at;
+  char *plaintext;
+} MarmotTimelineEditVersion;
+
+/**
+ * Accepted versions, oldest first within a latest-first page.
+ */
+typedef struct MarmotTimelineEditHistoryPage {
+  struct MarmotTimelineEditVersion *versions;
+  uintptr_t versions_len;
+  bool has_more_before;
+} MarmotTimelineEditHistoryPage;
 
 typedef struct MarmotReportedContent {
   char *message_id_hex;
@@ -7841,6 +7870,23 @@ MarmotStatus marmot_set_product_analytics_activity(const struct MarmotClient *cl
                                                    uint32_t activity);
 
 /**
+ * Read accepted edit versions separately from screen snapshots. Supply both
+ * cursor values, or has_before=0 and a NULL id for the newest page. Limit 1..=100.
+ * Free with marmot_timeline_edit_history_page_free.
+ * # Safety
+ * Client and strings must be valid, before_message_id nullable, out writable.
+ */
+MarmotStatus marmot_message_edit_history(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         const char *target_message_id_hex,
+                                         uint8_t has_before,
+                                         uint64_t before_edited_at,
+                                         const char *before_message_id_hex,
+                                         uint32_t limit,
+                                         struct MarmotTimelineEditHistoryPage **out);
+
+/**
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -10011,6 +10057,16 @@ void marmot_timeline_page_free(struct MarmotTimelinePage *ptr);
  * `update` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_timeline_subscription_update_free(struct MarmotTimelineSubscriptionUpdate *update);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_timeline_edit_history_page_free(struct MarmotTimelineEditHistoryPage *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

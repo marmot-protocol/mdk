@@ -160,8 +160,10 @@ mod migration_0073_message_draft_revisions;
 mod migration_0074_chat_list_invite_attention;
 #[path = "migrations/0075_user_blocks.rs"]
 mod migration_0075_user_blocks;
-#[path = "migrations/0076_content_reports.rs"]
-mod migration_0076_content_reports;
+#[path = "migrations/0076_accepted_edits.rs"]
+mod migration_0076_accepted_edits;
+#[path = "migrations/0077_content_reports.rs"]
+mod migration_0077_content_reports;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -547,8 +549,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 76,
-        name: "0076_content_reports",
-        apply: migration_0076_content_reports::apply,
+        name: "0076_accepted_edits",
+        apply: migration_0076_accepted_edits::apply,
+    },
+    Migration {
+        version: 77,
+        name: "0077_content_reports",
+        apply: migration_0077_content_reports::apply,
     },
 ];
 
@@ -1320,7 +1327,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 76,
+                found: 77,
                 latest_supported: 46,
             }
         ));
@@ -1376,7 +1383,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 76,
+                found: 77,
                 latest_supported: 46,
             }
         ));
@@ -1680,7 +1687,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 76,
+                found: 77,
                 latest_supported: 46,
             }
         ));

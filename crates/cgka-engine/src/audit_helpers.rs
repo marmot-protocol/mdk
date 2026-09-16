@@ -185,10 +185,7 @@ pub(crate) fn epoch_state_name_str(name: &str) -> &'static str {
 }
 
 pub(crate) fn member_ref_hex(member: &MemberId) -> MemberRefHex {
-    let mut hasher = Sha256::new();
-    hasher.update(b"marmot-audit-member-ref/v1");
-    hasher.update(member.as_slice());
-    hex::encode(&hasher.finalize()[..16])
+    marmot_forensics::member_ref_hex(member.as_slice())
 }
 
 fn value_digest_hex(change_kind: &str, value: &[u8]) -> DigestHex {
@@ -744,5 +741,143 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(emitted, defined);
+    }
+
+    #[test]
+    fn member_ref_hex_delegates_to_shared_helper_and_pins_known_answers() {
+        let alice = MemberId::new((0u8..32).collect::<Vec<_>>());
+        let bob = MemberId::new((32u8..64).collect::<Vec<_>>());
+        assert_eq!(
+            member_ref_hex(&alice),
+            marmot_forensics::member_ref_hex(alice.as_slice())
+        );
+        assert_eq!(member_ref_hex(&alice), "8e66aded45480108db05bdf8af61c8d8");
+        assert_eq!(member_ref_hex(&bob), "5469b0a49fe3c891746157be46309935");
+        assert_ne!(member_ref_hex(&alice), member_ref_hex(&bob));
+    }
+
+    #[test]
+    fn removal_and_leave_subjects_join_source_local_member_ref() {
+        use marmot_forensics::{
+            AuditEventKind, AuditRecord, AuditSourceContext, ForensicRecorder, JsonlRecorder,
+            default_jsonl_path,
+        };
+        use tempfile::TempDir;
+
+        let producer = MemberId::new((0u8..32).collect::<Vec<_>>());
+        let other = MemberId::new((32u8..64).collect::<Vec<_>>());
+        let actor = MemberId::new((64u8..96).collect::<Vec<_>>());
+        let producer_ref = member_ref_hex(&producer);
+        let other_ref = member_ref_hex(&other);
+        let actor_ref = member_ref_hex(&actor);
+        assert_ne!(producer_ref, actor_ref);
+        assert_ne!(producer_ref, other_ref);
+
+        let dir = TempDir::new().unwrap();
+        let path = default_jsonl_path(dir.path(), "engine-join");
+        let recorder = JsonlRecorder::open(&path, "engine-join".into()).unwrap();
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SourceContext {
+                source: AuditSourceContext {
+                    local_member_ref: Some(producer_ref.clone()),
+                    ..Default::default()
+                },
+            },
+        ));
+        recorder.record(AuditRecord::new(
+            Some("aa".into()),
+            group_state_changed_event(
+                EpochId(4),
+                Some(&actor),
+                &GroupStateChange::MemberRemoved {
+                    member: producer.clone(),
+                },
+                None,
+            ),
+        ));
+        recorder.record(AuditRecord::new(
+            Some("aa".into()),
+            group_state_changed_event(
+                EpochId(5),
+                None,
+                &GroupStateChange::MemberLeft {
+                    member: producer.clone(),
+                },
+                None,
+            ),
+        ));
+        recorder.record(AuditRecord::new(
+            Some("aa".into()),
+            group_state_changed_event(
+                EpochId(6),
+                Some(&actor),
+                &GroupStateChange::MemberRemoved { member: other },
+                None,
+            ),
+        ));
+        drop(recorder);
+
+        let events: Vec<marmot_forensics::AuditEvent> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let source = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                AuditEventKind::SourceContext { source } => source.local_member_ref.clone(),
+                _ => None,
+            })
+            .expect("source local_member_ref");
+        let membership: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                AuditEventKind::GroupStateChanged {
+                    change_kind,
+                    membership_change_source,
+                    actor_member_ref,
+                    subject_member_ref,
+                    ..
+                } => Some((
+                    change_kind.as_str(),
+                    *membership_change_source,
+                    actor_member_ref.clone(),
+                    subject_member_ref.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(source, producer_ref);
+        assert_eq!(
+            membership[0],
+            (
+                "member_removed",
+                Some(MembershipChangeSource::AdminAction),
+                Some(actor_ref.clone()),
+                Some(producer_ref.clone())
+            )
+        );
+        assert_eq!(
+            membership[1],
+            (
+                "member_left",
+                Some(MembershipChangeSource::SelfLeave),
+                None,
+                Some(producer_ref.clone())
+            )
+        );
+        assert_eq!(
+            membership[2],
+            (
+                "member_removed",
+                Some(MembershipChangeSource::AdminAction),
+                Some(actor_ref),
+                Some(other_ref)
+            )
+        );
+        assert_eq!(membership[0].3.as_deref(), Some(source.as_str()));
+        assert_eq!(membership[1].3.as_deref(), Some(source.as_str()));
+        assert_ne!(membership[2].3.as_deref(), Some(source.as_str()));
     }
 }

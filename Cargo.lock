@@ -3511,9 +3511,11 @@ name = "marmot-forensics"
 version = "0.10.0"
 dependencies = [
  "fs-private",
+ "hex",
  "jsonschema",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "web-time",
 ]

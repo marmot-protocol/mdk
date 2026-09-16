@@ -609,6 +609,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
     TimelineMessageRecord {
         revision_id_hex: String::new(),
         moderation: storage_sqlite::MessageModerationSummary::default(),
+        edit: None,
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         source_epoch: None,
@@ -2764,5 +2765,211 @@ async fn message_journey_overflow() {
         assert!(page.messages[0].source_message_id_hex.is_some());
     }
     drop(client);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://test.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("edits", &[]).await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let storage = app.account_storage("alice").unwrap();
+    let original = storage_sqlite::StoredAppEvent {
+        group_id_hex: group_hex.clone(),
+        message_id_hex: "01".repeat(32),
+        source_message_id_hex: Some("02".repeat(32)),
+        source_epoch: Some(0),
+        direction: "received".into(),
+        sender: "ee".repeat(32),
+        plaintext: "original".into(),
+        kind: 9,
+        tags: vec![],
+        recorded_at: 1,
+        received_at: 1,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    let update = storage.record_app_event(&original).unwrap();
+    app.app_projection_update("alice", update).unwrap();
+    let runtime = app.runtime();
+    let mut subscription = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    let before = subscription
+        .snapshot
+        .iter()
+        .find(|r| r.group_id_hex == group_hex)
+        .unwrap()
+        .clone();
+    let mut edit = original.clone();
+    edit.message_id_hex = "03".repeat(32);
+    edit.source_message_id_hex = Some("04".repeat(32));
+    edit.kind = 1009;
+    edit.recorded_at = 2;
+    edit.plaintext = "**edited**".into();
+    edit.tags = vec![vec!["e".into(), original.message_id_hex.clone()]];
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&edit).unwrap())
+        .unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::LastMessageContentChanged
+    );
+    runtime
+        .events
+        .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account.account_id_hex.clone(),
+            account_label: "alice".into(),
+            update,
+        }))
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let RuntimeChatListUpdate::Row { trigger, row } = event else {
+        panic!("expected changed row")
+    };
+    assert_eq!(trigger, ChatListUpdateTrigger::LastMessageContentChanged);
+    assert_eq!(row.last_message.as_ref().unwrap().plaintext, "**edited**");
+    assert_eq!(row.unread_count, before.unread_count);
+    assert_eq!(
+        row.last_message.as_ref().unwrap().message_id_hex,
+        before.last_message.as_ref().unwrap().message_id_hex
+    );
+    assert_eq!(
+        row.last_message.as_ref().unwrap().timeline_at,
+        before.last_message.as_ref().unwrap().timeline_at
+    );
+    let recovered = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    assert_eq!(
+        recovered
+            .snapshot
+            .iter()
+            .find(|r| r.group_id_hex == group_hex)
+            .unwrap()
+            .last_message,
+        row.last_message
+    );
+    edit.message_id_hex = "05".repeat(32);
+    edit.source_message_id_hex = Some("06".repeat(32));
+    edit.recorded_at = 3;
+    edit.plaintext = "after lag".into();
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&edit).unwrap())
+        .unwrap();
+    let event = MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+        account_id_hex: account.account_id_hex,
+        account_label: "alice".into(),
+        update,
+    });
+    // No await in this current-thread test: overflow before the subscriber can drain.
+    for _ in 0..4096 {
+        runtime.events.send(event.clone()).unwrap();
+    }
+    let recovered_event = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let RuntimeChatListUpdate::Row {
+        trigger,
+        row: recovered,
+    } = recovered_event
+    else {
+        panic!("expected row reconciled from lag recovery snapshot");
+    };
+    assert_eq!(trigger, ChatListUpdateTrigger::SnapshotRefresh);
+    assert_eq!(
+        recovered.last_message.as_ref().unwrap().plaintext,
+        "after lag"
+    );
+    assert_eq!(recovered.unread_count, before.unread_count);
+    let mut older = original.clone();
+    older.message_id_hex = "07".repeat(32);
+    older.source_message_id_hex = Some("08".repeat(32));
+    older.recorded_at = 0;
+    app.app_projection_update("alice", storage.record_app_event(&older).unwrap())
+        .unwrap();
+    let mut older_edit = edit.clone();
+    older_edit.message_id_hex = "09".repeat(32);
+    older_edit.source_message_id_hex = Some("0a".repeat(32));
+    older_edit.tags[0][1] = older.message_id_hex;
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&older_edit).unwrap())
+        .unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::SnapshotRefresh,
+        "older edits do not change the selected preview"
+    );
+    let mut retract = edit.clone();
+    retract.message_id_hex = "0b".repeat(32);
+    retract.source_message_id_hex = Some("0c".repeat(32));
+    retract.kind = 5;
+    retract.tags[0][1] = edit.message_id_hex;
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&retract).unwrap())
+        .unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::LastMessageContentChanged,
+        "retracting the winner changes effective content"
+    );
+    assert_eq!(
+        update
+            .chat_list_row
+            .unwrap()
+            .last_message
+            .unwrap()
+            .plaintext,
+        "**edited**"
+    );
+    // Catch-up can combine a backfilled message with an edit of the selection.
+    // The content-only refinement must preserve the batch's stronger trigger.
+    let mut backfill = original.clone();
+    backfill.message_id_hex = "0d".repeat(32);
+    backfill.source_message_id_hex = Some("0e".repeat(32));
+    backfill.recorded_at = 0;
+    let backfill_update = storage.record_app_event(&backfill).unwrap();
+    let mut batch_edit = original.clone();
+    batch_edit.message_id_hex = "0f".repeat(32);
+    batch_edit.source_message_id_hex = Some("10".repeat(32));
+    batch_edit.kind = 1009;
+    batch_edit.recorded_at = 4;
+    batch_edit.plaintext = "batch edit".into();
+    batch_edit.tags = vec![vec!["e".into(), original.message_id_hex.clone()]];
+    let mut batch = storage.record_app_event(&batch_edit).unwrap();
+    batch.changes.extend(backfill_update.changes);
+    let update = app.app_projection_update("alice", batch).unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::NewLastMessage
+    );
+    assert_eq!(
+        update
+            .chat_list_row
+            .unwrap()
+            .last_message
+            .unwrap()
+            .plaintext,
+        "batch edit"
+    );
+    let update = app
+        .invalidate_timeline_source_message(
+            "alice",
+            original.source_message_id_hex.as_ref().unwrap(),
+            "losing branch",
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::LastMessageContentChanged,
+        "invalidation can replace the selected message"
+    );
     runtime.shutdown_and_close().await.unwrap();
 }

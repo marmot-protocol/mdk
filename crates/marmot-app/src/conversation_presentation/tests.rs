@@ -53,6 +53,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
         revision_id_hex: String::new(),
         moderation: storage_sqlite::MessageModerationSummary::default(),
+        edit: None,
         message_id_hex: "01".repeat(32),
         source_message_id_hex: Some("02".repeat(32)),
         source_epoch: Some(1),

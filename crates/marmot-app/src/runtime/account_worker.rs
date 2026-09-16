@@ -876,7 +876,7 @@ async fn run_app_runtime_account_worker(
             }
         }
     };
-    shared.app_performance_telemetry().record_sync_result(
+    shared.app_performance_telemetry().record_classified_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
         startup_sync_result
@@ -2011,7 +2011,7 @@ async fn handle_account_worker_catch_up(
     context
         .shared
         .app_performance_telemetry()
-        .record_sync_result(
+        .record_classified_result(
             AppPerformanceOperation::AccountSync,
             sync_started_at.elapsed(),
             result
@@ -2983,7 +2983,7 @@ fn account_worker_command_future<'a>(
                     ))
                 }
             };
-            shared.app_performance_telemetry().record_sync_result(
+            shared.app_performance_telemetry().record_classified_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
                 result
@@ -3058,7 +3058,7 @@ fn account_worker_command_future<'a>(
                     ))
                 }
             };
-            shared.app_performance_telemetry().record_sync_result(
+            shared.app_performance_telemetry().record_classified_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
                 result

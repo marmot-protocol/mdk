@@ -4,7 +4,8 @@ use crate::types::moderation::MarmotMessageModerationSummary;
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    GroupSystemEventFfi, RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi,
+    GroupSystemEventFfi, RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi,
+    TimelineEditSummaryFfi, TimelineEditVersionFfi, TimelineMessageChangeFfi,
     TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
@@ -170,6 +171,7 @@ c_mirror! {
         /// reactions, stream rows, and malformed assertions.
         opt_rec group_system: MarmotGroupSystemEvent,
         rec reactions: MarmotTimelineReactionSummary,
+        opt_rec edit: MarmotTimelineEditSummary,
         copy deleted: bool,
         opt_str deleted_by_message_id_hex,
         /// Convergence invalidation reason (e.g. `LosingBranch`); NULL
@@ -329,4 +331,63 @@ pub unsafe extern "C" fn marmot_timeline_subscription_update_free(
     update: *mut MarmotTimelineSubscriptionUpdate,
 ) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
+}
+
+c_mirror! {
+    /// Compact accepted-edit metadata on an effective timeline row.
+    MarmotTimelineEditSummary from TimelineEditSummaryFfi {
+        copy edit_count: u64,
+        str latest_edit_message_id_hex,
+        copy edited_at: u64,
+    }
+}
+c_mirror! {
+    /// One accepted replacement version.
+    MarmotTimelineEditVersion from TimelineEditVersionFfi {
+        str message_id_hex,
+        copy edited_at: u64,
+        str plaintext,
+    }
+}
+c_mirror! {
+    /// Accepted versions, oldest first within a latest-first page.
+    MarmotTimelineEditHistoryPage from TimelineEditHistoryPageFfi,
+    free marmot_timeline_edit_history_page_free {
+        vec versions/versions_len: MarmotTimelineEditVersion,
+        copy has_more_before: bool,
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    #[test]
+    fn accepted_edit_records_preserve_metadata_and_deep_free() {
+        #[cfg(feature = "alloc-audit")]
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let mut summary = MarmotTimelineEditSummary::from(TimelineEditSummaryFfi {
+            edit_count: 2,
+            latest_edit_message_id_hex: "edit".into(),
+            edited_at: 4,
+        });
+        assert_eq!(summary.edit_count, 2);
+        let mut page = MarmotTimelineEditHistoryPage::from(TimelineEditHistoryPageFfi {
+            versions: vec![TimelineEditVersionFfi {
+                message_id_hex: "edit".into(),
+                edited_at: 4,
+                plaintext: "body".into(),
+            }],
+            has_more_before: true,
+        });
+        assert_eq!(page.versions_len, 1);
+        assert!(page.has_more_before);
+        unsafe {
+            summary.free_in_place();
+            page.free_in_place();
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
 }

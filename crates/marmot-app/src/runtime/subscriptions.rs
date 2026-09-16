@@ -748,6 +748,8 @@ pub enum ChatListUpdateTrigger {
     #[default]
     SnapshotRefresh,
     Removed,
+    /// Effective selected-message content changed without new activity.
+    LastMessageContentChanged,
 }
 
 impl ChatListUpdateTrigger {

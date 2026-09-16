@@ -127,11 +127,12 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
             revisions.insert(edit.message_id_hex.clone(), edit);
         }
     }
-    let latest = revisions
-        .values()
-        .filter(|e| e.kind == MARMOT_APP_EVENT_KIND_EDIT)
-        .max_by_key(|e| (e.recorded_at, &e.message_id_hex))
-        .map_or(target, |e| e.message_id_hex.as_str());
+    // The reported revision remains stable, while the current revision follows
+    // the shared accepted-edit projection (including retracted edits).
+    let latest = conn.query_row_cached(
+        "SELECT json_extract(edit_json, '$.latest_edit_message_id_hex') FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2",
+        params![group,target], |r| r.get::<_, Option<String>>(0),
+    ).optional().storage()?.flatten().unwrap_or_else(||target.to_owned());
     let deleted: bool = conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2 AND deleted=1)",params![group,target],|r|r.get(0)).storage()?;
     let candidates =
         app_events_targeting_message_tx(conn, group, MARMOT_APP_EVENT_KIND_REPORT, target)?;
@@ -769,6 +770,27 @@ mod tests {
             Some("original")
         );
         assert_eq!(details.reports[1].reported_text.as_deref(), Some("edited"));
+        let current = details.current_message.unwrap();
+        assert_eq!(current.plaintext, "edited");
+        assert_eq!(current.revision_id_hex, id(3));
+        assert_eq!(current.edit.unwrap().latest_edit_message_id_hex, id(3));
+        s.record_app_event(&event(5, 10, 5, vec![vec!["e".into(), id(3)]], ""))
+            .unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            let current = s
+                .message_reports(&id(99), &id(1), None, 100)
+                .unwrap()
+                .current_message
+                .unwrap();
+            assert_eq!(current.plaintext, "original");
+            assert_eq!(current.revision_id_hex, id(1));
+            assert!(current.edit.is_none());
+            assert_eq!(page(&s).items[0].revision_id_hex, id(1));
+            assert_eq!(page(&s).items[0].moderation.total_reports, 2);
+        }
     }
     #[test]
     fn removal_hides_all_revisions_and_review_content_even_after_rebuild() {
@@ -922,15 +944,20 @@ mod tests {
                 if rebuild {
                     s.rebuild_message_timeline_for_group(&id(99)).unwrap();
                 }
-                for n in [1, 3] {
-                    assert!(
-                        s.timeline_message(&id(99), &id(n))
-                            .unwrap()
-                            .unwrap()
-                            .deleted,
-                        "order {order:?}, rebuild {rebuild}, message {n}"
-                    );
-                }
+                assert!(
+                    s.timeline_message(&id(99), &id(1))
+                        .unwrap()
+                        .unwrap()
+                        .deleted,
+                    "order {order:?}, rebuild {rebuild}"
+                );
+                assert!(s.timeline_message(&id(99), &id(3)).unwrap().is_none());
+                assert!(
+                    s.message_edit_history(&id(99), &id(1), None, 100)
+                        .unwrap()
+                        .versions
+                        .is_empty()
+                );
             }
             s.invalidate_app_event_by_source(&id(4), "losing_branch")
                 .unwrap();
@@ -1226,7 +1253,9 @@ mod tests {
         .unwrap();
         assert!(s.timeline_message(&id(99), &id(3)).unwrap().is_none());
         let details = s.message_reports(&id(99), &id(1), None, 10).unwrap();
-        assert_eq!(details.current_message.unwrap().plaintext, "original");
+        let current = details.current_message.unwrap();
+        assert_eq!(current.plaintext, "late edit");
+        assert_eq!(current.revision_id_hex, id(3));
         assert_eq!(
             details.reports[0]
                 .reported_revision

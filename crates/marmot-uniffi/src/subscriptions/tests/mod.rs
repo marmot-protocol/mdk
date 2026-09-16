@@ -16,6 +16,7 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
         revision_id_hex: String::new(),
         moderation: marmot_app::MessageModerationSummary::default(),
+        edit: None,
         message_id_hex: id.to_string(),
         source_message_id_hex: None,
         source_epoch: None,

@@ -37,8 +37,14 @@ struct ChatProjectionsSmoke {
         let reports = ContentReportPageFfi(removedByEventId: "delete", removingAccount: "admin", removedAt: 1, currentMessage: nil, reports: [report], nextCursor: nil)
         let reportsCopy = try FfiConverterTypeContentReportPageFfi.lift(FfiConverterTypeContentReportPageFfi.lower(reports))
         precondition(reportsCopy == reports)
+        let edit = TimelineEditSummaryFfi(editCount: 3, latestEditMessageIdHex: "edit", editedAt: 17)
+        let editCopy = try FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit))
+        precondition(editCopy == edit)
+        let history = TimelineEditHistoryPageFfi(versions: [TimelineEditVersionFfi(messageIdHex: "edit", editedAt: 17, plaintext: "replacement")], hasMoreBefore: true)
+        let historyCopy = try FfiConverterTypeTimelineEditHistoryPageFfi.lift(FfiConverterTypeTimelineEditHistoryPageFfi.lower(history))
+        precondition(historyCopy == history)
         try conversationRoundTrips()
-        print("Swift C4/C5 projection round trips passed")
+        print("Swift C4/C5/C6 projection round trips passed")
     }
 }
 
@@ -120,4 +126,11 @@ func compileModerationCommands(_ marmot: Marmot, account: String, group: String)
     _ = try marmot.messageReports(accountRef: account, groupIdHex: group, messageId: "message", after: nil, limit: 50)
     let queue = try await marmot.subscribeReportedContent(accountRef: account, groupIdHex: group, pendingOnly: true, limit: 50)
     _ = queue.snapshot(); _ = await queue.next()
+}
+
+func compileEditHistory(_ marmot: Marmot, account: String, group: String, target: String) throws {
+    let page = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: nil, beforeMessageIdHex: nil, limit: 50)
+    if let oldest = page.versions.first {
+        _ = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: oldest.editedAt, beforeMessageIdHex: oldest.messageIdHex, limit: 50)
+    }
 }

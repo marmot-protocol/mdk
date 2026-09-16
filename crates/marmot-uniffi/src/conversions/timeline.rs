@@ -210,6 +210,7 @@ pub struct TimelineMessageRecordFfi {
     /// stream rows, and malformed/free-text kind-1210 assertions.
     pub group_system: Option<GroupSystemEventFfi>,
     pub reactions: TimelineReactionSummaryFfi,
+    pub edit: Option<TimelineEditSummaryFfi>,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
     /// Set when convergence invalidated this message (it landed on a losing
@@ -248,6 +249,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             group_system: group_system.map(Into::into),
             reactions: value.reactions.into(),
+            edit: value.edit.map(Into::into),
             deleted: value.deleted,
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
             invalidation_status: value.invalidation_status,
@@ -622,6 +624,7 @@ mod tests {
         TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            edit: None,
             message_id_hex: "msg".to_owned(),
             source_message_id_hex: None,
             source_epoch,
@@ -769,5 +772,48 @@ mod tests {
         assert_eq!(reference.file_name, "clip.mp4");
         assert_eq!(reference.source_epoch, 3);
         assert_eq!(reply.invalidation_status.as_deref(), Some("LosingBranch"));
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineEditSummaryFfi {
+    pub edit_count: u64,
+    pub latest_edit_message_id_hex: String,
+    pub edited_at: u64,
+}
+impl From<marmot_app::TimelineEditSummary> for TimelineEditSummaryFfi {
+    fn from(v: marmot_app::TimelineEditSummary) -> Self {
+        Self {
+            edit_count: v.edit_count,
+            latest_edit_message_id_hex: v.latest_edit_message_id_hex,
+            edited_at: v.edited_at,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineEditVersionFfi {
+    pub message_id_hex: String,
+    pub edited_at: u64,
+    pub plaintext: String,
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineEditHistoryPageFfi {
+    pub versions: Vec<TimelineEditVersionFfi>,
+    pub has_more_before: bool,
+}
+impl From<marmot_app::TimelineEditHistoryPage> for TimelineEditHistoryPageFfi {
+    fn from(v: marmot_app::TimelineEditHistoryPage) -> Self {
+        Self {
+            versions: v
+                .versions
+                .into_iter()
+                .map(|v| TimelineEditVersionFfi {
+                    message_id_hex: v.message_id_hex,
+                    edited_at: v.edited_at,
+                    plaintext: v.plaintext,
+                })
+                .collect(),
+            has_more_before: v.has_more_before,
+        }
     }
 }

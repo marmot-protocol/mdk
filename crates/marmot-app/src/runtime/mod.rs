@@ -4238,6 +4238,20 @@ impl MarmotAppRuntime {
             .timeline_messages_with_query(&account.label, query)
     }
 
+    pub fn message_edit_history(
+        &self,
+        account_ref: &str,
+        group: &str,
+        target: &str,
+        before: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<crate::TimelineEditHistoryPage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .message_edit_history(&account.label, group, target, before, limit)
+    }
+
     pub fn timeline_message(
         &self,
         account_ref: &str,
@@ -5982,14 +5996,16 @@ impl AccountManager {
             })
         }
         .await;
-        self.shared.app_performance_telemetry().record_sync_result(
-            AppPerformanceOperation::AccountCatchUp,
-            started_at.elapsed(),
-            result
-                .as_ref()
-                .err()
-                .map(account_catch_up_metric_classification),
-        );
+        self.shared
+            .app_performance_telemetry()
+            .record_classified_result(
+                AppPerformanceOperation::AccountCatchUp,
+                started_at.elapsed(),
+                result
+                    .as_ref()
+                    .err()
+                    .map(account_catch_up_metric_classification),
+            );
         result
     }
 

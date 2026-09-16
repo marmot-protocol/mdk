@@ -826,6 +826,7 @@ pub(crate) fn timeline_message_record_json(
         "media": message.media,
         "agent_text_stream": message.agent_text_stream,
         "reactions": message.reactions,
+        "edit": message.edit,
         "deleted": message.deleted,
         "deleted_by_message_id": message.deleted_by_message_id_hex,
         "retention_seconds": message.retention_seconds,
@@ -1053,6 +1054,7 @@ mod tests {
         let message = TimelineMessageRecord {
             revision_id_hex: String::new(),
             moderation: marmot_app::MessageModerationSummary::default(),
+            edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(3),

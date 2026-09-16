@@ -58,7 +58,7 @@ admin deletion privileges.
 
 ## Persistence and retention
 
-Migration 0076 adds source-authority metadata, indexed report and moderation
+Migration 0077 adds source-authority metadata, indexed report and moderation
 projections, and a durable backfill cursor over the pre-migration event prefix.
 Maintenance advances at most 100 old events per batch. Normal receive reprojects
 only affected message targets via modifier edges.

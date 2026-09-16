@@ -4121,3 +4121,118 @@ fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
         Some(cgka_traits::Timestamp(100))
     );
 }
+
+#[test]
+fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
+    for expiry in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edits.sqlite");
+        let store = SqliteAccountStorage::from_connection_with_options(
+            rusqlite::Connection::open(&path).unwrap(),
+            crate::SqliteStorageOptions {
+                secure_delete: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".into(),
+                    seen_events: vec![],
+                    last_transport_timestamp: None,
+                    groups: vec![group("aa", "edits")],
+                },
+                16,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        let mut target = app_event("target", "aa", 100);
+        target.plaintext = "retained original".into();
+        store.record_app_event(&target).unwrap();
+        let secret = "accepted-edit-prune-secret-1864-unique";
+        let mut edit = app_event("edit", "aa", 10);
+        edit.kind = 1009;
+        edit.plaintext = secret.into();
+        edit.tags = vec![vec!["e".into(), "target".into()]];
+        store
+            .record_app_event_with_retention(&edit, Some(AppMessageRetentionDecision::new(10, 5)))
+            .unwrap();
+        store
+            .refresh_chat_list_row("local", "aa", &no_mentions)
+            .unwrap();
+        assert_eq!(
+            store
+                .timeline_message("aa", "target")
+                .unwrap()
+                .unwrap()
+                .plaintext,
+            secret
+        );
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch("CREATE TEMP TABLE scrub_audit (surface TEXT, prior BLOB);
+                CREATE TEMP TRIGGER audit_target_restore BEFORE UPDATE ON message_timeline
+                WHEN OLD.message_id_hex='target' AND NEW.plaintext='retained original'
+                  AND OLD.plaintext IS NOT NEW.plaintext
+                BEGIN INSERT INTO scrub_audit VALUES ('timeline',CAST(OLD.plaintext AS BLOB)); END;
+                CREATE TEMP TRIGGER audit_preview_restore BEFORE UPDATE ON chat_list_rows
+                WHEN OLD.group_id_hex='aa' AND NEW.last_message_preview='retained original'
+                  AND OLD.last_message_preview IS NOT NEW.last_message_preview
+                BEGIN INSERT INTO scrub_audit VALUES ('preview',CAST(OLD.last_message_preview AS BLOB)); END;
+                PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        assert!(file_contains(&path, secret.as_bytes()));
+        let result = if expiry {
+            store.secure_prune_expired_app_events("aa", 15, "local", &no_mentions)
+        } else {
+            store.secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        }
+        .unwrap();
+        assert_eq!(result.pruned_messages, 1);
+        assert!(!result.erasure_pending);
+        let row = store.timeline_message("aa", "target").unwrap().unwrap();
+        assert_eq!(row.plaintext, "retained original");
+        assert!(row.edit.is_none());
+        assert!(
+            store
+                .message_edit_history("aa", "target", None, 10)
+                .unwrap()
+                .versions
+                .is_empty()
+        );
+        {
+            let conn = store.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT surface,prior FROM scrub_audit")
+                .unwrap();
+            let audit = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(audit.len(), 2);
+            for (surface, prior) in audit {
+                assert!(
+                    !prior.is_empty() && prior.iter().all(|b| *b == 0),
+                    "{surface} must be scrubbed before restoring the retained target (expiry={expiry})"
+                );
+            }
+            let secure_delete: i64 = conn
+                .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(secure_delete, 0, "restore caller setting");
+        }
+        drop(store);
+        for file in [path.clone(), path.with_extension("sqlite-wal")] {
+            if file.exists() {
+                assert!(
+                    !file_contains(&file, secret.as_bytes()),
+                    "no pruned edit bytes in {file:?}"
+                );
+            }
+        }
+    }
+}
