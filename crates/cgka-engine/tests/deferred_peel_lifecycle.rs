@@ -13,6 +13,8 @@ use cgka_traits::app_components::{
     encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+#[cfg(feature = "test-policy-overrides")]
+use cgka_traits::engine::GroupHydrationQuarantineReason;
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -21,6 +23,8 @@ use cgka_traits::ingest::{
 };
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
+#[cfg(feature = "test-policy-overrides")]
+use cgka_traits::storage::GroupStorage;
 use cgka_traits::storage::{
     DeferredPeelGeneration, DeferredPeelGenerationStorage, MessageStorage, OutboundIntentStorage,
     StorageError,
@@ -2079,6 +2083,271 @@ async fn terminal_group_releases_its_account_byte_budget_across_restart() {
             }
         ),
         "the account budget is still enforced past that point"
+    );
+}
+
+/// Carol holds one deferred row in group A and one in group B, both still
+/// live. Returns her (pre-restart), her storage, group A plus a wrap template
+/// whose first row is already retained and the exact byte size one of its rows
+/// charges, and group B plus the same pair.
+///
+/// Group A's payload is deliberately the shorter of the two, so a budget sized
+/// in group-B rows always has room to admit one more group-A row.
+#[cfg(feature = "test-policy-overrides")]
+async fn carol_deferring_in_two_live_groups() -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    TransportMessage,
+    usize,
+    GroupId,
+    TransportMessage,
+    usize,
+) {
+    let (mut alice, mut carol, storage, _peeler, group_a, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+
+    let template_a = send_app(&mut alice, &group_a, "a").await;
+    assert!(matches!(
+        carol.ingest(template_a.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_a = storage.get_message(&template_a.id).unwrap().payload.len();
+    assert!(
+        bytes_a > 0,
+        "group A must hold real bytes for the account budget to notice it"
+    );
+
+    let group_b = add_group_two_epochs_ahead(&mut alice, &mut carol).await;
+    let template_b = send_app(&mut alice, &group_b, "group B deferred bytes").await;
+    let first_b = TransportMessage {
+        id: MessageId::new(b"unsweepable-b-0001".to_vec()),
+        ..template_b.clone()
+    };
+    assert!(matches!(
+        carol.ingest(first_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_b = storage.get_message(&first_b.id).unwrap().payload.len();
+
+    (
+        carol, storage, group_a, template_a, bytes_a, group_b, template_b, bytes_b,
+    )
+}
+
+/// Spend an account budget of exactly two group-B rows: the second row must be
+/// admitted and the third refused. Group A's rows are the variable under test —
+/// whatever they cost, they must not come out of this budget.
+#[cfg(feature = "test-policy-overrides")]
+async fn assert_group_b_owns_the_whole_account_budget(
+    restarted: &mut Engine<SqliteAccountStorage>,
+    template_b: TransportMessage,
+    bytes_b: usize,
+    why: &str,
+) {
+    let second_b = TransportMessage {
+        id: MessageId::new(b"unsweepable-b-0002".to_vec()),
+        ..template_b.clone()
+    };
+    assert!(
+        matches!(
+            restarted.ingest(second_b).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "{why}"
+    );
+
+    let overflow_b = TransportMessage {
+        id: MessageId::new(b"unsweepable-b-0003".to_vec()),
+        ..template_b
+    };
+    assert!(
+        matches!(
+            restarted.ingest(overflow_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "the account budget is still enforced past that point"
+    );
+}
+
+/// The account byte budget bounds rows *awaiting a sweep*. A durably halted
+/// group is one the deferred-peel sweep refuses at the door, so its rows are
+/// parked rather than queued and must not spend budget every healthy group on
+/// the device needs — otherwise one stuck group refuses inbound traffic
+/// account-wide for as long as the halt lasts, which the field shows is days
+/// across many restarts.
+///
+/// The durable `unrecoverable` marker is written here directly, exactly as
+/// `distributed_convergence.rs` does for its own halt gates: the real
+/// fail-closed path that writes it (`MissingRetainedAnchor`) is covered there,
+/// and the state every later open reads is what this test is about.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn unrecoverable_group_does_not_charge_the_account_byte_budget() {
+    let (carol, storage, group_a, template_a, bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    let mut halted = storage.get_group(&group_a).unwrap();
+    halted.unrecoverable = true;
+    storage.put_group(&halted).unwrap();
+
+    let mut restarted =
+        restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(2));
+    assert_group_b_owns_the_whole_account_budget(
+        &mut restarted,
+        template_b,
+        bytes_b,
+        "a halted group's parked rows must not spend the account byte budget a live group needs",
+    )
+    .await;
+
+    assert_eq!(
+        storage.get_message(&template_a.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the halted group keeps every retained row for a verified repair path"
+    );
+    assert!(
+        restarted
+            .engine_metrics()
+            .deferred_peel_peak_bytes_per_group
+            >= bytes_a as u64,
+        "the halted group's rows are still real per-group usage and stay visible as such"
+    );
+}
+
+/// Corrupt one group's stored wire profile so reopening classifies it
+/// `MemberValidationFailed` and quarantines it, the way `hydration_quarantine.rs`
+/// does. Every other stored group stays live.
+#[cfg(feature = "test-policy-overrides")]
+fn quarantine_group_on_next_open(storage: &SqliteAccountStorage, group_id: &GroupId) {
+    let mut mismatched = storage.get_group(group_id).unwrap();
+    mismatched.protocol_profile = cgka_traits::group::ProtocolProfile::Current;
+    storage.put_group(&mismatched).unwrap();
+}
+
+/// A hydration-quarantined group is the other shape the sweep refuses at the
+/// door: it vanishes from every live surface until an explicit repair, so its
+/// retained rows can never drain and must not hold the account budget hostage
+/// either.
+///
+/// The quarantine is reached the way `hydration_quarantine.rs` reaches it —
+/// flipping the stored wire profile so reopening classifies group A as
+/// `MemberValidationFailed` — which leaves group B untouched and live.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn quarantined_group_does_not_charge_the_account_byte_budget() {
+    let (carol, storage, group_a, template_a, _bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    quarantine_group_on_next_open(&storage, &group_a);
+
+    let mut restarted =
+        restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(2));
+    assert_group_b_owns_the_whole_account_budget(
+        &mut restarted,
+        template_b,
+        bytes_b,
+        "a quarantined group's parked rows must not spend the account byte budget a live \
+         group needs",
+    )
+    .await;
+
+    assert_eq!(
+        restarted.quarantined_groups(),
+        vec![(
+            group_a,
+            GroupHydrationQuarantineReason::MemberValidationFailed
+        )],
+        "only group A may be quarantined; group B has to stay live"
+    );
+    assert_eq!(
+        storage.get_message(&template_a.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the quarantined group keeps every retained row for post-repair replay"
+    );
+}
+
+/// Excluding a blocked group at open is only half the definition: the quarantine
+/// retention path in `ingest_group_message` keeps persisting new `PeelDeferred`
+/// rows for that group, so the per-row add has to agree with the reconstruction.
+/// Otherwise the account creeps back up one retained row at a time and the
+/// account-wide refusal returns by a slower route.
+///
+/// The per-group state must still move — the per-group cap is the only thing
+/// bounding a blocked group's backlog.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn rows_retained_for_a_blocked_group_do_not_accrue_account_bytes() {
+    let (carol, storage, group_a, template_a, bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    quarantine_group_on_next_open(&storage, &group_a);
+
+    let account_byte_limit = bytes_b.saturating_mul(2);
+    assert!(
+        bytes_b.saturating_add(bytes_a) <= account_byte_limit,
+        "the budget must have room to admit one more group-A row, or this test would \
+         measure the refusal rather than the accrual"
+    );
+    let mut restarted = restart_carol_with_account_budget(storage.clone(), account_byte_limit);
+
+    // New traffic for the quarantined group, retained exactly as before.
+    let second_a = TransportMessage {
+        id: MessageId::new(b"unsweepable-a-0002".to_vec()),
+        ..template_a
+    };
+    restarted.ingest(second_a.clone()).await.unwrap();
+    assert_eq!(
+        storage.get_message(&second_a.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the quarantine retention path must still retain the row"
+    );
+    assert!(
+        restarted.engine_metrics().deferred_peel_peak_rows_per_group >= 2,
+        "the per-group state must still count it: the per-group cap is what bounds a \
+         blocked group's backlog"
+    );
+
+    assert_group_b_owns_the_whole_account_budget(
+        &mut restarted,
+        template_b,
+        bytes_b,
+        "rows retained for a blocked group must not accrue against the account budget",
+    )
+    .await;
+}
+
+/// The bound the two exclusions above must not weaken: a group the sweep CAN
+/// enter keeps charging the shared account budget, so one live group's backlog
+/// still refuses another live group. Same fixture and same budget as those two
+/// tests — the only variable is whether group A is durably blocked.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn live_group_still_charges_the_account_byte_budget_of_another_group() {
+    let (carol, storage, _group_a, _template_a, _bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    let mut restarted = restart_carol_with_account_budget(storage, bytes_b.saturating_mul(2));
+    let second_b = TransportMessage {
+        id: MessageId::new(b"unsweepable-b-0002".to_vec()),
+        ..template_b
+    };
+    assert!(
+        matches!(
+            restarted.ingest(second_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "a live group's retained rows must still be charged account-wide"
     );
 }
 

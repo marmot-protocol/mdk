@@ -475,7 +475,9 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   queries, the safe-export family, `own_leaf_index`) calls `ensure_group_live` first and returns `UnknownGroup`; `do_send` and
   `converge_and_drain_queued_outbound_intents` refuse to run; `ingest_group_message` retains inbound input as
   `PeelDeferred` and classifies it `Stale { reason: Quarantined }`; `converge_stored_openmls_messages` reports a
-  `Blocked` run without touching state; `retry_deferred_peels` skips the group. When you add a new accessor or data
+  `Blocked` run without touching state; `retry_deferred_peels` skips the group, and because no sweep can ever
+  drain them, those retained rows (like a group halted `Unrecoverable`) are bounded by the per-group deferred-peel
+  caps alone and never charge the account-wide byte budget. When you add a new accessor or data
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.

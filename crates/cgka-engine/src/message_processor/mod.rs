@@ -377,6 +377,45 @@ impl DeferredPeelGroupState {
 
 #[derive(Default)]
 pub(crate) struct DeferredPeelAccountState {
+    /// Account-wide `PeelDeferred` bytes, in the sense the account cap is
+    /// meant to bound: bytes *awaiting a sweep*.
+    ///
+    /// The total sums only groups the deferred-peel sweep will actually enter.
+    /// Rows in a group it refuses at the door — see
+    /// [`Engine::deferred_peel_sweep_is_blocked`] — are parked, not queued: no
+    /// sweep will ever drain them, so charging them would let one stuck group
+    /// spend the whole account budget and refuse inbound traffic for every
+    /// healthy group on the device.
+    ///
+    /// Both writers skip such a group, and must keep agreeing:
+    /// [`Engine::ensure_peel_deferred_usage_initialized`] reconstructs the sum
+    /// at open, and [`Engine::note_peel_deferred_row_persisted`] adds each new
+    /// row after that — ingest keeps retaining rows for a quarantined group,
+    /// so an ungated add would walk the total back up one row at a time. A
+    /// blocked group still keeps full per-group state, because the per-group
+    /// cap remains its only bound and a verified repair replays its rows.
+    ///
+    /// The bound this relaxes: on-disk `PeelDeferred` bytes may exceed the
+    /// account cap by at most one per-group cap per un-sweepable group, since
+    /// an un-sweepable group cannot grow past its own per-group cap.
+    ///
+    /// Membership of the sum is decided by the predicate at the moment of each
+    /// write, so the two mid-session transitions are approximate until the next
+    /// reconstruction, in opposite and equally bounded directions:
+    ///
+    /// - a group that becomes blocked mid-session keeps the charge it already
+    ///   had, until the next open;
+    /// - a group blocked at reconstruction time that later heals drains rows it
+    ///   was never charged for, leaving the total low by at most one per-group
+    ///   cap per such group, until the next open.
+    ///
+    /// Note the asymmetry is keyed on the group's state at reconstruction time,
+    /// not at retire time. A sweep that enters a `Stable` group and halts it
+    /// part-way through then retires rows the reconstruction *did* charge, and
+    /// decrementing those is correct — do not gate the retire on the predicate.
+    ///
+    /// `Engine::forget_group_local` and the next open both restore an exact
+    /// total.
     bytes: usize,
     counted: bool,
 }
@@ -1838,6 +1877,35 @@ impl<S: StorageProvider> Engine<S> {
             .progressed)
     }
 
+    /// Whether the deferred-peel sweep refuses to enter this group for a
+    /// reason that outlives the sweep attempt.
+    ///
+    /// Two reasons, both durable and both needing an explicit repair before a
+    /// sweep can ever run again:
+    ///
+    /// - A hydration quarantine leaves no `epoch_manager` entry at all, so the
+    ///   `Stable` gate below would fall through and re-ingest retained rows
+    ///   against the very state validation rejected (mdk#364). The rows replay
+    ///   once repair clears the quarantine.
+    /// - A durable `Unrecoverable` halt freezes the group until an
+    ///   authenticated repair Welcome, and the `Stable` gate refuses it for as
+    ///   long as the halt lasts.
+    ///
+    /// Rows retained behind either gate are parked, not queued, which is why
+    /// [`DeferredPeelAccountState::bytes`] leaves them out of the account
+    /// total. Transient non-`Stable` states are deliberately excluded: they
+    /// resolve on their own, so their rows really are awaiting a sweep.
+    ///
+    /// Deliberately reads only the in-memory state the sweep itself reads, so
+    /// the prediction and the refusal cannot disagree. Session open restores a
+    /// durable halt into the epoch map before any ingest can reach the account
+    /// budget (`Engine::hydrate_stable_groups_from_storage`);
+    /// [`Self::sync_unrecoverable_halt_from_record`] is the syncing form for
+    /// the paths that run without session-open hydration.
+    pub(crate) fn deferred_peel_sweep_is_blocked(&self, group_id: &GroupId) -> bool {
+        self.quarantined_reason(group_id).is_some() || self.epoch_manager.is_unrecoverable(group_id)
+    }
+
     async fn retry_deferred_peels_with_execution(
         &mut self,
         group_id: &GroupId,
@@ -1856,11 +1924,10 @@ impl<S: StorageProvider> Engine<S> {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
             DeferredPeelExecution::Background { .. } => None,
         };
-        // A quarantined group has no epoch_manager entry, so the Stable gate
-        // below would fall through and re-ingest its retained rows against
-        // the very state validation rejected (mdk#364). The rows replay
-        // once repair clears the quarantine.
-        if self.quarantined_reason(group_id).is_some() {
+        // Durably blocked: quarantined or halted Unrecoverable. This is the
+        // same question `ensure_peel_deferred_usage_initialized` asks when it
+        // decides whose rows the account budget is bounding.
+        if self.deferred_peel_sweep_is_blocked(group_id) {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -2925,6 +2992,9 @@ impl<S: StorageProvider> Engine<S> {
             let bytes = records.iter().fold(0_usize, |sum, record| {
                 sum.saturating_add(record.payload.len())
             });
+            // Per-group state is reconstructed for every group; only the
+            // account total is scoped to sweepable ones.
+            let sweep_is_blocked = self.deferred_peel_sweep_is_blocked(&group_id);
             let state = self.deferred_peel.entry(group_id).or_default();
             state.deferred_rows = rows;
             state.deferred_bytes = bytes;
@@ -2935,7 +3005,15 @@ impl<S: StorageProvider> Engine<S> {
                     (record.id, payload_bytes)
                 })
                 .collect();
-            account_bytes = account_bytes.saturating_add(bytes);
+            if !sweep_is_blocked {
+                account_bytes = account_bytes.saturating_add(bytes);
+            }
+            // `peak_group_*` stay account-wide on purpose: a blocked group's
+            // rows are real per-group usage and still bind its per-group cap,
+            // even though nothing is waiting to sweep them. The third metric,
+            // `deferred_peel_peak_bytes_per_account`, instead receives
+            // `account_bytes` below, so it reports the sweepable-scoped total
+            // the cap is actually compared against.
             peak_group_rows = peak_group_rows.max(rows);
             peak_group_bytes = peak_group_bytes.max(bytes);
         }
@@ -3079,11 +3157,18 @@ impl<S: StorageProvider> Engine<S> {
         message_id: &MessageId,
         payload_bytes: usize,
     ) {
+        // The account total sums only sweepable groups, so this add has to skip
+        // exactly the groups `ensure_peel_deferred_usage_initialized` skips —
+        // ingest keeps retaining rows for a quarantined group, and charging
+        // them would let the account creep back up one retained row at a time.
+        // The per-group add below is unconditional: the per-group cap is the
+        // only thing bounding a blocked group's backlog.
+        let charges_account = !self.deferred_peel_sweep_is_blocked(group_id);
         let (group_rows, group_bytes) = {
             let state = self.deferred_peel.entry(group_id.clone()).or_default();
             match state.note_row_persisted(message_id.clone(), payload_bytes) {
                 Some(previous) => {
-                    if self.deferred_peel_account.counted {
+                    if charges_account && self.deferred_peel_account.counted {
                         self.deferred_peel_account.bytes = self
                             .deferred_peel_account
                             .bytes
@@ -3092,7 +3177,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 None => {
-                    if self.deferred_peel_account.counted {
+                    if charges_account && self.deferred_peel_account.counted {
                         self.deferred_peel_account.bytes = self
                             .deferred_peel_account
                             .bytes
