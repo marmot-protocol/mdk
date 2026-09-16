@@ -13,7 +13,7 @@ impl ConversationAnchor {
         &self.key.4
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum ConversationOpenTarget {
     /// First unread in accepted conversations; otherwise the latest row.
     #[default]
@@ -24,7 +24,7 @@ pub enum ConversationOpenTarget {
     /// Retain identity, or recover next/previous using its saved canonical key.
     Anchor(ConversationAnchor),
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConversationOpenQuery {
     pub target: ConversationOpenTarget,
     /// Total rows, including the anchor: 1..=200; default 50.
@@ -40,7 +40,7 @@ impl Default for ConversationOpenQuery {
 }
 /// Re-read a bounded live window around its retained viewport anchor. The runtime
 /// owns the anchor token and row budget; clients retain pixel offsets separately.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConversationWindowQuery {
     pub opening: ConversationOpenQuery,
     /// Desired rows before the anchor. None preserves the centered opening policy.

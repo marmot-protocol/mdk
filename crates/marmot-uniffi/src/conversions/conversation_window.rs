@@ -508,6 +508,12 @@ impl ConversationConversionCache {
         ConversationWindowSnapshotFfi::with_messages(v, messages)
     }
     fn row(&mut self, row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
+        let cached = self.rows.get(&row.message_id_hex);
+        if let Some(cached) = cached
+            .filter(|cached| visible_row_key(&cached.source, true) == visible_row_key(row, trusted))
+        {
+            return cached.converted.clone();
+        }
         let source = app::TimelineMessageRecord {
             message_id_hex: row.message_id_hex.clone(),
             source_message_id_hex: row.source_message_id_hex.clone(),
@@ -537,10 +543,6 @@ impl ConversationConversionCache {
             deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
             invalidation_status: row.invalidation_status.clone(),
         };
-        let cached = self.rows.get(&row.message_id_hex);
-        if let Some(cached) = cached.filter(|cached| cached.source == source) {
-            return cached.converted.clone();
-        }
         let tokens = match cached.filter(|cached| {
             cached.source.kind == row.kind && cached.source.plaintext == row.plaintext
         }) {
@@ -567,6 +569,64 @@ impl ConversationConversionCache {
         );
         converted
     }
+}
+
+// Borrow the visible fields so cache hits do not allocate a second source row.
+// Exhaustive destructuring makes additions to the source record a compile error
+// until their effect on conversion reuse is explicitly considered.
+fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl PartialEq + '_ {
+    let app::TimelineMessageRecord {
+        message_id_hex,
+        source_message_id_hex,
+        source_epoch,
+        retention_seconds,
+        retention_expires_at,
+        direction,
+        group_id_hex,
+        sender,
+        plaintext,
+        kind,
+        tags: _,
+        timeline_at,
+        received_at,
+        reply_to_message_id_hex,
+        reply_preview,
+        media,
+        agent_text_stream,
+        group_system,
+        reactions: _,
+        edit,
+        deleted,
+        deleted_by_message_id_hex,
+        invalidation_status,
+    } = row;
+    (
+        (
+            message_id_hex,
+            source_message_id_hex,
+            source_epoch,
+            retention_seconds,
+            retention_expires_at,
+            direction,
+            group_id_hex,
+            sender,
+            plaintext,
+            kind,
+        ),
+        (
+            timeline_at,
+            received_at,
+            reply_to_message_id_hex,
+            reply_preview,
+            media,
+            agent_text_stream,
+            edit,
+            deleted,
+            deleted_by_message_id_hex,
+            invalidation_status,
+        ),
+        if trusted { group_system.as_ref() } else { None },
+    )
 }
 
 impl std::fmt::Debug for ConversationCapabilitiesFfi {
@@ -955,42 +1015,104 @@ mod conversion_cache_tests {
     #[ignore = "host conversion timing; excludes FFI serialization and native UI work"]
     fn bench_prepared_conversation_conversion() {
         use std::{hint::black_box, time::Instant};
-        for size in [50, 200] {
-            let mut rows: Vec<_> = (0..size).map(record).collect();
-            for row in &mut rows {
-                row.plaintext = "**Bold** and _italic_ with [a link](https://example.com).\n\n- first\n- second\n\n".repeat(32);
-            }
-            let mut cache = ConversationConversionCache::default();
-            for row in &rows {
-                black_box(cache.row(row, false));
-            }
-            for change_one in [false, true] {
-                let started = Instant::now();
-                let parses = cache.parses;
-                for i in 0..20 {
-                    if change_one {
-                        rows[i % size].plaintext.push('x');
-                    }
-                    for row in &rows {
-                        black_box(cache.row(row, false));
-                    }
-                }
-                let cached = started.elapsed();
-                assert_eq!(cache.parses - parses, if change_one { 20 } else { 0 });
-                let started = Instant::now();
-                for i in 0..20 {
-                    if change_one {
-                        rows[i % size].plaintext.push('x');
-                    }
-                    for row in &rows {
-                        black_box(presented_timeline(row, false));
+        for with_media in [false, true] {
+            for size in [50, 200] {
+                let mut rows: Vec<_> = (0..size).map(record).collect();
+                for row in &mut rows {
+                    row.plaintext = "**Bold** and _italic_ with [a link](https://example.com).\n\n- first\n- second\n\n".repeat(32);
+                    if with_media {
+                        let tag = vec![
+                            "imeta".to_owned(),
+                            "v encrypted-media-v1".into(),
+                            format!(
+                                "locator blossom-v1 https://media.example/{}.bin",
+                                "22".repeat(32)
+                            ),
+                            format!("ciphertext_sha256 {}", "22".repeat(32)),
+                            format!("plaintext_sha256 {}", "23".repeat(32)),
+                            format!("nonce {}", "22".repeat(12)),
+                            "m video/mp4".into(),
+                            "filename clip.mp4".into(),
+                        ];
+                        row.source_epoch = Some(7);
+                        row.media = Some(serde_json::json!({"imeta": [tag.clone(), tag]}));
+                        assert!(presented_timeline(row, false).media.iter().all(
+                            |outcome| matches!(outcome, MediaAttachmentOutcomeFfi::Accepted { .. })
+                        ));
                     }
                 }
-                eprintln!(
-                    "prepared rows={size} change_one={change_one} updates=20 cached_ms={} uncached_ms={}",
-                    cached.as_millis(),
-                    started.elapsed().as_millis()
-                );
+                let mut cache = ConversationConversionCache::default();
+                for row in &rows {
+                    black_box(cache.row(row, false));
+                }
+                for change_one in [false, true] {
+                    let started = Instant::now();
+                    let parses = cache.parses;
+                    for i in 0..20 {
+                        if change_one {
+                            rows[i % size].plaintext.push('x');
+                        }
+                        for row in &rows {
+                            black_box(cache.row(row, false));
+                        }
+                    }
+                    let cached = started.elapsed();
+                    assert_eq!(cache.parses - parses, if change_one { 20 } else { 0 });
+                    // Benchmark the smaller token-only alternative separately:
+                    // it still converts media and the rest of every row.
+                    let mut tokens: std::collections::HashMap<_, _> = rows
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.message_id_hex.clone(),
+                                (
+                                    row.kind,
+                                    row.plaintext.clone(),
+                                    super::super::common::markdown_content_tokens(
+                                        row.kind,
+                                        &row.plaintext,
+                                    ),
+                                ),
+                            )
+                        })
+                        .collect();
+                    let started = Instant::now();
+                    for i in 0..20 {
+                        if change_one {
+                            rows[i % size].plaintext.push('x');
+                        }
+                        for row in &rows {
+                            let cached = tokens.get_mut(&row.message_id_hex).unwrap();
+                            if cached.0 != row.kind || cached.1 != row.plaintext {
+                                *cached = (
+                                    row.kind,
+                                    row.plaintext.clone(),
+                                    super::super::common::markdown_content_tokens(
+                                        row.kind,
+                                        &row.plaintext,
+                                    ),
+                                );
+                            }
+                            black_box(presented_timeline_with_tokens(row, false, cached.2.clone()));
+                        }
+                    }
+                    let token_only = started.elapsed();
+                    let started = Instant::now();
+                    for i in 0..20 {
+                        if change_one {
+                            rows[i % size].plaintext.push('x');
+                        }
+                        for row in &rows {
+                            black_box(presented_timeline(row, false));
+                        }
+                    }
+                    eprintln!(
+                        "prepared rows={size} media={with_media} change_one={change_one} updates=20 cached_ms={} token_only_ms={} uncached_ms={}",
+                        cached.as_millis(),
+                        token_only.as_millis(),
+                        started.elapsed().as_millis()
+                    );
+                }
             }
         }
     }

@@ -71,11 +71,12 @@ impl History {
 
 #[tokio::test]
 async fn live_window_observes_pending_send_while_relay_publish_is_blocked() {
-    check_pending_send(false).await;
-    check_pending_send(true).await;
+    check_pending_send(false, false).await;
+    check_pending_send(true, false).await;
+    check_pending_send(false, true).await;
 }
 
-async fn check_pending_send(draft: bool) {
+async fn check_pending_send(draft: bool, fail: bool) {
     let h = History::new(200).await;
     let runtime = MarmotAppRuntime::new(h.app.clone());
     let mut window = runtime
@@ -142,6 +143,9 @@ async fn check_pending_send(draft: bool) {
     } else {
         None
     };
+    if fail {
+        h.relay.reject_next_publish();
+    }
     h.relay.block_next_publish();
     let sender = runtime.clone();
     let group = h.group.clone();
@@ -162,7 +166,7 @@ async fn check_pending_send(draft: bool) {
     tokio::time::timeout(Duration::from_secs(10), h.relay.wait_for_blocked_publish())
         .await
         .unwrap();
-    let pending = tokio::time::timeout(Duration::from_millis(500), async {
+    let pending = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let snapshot = window.recv().await.unwrap().unwrap();
             if snapshot
@@ -182,7 +186,6 @@ async fn check_pending_send(draft: bool) {
     let sent = tokio::time::timeout(Duration::from_secs(10), send)
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
     let pending =
         pending.expect("an open window must show the local row before publication completes");
@@ -196,6 +199,28 @@ async fn check_pending_send(draft: bool) {
     assert!(row.source_message_id_hex.is_none());
     assert!(pending.presentation.header.epoch.is_some());
     assert!(pending.presentation.header.capabilities.can_send);
+    if fail {
+        assert!(
+            sent.is_err(),
+            "a definitive publish failure must fail the send: {sent:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let updated = window.recv().await.unwrap().unwrap();
+                if updated.page.page().messages.iter().any(|r| {
+                    r.message_id_hex == row.message_id_hex
+                        && r.invalidation_status.as_deref() == Some("local_publish_failed")
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the open window must retract the pending send");
+        runtime.shutdown_and_close().await.unwrap();
+        return;
+    }
+    let sent = sent.unwrap();
     assert_eq!(sent.message_ids, vec![row.message_id_hex.clone()]);
     let delivered = tokio::time::timeout(Duration::from_secs(10), async {
         loop {

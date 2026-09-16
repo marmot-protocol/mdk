@@ -3669,7 +3669,7 @@ impl AppClient {
         if should_project_locally {
             let update = self.record_send_intent_projection(group_id, &sender, &event)?;
             on_local_projection(update);
-            self.publish_conversation_captures();
+            self.publish_conversation_captures(group_id);
         }
 
         let send_result = match self.sync_runtime_groups().await {
@@ -3719,6 +3719,7 @@ impl AppClient {
                     &app_event_id,
                     &mut on_local_projection,
                 );
+                self.publish_conversation_captures(group_id);
                 return Err(err);
             }
         };
@@ -3753,6 +3754,7 @@ impl AppClient {
                 &app_event_id,
                 &mut on_local_projection,
             );
+            self.publish_conversation_captures(group_id);
             return Err(publish_err);
         }
         if let Some(context) = &audit_context {
@@ -3809,8 +3811,12 @@ impl AppClient {
         self.observe_send_applied_effects_best_effort(&effects)
             .await;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        // Publish the settled projection independently of notification policy,
+        // before notification delivery can introduce another transport wait.
+        if should_project_locally {
+            self.publish_conversation_captures(group_id);
+        }
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
-            self.publish_conversation_captures();
             self.publish_notification_trigger_best_effort(
                 group_id,
                 notifications::NotificationTrigger::NewMessage,

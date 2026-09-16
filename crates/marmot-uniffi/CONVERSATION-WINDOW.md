@@ -33,11 +33,14 @@ Before the first live capture, paging and local updates remain available during
 catch-up: captures have a 50 ms wait budget before falling back to fresh local data.
 After live authority arrives, queued captures await the worker without that display
 timeout, retaining the last complete snapshot. During an outgoing send, the worker
-captures registered open windows after the local pending projection and before
-awaiting transport, then again before notification publication. These reads use
+captures registered open windows for the sending group after the local pending
+projection and before awaiting transport, then again after settlement or retraction
+and before notification publication. These reads use
 the same live authority/account boundary as normal captures, so pending rows can
 reach the open screen while publication is stalled. Checkpoints coalesce per
 window, respect its current viewport, and are discarded when that viewport changes.
+Every consumed checkpoint schedules a fresh worker read, so invalidations newer
+than the checkpoint cannot be lost when the window drains queued signals.
 They never downgrade the composer or combine stale permissions with newer local
 rows. An explicit `NotReady` response
 from the worker still schedules a quiet retry. Worker acquisition runs to completion

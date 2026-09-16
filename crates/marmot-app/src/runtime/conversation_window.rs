@@ -189,7 +189,7 @@ impl SendCapture {
     }
     fn set_query(&self, query: &ConversationWindowQuery) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !same_query(&state.query, query) {
+        if state.query != *query {
             state.query = query.clone();
             state.generation += 1;
             state.pending = None;
@@ -202,17 +202,6 @@ impl SendCapture {
             .pending
             .take()
     }
-}
-fn same_query(a: &ConversationWindowQuery, b: &ConversationWindowQuery) -> bool {
-    a.opening.limit == b.opening.limit
-        && a.before_anchor == b.before_anchor
-        && match (&a.opening.target, &b.opening.target) {
-            (ConversationOpenTarget::Automatic, ConversationOpenTarget::Automatic)
-            | (ConversationOpenTarget::Latest, ConversationOpenTarget::Latest) => true,
-            (ConversationOpenTarget::Message(a), ConversationOpenTarget::Message(b)) => a == b,
-            (ConversationOpenTarget::Anchor(a), ConversationOpenTarget::Anchor(b)) => a == b,
-            _ => false,
-        }
 }
 impl AppClient {
     pub(crate) fn register_conversation_capture(&mut self, observer: Option<Weak<SendCapture>>) {
@@ -232,13 +221,14 @@ impl AppClient {
             }
         }
     }
-    pub(crate) fn publish_conversation_captures(&mut self) {
+    pub(crate) fn publish_conversation_captures(&mut self, group: &GroupId) {
         self.conversation_captures
             .retain(|capture| capture.strong_count() > 0);
         let observers: Vec<_> = self
             .conversation_captures
             .iter()
             .filter_map(Weak::upgrade)
+            .filter(|observer| observer.group == *group)
             .collect();
         for observer in observers {
             let (query, generation) = {
@@ -247,6 +237,7 @@ impl AppClient {
             };
             // Use the same live engine/account read boundary as a normal window
             // capture. Never combine frozen permissions with newer account rows.
+            // Best effort: the normal read path still owns capture errors.
             if let Ok(captured) =
                 capture_conversation(self, &observer.group, query, &observer.epoch)
             {
@@ -491,7 +482,7 @@ impl Reader {
         &mut self,
         query: &ConversationWindowQuery,
         allow_checkpoint: bool,
-    ) -> Result<CapturedConversation, ConversationWindowError> {
+    ) -> Result<(CapturedConversation, bool), ConversationWindowError> {
         let worker = match self.worker.borrow().as_ref() {
             Some(Ok(worker)) => worker.clone(),
             Some(Err(error)) if error.terminal() => return Err(error.clone()),
@@ -503,7 +494,7 @@ impl Reader {
         self.send_capture.set_query(query);
         let mut changed = self.send_capture.changed.subscribe();
         if allow_checkpoint && let Some(captured) = self.send_capture.take() {
-            return Ok(captured);
+            return Ok((captured, true));
         }
         let (respond, rx) = oneshot::channel();
         let capture = async {
@@ -523,10 +514,10 @@ impl Reader {
         loop {
             tokio::select! {
                 biased;
-                result = &mut capture => return result,
+                result = &mut capture => return result.map(|captured| (captured, false)),
                 _ = changed.changed(), if allow_checkpoint => {
                     if worker.is_closed() { return Err(ConversationWindowError::Closed); }
-                    if let Some(captured) = self.send_capture.take() { return Ok(captured); }
+                    if let Some(captured) = self.send_capture.take() { return Ok((captured, true)); }
                 }
             }
         }
@@ -538,20 +529,27 @@ impl Reader {
         revision: ConversationWindowRevision,
         allow_local: bool,
         allow_checkpoint: bool,
-    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
+    ) -> Result<(ConversationWindowSnapshot, bool), ConversationWindowError> {
         if !allow_local {
             // Established windows require a coherent live capture, including
             // checkpoints supplied by an in-flight send. The actor still
             // cancels on close/reset/shutdown; never downgrade to a local read.
-            let captured = self.capture_live(query, allow_checkpoint).await?;
-            return self.present(captured, revision).await;
+            let (captured, checkpoint) = self.capture_live(query, allow_checkpoint).await?;
+            return self
+                .present(captured, revision)
+                .await
+                .map(|snapshot| (snapshot, checkpoint));
         }
         match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query, allow_checkpoint)).await
         {
-            Ok(Ok(captured)) => self.present(captured, revision).await,
-            Ok(Err(ConversationWindowError::NotReady)) | Err(_) => {
-                self.read_local(query, revision).await
-            }
+            Ok(Ok((captured, checkpoint))) => self
+                .present(captured, revision)
+                .await
+                .map(|snapshot| (snapshot, checkpoint)),
+            Ok(Err(ConversationWindowError::NotReady)) | Err(_) => self
+                .read_local(query, revision)
+                .await
+                .map(|snapshot| (snapshot, false)),
             Ok(Err(error)) => Err(error),
         }
     }
@@ -991,7 +989,7 @@ async fn run(
             result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), command.is_none()) => result,
         };
         match result {
-            Ok(mut replacement) => {
+            Ok((mut replacement, checkpoint)) => {
                 let changed = command.is_some() || !replacement.same_content(&current);
                 if changed {
                     replacement.revision.sequence = current
@@ -1011,7 +1009,10 @@ async fn run(
                     let _ = command.reply.send(Ok(current.clone()));
                 }
                 authority_pending = current.presentation.header.epoch.is_none();
-                dirty = false; // local invalidations stay prompt during quiet authority retries
+                // A checkpoint predates sources.drain(), so it may not include
+                // invalidations discarded there. Follow it with a fresh capture
+                // even when no further event or send completion arrives.
+                dirty = checkpoint;
                 failed = false;
                 retry_delayed = false;
             }
