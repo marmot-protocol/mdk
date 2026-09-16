@@ -71,6 +71,7 @@ impl Fixture {
         runtime.accounts.workers.lock().await.insert(
             account.account_id_hex.clone(),
             ManagedAccountWorker {
+                ready: true,
                 handle,
                 commands,
                 media_admission: Arc::new(Semaphore::new(1)),
