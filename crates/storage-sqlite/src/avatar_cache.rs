@@ -141,6 +141,8 @@ pub struct AvatarAssetStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvatarAssetRead {
+    /// This read discarded corrupt stored bytes. Ordinary cache misses are false.
+    pub repaired: bool,
     pub status: AvatarAssetStatus,
     pub image: Option<AvatarImage>,
 }
@@ -330,9 +332,11 @@ impl SqliteAccountStorage {
             return Ok(AvatarAssetRead {
                 status: state,
                 image: None,
+                repaired: false,
             });
         }
         let mut image = None;
+        let mut repaired = false;
         if matches!(
             state.availability,
             AvatarAvailability::Ready | AvatarAvailability::Stale
@@ -379,10 +383,12 @@ impl SqliteAccountStorage {
                 )
                 .storage()?;
                 state = status(&tx, reference, now)?;
+                repaired = true;
             }
         }
         tx.commit().storage()?;
         Ok(AvatarAssetRead {
+            repaired,
             status: state,
             image,
         })

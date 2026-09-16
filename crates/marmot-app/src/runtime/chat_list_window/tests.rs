@@ -1098,6 +1098,32 @@ async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag(
         .await
         .unwrap();
     let reference = requested[0].reference.clone().unwrap();
+    let mut signals = f.app.presentation_signals.avatars.subscribe();
+    for _ in 0..3 {
+        f.runtime
+            .request_avatar_assets("alice", vec![asset.target.clone()])
+            .await
+            .unwrap();
+        let missing = f
+            .runtime
+            .read_avatar_assets("alice", vec![reference.clone()], 16)
+            .await
+            .unwrap();
+        assert_eq!(
+            missing[0].result.status.availability,
+            AvatarAvailability::Missing
+        );
+        assert!(!missing[0].result.repaired);
+    }
+    f.runtime
+        .request_avatar_assets("alice", vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        signals.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
     let image =
         storage_sqlite::AvatarImage::new(vec![8; 16], storage_sqlite::AvatarImageFormat::Png, 1, 1)
             .unwrap();

@@ -110,9 +110,9 @@ c_mirror! { MarmotPresentationVersion from PresentationVersionFfi {
     copy revision: u64,
 } }
 c_mirror! { MarmotPresentedChatRow from PresentedChatRowFfi, free marmot_presented_chat_row_free {
-    opt_rec avatar_asset: MarmotAvatarAsset,
     rec row: MarmotChatListRow,
     rec presentation: MarmotConversationPresentation,
+    opt_rec avatar_asset: MarmotAvatarAsset,
 } }
 c_mirror! { MarmotPresentedChatListSnapshot from PresentedChatListSnapshotFfi, free marmot_presented_chat_list_snapshot_free {
     vec rows/rows_len: MarmotPresentedChatRow,

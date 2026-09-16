@@ -53,9 +53,9 @@ pub struct PresentationVersionFfi {
 }
 #[derive(Clone, uniffi::Record)]
 pub struct PresentedChatRowFfi {
-    pub avatar_asset: Option<super::AvatarAssetFfi>,
     pub row: ChatListRowFfi,
     pub presentation: ConversationPresentationFfi,
+    pub avatar_asset: Option<super::AvatarAssetFfi>,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct PresentedChatListSnapshotFfi {

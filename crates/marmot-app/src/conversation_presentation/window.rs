@@ -267,24 +267,25 @@ impl MarmotApp {
         {
             capabilities.can_send = false;
         }
-        for identity in identities.values_mut() {
-            identity.avatar_asset = storage
-                .avatar_target_presentation(
-                    &input.group_id_hex,
-                    Some(&identity.account_id_hex),
-                    &identity.avatar,
-                    crate::unix_now_seconds(),
-                )
-                .map_err(AppError::from)?;
-        }
-        let avatar_asset = storage
-            .avatar_target_presentation(
+        let selections: Vec<_> = std::iter::once((None, &selected.avatar))
+            .chain(
+                identities
+                    .values()
+                    .map(|identity| (Some(identity.account_id_hex.as_str()), &identity.avatar)),
+            )
+            .collect();
+        let mut assets = storage
+            .avatar_target_presentations(
                 &input.group_id_hex,
-                None,
-                &selected.avatar,
+                &selections,
                 crate::unix_now_seconds(),
             )
-            .map_err(AppError::from)?;
+            .map_err(AppError::from)?
+            .into_iter();
+        let avatar_asset = assets.next().flatten();
+        for (identity, asset) in identities.values_mut().zip(assets) {
+            identity.avatar_asset = asset;
+        }
         let result = ConversationWindowPresentation {
             header: ConversationHeader {
                 avatar_asset,

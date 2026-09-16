@@ -18,9 +18,9 @@ pub struct LocalAvatarRead {
 }
 fn validate_count(count: usize) -> Result<(), AppError> {
     if count > MAX_AVATAR_BATCH_ITEMS {
-        return Err(AppError::InvalidEncryptedMedia(
-            "avatar batch exceeds 16 items".into(),
-        ));
+        return Err(AppError::InvalidEncryptedMedia(format!(
+            "avatar batch exceeds {MAX_AVATAR_BATCH_ITEMS} items"
+        )));
     }
     Ok(())
 }
@@ -37,29 +37,69 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let app = self.accounts.app.clone();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let work = blocking_app_task(move || {
+            if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
+            {
+                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+            }
+            let storage = app.account_storage(&account.label)?;
+            let mut changed = false;
+            let mut requested = false;
+            let result = targets
+                .into_iter()
+                .map(|target| {
+                    let Some(group) = storage.resolve_avatar_target(&target)? else {
+                        return Ok(AvatarAssetPresentation::invalidated(target));
+                    };
+                    let (selected, version) = if let Some(member) = target.member() {
+                        let Some(input) = storage.chat_presentation_input(&group)? else {
+                            return Ok(AvatarAssetPresentation::invalidated(target));
+                        };
+                        let (selected, version) = super::avatar::selected_identity(
+                            &app,
+                            &input,
+                            &account.account_id_hex,
+                            member,
+                        )?;
+                        (selected, Some(version))
+                    } else {
+                        let ChatPresentationRead::Ready(value) =
+                            storage.chat_presentation(&group)?
+                        else {
+                            return Ok(AvatarAssetPresentation::invalidated(target));
+                        };
+                        (value.presentation.avatar, None)
+                    };
+                    let now = crate::unix_now_seconds();
+                    let before = storage.avatar_target_presentation(
+                        &group,
+                        target.member(),
+                        &selected,
+                        now,
+                    )?;
+                    let after =
+                        storage.request_avatar_target(&target, &selected, version.as_ref(), now)?;
+                    if after.status.availability != storage_sqlite::AvatarAvailability::Invalidated
+                    {
+                        requested = true;
+                        changed |= before.as_ref() != Some(&after);
+                    }
+                    Ok(after)
+                })
+                .collect::<Result<Vec<_>, AppError>>();
+            // Even a later-item failure must publish already committed demand.
+            if requested {
+                app.presentation_signals.wake();
+            }
+            if changed {
+                let _ = app.presentation_signals.avatars.send(account.label);
+            }
+            result
+        });
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => Err(AppError::RuntimeStopping),
-            result = blocking_app_task(move || {
-                if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex { return Err(marmot_account::AccountHomeError::AccountIdMismatch.into()); }
-                let storage = app.account_storage(&account.label)?;
-                let result = targets.into_iter().map(|target| {
-                    let Some(group) = storage.resolve_avatar_target(&target)? else { return Ok(AvatarAssetPresentation::invalidated(target)); };
-                    let (selected, version) = if let Some(member) = target.member() {
-                        let Some(input) = storage.chat_presentation_input(&group)? else { return Ok(AvatarAssetPresentation::invalidated(target)); };
-                        let (selected,version) = super::avatar::selected_identity(&app, &input, &account.account_id_hex, member)?;
-                        (selected, Some(version))
-                    } else {
-                        let ChatPresentationRead::Ready(value) = storage.chat_presentation(&group)? else { return Ok(AvatarAssetPresentation::invalidated(target)); };
-                        (value.presentation.avatar,None)
-                    };
-                    Ok(storage.request_avatar_target(&target, &selected, version.as_ref(), crate::unix_now_seconds())?)
-                }).collect::<Result<Vec<_>,AppError>>();
-                // Even a later-item failure must publish already committed demand.
-                app.presentation_signals.wake();
-                let _ = app.presentation_signals.avatars.send(account.label);
-                result
-            }) => result,
+            result = work => result,
         }
     }
 
@@ -82,28 +122,45 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let app = self.accounts.app.clone();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let work = blocking_app_task(move || {
+            if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
+            {
+                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+            }
+            let storage = app.account_storage(&account.label)?;
+            let mut remaining = max_bytes;
+            let mut reads = Vec::with_capacity(references.len());
+            let mut repaired = false;
+            let outcome = (|| {
+                for reference in references {
+                    let result = storage.read_avatar_bounded(
+                        &reference,
+                        crate::unix_now_seconds(),
+                        remaining,
+                    )?;
+                    let deferred = result.image.is_none() && result.status.byte_count > remaining;
+                    repaired |= result.repaired;
+                    if let Some(image) = &result.image {
+                        remaining -= image.bytes().len() as u64;
+                    }
+                    reads.push(LocalAvatarRead {
+                        reference,
+                        result,
+                        deferred,
+                    });
+                }
+                Ok(reads)
+            })();
+            if repaired {
+                app.presentation_signals.wake();
+                let _ = app.presentation_signals.avatars.send(account.label);
+            }
+            outcome
+        });
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => Err(AppError::RuntimeStopping),
-            result = blocking_app_task(move || {
-                if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex { return Err(marmot_account::AccountHomeError::AccountIdMismatch.into()); }
-                let storage = app.account_storage(&account.label)?;
-                let mut remaining = max_bytes;
-                let mut reads = Vec::with_capacity(references.len());
-                let mut repaired = false;
-                for reference in references {
-                    let result = storage.read_avatar_bounded(&reference, crate::unix_now_seconds(), remaining)?;
-                    let deferred = result.image.is_none() && result.status.byte_count > remaining;
-                    repaired |= result.status.availability == storage_sqlite::AvatarAvailability::Missing;
-                    if let Some(image) = &result.image { remaining -= image.bytes().len() as u64; }
-                    reads.push(LocalAvatarRead { reference, result, deferred });
-                }
-                if repaired {
-                    app.presentation_signals.wake();
-                    let _ = app.presentation_signals.avatars.send(account.label);
-                }
-                Ok(reads)
-            }) => result,
+            result = work => result,
         }
     }
 

@@ -127,6 +127,22 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<AvatarAssetPresentation>> {
         target_presentation(&*self.lock()?, group, member, selected, now)
     }
+    /// Read one conversation's header/identity metadata under one account lock.
+    pub fn avatar_target_presentations(
+        &self,
+        group: &str,
+        selections: &[(Option<&str>, &SelectedAvatar)],
+        now: u64,
+    ) -> StorageResult<Vec<Option<AvatarAssetPresentation>>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let result = selections
+            .iter()
+            .map(|(member, selected)| target_presentation(&tx, group, *member, selected, now))
+            .collect::<StorageResult<Vec<_>>>()?;
+        tx.commit().storage()?;
+        Ok(result)
+    }
     /// Resolve only within this account and the same retained chat incarnation.
     pub fn resolve_avatar_target(
         &self,
@@ -151,12 +167,9 @@ impl SqliteAccountStorage {
             }
             if let Some(member) = target.member() {
                 let version = version.ok_or_else(|| invalid("avatar profile version missing"))?;
-                if self
-                    .request_identity_avatar_acquisition(&group, member, selected, version)?
-                    .is_none()
-                {
-                    return Ok(AvatarAssetPresentation::invalidated(target.clone()));
-                }
+                // A version mismatch durably registers demand while directory
+                // adoption catches up. The target remains current and Missing.
+                self.request_identity_avatar_acquisition(&group, member, selected, version)?;
             } else {
                 let crate::ChatPresentationRead::Ready(current) = self.chat_presentation(&group)?
                 else {
@@ -187,71 +200,59 @@ pub(crate) fn target_presentation(
     let Some(source) = source_key(selected) else {
         return Ok(None);
     };
-    let pair: Option<(Vec<u8>,Vec<u8>)> = conn.query_row("SELECT m.store_epoch, presentation_row_epoch FROM chat_list_rows CROSS JOIN chat_presentation_meta m WHERE group_id_hex = ?1 AND m.id = 1", [group], |r| Ok((r.get(0)?,r.get(1)?))).optional().storage()?;
-    let Some((epoch, row)) = pair else {
-        return Ok(None);
-    };
-    let chat = format!("chat:{}", hex::encode(&row));
-    let owner = member
-        .map(|id| format!("identity:{chat}:{id}"))
-        .unwrap_or(chat);
-    let token: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT token FROM avatar_assets WHERE owner_key = ?1 AND source_key = ?2",
-            params![owner, source],
-            |r| r.get(0),
-        )
-        .optional()
-        .storage()?;
-    let target = AvatarAssetTarget {
-        epoch: epoch.clone(),
-        row,
-        member: member.map(str::to_owned),
-        source: source.to_owned(),
-    };
-    let reference = token.map(|token| AvatarAssetRef {
-        store_epoch: epoch,
-        token,
-    });
-    let (status, acquisition) = if let Some(reference) = &reference {
-        let state: Option<i64> = conn
-            .query_row(
-                "SELECT state FROM avatar_acquisition WHERE token = ?1",
-                [&reference.token],
-                |r| r.get(0),
-            )
-            .optional()
-            .storage()?;
-        (
-            status(conn, reference, now)?,
-            state.map(|s| match s {
+    conn.prepare_cached(
+        "SELECT m.store_epoch, r.presentation_row_epoch, a.token,
+                coalesce(a.content_revision, 0), coalesce(length(a.bytes), 0),
+                a.refresh_at, q.state
+         FROM chat_list_rows r CROSS JOIN chat_presentation_meta m
+         LEFT JOIN avatar_assets a ON a.owner_key =
+             CASE WHEN ?2 IS NULL THEN 'chat:' || lower(hex(r.presentation_row_epoch))
+             ELSE 'identity:chat:' || lower(hex(r.presentation_row_epoch)) || ':' || ?2 END
+             AND a.source_key = ?3
+         LEFT JOIN avatar_acquisition q ON q.token = a.token
+         WHERE r.group_id_hex = ?1 AND m.id = 1",
+    )
+    .storage()?
+    .query_row(params![group, member, source], |r| {
+        let epoch: Vec<u8> = r.get(0)?;
+        let row: Vec<u8> = r.get(1)?;
+        let token: Option<Vec<u8>> = r.get(2)?;
+        let content_revision = nonnegative(r, 3)?;
+        let byte_count = nonnegative(r, 4)?;
+        let refresh_at: Option<i64> = r.get(5)?;
+        let acquisition: Option<i64> = r.get(6)?;
+        Ok(AvatarAssetPresentation {
+            target: AvatarAssetTarget {
+                epoch: epoch.clone(),
+                row,
+                member: member.map(str::to_owned),
+                source: source.to_owned(),
+            },
+            reference: token.map(|token| AvatarAssetRef {
+                store_epoch: epoch,
+                token,
+            }),
+            status: AvatarAssetStatus {
+                availability: if byte_count == 0 {
+                    AvatarAvailability::Missing
+                } else if refresh_at.is_some_and(|deadline| deadline >= 0 && now >= deadline as u64)
+                {
+                    AvatarAvailability::Stale
+                } else {
+                    AvatarAvailability::Ready
+                },
+                content_revision,
+                byte_count,
+            },
+            acquisition: acquisition.map(|state| match state {
                 0 => AvatarAcquisitionState::Idle,
                 1 => AvatarAcquisitionState::Queued,
                 2 => AvatarAcquisitionState::Fetching,
                 3 => AvatarAcquisitionState::RetryScheduled,
                 _ => AvatarAcquisitionState::Blocked,
             }),
-        )
-    } else {
-        (
-            AvatarAssetStatus {
-                availability: AvatarAvailability::Missing,
-                content_revision: 0,
-                byte_count: 0,
-            },
-            None,
-        )
-    };
-    Ok(Some(AvatarAssetPresentation {
-        target,
-        reference,
-        status,
-        acquisition,
-    }))
-}
-pub(crate) fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+        })
+    })
+    .optional()
+    .storage()
 }

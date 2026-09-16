@@ -362,6 +362,8 @@ fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
     let result = store.read_avatar(&reference, 0).unwrap();
     assert_eq!(result.status.availability, AvatarAvailability::Missing);
     assert_eq!(result.status.content_revision, 2);
+    assert!(result.repaired);
+    assert!(!store.read_avatar(&reference, 0).unwrap().repaired);
     assert!(result.image.is_none());
     assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 0);
     assert_eq!(
@@ -1227,6 +1229,16 @@ fn avatar_identity_demand_survives_directory_generation_catchup() {
             .unwrap()
             .is_none()
     );
+    let pending = store
+        .avatar_target_presentation("group", Some("member"), &selected_url("a"), 0)
+        .unwrap()
+        .unwrap();
+    let requested = store
+        .request_avatar_target(&pending.target, &selected_url("a"), Some(&version), 0)
+        .unwrap();
+    assert_eq!(requested.target, pending.target);
+    assert_eq!(requested.status.availability, AvatarAvailability::Missing);
+    assert!(requested.reference.is_none());
     let registered = store.requested_avatar_identities_after("").unwrap();
     assert_eq!(registered.len(), 1);
     let checkpoint = store.chat_presentation_checkpoint().unwrap();

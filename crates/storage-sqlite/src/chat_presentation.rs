@@ -559,7 +559,7 @@ impl SqliteAccountStorage {
                 &row.group_id_hex,
                 None,
                 &presentation.avatar,
-                crate::avatar_cache::access::now(),
+                crate::codec::unix_now_seconds(),
             )?;
             presented.push(PresentedChatRow {
                 row,

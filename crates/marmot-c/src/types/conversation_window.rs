@@ -39,7 +39,6 @@ copy can_enable_disbanding: bool,
 copy can_disband: bool,
 } }
 c_mirror! { MarmotConversationHeader from ConversationHeaderFfi {
-    opt_rec avatar_asset: MarmotAvatarAsset,
 rec selected: MarmotConversationPresentation,
 opt_copy has_member_count/member_count: u64,
 copy archived: bool,
@@ -48,13 +47,14 @@ copy lifecycle: MarmotGroupLifecycleState,
 copy disbanding: bool,
 copy unrecoverable: bool,
 rec capabilities: MarmotConversationCapabilities,
+    opt_rec avatar_asset: MarmotAvatarAsset,
 } }
 c_mirror! { MarmotConversationIdentity from ConversationIdentityFfi {
-    opt_rec avatar_asset: MarmotAvatarAsset,
 str account_id_hex,
 str display_name,
 rec avatar: MarmotSelectedAvatar,
 copy has_cached_profile: bool,
+    opt_rec avatar_asset: MarmotAvatarAsset,
 } }
 c_mirror! { MarmotConversationSystemReferences from ConversationSystemReferencesFfi {
 str system_type,

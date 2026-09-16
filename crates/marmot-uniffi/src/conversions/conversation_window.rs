@@ -76,7 +76,6 @@ impl From<app::conversation_presentation::ConversationCapabilities>
 }
 #[derive(Clone, uniffi::Record)]
 pub struct ConversationHeaderFfi {
-    pub avatar_asset: Option<AvatarAssetFfi>,
     pub selected: ConversationPresentationFfi,
     pub member_count: Option<u64>,
     pub archived: bool,
@@ -85,6 +84,7 @@ pub struct ConversationHeaderFfi {
     pub disbanding: bool,
     pub unrecoverable: bool,
     pub capabilities: ConversationCapabilitiesFfi,
+    pub avatar_asset: Option<AvatarAssetFfi>,
 }
 impl From<app::conversation_presentation::ConversationHeader> for ConversationHeaderFfi {
     fn from(v: app::conversation_presentation::ConversationHeader) -> Self {
@@ -103,11 +103,11 @@ impl From<app::conversation_presentation::ConversationHeader> for ConversationHe
 }
 #[derive(Clone, uniffi::Record)]
 pub struct ConversationIdentityFfi {
-    pub avatar_asset: Option<AvatarAssetFfi>,
     pub account_id_hex: String,
     pub display_name: String,
     pub avatar: SelectedAvatarFfi,
     pub has_cached_profile: bool,
+    pub avatar_asset: Option<AvatarAssetFfi>,
 }
 impl From<app::conversation_presentation::ConversationIdentity> for ConversationIdentityFfi {
     fn from(v: app::conversation_presentation::ConversationIdentity) -> Self {

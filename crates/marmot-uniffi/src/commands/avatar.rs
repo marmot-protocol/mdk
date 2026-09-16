@@ -3,7 +3,10 @@ use crate::{Marmot, MarmotKitError};
 use marmot_app::{AppError, AvatarAssetRef, AvatarAssetTarget, MAX_AVATAR_BATCH_ITEMS};
 fn check_count(count: usize) -> Result<(), MarmotKitError> {
     if count > MAX_AVATAR_BATCH_ITEMS {
-        return Err(AppError::InvalidEncryptedMedia("avatar batch exceeds 16 items".into()).into());
+        return Err(AppError::InvalidEncryptedMedia(format!(
+            "avatar batch exceeds {MAX_AVATAR_BATCH_ITEMS} items"
+        ))
+        .into());
     }
     Ok(())
 }

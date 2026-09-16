@@ -2436,9 +2436,9 @@ typedef struct MarmotConversationPresentation {
 } MarmotConversationPresentation;
 
 typedef struct MarmotPresentedChatRow {
-  struct MarmotAvatarAsset *avatar_asset;
   struct MarmotChatListRow row;
   struct MarmotConversationPresentation presentation;
+  struct MarmotAvatarAsset *avatar_asset;
 } MarmotPresentedChatRow;
 
 typedef struct MarmotPresentationVersion {
@@ -4582,7 +4582,6 @@ typedef struct MarmotConversationCapabilities {
 } MarmotConversationCapabilities;
 
 typedef struct MarmotConversationHeader {
-  struct MarmotAvatarAsset *avatar_asset;
   struct MarmotConversationPresentation selected;
   bool has_member_count;
   /**
@@ -4599,6 +4598,7 @@ typedef struct MarmotConversationHeader {
   bool disbanding;
   bool unrecoverable;
   struct MarmotConversationCapabilities capabilities;
+  struct MarmotAvatarAsset *avatar_asset;
 } MarmotConversationHeader;
 
 typedef struct MarmotConversationSystemReferences {
@@ -4643,11 +4643,11 @@ typedef struct MarmotConversationMessage {
 } MarmotConversationMessage;
 
 typedef struct MarmotConversationIdentity {
-  struct MarmotAvatarAsset *avatar_asset;
   char *account_id_hex;
   char *display_name;
   struct MarmotSelectedAvatar avatar;
   bool has_cached_profile;
+  struct MarmotAvatarAsset *avatar_asset;
 } MarmotConversationIdentity;
 
 typedef struct MarmotConversationOpenReadState {
