@@ -2,7 +2,6 @@ pub mod reports;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
 };
-pub use reports::*;
 mod capture;
 pub use capture::ConversationAccountSnapshot;
 mod edits;
@@ -154,7 +153,7 @@ pub struct StoredAppEvent {
     /// when that commit loses a fork. `None` for all other event kinds.
     pub origin_commit_id: Option<String>,
     /// Legacy persisted admin verdict. New runtime writes derive this from
-    /// authenticated source-state evidence for deletes and shared review
+    /// authenticated source-state evidence for admin deletions and dismissal labels
     /// decisions. A resolved verdict is stable across later admin changes;
     /// convergence invalidation can still withdraw the action's effects.
     pub moderation_grant: bool,
@@ -184,8 +183,8 @@ pub struct TimelineMessageQuery {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
-    pub revision_id_hex: String,
-    pub moderation: MessageModerationSummary,
+    #[serde(default)]
+    pub has_reports: bool,
     #[serde(default)]
     pub group_system: Option<crate::GroupSystemEventProjection>,
     pub message_id_hex: String,
@@ -621,24 +620,6 @@ impl SqliteAccountStorage {
                     changes: Vec::new(),
                 });
             }
-            let mut retained_event;
-            let event = if event.kind == MARMOT_APP_EVENT_KIND_REPORT
-                && cgka_traits::reporting::parse_report(&event.tags, &event.plaintext).is_some()
-                && reports::target_expired(
-                    &conn, &event.group_id_hex,
-                    tag_value(&event.tags, "e").unwrap_or_default(),
-                )?
-            {
-                conn.execute_cached(
-                    "INSERT OR IGNORE INTO content_pruned_controls VALUES (?1, ?2)",
-                    params![event.group_id_hex, event.message_id_hex],
-                ).storage()?;
-                retained_event = event.clone();
-                retained_event.plaintext.clear();
-                &retained_event
-            } else {
-                event
-            };
             let new_affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
             // Upserting an existing app_event may change its kind/tags, so the
             // incremental path must reproject both the old projection dependents
@@ -749,19 +730,16 @@ impl SqliteAccountStorage {
                                 WHEN kind = 5 AND authority_state = 0 THEN moderation_grant
                                 WHEN kind IN (1985, 4891) THEN ?4
                                 ELSE 0
-                            END,
-                            reporting_allowed = ?5
+                            END
                          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND authority_state != 2",
                         params![
                             event.group_id_hex, event.message_id_hex,
                             authority.source_context.as_slice(), authority.moderation_grant,
-                            authority.reporting_allowed,
                         ],
                     ).storage()?;
                 } else if existing_event.is_none() {
                     conn.execute_cached(
-                        "UPDATE app_events SET authority_state = 1, moderation_grant = 0,
-                                               reporting_allowed = 0
+                        "UPDATE app_events SET authority_state = 1, moderation_grant = 0
                          WHERE group_id_hex = ?1 AND message_id_hex = ?2",
                         params![event.group_id_hex, event.message_id_hex],
                     ).storage()?;
@@ -1711,32 +1689,20 @@ fn secure_prune_selected_app_events_tx(
 
     let roots = pruned_message_ids.clone();
     for root in &roots {
-        for kind in [MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_EDIT] {
-            for dependent in app_events_targeting_message_tx(tx, group_id_hex, kind, root)? {
-                pruned_message_ids.insert(dependent.message_id_hex);
-            }
+        for dependent in
+            app_events_targeting_message_tx(tx, group_id_hex, MARMOT_APP_EVENT_KIND_EDIT, root)?
+        {
+            pruned_message_ids.insert(dependent.message_id_hex);
         }
     }
-    // Retain only structural control evidence. Removing these rows would let
-    // a delayed duplicate reopen a review or resurrect a removed message.
+    // Retain deletion evidence so delayed targets and edits remain hidden.
+    // Reports and dismissal explanations expire independently of their targets.
     let pruned_controls =
         reports::retain_pruned_controls(tx, group_id_hex, &mut pruned_message_ids)?;
     for event in &pruned_events {
         if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
             reports::retain_expired_target(tx, group_id_hex, &event.message_id_hex)?;
         }
-    }
-    for root in &roots {
-        tx.execute_cached(
-            "DELETE FROM content_reports WHERE group_id_hex=?1 AND message_id_hex=?2",
-            params![group_id_hex, root],
-        )
-        .storage()?;
-        tx.execute_cached(
-            "DELETE FROM content_moderation WHERE group_id_hex=?1 AND message_id_hex=?2",
-            params![group_id_hex, root],
-        )
-        .storage()?;
     }
     retain_pruned_chat_activity_tx(tx, group_id_hex, &pruned_message_ids)?;
     scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
@@ -3916,8 +3882,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     Ok(TimelineMessageRecord {
-        revision_id_hex: row.get(0)?,
-        moderation: MessageModerationSummary::default(),
+        has_reports: false,
         group_system: crate::group_system::projected_group_system(
             row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
             &row.get::<_, String>(8)?,

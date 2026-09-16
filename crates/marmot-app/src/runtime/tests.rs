@@ -607,8 +607,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
 
 fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
     TimelineMessageRecord {
-        revision_id_hex: String::new(),
-        moderation: storage_sqlite::MessageModerationSummary::default(),
+        has_reports: false,
         group_system: None,
         edit: None,
         message_id_hex: message_id_hex.to_owned(),
@@ -2989,12 +2988,10 @@ fn recovery_preserves_persisted_authority_after_reopen() {
         Some(AppMessageAuthority {
             source_context: [42; 32],
             moderation_grant: true,
-            reporting_allowed: true,
         }),
         Some(AppMessageAuthority {
             source_context: [43; 32],
             moderation_grant: false,
-            reporting_allowed: false,
         }),
         None,
     ];

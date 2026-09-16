@@ -2199,7 +2199,14 @@ mod tests {
         let requests = store
             .pending_application_authority_batch(None, 100)
             .unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.message_id.clone())
+                .collect::<Vec<_>>(),
+            vec![mid(6), mid(7)]
+        );
         // Acknowledging the app output must not discard unresolved evidence.
         let ids = requests
             .iter()
@@ -2211,7 +2218,7 @@ mod tests {
                 .pending_application_authority_batch(None, 100)
                 .unwrap()
                 .len(),
-            3
+            2
         );
         let result: StorageResult<()> = store.with_transaction(|storage| {
             storage.delete_message(&ids[0])?;
@@ -2223,7 +2230,7 @@ mod tests {
                 .pending_application_authority_batch(None, 100)
                 .unwrap()
                 .len(),
-            3
+            2
         );
         for id in &ids {
             store.delete_message(id).unwrap();

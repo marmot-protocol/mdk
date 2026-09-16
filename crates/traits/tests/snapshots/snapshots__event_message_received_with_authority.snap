@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "GroupEvent::MessageReceived\n{\n    authority:\n    Some(cgka_traits::app_event::AppMessageAuthority\n    {\n        source_context: [43; 32], moderation_grant: false, reporting_allowed:\n        true,\n    }), group_id: gid(), message_id: mid(), epoch: EpochId(7), sender:\n    mem_id(), payload: b\"hi\".to_vec(), retention: None,\n}"
+expression: "GroupEvent::MessageReceived\n{\n    authority:\n    Some(cgka_traits::app_event::AppMessageAuthority\n    { source_context: [43; 32], moderation_grant: false, }), group_id: gid(),\n    message_id: mid(), epoch: EpochId(7), sender: mem_id(), payload:\n    b\"hi\".to_vec(), retention: None,\n}"
 ---
 {
   "MessageReceived": {
@@ -63,8 +63,7 @@ expression: "GroupEvent::MessageReceived\n{\n    authority:\n    Some(cgka_trait
         43,
         43
       ],
-      "moderation_grant": false,
-      "reporting_allowed": true
+      "moderation_grant": false
     }
   }
 }

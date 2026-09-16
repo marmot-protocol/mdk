@@ -237,28 +237,26 @@ allow an old relay delivery to create an invitation after unblocking.
 Native screens and imports of old White Noise local databases are outside this
 feature. Existing published lists migrate through relay synchronization.
 
-## Group reports and shared review
+## Group reports and admin deletion
 
-Reports use kind 1984; shared dismissals label report events with NIP-32 kind
-1985. Admin removals use Marmot kind 4891, while kind 5 remains author deletion.
+`report_message` sends a kind-1984 NIP-56 report with a category and optional
+explanation. It references a message event directly, without a revision tag or
+per-reporter deduplication. Admins use `dismiss_reports` to label specific report
+events with kind 1985 and an optional explanation. Each label is independent.
 
-`report_message` reports a whole message at an explicit original/edit revision
-with a NIP-56 reason and optional explanation (`other` requires one).
-`dismiss_reports` shares an admin's decision for selected report IDs.
-`delete_message` sends kind 4891 when an eligible active admin removes an
-available whole chat message and all its revisions, including their own message.
-Otherwise, authors can retract their own content with kind 5, including an
-already-removed or invalidated target. Cross-author removal requires admin
-authority and an eligible chat target; other attempts fail before publication. Older
-clients may retain content removed by kind 4891. Conversely, upgraded clients
-reject a newly received older client's admin kind-5 deletion of another author's
-message. Previously honored legacy tombstones stay honored locally. Mixed versions
-can therefore disagree in either direction; upgrade all group participants for
-consistent moderation. Reports and reviews use encrypted
-group messages and do not add chat rows, unread activity, or report notifications.
+The existing `delete_message` API sends kind 4891 for admin deletion of a whole
+chat, including an unreported message or the admin's own message. Kind 5 remains
+author-only retraction. Admin authorization comes from authenticated source state;
+later demotion does not revoke an established verdict. Group size and name do not
+affect authorization.
 
-`reported_content`, `message_reports`, and `subscribe_reported_content` expose
-bounded review pages, pending-message counts, reported/current content and shared
-resolution metadata. Personal blocking does not hide these review details.
+`content_reports` lists individual reports, optionally filtered to a message.
+`report_dismissals` lists admin labels. `reported_message` returns a reported
+target's current deletion-masked projection, bypassing personal blocking.
+Timeline records expose `has_reports` through existing subscriptions. There is no
+shared queue, counter, or aggregate review status. Hosts choose review UI and
+notifications. Report explanations follow their own retention and survive target
+deletion while retained.
+
 See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md)
-for source-state authorization, durable recovery, retention, and rollout order.
+for source-state authorization, durable recovery, retention, and client compatibility.

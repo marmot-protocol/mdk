@@ -1849,20 +1849,17 @@ pub(crate) enum GroupConfirmationProjection {
     },
 }
 
-/// Send-time preflight for admin removal: require an active admin and group
-/// reporting eligibility. Eligibility is mutable source-state policy: named
-/// two-account groups are eligible, while unnamed two-account groups are not.
-/// The engine stamps the final authority at encryption time.
+/// Send-time preflight for admin actions. The engine stamps final authority
+/// from the authenticated source state when the event is encrypted.
 pub(crate) fn delete_moderation_grant(
     group: &Group,
     admins: &[[u8; 32]],
     sender_hex: &str,
 ) -> bool {
     let accounts: HashSet<_> = group.members.iter().map(|member| &member.id).collect();
-    cgka_traits::reporting::group_reporting_allowed(accounts.len(), Some(&group.name))
-        && accounts
-            .iter()
-            .any(|id| hex::encode(id.as_slice()) == sender_hex)
+    accounts
+        .iter()
+        .any(|id| hex::encode(id.as_slice()) == sender_hex)
         && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
 }
 
@@ -1917,16 +1914,16 @@ mod delete_moderation_grant_tests {
     }
 
     #[test]
-    fn direct_conversation_never_grants_even_to_admin() {
+    fn unnamed_pair_allows_admin_removal() {
         let group = group_with("", 2);
-        assert!(!delete_moderation_grant(
+        assert!(delete_moderation_grant(
             &group,
             &[ADMIN],
             &hex::encode(ADMIN)
         ));
-        // A whitespace-only name is still an unnamed direct conversation.
+        // Display names do not affect protocol authorization.
         let group = group_with("  ", 2);
-        assert!(!delete_moderation_grant(
+        assert!(delete_moderation_grant(
             &group,
             &[ADMIN],
             &hex::encode(ADMIN)
@@ -1965,10 +1962,10 @@ mod delete_moderation_grant_tests {
     }
 
     #[test]
-    fn multiple_devices_do_not_change_two_account_eligibility() {
+    fn multiple_devices_and_display_name_do_not_change_admin_authority() {
         let mut group = group_with("\u{00a0}\u{2007}\u{3000}", 2);
         group.members.push(group.members[0].clone());
-        assert!(!delete_moderation_grant(
+        assert!(delete_moderation_grant(
             &group,
             &[ADMIN],
             &hex::encode(ADMIN)

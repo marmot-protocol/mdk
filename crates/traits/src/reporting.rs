@@ -1,41 +1,14 @@
-//! Typed interpretation of group reports and shared review decisions.
+//! Typed interpretation of group reports, dismissal labels, and admin deletion.
 use serde::{Deserialize, Serialize};
 
-use crate::app_event::{
-    MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
-};
+use crate::app_event::{MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REVIEW};
 
 /// Only these moderation controls need retained source-state authority.
 /// Ordinary app events and author deletion do not create authority retry work.
 pub fn requires_source_authority(kind: u64) -> bool {
     matches!(
         kind,
-        MARMOT_APP_EVENT_KIND_REPORT | MARMOT_APP_EVENT_KIND_REVIEW | MARMOT_APP_EVENT_KIND_REMOVE
-    )
-}
-
-/// Whether a source state permits group reports, shared review, and admin removal.
-/// Count distinct authenticated account identities, not device leaves. An absent
-/// profile name is treated like an empty name for this application policy only.
-pub fn group_reporting_allowed(account_count: usize, name: Option<&str>) -> bool {
-    account_count != 2 || name.is_some_and(|name| name.chars().any(|c| !reporting_whitespace(c)))
-}
-
-/// Fixed Unicode White_Space set from the moderation contract. Keep explicit so
-/// a Unicode library update cannot silently change source-state eligibility.
-fn reporting_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0009}'..='\u{000D}'
-            | '\u{0020}'
-            | '\u{0085}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'..='\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
+        MARMOT_APP_EVENT_KIND_REVIEW | MARMOT_APP_EVENT_KIND_REMOVE
     )
 }
 
@@ -74,10 +47,6 @@ impl ReportReason {
             _ => return None,
         })
     }
-    pub fn valid_explanation(self, explanation: &str) -> bool {
-        explanation.len() <= 4096
-            && (self != Self::Other || explanation.chars().any(|c| !reporting_whitespace(c)))
-    }
 }
 
 pub fn event_id_is_valid(value: &str) -> bool {
@@ -89,7 +58,6 @@ pub fn event_id_is_valid(value: &str) -> bool {
 
 pub struct ReportReference<'a> {
     pub target: &'a str,
-    pub revision: &'a str,
     pub author: &'a str,
     pub reason: ReportReason,
 }
@@ -100,26 +68,13 @@ fn one_tag<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a [String]> {
     let tag = matching.next()?;
     matching.next().is_none().then_some(tag.as_slice())
 }
-pub fn parse_report<'a>(tags: &'a [Vec<String>], content: &str) -> Option<ReportReference<'a>> {
+pub fn parse_report<'a>(tags: &'a [Vec<String>], _content: &str) -> Option<ReportReference<'a>> {
     let event = one_tag(tags, "e")?;
     let target = event.get(1)?.as_str();
     let author = one_tag(tags, "p")?.get(1)?.as_str();
     let reason = ReportReason::parse(event.get(2)?)?;
-    let revision = if tags
-        .iter()
-        .any(|tag| tag.first().is_some_and(|t| t == "revision"))
-    {
-        one_tag(tags, "revision")?.get(1)?.as_str()
-    } else {
-        target
-    };
-    (event_id_is_valid(target)
-        && event_id_is_valid(author)
-        && event_id_is_valid(revision)
-        && reason.valid_explanation(content))
-    .then_some(ReportReference {
+    (event_id_is_valid(target) && event_id_is_valid(author)).then_some(ReportReference {
         target,
-        revision,
         author,
         reason,
     })
@@ -136,16 +91,24 @@ fn event_targets(tags: &[Vec<String>]) -> Option<Vec<String>> {
 /// Kind-1985 dismissal: a label on explicit report ids. Content may explain the
 /// label but does not select or override its meaning.
 pub fn parse_dismissal(tags: &[Vec<String>], _content: &str) -> Option<Vec<String>> {
-    let namespace = one_tag(tags, "L")?;
-    let label = one_tag(tags, "l")?;
-    if namespace.get(1)?.as_str() != REPORT_REVIEW_NAMESPACE
-        || label.get(1)?.as_str() != "dismissed"
-        || label.get(2)?.as_str() != REPORT_REVIEW_NAMESPACE
-    {
+    let has_namespace = tags.iter().any(|tag| {
+        tag.first().is_some_and(|s| s == "L")
+            && tag.get(1).is_some_and(|s| s == REPORT_REVIEW_NAMESPACE)
+    });
+    let has_label = tags.iter().any(|tag| {
+        tag.first().is_some_and(|s| s == "l")
+            && tag.get(1).is_some_and(|s| s == "dismissed")
+            && tag.get(2).is_some_and(|s| s == REPORT_REVIEW_NAMESPACE)
+    });
+    if !has_namespace || !has_label {
         return None;
     }
-    let ids = event_targets(tags)?;
-    (!ids.is_empty() && ids.len() <= 100).then_some(ids)
+    let ids: Vec<_> = tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|s| s == "e"))
+        .filter_map(|tag| tag.get(1).filter(|id| event_id_is_valid(id)).cloned())
+        .collect();
+    (!ids.is_empty()).then_some(ids)
 }
 /// Kind-4891 admin removal: one original message, including every revision.
 pub fn parse_removal(tags: &[Vec<String>], content: &str) -> Option<String> {
@@ -166,132 +129,80 @@ pub fn parse_removal(tags: &[Vec<String>], content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn source_authority_is_required_only_for_moderation_kinds() {
-        for kind in [1984, 1985, 4891] {
-            assert!(requires_source_authority(kind));
-        }
-        for kind in [
-            0,
-            5,
-            7,
-            9,
-            1009,
-            1200,
-            1210,
-            1983,
-            1986,
-            4890,
-            4892,
-            u64::MAX,
-        ] {
-            assert!(!requires_source_authority(kind));
-        }
+    fn tags(values: &[&[&str]]) -> Vec<Vec<String>> {
+        values
+            .iter()
+            .map(|tag| tag.iter().map(|s| (*s).into()).collect())
+            .collect()
     }
-
     #[test]
-    fn reporting_eligibility_uses_account_count_and_optional_name() {
-        for name in [None, Some(""), Some(" \t\r\n\u{00a0}\u{3000}")] {
-            assert!(!group_reporting_allowed(2, name));
-            for count in [0, 1, 3, 4] {
-                assert!(group_reporting_allowed(count, name));
-            }
-        }
-        for name in ["pair", " pair ", "\u{200b}", "\u{feff}", "\u{001c}"] {
-            assert!(group_reporting_allowed(2, Some(name)));
-            assert!(ReportReason::Other.valid_explanation(name));
-        }
-    }
-
-    #[test]
-    fn reporting_whitespace_matches_the_fixed_contract() {
-        let whitespace = [
-            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}',
-            '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
-            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
-            '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
-        ];
-        for c in char::MIN..=char::MAX {
-            assert_eq!(reporting_whitespace(c), whitespace.contains(&c));
-        }
-        for c in whitespace {
-            let text = c.to_string();
-            assert!(!group_reporting_allowed(2, Some(&text)));
-            assert!(!ReportReason::Other.valid_explanation(&text));
-        }
-    }
-
-    #[test]
-    fn nip56_categories_and_revision_default_are_strict() {
-        let id = "11".repeat(32);
-        let author = "22".repeat(32);
+    fn reports_use_nip56_categories_without_revision_or_explanation_requirements() {
         for reason in [
-            "nudity",
-            "malware",
-            "profanity",
-            "illegal",
-            "spam",
-            "impersonation",
-            "other",
+            ReportReason::Nudity,
+            ReportReason::Malware,
+            ReportReason::Profanity,
+            ReportReason::Illegal,
+            ReportReason::Spam,
+            ReportReason::Impersonation,
+            ReportReason::Other,
         ] {
-            let tags = vec![
-                vec!["e".into(), id.clone(), reason.into()],
-                vec!["p".into(), author.clone()],
-            ];
-            assert_eq!(parse_report(&tags, "explanation").unwrap().revision, id);
-            assert_eq!(parse_report(&tags, "").is_some(), reason != "other");
+            let t = tags(&[
+                &["e", &"11".repeat(32), reason.as_str()],
+                &["p", &"22".repeat(32)],
+            ]);
+            let parsed = parse_report(&t, "").unwrap();
+            assert_eq!(parsed.reason, reason);
+            assert_eq!(parsed.target, "11".repeat(32));
         }
-        assert!(!ReportReason::Other.valid_explanation(" \n"));
-        assert!(!ReportReason::Spam.valid_explanation(&"a".repeat(4097)));
-        let mut tags = vec![
-            vec!["e".into(), id.clone(), "spam".into()],
-            vec!["p".into(), author],
-        ];
-        tags.push(vec!["revision".into(), "bad-id".into()]);
-        assert!(parse_report(&tags, "").is_none());
-        tags.pop();
-        tags.push(tags[0].clone());
-        assert!(parse_report(&tags, "").is_none());
+        assert!(!requires_source_authority(1984));
+        assert!(!requires_source_authority(5));
+        assert!(requires_source_authority(1985));
+        assert!(requires_source_authority(4891));
     }
     #[test]
-    fn dismissal_labels_are_namespaced_and_bounded() {
-        let mut tags = vec![
-            vec!["L".into(), REPORT_REVIEW_NAMESPACE.into()],
-            vec![
-                "l".into(),
-                "dismissed".into(),
-                REPORT_REVIEW_NAMESPACE.into(),
-            ],
-            vec!["e".into(), "11".repeat(32)],
-        ];
-        assert!(parse_dismissal(&tags, "").is_some());
-        assert!(parse_dismissal(&tags, "optional explanation").is_some());
-        tags[1][1] = "remove".into();
-        assert!(parse_dismissal(&tags, "").is_none());
-        tags[1][1] = "dismissed".into();
-        tags[1][2] = "other.namespace".into();
-        assert!(parse_dismissal(&tags, "").is_none());
-        tags[1][2] = REPORT_REVIEW_NAMESPACE.into();
-        tags.extend(vec![tags[2].clone(); 100]);
-        assert!(parse_dismissal(&tags, "").is_none());
-        assert!(parse_dismissal(&[], r#"{"v":1,"action":"dismiss"}"#).is_none());
+    fn dismissal_accepts_additional_labels_and_handles_each_reference_independently() {
+        let id = "11".repeat(32);
+        let mut t = tags(&[
+            &["L", "other"],
+            &["L", REPORT_REVIEW_NAMESPACE, "extension"],
+            &["l", "dismissed", REPORT_REVIEW_NAMESPACE, "extension"],
+            &["l", "other", "other"],
+            &["e", "bad"],
+            &["e"],
+            &["e", &id, "extension"],
+        ]);
+        assert_eq!(
+            parse_dismissal(&t, "optional explanation"),
+            Some(vec![id.clone()])
+        );
+        t.extend((0..101).map(|_| vec!["e".into(), id.clone()]));
+        assert_eq!(parse_dismissal(&t, "").unwrap().len(), 102);
+        assert!(parse_dismissal(&tags(&[&["e", &id]]), "dismissed").is_none());
     }
     #[test]
-    fn removal_version_action_and_single_target_are_strict() {
-        let tags = vec![vec!["e".into(), "11".repeat(32)]];
-        assert!(parse_removal(&tags, r#"{"v":1,"action":"remove"}"#).is_some());
-        for text in [
+    fn removal_requires_one_reference_and_exact_versioned_json() {
+        let id = "ab".repeat(32);
+        let t = tags(&[&["e", &id, "extension"], &["other", "ignored"]]);
+        assert_eq!(
+            parse_removal(&t, r#"{"v":1,"action":"remove"}"#),
+            Some(id.clone())
+        );
+        for content in [
+            r#"{"v":1,"v":1,"action":"remove"}"#,
+            r#"{"v":1.0,"action":"remove"}"#,
+            r#"{"v":1,"action":"remove","extra":0}"#,
             r#"{"v":2,"action":"remove"}"#,
             r#"{"v":1,"action":"dismiss"}"#,
-            r#"{"v":1,"action":"remove","extra":0}"#,
-            r#"{"v":1,"v":1,"action":"remove"}"#,
-            r#"{"v":2,"v":1,"action":"remove"}"#,
-            r#"{"v":1,"v":2,"action":"remove"}"#,
-            r#"{"v":1,"action":"dismiss","action":"remove"}"#,
-            r#"{"v":1,"action":"remove","action":"remove"}"#,
         ] {
-            assert!(parse_removal(&tags, text).is_none());
+            assert!(parse_removal(&t, content).is_none(), "{content}");
         }
-        assert!(parse_removal(&vec![tags[0].clone(); 2], r#"{"v":1,"action":"remove"}"#).is_none());
+        assert!(
+            parse_removal(
+                &tags(&[&["e", &id], &["e", &id]]),
+                r#"{"v":1,"action":"remove"}"#
+            )
+            .is_none()
+        );
+        assert!(!event_id_is_valid(&id.to_uppercase()));
     }
 }

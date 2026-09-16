@@ -68,8 +68,7 @@ expression: app
         42,
         42
       ],
-      "moderation_grant": true,
-      "reporting_allowed": false
+      "moderation_grant": true
     }
   }
 }

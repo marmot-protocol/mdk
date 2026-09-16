@@ -36,17 +36,14 @@ struct ChatProjectionsSmoke {
             accounts: states.map { AccountAttentionEntryFfi(accountIdHex: "account", state: $0) })
         let copy = try FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
         precondition(copy == value)
-        for status in [ModerationStatusFfi.pending, .reviewed, .removed] {
-            let page = ReportedContentPageFfi(items: [ReportedContentFfi(messageIdHex: "message", revisionIdHex: "edit",
-                moderation: MessageModerationSummaryFfi(status: status, totalReports: 2, pendingReports: 1))], nextCursor: "cursor", pendingMessageCount: 1)
-            let pageCopy = try FfiConverterTypeReportedContentPageFfi.lift(FfiConverterTypeReportedContentPageFfi.lower(page))
-            precondition(pageCopy == page)
-        }
-        let report = ContentReportFfi(reportIdHex: "report", messageIdHex: "message", revisionIdHex: "edit", reporter: "member",
-            reason: .other, explanation: "explanation", reportedAt: 42, dismissedByEventId: "decision", reviewingAdmin: "admin", reportedText: nil, reportedRevision: nil)
-        let reports = ContentReportPageFfi(removedByEventId: "delete", removingAccount: "admin", removedAt: 1, currentMessage: nil, reports: [report], nextCursor: nil)
+        let report = ContentReportFfi(reportIdHex: "report", messageIdHex: "message", messageAuthor: "author", reporter: "member",
+            reason: .other, explanation: "explanation", reportedAt: 42, dismissed: true)
+        let reports = ContentReportPageFfi(reports: [report], nextCursor: nil)
         let reportsCopy = try FfiConverterTypeContentReportPageFfi.lift(FfiConverterTypeContentReportPageFfi.lower(reports))
         precondition(reportsCopy == reports)
+        let labels = ReportDismissalPageFfi(labels: [ReportDismissalFfi(eventIdHex: "label", admin: "admin", explanation: "reviewed", createdAt: 43)], nextCursor: "cursor")
+        let labelsCopy = try FfiConverterTypeReportDismissalPageFfi.lift(FfiConverterTypeReportDismissalPageFfi.lower(labels))
+        precondition(labelsCopy == labels)
         let edit = TimelineEditSummaryFfi(editCount: 3, latestEditMessageIdHex: "edit", editedAt: 17)
         let editCopy = try FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit))
         precondition(editCopy == edit)
@@ -131,11 +128,11 @@ func compileBlockCommands(_ marmot: Marmot, account: String, user: String) async
 }
 
 func compileModerationCommands(_ marmot: Marmot, account: String, group: String) async throws {
-    _ = try await marmot.reportMessage(accountRef: account, groupIdHex: group, messageId: "message", revisionId: "revision", reason: .spam, explanation: "")
-    _ = try await marmot.dismissReports(accountRef: account, groupIdHex: group, reportIds: ["report"])
-    _ = try marmot.messageReports(accountRef: account, groupIdHex: group, messageId: "message", after: nil, limit: 50)
-    let queue = try await marmot.subscribeReportedContent(accountRef: account, groupIdHex: group, pendingOnly: true, limit: 50)
-    _ = queue.snapshot(); _ = await queue.next()
+    _ = try await marmot.reportMessage(accountRef: account, groupIdHex: group, messageId: "message", reason: .spam, explanation: "")
+    _ = try await marmot.dismissReports(accountRef: account, groupIdHex: group, reportIds: ["report"], explanation: "reviewed")
+    _ = try marmot.contentReports(accountRef: account, groupIdHex: group, messageId: "message", after: nil, limit: 50)
+    _ = try marmot.reportedMessage(accountRef: account, groupIdHex: group, messageId: "message")
+    _ = try marmot.reportDismissals(accountRef: account, groupIdHex: group, reportId: "report", after: nil, limit: 50)
 }
 
 func compileEditHistory(_ marmot: Marmot, account: String, group: String, target: String) throws {

@@ -111,6 +111,5 @@ pub(crate) use codec::{
 };
 
 pub use timeline::reports::{
-    ContentReport, ContentReportPage, MessageModerationSummary, ModerationStatus, ReportedContent,
-    ReportedContentPage,
+    ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage,
 };

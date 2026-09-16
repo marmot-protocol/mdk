@@ -325,11 +325,11 @@ impl StoredAppMessageRecord {
 }
 
 /// Column list for [`SqliteAccountStorage::app_messages`], decoded by
-/// `app_message_from_row` (including resolved source authority at indexes 15–17).
+/// `app_message_from_row` (including resolved source authority at indexes 15–16).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
      received_at, insert_order, moderation_grant, invalidated, authority_state, \
-     authority_context, reporting_allowed";
+     authority_context";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
@@ -3768,7 +3768,6 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         Some(cgka_traits::app_event::AppMessageAuthority {
             source_context,
             moderation_grant: row.get::<_, i64>(13)? != 0,
-            reporting_allowed: row.get::<_, i64>(17)? != 0,
         })
     } else {
         None

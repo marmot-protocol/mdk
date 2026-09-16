@@ -7,14 +7,14 @@ boundary and client compatibility requirements.
 
 The engine derives `AppMessageAuthority` from the MLS state used at encryption
 or authenticated receive. It binds the verdict to a SHA-256 digest of that
-state's epoch authenticator, and records group eligibility and admin authority.
+state's epoch authenticator, and records active-member admin authority.
 This evidence is local metadata, never an author-supplied event claim.
 
 The branch digest is retained with moderation verdicts as provenance of the
 policy decision, including when the original source snapshot has been pruned.
 It is not an admin credential or an alternate branch-selection input. Ordinary
 chat, reaction, edit, and author-deletion events omit this evidence; only the
-three moderation kinds pay for its member/policy lookup and persistence.
+two admin control kinds pay for its member/policy lookup and persistence.
 
 The verdict travels through the session publish work, durable outbound fanout,
 account publication result, replay observation, durable pending application
@@ -30,10 +30,10 @@ emits unresolved authority instead of nesting another rewind inside replay.
 A successful source probe supplies both authority and retention. If its
 authentication fails, ingestion keeps the existing source-epoch retention
 fallback used by ordinary messages, while authority remains unresolved. Failure
-to prove moderation authority must not exempt report explanations from expiry.
+to prove admin authority must not exempt dismissal explanations from expiry.
 
 A separate durable retry record retains the source ID, sender, epoch and payload
-digest without plaintext. Only kinds 1984, 1985, and 4891 enter this path;
+digest without plaintext. Only kinds 1985 and 4891 enter this path;
 ordinary messages and kind-5 author deletion do not. Session/account
 `run_due_maintenance` drives `recover_pending_application_authority` in rotating
 batches of at most 32 pending records, independently of legacy projection
@@ -54,28 +54,31 @@ cannot gain admin deletion privileges.
 
 ## Persistence and retention
 
-Migration 0077 adds source-authority metadata, indexed report and moderation
-projections, and a durable backfill cursor over the pre-migration event prefix.
-Maintenance advances at most 100 old events per batch. Normal receive reprojects
-only affected message targets via modifier edges.
+Migration 0077 introduced source-authority metadata and a durable backfill cursor.
+Migration 0078 replaces its logical-report and aggregate-summary tables with one
+indexed row per report event. It preserves account history and established
+source-authority verdicts, drops the former group-eligibility flag, and resets the
+bounded backfill cursor over the existing prefix. Old eligibility denials for
+admin actions are re-evaluated against source state. Legacy deletion verdicts
+remain untouched.
 
-Reports are grouped by original message, revision, and reporter within one
-group. The earliest `(created_at, event_id)` chooses displayed duplicate details.
-A dismissal referencing any duplicate resolves that logical report. Concurrent
-valid dismissals choose the same canonical decision; a later report from a new
-reporter/revision remains pending unless the target has been removed. Removal
-closes pending review for every revision, and later reports cannot reopen it.
-Removal wins over edits and review status.
+Maintenance advances at most 100 old events per batch. Normal receive updates
+only affected targets through modifier edges. Report lookup is indexed by group,
+message, and report ID; pagination is exclusive and capped at 100. Dismissal labels
+are read from the existing indexed event/edge store with source authorization,
+without a separate resolution table. Multiple labels remain independent.
 
-Report records contain references and metadata, never a copy of target content.
-Expiration of the target prunes dependent explanations and edits. Expired
-controls intentionally retain minimal reference and resolution tombstones with
-explanations scrubbed. These are durable anti-resurrection evidence, not retained
-message content: duplicate reports, rebuilds, or late edits cannot reopen resolved
-review or restore removed content.
-Normal timeline, reply-preview, search, media, and review-detail content is
-suppressed after removal. There is no withdrawal, undo, or restore operation.
+Report records contain identifiers, authors, category and timestamp. Explanation
+text is read from its retained event; no target plaintext or attachments are
+copied. Reports and labels expire independently under ordinary message retention.
+Target deletion or expiry does not erase report explanations. Only deletion
+controls retain minimal structural evidence after expiry, with unrelated tags
+removed. Target replay fences exist only where retained deletion evidence needs
+them; ordinary chat and report traffic does not create a moderation tombstone
+ledger.
 
-The event write, modifier edges, per-message summary, logical reports, and queue
-counts use the account database transaction rail. Publication failure follows
-the existing local projection invalidation and retry behavior.
+The event write, modifier edges, affected message projections, and report index
+commit in one account transaction. Publication failure follows existing local
+projection invalidation and retry behavior. `has_reports` is an indexed existence
+check, not a counter or shared workflow state. There is no dedicated review queue
+subscription; clients use existing projection events to refresh their own views.

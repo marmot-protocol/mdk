@@ -178,7 +178,6 @@ const STREAM_FINAL_KIND_CHAT: &str = "9";
 pub(crate) enum AppMessageIntent {
     Report {
         target_message_id: String,
-        revision_id: String,
         reason: ReportReason,
         explanation: String,
         target_author: Option<String>,
@@ -188,6 +187,7 @@ pub(crate) enum AppMessageIntent {
     },
     DismissReports {
         report_ids: Vec<String>,
+        explanation: String,
     },
     Chat {
         content: String,
@@ -348,22 +348,15 @@ pub(crate) fn build_inner_event_with_media_reply(
         }
         AppMessageIntent::Report {
             target_message_id,
-            revision_id,
             reason,
             explanation,
             target_author,
         } => {
             validate_message_ref(target_message_id)?;
-            validate_message_ref(revision_id)?;
             let author = target_author.as_ref().ok_or_else(|| {
                 AppError::InvalidAppMessagePayload("report target has not been resolved".into())
             })?;
             validate_message_ref(author)?;
-            if !reason.valid_explanation(explanation) {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "invalid report explanation".into(),
-                ));
-            }
             Ok(event(
                 MARMOT_APP_EVENT_KIND_REPORT,
                 vec![
@@ -373,12 +366,14 @@ pub(crate) fn build_inner_event_with_media_reply(
                         reason.as_str().into(),
                     ],
                     vec!["p".into(), author.clone()],
-                    vec!["revision".into(), revision_id.clone()],
                 ],
                 explanation.clone(),
             ))
         }
-        AppMessageIntent::DismissReports { report_ids } => {
+        AppMessageIntent::DismissReports {
+            report_ids,
+            explanation,
+        } => {
             if report_ids.is_empty() || report_ids.len() > 100 {
                 return Err(AppError::InvalidAppMessagePayload(
                     "review requires between 1 and 100 reports".into(),
@@ -396,7 +391,11 @@ pub(crate) fn build_inner_event_with_media_reply(
                 vec!["l".into(), "dismissed".into(), namespace.into()],
             ];
             tags.extend(ids.iter().map(|id| event_ref_tag(id)));
-            Ok(event(MARMOT_APP_EVENT_KIND_REVIEW, tags, String::new()))
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REVIEW,
+                tags,
+                explanation.clone(),
+            ))
         }
         AppMessageIntent::RemoveMessage { target_message_id } => {
             validate_message_ref(target_message_id)?;
@@ -983,5 +982,54 @@ mod mention_tests {
             "]".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES + 1024)
         );
         assert!(mention_p_tags(&input).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+    #[test]
+    fn report_and_label_builders_follow_the_simple_wire_contract() {
+        let target = "11".repeat(32);
+        let author = "22".repeat(32);
+        let reporter = "33".repeat(32);
+        let report = build_inner_event(
+            &AppMessageIntent::Report {
+                target_message_id: target.clone(),
+                target_author: Some(author.clone()),
+                reason: ReportReason::Other,
+                explanation: String::new(),
+            },
+            &reporter,
+            1,
+        )
+        .unwrap();
+        assert_eq!(report.kind, 1984);
+        assert_eq!(
+            report.tags,
+            vec![
+                vec!["e".to_owned(), target, "other".into()],
+                vec!["p".to_owned(), author]
+            ]
+        );
+        assert!(report.content.is_empty());
+        let label = build_inner_event(
+            &AppMessageIntent::DismissReports {
+                report_ids: vec![report.id.clone()],
+                explanation: "reviewed".into(),
+            },
+            &reporter,
+            2,
+        )
+        .unwrap();
+        assert_eq!(label.kind, 1985);
+        assert_eq!(label.content, "reviewed");
+        assert_eq!(
+            cgka_traits::reporting::parse_dismissal(&label.tags, &label.content),
+            Some(vec![report.id])
+        );
+        for kind in [1984, 1985, 4891] {
+            assert!(is_reserved_app_event_kind(kind));
+        }
     }
 }

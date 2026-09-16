@@ -940,14 +940,6 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             None
         };
-        if app_event.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REPORT
-            && !authority.is_some_and(|a| a.reporting_allowed)
-        {
-            self.return_unmodified_mls_group(&group_id, mls_group);
-            return Err(EngineError::InvalidAppMessagePayload(
-                "reporting is unavailable in direct conversations".into(),
-            ));
-        }
         if matches!(
             app_event.kind,
             cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REVIEW

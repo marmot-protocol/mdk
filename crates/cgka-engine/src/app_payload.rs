@@ -5,21 +5,14 @@ pub(crate) fn source_authority(
     group: &openmls::group::MlsGroup,
     sender: &MemberId,
 ) -> Result<cgka_traits::app_event::AppMessageAuthority, EngineError> {
-    let profile = crate::app_components::group_profile_of_group(group)?;
     let members = group
         .members()
         .map(|member| crate::identity::validated_member_id(&member.credential))
         .collect::<Result<std::collections::HashSet<_>, _>>()?;
-    let reporting_allowed = cgka_traits::reporting::group_reporting_allowed(
-        members.len(),
-        profile.as_ref().map(|(name, _)| name.as_str()),
-    );
     let admins = crate::app_components::admins_of_group(group)?;
     Ok(cgka_traits::app_event::AppMessageAuthority {
         source_context: Sha256::digest(group.epoch_authenticator().as_slice()).into(),
-        reporting_allowed,
-        moderation_grant: reporting_allowed
-            && members.contains(sender)
+        moderation_grant: members.contains(sender)
             && admins.iter().any(|key| key.as_slice() == sender.as_slice()),
     })
 }

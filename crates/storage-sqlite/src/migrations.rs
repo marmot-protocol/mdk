@@ -164,6 +164,8 @@ mod migration_0075_user_blocks;
 mod migration_0076_accepted_edits;
 #[path = "migrations/0077_content_reports.rs"]
 mod migration_0077_content_reports;
+#[path = "migrations/0078_simple_content_reports.rs"]
+mod migration_0078_simple_content_reports;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -556,6 +558,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "0077_content_reports",
         apply: migration_0077_content_reports::apply,
+    },
+    Migration {
+        version: 78,
+        name: "0078_simple_content_reports",
+        apply: migration_0078_simple_content_reports::apply,
     },
 ];
 
@@ -1327,7 +1334,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 77,
+                found: 78,
                 latest_supported: 46,
             }
         ));
@@ -1383,7 +1390,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 77,
+                found: 78,
                 latest_supported: 46,
             }
         ));
@@ -1687,7 +1694,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 77,
+                found: 78,
                 latest_supported: 46,
             }
         ));
@@ -3119,5 +3126,71 @@ mod group_reset_tests {
             )
             .unwrap();
         assert_eq!(unchanged, cutoff);
+    }
+}
+
+#[cfg(test)]
+mod simple_content_reports_tests {
+    use super::*;
+    #[test]
+    fn simplifies_populated_schema_without_resetting_history_or_legacy_deletions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        run(&mut conn, &MIGRATIONS[..77]).unwrap();
+        for (id, kind, grant, allowed, state) in [
+            ("chat", 9, 0, 1, 0),
+            ("report", 1984, 0, 1, 2),
+            ("label", 1985, 1, 1, 2),
+            ("pair-removal", 4891, 0, 0, 2),
+            ("legacy-delete", 5, 1, 1, 0),
+        ] {
+            conn.execute("INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at,moderation_grant,reporting_allowed,authority_state,authority_context)
+                VALUES('group',?1,'received','author','retained history',?2,'[]',1,1,?3,?4,?5,x'aa')",rusqlite::params![id,kind,grant,allowed,state]).unwrap();
+        }
+        run(&mut conn, MIGRATIONS).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM app_events WHERE plaintext='retained history'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 5);
+        let legacy:(i64,i64)=conn.query_row("SELECT moderation_grant,authority_state FROM app_events WHERE message_id_hex='legacy-delete'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(legacy, (1, 0));
+        let label:(i64,Vec<u8>)=conn.query_row("SELECT moderation_grant,authority_context FROM app_events WHERE message_id_hex='label'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(label, (1, vec![0xaa]));
+        let pending: i64 = conn
+            .query_row(
+                "SELECT authority_state FROM app_events WHERE message_id_hex='pair-removal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        let progress: (i64, i64) = conn
+            .query_row(
+                "SELECT after_order,through_order FROM content_report_backfill",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(progress, (0, 5));
+        assert!(conn.prepare("SELECT * FROM content_moderation").is_err());
+        assert!(
+            conn.prepare("SELECT revision_id_hex FROM content_reports")
+                .is_err()
+        );
+        assert!(
+            conn.prepare("SELECT reporting_allowed FROM app_events")
+                .is_err()
+        );
+        run(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM app_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
     }
 }

@@ -1052,8 +1052,7 @@ mod tests {
         .to_content()
         .unwrap();
         let message = TimelineMessageRecord {
-            revision_id_hex: String::new(),
-            moderation: marmot_app::MessageModerationSummary::default(),
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "system-1".to_owned(),

@@ -934,7 +934,7 @@ pub struct AppMessageRecord {
     /// losing-branch tombstone.
     #[serde(default)]
     pub invalidated: bool,
-    /// Whether this delete or shared review carried an authenticated
+    /// Whether this admin deletion or dismissal label carried an authenticated
     /// source-state moderation grant when it was recorded.
     #[serde(default)]
     pub moderation_grant: bool,
@@ -6702,8 +6702,4 @@ fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), App
 mod tests;
 
 pub use cgka_traits::reporting::ReportReason;
-pub use runtime::RuntimeReportedContentSubscription;
-pub use storage_sqlite::{
-    ContentReport, ContentReportPage, MessageModerationSummary, ModerationStatus, ReportedContent,
-    ReportedContentPage,
-};
+pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};

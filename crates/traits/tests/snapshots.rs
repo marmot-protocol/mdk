@@ -654,7 +654,6 @@ fn snapshot_send_results() {
         *authority = Some(cgka_traits::app_event::AppMessageAuthority {
             source_context: [42; 32],
             moderation_grant: true,
-            reporting_allowed: false,
         });
     }
     insta::assert_json_snapshot!("result_application_message_with_authority", app);
@@ -723,7 +722,6 @@ fn snapshot_group_events() {
             authority: Some(cgka_traits::app_event::AppMessageAuthority {
                 source_context: [43; 32],
                 moderation_grant: false,
-                reporting_allowed: true,
             }),
             group_id: gid(),
             message_id: mid(),

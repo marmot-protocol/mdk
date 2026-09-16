@@ -8,8 +8,7 @@ use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
 use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
-    STREAM_TAG,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
 };
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
@@ -14472,8 +14471,8 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
 }
 
 #[tokio::test]
-async fn encrypted_content_reports_share_review_without_chat_rows() {
-    use marmot_app::{ModerationStatus, ReportReason};
+async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
+    use marmot_app::ReportReason;
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -14489,211 +14488,102 @@ async fn encrypted_content_reports_share_review_without_chat_rows() {
     alice.sync().await.unwrap();
     let group_hex = hex::encode(group.as_slice());
     let runtime = MarmotAppRuntime::new(app.clone());
-    let before = app
-        .timeline_messages_with_query(
-            "alice",
-            TimelineMessageQuery {
-                group_id_hex: Some(group_hex.clone()),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-        .messages
-        .len();
     let report = bob
-        .report_message(&group, target, target, ReportReason::Spam, "")
+        .report_message(&group, target, ReportReason::Spam, "quoted explanation")
         .await
         .unwrap();
-    let retry = bob
-        .report_message(
-            &group,
-            target,
-            target,
-            ReportReason::Other,
-            "different details",
-        )
+    let other = bob
+        .report_message(&group, target, ReportReason::Other, "")
         .await
         .unwrap();
-    assert_eq!(report.message_ids, retry.message_ids);
+    assert_ne!(report.message_ids, other.message_ids);
     alice.sync().await.unwrap();
-    assert_eq!(
-        runtime
-            .reported_content("alice", &group, true, None, 10)
+    for account in ["alice", "bob"] {
+        let page = runtime
+            .content_reports(account, &group, Some(target), None, 10)
+            .unwrap();
+        assert_eq!(page.reports.len(), 2);
+        assert!(page.reports.iter().all(|r| !r.dismissed));
+        let messages = app
+            .timeline_messages_with_query(
+                account,
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_hex.clone()),
+                    ..Default::default()
+                },
+            )
             .unwrap()
-            .pending_message_count,
-        1
-    );
-    assert_eq!(
-        app.timeline_messages_with_query(
-            "alice",
-            TimelineMessageQuery {
-                group_id_hex: Some(group_hex.clone()),
-                ..Default::default()
-            }
-        )
-        .unwrap()
-        .messages
-        .len(),
-        before
-    );
+            .messages;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].has_reports);
+    }
     assert!(
-        bob.dismiss_reports(&group, report.message_ids.clone())
+        bob.dismiss_reports(&group, report.message_ids.clone(), "no authority")
             .await
             .is_err()
     );
-    let retracted = bob.delete_message(&group, target).await.unwrap();
-    assert_eq!(
-        app.message_by_id("bob", &group_hex, &retracted.message_ids[0])
-            .unwrap()
-            .unwrap()
-            .kind,
-        MARMOT_APP_EVENT_KIND_DELETE
-    );
-    alice.sync().await.unwrap();
-    for label in ["alice", "bob"] {
-        let pending = runtime
-            .reported_content(label, &group, true, None, 10)
-            .unwrap();
-        assert_eq!(pending.pending_message_count, 1);
-        assert_eq!(
-            pending.items[0].moderation.status,
-            ModerationStatus::Pending
-        );
-        let details = runtime
-            .message_reports(label, &group, target, None, 10)
-            .unwrap();
-        assert!(details.removed_by_event_id.is_none());
-        assert!(details.reports[0].reported_text.is_none());
-        assert!(details.reports[0].reported_revision.is_none());
-        let message = details.current_message.unwrap();
-        assert!(message.deleted && message.plaintext.is_empty());
-    }
     let dismissal = alice
-        .dismiss_reports(&group, report.message_ids.clone())
-        .await
-        .unwrap();
-    let label = app
-        .message_by_id("alice", &group_hex, &dismissal.message_ids[0])
-        .unwrap()
-        .unwrap();
-    assert_eq!(label.kind, 1985);
-    assert_eq!(
-        cgka_traits::reporting::parse_dismissal(&label.tags, &label.plaintext),
-        Some(report.message_ids.clone())
-    );
-    bob.sync().await.unwrap();
-
-    assert_eq!(
-        runtime
-            .reported_content("bob", &group, false, None, 10)
-            .unwrap()
-            .items[0]
-            .moderation
-            .status,
-        ModerationStatus::Reviewed
-    );
-    // Retraction does not prohibit another member from reporting the retained
-    // message identity. That new logical report reopens shared review.
-    alice
-        .report_message(&group, target, target, ReportReason::Spam, "")
+        .dismiss_reports(&group, report.message_ids.clone(), "reviewed")
         .await
         .unwrap();
     bob.sync().await.unwrap();
-    assert_eq!(
-        runtime
-            .reported_content("bob", &group, true, None, 10)
-            .unwrap()
-            .pending_message_count,
-        1
-    );
-    let removed = alice.delete_message(&group, target).await.unwrap();
-    let removal = app
-        .message_by_id("alice", &group_hex, &removed.message_ids[0])
-        .unwrap()
-        .unwrap();
-    assert_eq!(removal.kind, 4891);
-    assert_eq!(
-        cgka_traits::reporting::parse_removal(&removal.tags, &removal.plaintext).as_deref(),
-        Some(target.as_str())
-    );
-    bob.sync().await.unwrap();
-    let after_removal = bob
-        .report_message(&group, target, target, ReportReason::Spam, "")
-        .await
-        .unwrap();
-    assert_eq!(after_removal.message_ids, report.message_ids);
-    for label in ["alice", "bob"] {
-        let details = runtime
-            .message_reports(label, &group, target, None, 10)
+    for account in ["alice", "bob"] {
+        let page = runtime
+            .content_reports(account, &group, Some(target), None, 10)
             .unwrap();
-        assert!(details.current_message.unwrap().plaintext.is_empty());
-        assert!(details.reports[0].reported_revision.is_none());
-        assert_eq!(
-            runtime
-                .reported_content(label, &group, false, None, 10)
+        assert_eq!(page.reports.iter().filter(|r| r.dismissed).count(), 1);
+        assert!(
+            page.reports
+                .iter()
+                .find(|r| r.report_id_hex == report.message_ids[0])
                 .unwrap()
-                .items[0]
-                .moderation
-                .status,
-            ModerationStatus::Removed
+                .dismissed
+        );
+        let labels = runtime
+            .report_dismissals(account, &group, &report.message_ids[0], None, 10)
+            .unwrap();
+        assert_eq!(labels.labels.len(), 1);
+        assert_eq!(labels.labels[0].event_id_hex, dismissal.message_ids[0]);
+        assert_eq!(labels.labels[0].explanation, "reviewed");
+    }
+    // Admin removal is independent of reports and also applies to their own chat.
+    let unreported = bob.send(&group, b"unreported").await.unwrap();
+    alice.sync().await.unwrap();
+    let own = alice.send(&group, b"admin message").await.unwrap();
+    for id in [target, &unreported.message_ids[0], &own.message_ids[0]] {
+        let removed = alice.delete_message(&group, id).await.unwrap();
+        assert_eq!(
+            app.message_by_id("alice", &group_hex, &removed.message_ids[0])
+                .unwrap()
+                .unwrap()
+                .kind,
+            4891
         );
     }
-
-    // The same public delete API must close review when the admin also owns
-    // the reported chat, rather than silently selecting author-only kind 5.
-    let own = alice
-        .send(&group, b"admin's own reported content")
-        .await
-        .unwrap();
-    let own_target = &own.message_ids[0];
     bob.sync().await.unwrap();
-    bob.report_message(&group, own_target, own_target, ReportReason::Spam, "")
-        .await
-        .unwrap();
-    alice.sync().await.unwrap();
-    let removed = alice.delete_message(&group, own_target).await.unwrap();
-    assert_eq!(
-        app.message_by_id("alice", &group_hex, &removed.message_ids[0])
-            .unwrap()
-            .unwrap()
-            .kind,
-        4891
-    );
-    bob.sync().await.unwrap();
-    // Once moderation already removed the admin's own target, repeating delete
-    // may still author-retract it; the existing removal outcome stays intact.
-    let repeated = alice.delete_message(&group, own_target).await.unwrap();
-    assert_eq!(
-        app.message_by_id("alice", &group_hex, &repeated.message_ids[0])
-            .unwrap()
-            .unwrap()
-            .kind,
-        MARMOT_APP_EVENT_KIND_DELETE
-    );
-    bob.sync().await.unwrap();
-    for label in ["alice", "bob"] {
-        assert_eq!(
-            runtime
-                .reported_content(label, &group, true, None, 10)
+    for account in ["alice", "bob"] {
+        for id in [target, &unreported.message_ids[0], &own.message_ids[0]] {
+            let message = runtime
+                .timeline_message(account, &group_hex, id)
                 .unwrap()
-                .pending_message_count,
-            0
-        );
-        let details = runtime
-            .message_reports(label, &group, own_target, None, 10)
+                .unwrap();
+            assert!(message.deleted && message.plaintext.is_empty());
+        }
+        let reports = runtime
+            .content_reports(account, &group, Some(target), None, 10)
             .unwrap();
-        assert_eq!(
-            details.removed_by_event_id,
-            Some(removed.message_ids[0].clone())
+        assert_eq!(reports.reports.len(), 2);
+        assert!(
+            reports
+                .reports
+                .iter()
+                .any(|r| r.explanation == "quoted explanation")
         );
-        let current = details.current_message.unwrap();
-        assert_eq!(current.moderation.status, ModerationStatus::Removed);
-        assert!(current.deleted && current.plaintext.is_empty());
     }
 }
 
 #[tokio::test]
-async fn live_report_queue_updates_without_unread_or_activity_changes() {
+async fn live_report_indicator_uses_existing_timeline_subscription() {
     use marmot_app::ReportReason;
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -14725,19 +14615,30 @@ async fn live_report_queue_updates_without_unread_or_activity_changes() {
     wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::MessageReceived(m) if m.account_id_hex==a && m.message.message_id_hex==*target)).await;
     let group_hex = hex::encode(group.as_slice());
     let before = runtime.chat_list_row(&a, &group_hex).unwrap().unwrap();
-    let mut queue = runtime
-        .subscribe_reported_content(&a, &group, true, 10)
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            &a,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(queue.snapshot.pending_message_count, 0);
-    let report = runtime
-        .report_message(&b, &group, target, target, ReportReason::Spam, "")
+    assert!(!timeline.take_snapshot().messages[0].has_reports);
+    let _report = runtime
+        .report_message(&b, &group, target, ReportReason::Spam, "")
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let page = queue.recv().await.unwrap();
-            if page.pending_message_count == 1 {
+            timeline.recv().await.unwrap();
+            if timeline
+                .take_snapshot()
+                .messages
+                .iter()
+                .any(|m| m.message_id_hex == *target && m.has_reports)
+            {
                 break;
             }
         }
@@ -14748,26 +14649,12 @@ async fn live_report_queue_updates_without_unread_or_activity_changes() {
     assert_eq!(before.unread_count, after.unread_count);
     assert_eq!(before.activity_sort_at, after.activity_sort_at);
     assert_eq!(before.last_message, after.last_message);
-    runtime
-        .dismiss_reports(&a, &group, report.message_ids)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let page = queue.recv().await.unwrap();
-            if page.pending_message_count == 0 {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
     runtime.shutdown().await;
 }
 
 #[tokio::test]
-async fn offline_member_recovers_shared_review_after_admin_demotion() {
-    use marmot_app::{ModerationStatus, ReportReason};
+async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
+    use marmot_app::ReportReason;
     let (_relay, url) = mock_relay().await;
     let dirs = [
         tempfile::tempdir().unwrap(),
@@ -14846,20 +14733,20 @@ async fn offline_member_recovers_shared_review_after_admin_demotion() {
         .unwrap();
     let target = &sent.message_ids[0];
     let report = bob
-        .report_message(&b, &group, target, target, ReportReason::Spam, "")
+        .report_message(&b, &group, target, ReportReason::Spam, "")
         .await
         .unwrap();
-    bob.dismiss_reports(&b, &group, report.message_ids)
+    bob.dismiss_reports(&b, &group, report.message_ids, "reviewed before demotion")
         .await
         .unwrap();
     timeout(Duration::from_secs(30), async {
         loop {
             if alice
-                .reported_content(&a, &group, false, None, 10)
+                .content_reports(&a, &group, None, None, 10)
                 .unwrap()
-                .items
+                .reports
                 .first()
-                .is_some_and(|i| i.moderation.status == ModerationStatus::Reviewed)
+                .is_some_and(|i| i.dismissed)
             {
                 break;
             }
@@ -14889,11 +14776,11 @@ async fn offline_member_recovers_shared_review_after_admin_demotion() {
     let recovered = timeout(Duration::from_secs(30), async {
         loop {
             if carol
-                .reported_content(&c, &group, false, None, 10)
+                .content_reports(&c, &group, None, None, 10)
                 .unwrap()
-                .items
+                .reports
                 .first()
-                .is_some_and(|i| i.moderation.status == ModerationStatus::Reviewed)
+                .is_some_and(|i| i.dismissed)
             {
                 break;
             }
@@ -14903,9 +14790,9 @@ async fn offline_member_recovers_shared_review_after_admin_demotion() {
     .await;
     assert!(
         recovered.is_ok(),
-        "offline state: epoch={:?}, queue={:?}, records={:?}",
+        "offline state: epoch={:?}, reports={:?}, records={:?}",
         carol.group_mls_state(&c, &group).await.map(|s| s.epoch),
-        carol.reported_content(&c, &group, false, None, 10),
+        carol.content_reports(&c, &group, None, None, 10),
         reopened_carol_app.messages(&c).map(|messages| messages
             .into_iter()
             .map(|m| (m.kind, m.source_epoch, m.invalidated, m.moderation_grant))
@@ -14913,11 +14800,10 @@ async fn offline_member_recovers_shared_review_after_admin_demotion() {
     );
     for (runtime, account) in [(&alice, &a), (&bob, &b), (&carol, &c)] {
         let page = runtime
-            .reported_content(account, &group, false, None, 10)
+            .content_reports(account, &group, None, None, 10)
             .unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].moderation.status, ModerationStatus::Reviewed);
-        assert_eq!(page.pending_message_count, 0);
+        assert_eq!(page.reports.len(), 1);
+        assert!(page.reports[0].dismissed);
     }
     alice.shutdown().await;
     bob.shutdown().await;

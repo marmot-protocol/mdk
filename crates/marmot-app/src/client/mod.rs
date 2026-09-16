@@ -3608,64 +3608,25 @@ impl AppClient {
         let intent = match intent {
             AppMessageIntent::Report {
                 target_message_id,
-                revision_id,
                 reason,
                 explanation,
                 ..
             } => {
-                let group = self.runtime.group_record(group_id)?;
-                let accounts: HashSet<_> = group.members.iter().map(|member| &member.id).collect();
-                if !cgka_traits::reporting::group_reporting_allowed(
-                    accounts.len(),
-                    Some(&group.name),
-                ) {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "reporting is unavailable in direct conversations".into(),
-                    ));
-                }
                 let storage = self.app.account_storage(&self.state.label)?;
                 let group_hex = hex::encode(group_id.as_slice());
-                if let Some(id) =
-                    storage.own_report(&group_hex, &target_message_id, &revision_id, &sender)?
-                    && let Some(existing) = storage.app_message(&group_hex, &id)?
-                {
-                    let event = MarmotInnerEvent::new(
-                        existing.sender,
-                        existing.recorded_at,
-                        existing.kind,
-                        existing.tags,
-                        existing.plaintext,
-                    );
-                    return Ok((
-                        event,
-                        SendSummary {
-                            published: 0,
-                            message_ids: vec![id],
-                            accept_disposition: if existing.retention.is_some() {
-                                cgka_traits::SendAcceptDisposition::Published
-                            } else {
-                                cgka_traits::SendAcceptDisposition::AcceptedPending
-                            },
-                            maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
-                        },
-                    ));
-                }
                 let author = storage
-                    .report_target_author(&group_hex, &target_message_id, &revision_id)?
+                    .report_target_author(&group_hex, &target_message_id)?
                     .ok_or_else(|| {
-                        AppError::InvalidAppMessagePayload(
-                            "report target revision is unavailable".into(),
-                        )
+                        AppError::InvalidAppMessagePayload("report target is unavailable".into())
                     })?;
                 AppMessageIntent::Report {
                     target_message_id,
-                    revision_id,
                     reason,
                     explanation,
                     target_author: Some(author),
                 }
             }
-            AppMessageIntent::DismissReports { ref report_ids } => {
+            AppMessageIntent::DismissReports { ref report_ids, .. } => {
                 if !self.delete_moderation_grant(group_id, &sender) {
                     return Err(AppError::InvalidAppMessagePayload(
                         "group admin authority required".into(),
@@ -3692,7 +3653,6 @@ impl AppClient {
                         .report_target_author(
                             &hex::encode(group_id.as_slice()),
                             &target_message_id,
-                            &target_message_id,
                         )?
                         .is_some()
                 {
@@ -3704,7 +3664,7 @@ impl AppClient {
                         ));
                     }
                     // An unavailable moderation target does not take away the
-                    // author's ordinary retraction path (e.g. after removal).
+                    // author's ordinary retraction path after invalidation or pruning.
                     AppMessageIntent::Delete { target_message_id }
                 }
             }
@@ -4201,7 +4161,6 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         message_id: &str,
-        revision_id: &str,
         reason: crate::ReportReason,
         explanation: &str,
     ) -> Result<SendSummary, AppError> {
@@ -4210,7 +4169,6 @@ impl AppClient {
                 group_id,
                 AppMessageIntent::Report {
                     target_message_id: message_id.into(),
-                    revision_id: revision_id.into(),
                     reason,
                     explanation: explanation.into(),
                     target_author: None,
@@ -4223,9 +4181,16 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         report_ids: Vec<String>,
+        explanation: &str,
     ) -> Result<SendSummary, AppError> {
         let (_, summary) = self
-            .send_app_event(group_id, AppMessageIntent::DismissReports { report_ids })
+            .send_app_event(
+                group_id,
+                AppMessageIntent::DismissReports {
+                    report_ids,
+                    explanation: explanation.into(),
+                },
+            )
             .await?;
         Ok(summary)
     }

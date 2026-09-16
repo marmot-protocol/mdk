@@ -494,8 +494,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_preserves_materialized_metadata() {
         let record = TimelineMessageRecord {
-            revision_id_hex: String::new(),
-            moderation: marmot_app::MessageModerationSummary::default(),
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "message-1".to_owned(),
@@ -621,8 +620,7 @@ mod tests {
         .to_content()
         .unwrap();
         let record = TimelineMessageRecord {
-            revision_id_hex: String::new(),
-            moderation: marmot_app::MessageModerationSummary::default(),
+            has_reports: false,
             group_system: Some({
                 let mut event =
                     marmot_app::group_system_event_from_message(1210, &content).unwrap();
@@ -676,8 +674,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
         let record = TimelineMessageRecord {
-            revision_id_hex: String::new(),
-            moderation: marmot_app::MessageModerationSummary::default(),
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "system-bad".to_owned(),

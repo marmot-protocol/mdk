@@ -1,6 +1,5 @@
 //! C mirrors of the materialized timeline conversions.
 
-use crate::types::moderation::MarmotMessageModerationSummary;
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
@@ -142,8 +141,7 @@ c_mirror! {
     MarmotTimelineMessageRecord from TimelineMessageRecordFfi,
     free marmot_timeline_message_record_free {
         str message_id_hex,
-        str revision_id_hex,
-        rec moderation: MarmotMessageModerationSummary,
+        copy has_reports: bool,
         /// Delivery marker for own (`direction == "sent"`) messages: NULL
         /// while committed-but-undelivered (render as pending/failed),
         /// the published source event id once delivered. Always set for

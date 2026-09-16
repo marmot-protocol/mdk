@@ -188,8 +188,7 @@ impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
-    pub revision_id_hex: String,
-    pub moderation: crate::MessageModerationSummaryFfi,
+    pub has_reports: bool,
     pub message_id_hex: String,
     /// Delivery marker for own (`direction == "sent"`) messages. An own send
     /// commits and projects locally *before* it publishes, so a message that
@@ -256,8 +255,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         Self {
-            revision_id_hex: value.revision_id_hex,
-            moderation: value.moderation.into(),
+            has_reports: value.has_reports,
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
             source_epoch: value.source_epoch,
@@ -652,8 +650,7 @@ mod tests {
         reply_preview: Option<TimelineReplyPreview>,
     ) -> TimelineMessageRecord {
         TimelineMessageRecord {
-            revision_id_hex: String::new(),
-            moderation: marmot_app::MessageModerationSummary::default(),
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "msg".to_owned(),

@@ -56,7 +56,6 @@ pub const MARMOT_APP_EVENT_KIND_REMOVE: u64 = 4891;
 pub struct AppMessageAuthority {
     pub source_context: [u8; 32],
     pub moderation_grant: bool,
-    pub reporting_allowed: bool,
 }
 /// Minimal durable retry evidence: no report explanation or target plaintext.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

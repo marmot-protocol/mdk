@@ -33,13 +33,11 @@ fun main() {
     val value = AccountAttentionSnapshotFfi("summary", ULong.MAX_VALUE, states.map { AccountAttentionEntryFfi("account", it) })
     val copy = FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
     check(copy == value)
-    for (status in ModerationStatusFfi.entries) {
-        val page = ReportedContentPageFfi(listOf(ReportedContentFfi("message", "edit", MessageModerationSummaryFfi(status, 2uL, 1uL))), "cursor", 1uL)
-        check(FfiConverterTypeReportedContentPageFfi.lift(FfiConverterTypeReportedContentPageFfi.lower(page)) == page)
-    }
-    val report = ContentReportFfi("report", "message", "edit", "member", ReportReasonFfi.OTHER, "explanation", 42uL, "decision", "admin", null, null)
-    val reports = ContentReportPageFfi("delete", "admin", 1uL, null, listOf(report), null)
+    val report = ContentReportFfi("report", "message", "author", "member", ReportReasonFfi.OTHER, "explanation", 42uL, true)
+    val reports = ContentReportPageFfi(listOf(report), null)
     check(FfiConverterTypeContentReportPageFfi.lift(FfiConverterTypeContentReportPageFfi.lower(reports)) == reports)
+    val labels = ReportDismissalPageFfi(listOf(ReportDismissalFfi("label", "admin", "reviewed", 43uL)), "cursor")
+    check(FfiConverterTypeReportDismissalPageFfi.lift(FfiConverterTypeReportDismissalPageFfi.lower(labels)) == labels)
     conversationRoundTrips()
     println("Kotlin C4/C5/C6 projection round trips passed")
 }
@@ -109,10 +107,11 @@ suspend fun compileBlockCommands(marmot: Marmot, account: String, user: String) 
 }
 
 suspend fun compileModerationCommands(marmot: Marmot, account: String, group: String) {
-    marmot.reportMessage(account, group, "message", "revision", ReportReasonFfi.SPAM, "")
-    marmot.dismissReports(account, group, listOf("report"))
-    marmot.messageReports(account, group, "message", null, 50u)
-    marmot.subscribeReportedContent(account, group, true, 50u).use { queue -> queue.snapshot(); queue.next() }
+    marmot.reportMessage(account, group, "message", ReportReasonFfi.SPAM, "")
+    marmot.dismissReports(account, group, listOf("report"), "reviewed")
+    marmot.contentReports(account, group, "message", null, 50u)
+    marmot.reportedMessage(account, group, "message")
+    marmot.reportDismissals(account, group, "report", null, 50u)
 }
 
 fun compileEditHistory(marmot: Marmot, account: String, group: String, target: String) {

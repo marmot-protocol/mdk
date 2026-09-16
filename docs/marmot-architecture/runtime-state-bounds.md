@@ -43,9 +43,9 @@ stable under delayed delivery and convergence; ordinary chat expiry must not cre
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| `content_moderation`, `content_reports` | One summary per reported or removed target; one report per logical `(target, revision, reporter)`. Unreported, unremoved chats have no row. | Recomputed from authenticated controls; invalidation removes withdrawn reports and empty summaries. Target pruning clears both projections; group deletion removes all rows. |
-| `content_pruned_controls` and retained control `app_events` | One marker and minimal structural record per retained deletion/report/review/removal control. Input-relative to actual controls, not chat traffic. | Retention and explicit secure erasure scrub report/review explanations and unrelated tags but preserve ids, decision references, authority verdicts and authenticated source-context provenance. Group deletion reclaims the evidence. |
-| `content_expired_targets` | At most one marker per erased chat target that had a report/moderation projection or a retained control targeting it. Ordinary expired chats create no marker. | Retained until group deletion so late target/edit/report delivery cannot resurrect moderated content or its scrubbed explanations. Repeated pruning or delivery reuses the same marker. |
+| `content_reports` | One metadata row per retained valid report event; no target summaries or logical-report grouping. | Recomputed for affected targets; event expiry/invalidation and group deletion remove rows. Target expiry does not erase reports. |
+| `content_pruned_controls` and retained control `app_events` | One marker and minimal structural record per retained kind-5 or kind-4891 deletion. | Expiry removes unrelated tags while preserving references, verdicts and source provenance. Group deletion reclaims evidence. Reports and labels use ordinary retention. |
+| `content_expired_targets` | At most one marker per erased target with retained deletion evidence. Ordinary expired chats and reports create no marker. | Retained until group deletion so late target/edit delivery cannot restore deleted content. Repeated delivery reuses the marker. |
 | `content_report_backfill` | One cursor row per account database. | Advances through the captured pre-migration prefix in batches of at most 100 events; completion retains only that progress row. |
 
 Explicit secure erasure intentionally retains these minimal moderation identifiers and branch-provenance records;

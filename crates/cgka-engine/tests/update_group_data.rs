@@ -3616,10 +3616,15 @@ async fn unresolved_moderation_proof_preserves_source_epoch_retention() {
     let payload = MarmotAppEvent::new(
         hex::encode(bob.self_id().as_slice()),
         100,
-        1984,
+        1985,
         vec![
-            vec!["e".into(), "11".repeat(32), "spam".into()],
-            vec!["p".into(), hex::encode(alice.self_id().as_slice())],
+            vec!["L".into(), "marmot.report-review.v1".into()],
+            vec![
+                "l".into(),
+                "dismissed".into(),
+                "marmot.report-review.v1".into(),
+            ],
+            vec!["e".into(), "11".repeat(32)],
         ],
         "expiring explanation",
     )
@@ -3823,7 +3828,7 @@ async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
             _ => None,
         })
         .expect("source authority is authenticated even when it denies the removal");
-    assert!(authority.reporting_allowed);
+
     assert!(!authority.moderation_grant);
 }
 
@@ -3831,7 +3836,7 @@ async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
 async fn ordinary_messages_and_author_deletion_omit_moderation_authority() {
     let (mut alice, alice_storage, mut bob, _, gid) = create_admin_pair_with_storage().await;
     alice.drain_events();
-    for kind in [9, 7, 1009, 5] {
+    for kind in [9, 7, 1009, 5, 1984] {
         let payload = MarmotAppEvent::new(
             hex::encode(bob.self_id().as_slice()),
             1,
@@ -3877,7 +3882,7 @@ async fn ordinary_messages_and_author_deletion_omit_moderation_authority() {
 }
 
 #[tokio::test]
-async fn engine_rejects_moderation_in_unnamed_two_account_groups() {
+async fn engine_allows_moderation_in_unnamed_two_account_groups() {
     let (mut alice, _, gid) = create_pair().await;
     let rename = alice
         .send(SendIntent::UpdateGroupData {
@@ -3910,7 +3915,7 @@ async fn engine_rejects_moderation_in_unnamed_two_account_groups() {
                     expected_epoch: None
                 })
                 .await,
-            Err(EngineError::InvalidAppMessagePayload(_))
+            Ok(SendResult::ApplicationMessage { .. })
         ));
     }
 }
