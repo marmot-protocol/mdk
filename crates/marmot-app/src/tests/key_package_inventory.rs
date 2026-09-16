@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use cgka_engine::key_package::key_package_metadata;
@@ -591,6 +591,41 @@ fn is_mixed_retained_without_new_current(
     retained_previous && current_ref(entries).is_none()
 }
 
+struct InventorySeamHandshake {
+    hook: Arc<dyn Fn() + Send + Sync>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+fn inventory_seam_handshake() -> InventorySeamHandshake {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    InventorySeamHandshake {
+        hook: Arc::new(move || {
+            hook_entered.notify_one();
+            let (lock, cvar) = &*hook_release;
+            let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = cvar
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }),
+        entered,
+        release,
+    }
+}
+
+impl InventorySeamHandshake {
+    fn acknowledge_writer(&self) {
+        let (lock, cvar) = &*self.release;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        cvar.notify_one();
+    }
+}
+
 fn assert_coherent_rotation_inventory(
     entries: &[crate::AccountKeyPackageInventoryEntry],
     previous_current_ref: &str,
@@ -846,7 +881,95 @@ async fn concurrent_refresh_uses_post_rotation_local_snapshot() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+async fn interleave_local_at_inventory_seam(
+    runtime: &MarmotAppRuntime,
+    account_id: &str,
+    complete_rotation_before_release: bool,
+) -> Vec<crate::AccountKeyPackageInventoryEntry> {
+    let seam = inventory_seam_handshake();
+    runtime.set_inventory_snapshot_between_reads_for_test(Some(seam.hook.clone()));
+    let local_account = account_id.to_owned();
+    let local_runtime = runtime.clone();
+    let local_read = tokio::task::spawn_blocking(move || {
+        local_runtime.local_account_key_packages(&local_account)
+    });
+    tokio::time::timeout(Duration::from_secs(2), seam.entered.notified())
+        .await
+        .expect("local snapshot must reach the ownership/lifecycle seam");
+    if complete_rotation_before_release {
+        runtime.rotate_key_package(account_id).await.unwrap();
+        seam.acknowledge_writer();
+    } else {
+        let rotate = tokio::spawn({
+            let runtime = runtime.clone();
+            let account_id = account_id.to_owned();
+            async move { runtime.rotate_key_package(&account_id).await }
+        });
+        seam.acknowledge_writer();
+        let _ = tokio::time::timeout(Duration::from_secs(5), rotate)
+            .await
+            .expect("rotation after the local snapshot must finish")
+            .unwrap()
+            .unwrap();
+    }
+    let local = tokio::time::timeout(Duration::from_secs(5), local_read)
+        .await
+        .expect("local snapshot must finish")
+        .unwrap()
+        .unwrap();
+    runtime.set_inventory_snapshot_between_reads_for_test(None);
+    local
+}
+
+async fn interleave_refresh_at_inventory_seam(
+    runtime: &MarmotAppRuntime,
+    account_id: &str,
+    complete_rotation_before_release: bool,
+) -> Vec<crate::AccountKeyPackageInventoryEntry> {
+    let seam = inventory_seam_handshake();
+    runtime.set_inventory_snapshot_between_reads_for_test(Some(seam.hook.clone()));
+    let refresh_account = account_id.to_owned();
+    let refresh_runtime = runtime.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_runtime
+            .refresh_account_key_packages(&refresh_account, vec![endpoint(DIRECTORY)])
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), seam.entered.notified())
+        .await
+        .expect("refresh snapshot must reach the ownership/lifecycle seam");
+    if complete_rotation_before_release {
+        runtime.rotate_key_package(account_id).await.unwrap();
+        seam.acknowledge_writer();
+    } else {
+        let rotate = tokio::spawn({
+            let runtime = runtime.clone();
+            let account_id = account_id.to_owned();
+            async move { runtime.rotate_key_package(&account_id).await }
+        });
+        seam.acknowledge_writer();
+        let _ = tokio::time::timeout(Duration::from_secs(5), rotate)
+            .await
+            .expect("rotation after the refresh snapshot must finish")
+            .unwrap()
+            .unwrap();
+    }
+    let refreshed = tokio::time::timeout(Duration::from_secs(5), refresh)
+        .await
+        .expect("refresh snapshot must finish")
+        .unwrap()
+        .unwrap();
+    runtime.set_inventory_snapshot_between_reads_for_test(None);
+    refreshed
+}
+
+fn current_inventory_ref(runtime: &MarmotAppRuntime, account_id: &str) -> String {
+    current_ref(&runtime.local_account_key_packages(account_id).unwrap())
+        .expect("current after interleave")
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inventory_stays_coherent_when_rotation_interleaves_ownership_and_lifecycle() {
     let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
     let before = runtime
@@ -891,48 +1014,6 @@ async fn inventory_stays_coherent_when_rotation_interleaves_ownership_and_lifecy
     let previous_current = current_ref(&local_after_split)
         .expect("post-rotation current")
         .to_owned();
-    let published = published_key_package_events(&relay);
-    seed_fetcher(&fetcher, &account, published, &[DIRECTORY]);
-
-    let between_local = Arc::new(tokio::sync::Notify::new());
-    let local_signal = between_local.clone();
-    runtime.set_inventory_snapshot_between_reads_for_test(Some(Arc::new(move || {
-        local_signal.notify_one();
-    })));
-
-    let local_account = account.account_id_hex.clone();
-    let local_runtime = runtime.clone();
-    let local_read = tokio::task::spawn_blocking(move || {
-        local_runtime.local_account_key_packages(&local_account)
-    });
-    tokio::time::timeout(Duration::from_secs(2), between_local.notified())
-        .await
-        .expect("local snapshot must reach the ownership/lifecycle seam");
-    let rotate_during_local = tokio::spawn({
-        let runtime = runtime.clone();
-        let account_id = account.account_id_hex.clone();
-        async move { runtime.rotate_key_package(&account_id).await }
-    });
-    let local = tokio::time::timeout(Duration::from_secs(5), local_read)
-        .await
-        .expect("local snapshot must finish")
-        .unwrap()
-        .unwrap();
-    assert_coherent_rotation_inventory(&local, &previous_current);
-    let _ = tokio::time::timeout(Duration::from_secs(5), rotate_during_local)
-        .await
-        .expect("rotation after the local snapshot must finish")
-        .unwrap()
-        .unwrap();
-
-    runtime.set_inventory_snapshot_between_reads_for_test(None);
-    let refresh_previous = current_ref(
-        &runtime
-            .local_account_key_packages(&account.account_id_hex)
-            .unwrap(),
-    )
-    .expect("current after local interleave")
-    .to_owned();
     seed_fetcher(
         &fetcher,
         &account,
@@ -940,38 +1021,47 @@ async fn inventory_stays_coherent_when_rotation_interleaves_ownership_and_lifecy
         &[DIRECTORY],
     );
 
-    let between_refresh = Arc::new(tokio::sync::Notify::new());
-    let refresh_signal = between_refresh.clone();
-    runtime.set_inventory_snapshot_between_reads_for_test(Some(Arc::new(move || {
-        refresh_signal.notify_one();
-    })));
+    runtime.set_inventory_snapshot_split_reads_for_test(true);
+    let split_local =
+        interleave_local_at_inventory_seam(&runtime, &account.account_id_hex, true).await;
+    assert!(
+        is_mixed_retained_without_new_current(&split_local, &previous_current),
+        "live entrypoints must mix when the snapshot wrapper is disabled"
+    );
+    let refresh_split_previous = current_inventory_ref(&runtime, &account.account_id_hex);
+    seed_fetcher(
+        &fetcher,
+        &account,
+        published_key_package_events(&relay),
+        &[DIRECTORY],
+    );
+    let split_refresh =
+        interleave_refresh_at_inventory_seam(&runtime, &account.account_id_hex, true).await;
+    assert!(
+        is_mixed_retained_without_new_current(&split_refresh, &refresh_split_previous),
+        "refresh must mix when the snapshot wrapper is disabled"
+    );
 
-    let refresh_account = account.account_id_hex.clone();
-    let refresh_runtime = runtime.clone();
-    let refresh = tokio::spawn(async move {
-        refresh_runtime
-            .refresh_account_key_packages(&refresh_account, vec![endpoint(DIRECTORY)])
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(2), between_refresh.notified())
-        .await
-        .expect("refresh snapshot must reach the ownership/lifecycle seam");
-    let rotate_during_refresh = tokio::spawn({
-        let runtime = runtime.clone();
-        let account_id = account.account_id_hex.clone();
-        async move { runtime.rotate_key_package(&account_id).await }
-    });
-    let refreshed = tokio::time::timeout(Duration::from_secs(5), refresh)
-        .await
-        .expect("refresh snapshot must finish")
-        .unwrap()
-        .unwrap();
+    runtime.set_inventory_snapshot_split_reads_for_test(false);
+    let snapshot_previous = current_inventory_ref(&runtime, &account.account_id_hex);
+    seed_fetcher(
+        &fetcher,
+        &account,
+        published_key_package_events(&relay),
+        &[DIRECTORY],
+    );
+    let local = interleave_local_at_inventory_seam(&runtime, &account.account_id_hex, false).await;
+    assert_coherent_rotation_inventory(&local, &snapshot_previous);
+    let refresh_previous = current_inventory_ref(&runtime, &account.account_id_hex);
+    seed_fetcher(
+        &fetcher,
+        &account,
+        published_key_package_events(&relay),
+        &[DIRECTORY],
+    );
+    let refreshed =
+        interleave_refresh_at_inventory_seam(&runtime, &account.account_id_hex, false).await;
     assert_coherent_rotation_inventory(&refreshed, &refresh_previous);
-    let _ = tokio::time::timeout(Duration::from_secs(5), rotate_during_refresh)
-        .await
-        .expect("rotation after the refresh snapshot must finish")
-        .unwrap()
-        .unwrap();
 
     runtime.shutdown().await;
 }

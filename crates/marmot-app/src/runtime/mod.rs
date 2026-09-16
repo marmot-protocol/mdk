@@ -3441,6 +3441,12 @@ impl MarmotAppRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_split_reads_for_test(&self, split: bool) {
+        self.accounts
+            .set_inventory_snapshot_split_reads_for_test(split);
+    }
+
+    #[cfg(test)]
     pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
         self.accounts.app_for_test()
     }
@@ -5558,6 +5564,11 @@ impl AccountManager {
         hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) {
         self.app.set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_split_reads_for_test(&self, split: bool) {
+        self.app.set_inventory_snapshot_split_reads_for_test(split);
     }
 
     #[cfg(test)]

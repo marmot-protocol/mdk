@@ -508,6 +508,8 @@ pub struct MarmotApp {
     #[cfg(test)]
     inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
+    inventory_snapshot_split_reads: Arc<AtomicBool>,
+    #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
@@ -1441,6 +1443,8 @@ impl MarmotApp {
             #[cfg(test)]
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            inventory_snapshot_split_reads: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
@@ -1525,6 +1529,8 @@ impl MarmotApp {
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            inventory_snapshot_split_reads: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
@@ -4217,6 +4223,17 @@ impl MarmotApp {
         AppError,
     > {
         let storage = self.account_storage(label)?;
+        #[cfg(test)]
+        if self.inventory_snapshot_split_reads.load(Ordering::SeqCst) {
+            let owned = cgka_engine::key_package::durably_owned_key_packages(
+                &storage,
+                cgka_traits::group::ProtocolProfile::Current,
+            )
+            .map_err(cgka_session::SessionError::from)?;
+            self.run_inventory_snapshot_between_reads_for_test();
+            let lifecycle = storage.key_package_lifecycle()?;
+            return Ok((owned, lifecycle));
+        }
         cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
             let owned = cgka_engine::key_package::durably_owned_key_packages(
                 storage,
@@ -5875,6 +5892,12 @@ impl MarmotApp {
             .inventory_snapshot_between_reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_split_reads_for_test(&self, split: bool) {
+        self.inventory_snapshot_split_reads
+            .store(split, Ordering::SeqCst);
     }
 
     #[cfg(test)]
