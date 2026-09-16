@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-16
+
+This minor release establishes a new compatibility cohort. Update generated Swift/Kotlin source and native libraries together; review changed records, enums, and CLI JSON before upgrading. Account storage advances through migration 75. Back up before upgrade; downgrade is unsupported (re-upgrade or restore a pre-upgrade backup). See [0.10.0 release notes](../../docs/release/0.10.0.md).
+
 ### Changed
 
 - Forensic audit-log uploads now resolve, validate, and pin a fresh client for each attempt, with redirects and
