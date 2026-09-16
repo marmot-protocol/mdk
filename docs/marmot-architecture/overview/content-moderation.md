@@ -28,6 +28,13 @@ publication. Kind 4891 references
 the original message and carries `{"v":1,"action":"remove"}`. This does not
 extend NIP-09 authorization.
 
+An author retraction hides the content without resolving its reports. Only an
+effective kind-4891 control gives `ModerationStatus::Removed` and removal
+attribution; kind-5 tombstones keep pending/reviewed report state independent of
+content availability. Later reports can reopen a retracted message's review.
+Convergence withdrawal of a kind-4891 control reopens unresolved reports even
+when an author tombstone still hides the body.
+
 The runtime, UniFFI, and C surfaces expose bounded `reported_content` and
 `message_reports` pages, report/revision metadata, moderation summaries, and a
 `subscribe_reported_content` snapshot plus live updates. Review details include
@@ -63,6 +70,11 @@ rollback guard and authenticates the ciphertext and payload there before reading
 its policy. An equal epoch number on a different branch is insufficient. The
 guard restores live ratchets and group state even on failure. Out-of-epoch replay
 emits unresolved authority instead of nesting another rewind inside replay.
+
+A successful source probe supplies both authority and retention. If its
+authentication fails, ingestion keeps the existing source-epoch retention
+fallback used by ordinary messages, while authority remains unresolved. Failure
+to prove moderation authority must not exempt report explanations from expiry.
 
 A separate durable retry record retains the source ID, sender, epoch and payload
 digest without plaintext. Only kinds 1984, 1985, and 4891 enter this path;

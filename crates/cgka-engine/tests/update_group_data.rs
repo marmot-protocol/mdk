@@ -3593,6 +3593,132 @@ async fn unavailable_moderation_authority_survives_restart_and_resolves_later() 
 }
 
 #[tokio::test]
+async fn unresolved_moderation_proof_preserves_source_epoch_retention() {
+    use tls_codec::Deserialize as _;
+    let (mut alice, storage, mut bob, _, gid) = create_admin_pair_with_storage().await;
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match update {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(route_to_group(&commit, &gid)).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    let payload = MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        100,
+        1984,
+        vec![
+            vec!["e".into(), "11".repeat(32), "spam".into()],
+            vec!["p".into(), hex::encode(alice.self_id().as_slice())],
+        ],
+        "expiring explanation",
+    )
+    .encode()
+    .unwrap();
+    let (message, epoch) = match bob
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage {
+            msg, source_epoch, ..
+        } => (route_to_group(&msg, &gid), source_epoch),
+        _ => unreachable!(),
+    };
+    // An otherwise correct source snapshot can no longer authenticate a
+    // ciphertext once its sender ratchet has consumed it. The live receiver
+    // still has its unused past-epoch ratchet and can deliver the report.
+    storage
+        .create_group_state_snapshot(&gid, "test-before-report")
+        .unwrap();
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let protocol = openmls::prelude::MlsMessageIn::tls_deserialize_exact(&message.payload)
+        .unwrap()
+        .try_into_protocol_message()
+        .unwrap();
+    group.process_message(&provider, protocol).unwrap();
+    storage
+        .create_group_state_snapshot(&gid, "test-consumed-report")
+        .unwrap();
+    storage
+        .rollback_group_state_to_snapshot(&gid, "test-before-report")
+        .unwrap();
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 0u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let pending = match update {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    storage
+        .create_group_state_snapshot(&gid, "test-current-report-state")
+        .unwrap();
+    storage
+        .rollback_group_state_to_snapshot(&gid, "test-consumed-report")
+        .unwrap();
+    storage
+        .create_group_state_snapshot(&gid, &format!("openmls-retained-anchor-{}", epoch.0))
+        .unwrap();
+    storage
+        .rollback_group_state_to_snapshot(&gid, "test-current-report-state")
+        .unwrap();
+    alice.drain_events();
+    alice.ingest(message).await.unwrap();
+    let (authority, retention) = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived {
+                authority,
+                retention,
+                ..
+            } => Some((authority, retention)),
+            _ => None,
+        })
+        .expect("report remains deliverable using live past-epoch secrets");
+    assert!(
+        authority.is_none(),
+        "consumed snapshot cannot prove moderation authority"
+    );
+    assert_eq!(retention, Some(AppMessageRetentionDecision::new(100, 60)));
+    let pending = storage
+        .pending_application_authority_batch(None, 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].retention, retention);
+}
+
+#[tokio::test]
 async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
     let (mut alice, _, mut bob, bob_storage, gid) = create_admin_pair_with_storage().await;
     // Bob loses admin authority in the source epoch of the malicious removal.

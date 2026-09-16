@@ -111,6 +111,25 @@ fn report_reference<'a>(
     ))
 }
 
+// Content deletion and moderation removal are separate facts. A later kind-5
+// tombstone may own the timeline's deletion attribution without superseding an
+// effective kind-4891 decision. Select that decision from its indexed edges.
+fn effective_removal(
+    conn: &Connection,
+    group: &str,
+    target: &str,
+) -> StorageResult<Option<RawAppEvent>> {
+    Ok(
+        app_events_targeting_message_tx(conn, group, MARMOT_APP_EVENT_KIND_REMOVE, target)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.moderation_grant
+                    && parse_removal(&event.tags, &event.plaintext).as_deref() == Some(target)
+            }),
+    )
+}
+
 pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageResult<()> {
     // Most timeline rows have no moderation state. Probe indexed keys before
     // loading raw content or edits, including when a non-chat event is projected.
@@ -119,15 +138,17 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
         .query_row_cached(
             "SELECT EXISTS (
                 SELECT 1 FROM message_modifier_edges
-                WHERE group_id_hex = ?1 AND target_message_id_hex = ?2 AND kind = ?3
-             ) OR EXISTS (
-                SELECT 1 FROM message_timeline
-                WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND deleted = 1
+                WHERE group_id_hex = ?1 AND target_message_id_hex = ?2 AND kind IN (?3, ?4)
              ) OR EXISTS (
                 SELECT 1 FROM content_moderation
                 WHERE group_id_hex = ?1 AND message_id_hex = ?2
              )",
-            params![group, target, u64_to_i64(MARMOT_APP_EVENT_KIND_REPORT)?],
+            params![
+                group,
+                target,
+                u64_to_i64(MARMOT_APP_EVENT_KIND_REPORT)?,
+                u64_to_i64(MARMOT_APP_EVENT_KIND_REMOVE)?
+            ],
             |row| row.get(0),
         )
         .storage()?;
@@ -158,17 +179,18 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
     }
     // The reported revision remains stable, while the current revision follows
     // the shared accepted-edit projection (including retracted edits).
-    let (latest, deleted) = conn
+    let latest = conn
         .query_row_cached(
-            "SELECT json_extract(edit_json, '$.latest_edit_message_id_hex'), deleted
+            "SELECT json_extract(edit_json, '$.latest_edit_message_id_hex')
              FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group, target],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()
         .storage()?
-        .unwrap_or((None, false));
+        .flatten();
     let latest = latest.unwrap_or_else(|| target.to_owned());
+    let removed = effective_removal(conn, group, target)?.is_some();
     let candidates =
         app_events_targeting_message_tx(conn, group, MARMOT_APP_EVENT_KIND_REPORT, target)?;
     // Group duplicates before applying dismissal: a new duplicate event can
@@ -215,7 +237,7 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
         }
         dismissals.sort_by_key(|e| (e.recorded_at, e.message_id_hex.clone()));
         let dismissal = dismissals.first().map(|e| e.message_id_hex.as_str());
-        if dismissal.is_none() && !deleted {
+        if dismissal.is_none() && !removed {
             pending += 1;
         }
         conn.execute_cached(
@@ -236,7 +258,7 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
         )
         .storage()?;
     }
-    if total == 0 && !deleted {
+    if total == 0 && !removed {
         conn.execute_cached(
             "DELETE FROM content_moderation WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group, target],
@@ -253,7 +275,7 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
                 total_reports = excluded.total_reports,
                 pending_reports = excluded.pending_reports,
                 removed = excluded.removed",
-            params![group, target, latest, total, pending, deleted],
+            params![group, target, latest, total, pending, removed],
         )
         .storage()?;
     }
@@ -271,7 +293,7 @@ pub(super) fn hydrate(
             || message.message_id_hex.clone(),
             |edit| edit.latest_edit_message_id_hex.clone(),
         );
-        message.moderation = summary(0, 0, message.deleted);
+        message.moderation = MessageModerationSummary::default();
     }
     let groups: BTreeSet<_> = messages.iter().map(|m| m.group_id_hex.clone()).collect();
     for group in groups {
@@ -446,12 +468,12 @@ impl SqliteAccountStorage {
             .prepare_cached(
                 "SELECT r.report_id_hex, r.revision_id_hex, r.reporter, r.reason,
                     e.plaintext, r.reported_at, r.dismissed_by, d.sender,
-                    CASE WHEN m.removed = 0 THEN v.plaintext ELSE NULL END
+                    CASE WHEN t.deleted = 0 THEN v.plaintext ELSE NULL END
              FROM content_reports r
              JOIN app_events e
                ON e.group_id_hex = r.group_id_hex AND e.message_id_hex = r.report_id_hex
-             JOIN content_moderation m
-               ON m.group_id_hex = r.group_id_hex AND m.message_id_hex = r.message_id_hex
+             LEFT JOIN message_timeline t
+               ON t.group_id_hex = r.group_id_hex AND t.message_id_hex = r.message_id_hex
              LEFT JOIN app_events d
                ON d.group_id_hex = r.group_id_hex AND d.message_id_hex = r.dismissed_by
              LEFT JOIN app_events v
@@ -516,16 +538,15 @@ impl SqliteAccountStorage {
                 });
             }
         }
-        let removed_by_event_id = current_message
-            .as_ref()
-            .and_then(|m| m.deleted_by_message_id_hex.clone());
-        let removal = removed_by_event_id
-            .as_ref()
-            .map(|id| raw(&conn, group, id))
-            .transpose()?
-            .flatten();
+        let removal = if current_message.as_ref().is_some_and(|m| {
+            m.kind == MARMOT_APP_EVENT_KIND_CHAT && m.moderation.status == ModerationStatus::Removed
+        }) {
+            effective_removal(&conn, group, target)?
+        } else {
+            None
+        };
         Ok(ContentReportPage {
-            removed_by_event_id,
+            removed_by_event_id: removal.as_ref().map(|e| e.message_id_hex.clone()),
             removing_account: removal.as_ref().map(|e| e.sender.clone()),
             removed_at: removal.as_ref().map(|e| e.recorded_at),
             current_message,
@@ -547,8 +568,8 @@ impl SqliteAccountStorage {
         };
         let removed: bool = conn
             .query_row_cached(
-                "SELECT EXISTS (SELECT 1 FROM message_timeline
-             WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND deleted = 1)",
+                "SELECT EXISTS (SELECT 1 FROM content_moderation
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND removed = 1)",
                 params![group, target],
                 |row| row.get(0),
             )
@@ -1722,6 +1743,135 @@ mod tests {
             let cross = s.reported_content(&id(98), false, None, 10).unwrap();
             assert_eq!(cross.items[0].moderation.status, ModerationStatus::Pending);
             assert_eq!(cross.pending_message_count, 1);
+        }
+    }
+
+    #[test]
+    fn author_deletion_hides_content_without_closing_shared_review() {
+        let mut chat = target();
+        chat.tags.push(vec![
+            "imeta".into(),
+            "url https://example.com/image.png".into(),
+            "m image/png".into(),
+        ]);
+        let events = [
+            chat,
+            report(2, 11, 1),
+            event(4, 10, 5, vec![vec!["e".into(), id(1)]], ""),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let s = SqliteAccountStorage::in_memory().unwrap();
+            for index in order {
+                s.record_app_event(&events[index]).unwrap();
+            }
+            // A delayed edit cannot expose the retracted body either.
+            s.record_app_event(&event(3, 10, 1009, vec![vec!["e".into(), id(1)]], "edited"))
+                .unwrap();
+            for rebuild in [false, true] {
+                if rebuild {
+                    s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                }
+                let pending = s.reported_content(&id(99), true, None, 10).unwrap();
+                assert_eq!(pending.pending_message_count, 1);
+                assert_eq!(
+                    pending.items[0].moderation.status,
+                    ModerationStatus::Pending
+                );
+                assert_eq!(pending.items[0].moderation.pending_reports, 1);
+                assert_eq!(
+                    s.report_target_author(&id(99), &id(1), &id(1)).unwrap(),
+                    Some(id(10))
+                );
+                let details = s.message_reports(&id(99), &id(1), None, 10).unwrap();
+                assert!(details.removed_by_event_id.is_none());
+                assert!(details.removing_account.is_none());
+                assert!(details.removed_at.is_none());
+                assert!(details.reports[0].reported_text.is_none());
+                assert!(details.reports[0].reported_revision.is_none());
+                let current = details.current_message.unwrap();
+                assert!(current.deleted && current.plaintext.is_empty() && current.media.is_none());
+            }
+            s.record_app_event(&dismiss(5, &[2])).unwrap();
+            assert_eq!(
+                page(&s).items[0].moderation.status,
+                ModerationStatus::Reviewed
+            );
+            s.record_app_event(&report(6, 12, 1)).unwrap();
+            assert_eq!(page(&s).pending_message_count, 1);
+            assert_eq!(page(&s).items[0].moderation.pending_reports, 1);
+        }
+    }
+
+    #[test]
+    fn admin_removal_and_author_deletion_keep_independent_effects_and_attribution() {
+        for reverse in [false, true] {
+            let s = SqliteAccountStorage::in_memory().unwrap();
+            s.record_app_event(&target()).unwrap();
+            s.record_app_event(&report(2, 11, 1)).unwrap();
+            let controls = [
+                removal(3, 1),
+                event(4, 10, 5, vec![vec!["e".into(), id(1)]], ""),
+            ];
+            for index in if reverse { [1, 0] } else { [0, 1] } {
+                s.record_app_event(&controls[index]).unwrap();
+            }
+            for rebuild in [false, true] {
+                if rebuild {
+                    s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                }
+                assert_eq!(page(&s).pending_message_count, 0);
+                assert_eq!(
+                    page(&s).items[0].moderation.status,
+                    ModerationStatus::Removed
+                );
+                assert!(
+                    s.report_target_author(&id(99), &id(1), &id(1))
+                        .unwrap()
+                        .is_none()
+                );
+                let details = s.message_reports(&id(99), &id(1), None, 10).unwrap();
+                assert_eq!(details.removed_by_event_id, Some(id(3)));
+                assert_eq!(details.removing_account, Some(id(20)));
+                assert_eq!(details.removed_at, Some(3));
+            }
+            s.invalidate_app_event_by_source(&id(3), "losing_branch")
+                .unwrap();
+            for rebuild in [false, true] {
+                if rebuild {
+                    s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                }
+                assert_eq!(page(&s).pending_message_count, 1);
+                let details = s.message_reports(&id(99), &id(1), None, 10).unwrap();
+                assert!(details.removed_by_event_id.is_none());
+                assert!(details.reports[0].reported_text.is_none());
+                let current = details.current_message.unwrap();
+                assert!(current.deleted && current.plaintext.is_empty());
+                assert_eq!(current.moderation.status, ModerationStatus::Pending);
+            }
+        }
+    }
+
+    #[test]
+    fn unreported_author_deletion_has_no_admin_removal_projection() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        s.record_app_event(&target()).unwrap();
+        s.record_app_event(&event(2, 10, 5, vec![vec!["e".into(), id(1)]], ""))
+            .unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            assert_eq!(moderation_rows(&s), 0);
+            let current = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert!(current.deleted);
+            assert_eq!(current.moderation.status, ModerationStatus::Unreported);
         }
     }
 

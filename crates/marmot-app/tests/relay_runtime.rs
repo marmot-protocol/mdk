@@ -14524,6 +14524,33 @@ async fn encrypted_content_reports_share_review_without_chat_rows() {
             .await
             .is_err()
     );
+    let retracted = bob.delete_message(&group, target).await.unwrap();
+    assert_eq!(
+        app.message_by_id("bob", &group_hex, &retracted.message_ids[0])
+            .unwrap()
+            .unwrap()
+            .kind,
+        5
+    );
+    alice.sync().await.unwrap();
+    for label in ["alice", "bob"] {
+        let pending = runtime
+            .reported_content(label, &group, true, None, 10)
+            .unwrap();
+        assert_eq!(pending.pending_message_count, 1);
+        assert_eq!(
+            pending.items[0].moderation.status,
+            ModerationStatus::Pending
+        );
+        let details = runtime
+            .message_reports(label, &group, target, None, 10)
+            .unwrap();
+        assert!(details.removed_by_event_id.is_none());
+        assert!(details.reports[0].reported_text.is_none());
+        assert!(details.reports[0].reported_revision.is_none());
+        let message = details.current_message.unwrap();
+        assert!(message.deleted && message.plaintext.is_empty());
+    }
     let dismissal = alice
         .dismiss_reports(&group, report.message_ids.clone())
         .await
@@ -14547,6 +14574,20 @@ async fn encrypted_content_reports_share_review_without_chat_rows() {
             .moderation
             .status,
         ModerationStatus::Reviewed
+    );
+    // Retraction does not prohibit another member from reporting the retained
+    // message identity. That new logical report reopens shared review.
+    alice
+        .report_message(&group, target, target, ReportReason::Spam, "")
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+    assert_eq!(
+        runtime
+            .reported_content("bob", &group, true, None, 10)
+            .unwrap()
+            .pending_message_count,
+        1
     );
     let removed = alice.delete_message(&group, target).await.unwrap();
     let removal = app

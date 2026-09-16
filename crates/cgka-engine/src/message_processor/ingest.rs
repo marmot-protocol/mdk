@@ -1386,20 +1386,18 @@ impl<S: StorageProvider> Engine<S> {
                         crate::app_components::message_retention_seconds_of_group(&mls_group)?
                             .unwrap_or(0),
                     )
-                } else if needs_authority {
-                    // One authenticated source visit supplies both policies.
-                    historical_source
+                } else {
+                    // Successful authentication supplies both policies in one
+                    // visit. If it remains unresolved, retain the ordinary
+                    // source-epoch retention fallback; missing moderation proof
+                    // must not exempt report explanations from expiry.
+                    let recovered = historical_source
                         .as_ref()
                         .map(|source| source.retention_seconds)
                         .or_else(|| {
                             recovered_source_retention.and_then(|(epoch, seconds)| {
                                 (epoch == msg_epoch).then_some(seconds.unwrap_or(0))
                             })
-                        })
-                } else {
-                    let recovered =
-                        recovered_source_retention.and_then(|(snapshot_epoch, seconds)| {
-                            (snapshot_epoch == msg_epoch).then_some(seconds.unwrap_or(0))
                         });
                     match recovered {
                         Some(seconds) => Some(seconds),
