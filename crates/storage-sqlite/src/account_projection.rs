@@ -2039,7 +2039,7 @@ impl SqliteAccountStorage {
         // Single-source the column list + replay ordering so the query order and
         // the runtime recovery watermark/suppression (via `AppEventReplayCursor`)
         // cannot drift (#630, #736). The limited variants take the newest-first
-        // `LIMIT` window, then re-sort ascending into replay order.
+        // `LIMIT` window, then reverse that bounded page into replay order.
         let cols = APP_EVENT_REPLAY_COLUMNS;
         let asc = APP_EVENT_REPLAY_ORDER_ASC;
         let desc = APP_EVENT_REPLAY_ORDER_DESC;
@@ -2070,13 +2070,7 @@ impl SqliteAccountStorage {
             format!("WHERE {}", conditions.join(" AND "))
         };
         let sql = match query.limit {
-            Some(_) => format!(
-                "SELECT {cols} FROM (
-                    SELECT {cols} FROM app_events
-                    {where_sql}
-                    ORDER BY {desc} LIMIT ?
-                 ) ORDER BY {asc}"
-            ),
+            Some(_) => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {desc} LIMIT ?"),
             None => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {asc}"),
         };
         if let Some(limit) = query.limit {
@@ -2087,7 +2081,13 @@ impl SqliteAccountStorage {
         let rows = statement
             .query_map(params_from_iter(values.iter()), app_message_from_row)
             .storage()?;
-        rows.collect::<Result<Vec<_>, _>>().storage()
+        let mut records = rows.collect::<Result<Vec<_>, _>>().storage()?;
+        if query.limit.is_some() {
+            // DESC reverses every component of the unique replay key. Reversing
+            // the selected page avoids copying wide rows through a SQL sorter.
+            records.reverse();
+        }
+        Ok(records)
     }
 
     /// Resolve one durable raw app event without scanning group history.

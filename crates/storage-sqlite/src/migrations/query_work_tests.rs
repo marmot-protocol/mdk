@@ -1,6 +1,6 @@
 use crate::SqliteAccountStorage;
 use crate::encrypted_media_secrets::retire_unreferenced_encrypted_media_secret_epochs_tx;
-use crate::query_work_test_support::{QUERY_MEASUREMENT, measured};
+use crate::query_work_test_support::{QUERY_MEASUREMENT, measure, measured};
 use std::collections::BTreeSet;
 
 fn seed_query_history(conn: &rusqlite::Connection, count: i64) {
@@ -176,12 +176,15 @@ fn replay_query_work() {
     use openmls_traits::storage::StorageProvider;
 
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    let mut recent_message_steps = None;
     for count in [256, 4_096] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let now = crate::unix_now_seconds();
         seed_replay_history(&store, count, i64::try_from(now).unwrap());
 
-        let messages = measured(&store, "account recent messages", 1_000, || {
+        // Keep the existing page budget even with source-authority columns,
+        // and independently pin that growing history adds no VM work.
+        let (messages, steps) = measure(&store, || {
             store
                 .app_messages(crate::StoredAppMessageQuery {
                     group_id_hex: None,
@@ -190,6 +193,13 @@ fn replay_query_work() {
                 })
                 .unwrap()
         });
+        assert!(steps < 1_000, "account recent messages: {steps} >= 1000");
+        if let Some(previous) = recent_message_steps.replace(steps) {
+            assert_eq!(
+                steps, previous,
+                "recent-page VM work must not grow with history"
+            );
+        }
         assert_eq!(
             messages
                 .iter()
