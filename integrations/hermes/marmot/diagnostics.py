@@ -51,6 +51,9 @@ DISCONNECT_REASONS = (
 )
 
 REDACT_TOKENS = ("token", "secret", "nsec", "password", "authorization")
+INBOUND_MEDIA_KINDS = ("document", "image", "video", "voice")
+OUTBOUND_MEDIA_KINDS = ("document", "image", "video", "voice")
+ACCOUNT_ID_HEX_LEN = 64
 
 
 def redacted(text: str) -> str:
@@ -165,6 +168,80 @@ def normalize_home_route(value: Any) -> Optional[str]:
     return lowered
 
 
+def normalize_account_id(value: Any) -> Optional[str]:
+    route = normalize_home_route(value)
+    if route is None or len(route) != ACCOUNT_ID_HEX_LEN:
+        return None
+    return route
+
+
+def parse_config_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if not text:
+        return default
+    return text not in {"0", "false", "no", "off", "disabled"}
+
+
+def first_config_value(extra: dict[str, Any], *keys: str, env: Optional[str] = None) -> Any:
+    if env:
+        value = os.getenv(env)
+        if value:
+            return value
+    for key in keys:
+        value = extra.get(key)
+        if value:
+            return value
+    return None
+
+
+def identity_digest(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def media_fingerprint_value() -> dict[str, Any]:
+    return {
+        "inbound": list(INBOUND_MEDIA_KINDS),
+        "outbound": list(OUTBOUND_MEDIA_KINDS),
+    }
+
+
+def host_outbound_dispatch_status() -> Optional[bool]:
+    module = sys.modules.get("gateway.platforms.base")
+    if module is None:
+        return None
+    return getattr(module, "MediaKind", None) is not None
+
+
+def media_capability_status(*, host_outbound_dispatch: Optional[bool] = None) -> dict[str, Any]:
+    status = media_fingerprint_value()
+    if host_outbound_dispatch is None:
+        host_outbound_dispatch = host_outbound_dispatch_status()
+    status["host_outbound_dispatch"] = host_outbound_dispatch
+    return status
+
+
+def bounded_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def report_exit_code(report: dict[str, Any]) -> int:
+    if "exit_code" not in report:
+        return 1
+    try:
+        return int(report["exit_code"])
+    except (TypeError, ValueError):
+        return 1
+
+
 def config_fingerprint(fields: dict[str, Any]) -> str:
     canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -178,17 +255,163 @@ def nonsecret_config_fields(
     account_id_hex: Optional[str],
     socket_path: Optional[str],
     home_route: Optional[str],
-    media: dict[str, Any],
+    media: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    normalized_socket = str(Path(socket_path).expanduser()) if socket_path else ""
     return {
         "senders": sorted({item.lower() for item in senders if item}),
         "allow_all": bool(allow_all),
         "welcomers": sorted({item.lower() for item in welcomers if item}),
-        "account_selected": bool(account_id_hex),
-        "socket_configured": bool(socket_path),
+        "account": identity_digest(account_id_hex),
+        "socket": identity_digest(normalized_socket),
         "home_route": home_route or "",
-        "media": media,
+        "media": media if media is not None else media_fingerprint_value(),
     }
+
+
+def merge_hermes_marmot_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    home_channel: Any = None
+    home_platform: Optional[str] = None
+    if not isinstance(config, dict):
+        return {"extra": extra, "home_channel": None, "home_platform": None}
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict) and isinstance(platforms.get("marmot"), dict):
+        platform = platforms["marmot"]
+        home_channel, home_platform = _home_channel_fields(platform.get("home_channel"))
+        nested = platform.get("extra")
+        if isinstance(nested, dict):
+            extra.update(nested)
+        else:
+            for key, value in platform.items():
+                if key in {"extra", "home_channel", "enabled", "name"} or value in (None, ""):
+                    continue
+                extra.setdefault(key, value)
+    plugins = config.get("plugins")
+    if isinstance(plugins, dict) and isinstance(plugins.get("entries"), dict):
+        plugin = plugins["entries"].get("marmot")
+        if isinstance(plugin, dict) and isinstance(plugin.get("settings"), dict):
+            settings = plugin["settings"]
+            for key, value in settings.items():
+                if value in (None, "") or key in extra:
+                    continue
+                extra[key] = value
+            if home_channel in (None, ""):
+                home_channel, home_platform = _home_channel_fields(settings.get("home_channel"))
+    return {
+        "extra": extra,
+        "home_channel": home_channel,
+        "home_platform": home_platform,
+    }
+
+
+def _home_channel_fields(raw: Any) -> tuple[Any, Optional[str]]:
+    if isinstance(raw, dict):
+        platform = raw.get("platform")
+        return raw.get("chat_id"), str(platform).strip().lower() if platform not in (None, "") else None
+    if isinstance(raw, str):
+        return raw, None
+    return None, None
+
+
+def resolve_home_route(
+    extra: dict[str, Any],
+    *,
+    home_channel: Any = None,
+    home_platform: Optional[str] = None,
+    override: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    if override:
+        route = normalize_home_route(override)
+        return route, "invalid" if route is None else None
+    if home_platform and home_platform not in {"marmot"}:
+        return None, "wrong_platform"
+    if isinstance(home_channel, dict) or home_channel in (None, ""):
+        raw = home_channel if isinstance(home_channel, dict) else extra.get("home_channel")
+        if raw not in (None, ""):
+            home_channel, extra_platform = _home_channel_fields(raw)
+            if extra_platform:
+                home_platform = extra_platform
+    if home_platform and home_platform not in {"marmot"}:
+        return None, "wrong_platform"
+    if home_channel in (None, ""):
+        return None, None
+    route = normalize_home_route(home_channel)
+    return route, "invalid" if route is None else None
+
+
+def resolve_account_id(
+    extra: dict[str, Any],
+    *,
+    override: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    candidate = override if override not in (None, "") else first_config_value(
+        extra, "account_id_hex", "account", env="MARMOT_ACCOUNT_ID_HEX"
+    )
+    if candidate in (None, ""):
+        return None, "auto"
+    account = normalize_account_id(candidate)
+    if account is None:
+        return None, "invalid"
+    return account, "explicit"
+
+
+def resolve_socket_path(extra: dict[str, Any], *, fallback: Optional[Path] = None) -> Optional[Path]:
+    configured = first_config_value(extra, "socket_path", "agent_socket", "socket", env="MARMOT_AGENT_SOCKET")
+    if configured:
+        return Path(str(configured)).expanduser()
+    home = first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME")
+    if home:
+        return Path(str(home)).expanduser() / "dev" / "wn-agent.sock"
+    return Path(fallback).expanduser() if fallback is not None else None
+
+
+def resolve_auth_token(
+    extra: dict[str, Any],
+    *,
+    token: Optional[str] = None,
+    token_file: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    if token not in (None, ""):
+        stripped = str(token).strip()
+        return (stripped or None), None if stripped else "empty"
+    if token_file not in (None, ""):
+        return _read_auth_token_file(token_file)
+    configured = first_config_value(extra, "auth_token", "agent_auth_token", env="MARMOT_AGENT_AUTH_TOKEN")
+    if configured not in (None, ""):
+        stripped = str(configured).strip()
+        return (stripped or None), None if stripped else "empty"
+    configured_file = first_config_value(
+        extra, "auth_token_file", "agent_auth_token_file", env="MARMOT_AGENT_AUTH_TOKEN_FILE"
+    )
+    if configured_file in (None, ""):
+        return None, None
+    return _read_auth_token_file(configured_file)
+
+
+def _read_auth_token_file(path_value: Any) -> tuple[Optional[str], Optional[str]]:
+    path = Path(str(path_value)).expanduser()
+    try:
+        loaded = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, "unreadable"
+    return (loaded or None), None if loaded else "empty"
+
+
+def resolve_welcomers(extra: dict[str, Any]) -> list[str]:
+    raw = extra.get("welcomer_allowlist") or extra.get("allow_welcomers") or extra.get("welcomerAllowlist")
+    if raw in (None, ""):
+        raw = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    if not isinstance(raw, list):
+        return []
+    values = []
+    for item in raw:
+        normalized = normalize_home_route(item)
+        if normalized:
+            values.append(normalized)
+    return values
 
 
 @dataclass
@@ -206,12 +429,23 @@ class PluginObservations:
     welcomer_count: int = 0
     account_selected: bool = False
     home_configured: bool = False
+    loaded_home_digest: str = ""
     media: dict[str, Any] = field(default_factory=dict)
+    _recovery_pending: bool = False
 
-    def snapshot(self, expected_fingerprint: Optional[str] = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        expected_fingerprint: Optional[str] = None,
+        expected_home_digest: Optional[str] = None,
+    ) -> dict[str, Any]:
         match: Optional[bool] = None
         if expected_fingerprint and self.loaded_fingerprint:
             match = expected_fingerprint == self.loaded_fingerprint
+        home_matches: Optional[bool] = None
+        if expected_home_digest:
+            home_matches = bool(self.loaded_home_digest) and expected_home_digest == self.loaded_home_digest
+        elif self.loaded_home_digest:
+            home_matches = None
         return {
             "schema_version": SCHEMA_VERSION,
             "lifecycle": self.state,
@@ -226,17 +460,27 @@ class PluginObservations:
             "welcomer_count": self.welcomer_count,
             "account_selected": self.account_selected,
             "home_configured": self.home_configured,
-            "media_ready": bool(self.media),
+            "home_matches": home_matches,
+            "media_ready": bool(self.media.get("inbound") or self.media.get("outbound") or self.media),
             "plugin_version": self.plugin_version,
         }
 
     def mark(self, state: str, *, reason: Optional[str] = None) -> None:
         if state not in LIFECYCLE_STATES:
             state = "failed"
-        if state == "reconnecting" and self.state == "established":
+        previous = self.state
+        if state == "reconnecting" and previous == "established":
             self.reconnect_count += 1
-        if state == "established" and self.state in {"reconnecting", "failed"}:
+            self._recovery_pending = True
+        if state == "failed" and previous not in {"failed", "stopped"}:
+            self._recovery_pending = True
+        if state == "awaiting_ack" and previous in {"reconnecting", "failed"}:
+            self._recovery_pending = True
+        if state == "established" and (previous in {"reconnecting", "failed"} or self._recovery_pending):
             self.recovery_count += 1
+            self._recovery_pending = False
+        if state == "stopped":
+            self._recovery_pending = False
         if reason == "resync_required":
             self.resync_count += 1
         if reason in DISCONNECT_REASONS:
@@ -289,14 +533,17 @@ class DiagnosticSocketServer:
                 fingerprint = request.get("config_fingerprint")
                 if fingerprint is not None and not isinstance(fingerprint, str):
                     fingerprint = None
+                home_digest = request.get("home_route_digest")
+                if home_digest is not None and not isinstance(home_digest, str):
+                    home_digest = None
                 payload = json.dumps(
-                    self.observations.snapshot(fingerprint),
+                    self.observations.snapshot(fingerprint, expected_home_digest=home_digest),
                     separators=(",", ":"),
                     sort_keys=True,
                 ).encode("utf-8") + b"\n"
                 writer.write(payload)
                 await asyncio.wait_for(writer.drain(), timeout=IO_TIMEOUT_S)
-        except (asyncio.TimeoutError, OSError):
+        except (asyncio.TimeoutError, OSError, ValueError):
             return
         finally:
             try:
@@ -483,6 +730,7 @@ async def read_plugin_status(
     hermes_home: Path,
     *,
     config_fingerprint_hex: Optional[str] = None,
+    expected_home_digest: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     path = diagnostics_socket_path(hermes_home)
     if path.is_symlink() or not path.exists():
@@ -500,6 +748,8 @@ async def read_plugin_status(
         payload = {"schema_version": SCHEMA_VERSION, "type": "status"}
         if config_fingerprint_hex:
             payload["config_fingerprint"] = config_fingerprint_hex
+        if expected_home_digest:
+            payload["home_route_digest"] = expected_home_digest
         writer.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
         await asyncio.wait_for(writer.drain(), timeout=IO_TIMEOUT_S)
         line = await asyncio.wait_for(reader.readline(), timeout=IO_TIMEOUT_S)

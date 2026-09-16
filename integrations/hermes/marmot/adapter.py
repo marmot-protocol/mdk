@@ -1661,26 +1661,45 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     def _load_observation_config(self, extra: Dict[str, Any]) -> None:
         senders = self._loaded_sender_ids(extra)
-        allow_all = bool(extra.get("allow_all_users") or os.getenv("MARMOT_ALLOW_ALL_USERS"))
+        allow_all = marmot_diagnostics.parse_config_bool(
+            marmot_diagnostics.first_config_value(extra, "allow_all_users", env="MARMOT_ALLOW_ALL_USERS"),
+            default=False,
+        )
+        home_route = self._configured_home_route(extra)
         fields = marmot_diagnostics.nonsecret_config_fields(
             senders=[str(item) for item in senders],
             allow_all=allow_all,
             welcomers=[str(item) for item in (self.welcomer_allowlist or [])],
             account_id_hex=self.account_id_hex,
             socket_path=self.socket_path,
-            home_route=marmot_diagnostics.normalize_home_route(self.group_id_hex),
-            media=media_capability_status(),
+            home_route=home_route,
         )
         self._observations.loaded_fingerprint = marmot_diagnostics.config_fingerprint(fields)
         self._observations.sender_count = len(fields["senders"])
         self._observations.allow_all = allow_all
         self._observations.welcomer_count = len(self.welcomer_allowlist or [])
         self._observations.account_selected = bool(self.account_id_hex)
-        self._observations.home_configured = bool(self.group_id_hex)
+        self._observations.home_configured = bool(home_route)
+        self._observations.loaded_home_digest = marmot_diagnostics.identity_digest(home_route)
         self._observations.media = media_capability_status()
         self._observations.plugin_version = marmot_diagnostics.plugin_version_from_manifest(
             Path(__file__).resolve().parent
         )
+
+    def _configured_home_route(self, extra: Dict[str, Any]) -> Optional[str]:
+        home_channel = getattr(self.config, "home_channel", None)
+        platform = None
+        chat_id = None
+        if home_channel is not None:
+            platform = str(getattr(home_channel, "platform", "") or "").strip().lower() or None
+            chat_id = getattr(home_channel, "chat_id", None)
+        route, error = marmot_diagnostics.resolve_home_route(
+            extra,
+            home_channel=chat_id if chat_id not in (None, "") else extra.get("home_channel"),
+            home_platform=platform,
+        )
+        del error
+        return route
 
     def _hermes_home(self) -> Path:
         return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
@@ -1709,7 +1728,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.debug("Marmot diagnostics endpoint cleanup failed", exc_info=True)
 
     def _on_inbound_ack(self) -> None:
-        self._inbound_established = True
+        # Diagnostic readiness only. The retry flag flips on the first event so
+        # ACK-then-EOF connections keep geometric backoff and the first-event
+        # callback still runs.
         self._observations.mark("established")
 
     async def _sync_welcomer_allowlist(self) -> None:
@@ -3907,11 +3928,9 @@ def _observation_reason(exc: BaseException) -> str:
 def media_capability_status() -> Dict[str, Any]:
     """Return passive, truthful media support without probing or mutation."""
 
-    return {
-        "inbound": sorted(MarmotPlatformAdapter.INBOUND_MEDIA_KINDS),
-        "outbound": sorted(MarmotPlatformAdapter.OUTBOUND_MEDIA_KINDS),
-        "host_outbound_dispatch": _HermesMediaKind is not None,
-    }
+    return marmot_diagnostics.media_capability_status(
+        host_outbound_dispatch=_HermesMediaKind is not None,
+    )
 
 
 def _plugin_settings(ctx) -> Dict[str, Any]:
@@ -4195,7 +4214,11 @@ async def _marmot_status_tool(
                 live = observations.snapshot()
                 status["subscription"] = live.get("lifecycle")
                 status["reconciliation"] = live.get("reconciliation")
-                status["restart_required"] = live.get("config_matches") is False
+                config_matches = live.get("config_matches")
+                if config_matches is None:
+                    status["restart_required"] = None
+                else:
+                    status["restart_required"] = config_matches is False
     except Exception as exc:
         logger.debug("Marmot readiness probe failed", exc_info=True)
         return json.dumps(

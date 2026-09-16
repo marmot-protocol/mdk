@@ -1367,6 +1367,14 @@ run_doctor() {
     if [ "$DOCTOR_JSON" -eq 1 ]; then
         doctor_json+=(--json)
     fi
+    doctor_service=()
+    if [ "$INSTALL_SERVICE" -eq 0 ]; then
+        doctor_service+=(--no-install-service)
+    fi
+    doctor_auth=()
+    if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
+        doctor_auth+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
+    fi
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -B -m marmot.doctor \
             --home "$MARMOT_HOME" \
@@ -1376,7 +1384,9 @@ run_doctor() {
             --prefix "$MARMOT_INSTALL_PREFIX" \
             --service-name "$MARMOT_AGENT_SERVICE_NAME" \
             --launchd-label "$MARMOT_AGENT_LAUNCHD_LABEL" \
-            ${doctor_json[@]+"${doctor_json[@]}"}
+            ${doctor_json[@]+"${doctor_json[@]}"} \
+            ${doctor_service[@]+"${doctor_service[@]}"} \
+            ${doctor_auth[@]+"${doctor_auth[@]}"}
 }
 
 while [ "$#" -gt 0 ]; do

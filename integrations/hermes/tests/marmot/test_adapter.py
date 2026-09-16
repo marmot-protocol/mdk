@@ -5007,6 +5007,151 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(delays[1][1], delays[0][1])
         self.assertGreater(delays[2][1], delays[1][1])
 
+    async def test_ack_without_events_backs_off_and_marks_established(self):
+        attempts = {"n": 0}
+        delays = []
+        first_event_callbacks = {"n": 0}
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
+                attempts["n"] += 1
+                if on_ack is not None:
+                    on_ack()
+                await asyncio.sleep(0)
+                return
+                yield  # pragma: no cover
+
+        adapter = self._adapter(FakeClient())
+        original_established = adapter._consume_inbound_once
+
+        async def wrapped(*, drain=False, on_established=None):
+            def tracked():
+                first_event_callbacks["n"] += 1
+                if callable(on_established):
+                    on_established()
+
+            await original_established(drain=drain, on_established=tracked)
+
+        adapter._consume_inbound_once = wrapped
+        real_backoff = self.adapter_module.reconnect_backoff_ms
+
+        def recording_backoff(attempt, base_ms, cap_ms, rand=None):
+            value = real_backoff(attempt, base_ms, cap_ms, rand=rand)
+            delays.append((attempt, value))
+            return 0
+
+        self.adapter_module.reconnect_backoff_ms = recording_backoff
+        try:
+            loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 1.0))
+            for _ in range(300):
+                if len(delays) >= 4:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            self.adapter_module.reconnect_backoff_ms = real_backoff
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+
+        self.assertGreaterEqual(adapter._observations.reconnect_count, 1)
+        self.assertGreaterEqual(adapter._observations.recovery_count, 1)
+        self.assertEqual(first_event_callbacks["n"], 0)
+        self.assertEqual([attempt for attempt, _ in delays[:4]], [0, 1, 2, 3])
+        self.assertEqual(delays[0][1], 1000)
+        self.assertGreater(delays[1][1], delays[0][1])
+
+    async def test_first_event_after_ack_still_runs_established_callback(self):
+        called = {"n": 0}
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
+                if on_ack is not None:
+                    on_ack()
+                yield wire_event({
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "sender_account_id_hex": "44" * 32,
+                    "text": "hello",
+                    "mentions_self": True,
+                })
+
+        adapter = self._adapter(FakeClient(), {"group_activation": "always"})
+
+        def on_established():
+            called["n"] += 1
+
+        await adapter._consume_inbound_once(on_established=on_established)
+        self.assertEqual(called["n"], 1)
+        self.assertTrue(adapter._inbound_established)
+        self.assertEqual(adapter._observations.state, "established")
+
+    def test_observation_fingerprint_matches_doctor_and_detects_replacements(self):
+        diag = self.adapter_module.marmot_diagnostics
+
+        extra = {
+            "account_id_hex": "11" * 32,
+            "socket_path": "/tmp/doctor-match.sock",
+            "allow_all_users": "false",
+            "allowed_users": "aa" * 32,
+            "welcomer_allowlist": "bb" * 32,
+            "home_channel": "cc" * 16,
+            "group_id_hex": "dd" * 16,
+        }
+        config = self.config_cls(
+            extra=extra,
+            home_channel=type("Home", (), {"platform": "marmot", "chat_id": "cc" * 16})(),
+        )
+
+        class FakeClient:
+            pass
+
+        with unittest.mock.patch.dict(os.environ, {"MARMOT_ALLOW_ALL_USERS": "false"}):
+            adapter = self.adapter_module.MarmotPlatformAdapter(config, client=FakeClient())
+            doctor_fields = diag.nonsecret_config_fields(
+                senders=["aa" * 32],
+                allow_all=diag.parse_config_bool("false"),
+                welcomers=diag.resolve_welcomers(extra),
+                account_id_hex=adapter.account_id_hex,
+                socket_path=adapter.socket_path,
+                home_route="cc" * 16,
+            )
+            self.assertEqual(
+                adapter._observations.loaded_fingerprint,
+                diag.config_fingerprint(doctor_fields),
+            )
+            self.assertFalse(adapter._observations.allow_all)
+            self.assertTrue(adapter._observations.home_configured)
+            replaced = dict(extra)
+            replaced["account_id_hex"] = "22" * 32
+            replaced["socket_path"] = "/tmp/doctor-other.sock"
+            other = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra=replaced,
+                    home_channel=type("Home", (), {"platform": "marmot", "chat_id": "cc" * 16})(),
+                ),
+                client=FakeClient(),
+            )
+            self.assertNotEqual(
+                adapter._observations.loaded_fingerprint,
+                other._observations.loaded_fingerprint,
+            )
+
+    async def test_recovery_count_increments_through_awaiting_ack(self):
+        observations = self.adapter_module.marmot_diagnostics.PluginObservations()
+        observations.mark("starting")
+        observations.mark("awaiting_ack")
+        observations.mark("established")
+        observations.mark("reconnecting", reason="socket_closed")
+        observations.mark("awaiting_ack")
+        observations.mark("established")
+        self.assertEqual(observations.recovery_count, 1)
+        snapshot = observations.snapshot()
+        self.assertEqual(snapshot["last_disconnect_reason"], "socket_closed")
+
     # --- Behavior 8: preview vs durable timeout -------------------------------
     async def test_preview_ops_use_short_timeout_durable_uses_full(self):
         seen = []

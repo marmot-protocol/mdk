@@ -1,7 +1,7 @@
 ---
 title: "Hermes Agent Production Runbook"
 created: 2026-06-08
-updated: 2026-06-11
+updated: 2026-09-16
 tags: [marmot, architecture, agents, hermes, runbook, deployment]
 status: draft-runbook
 ---

@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,10 +29,11 @@ DELIVERY_CHECK = diag.check(
 
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+    deadline = time.monotonic() + diag.DOCTOR_DEADLINE_S
     marmot_home = Path(args.home).expanduser()
     hermes_home = Path(args.hermes_home).expanduser()
     plugin_dir = Path(args.plugin_dir).expanduser()
-    socket_path = Path(args.socket).expanduser()
+    installer_socket = Path(args.socket).expanduser()
     prefix = Path(args.prefix).expanduser()
     service_name = args.service_name
     launchd_label = args.launchd_label
@@ -44,43 +46,110 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     checks.append(_release_check("release.manifest_version", manifest_version))
 
     checks.extend(_service_checks(service_name, launchd_label, args.install_service))
-    checks.append(_socket_check(socket_path))
-    checks.extend(_file_checks(marmot_home))
 
     config_path = hermes_home / "config.yaml"
     env_path = hermes_home / ".env"
     config, config_error = diag.parse_config_safely(config_path)
-    senders, allow_all, env_error = diag.parse_env_safely(env_path)
-    marmot_config = _marmot_platform_config(config)
-    home_route = _configured_home_route(marmot_config, args.group_id_hex)
-    account_hex = _configured_account(marmot_config, args.account_id_hex)
-    socket_from_config = _configured_socket(marmot_config, socket_path)
-    welcomers = _configured_welcomers(marmot_config)
-    media = {"outbound": True, "inbound": True}
+    env_senders, env_allow_all, env_error = diag.parse_env_safely(env_path)
+    merged = diag.merge_hermes_marmot_config(config)
+    extra = merged["extra"]
+    senders = env_senders or _split_sender_list(
+        extra.get("allowed_users") or extra.get("allowed_users_hex") or os.getenv("MARMOT_ALLOWED_USERS")
+    )
+    allow_all = env_allow_all or diag.parse_config_bool(
+        diag.first_config_value(extra, "allow_all_users", env="MARMOT_ALLOW_ALL_USERS"),
+        default=False,
+    )
+    home_route, home_error = diag.resolve_home_route(
+        extra,
+        home_channel=merged["home_channel"],
+        home_platform=merged["home_platform"],
+        override=args.group_id_hex,
+    )
+    account_hex, account_mode = diag.resolve_account_id(extra, override=args.account_id_hex)
+    socket_path = diag.resolve_socket_path(extra, fallback=installer_socket) or installer_socket
+    welcomers = diag.resolve_welcomers(extra)
+    auth_token, auth_error = diag.resolve_auth_token(
+        extra,
+        token=args.auth_token,
+        token_file=args.auth_token_file,
+    )
     fingerprint_fields = diag.nonsecret_config_fields(
         senders=senders,
         allow_all=allow_all,
         welcomers=welcomers,
         account_id_hex=account_hex,
-        socket_path=str(socket_from_config) if socket_from_config else None,
+        socket_path=str(socket_path) if socket_path else None,
         home_route=home_route,
-        media=media,
     )
     fingerprint = diag.config_fingerprint(fingerprint_fields) if config_error is None else None
 
-    checks.extend(_config_checks(config_error, env_error, senders, allow_all, home_route))
-    connector = _connector_report(
-        socket_path,
-        account_hex,
-        home_route,
-        args.auth_token,
-        args.auth_token_file,
-    )
-    checks.extend(_connector_checks(connector, home_route, account_hex, binary_version))
-    live = asyncio.run(diag.read_plugin_status(hermes_home, config_fingerprint_hex=fingerprint))
+    checks.append(_socket_check(socket_path))
+    checks.extend(_file_checks(marmot_home))
+    checks.extend(_config_checks(config_error, env_error, senders, allow_all, home_route, home_error))
+    connector_attempted = False
+    connector = None
+    if account_mode == "invalid":
+        checks.append(
+            diag.check(
+                "account.selection",
+                owner="hermes_config",
+                provenance="observed",
+                status="fatal",
+                code="invalid",
+            )
+        )
+    elif auth_error:
+        checks.append(
+            diag.check(
+                "account.selection",
+                owner="wn_agent",
+                provenance="observed",
+                status="fatal",
+                code="unauthorized",
+            )
+        )
+    elif time.monotonic() < deadline:
+        connector = _connector_report(socket_path, account_hex, home_route, auth_token)
+        connector_attempted = True
+    else:
+        checks.append(
+            diag.check(
+                "account.selection",
+                owner="wn_agent",
+                provenance="observed",
+                status="unknown",
+                code="unknown",
+            )
+        )
+    if connector_attempted:
+        checks.extend(_connector_checks(connector, home_route, account_hex, binary_version, account_mode))
+    if time.monotonic() < deadline:
+        live = asyncio.run(
+            diag.read_plugin_status(
+                hermes_home,
+                config_fingerprint_hex=fingerprint,
+                expected_home_digest=diag.identity_digest(home_route) if home_route else None,
+            )
+        )
+    else:
+        live = None
     checks.extend(_plugin_checks(live, installed_plugin, home_route))
     checks.append(DELIVERY_CHECK)
     return diag.report_object(checks)
+
+
+def _split_sender_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    if not isinstance(raw, list):
+        return []
+    values = []
+    for item in raw:
+        normalized = diag.normalize_home_route(item)
+        if normalized:
+            values.append(normalized)
+    return values
 
 
 def _release_check(check_id: str, version: Optional[str]) -> dict[str, Any]:
@@ -143,8 +212,15 @@ def _service_checks(
     )
     if systemd is not None:
         properties = _parse_unit_properties(systemd)
+        load = properties.get("LoadState")
         active = properties.get("ActiveState")
-        if active == "active":
+        if load == "not-found":
+            status, code = "unknown", "not_managed"
+        elif load == "masked":
+            status, code = "fatal", "masked"
+        elif load in {"error", "bad-setting"}:
+            status, code = "fatal", "invalid"
+        elif active == "active":
             status, code = "healthy", "running"
         elif active == "inactive":
             status, code = "fatal", "stopped"
@@ -261,65 +337,20 @@ def _file_checks(marmot_home: Path) -> list[dict[str, Any]]:
     return checks
 
 
-def _marmot_platform_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
-    if not isinstance(config, dict):
-        return {}
-    platforms = config.get("platforms")
-    if isinstance(platforms, dict) and isinstance(platforms.get("marmot"), dict):
-        extra = platforms["marmot"].get("extra")
-        if isinstance(extra, dict):
-            return extra
-        return platforms["marmot"]
-    plugins = config.get("plugins")
-    if isinstance(plugins, dict):
-        entries = plugins.get("entries")
-        if isinstance(entries, dict) and isinstance(entries.get("marmot"), dict):
-            settings = entries["marmot"].get("settings")
-            if isinstance(settings, dict):
-                return settings
-    return {}
-
-
-def _configured_home_route(extra: dict[str, Any], override: Optional[str]) -> Optional[str]:
-    if override:
-        return diag.normalize_home_route(override)
-    for key in ("group_id_hex", "group"):
-        route = diag.normalize_home_route(extra.get(key))
-        if route:
-            return route
-    home_channel = extra.get("home_channel")
-    if isinstance(home_channel, dict):
-        return diag.normalize_home_route(home_channel.get("chat_id"))
-    if isinstance(home_channel, str):
-        return diag.normalize_home_route(home_channel)
-    return None
-
-
-def _configured_account(extra: dict[str, Any], override: Optional[str]) -> Optional[str]:
-    candidate = override or extra.get("account_id_hex") or extra.get("account")
-    route = diag.normalize_home_route(candidate)
-    return route if route and len(route) == 64 else None
-
-
-def _configured_socket(extra: dict[str, Any], fallback: Path) -> Optional[Path]:
-    raw = extra.get("socket_path") or extra.get("agent_socket") or extra.get("socket")
-    if raw:
-        return Path(str(raw)).expanduser()
-    return fallback
-
-
-def _configured_welcomers(extra: dict[str, Any]) -> list[str]:
-    raw = extra.get("welcomer_allowlist") or extra.get("allow_welcomers") or []
-    if isinstance(raw, str):
-        raw = [item.strip() for item in raw.split(",") if item.strip()]
-    if not isinstance(raw, list):
-        return []
-    values = []
-    for item in raw:
-        normalized = diag.normalize_home_route(item)
-        if normalized:
-            values.append(normalized)
-    return values
+def _configured_home_route(
+    extra: dict[str, Any],
+    override: Optional[str],
+    *,
+    home_channel: Any = None,
+    home_platform: Optional[str] = None,
+) -> Optional[str]:
+    route, _error = diag.resolve_home_route(
+        extra,
+        home_channel=home_channel if home_channel is not None else extra.get("home_channel"),
+        home_platform=home_platform,
+        override=override,
+    )
+    return route
 
 
 def _config_checks(
@@ -328,6 +359,7 @@ def _config_checks(
     senders: list[str],
     allow_all: bool,
     home_route: Optional[str],
+    home_error: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     checks = []
     if config_error == "missing":
@@ -399,13 +431,14 @@ def _config_checks(
             )
         )
     else:
+        home_code = home_error or "missing"
         checks.append(
             diag.check(
                 "home.syntax",
                 owner="hermes_config",
                 provenance="observed",
                 status="degraded",
-                code="missing",
+                code=home_code if home_code in {"invalid", "wrong_platform"} else "missing",
             )
         )
         checks.append(
@@ -414,7 +447,7 @@ def _config_checks(
                 owner="hermes_config",
                 provenance="observed",
                 status="degraded",
-                code="missing",
+                code=home_code if home_code in {"invalid", "wrong_platform"} else "missing",
             )
         )
     return checks
@@ -425,21 +458,18 @@ def _connector_report(
     account_hex: Optional[str],
     home_route: Optional[str],
     auth_token: Optional[str],
-    auth_token_file: Optional[str],
 ) -> Optional[dict[str, Any]]:
     try:
         from .agent_control import AgentControlError, MarmotAgentControlClient
     except Exception:
         return {"unsupported": True}
-    token = auth_token
-    if not token and auth_token_file:
-        try:
-            token = Path(auth_token_file).read_text(encoding="utf-8").strip() or None
-        except OSError:
-            token = None
 
     async def _request() -> dict[str, Any]:
-        client = MarmotAgentControlClient(socket_path, request_timeout=diag.CONNECTOR_TIMEOUT_S, auth_token=token)
+        client = MarmotAgentControlClient(
+            socket_path,
+            request_timeout=diag.CONNECTOR_TIMEOUT_S,
+            auth_token=auth_token,
+        )
         payload: dict[str, Any] = {"type": "diagnostic_status"}
         if account_hex:
             payload["account_id_hex"] = account_hex
@@ -461,6 +491,7 @@ def _connector_checks(
     home_route: Optional[str],
     account_hex: Optional[str],
     binary_version: Optional[str],
+    account_mode: str = "auto",
 ) -> list[dict[str, Any]]:
     if response is None:
         return [
@@ -485,7 +516,7 @@ def _connector_checks(
                 code="unauthorized",
             )
         ]
-    if error in {"unexpected_response", "protocol_error"}:
+    if error in {"unexpected_response", "protocol_error", "socket_closed"}:
         return [_unsupported("account.selection"), _unsupported("release.running_version")]
     if error:
         return [
@@ -589,22 +620,30 @@ def _connector_checks(
             },
         )
     )
+    welcomer_count = diag.bounded_int(report.get("welcomer_count"))
+    allow_any = bool(report.get("allow_any"))
+    if allow_any:
+        welcomer_status, welcomer_code = "healthy", "allow_any"
+    elif welcomer_count > 0:
+        welcomer_status, welcomer_code = "healthy", "configured"
+    else:
+        welcomer_status, welcomer_code = "degraded", "empty"
     checks.append(
         diag.check(
             "authorization.welcomers",
             owner="wn_agent",
             provenance="observed",
-            status="healthy" if report.get("allow_any") or (report.get("welcomer_count") or 0) > 0 else "degraded",
-            code="allow_any" if report.get("allow_any") else "configured",
+            status=welcomer_status,
+            code=welcomer_code,
             value={
-                "welcomer_count": report.get("welcomer_count"),
-                "allow_any": bool(report.get("allow_any")),
+                "welcomer_count": welcomer_count,
+                "allow_any": allow_any,
             },
         )
     )
     relays = report.get("relays") if isinstance(report.get("relays"), dict) else {}
-    connected = int(relays.get("connected") or 0)
-    configured = int(relays.get("configured") or 0)
+    connected = diag.bounded_int(relays.get("connected"))
+    configured = diag.bounded_int(relays.get("configured"))
     if configured == 0:
         relay_status, relay_code = "unknown", "unknown"
     elif connected == configured:
@@ -677,7 +716,7 @@ def _connector_checks(
                     code="unresolved",
                 )
             )
-    del account_hex
+    del account_hex, account_mode
     return checks
 
 
@@ -726,6 +765,9 @@ def _plugin_checks(
         "failed": ("degraded", "failed"),
         "stopped": ("unknown", "stopped"),
     }.get(lifecycle, ("unknown", "unknown"))
+    reconciliation = str(live.get("reconciliation") or "not_configured")
+    if sub_status[0] == "healthy" and reconciliation in {"failed", "pending"}:
+        sub_status = ("degraded", reconciliation)
     checks = [
         diag.check(
             "subscription.inbound",
@@ -736,7 +778,9 @@ def _plugin_checks(
             value={
                 "reconnect_count": live.get("reconnect_count"),
                 "resync_count": live.get("resync_count"),
-                "reconciliation": live.get("reconciliation"),
+                "recovery_count": live.get("recovery_count"),
+                "last_disconnect_reason": live.get("last_disconnect_reason"),
+                "reconciliation": reconciliation,
             },
         )
     ]
@@ -760,13 +804,20 @@ def _plugin_checks(
         )
     )
     if home_route:
+        home_matches = live.get("home_matches")
+        if home_matches is True:
+            home_status, home_code = "healthy", "matching"
+        elif home_matches is False:
+            home_status, home_code = "degraded", "mismatch"
+        else:
+            home_status, home_code = "unknown", "unknown"
         checks.append(
             diag.check(
                 "home.live_agreement",
                 owner="hermes_plugin",
                 provenance="observed",
-                status="healthy" if live.get("home_configured") else "degraded",
-                code="matching" if live.get("home_configured") else "mismatch",
+                status=home_status,
+                code=home_code,
             )
         )
     else:
@@ -832,7 +883,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     else:
         sys.stdout.write(diag.render_human(report))
-    return int(report.get("exit_code") or 1)
+    return diag.report_exit_code(report)
 
 
 if __name__ == "__main__":
