@@ -27,6 +27,9 @@ for author self-retraction. Cross-author removal is limited to kind-9 messages:
 stream starts, agent activity/operations, system events, and custom-kind rows are
 no longer admin-removal targets. Completed agent messages remain ordinary kind-9
 targets.
+An author's already-removed or invalidated target can still be retracted with
+kind 5 when it is no longer available for moderation. This preserves the existing
+removal outcome and attribution.
 A non-admin targeting another account's message receives an error before
 publication. Kind 4891 references
 the original message and carries `{"v":1,"action":"remove"}`. This does not

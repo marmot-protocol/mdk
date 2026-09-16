@@ -3697,14 +3697,23 @@ impl AppClient {
                 if target.as_ref().is_some_and(|target| {
                     target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
                 }) && self.delete_moderation_grant(group_id, &sender)
+                    && storage
+                        .report_target_author(
+                            &hex::encode(group_id.as_slice()),
+                            &target_message_id,
+                            &target_message_id,
+                        )?
+                        .is_some()
                 {
                     AppMessageIntent::RemoveMessage { target_message_id }
                 } else {
                     if target.is_some_and(|target| target.sender != sender) {
                         return Err(AppError::InvalidAppMessagePayload(
-                            "group admin authority and a chat message target are required".into(),
+                            "an available chat message and group admin authority are required to remove another account's content".into(),
                         ));
                     }
+                    // An unavailable moderation target does not take away the
+                    // author's ordinary retraction path (e.g. after removal).
                     AppMessageIntent::Delete { target_message_id }
                 }
             }
@@ -3727,22 +3736,6 @@ impl AppClient {
             }
             other => other,
         };
-        if let AppMessageIntent::RemoveMessage { target_message_id } = &intent {
-            let storage = self.app.account_storage(&self.state.label)?;
-            if !self.delete_moderation_grant(group_id, &sender)
-                || storage
-                    .report_target_author(
-                        &hex::encode(group_id.as_slice()),
-                        target_message_id,
-                        target_message_id,
-                    )?
-                    .is_none()
-            {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "group admin authority and a chat message target are required".into(),
-                ));
-            }
-        }
         // An encrypted-media reference is bound to the epoch that produced its
         // ciphertext: the wire `imeta` tag carries no epoch, so every recipient
         // derives the media key from the epoch of the message that delivers

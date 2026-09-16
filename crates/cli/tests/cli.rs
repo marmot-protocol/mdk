@@ -5006,13 +5006,39 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
             target_message_id,
         ],
     );
-    // A delete is a kind-5 tombstone with empty content and an `e` tag.
+    // An eligible admin removes their own chat through kind 4891 too.
     let delete_sync =
-        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 5, target_message_id);
-    let delete = first_message_with_kind_and_target(&delete_sync, 5, target_message_id)
+        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 4891, target_message_id);
+    let delete = first_message_with_kind_and_target(&delete_sync, 4891, target_message_id)
         .expect("delete message");
-    assert_eq!(delete["plaintext"], "");
+    assert_eq!(delete["plaintext"], r#"{"v":1,"action":"remove"}"#);
     assert_eq!(message_e_tag(delete), Some(target_message_id));
+
+    // A non-admin's own chat still uses author-only kind 5, independently of
+    // the kind-5 reaction retraction above and the admin's removal path.
+    let own = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "send",
+            group_id,
+            "ordinary retraction",
+        ],
+    );
+    let own_id = own["message_ids"][0].as_str().expect("own message id");
+    sync_until_message(home.path(), test_relay_url(), &alice, "ordinary retraction");
+    run_json(
+        home.path(),
+        &["--account", &bob, "messages", "delete", group_id, own_id],
+    );
+    let retraction_sync =
+        sync_until_message_with_kind(home.path(), test_relay_url(), &alice, 5, own_id);
+    let retraction =
+        first_message_with_kind_and_target(&retraction_sync, 5, own_id).expect("author retraction");
+    assert_eq!(retraction["plaintext"], "");
+    assert_eq!(message_e_tag(retraction), Some(own_id));
 
     let retry = run_json(
         home.path(),

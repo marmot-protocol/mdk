@@ -14646,6 +14646,17 @@ async fn encrypted_content_reports_share_review_without_chat_rows() {
         4891
     );
     bob.sync().await.unwrap();
+    // Once moderation already removed the admin's own target, repeating delete
+    // may still author-retract it; the existing removal outcome stays intact.
+    let repeated = alice.delete_message(&group, own_target).await.unwrap();
+    assert_eq!(
+        app.message_by_id("alice", &group_hex, &repeated.message_ids[0])
+            .unwrap()
+            .unwrap()
+            .kind,
+        MARMOT_APP_EVENT_KIND_DELETE
+    );
+    bob.sync().await.unwrap();
     for label in ["alice", "bob"] {
         assert_eq!(
             runtime
