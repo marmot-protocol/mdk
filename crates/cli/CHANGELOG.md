@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-16
+
+Update generated bindings, native libraries, and C headers together. Apple consumers must also stage the matching privacy resource in their Swift wrapper. Account storage advances through migration 80; back up before upgrade because downgrade is unsupported. See [0.10.1 release notes](../../docs/release/0.10.1.md).
+
 ### Fixed
 
 - OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
@@ -18,6 +22,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   generation cannot be stopped by a late account lookup from the previous attempt.
 
 ### Added
+
+- Durable, account-scoped avatar assets and validated local asset access across native chat lists and conversation windows in Rust, Swift/Kotlin and C.
+- Authenticated group-system previews with prepared actor and subject identities.
 
 - Encrypted group reports (1984), shared dismissal labels (1985), and admin removal (4891),
   with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
