@@ -17,6 +17,8 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first
 - `plugin.yaml` — Hermes platform plugin manifest.
 - `__init__.py` — plugin entry registration.
 - `adapter.py` — agent-control client, inbound/outbound bridging, and live-preview state machine.
+- `diagnostics.py` — shared doctor report helpers and the plugin-owned diagnostics socket.
+- `doctor.py` — privacy-safe, non-mutating installation collector used by `install-hermes-marmot.sh --doctor`.
 - `tests/` — unit tests and dev-script smoke coverage.
 
 ## Rules

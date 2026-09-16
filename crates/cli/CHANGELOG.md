@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
+  installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
+  `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
+  a private diagnostics socket.
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
   compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
   not create transcript rows, move conversations or generate unread/mention activity; raw events remain available.

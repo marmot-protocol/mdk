@@ -37,6 +37,8 @@ MIN_HERMES_VERSION="0.19.0"
 
 ASSUME_YES=0
 CONFIGURE_HERMES=1
+DOCTOR=0
+DOCTOR_JSON=0
 DRY_RUN=0
 ENABLE_STREAMING=0
 FORCE=0
@@ -94,6 +96,9 @@ Options:
   --system                 Install wn-agent to /usr/local/bin instead of ~/.local/bin
   --force                  Replace the existing Marmot plugin instead of backing it up
   --dry-run                Print actions without installing
+  --doctor                 Passive installation report; does not install or repair
+  --json                   Machine-readable doctor report; requires --doctor
+                           Exits 0 healthy / 1 degraded / 2 fatal. Not delivery proof.
   -h, --help               Show this help
 
 Environment:
@@ -1329,6 +1334,51 @@ Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${WN_AGENT_VERSION})
 EOF
 }
 
+emit_doctor_fatal() {
+    local message
+    message="$(cat <<'EOF'
+{"schema_version":1,"status":"fatal","exit_code":2,"checks":[{"id":"release.doctor_runtime","owner":"installer","provenance":"observed","status":"fatal","code":"helper_unavailable","value":null}]}
+EOF
+)"
+    if [ "$DOCTOR_JSON" -eq 1 ]; then
+        printf '%s\n' "$message"
+    else
+        printf '%s\n' "Hermes Marmot doctor: fatal (exit 2)"
+        printf '%s\n' "- release.doctor_runtime: fatal/helper_unavailable (installer/observed)"
+        printf '%s\n' "Passive observations only. This is not delivery, send, or repair proof."
+    fi
+}
+
+run_doctor() {
+    local python_root doctor_json
+    if ! command -v python3 >/dev/null 2>&1; then
+        emit_doctor_fatal
+        return 2
+    fi
+    if [ -f "$MARMOT_PLUGIN_DIR/doctor.py" ]; then
+        python_root="$(cd "$(dirname "$MARMOT_PLUGIN_DIR")" && pwd)"
+    elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../integrations/hermes/marmot/doctor.py" ]; then
+        python_root="$(cd "$SCRIPT_DIR/../integrations/hermes" && pwd)"
+    else
+        emit_doctor_fatal
+        return 2
+    fi
+    doctor_json=()
+    if [ "$DOCTOR_JSON" -eq 1 ]; then
+        doctor_json+=(--json)
+    fi
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -B -m marmot.doctor \
+            --home "$MARMOT_HOME" \
+            --hermes-home "$HERMES_HOME" \
+            --plugin-dir "$MARMOT_PLUGIN_DIR" \
+            --socket "$MARMOT_AGENT_SOCKET" \
+            --prefix "$MARMOT_INSTALL_PREFIX" \
+            --service-name "$MARMOT_AGENT_SERVICE_NAME" \
+            --launchd-label "$MARMOT_AGENT_LAUNCHD_LABEL" \
+            ${doctor_json[@]+"${doctor_json[@]}"}
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --bootstrap)
@@ -1408,6 +1458,14 @@ while [ "$#" -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
+        --doctor)
+            DOCTOR=1
+            shift
+            ;;
+        --json)
+            DOCTOR_JSON=1
+            shift
+            ;;
         -h | --help)
             usage
             exit 0
@@ -1429,6 +1487,26 @@ fi
 
 MARMOT_PLUGIN_DIR="${MARMOT_PLUGIN_DIR_OVERRIDE:-$HERMES_HOME/plugins/marmot}"
 MARMOT_AGENT_SOCKET="${MARMOT_AGENT_SOCKET_OVERRIDE:-$MARMOT_HOME/dev/wn-agent.sock}"
+
+if [ "$DOCTOR_JSON" -eq 1 ] && [ "$DOCTOR" -ne 1 ]; then
+    echo "error: --json requires --doctor" >&2
+    exit 1
+fi
+if [ "$DOCTOR" -eq 1 ]; then
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ] \
+        || [ "$SYSTEM_INSTALL" -eq 1 ] || [ "$ENABLE_STREAMING" -eq 1 ] \
+        || [ "$NO_START_WN_AGENT" -eq 1 ] || [ "$CONFIGURE_HERMES" -eq 0 ] \
+        || [ "$INSTALL_SERVICE" -eq 0 ] || [ "$CLI_RELAYS" -eq 1 ] \
+        || [ "$EXPLICIT_ALLOW_ALL" -eq 1 ] || [ "$GENERATE_IDENTITY_EXPLICIT" -eq 1 ] \
+        || [ -n "$EXISTING_IDENTITY_FILE" ] || [ -n "$EXPECTED_IDENTITY" ] \
+        || [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ] || [ "${#ALLOW_USERS[@]}" -gt 0 ] \
+        || [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
+        echo "error: --doctor cannot be combined with mutating installer options" >&2
+        exit 1
+    fi
+    run_doctor
+    exit "$?"
+fi
 
 if [ "$CLI_RELAYS" -eq 0 ]; then
     while IFS= read -r relay; do

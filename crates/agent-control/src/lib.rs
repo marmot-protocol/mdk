@@ -1,5 +1,12 @@
 //! Local control protocol DTOs and newline-delimited JSON framing for Marmot agents.
 
+mod diagnostics;
+
+pub use diagnostics::{
+    AgentControlAccountSelection, AgentControlDiagnosticHome, AgentControlDiagnosticKeyPackage,
+    AgentControlDiagnosticRelays, AgentControlDiagnosticReplay, AgentControlDiagnosticStatus,
+};
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -310,6 +317,12 @@ pub enum AgentControlRequest {
         text: String,
         data: Option<Value>,
     },
+    DiagnosticStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home_group_id_hex: Option<String>,
+    },
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
@@ -492,6 +505,9 @@ pub enum AgentControlResponse {
     InvitePolicy {
         account_id_hex: String,
         policy: AgentControlInvitePolicy,
+    },
+    DiagnosticStatus {
+        report: AgentControlDiagnosticStatus,
     },
     GroupInfo {
         account_id_hex: String,
@@ -1615,6 +1631,13 @@ mod tests {
                 "send_group_system_event",
             ),
             (
+                AgentControlRequest::DiagnosticStatus {
+                    account_id_hex: Some(account()),
+                    home_group_id_hex: Some(group()),
+                },
+                "diagnostic_status",
+            ),
+            (
                 AgentControlRequest::GroupInfo {
                     account_id_hex: account(),
                     group_id_hex: group(),
@@ -1845,5 +1868,69 @@ mod tests {
 
     fn hash() -> String {
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned()
+    }
+
+    #[test]
+    fn diagnostic_status_round_trip_omits_identifiers() {
+        let report = crate::AgentControlDiagnosticStatus {
+            protocol: crate::AGENT_CONTROL_PROTOCOL_V2.to_owned(),
+            connector_version: "0.10.0".to_owned(),
+            account_count: 2,
+            local_signing_account_count: 1,
+            selection: crate::AgentControlAccountSelection::Selected,
+            welcomer_count: 1,
+            allow_any: false,
+            key_package: crate::AgentControlDiagnosticKeyPackage {
+                availability: "present".to_owned(),
+                phase: Some("complete".to_owned()),
+                present: true,
+                expired: Some(false),
+                accepted_fanout_targets: 2,
+                unattempted_fanout_targets: 0,
+                failed_fanout_targets: 0,
+                policy_prohibited_fanout_targets: 0,
+            },
+            relays: crate::AgentControlDiagnosticRelays {
+                configured: 2,
+                connected: 2,
+                disconnected: 0,
+            },
+            replay: crate::AgentControlDiagnosticReplay {
+                state: "idle".to_owned(),
+                last_reason: None,
+                success_count: 3,
+                failure_count: 0,
+                resync_count: 0,
+                cancelled_count: 0,
+                error_count: 0,
+            },
+            home: crate::AgentControlDiagnosticHome {
+                requested: true,
+                resolved: true,
+                worker_available: true,
+                member_count: Some(2),
+                is_direct: Some(true),
+            },
+        };
+        let encoded = serde_json::to_string(&AgentControlResponse::DiagnosticStatus {
+            report: report.clone(),
+        })
+        .unwrap();
+        for forbidden in [
+            "account_id",
+            "group_id",
+            "npub",
+            "nprofile",
+            "wss://",
+            "http",
+            "key_package_ref",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostic report leaked {forbidden}"
+            );
+        }
+        let decoded: AgentControlResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, AgentControlResponse::DiagnosticStatus { report });
     }
 }

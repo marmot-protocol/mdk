@@ -81,6 +81,8 @@ SCRIPT
             "$INTEGRATION_PLUGIN_SOURCE/adapter.py" \
             "$INTEGRATION_PLUGIN_SOURCE/agent_control.py" \
             "$INTEGRATION_PLUGIN_SOURCE/ambient_context.py" \
+            "$INTEGRATION_PLUGIN_SOURCE/diagnostics.py" \
+            "$INTEGRATION_PLUGIN_SOURCE/doctor.py" \
             "$INTEGRATION_PLUGIN_SOURCE/inbound_spool.py" \
             "$INTEGRATION_PLUGIN_SOURCE/plugin.yaml" \
             "$plugin_dir/"

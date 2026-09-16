@@ -366,6 +366,34 @@ The installer prints restart guidance for your existing Hermes gateway. It does
 not restart Hermes automatically. Restart a managed gateway with
 `hermes gateway restart`.
 
+### Installation doctor
+
+`scripts/install-hermes-marmot.sh --doctor [--json]` is a passive report. It does
+not install, download, chmod, start services, write config, publish keys, or
+subscribe. `--json` requires `--doctor` and cannot be combined with mutating
+installer flags.
+
+The JSON schema is version 1: `{schema_version, status, exit_code, checks}`.
+Each check is `{id, owner, provenance, status, code, value}` with owners
+`installer`, `service`, `wn_agent`, `hermes_config`, or `hermes_plugin`, and
+provenance `observed` or `inferred`. Status is `healthy`, `degraded`, `fatal`,
+or `unknown`. Unavailable evidence uses `value: null`.
+
+Exit `0` is healthy, `1` is degraded (unknown/partial relays, missing or
+unresolved home, restart required, reconciliation or inbound recovery), and
+`2` is fatal (unusable install/config/auth/account selection, required service
+stopped, unreachable control, or unsafe private artifacts). Fatal dominates
+degraded. Historical catch-up errors do not keep a recovered current state
+degraded. Manual installs without a service manager report service evidence as
+unknown, not stopped.
+
+`delivery.probe` stays `not_probed`/`unknown` and is excluded from health.
+Inbound receipt, Hermes dispatch, reply acceptance, relay acknowledgement, and
+recipient delivery remain separate untested checkpoints. Restart Hermes after
+plugin or sender-authorization changes; do not treat inbound receipt as
+recipient delivery. Output never includes tokens, account/group ids, paths,
+URLs, or fingerprints.
+
 Manual equivalent:
 
 ```sh

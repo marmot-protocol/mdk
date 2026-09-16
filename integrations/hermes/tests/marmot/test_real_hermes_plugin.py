@@ -708,6 +708,8 @@ def main() -> int:
             "adapter.py",
             "agent_control.py",
             "ambient_context.py",
+            "diagnostics.py",
+            "doctor.py",
             "inbound_spool.py",
             "plugin.yaml",
             "README.md",

@@ -17,6 +17,7 @@ use crate::event_projection::{
     control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
     resync_required_event, runtime_replay_dedup_key,
 };
+use crate::reconcile_telemetry::ReconcileTelemetry;
 use crate::validation::agent_control_request_type;
 
 impl AgentConnector {
@@ -128,6 +129,7 @@ impl AgentConnector {
                                         error_code,
                                         "live inbound projection failed; emitting resync_required"
                                     );
+                                    ReconcileTelemetry::bump(&self.reconcile_telemetry.resync_required);
                                     Some((
                                         resync_required_event(
                                             account_id_hex.as_deref(),
@@ -156,6 +158,7 @@ impl AgentConnector {
                                 replay_window = crate::DELIVERED_INBOUND_CURSOR_CAPACITY,
                                 "inbound broadcast lag exceeded the bounded replay window; emitting resync_required"
                             );
+                            ReconcileTelemetry::bump(&self.reconcile_telemetry.resync_required);
                             Some((
                                 resync_required_event(
                                     account_id_hex.as_deref(),
@@ -209,6 +212,7 @@ impl AgentConnector {
                                         error_code = err.privacy_safe_code(),
                                         "inbound broadcast lagged; storage replay failed, emitting resync_required"
                                     );
+                                    ReconcileTelemetry::bump(&self.reconcile_telemetry.resync_required);
                                     Some((
                                         resync_required_event(
                                             account_id_hex.as_deref(),

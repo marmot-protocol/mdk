@@ -225,6 +225,30 @@ Stop the container and delete the named volume for a fresh agent account and Key
 just hermes-phone-test-reset
 ```
 
+## Installation doctor
+
+Use the installer doctor for a privacy-safe, non-mutating installation report:
+
+```sh
+scripts/install-hermes-marmot.sh --doctor
+scripts/install-hermes-marmot.sh --doctor --json
+```
+
+Honor the existing home, Hermes-home, plugin, socket, prefix, and service-name
+overrides. The report labels each check with owner (`installer`, `service`,
+`wn_agent`, `hermes_config`, `hermes_plugin`) and provenance (`observed` or
+`inferred`). Exit `0`/`1`/`2` maps to healthy/degraded/fatal. Fatal covers
+unusable installation, authentication, account selection, a stopped required
+service, unreachable control, or unsafe private artifacts. Degraded covers
+unknown observations, partial relays, missing or mismatched home, restart
+required, reconciliation failure, and transient inbound recovery.
+
+A missing service-manager unit on a manual install is unknown, not proof that
+`wn-agent` is stopped. Restart Hermes after plugin or sender-authorization
+changes. The doctor never starts Hermes, never repairs, and never proves
+delivery: inbound receipt, Hermes dispatch, reply acceptance, relay
+acknowledgement, and recipient delivery remain separate checkpoints.
+
 ## Rollback
 
 Stop Hermes first, then `wn-agent`:

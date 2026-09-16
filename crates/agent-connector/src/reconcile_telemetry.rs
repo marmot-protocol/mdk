@@ -9,7 +9,10 @@
 //! large-session regression harness asserts on and that operators can diff
 //! between scrapes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use agent_control::AgentControlDiagnosticReplay;
 
 /// Which background reconciliation source a scheduled pass belongs to. Used as
 /// the `source` field on per-pass tracing events so operators can attribute
@@ -63,6 +66,15 @@ pub(crate) struct ReconcileTelemetry {
     pub(crate) invite_policy_applied: AtomicU64,
     /// Policy apply attempts that failed and are retry-pending.
     pub(crate) invite_policy_apply_failures: AtomicU64,
+    /// Current catch-up pass is in flight.
+    pub(crate) catch_up_in_flight: AtomicBool,
+    /// Last completed catch-up pass failed. Cleared by a later success.
+    pub(crate) catch_up_last_failed: AtomicBool,
+    /// Bounded last catch-up reason (`catch_up_failed` or `cancelled`).
+    pub(crate) catch_up_last_reason: Mutex<Option<&'static str>>,
+    pub(crate) resync_required: AtomicU64,
+    pub(crate) catch_up_cancelled: AtomicU64,
+    pub(crate) catch_up_errors: AtomicU64,
 }
 
 /// Point-in-time copy of [`ReconcileTelemetry`], for harness assertions.
@@ -93,6 +105,52 @@ impl ReconcileTelemetry {
         counter.fetch_add(value as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn begin_catch_up(&self) {
+        self.catch_up_in_flight.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish_catch_up_ok(&self) {
+        self.catch_up_in_flight.store(false, Ordering::Relaxed);
+        self.catch_up_last_failed.store(false, Ordering::Relaxed);
+        if let Ok(mut reason) = self.catch_up_last_reason.lock() {
+            *reason = None;
+        }
+    }
+
+    pub(crate) fn finish_catch_up_err(&self, reason: &'static str) {
+        self.catch_up_in_flight.store(false, Ordering::Relaxed);
+        self.catch_up_last_failed.store(true, Ordering::Relaxed);
+        if let Ok(mut last_reason) = self.catch_up_last_reason.lock() {
+            *last_reason = Some(reason);
+        }
+        Self::bump(&self.catch_up_errors);
+    }
+
+    pub(crate) fn diagnostic_replay(&self) -> AgentControlDiagnosticReplay {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let state = if self.catch_up_in_flight.load(Ordering::Relaxed) {
+            "running"
+        } else if self.catch_up_last_failed.load(Ordering::Relaxed) {
+            "failed"
+        } else {
+            "idle"
+        };
+        let last_reason = self
+            .catch_up_last_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.map(str::to_owned));
+        AgentControlDiagnosticReplay {
+            state: state.to_owned(),
+            last_reason,
+            success_count: load(&self.catch_up_passes_completed),
+            failure_count: load(&self.catch_up_passes_failed),
+            resync_count: load(&self.resync_required),
+            cancelled_count: load(&self.catch_up_cancelled),
+            error_count: load(&self.catch_up_errors),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ReconcileTelemetrySnapshot {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -111,5 +169,27 @@ impl ReconcileTelemetry {
             invite_policy_applied: load(&self.invite_policy_applied),
             invite_policy_apply_failures: load(&self.invite_policy_apply_failures),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReconcileTelemetry;
+
+    #[test]
+    fn diagnostic_replay_recovers_from_failure() {
+        let telemetry = ReconcileTelemetry::default();
+        telemetry.begin_catch_up();
+        assert_eq!(telemetry.diagnostic_replay().state, "running");
+        telemetry.finish_catch_up_err("catch_up_failed");
+        let failed = telemetry.diagnostic_replay();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.last_reason.as_deref(), Some("catch_up_failed"));
+        telemetry.begin_catch_up();
+        telemetry.finish_catch_up_ok();
+        let idle = telemetry.diagnostic_replay();
+        assert_eq!(idle.state, "idle");
+        assert!(idle.last_reason.is_none());
+        assert!(idle.error_count >= 1);
     }
 }

@@ -10,7 +10,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Optional
 
 PROTOCOL = "marmot.agent-control.v2"
 MAX_FRAME_BYTES = 1024 * 1024
@@ -29,6 +29,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
     "group_info": frozenset({"group_info"}),
+    "diagnostic_status": frozenset({"diagnostic_status"}),
     "send_media": frozenset({"final_sent"}),
     "download_media": frozenset({"media_downloaded"}),
     "allowlist_list": frozenset({"allowlist"}),
@@ -134,6 +135,25 @@ class MarmotAgentControlClient:
         ):
             raise AgentControlError(
                 "wn-agent returned invalid account_list response",
+                code="protocol_error",
+            )
+        return response
+
+    async def diagnostic_status(
+        self,
+        *,
+        account_id_hex: Optional[str] = None,
+        home_group_id_hex: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"type": "diagnostic_status"}
+        if account_id_hex:
+            payload["account_id_hex"] = _normalize_hex(account_id_hex, "account_id_hex")
+        if home_group_id_hex:
+            payload["home_group_id_hex"] = _normalize_hex(home_group_id_hex, "home_group_id_hex")
+        response = await self.request(payload, timeout=min(self.request_timeout, 5.0))
+        if not isinstance(response.get("report"), dict):
+            raise AgentControlError(
+                "wn-agent returned invalid diagnostic_status response",
                 code="protocol_error",
             )
         return response
@@ -594,6 +614,7 @@ class MarmotAgentControlClient:
         *,
         account_id_hex: Optional[str] = None,
         group_id_hex: Optional[str] = None,
+        on_ack: Optional[Callable[[], Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         request_id = uuid.uuid4().hex
         writer: Optional[asyncio.StreamWriter] = None
@@ -628,6 +649,10 @@ class MarmotAgentControlClient:
             self._raise_if_error(ack)
             if ack.get("type") != "ack":
                 raise AgentControlError(f"expected subscribe ack, got {ack.get('type')!r}")
+            if on_ack is not None:
+                acknowledged = on_ack()
+                if isinstance(acknowledged, Awaitable):
+                    await acknowledged
 
             while True:
                 envelope = await self._read_envelope(reader, allow_eof=True, timeout=None)

@@ -20,6 +20,10 @@ PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
 TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="mdk-hermes-spool-suite-")
 atexit.register(TEST_SPOOL_ROOT.cleanup)
+os.environ.setdefault(
+    "HERMES_HOME",
+    str(Path(TEST_SPOOL_ROOT.name) / "hermes-home"),
+)
 
 
 def wire_event(event):
@@ -771,6 +775,36 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["type"], "inbound_message")
         self.assertEqual(event["text"], "ping")
 
+    async def test_inbound_subscription_invokes_on_ack_before_events(self):
+        ack_seen = asyncio.Event()
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "ack",
+                },
+            )
+            await writer.drain()
+            await ack_seen.wait()
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        acknowledged = []
+
+        def on_ack():
+            acknowledged.append(True)
+            ack_seen.set()
+
+        events = client.inbound_events(account_id_hex="11" * 32, on_ack=on_ack)
+        with self.assertRaises(StopAsyncIteration):
+            await asyncio.wait_for(anext(events), timeout=1.0)
+        self.assertEqual(acknowledged, [True])
+
     async def test_inbound_subscription_waits_without_request_timeout_after_ack(self):
         ack_sent = asyncio.Event()
         release_event = asyncio.Event()
@@ -1456,7 +1490,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         # keyword-only argument raises TypeError before the platform ever
         # comes up (#836).
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 await asyncio.Event().wait()
                 yield {}  # unreachable: marks this as an async generator
 
@@ -1561,7 +1595,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield inbound
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
@@ -1616,7 +1650,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -1655,7 +1689,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -1680,7 +1714,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         attempts = {"n": 0}
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 # Yield control so the event loop can run the test's poll/cancel between
                 # reconnect attempts (the consume loop reconnects in a tight cycle otherwise).
@@ -1759,7 +1793,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
                 # Keep the subscription open after yielding so the consume loop parks on the
@@ -1846,7 +1880,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -1898,7 +1932,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.final_sends = []
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -2053,7 +2087,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.published_profiles = []
                 self.final_sends = []
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -2105,7 +2139,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         attempts = {"n": 0}
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
@@ -2225,7 +2259,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self._prompt_started = asyncio.Event()
                 self._release = asyncio.Event()
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
 
@@ -2312,7 +2346,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.calls = 0
                 self.final_sends = []
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
 
@@ -3678,7 +3712,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield wire_event(event)
 
             async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
@@ -3855,7 +3889,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in (event, dict(event)):
                     yield wire_event(value)
 
@@ -4142,7 +4176,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield wire_event(event)
 
             async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
@@ -4222,7 +4256,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield wire_event(event)
 
         adapter = self._adapter(FakeClient())
@@ -4361,7 +4395,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in events:
                     yield wire_event(value)
 
@@ -4401,7 +4435,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         handler_calls = []
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield {
                     "type": "message_deleted",
                     "account_id_hex": "11" * 32,
@@ -4772,7 +4806,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in events:
                     yield wire_event(value)
 
@@ -4823,7 +4857,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in events:
                     yield wire_event(value)
 
@@ -4862,7 +4896,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         delays = []
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
@@ -4927,7 +4961,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         delays = []
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 # Never yields: a clean EOF on the inbound stream.
@@ -8682,7 +8716,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     is_direct=False,
                 )
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield {
                     "type": "group_state_changed",
                     "account_id_hex": self_outer.ACCOUNT,
@@ -8732,7 +8766,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     f"Name {group_id_hex[:4]}",
                 )
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 

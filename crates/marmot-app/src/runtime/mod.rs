@@ -224,6 +224,8 @@ pub struct AccountManager {
     onboarding_test_holds: Arc<OnboardingTestHolds>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
+    #[cfg(test)]
+    reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
     generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
 }
@@ -3333,6 +3335,37 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Read KeyPackage maintenance status from an already-running worker only.
+    ///
+    /// `Ok(None)` means no worker is running. This path never calls `reconcile`,
+    /// starts an account, publishes, syncs, or schedules maintenance.
+    pub async fn diagnostic_key_package_maintenance_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<Option<cgka_traits::KeyPackageLifecycleState>>, AppError> {
+        self.accounts
+            .diagnostic_key_package_maintenance_status(account_ref)
+            .await
+    }
+
+    /// Read group MLS state from an already-running worker only.
+    pub async fn diagnostic_group_mls_state(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<AppGroupMlsState>, AppError> {
+        self.accounts
+            .diagnostic_group_mls_state(account_ref, group_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn reconcile_invocation_count(&self) -> u64 {
+        self.accounts
+            .reconcile_invocations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn durably_owned_key_packages(
         &self,
         account_ref: &str,
@@ -5501,6 +5534,8 @@ impl AccountManager {
             onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(test)]
+            reconcile_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
                 accepting: true,
                 handles: Vec::new(),
@@ -5801,6 +5836,9 @@ impl AccountManager {
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
+        #[cfg(test)]
+        self.reconcile_invocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _worker_transaction = self.worker_transactions.lock().await;
         self.reconcile_locked().await
     }
@@ -6196,6 +6234,25 @@ impl AccountManager {
         self.worker_commands_for_account(account)
             .await
             .map(|(commands, _)| commands)
+    }
+
+    /// Look up an already-running worker without starting or reconciling one.
+    async fn existing_worker_commands(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<mpsc::Sender<AccountWorkerCommand>>, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if !account.can_sign() {
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
+        }
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()));
+        }
+        let workers = self.workers.lock().await;
+        Ok(workers
+            .get(&account.account_id_hex)
+            .map(|worker| worker.commands.clone()))
     }
 
     async fn worker_commands_for_setup(

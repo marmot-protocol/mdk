@@ -41,7 +41,10 @@ several files in the same crate); methods shared across those files are `pub(cra
   worker even with a matured retry pending.
 - `src/reconcile_telemetry.rs` — privacy-safe aggregate counters for the background reconciliation loops
   (`ReconcileTelemetry` on the connector: passes, outcomes, accounts/candidate rows considered) plus the
-  `ReconcileSource` label used on per-pass tracing events (mdk#1380).
+  `ReconcileSource` label used on per-pass tracing events (mdk#1380). Current catch-up/replay state is
+  exposed through `diagnostic_replay()`.
+- `src/diagnostics.rs` — identifier-free `diagnostic_status` handler (account selection, KeyPackage
+  aggregates, relay/replay/home observations) using no-start runtime reads.
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`retryable`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.

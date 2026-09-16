@@ -1178,9 +1178,11 @@ impl InboundCatchUpDriver {
         let started = tokio::time::Instant::now();
         let _guard = self.lock.lock().await;
         ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_started);
+        self.telemetry.begin_catch_up();
         let result = self.runtime.catch_up_accounts_reporting().await;
         match &result {
             Ok(summary) => {
+                self.telemetry.finish_catch_up_ok();
                 ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_completed);
                 ReconcileTelemetry::add(
                     &self.telemetry.catch_up_accounts_considered,
@@ -1203,6 +1205,7 @@ impl InboundCatchUpDriver {
                 Ok(())
             }
             Err(_) => {
+                self.telemetry.finish_catch_up_err("catch_up_failed");
                 ReconcileTelemetry::bump(&self.telemetry.catch_up_passes_failed);
                 tracing::warn!(
                     target: "agent_connector",
@@ -1241,10 +1244,19 @@ impl InboundCatchUpDriver {
     pub(crate) async fn request(&self) -> Result<(), AppError> {
         ReconcileTelemetry::bump(&self.telemetry.catch_up_explicit_requests);
         let _guard = self.lock.lock().await;
+        self.telemetry.begin_catch_up();
         let result = self.runtime.catch_up_accounts().await;
         if result.is_ok() {
+            self.telemetry.finish_catch_up_ok();
             let _ = self.events.send(InboundCatchUpEvent::Completed);
         } else {
+            let cancelled = matches!(result, Err(marmot_app::AppError::RuntimeStopping));
+            if cancelled {
+                ReconcileTelemetry::bump(&self.telemetry.catch_up_cancelled);
+                self.telemetry.finish_catch_up_err("cancelled");
+            } else {
+                self.telemetry.finish_catch_up_err("catch_up_failed");
+            }
             tracing::warn!(
                 target: "agent_connector",
                 method = "inbound_catch_up_request",

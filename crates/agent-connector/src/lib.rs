@@ -4,6 +4,7 @@ mod account;
 mod allowlist;
 mod bootstrap;
 mod connection;
+mod diagnostics;
 mod error;
 mod event_projection;
 mod identity;
