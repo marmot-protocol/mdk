@@ -189,23 +189,31 @@ impl SqliteAccountStorage {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let accessed = next_access(&tx)?;
-        tx.execute(
-            "INSERT INTO avatar_assets(owner_key, source_key, token, accessed)
-             VALUES(?1, ?2, randomblob(16), ?3)
-             ON CONFLICT(owner_key) DO UPDATE SET
-                token = CASE WHEN source_key = excluded.source_key THEN token ELSE excluded.token END,
-                content_revision = CASE WHEN source_key = excluded.source_key THEN content_revision ELSE 0 END,
-                bytes = CASE WHEN source_key = excluded.source_key THEN bytes ELSE NULL END,
-                digest = CASE WHEN source_key = excluded.source_key THEN digest ELSE NULL END,
-                media_type = CASE WHEN source_key = excluded.source_key THEN media_type ELSE NULL END,
-                width = CASE WHEN source_key = excluded.source_key THEN width ELSE NULL END,
-                height = CASE WHEN source_key = excluded.source_key THEN height ELSE NULL END,
-                refresh_at = CASE WHEN source_key = excluded.source_key THEN refresh_at ELSE NULL END,
-                source_key = excluded.source_key, accessed = excluded.accessed",
-            params![owner, source, accessed],
+        let unchanged: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM avatar_assets WHERE owner_key = ?1 AND source_key = ?2)",
+            params![owner, source], |r| r.get(0),
         ).storage()?;
+        if !unchanged {
+            tx.execute(
+                "INSERT INTO avatar_assets(owner_key, source_key, token)
+                 VALUES(?1, ?2, randomblob(16))
+                 ON CONFLICT(owner_key) DO UPDATE SET
+                    token = excluded.token, source_key = excluded.source_key,
+                    content_revision = 0, bytes = NULL, digest = NULL, media_type = NULL,
+                    width = NULL, height = NULL, refresh_at = NULL",
+                params![owner, source],
+            )
+            .storage()?;
+        }
         let reference =
             reference_for_owner(&tx, owner)?.ok_or_else(|| invalid("avatar binding missing"))?;
+        touch_access(&tx, &reference.token, accessed)?;
+        // Repeated bindings cannot grow the cache: avoid scanning usage or
+        // rewriting a blob just because another screen asks for the same source.
+        if unchanged {
+            tx.commit().storage()?;
+            return Ok(reference);
+        }
         evict(&tx, &reference.token, limits)?;
         tx.commit().storage()?;
         Ok(reference)
@@ -268,9 +276,9 @@ impl SqliteAccountStorage {
             .execute(
                 "UPDATE avatar_assets SET bytes = ?1, digest = ?2, media_type = ?3,
                 width = ?4, height = ?5, refresh_at = ?6,
-                content_revision = content_revision + 1, accessed = ?7
-             WHERE token = ?8 AND content_revision = ?9
-                AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?10",
+                content_revision = content_revision + 1
+             WHERE token = ?7 AND content_revision = ?8
+                AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?9",
                 params![
                     image.bytes(),
                     digest.as_slice(),
@@ -278,7 +286,6 @@ impl SqliteAccountStorage {
                     image.width,
                     image.height,
                     refresh_at,
-                    accessed,
                     reference.token,
                     expected,
                     reference.store_epoch
@@ -288,6 +295,7 @@ impl SqliteAccountStorage {
         if changed == 0 {
             return Ok(AvatarPublishResult::Superseded);
         }
+        touch_access(&tx, &reference.token, accessed)?;
         evict(&tx, &reference.token, limits)?;
         tx.commit().storage()?;
         Ok(AvatarPublishResult::Published {
@@ -342,11 +350,7 @@ impl SqliteAccountStorage {
                 .storage()?;
             if let Some(value) = decoded {
                 let accessed = next_access(&tx)?;
-                tx.execute(
-                    "UPDATE avatar_assets SET accessed = ?1 WHERE token = ?2",
-                    params![accessed, reference.token],
-                )
-                .storage()?;
+                touch_access(&tx, &reference.token, accessed)?;
                 image = Some(value);
             } else {
                 tx.execute(
@@ -407,6 +411,15 @@ fn valid_dimensions(width: u32, height: u32) -> bool {
 }
 fn next_access(conn: &Connection) -> StorageResult<i64> {
     conn.query_row("UPDATE avatar_cache_meta SET access_seq = access_seq + 1 WHERE id = 1 RETURNING access_seq", [], |r| r.get(0)).storage()
+}
+fn touch_access(conn: &Connection, token: &[u8], accessed: i64) -> StorageResult<()> {
+    conn.execute(
+        "INSERT INTO avatar_access(token, accessed) VALUES(?1, ?2)
+         ON CONFLICT(token) DO UPDATE SET accessed = excluded.accessed",
+        params![token, accessed],
+    )
+    .storage()?;
+    Ok(())
 }
 fn reference_for_owner(conn: &Connection, owner: &str) -> StorageResult<Option<AvatarAssetRef>> {
     conn.query_row(
@@ -471,10 +484,16 @@ fn usage(conn: &Connection) -> StorageResult<AvatarCacheUsage> {
 fn evict(conn: &Connection, protected: &[u8], limits: Limits) -> StorageResult<()> {
     let mut size = usage(conn)?;
     while size.entries > limits.entries || size.byte_count > limits.bytes {
-        let victim: Option<(Vec<u8>, u64)> = conn.query_row(
-            "SELECT token, coalesce(length(bytes), 0) FROM avatar_assets WHERE token != ?1 ORDER BY accessed, owner_key LIMIT 1",
-            [protected], |r| Ok((r.get(0)?, nonnegative(r, 1)?)),
-        ).optional().storage()?;
+        let victim: Option<(Vec<u8>, u64)> = conn
+            .query_row(
+                "SELECT a.token, coalesce(length(a.bytes), 0) FROM avatar_access r
+             JOIN avatar_assets a ON a.token = r.token WHERE a.token != ?1
+             ORDER BY r.accessed, r.token LIMIT 1",
+                [protected],
+                |r| Ok((r.get(0)?, nonnegative(r, 1)?)),
+            )
+            .optional()
+            .storage()?;
         let Some((token, bytes)) = victim else {
             return Err(invalid("avatar exceeds cache capacity"));
         };

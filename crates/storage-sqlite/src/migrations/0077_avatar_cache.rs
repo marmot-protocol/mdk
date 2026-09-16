@@ -24,7 +24,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             height INTEGER,
             refresh_at INTEGER CHECK(refresh_at IS NULL OR
                 (typeof(refresh_at) = 'integer' AND refresh_at >= 0)),
-            accessed INTEGER NOT NULL CHECK(typeof(accessed) = 'integer' AND accessed >= 0),
             CHECK((bytes IS NULL AND digest IS NULL AND media_type IS NULL AND width IS NULL
                     AND height IS NULL AND refresh_at IS NULL)
                 OR (bytes IS NOT NULL AND digest IS NOT NULL AND media_type IS NOT NULL
@@ -33,7 +32,11 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
                     AND typeof(width) = 'integer' AND typeof(height) = 'integer'
                     AND width BETWEEN 1 AND 4096 AND height BETWEEN 1 AND 4096))
         );
-        CREATE INDEX avatar_assets_lru ON avatar_assets(accessed, owner_key);
+        CREATE TABLE avatar_access (
+            token BLOB PRIMARY KEY NOT NULL REFERENCES avatar_assets(token) ON DELETE CASCADE ON UPDATE CASCADE,
+            accessed INTEGER NOT NULL CHECK(typeof(accessed) = 'integer' AND accessed >= 0)
+        );
+        CREATE INDEX avatar_access_lru ON avatar_access(accessed, token);
         CREATE TRIGGER avatar_cache_store_reset AFTER UPDATE OF store_epoch ON chat_presentation_meta
         WHEN OLD.store_epoch IS NOT NEW.store_epoch BEGIN
             DELETE FROM avatar_assets;

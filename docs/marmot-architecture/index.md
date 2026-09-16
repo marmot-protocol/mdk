@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-15
+updated: 2026-09-16
 tags: [marmot, architecture, index]
 ---
 
@@ -203,6 +203,9 @@ These are longer working documents. Go here when you need depth, not orientation
     `IdentityRemove` design space.
 
 ### Current state — facts and analysis
+
+- **Doc:** [`further-context/avatar-cache-storage.md`](./further-context/avatar-cache-storage.md)
+  - **What it covers:** C7-A protected avatar storage, bounds, local-read costs and later acquisition/native boundaries.
 
 - **Doc:** [`further-context/conversation-live-window-plan.md`](./further-context/conversation-live-window-plan.md)
   - **What it covers:** C5 M4 viewport/capture implementation and remaining engine-authority/live-actor requirements.

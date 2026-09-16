@@ -458,8 +458,10 @@ fn local_avatar_reads_do_not_scan_other_entries() {
         let conn = store.lock().unwrap();
         conn.execute_batch(
             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2047)
-             INSERT INTO avatar_assets(owner_key, source_key, token, accessed)
-             SELECT 'owner-' || x, 'source', randomblob(16), x FROM n;
+             INSERT INTO avatar_assets(owner_key, source_key, token)
+             SELECT 'owner-' || x, 'source', randomblob(16) FROM n;
+             INSERT INTO avatar_access(token, accessed)
+             SELECT token, CAST(substr(owner_key, 7) AS INTEGER) FROM avatar_assets WHERE owner_key != 'target';
              UPDATE avatar_cache_meta SET access_seq = 4096 WHERE id = 1;",
         )
         .unwrap();
@@ -474,6 +476,26 @@ fn local_avatar_reads_do_not_scan_other_entries() {
     let (state, status_steps) = measure(&store, || store.avatar_status(&reference, 0).unwrap());
     assert_eq!(state.availability, AvatarAvailability::Ready);
     assert!(status_steps < 100, "unbounded status read: {status_steps}");
+    let (same, bind_steps) = measure(&store, || bind(&store, "target"));
+    assert_eq!(same, reference);
+    assert!(
+        bind_steps < 500,
+        "unchanged binding scanned cache: {bind_steps}"
+    );
+    let (_, publish_steps) = measure(&store, || {
+        assert_eq!(
+            store
+                .publish_avatar(&reference, 1, &image(2, 16), None)
+                .unwrap(),
+            AvatarPublishResult::Published {
+                content_revision: 2
+            }
+        );
+    });
+    assert!(
+        publish_steps < 30_000,
+        "publication exceeded bounded metadata work: {publish_steps}"
+    );
     let new = bind(&store, "new-owner");
     assert_eq!(
         store.avatar_cache_usage().unwrap().entries,
@@ -528,4 +550,85 @@ fn failed_source_rebind_and_counter_overflow_preserve_previous_pixels() {
         .unwrap();
     assert!(store.bind_avatar_source("owner", "new").is_err());
     assert_eq!(store.avatar_reference("owner").unwrap(), Some(reference));
+}
+
+#[test]
+fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("avatar-wal.db");
+    let key = crate::SqlCipherKey::new("avatar-wal-test-key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let reference = bind(&store, "owner");
+    publish(&store, &reference, &image(42, MAX_AVATAR_BYTES));
+    {
+        let conn = store.lock().unwrap();
+        conn.execute("UPDATE avatar_cache_meta SET access_seq = 126", [])
+            .unwrap();
+        conn.execute("UPDATE avatar_access SET accessed = 126", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+    // SQLite integer encoding widens at 128. LRU bookkeeping must not rewrite
+    // the adjacent 10 MiB image when that happens.
+    for _ in 0..3 {
+        ready(&store, &reference);
+    }
+    store
+        .lock()
+        .unwrap()
+        .execute("UPDATE avatar_cache_meta SET access_seq = 32766", [])
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(bind(&store, "owner"), reference);
+    }
+    let wal_bytes = std::fs::metadata(path.with_extension("db-wal"))
+        .unwrap()
+        .len();
+    eprintln!("10 MiB avatar: three reads and three unchanged binds wrote {wal_bytes} WAL bytes");
+    assert!(
+        wal_bytes < 256 * 1024,
+        "avatar reads rewrote {wal_bytes} WAL bytes"
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn removing_live_avatar_invalidates_shared_views_and_preserves_other_owners() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let reference = bind(&store, "removed");
+    let another_view = bind(&store, "removed");
+    let other = bind(&store, "retained");
+    let bytes = image(1, 16);
+    publish(&store, &reference, &bytes);
+    publish(&store, &other, &bytes);
+    assert!(store.remove_avatar_source(&reference).unwrap());
+    assert_eq!(
+        store.avatar_cache_usage().unwrap(),
+        AvatarCacheUsage {
+            entries: 1,
+            byte_count: 16
+        }
+    );
+    assert_eq!(store.avatar_reference("removed").unwrap(), None);
+    assert_eq!(
+        store
+            .read_avatar(&another_view, 0)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated
+    );
+    assert_eq!(
+        store.publish_avatar(&reference, 1, &bytes, None).unwrap(),
+        AvatarPublishResult::Superseded
+    );
+    assert_eq!(ready(&store, &other).image, Some(bytes));
+    assert_ne!(bind(&store, "removed"), reference);
+    let recency: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT count(*) FROM avatar_access", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(recency as u64, store.avatar_cache_usage().unwrap().entries);
 }
