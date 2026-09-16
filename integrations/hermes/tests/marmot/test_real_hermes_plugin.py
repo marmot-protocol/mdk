@@ -517,20 +517,28 @@ def _source_install_supports_subdirectories(plugins_cmd_module) -> bool:
     )
 
 
+# Pre-subdirectory Hermes installs this exact file set. Keep it aligned with
+# the post-install required files below so media-api-candidate / plugin-only
+# cohorts receive doctor.py and diagnostics.py.
+PLUGIN_ONLY_RUNTIME_FILES = (
+    "__init__.py",
+    "adapter.py",
+    "agent_control.py",
+    "ambient_context.py",
+    "diagnostics.py",
+    "doctor.py",
+    "inbound_spool.py",
+    "plugin.yaml",
+    "README.md",
+)
+
+
 def _plugin_only_repository(mdk_source: Path, mdk_ref: str, temp_root: Path) -> Path:
     """Build an exact-content plugin repository for pre-subdirectory Hermes."""
 
     repository = temp_root / "marmot-plugin-only-source"
     repository.mkdir()
-    for name in (
-        "__init__.py",
-        "adapter.py",
-        "agent_control.py",
-        "ambient_context.py",
-        "inbound_spool.py",
-        "plugin.yaml",
-        "README.md",
-    ):
+    for name in PLUGIN_ONLY_RUNTIME_FILES:
         content = subprocess.check_output(
             ["git", "show", f"{mdk_ref}:integrations/hermes/marmot/{name}"],
             cwd=mdk_source,
@@ -703,17 +711,7 @@ def main() -> int:
             )
 
         plugin_dir = home / ".hermes" / "plugins" / "marmot"
-        required = {
-            "__init__.py",
-            "adapter.py",
-            "agent_control.py",
-            "ambient_context.py",
-            "diagnostics.py",
-            "doctor.py",
-            "inbound_spool.py",
-            "plugin.yaml",
-            "README.md",
-        }
+        required = set(PLUGIN_ONLY_RUNTIME_FILES)
         missing = sorted(name for name in required if not (plugin_dir / name).is_file())
         if missing:
             raise AssertionError(f"installed plugin is missing files: {missing}")
