@@ -2225,3 +2225,136 @@ fn recover_notification_updates_rebuilds_fresh_kind_1210_rows() {
         "pre-watermark kind-1210 rows must stay history"
     );
 }
+
+#[test]
+fn system_reaction_preview_decodes_only_supported_nonempty_text() {
+    let reaction = received_reaction("👍", &"aa".repeat(32));
+    for (content, expected) in [
+        (
+            r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"actor":"private-id"}}"#,
+            Some("Member added"),
+        ),
+        (
+            r#"{"v":1,"system_type":"future_type","text":"Future activity"}"#,
+            Some("Future activity"),
+        ),
+        (r#"{"v":1,"system_type":"member_added","text":"   "}"#, None),
+        (
+            r#"{"v":2,"system_type":"member_added","text":"future payload"}"#,
+            None,
+        ),
+        (r#"{"v":1,"system_type":"member_added"}"#, None),
+        ("not JSON", None),
+    ] {
+        let mut target = timeline_target(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, content);
+        assert_eq!(
+            reaction_notification_fields(&reaction, Some(&target)),
+            (Some("👍".into()), expected.map(str::to_owned)),
+            "{content}"
+        );
+        target.deleted = true;
+        assert_eq!(
+            reaction_notification_fields(&reaction, Some(&target)).1,
+            None
+        );
+        target.deleted = false;
+        target.invalidated = true;
+        assert_eq!(
+            reaction_notification_fields(&reaction, Some(&target)).1,
+            None
+        );
+    }
+    let oversized =
+        serde_json::json!({"v":1,"system_type":"member_added","text":"x".repeat(16 * 1024)})
+            .to_string();
+    let target = timeline_target(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, &oversized);
+    assert_eq!(
+        reaction_notification_fields(&reaction, Some(&target)).1,
+        None
+    );
+}
+
+#[test]
+fn system_reaction_notifications_use_stored_actor_and_respect_origin_withdrawal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account = app.account_home().create_account("alice").unwrap();
+    let local = account.account_id_hex;
+    let peer = "bb".repeat(32);
+    let group = cgka_traits::GroupId::new(vec![0xEE; 16]);
+    let group_hex = hex::encode(group.as_slice());
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(
+        &mut resolver,
+        "alice",
+        &local,
+        &group_hex,
+        Some(&peer),
+        true,
+        false,
+    );
+    for (index, actor) in [Some(local.as_str()), Some(peer.as_str()), None]
+        .into_iter()
+        .enumerate()
+    {
+        let material = group_system_event_material(
+            &group,
+            index as u64,
+            actor.map(member_id_from_hex).as_ref(),
+            &cgka_traits::engine::GroupStateChange::MemberAdded {
+                member: member_id_from_hex(&peer),
+            },
+        )
+        .unwrap();
+        let origin = cgka_traits::MessageId::new(vec![index as u8 + 1; 32]);
+        let projection = crate::AppMessageProjection {
+            authority: None,
+            message_id_hex: material.message_id_hex.clone(),
+            source_message_id_hex: None,
+            group_id_hex: group_hex.clone(),
+            direction: "system".into(),
+            sender: material.sender,
+            plaintext: material.content,
+            kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: material.tags,
+            source_epoch: Some(index as u64),
+            retention: None,
+            recorded_at: Some(10),
+            origin_commit_id: Some(hex::encode(origin.as_slice())),
+            moderation_grant: false,
+        };
+        app.record_account_app_event("alice", &projection).unwrap();
+        let mut reaction = received_reaction("👍", &projection.message_id_hex);
+        reaction.group_id = group.clone();
+        let event = RuntimeMessageReceived {
+            account_label: "alice".into(),
+            account_id_hex: local.clone(),
+            message: reaction,
+        };
+        let alert = notification_update_from_message(&app, &mut resolver, &event).unwrap();
+        if actor != Some(local.as_str()) {
+            assert!(
+                alert.is_none(),
+                "another actor or no actor must not notify this account"
+            );
+            continue;
+        }
+        assert_eq!(
+            alert.unwrap().reacted_to_preview.as_deref(),
+            Some("Member added")
+        );
+        let withdrawal = cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group.clone(),
+            epoch: cgka_traits::EpochId(index as u64),
+            invalidated_commit_id: origin,
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        };
+        app.projection_update_for_invalidation_event("alice", &withdrawal)
+            .unwrap()
+            .unwrap();
+        // Replaying the source must not revive a losing commit or its preview.
+        app.record_account_app_event("alice", &projection).unwrap();
+        let alert = notification_update_from_message(&app, &mut resolver, &event).unwrap();
+        assert!(alert.and_then(|alert| alert.reacted_to_preview).is_none());
+    }
+}

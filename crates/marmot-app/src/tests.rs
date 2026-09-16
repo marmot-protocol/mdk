@@ -21986,3 +21986,6 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
         selected.group_system.unwrap().subject_account_id_hex
     );
 }
+
+#[path = "tests/conversation_cold_open.rs"]
+mod conversation_cold_open;

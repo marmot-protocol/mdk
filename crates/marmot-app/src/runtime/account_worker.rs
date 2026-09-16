@@ -2391,7 +2391,9 @@ async fn handle_startup_hydration_command(
             store_epoch,
             respond,
         } => {
-            let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            if !respond.is_closed() {
+                let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            }
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             let _ = client
@@ -3151,42 +3153,27 @@ fn account_worker_command_future<'a>(
                     "runtime post-create snapshot failed",
                 );
                 Box::pin(serve_snapshot_reads_until(
-                read_snapshot,
-                async {
-                    client
-                        .drive_unpublished_welcome_delivery(Some(&telemetry))
-                        .await;
-                    publish_pending_welcome_delivery_events(
-                        events,
-                        account_id_hex,
-                        account_label,
-                        client,
-                    );
-                    let subscription_started_at = Instant::now();
-                    let subscription_refresh = client.sync_runtime_groups().await;
-                    telemetry.record(
-                        AppPerformanceOperation::GroupCreateSubscriptionRefresh,
-                        subscription_started_at.elapsed(),
-                        subscription_refresh.is_ok(),
-                    );
-                    if let Err(error) = subscription_refresh {
-                        tracing::warn!(
-                            target: "marmot_app::runtime",
-                            method = "create_group_subscription_refresh",
-                            error_kind = error.privacy_safe_kind(),
-                            "confirmed group creation could not refresh subscriptions immediately"
+                    read_snapshot,
+                    async {
+                        client
+                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                            .await;
+                        publish_pending_welcome_delivery_events(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            client,
                         );
-                    }
-                    client
-                        .retry_pending_push_registration_shares_best_effort()
-                        .await;
-                },
-                commands,
-                pending,
-                app,
-                account_label,
-            ))
-            .await;
+                        client
+                            .retry_pending_push_registration_shares_best_effort()
+                            .await;
+                    },
+                    commands,
+                    pending,
+                    app,
+                    account_label,
+                ))
+                .await;
             }
             true
         }),
@@ -3300,7 +3287,9 @@ fn account_worker_command_future<'a>(
             store_epoch,
             respond,
         } => Box::pin(async move {
-            let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            if !respond.is_closed() {
+                let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+            }
             true
         }),
         AccountWorkerCommand::GroupMlsState { group_id, respond } => Box::pin(async move {
