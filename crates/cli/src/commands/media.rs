@@ -624,6 +624,7 @@ mod tests {
 
     fn sample_message(tags: Vec<Vec<String>>) -> AppMessageRecord {
         AppMessageRecord {
+            authority: None,
             message_id_hex: "aa".repeat(32),
             direction: "incoming".to_owned(),
             group_id_hex: "bb".repeat(32),

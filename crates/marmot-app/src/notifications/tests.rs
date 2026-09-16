@@ -1731,6 +1731,7 @@ fn signed_record_survives_wire_round_trip_and_verifies() {
 #[test]
 fn recovery_skips_rows_before_the_subscription_watermark() {
     let mut record = AppMessageRecord {
+        authority: None,
         message_id_hex: "11".repeat(32),
         direction: "received".to_owned(),
         group_id_hex: "22".repeat(16),
@@ -2014,6 +2015,7 @@ fn group_state_live_and_recovery_share_a_deterministic_key() {
         account_label,
         &local,
         &AppMessageRecord {
+            authority: None,
             message_id_hex: material.message_id_hex.clone(),
             direction: "system".to_owned(),
             group_id_hex,
@@ -2041,6 +2043,7 @@ fn group_state_live_and_recovery_share_a_deterministic_key() {
 #[test]
 fn recovery_skips_invalidated_group_system_rows() {
     let mut record = AppMessageRecord {
+        authority: None,
         message_id_hex: "11".repeat(32),
         direction: "system".to_owned(),
         group_id_hex: "22".repeat(16),

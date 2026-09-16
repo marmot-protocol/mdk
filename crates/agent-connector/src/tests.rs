@@ -4598,6 +4598,7 @@ fn received_chat_record(
     text: &str,
 ) -> AppMessageRecord {
     AppMessageRecord {
+        authority: None,
         message_id_hex: message_id_hex.to_owned(),
         direction: "received".to_owned(),
         group_id_hex: group_id_hex.to_owned(),

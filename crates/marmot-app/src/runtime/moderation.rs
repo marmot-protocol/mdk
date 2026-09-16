@@ -28,17 +28,16 @@ impl RuntimeReportedContentSubscription {
                     let group = self.group.clone();
                     let pending = self.pending_only;
                     let limit = self.limit;
-                    return match blocking_app_task(move || {
+                    match blocking_app_task(move || {
                         Ok(storage.reported_content(&group, pending, None, limit)?)
                     }).await {
-                        Ok(page) => Some(page),
+                        Ok(page) => return Some(page),
                         Err(_) => {
                             tracing::warn!(
                                 target: "marmot_app::moderation",
                                 method = "recv",
                                 "report subscription read failed"
                             );
-                            None
                         }
                     };
                 }
@@ -145,5 +144,79 @@ impl MarmotAppRuntime {
             events,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn report_subscription_survives_read_failure_and_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.sqlite");
+        let key = storage_sqlite::SqlCipherKey::new("subscription test key").unwrap();
+        let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        let (events, receiver) = broadcast::channel(1);
+        let (stopping, shutdown) = watch::channel(false);
+        let mut subscription = RuntimeReportedContentSubscription {
+            snapshot: storage.reported_content("aa", true, None, 10).unwrap(),
+            storage,
+            account_id: "alice".into(),
+            group: "aa".into(),
+            pending_only: true,
+            limit: 10,
+            events: receiver,
+            stopping: shutdown,
+        };
+        let overflow = || {
+            for _ in 0..2 {
+                events
+                    .send(MarmotAppEvent::GroupStateUpdated {
+                        account_id_hex: "alice".into(),
+                        account_label: "alice".into(),
+                        group_id: GroupId::new(vec![0xaa]),
+                    })
+                    .unwrap();
+            }
+        };
+        // Force an actual read error, then restore the table on the same store.
+        connection
+            .execute_batch("ALTER TABLE content_moderation RENAME TO unavailable_moderation")
+            .unwrap();
+        assert!(
+            subscription
+                .storage
+                .reported_content("aa", true, None, 10)
+                .is_err()
+        );
+        overflow();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            subscription.events.is_empty(),
+            "failed refresh was consumed"
+        );
+        connection
+            .execute_batch("ALTER TABLE unavailable_moderation RENAME TO content_moderation")
+            .unwrap();
+        overflow();
+        let page = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+            .await
+            .unwrap()
+            .expect("read failure must not terminate the subscription");
+        assert_eq!(page, subscription.snapshot);
+        stopping.send(true).unwrap();
+        assert!(subscription.recv().await.is_none());
     }
 }

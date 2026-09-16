@@ -1716,6 +1716,7 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
     let stream_id_hex = hex::encode([0xab; 32]);
     let (message_id_hex, start, sender) = latest_agent_stream_start(
         vec![AppMessageRecord {
+            authority: None,
             message_id_hex: "11".repeat(32),
             direction: "inbound".to_owned(),
             group_id_hex: "22".repeat(32),
@@ -1779,6 +1780,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
 
 fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMessageRecord {
     AppMessageRecord {
+        authority: None,
         message_id_hex: message_id_hex.to_owned(),
         direction: "received".to_owned(),
         group_id_hex: group_id_hex.to_owned(),
@@ -2974,4 +2976,84 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
         "invalidation can replace the selected message"
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn recovery_preserves_persisted_authority_after_reopen() {
+    use cgka_traits::app_event::{AppMessageAuthority, MARMOT_APP_EVENT_KIND_REVIEW};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("authority.sqlite");
+    let key = storage_sqlite::SqlCipherKey::new("authority replay test key").unwrap();
+    let evidence = [
+        None,
+        Some(AppMessageAuthority {
+            source_context: [42; 32],
+            moderation_grant: true,
+            reporting_allowed: true,
+        }),
+        Some(AppMessageAuthority {
+            source_context: [43; 32],
+            moderation_grant: false,
+            reporting_allowed: false,
+        }),
+        None,
+    ];
+    let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for (index, authority) in evidence.into_iter().enumerate() {
+        let event = storage_sqlite::StoredAppEvent {
+            group_id_hex: "aa".into(),
+            message_id_hex: format!("{index:064x}"),
+            source_message_id_hex: Some(format!("{:064x}", index + 100)),
+            source_epoch: Some(7),
+            direction: "received".into(),
+            sender: "ab".repeat(32),
+            plaintext: String::new(),
+            kind: MARMOT_APP_EVENT_KIND_REVIEW,
+            tags: vec![],
+            recorded_at: index as u64,
+            received_at: index as u64,
+            origin_commit_id: None,
+            moderation_grant: index == 3,
+        };
+        if index == 3 {
+            // Legacy grants alone are not reconstructed as source evidence.
+            storage.record_app_event(&event).unwrap();
+        } else {
+            storage
+                .record_app_event_with_source(&event, None, authority)
+                .unwrap();
+        }
+    }
+    storage.close().unwrap();
+    let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let rows = storage
+        .app_messages(storage_sqlite::StoredAppMessageQuery {
+            group_id_hex: Some("aa".into()),
+            kinds: None,
+            limit: Some(4),
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for (row, authority) in rows.into_iter().zip(evidence) {
+        assert_eq!(row.authority, authority);
+        assert_eq!(
+            storage
+                .app_message("aa", &row.message_id_hex)
+                .unwrap()
+                .unwrap()
+                .authority,
+            authority
+        );
+        let record = crate::conversions::app_message_record_from_stored(row);
+        let record: AppMessageRecord =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        let update =
+            received_message_update_from_record("account", "alice", record, &HashMap::new())
+                .unwrap();
+        let RuntimeMessageUpdate::Message(received) = update else {
+            panic!("expected message")
+        };
+        assert_eq!(received.message.source_epoch, 7);
+        assert_eq!(received.message.authority, authority);
+    }
 }

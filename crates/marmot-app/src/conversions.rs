@@ -298,6 +298,7 @@ pub(crate) fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
 
 pub(crate) fn app_message_record_from_stored(record: StoredAppMessageRecord) -> AppMessageRecord {
     AppMessageRecord {
+        authority: record.authority,
         message_id_hex: record.message_id_hex,
         direction: record.direction,
         group_id_hex: record.group_id_hex,

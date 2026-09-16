@@ -1129,6 +1129,7 @@ mod tests {
     #[test]
     fn message_and_timeline_plain_rows_sanitize_untrusted_fields() {
         let hostile = AppMessageRecord {
+            authority: None,
             message_id_hex: "11".repeat(32),
             direction: "received".to_owned(),
             group_id_hex: "aa\u{1b}]8;;https://evil.example\u{7}bb".to_owned(),

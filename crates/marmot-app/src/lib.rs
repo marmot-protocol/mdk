@@ -899,6 +899,10 @@ pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) -> std::vec::Drai
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppMessageRecord {
+    /// Authenticated source-state evidence. Legacy and unresolved rows remain
+    /// `None`; recovery must never infer this from current group policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
     pub direction: String,
     pub group_id_hex: String,

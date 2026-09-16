@@ -566,6 +566,7 @@ impl LegacyAccountProjectionDb {
             let recorded_at = row.get::<_, i64>(8)?;
             let received_at = row.get::<_, i64>(9)?;
             Ok(AppMessageRecord {
+                authority: None,
                 message_id_hex: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 direction: row.get(1)?,
                 group_id_hex: row.get(2)?,

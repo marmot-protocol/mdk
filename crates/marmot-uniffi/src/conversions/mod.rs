@@ -711,6 +711,7 @@ mod tests {
     #[test]
     fn app_message_record_ffi_leaves_non_chat_tokens_empty() {
         let record = AppMessageRecord {
+            authority: None,
             message_id_hex: "reaction-1".to_owned(),
             direction: "sent".to_owned(),
             group_id_hex: "11".repeat(32),

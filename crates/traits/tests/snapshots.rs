@@ -632,7 +632,7 @@ fn snapshot_send_intents() {
 
 #[test]
 fn snapshot_send_results() {
-    let app = SendResult::ApplicationMessage {
+    let mut app = SendResult::ApplicationMessage {
         authority: None,
         msg: TransportMessage {
             id: mid(),
@@ -650,6 +650,14 @@ fn snapshot_send_results() {
         retention: cgka_traits::AppMessageRetentionDecision::new(10, 60),
     };
     insta::assert_json_snapshot!("result_application_message", app);
+    if let SendResult::ApplicationMessage { authority, .. } = &mut app {
+        *authority = Some(cgka_traits::app_event::AppMessageAuthority {
+            source_context: [42; 32],
+            moderation_grant: true,
+            reporting_allowed: false,
+        });
+    }
+    insta::assert_json_snapshot!("result_application_message_with_authority", app);
     insta::assert_json_snapshot!(
         "result_proposal",
         SendResult::Proposal {
@@ -701,6 +709,22 @@ fn snapshot_group_events() {
         "event_message_received",
         GroupEvent::MessageReceived {
             authority: None,
+            group_id: gid(),
+            message_id: mid(),
+            epoch: EpochId(7),
+            sender: mem_id(),
+            payload: b"hi".to_vec(),
+            retention: None,
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_message_received_with_authority",
+        GroupEvent::MessageReceived {
+            authority: Some(cgka_traits::app_event::AppMessageAuthority {
+                source_context: [43; 32],
+                moderation_grant: false,
+                reporting_allowed: true,
+            }),
             group_id: gid(),
             message_id: mid(),
             epoch: EpochId(7),

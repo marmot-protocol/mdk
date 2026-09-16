@@ -1589,6 +1589,11 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     group_id_hex: &str,
 ) -> StorageResult<()> {
     let events = app_events_for_rebuild_tx(tx, group_id_hex)?;
+    let chat_ids: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == MARMOT_APP_EVENT_KIND_CHAT)
+        .map(|event| event.message_id_hex.clone())
+        .collect();
     let (rows, stream_starts) = project_group_events(events);
     tx.execute_cached(
         "DELETE FROM message_timeline WHERE group_id_hex = ?1",
@@ -1603,10 +1608,8 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     for row in rows {
         upsert_message_timeline_row_tx(tx, &row)?;
     }
-    for row in app_events_for_rebuild_tx(tx, group_id_hex)? {
-        if row.kind == MARMOT_APP_EVENT_KIND_CHAT {
-            reports::refresh(tx, group_id_hex, &row.message_id_hex)?;
-        }
+    for message_id in chat_ids {
+        reports::refresh(tx, group_id_hex, &message_id)?;
     }
     for start in stream_starts {
         upsert_agent_stream_start_tx(tx, &start)?;
