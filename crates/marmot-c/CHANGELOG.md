@@ -14,6 +14,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   library for the changed output layouts. Admin removal uses kind 4891; author deletion
   remains kind 5. Cross-author non-admin deletion now returns an error, and mixed-version
   groups can disagree on either the old admin kind-5 or new kind-4891 removal behavior.
+  Eligible admins use kind 4891 for their own chat messages too. Cross-author removal is limited
+  to whole kind-9 messages; stream starts, activity, operations, system and custom-kind rows
+  are no longer admin-removal targets.
 
 - Typed group-system chat previews and explicit `MarmotGroupSystemEventProvenance`
   on timeline and preview events. Authenticated actor/subject IDs remain distinct;

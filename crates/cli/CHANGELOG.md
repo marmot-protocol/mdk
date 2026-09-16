@@ -23,7 +23,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Changed
 
 - `messages delete` / `delete_message` use kind 5 for author deletion and kind 4891 for
-  an eligible admin removing another author's chat. A non-author non-admin now receives an error.
+  an eligible admin removing any chat, including their own. A non-author non-admin now receives an error.
+  Cross-author admin removal is limited to whole kind-9 messages; agent-stream starts, activity,
+  operations, system events, and custom-kind rows are no longer admin-removal targets.
   Older peers may retain 4891-removed content; upgraded peers reject newly received cross-author
   admin kind-5 requests. Previously honored legacy tombstones remain. Upgrade all participants
   for consistent moderation.

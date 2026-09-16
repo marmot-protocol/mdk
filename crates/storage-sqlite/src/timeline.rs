@@ -1600,12 +1600,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         params![group_id_hex],
     )
     .storage()?;
-    for mut row in rows {
-        if row.kind == MARMOT_APP_EVENT_KIND_EDIT {
-            apply_targeted_modifiers_tx(tx, &mut row)?;
-        } else {
-            apply_message_removals_tx(tx, &mut row)?;
-        }
+    for row in rows {
         upsert_message_timeline_row_tx(tx, &row)?;
     }
     for row in app_events_for_rebuild_tx(tx, group_id_hex)? {
@@ -3628,6 +3623,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             // mutate canonical content, so they are skipped entirely.
             MARMOT_APP_EVENT_KIND_REACTION if !event.invalidated => reactions.push(event.clone()),
             MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
+            MARMOT_APP_EVENT_KIND_REMOVE if !event.invalidated => deletes.push(event.clone()),
             // Modifier kinds never get a row of their own. Every other kind —
             // including app-defined custom kinds — projects a generic row.
             MARMOT_APP_EVENT_KIND_REACTION
@@ -3654,6 +3650,9 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
         .collect::<HashMap<_, _>>();
     let mut deleted_reaction_ids = HashSet::new();
     for delete in &deletes {
+        if delete.kind != MARMOT_APP_EVENT_KIND_DELETE {
+            continue;
+        }
         for target in tag_values(&delete.tags, EVENT_REF_TAG) {
             if let Some(target_event) = events_by_id.get(target)
                 && target_event.kind == MARMOT_APP_EVENT_KIND_REACTION
@@ -3702,12 +3701,24 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             .collect();
     }
 
+    deletes.sort_by(|a, b| {
+        (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
+    });
     for delete in deletes {
         for target in tag_values(&delete.tags, EVENT_REF_TAG) {
             let Some(row) = timeline.get_mut(target) else {
                 continue;
             };
-            if row.sender != delete.sender && !delete.moderation_grant {
+            if delete.kind == MARMOT_APP_EVENT_KIND_REMOVE {
+                if row.kind != MARMOT_APP_EVENT_KIND_CHAT
+                    || !delete.moderation_grant
+                    || cgka_traits::reporting::parse_removal(&delete.tags, &delete.plaintext)
+                        .as_deref()
+                        != Some(target)
+                {
+                    continue;
+                }
+            } else if row.sender != delete.sender && !delete.moderation_grant {
                 continue;
             }
             row.deleted = true;

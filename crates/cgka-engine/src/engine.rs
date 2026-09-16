@@ -574,13 +574,15 @@ impl<S: StorageProvider> EngineBuilder<S> {
         // Upgrade pending outputs from older databases onto the minimal
         // authority-retry rail before the app acknowledges their plaintext.
         for event in &pending_application_events {
-            if matches!(
-                event,
-                GroupEvent::MessageReceived {
-                    authority: None,
-                    ..
-                }
-            ) {
+            if let GroupEvent::MessageReceived {
+                authority: None,
+                payload,
+                ..
+            } = event
+                && cgka_traits::app_event::MarmotAppEvent::decode(payload).is_ok_and(|event| {
+                    cgka_traits::reporting::requires_source_authority(event.kind)
+                })
+            {
                 self.storage.put_pending_application_event(event)?;
             }
         }

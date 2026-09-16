@@ -3692,40 +3692,21 @@ impl AppClient {
             }
             AppMessageIntent::Delete { target_message_id } => {
                 let storage = self.app.account_storage(&self.state.label)?;
-                if let Some(target) =
-                    storage.app_message(&hex::encode(group_id.as_slice()), &target_message_id)?
-                    && target.sender != sender
+                let target =
+                    storage.app_message(&hex::encode(group_id.as_slice()), &target_message_id)?;
+                if target.as_ref().is_some_and(|target| {
+                    target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                }) && self.delete_moderation_grant(group_id, &sender)
                 {
-                    if !self.delete_moderation_grant(group_id, &sender)
-                        || target.kind != cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
-                    {
+                    AppMessageIntent::RemoveMessage { target_message_id }
+                } else {
+                    if target.is_some_and(|target| target.sender != sender) {
                         return Err(AppError::InvalidAppMessagePayload(
                             "group admin authority and a chat message target are required".into(),
                         ));
                     }
-                    AppMessageIntent::RemoveMessage { target_message_id }
-                } else {
                     AppMessageIntent::Delete { target_message_id }
                 }
-            }
-            AppMessageIntent::RemoveMessage {
-                ref target_message_id,
-            } => {
-                let storage = self.app.account_storage(&self.state.label)?;
-                if !self.delete_moderation_grant(group_id, &sender)
-                    || storage
-                        .report_target_author(
-                            &hex::encode(group_id.as_slice()),
-                            target_message_id,
-                            target_message_id,
-                        )?
-                        .is_none()
-                {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "group admin authority and a chat message target are required".into(),
-                    ));
-                }
-                intent
             }
             AppMessageIntent::Unreact {
                 target_message_id,
@@ -3746,6 +3727,22 @@ impl AppClient {
             }
             other => other,
         };
+        if let AppMessageIntent::RemoveMessage { target_message_id } = &intent {
+            let storage = self.app.account_storage(&self.state.label)?;
+            if !self.delete_moderation_grant(group_id, &sender)
+                || storage
+                    .report_target_author(
+                        &hex::encode(group_id.as_slice()),
+                        target_message_id,
+                        target_message_id,
+                    )?
+                    .is_none()
+            {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "group admin authority and a chat message target are required".into(),
+                ));
+            }
+        }
         // An encrypted-media reference is bound to the epoch that produced its
         // ciphertext: the wire `imeta` tag carries no epoch, so every recipient
         // derives the media key from the epoch of the message that delivers
@@ -4249,8 +4246,8 @@ impl AppClient {
         Ok(summary)
     }
 
-    /// Delete one's own target with kind 5, or remove another account's whole
-    /// chat message and all revisions with admin-only kind 4891. A non-admin
+    /// Remove a whole chat with kind 4891 when an eligible admin, including one's
+    /// own chat. Otherwise delete one's own target with kind 5. A non-admin
     /// targeting another account's known message receives an error before send.
     /// Older clients may retain content removed by kind 4891.
     pub async fn delete_message(

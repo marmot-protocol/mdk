@@ -21,8 +21,12 @@ set for app preflight and engine authorization; an absent profile name is empty
 for this check. `dismiss_reports` accepts explicit report IDs and requires active
 admin preflight. Reports use inner kind 1984. Dismissals use NIP-32 kind 1985 with the
 `dismissed` label in namespace `marmot.report-review.v1`, referencing report IDs.
-`delete_message` sends kind 5 for author self-retraction and kind 4891 for active
-admin removal of another account's whole chat message and all its revisions.
+`delete_message` sends kind 4891 for an eligible active admin removing a whole chat
+message and all its revisions, including their own chat. Otherwise it sends kind 5
+for author self-retraction. Cross-author removal is limited to kind-9 messages:
+stream starts, agent activity/operations, system events, and custom-kind rows are
+no longer admin-removal targets. Completed agent messages remain ordinary kind-9
+targets.
 A non-admin targeting another account's message receives an error before
 publication. Kind 4891 references
 the original message and carries `{"v":1,"action":"remove"}`. This does not

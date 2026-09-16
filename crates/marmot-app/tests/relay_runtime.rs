@@ -7733,9 +7733,12 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .await
         .unwrap();
     let deletion = bob.sync().await.unwrap();
-    // Author self-retraction remains a kind-5 tombstone with an `e` tag.
-    assert_eq!(deletion.messages[0].plaintext, "");
-    assert_eq!(deletion.messages[0].kind, MARMOT_APP_EVENT_KIND_DELETE);
+    // An eligible admin removes their own chat through kind 4891 too.
+    assert_eq!(
+        deletion.messages[0].plaintext,
+        r#"{"v":1,"action":"remove"}"#
+    );
+    assert_eq!(deletion.messages[0].kind, 4891);
     assert_eq!(
         tag_value(&deletion.messages[0].tags, "e"),
         Some(target_message_id.as_str())
@@ -14530,7 +14533,7 @@ async fn encrypted_content_reports_share_review_without_chat_rows() {
             .unwrap()
             .unwrap()
             .kind,
-        5
+        MARMOT_APP_EVENT_KIND_DELETE
     );
     alice.sync().await.unwrap();
     for label in ["alice", "bob"] {
@@ -14620,6 +14623,47 @@ async fn encrypted_content_reports_share_review_without_chat_rows() {
                 .status,
             ModerationStatus::Removed
         );
+    }
+
+    // The same public delete API must close review when the admin also owns
+    // the reported chat, rather than silently selecting author-only kind 5.
+    let own = alice
+        .send(&group, b"admin's own reported content")
+        .await
+        .unwrap();
+    let own_target = &own.message_ids[0];
+    bob.sync().await.unwrap();
+    bob.report_message(&group, own_target, own_target, ReportReason::Spam, "")
+        .await
+        .unwrap();
+    alice.sync().await.unwrap();
+    let removed = alice.delete_message(&group, own_target).await.unwrap();
+    assert_eq!(
+        app.message_by_id("alice", &group_hex, &removed.message_ids[0])
+            .unwrap()
+            .unwrap()
+            .kind,
+        4891
+    );
+    bob.sync().await.unwrap();
+    for label in ["alice", "bob"] {
+        assert_eq!(
+            runtime
+                .reported_content(label, &group, true, None, 10)
+                .unwrap()
+                .pending_message_count,
+            0
+        );
+        let details = runtime
+            .message_reports(label, &group, own_target, None, 10)
+            .unwrap();
+        assert_eq!(
+            details.removed_by_event_id,
+            Some(removed.message_ids[0].clone())
+        );
+        let current = details.current_message.unwrap();
+        assert_eq!(current.moderation.status, ModerationStatus::Removed);
+        assert!(current.deleted && current.plaintext.is_empty());
     }
 }
 
