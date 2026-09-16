@@ -16,6 +16,11 @@ pub(crate) enum MessageDisposition {
     /// that epoch is now outside the retained app-payload decryption window.
     /// Terminal under the active convergence policy.
     AppPayloadRetentionExpired,
+    /// The transport bytes failed to peel and the envelope predates the
+    /// Welcome that installed this local copy of the group
+    /// (`Group::local_copy_welcome_created_at`). The copy holds no secrets for
+    /// the epochs that sealed it and never will — terminal, never retried.
+    PredatesLocalCopy,
     /// The transport bytes failed to peel against the current epoch context
     /// and every retained snapshot. Retained as `PeelDeferred`; retried only
     /// when the (epoch, snapshot-set) peel context actually changes.
@@ -43,6 +48,7 @@ impl MessageDisposition {
         match self {
             Self::PreMembershipEvent => "pre_membership_event",
             Self::AppPayloadRetentionExpired => "app_payload_retention_expired",
+            Self::PredatesLocalCopy => "predates_local_copy",
             // Historical audit string, kept for dashboard continuity.
             Self::RetryPending => "peel_failed_no_snapshot",
             Self::RetryBudgetRefused => "resource_refused_retry_budget",

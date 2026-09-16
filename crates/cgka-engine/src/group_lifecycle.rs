@@ -538,6 +538,8 @@ impl<S: StorageProvider> Engine<S> {
             disbanded: None,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
             local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
+            // A copy this device created was never installed by a Welcome.
+            local_copy_welcome_created_at: None,
         };
         if self.new_protocol_profile == ProtocolProfile::Legacy {
             self.storage.put_group(&group_record)?;
@@ -1373,6 +1375,13 @@ impl<S: StorageProvider> Engine<S> {
                 // Unconditional, unlike `join_epoch`: a first join and a
                 // replacement join both install a copy that starts here.
                 local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
+                // Clamped to this device's own clock. The value is the welcome
+                // rumor's `created_at`, which no relay validates, so an inviter
+                // running fast — or lying — would otherwise push the floor into
+                // the future and make ordinary later traffic look like history.
+                // The joining device's clock is the one bound it can trust.
+                local_copy_welcome_created_at: welcome_created_at
+                    .map(|created_at| created_at.min(joined_at)),
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
             if reset_cutoff.is_some() {

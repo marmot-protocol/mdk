@@ -850,6 +850,7 @@ fn snapshot_group_and_member() {
             disbanded: None,
             join_epoch: EpochId(2),
             local_copy_install_epoch: EpochId(2),
+            local_copy_welcome_created_at: None,
         }
     );
 }
