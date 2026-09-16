@@ -74,6 +74,7 @@ pub use account_attention::{
 };
 mod chat_list_window;
 mod conversation_window;
+pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,

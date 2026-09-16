@@ -358,6 +358,18 @@ pub struct ConversationWindowSnapshotFfi {
 }
 // Borrow raw rows so conversion never clones the full reactor/tag collections.
 fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
+    presented_timeline_with_tokens(
+        row,
+        trusted,
+        super::common::markdown_content_tokens(row.kind, &row.plaintext),
+    )
+}
+
+fn presented_timeline_with_tokens(
+    row: &app::TimelineMessageRecord,
+    trusted: bool,
+    content_tokens: crate::markdown::MarkdownDocumentFfi,
+) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
         edit: row.edit.clone().map(Into::into),
         message_id_hex: row.message_id_hex.clone(),
@@ -369,7 +381,7 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
         group_id_hex: row.group_id_hex.clone(),
         sender: row.sender.clone(),
         plaintext: row.plaintext.clone(),
-        content_tokens: super::common::markdown_content_tokens(row.kind, &row.plaintext),
+        content_tokens,
         kind: row.kind,
         tags: vec![],
         timeline_at: row.timeline_at,
@@ -411,6 +423,15 @@ impl From<&app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
                 references: references.clone().into(),
             })
             .collect();
+        Self::with_messages(v, messages)
+    }
+}
+impl ConversationWindowSnapshotFfi {
+    fn with_messages(
+        v: &app::ConversationWindowSnapshot,
+        messages: Vec<ConversationMessageFfi>,
+    ) -> Self {
+        let page = v.page.page();
         Self {
             revision: v.revision.clone().into(),
             header: v.presentation.header.clone().into(),
@@ -431,6 +452,123 @@ impl From<&app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
         }
     }
 }
+/// Subscription-local cache. Command replies and stream echoes share it; older
+/// replies never replace the cache retained for a newer window.
+#[derive(Default)]
+pub(crate) struct ConversationConversionCache {
+    sequence: Option<u64>,
+    rows: std::collections::HashMap<String, CachedConversationRow>,
+    closed: bool,
+    #[cfg(test)]
+    conversions: usize,
+    #[cfg(test)]
+    parses: usize,
+}
+struct CachedConversationRow {
+    source: app::TimelineMessageRecord,
+    converted: TimelineMessageRecordFfi,
+}
+impl ConversationConversionCache {
+    pub(crate) fn close(&mut self) {
+        self.rows.clear();
+        self.closed = true;
+    }
+    pub(crate) fn convert(
+        &mut self,
+        v: &app::ConversationWindowSnapshot,
+    ) -> ConversationWindowSnapshotFfi {
+        if self.closed
+            || self
+                .sequence
+                .is_some_and(|sequence| sequence > v.revision.sequence)
+        {
+            return v.into();
+        }
+        let messages = v
+            .page
+            .page()
+            .messages
+            .iter()
+            .zip(&v.presentation.messages)
+            .enumerate()
+            .map(|(i, (row, references))| ConversationMessageFfi {
+                timeline: self.row(row, v.page.authenticated_system_content(i).is_some()),
+                references: references.clone().into(),
+            })
+            .collect();
+        let retained: std::collections::HashSet<_> = v
+            .page
+            .page()
+            .messages
+            .iter()
+            .map(|row| &row.message_id_hex)
+            .collect();
+        self.rows.retain(|id, _| retained.contains(id));
+        self.sequence = Some(v.revision.sequence);
+        ConversationWindowSnapshotFfi::with_messages(v, messages)
+    }
+    fn row(&mut self, row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
+        let source = app::TimelineMessageRecord {
+            message_id_hex: row.message_id_hex.clone(),
+            source_message_id_hex: row.source_message_id_hex.clone(),
+            source_epoch: row.source_epoch,
+            retention_seconds: row.retention_seconds,
+            retention_expires_at: row.retention_expires_at,
+            direction: row.direction.clone(),
+            group_id_hex: row.group_id_hex.clone(),
+            sender: row.sender.clone(),
+            plaintext: row.plaintext.clone(),
+            kind: row.kind,
+            tags: vec![],
+            timeline_at: row.timeline_at,
+            received_at: row.received_at,
+            reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
+            reply_preview: row.reply_preview.clone(),
+            media: row.media.clone(),
+            agent_text_stream: row.agent_text_stream.clone(),
+            group_system: if trusted {
+                row.group_system.clone()
+            } else {
+                None
+            },
+            reactions: Default::default(),
+            edit: row.edit.clone(),
+            deleted: row.deleted,
+            deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
+            invalidation_status: row.invalidation_status.clone(),
+        };
+        let cached = self.rows.get(&row.message_id_hex);
+        if let Some(cached) = cached.filter(|cached| cached.source == source) {
+            return cached.converted.clone();
+        }
+        let tokens = match cached.filter(|cached| {
+            cached.source.kind == row.kind && cached.source.plaintext == row.plaintext
+        }) {
+            Some(cached) => cached.converted.content_tokens.clone(),
+            None => {
+                #[cfg(test)]
+                {
+                    self.parses += 1;
+                }
+                super::common::markdown_content_tokens(row.kind, &row.plaintext)
+            }
+        };
+        #[cfg(test)]
+        {
+            self.conversions += 1;
+        }
+        let converted = presented_timeline_with_tokens(&source, trusted, tokens);
+        self.rows.insert(
+            row.message_id_hex.clone(),
+            CachedConversationRow {
+                source,
+                converted: converted.clone(),
+            },
+        );
+        converted
+    }
+}
+
 impl std::fmt::Debug for ConversationCapabilitiesFfi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversationCapabilitiesFfi")
@@ -621,5 +759,239 @@ mod edit_contract_tests {
         assert_eq!(legacy.content_tokens, prepared.content_tokens);
         assert_eq!(prepared.edit.unwrap().latest_edit_message_id_hex, "edit");
         assert_eq!(legacy.edit.unwrap().edit_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod conversion_cache_tests {
+    use super::*;
+    #[tokio::test]
+    async fn prepared_cache_keeps_snapshot_metadata_fresh_and_prunes_paged_rows() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = app::MarmotApp::with_relay(dir.path(), relay.url().await.as_str());
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("conversion cache", &[]).await.unwrap();
+        for i in 0..3 {
+            client
+                .send(&group, format!("**message {i}**").as_bytes())
+                .await
+                .unwrap();
+        }
+        drop(client);
+        let runtime = app.runtime();
+        let window = runtime
+            .open_conversation_window(
+                "alice",
+                &group,
+                app::ConversationOpenQuery {
+                    target: app::ConversationOpenTarget::Latest,
+                    limit: 3,
+                },
+            )
+            .await
+            .unwrap();
+        let mut snapshot = window.snapshot.clone();
+        let mut cache = ConversationConversionCache::default();
+        let wire = |snapshot| {
+            let mut bytes = vec![];
+            <ConversationWindowSnapshotFfi as uniffi::Lower<crate::UniFfiTag>>::write(
+                snapshot, &mut bytes,
+            );
+            // Balance the lowered object handle retained by the draft revision.
+            drop(
+                <ConversationWindowSnapshotFfi as uniffi::Lift<crate::UniFfiTag>>::try_read(
+                    &mut bytes.as_slice(),
+                )
+                .unwrap(),
+            );
+            bytes
+        };
+        let equivalent = |actual: ConversationWindowSnapshotFfi,
+                          mut expected: ConversationWindowSnapshotFfi| {
+            assert!(actual.draft.revision.inner == expected.draft.revision.inner);
+            // Object handles encode allocation identity, not the revision value.
+            expected.draft.revision = actual.draft.revision.clone();
+            assert_eq!(wire(actual), wire(expected));
+        };
+        equivalent(cache.convert(&snapshot), (&snapshot).into());
+        assert_eq!((cache.conversions, cache.parses), (3, 3));
+        snapshot.revision.sequence += 1;
+        snapshot.presentation.header.archived = true;
+        snapshot.read_state.manually_marked_unread = true;
+        snapshot
+            .presentation
+            .identities
+            .values_mut()
+            .next()
+            .unwrap()
+            .display_name = "new profile name".into();
+        snapshot.presentation.messages[0].reactions.total_count += 1;
+        equivalent(cache.convert(&snapshot), (&snapshot).into());
+        assert_eq!((cache.conversions, cache.parses), (3, 3));
+        let selected = app
+            .selected_message_draft("alice", &hex::encode(group.as_slice()))
+            .unwrap();
+        snapshot.draft = app
+            .save_message_draft_if_revision(
+                "alice",
+                &selected.revision,
+                "draft changed",
+                None,
+                vec![],
+            )
+            .unwrap();
+        equivalent(cache.convert(&snapshot), (&snapshot).into());
+        assert_eq!((cache.conversions, cache.parses), (3, 3));
+        let small = runtime
+            .open_conversation_window(
+                "alice",
+                &group,
+                app::ConversationOpenQuery {
+                    target: app::ConversationOpenTarget::Latest,
+                    limit: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let mut paged = small.snapshot.clone();
+        paged.revision = snapshot.revision.clone();
+        paged.revision.sequence += 1;
+        equivalent(cache.convert(&paged), (&paged).into());
+        assert_eq!(cache.rows.len(), 1);
+        assert_eq!((cache.conversions, cache.parses), (3, 3));
+        // An older command reply is still correct, but cannot repopulate rows
+        // removed by the newer stream replacement.
+        equivalent(cache.convert(&snapshot), (&snapshot).into());
+        assert_eq!(cache.rows.len(), 1);
+        assert_eq!(cache.sequence, Some(paged.revision.sequence));
+        cache.close();
+        equivalent(cache.convert(&paged), (&paged).into());
+        assert!(cache.rows.is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    fn record(id: usize) -> app::TimelineMessageRecord {
+        serde_json::from_value(serde_json::json!({
+            "message_id_hex":id.to_string(),"direction":"received","group_id_hex":"11","sender":"alice",
+            "plaintext":"**unchanged** message","kind":9,"tags":[],"timeline_at":1,"received_at":1,
+            "reactions":{"by_emoji":{},"user_reactions":[]},"deleted":false
+        })).unwrap()
+    }
+    fn wire(value: TimelineMessageRecordFfi) -> Vec<u8> {
+        let mut bytes = vec![];
+        <TimelineMessageRecordFfi as uniffi::Lower<crate::UniFfiTag>>::write(value, &mut bytes);
+        bytes
+    }
+    #[test]
+    fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
+        for size in [50, 200] {
+            let mut cache = ConversationConversionCache::default();
+            let mut rows: Vec<_> = (0..size).map(record).collect();
+            for row in &rows {
+                assert_eq!(
+                    wire(cache.row(row, false)),
+                    wire(presented_timeline(row, false))
+                );
+            }
+            assert_eq!((cache.conversions, cache.parses), (size, size));
+            // Reactions live in the references sidecar; raw tags/reactor lists
+            // must neither invalidate nor enter the prepared-row cache.
+            rows[0]
+                .reactions
+                .by_emoji
+                .insert("👍".into(), vec!["alice".into(); 5000]);
+            rows[0].tags.push(vec!["irrelevant".into()]);
+            for row in &rows {
+                cache.row(row, false);
+            }
+            assert_eq!((cache.conversions, cache.parses), (size, size));
+            assert!(cache.rows["0"].source.tags.is_empty());
+            assert!(cache.rows["0"].source.reactions.by_emoji.is_empty());
+            rows[0].source_message_id_hex = Some("delivered".into());
+            rows[0].source_epoch = Some(2);
+            assert_eq!(
+                wire(cache.row(&rows[0], false)),
+                wire(presented_timeline(&rows[0], false))
+            );
+            assert_eq!((cache.conversions, cache.parses), (size + 1, size));
+            rows[0].plaintext = "**edited**".into();
+            assert_eq!(
+                wire(cache.row(&rows[0], false)),
+                wire(presented_timeline(&rows[0], false))
+            );
+            assert_eq!(cache.parses, size + 1);
+            rows[0].deleted = true;
+            rows[0].invalidation_status = Some("invalidated".into());
+            assert_eq!(
+                wire(cache.row(&rows[0], false)),
+                wire(presented_timeline(&rows[0], false))
+            );
+            assert_eq!(cache.parses, size + 1);
+            cache.close();
+            assert!(cache.rows.is_empty());
+        }
+    }
+    #[test]
+    fn prepared_conversion_does_not_cache_stale_system_provenance() {
+        let mut row = record(0);
+        row.kind = 1210;
+        row.plaintext = r#"{"v":1,"system_type":"admin_added","text":"added","data":{}}"#.into();
+        row.group_system = app::group_system_event_from_message(1210, &row.plaintext);
+        assert!(row.group_system.is_some());
+        let mut cache = ConversationConversionCache::default();
+        assert!(cache.row(&row, false).group_system.is_none());
+        assert_eq!(
+            wire(cache.row(&row, true)),
+            wire(presented_timeline(&row, true))
+        );
+        assert!(cache.row(&row, false).group_system.is_none());
+        assert_eq!(cache.parses, 1);
+    }
+
+    #[test]
+    #[ignore = "host conversion timing; excludes FFI serialization and native UI work"]
+    fn bench_prepared_conversation_conversion() {
+        use std::{hint::black_box, time::Instant};
+        for size in [50, 200] {
+            let mut rows: Vec<_> = (0..size).map(record).collect();
+            for row in &mut rows {
+                row.plaintext = "**Bold** and _italic_ with [a link](https://example.com).\n\n- first\n- second\n\n".repeat(32);
+            }
+            let mut cache = ConversationConversionCache::default();
+            for row in &rows {
+                black_box(cache.row(row, false));
+            }
+            for change_one in [false, true] {
+                let started = Instant::now();
+                let parses = cache.parses;
+                for i in 0..20 {
+                    if change_one {
+                        rows[i % size].plaintext.push('x');
+                    }
+                    for row in &rows {
+                        black_box(cache.row(row, false));
+                    }
+                }
+                let cached = started.elapsed();
+                assert_eq!(cache.parses - parses, if change_one { 20 } else { 0 });
+                let started = Instant::now();
+                for i in 0..20 {
+                    if change_one {
+                        rows[i % size].plaintext.push('x');
+                    }
+                    for row in &rows {
+                        black_box(presented_timeline(row, false));
+                    }
+                }
+                eprintln!(
+                    "prepared rows={size} change_one={change_one} updates=20 cached_ms={} uncached_ms={}",
+                    cached.as_millis(),
+                    started.elapsed().as_millis()
+                );
+            }
+        }
     }
 }

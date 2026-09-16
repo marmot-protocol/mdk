@@ -47,8 +47,9 @@ impl Fixture {
                 tokio::select! {
                     _ = &mut stop => return,
                     command = rx.recv() => match command {
-                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, respond }) => {
+                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, observer, respond }) => {
                             n.fetch_add(1, Ordering::SeqCst);
+                            client.register_conversation_capture(observer);
                             let mode = m.load(Ordering::SeqCst);
                             if mode == 5 {
                                 reached.notify_one();
@@ -869,6 +870,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
                 group_id: f.group.clone(),
                 query: Default::default(),
                 store_epoch: f.store.chat_presentation_version().unwrap().store_epoch,
+                observer: None,
                 respond,
             })
             .unwrap();
@@ -1045,6 +1047,74 @@ async fn cold_capture_does_not_force_group_hydration() {
         client.runtime.session().unhydrated_group_ids(),
         vec![f.group.clone()]
     );
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
+    let f = Fixture::new(20).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let observer = Arc::new(SendCapture::new(
+        f.group.clone(),
+        f.store.chat_presentation_version().unwrap().store_epoch,
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    assert_eq!(client.conversation_captures.len(), 1);
+    client.publish_conversation_captures();
+    let captured = observer.take().unwrap();
+    assert!(captured.authority.is_some());
+    assert_eq!(captured.account.page.page().messages.len(), 5);
+
+    // A viewport change invalidates the previous capture, including a change
+    // that fails to resolve. It must not fall back to the previous viewport.
+    client.publish_conversation_captures();
+    let mut missing = query.clone();
+    missing.opening.target = ConversationOpenTarget::Message("ff".repeat(32));
+    observer.set_query(&missing);
+    assert!(observer.take().is_none());
+    client.publish_conversation_captures();
+    assert!(observer.take().is_none());
+    observer.set_query(&query);
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    client.publish_conversation_captures();
+    let captured = observer.take().unwrap();
+    assert_eq!(
+        captured.account.presentation_input.self_membership,
+        crate::SelfMembership::Removed
+    );
+    assert!(captured.authority.is_some());
+    client.publish_conversation_captures();
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    assert!(
+        observer.take().is_none(),
+        "normal reads supersede earlier checkpoints"
+    );
+    let weak = Arc::downgrade(&observer);
+    drop(observer);
+    client.publish_conversation_captures();
+    assert!(weak.upgrade().is_none());
+    assert!(client.conversation_captures.is_empty());
     drop(client);
     f.close().await;
 }

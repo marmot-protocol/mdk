@@ -70,6 +70,189 @@ impl History {
 }
 
 #[tokio::test]
+async fn live_window_observes_pending_send_while_relay_publish_is_blocked() {
+    check_pending_send(false).await;
+    check_pending_send(true).await;
+}
+
+async fn check_pending_send(draft: bool) {
+    let h = History::new(200).await;
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    let mut window = runtime
+        .open_conversation_window(
+            "alice",
+            &h.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while window.snapshot.presentation.header.epoch.is_none() {
+            window.snapshot = window.recv().await.unwrap().unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    // A second viewport must keep its own query while the latest window follows sends.
+    let mut history = runtime
+        .open_conversation_window(
+            "alice",
+            &h.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Message(format!("{:064x}", 20)),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while history.snapshot.presentation.header.epoch.is_none() {
+            history.snapshot = history.recv().await.unwrap().unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let historical_ids: Vec<_> = history
+        .snapshot
+        .page
+        .page()
+        .messages
+        .iter()
+        .map(|r| r.message_id_hex.clone())
+        .collect();
+    let revision = if draft {
+        let selected = runtime
+            .selected_message_draft("alice", &hex::encode(h.group.as_slice()))
+            .unwrap();
+        Some(
+            runtime
+                .save_message_draft_if_revision(
+                    "alice",
+                    &selected.revision,
+                    "pending window message",
+                    None,
+                    vec![],
+                )
+                .unwrap()
+                .revision,
+        )
+    } else {
+        None
+    };
+    h.relay.block_next_publish();
+    let sender = runtime.clone();
+    let group = h.group.clone();
+    let send = tokio::spawn(async move {
+        match revision {
+            Some(revision) => {
+                sender
+                    .send_message_draft("alice", &group, revision, vec![])
+                    .await
+            }
+            None => {
+                sender
+                    .send_message("alice", &group, b"pending window message".to_vec())
+                    .await
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), h.relay.wait_for_blocked_publish())
+        .await
+        .unwrap();
+    let pending = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let snapshot = window.recv().await.unwrap().unwrap();
+            if snapshot
+                .page
+                .page()
+                .messages
+                .iter()
+                .any(|row| row.plaintext == "pending window message")
+            {
+                return snapshot;
+            }
+        }
+    })
+    .await;
+    assert!(!send.is_finished());
+    h.relay.release_publish();
+    let sent = tokio::time::timeout(Duration::from_secs(10), send)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let pending =
+        pending.expect("an open window must show the local row before publication completes");
+    let row = pending
+        .page
+        .page()
+        .messages
+        .iter()
+        .find(|row| row.plaintext == "pending window message")
+        .unwrap();
+    assert!(row.source_message_id_hex.is_none());
+    assert!(pending.presentation.header.epoch.is_some());
+    assert!(pending.presentation.header.capabilities.can_send);
+    assert_eq!(sent.message_ids, vec![row.message_id_hex.clone()]);
+    let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let updated = window.recv().await.unwrap().unwrap();
+            if updated.page.page().messages.iter().any(|r| {
+                r.message_id_hex == row.message_id_hex && r.source_message_id_hex.is_some()
+            }) {
+                return updated;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(delivered.revision.sequence > pending.revision.sequence);
+    assert_eq!(
+        delivered
+            .page
+            .page()
+            .messages
+            .iter()
+            .filter(|r| r.message_id_hex == row.message_id_hex)
+            .count(),
+        1
+    );
+    if draft {
+        assert!(delivered.draft.draft.is_none());
+    }
+    let history = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match history
+                .window_handle()
+                .set_visible_anchor(&history.snapshot.revision, &historical_ids[5])
+                .await
+            {
+                Err(crate::ConversationWindowError::StaleWindow) => {
+                    history.snapshot = history.recv().await.unwrap().unwrap();
+                }
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        history
+            .page
+            .page()
+            .messages
+            .iter()
+            .map(|r| r.message_id_hex.clone())
+            .collect::<Vec<_>>(),
+        historical_ids
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cold_open_renders_large_history_during_stalled_initial_sync() {
     for count in [200, 5_000] {
         let h = History::new(count).await;

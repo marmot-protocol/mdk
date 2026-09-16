@@ -159,6 +159,7 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         query: storage_sqlite::ConversationWindowQuery,
         store_epoch: Vec<u8>,
+        observer: Option<std::sync::Weak<super::SendCapture>>,
         respond: oneshot::Sender<Result<CapturedConversation, ConversationWindowError>>,
     },
     GroupMlsState {
@@ -2382,9 +2383,11 @@ async fn handle_startup_hydration_command(
             group_id,
             query,
             store_epoch,
+            observer,
             respond,
         } => {
             if !respond.is_closed() {
+                client.register_conversation_capture(observer);
                 let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
             }
         }
@@ -3278,9 +3281,11 @@ fn account_worker_command_future<'a>(
             group_id,
             query,
             store_epoch,
+            observer,
             respond,
         } => Box::pin(async move {
             if !respond.is_closed() {
+                client.register_conversation_capture(observer);
                 let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
             }
             true
@@ -5392,6 +5397,7 @@ mod tests {
                     group_id: GroupId::new(vec![1; 16]),
                     query: Default::default(),
                     store_epoch: vec![],
+                    observer: None,
                     respond,
                 })
                 .unwrap();

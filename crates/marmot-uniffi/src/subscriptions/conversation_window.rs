@@ -21,6 +21,7 @@ pub(crate) async fn conversation_deadline<T>(
 pub struct ConversationWindowSubscription {
     snapshot: StdMutex<Option<ConversationWindowSnapshotFfi>>,
     generation: String,
+    conversion_cache: StdMutex<ConversationConversionCache>,
     commands: marmot_app::ConversationWindowHandle,
     receiver: Mutex<Option<marmot_app::RuntimeConversationWindowSubscription>>,
     closed: watch::Sender<bool>,
@@ -28,13 +29,25 @@ pub struct ConversationWindowSubscription {
 impl ConversationWindowSubscription {
     pub(crate) fn new(inner: marmot_app::RuntimeConversationWindowSubscription) -> Arc<Self> {
         let generation = inner.snapshot.revision.generation.clone();
+        let mut cache = ConversationConversionCache::default();
+        let snapshot = cache.convert(&inner.snapshot);
         Arc::new(Self {
-            snapshot: StdMutex::new(Some((&inner.snapshot).into())),
+            snapshot: StdMutex::new(Some(snapshot)),
+            conversion_cache: StdMutex::new(cache),
             generation,
             commands: inner.window_handle(),
             receiver: Mutex::new(Some(inner)),
             closed: watch::channel(false).0,
         })
+    }
+    fn convert(
+        &self,
+        snapshot: &marmot_app::ConversationWindowSnapshot,
+    ) -> ConversationWindowSnapshotFfi {
+        self.conversion_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .convert(snapshot)
     }
     fn revision(
         &self,
@@ -68,7 +81,7 @@ impl ConversationWindowSubscription {
         tokio::select! {
             biased;
             _ = closed.changed() => Err(MarmotKitError::ConversationWindowClosed),
-            result = conversation_deadline(timeout_ms, async { Ok(future.await?.into()) }) => result,
+            result = conversation_deadline(timeout_ms, async { Ok(self.convert(&future.await?)) }) => result,
         }
     }
 }
@@ -91,7 +104,7 @@ impl ConversationWindowSubscription {
             result = async {
                 let mut guard = self.receiver.lock().await;
                 match guard.as_mut() {
-                    Some(inner) => Ok(inner.recv().await?.map(Into::into)),
+                    Some(inner) => Ok(inner.recv().await?.map(|snapshot| self.convert(&snapshot))),
                     None => Ok(None),
                 }
             } => result,
@@ -101,6 +114,10 @@ impl ConversationWindowSubscription {
     /// Drop the native object too when finished. Previously returned snapshots stay valid.
     pub async fn cancel(&self) {
         self.closed.send_replace(true);
+        self.conversion_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
         self.receiver.lock().await.take();
         take_snapshot(&self.snapshot);
     }
