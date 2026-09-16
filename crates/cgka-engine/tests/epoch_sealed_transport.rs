@@ -850,6 +850,12 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
         "only the row that could plausibly be this copy's history announces its release"
     );
 }
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after the Unix epoch")
+        .as_secs()
+}
 
 /// A Welcome dated in the future records this device's clock, not the claim.
 ///
@@ -863,7 +869,9 @@ async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
 
     let far_future = u64::MAX;
     let welcome = readd(&mut alice, &mut bob, &group_id, far_future).await;
+    let before_join = unix_seconds_now();
     bob.join_welcome(welcome).await.unwrap();
+    let after_join = unix_seconds_now();
 
     let recorded = bob_storage
         .get_group(&group_id)
@@ -871,8 +879,8 @@ async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
         .local_copy_welcome_created_at
         .expect("a welcome-installed copy records its invitation time");
     assert!(
-        recorded.0 < far_future,
-        "an unvalidated future claim must not be recorded verbatim, got {recorded:?}"
+        (before_join..=after_join).contains(&recorded.0),
+        "an unvalidated future claim is replaced by this device's clock at the join, got {recorded:?}"
     );
     assert!(
         !bob_storage

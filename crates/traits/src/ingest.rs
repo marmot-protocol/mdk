@@ -171,13 +171,13 @@ pub enum StaleReason {
     /// The message predates this account-device's membership and can never
     /// decrypt on this local copy.
     PreMembership,
-    /// The message belongs to the group's history from before this local copy
-    /// of it was installed — the traffic a removed-then-re-added device is
-    /// served for the epochs it was absent, or the history a first joiner is
-    /// served from before its Welcome. A transport seals a group message under
-    /// the sending epoch's exporter secret, and the copy's own epochs begin at
-    /// the commit that minted its Welcome, so nothing published earlier can
-    /// ever be opened here. Terminal, never retried.
+    /// The message opened, but its source epoch lies below
+    /// `Group::local_copy_install_epoch`: it belongs to the group's history
+    /// from before this local copy was installed — the epochs a
+    /// removed-then-re-added device was absent for, or a first joiner's
+    /// pre-Welcome history. OpenMLS refuses it as too distant in the past, and
+    /// on a replacement copy `join_epoch` is zero, so this floor is the one
+    /// that names the verdict. Terminal, never retried.
     PredatesLocalCopy,
     /// Convergence excluded the input below the retained anchor.
     BeyondAnchor,
