@@ -219,6 +219,22 @@ enum ScheduledAutoCommitReplay {
     NotApplicable,
 }
 
+/// Which lower bound on "this local copy's history" an epoch sits below.
+///
+/// Reported apart rather than collapsed to a boolean because they are
+/// different statements about the device: `PreMembership` says it was not in
+/// the group yet, `BelowCopyInstall` says it was, in an interval this copy
+/// replaced. See [`Engine::epoch_below_this_copys_history`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BelowCopyHistory {
+    /// Below `Group::join_epoch` — before this device's first membership.
+    PreMembership,
+    /// Below `Group::local_copy_install_epoch` — before the Welcome that
+    /// installed the CURRENT copy, which is where a replacement copy's own
+    /// history begins.
+    BelowCopyInstall,
+}
+
 impl<S: StorageProvider> Engine<S> {
     fn terminalize_rejected_proposal(
         &mut self,
@@ -1006,7 +1022,8 @@ impl<S: StorageProvider> Engine<S> {
         // OpenMLS processing instead of feeding it the retry lifecycle.
         if msg_content_type == ContentType::Application
             && msg_epoch < current_epoch
-            && self.msg_is_pre_membership(&group_id, msg_epoch)
+            && self.epoch_below_this_copys_history(&group_id, msg_epoch)
+                == Some(BelowCopyHistory::PreMembership)
         {
             let tag = crate::message_disposition::MessageDisposition::PreMembershipEvent.tag();
             self.persist_openmls_wire_message_with_processed_transport_id(
@@ -1112,8 +1129,9 @@ impl<S: StorageProvider> Engine<S> {
                 // to a discarded copy and rewinding onto it is what produces
                 // `CandidateStateUnavailable`) nor the missing-anchor alarm,
                 // which is reserved for a gap in history this copy really had.
-                let below_this_copys_history =
-                    self.commit_is_below_this_copys_history(&group_id, msg_epoch);
+                let below_this_copys_history = self
+                    .epoch_below_this_copys_history(&group_id, msg_epoch)
+                    .is_some();
                 convergence_refused_for_missing_anchor = within_rewind_horizon
                     && !active_pass
                     && !has_source_anchor
@@ -1179,24 +1197,30 @@ impl<S: StorageProvider> Engine<S> {
             Ok(p) => p,
             Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
                 // Refine the historical classification (mdk#339):
-                // before the join epoch the message was never decryptable
-                // here by design; at or after it, this device was a
-                // member but the past-epoch secrets are gone.
-                let pre_membership = self.msg_is_pre_membership(&group_id, msg_epoch);
-                let tag = if pre_membership {
-                    crate::message_disposition::MessageDisposition::PreMembershipEvent.tag()
-                } else {
-                    crate::message_disposition::MessageDisposition::AppPayloadRetentionExpired.tag()
+                // below either of this copy's floors the message was never
+                // openable here by design — before the join epoch this device
+                // was not a member, and below the install epoch this copy holds
+                // no state and never will. Above both, the device was a member
+                // at the source epoch and its secrets have simply aged out.
+                use crate::message_disposition::MessageDisposition;
+                let (reason, tag) = match self.epoch_below_this_copys_history(&group_id, msg_epoch)
+                {
+                    Some(BelowCopyHistory::PreMembership) => (
+                        StaleReason::PreMembership,
+                        MessageDisposition::PreMembershipEvent.tag(),
+                    ),
+                    Some(BelowCopyHistory::BelowCopyInstall) => (
+                        StaleReason::PredatesLocalCopy,
+                        MessageDisposition::PredatesLocalCopy.tag(),
+                    ),
+                    None => (
+                        StaleReason::BeyondAppRetention,
+                        MessageDisposition::AppPayloadRetentionExpired.tag(),
+                    ),
                 };
                 self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                 self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
-                return reported(IngestOutcome::Stale {
-                    reason: if pre_membership {
-                        StaleReason::PreMembership
-                    } else {
-                        StaleReason::BeyondAppRetention
-                    },
-                });
+                return reported(IngestOutcome::Stale { reason });
             }
             Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
                 let current = EpochId(mls_group.epoch().as_u64());
@@ -2378,9 +2402,14 @@ impl<S: StorageProvider> Engine<S> {
         Ok(IngestOutcome::Ignored { category })
     }
 
-    /// Whether a commit at `msg_epoch` sits below every epoch this local copy
-    /// could ever rewind to, so it is not a rival of anything and the
-    /// missing-anchor alarm must not fire for it.
+    /// Which "not this copy's history" floor `msg_epoch` sits below, if any.
+    ///
+    /// A commit below either floor is not a rival of anything — this copy could
+    /// never rewind to that epoch — so the missing-anchor alarm must not fire
+    /// for it. An application message below either floor is likewise past this
+    /// copy's reach, and the two floors are reported apart because they are
+    /// different statements about the device, and the classification the
+    /// application sees says which one it is.
     ///
     /// Two independent floors, evaluated from one record load:
     ///
@@ -2402,27 +2431,20 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Best-effort in the same way as the fields themselves: `EpochId(0)`
     /// means "unknown" and applies no floor.
-    fn commit_is_below_this_copys_history(&self, group_id: &GroupId, msg_epoch: EpochId) -> bool {
-        let Ok(group) = self.storage.get_group(group_id) else {
-            return false;
-        };
+    fn epoch_below_this_copys_history(
+        &self,
+        group_id: &GroupId,
+        msg_epoch: EpochId,
+    ) -> Option<BelowCopyHistory> {
+        let group = self.storage.get_group(group_id).ok()?;
         let below = |floor: EpochId| floor.0 > 0 && msg_epoch < floor;
-        below(group.join_epoch) || below(group.local_copy_install_epoch)
-    }
-
-    /// Whether `msg_epoch` predates this device's membership in `group_id`
-    /// (mdk#339): such a message was never decryptable here by design —
-    /// OpenMLS holds no secrets for epochs before the welcome — so it is
-    /// terminal, never retried. Best-effort: a `join_epoch` of `EpochId(0)`
-    /// (legacy records or a missing record) is "unknown", which applies no
-    /// bound and returns `false`.
-    fn msg_is_pre_membership(&self, group_id: &GroupId, msg_epoch: EpochId) -> bool {
-        let join_epoch = self
-            .storage
-            .get_group(group_id)
-            .map(|group| group.join_epoch)
-            .unwrap_or_default();
-        join_epoch.0 > 0 && msg_epoch < join_epoch
+        if below(group.join_epoch) {
+            Some(BelowCopyHistory::PreMembership)
+        } else if below(group.local_copy_install_epoch) {
+            Some(BelowCopyHistory::BelowCopyInstall)
+        } else {
+            None
+        }
     }
 
     /// Loud, non-terminal handling for an in-horizon rival commit whose

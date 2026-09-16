@@ -171,6 +171,14 @@ pub enum StaleReason {
     /// The message predates this account-device's membership and can never
     /// decrypt on this local copy.
     PreMembership,
+    /// The message belongs to the group's history from before this local copy
+    /// of it was installed — the traffic a removed-then-re-added device is
+    /// served for the epochs it was absent, or the history a first joiner is
+    /// served from before its Welcome. A transport seals a group message under
+    /// the sending epoch's exporter secret, and the copy's own epochs begin at
+    /// the commit that minted its Welcome, so nothing published earlier can
+    /// ever be opened here. Terminal, never retried.
+    PredatesLocalCopy,
     /// Convergence excluded the input below the retained anchor.
     BeyondAnchor,
     /// Convergence excluded the input beyond the rollback horizon.
