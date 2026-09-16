@@ -244,9 +244,12 @@ Reports use kind 1984; shared dismissals label report events with NIP-32 kind
 
 `report_message` reports a whole message at an explicit original/edit revision
 with a NIP-56 reason and optional explanation (`other` requires one).
-`dismiss_reports` shares an admin's decision for selected report IDs; the existing
-`delete_message` removes all revisions. Reports and reviews use encrypted group
-messages and do not add chat rows, unread activity, or report notifications.
+`dismiss_reports` shares an admin's decision for selected report IDs.
+`delete_message` sends kind 5 for the caller's own content and kind 4891 for an
+active admin removing another account's chat message and all its revisions.
+A non-admin attempting the latter receives an error before publication. Older
+clients may retain content removed by kind 4891. Reports and reviews use encrypted
+group messages and do not add chat rows, unread activity, or report notifications.
 
 `reported_content`, `message_reports`, and `subscribe_reported_content` expose
 bounded review pages, pending-message counts, reported/current content and shared

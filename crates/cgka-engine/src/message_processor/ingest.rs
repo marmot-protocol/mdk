@@ -1351,11 +1351,51 @@ impl<S: StorageProvider> Engine<S> {
                             });
                         }
                     };
+                let needs_authority =
+                    cgka_traits::reporting::requires_source_authority(app_event.kind);
+                let historical_source = if needs_authority && msg_epoch != current_epoch {
+                    if let Some(snapshot) = crate::app_payload::retained_source_snapshot(
+                        &self.storage,
+                        &group_id,
+                        msg_epoch,
+                    )? {
+                        use sha2::{Digest, Sha256};
+                        let request = cgka_traits::app_event::PendingAppMessageAuthority {
+                            group_id: group_id.clone(),
+                            message_id: msg.id.clone(),
+                            epoch: msg_epoch,
+                            sender: sender.clone(),
+                            payload_digest: Sha256::digest(&payload).into(),
+                            retention: None,
+                        };
+                        crate::app_payload::historical_source(
+                            &self.storage,
+                            &self.crypto,
+                            &request,
+                            &snapshot,
+                            &openmls_msg.payload,
+                        )?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let retention_seconds = if msg_epoch == current_epoch {
                     Some(
                         crate::app_components::message_retention_seconds_of_group(&mls_group)?
                             .unwrap_or(0),
                     )
+                } else if needs_authority {
+                    // One authenticated source visit supplies both policies.
+                    historical_source
+                        .as_ref()
+                        .map(|source| source.retention_seconds)
+                        .or_else(|| {
+                            recovered_source_retention.and_then(|(epoch, seconds)| {
+                                (epoch == msg_epoch).then_some(seconds.unwrap_or(0))
+                            })
+                        })
                 } else {
                     let recovered =
                         recovered_source_retention.and_then(|(snapshot_epoch, seconds)| {
@@ -1375,14 +1415,7 @@ impl<S: StorageProvider> Engine<S> {
                 let authority = if msg_epoch == current_epoch {
                     Some(crate::app_payload::source_authority(&mls_group, &sender)?)
                 } else {
-                    crate::app_payload::historical_authority(
-                        &self.storage,
-                        &group_id,
-                        msg_epoch,
-                        &sender,
-                        &openmls_msg.payload,
-                        &payload,
-                    )?
+                    historical_source.map(|source| source.authority)
                 };
                 let event = GroupEvent::MessageReceived {
                     group_id: group_id.clone(),

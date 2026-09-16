@@ -154,6 +154,8 @@ pub struct Engine<S: StorageProvider> {
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) authority_recovery_cursor: Option<MessageId>,
+    pub(crate) authority_recovery_attempts: HashMap<MessageId, [u8; 32]>,
+    pub(crate) authority_recovery_seen: HashSet<MessageId>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
     /// Standalone proposal messages produced by engine-maintained lifecycle
     /// work. Unlike `auto_publish_buf`, these do not have a pending commit ref.
@@ -621,6 +623,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
             authority_recovery_cursor: None,
+            authority_recovery_attempts: HashMap::new(),
+            authority_recovery_seen: HashSet::new(),
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
             valid_proposal_groups: HashSet::new(),
@@ -3238,9 +3242,6 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {
-        if self.recover_pending_application_authority().is_err() {
-            tracing::warn!(target: "cgka_engine::engine", method="drain_events", "source authority recovery deferred");
-        }
         self.events_buf.drain(..).collect()
     }
 

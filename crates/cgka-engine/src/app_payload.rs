@@ -6,15 +6,21 @@ pub(crate) fn source_authority(
     sender: &MemberId,
 ) -> Result<cgka_traits::app_event::AppMessageAuthority, EngineError> {
     let profile = crate::app_components::group_profile_of_group(group)?;
-    let direct = group.members().count() == 2
-        && profile
-            .as_ref()
-            .is_none_or(|(name, _)| name.trim().is_empty());
+    let members = group
+        .members()
+        .map(|member| crate::identity::validated_member_id(&member.credential))
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    let reporting_allowed = cgka_traits::reporting::group_reporting_allowed(
+        members.len(),
+        profile.as_ref().map(|(name, _)| name.as_str()),
+    );
     let admins = crate::app_components::admins_of_group(group)?;
     Ok(cgka_traits::app_event::AppMessageAuthority {
         source_context: Sha256::digest(group.epoch_authenticator().as_slice()).into(),
-        reporting_allowed: !direct,
-        moderation_grant: !direct && admins.iter().any(|key| key.as_slice() == sender.as_slice()),
+        reporting_allowed,
+        moderation_grant: reporting_allowed
+            && members.contains(sender)
+            && admins.iter().any(|key| key.as_slice() == sender.as_slice()),
     })
 }
 
@@ -47,74 +53,82 @@ pub(crate) fn validate_app_payload_for_sender(
     Ok(event)
 }
 
-/// Authenticate the ciphertext again in the retained source state before
-/// consulting its policy. An epoch number alone never proves branch identity.
-/// The guard restores live state (including ratchets) on every return path.
-pub(crate) fn historical_authority<S: cgka_traits::StorageProvider>(
-    storage: &S,
-    group_id: &cgka_traits::GroupId,
-    epoch: cgka_traits::EpochId,
-    sender: &MemberId,
-    wire: &[u8],
-    payload: &[u8],
-) -> Result<Option<cgka_traits::app_event::AppMessageAuthority>, EngineError> {
-    Ok(historical_authority_and_payload(
-        storage,
-        group_id,
-        epoch,
-        sender,
-        wire,
-        &Sha256::digest(payload).into(),
-    )?
-    .map(|(authority, _)| authority))
+/// Source policy authenticated by replaying the exact ciphertext. Retention and
+/// moderation use the same snapshot visit, so delayed controls pay one rewind.
+pub(crate) struct HistoricalSource {
+    pub authority: cgka_traits::app_event::AppMessageAuthority,
+    pub retention_seconds: u64,
+    pub payload: Vec<u8>,
 }
 
-fn historical_authority_and_payload<S: cgka_traits::StorageProvider>(
+pub(crate) fn retained_source_snapshot<S: cgka_traits::StorageProvider>(
     storage: &S,
     group_id: &cgka_traits::GroupId,
     epoch: cgka_traits::EpochId,
-    sender: &MemberId,
-    wire: &[u8],
-    expected_digest: &[u8; 32],
-) -> Result<Option<(cgka_traits::app_event::AppMessageAuthority, Vec<u8>)>, EngineError> {
-    use openmls::prelude::{MlsGroup, ProcessedMessageContent};
-    use openmls_traits::OpenMlsProvider;
-    let name = storage
+) -> Result<Option<String>, EngineError> {
+    Ok(storage
         .list_group_snapshots(group_id)?
         .into_iter()
         .find(|name| {
             crate::openmls_projection::retained_anchor_epoch_from_snapshot_name(name)
                 == Some(epoch.0)
-        });
-    let Some(name) = name else { return Ok(None) };
+        }))
+}
+
+/// Authentication failure against a retained branch is unresolved, not a
+/// rejection: another branch at the same epoch may supply the missing proof.
+/// The guard restores live state and ratchets on every return path.
+pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
+    storage: &S,
+    crypto: &openmls_rust_crypto::RustCrypto,
+    request: &cgka_traits::app_event::PendingAppMessageAuthority,
+    snapshot: &str,
+    wire: &[u8],
+) -> Result<Option<HistoricalSource>, EngineError> {
+    use cgka_traits::storage::StorageError;
+    use openmls::prelude::{MlsGroup, ProcessedMessageContent};
+    use openmls_traits::OpenMlsProvider;
     let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
         storage,
-        group_id.clone(),
-        crate::snapshot_guard::RewindSite::RetentionSource,
-        "moderation-authority",
+        request.group_id.clone(),
+        crate::snapshot_guard::RewindSite::ModerationSource,
+        &format!("{:032x}", rand::random::<u128>()),
     )?;
-    storage.rollback_group_state_to_snapshot(group_id, &name)?;
-    let crypto = openmls_rust_crypto::RustCrypto::default();
-    let provider = crate::provider::EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
-    let mut group = MlsGroup::load(
+    match storage.rollback_group_state_to_snapshot(&request.group_id, snapshot) {
+        Ok(()) => {}
+        Err(StorageError::SnapshotMissing(_)) => {
+            guard.commit()?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let provider = crate::provider::EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
+    let group = MlsGroup::load(
         provider.storage(),
-        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        &openmls::group::GroupId::from_slice(request.group_id.as_slice()),
     )
-    .map_err(|_| EngineError::Backend("load moderation source state".into()))?
-    .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-    let result = if group.epoch().as_u64() == epoch.0 {
+    .map_err(|_| EngineError::Backend("load moderation source state".into()))?;
+    let result = if let Some(mut group) = group.filter(|g| g.epoch().as_u64() == request.epoch.0) {
         let (_, protocol) = crate::openmls_projection::project_protocol_message(wire)
             .map_err(|_| EngineError::Backend("decode moderation source message".into()))?;
         match protocol.and_then(|protocol| group.process_message(&provider, protocol).ok()) {
             Some(processed)
                 if crate::identity::member_id_of_processed_message(&processed, &group).as_ref()
-                    == Some(sender) =>
+                    == Some(&request.sender) =>
             {
                 match processed.into_content() {
                     ProcessedMessageContent::ApplicationMessage(bytes) => {
                         let payload = bytes.into_bytes();
-                        if <[u8; 32]>::from(Sha256::digest(&payload)) == *expected_digest {
-                            Some((source_authority(&group, sender)?, payload))
+                        if <[u8; 32]>::from(Sha256::digest(&payload)) == request.payload_digest {
+                            Some(HistoricalSource {
+                                authority: source_authority(&group, &request.sender)?,
+                                retention_seconds:
+                                    crate::app_components::message_retention_seconds_of_group(
+                                        &group,
+                                    )?
+                                    .unwrap_or(0),
+                                payload,
+                            })
                         } else {
                             None
                         }
@@ -132,7 +146,9 @@ fn historical_authority_and_payload<S: cgka_traits::StorageProvider>(
 }
 
 impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
-    pub(crate) fn recover_pending_application_authority(&mut self) -> Result<(), EngineError> {
+    /// Retry at most 32 unresolved moderation controls on the maintenance rail.
+    /// Event draining is deliberately free of database reads and MLS rewinds.
+    pub fn recover_pending_application_authority(&mut self) -> Result<(), EngineError> {
         use cgka_traits::engine::GroupEvent;
         use cgka_traits::message::{MessageState, StoredMessagePayload};
         let events = self
@@ -140,12 +156,37 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
             .pending_application_authority_batch(self.authority_recovery_cursor.as_ref(), 32)?;
         if events.is_empty() {
             self.authority_recovery_cursor = None;
+            self.authority_recovery_attempts
+                .retain(|id, _| self.authority_recovery_seen.contains(id));
+            self.authority_recovery_seen.clear();
             return Ok(());
         }
         for request in events {
             self.authority_recovery_cursor = Some(request.message_id.clone());
-            let record = self.storage.get_message(&request.message_id)?;
+            self.authority_recovery_seen
+                .insert(request.message_id.clone());
+            let record = match self.storage.get_message(&request.message_id) {
+                Ok(record) => record,
+                Err(cgka_traits::storage::StorageError::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
             if record.state != MessageState::Processed {
+                continue;
+            }
+            let Some(snapshot) =
+                retained_source_snapshot(&self.storage, &request.group_id, request.epoch)?
+            else {
+                continue;
+            };
+            // This secret-derived digest is only an in-memory retry key, never
+            // a policy verdict or durable evidence. A replacement under the
+            // same snapshot name must permit authentication again.
+            let fingerprint = self
+                .storage
+                .group_snapshot_fingerprint(&request.group_id, &snapshot)?;
+            if fingerprint.is_some()
+                && self.authority_recovery_attempts.get(&request.message_id) == fingerprint.as_ref()
+            {
                 continue;
             }
             let stored = StoredMessagePayload::decode(&record.payload)
@@ -153,25 +194,34 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
             let Some(wire) = stored.as_openmls_wire() else {
                 continue;
             };
-            if let Some((authority, payload)) = historical_authority_and_payload(
+            if let Some(source) = historical_source(
                 &self.storage,
-                &request.group_id,
-                request.epoch,
-                &request.sender,
+                &self.crypto,
+                &request,
+                &snapshot,
                 &wire.payload,
-                &request.payload_digest,
             )? {
+                let app_event = validate_app_payload_for_sender(&source.payload, &request.sender)?;
                 let event = GroupEvent::MessageReceived {
                     group_id: request.group_id,
-                    message_id: request.message_id,
+                    message_id: request.message_id.clone(),
                     epoch: request.epoch,
                     sender: request.sender,
-                    payload,
-                    authority: Some(authority),
-                    retention: request.retention,
+                    payload: source.payload,
+                    authority: Some(source.authority),
+                    retention: request.retention.or_else(|| {
+                        Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
+                            app_event.created_at,
+                            source.retention_seconds,
+                        ))
+                    }),
                 };
                 self.storage.put_pending_application_event(&event)?;
+                self.authority_recovery_attempts.remove(&request.message_id);
                 self.events_buf.push_back(event);
+            } else if let Some(fingerprint) = fingerprint {
+                self.authority_recovery_attempts
+                    .insert(request.message_id, fingerprint);
             }
         }
         Ok(())
@@ -187,6 +237,50 @@ mod tests {
         MarmotAppEvent::new(pubkey, 1, 9, vec![], "hello")
             .encode()
             .expect("encode app event")
+    }
+
+    #[test]
+    fn vanished_source_snapshot_stays_unresolved_and_restores_live_state() {
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::{EpochId, GroupId, MessageId};
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+        let group_id = GroupId::new(vec![7; 16]);
+        let group = cgka_traits::group::Group {
+            id: group_id.clone(),
+            name: "live".into(),
+            description: String::new(),
+            epoch: EpochId(3),
+            members: Vec::new(),
+            required_capabilities: Default::default(),
+            protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
+            removed: false,
+            unrecoverable: false,
+            disbanded: None,
+            join_epoch: EpochId(0),
+            local_copy_install_epoch: EpochId(0),
+        };
+        storage.put_group(&group).unwrap();
+        let request = cgka_traits::app_event::PendingAppMessageAuthority {
+            group_id: group_id.clone(),
+            message_id: MessageId::new(vec![1; 32]),
+            epoch: EpochId(1),
+            sender: MemberId::new(vec![2; 32]),
+            payload_digest: [0; 32],
+            retention: None,
+        };
+        assert!(
+            super::historical_source(
+                &storage,
+                &openmls_rust_crypto::RustCrypto::default(),
+                &request,
+                "pruned-after-listing",
+                &[]
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(storage.get_group(&group_id).unwrap().name, "live");
+        assert!(storage.list_group_snapshots(&group_id).unwrap().is_empty());
     }
 
     #[test]

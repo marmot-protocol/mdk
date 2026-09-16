@@ -3550,6 +3550,21 @@ async fn unavailable_moderation_authority_survives_restart_and_resolves_later() 
     drop(alice);
     let mut alice = build_with_storage_and_peeler(b"alice", alice_storage.clone(), mock_peeler());
     assert!(alice.drain_events().is_empty());
+    alice.recover_pending_application_authority().unwrap();
+    assert!(alice.drain_events().is_empty());
+    // A present but wrong source snapshot must not cause a rewind on every
+    // maintenance pass. Replacement under the same name must remain retryable.
+    alice_storage
+        .create_group_state_snapshot(&gid, "openmls-retained-anchor-1")
+        .unwrap();
+    alice.recover_pending_application_authority().unwrap(); // wrap cursor
+    alice.recover_pending_application_authority().unwrap(); // attempt bad evidence
+    let generation = alice_storage.mls_write_generation();
+    assert!(generation.is_some());
+    alice.recover_pending_application_authority().unwrap(); // wrap cursor
+    alice.recover_pending_application_authority().unwrap(); // unchanged evidence
+    assert_eq!(generation, alice_storage.mls_write_generation());
+    assert!(alice.drain_events().is_empty());
     alice_storage
         .create_group_state_snapshot(&gid, "test-authority-live")
         .unwrap();
@@ -3563,7 +3578,9 @@ async fn unavailable_moderation_authority_survives_restart_and_resolves_later() 
         .rollback_group_state_to_snapshot(&gid, "test-authority-live")
         .unwrap();
     // The bounded cursor wraps after an unresolved pass, then retries.
-    alice.drain_events();
+    assert!(alice.drain_events().is_empty());
+    alice.recover_pending_application_authority().unwrap();
+    alice.recover_pending_application_authority().unwrap();
     let received = alice
         .drain_events()
         .into_iter()

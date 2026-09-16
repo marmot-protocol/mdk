@@ -4233,15 +4233,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                                     .map_err(|e| OpenMlsProjectionError::Replay(e.to_string()))?,
                             )
                         } else {
-                            crate::app_payload::historical_authority(
-                                storage,
-                                group_id,
-                                cgka_traits::EpochId(source_epoch),
-                                sender,
-                                &message.payload,
-                                &payload,
-                            )
-                            .map_err(|e| OpenMlsProjectionError::Replay(e.to_string()))?
+                            // Do not nest a source-policy rewind inside a replay
+                            // guard. Durable control-only recovery authenticates
+                            // historical evidence on the maintenance rail.
+                            None
                         },
                         retention: AppMessageRetentionDecision::new(
                             app_event.created_at,

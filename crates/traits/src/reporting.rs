@@ -1,6 +1,44 @@
 //! Typed interpretation of group reports and shared review decisions.
 use serde::{Deserialize, Serialize};
 
+use crate::app_event::{
+    MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
+};
+
+/// Only these moderation controls need retained source-state authority.
+/// Ordinary app events and author deletion do not create authority retry work.
+pub fn requires_source_authority(kind: u64) -> bool {
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_REPORT | MARMOT_APP_EVENT_KIND_REVIEW | MARMOT_APP_EVENT_KIND_REMOVE
+    )
+}
+
+/// Whether a source state permits group reports, shared review, and admin removal.
+/// Count distinct authenticated account identities, not device leaves. An absent
+/// profile name is treated like an empty name for this application policy only.
+pub fn group_reporting_allowed(account_count: usize, name: Option<&str>) -> bool {
+    account_count != 2 || name.is_some_and(|name| name.chars().any(|c| !reporting_whitespace(c)))
+}
+
+/// Fixed Unicode White_Space set from the moderation contract. Keep explicit so
+/// a Unicode library update cannot silently change source-state eligibility.
+fn reporting_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportReason {
@@ -37,7 +75,8 @@ impl ReportReason {
         })
     }
     pub fn valid_explanation(self, explanation: &str) -> bool {
-        explanation.len() <= 4096 && (self != Self::Other || !explanation.trim().is_empty())
+        explanation.len() <= 4096
+            && (self != Self::Other || explanation.chars().any(|c| !reporting_whitespace(c)))
     }
 }
 
@@ -128,6 +167,61 @@ pub fn parse_removal(tags: &[Vec<String>], content: &str) -> Option<String> {
 mod tests {
     use super::*;
     #[test]
+    fn source_authority_is_required_only_for_moderation_kinds() {
+        for kind in [1984, 1985, 4891] {
+            assert!(requires_source_authority(kind));
+        }
+        for kind in [
+            0,
+            5,
+            7,
+            9,
+            1009,
+            1200,
+            1210,
+            1983,
+            1986,
+            4890,
+            4892,
+            u64::MAX,
+        ] {
+            assert!(!requires_source_authority(kind));
+        }
+    }
+
+    #[test]
+    fn reporting_eligibility_uses_account_count_and_optional_name() {
+        for name in [None, Some(""), Some(" \t\r\n\u{00a0}\u{3000}")] {
+            assert!(!group_reporting_allowed(2, name));
+            for count in [0, 1, 3, 4] {
+                assert!(group_reporting_allowed(count, name));
+            }
+        }
+        for name in ["pair", " pair ", "\u{200b}", "\u{feff}", "\u{001c}"] {
+            assert!(group_reporting_allowed(2, Some(name)));
+            assert!(ReportReason::Other.valid_explanation(name));
+        }
+    }
+
+    #[test]
+    fn reporting_whitespace_matches_the_fixed_contract() {
+        let whitespace = [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}',
+            '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
+            '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ];
+        for c in char::MIN..=char::MAX {
+            assert_eq!(reporting_whitespace(c), whitespace.contains(&c));
+        }
+        for c in whitespace {
+            let text = c.to_string();
+            assert!(!group_reporting_allowed(2, Some(&text)));
+            assert!(!ReportReason::Other.valid_explanation(&text));
+        }
+    }
+
+    #[test]
     fn nip56_categories_and_revision_default_are_strict() {
         let id = "11".repeat(32);
         let author = "22".repeat(32);
@@ -191,6 +285,10 @@ mod tests {
             r#"{"v":1,"action":"dismiss"}"#,
             r#"{"v":1,"action":"remove","extra":0}"#,
             r#"{"v":1,"v":1,"action":"remove"}"#,
+            r#"{"v":2,"v":1,"action":"remove"}"#,
+            r#"{"v":1,"v":2,"action":"remove"}"#,
+            r#"{"v":1,"action":"dismiss","action":"remove"}"#,
+            r#"{"v":1,"action":"remove","action":"remove"}"#,
         ] {
             assert!(parse_removal(&tags, text).is_none());
         }

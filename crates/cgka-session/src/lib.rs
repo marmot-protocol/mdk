@@ -1245,6 +1245,12 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    /// Bounded local policy recovery, driven by account maintenance.
+    pub fn recover_pending_application_authority(&mut self) -> SessionResult<()> {
+        self.engine.recover_pending_application_authority()?;
+        Ok(())
+    }
+
     pub fn drain(&mut self) -> SessionEffects {
         tracing::trace!(
             target: TRACE_TARGET,

@@ -97,7 +97,14 @@ fn report_reference<'a>(
     if !allowed {
         return Ok(None);
     }
-    let pruned:bool=conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM content_pruned_controls WHERE group_id_hex=?1 AND message_id_hex=?2)",params![event.group_id_hex,event.message_id_hex],|r|r.get(0)).storage()?;
+    let pruned: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS (SELECT 1 FROM content_pruned_controls
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+            params![event.group_id_hex, event.message_id_hex],
+            |row| row.get(0),
+        )
+        .storage()?;
     Ok(parse_report(
         &event.tags,
         if pruned { "pruned" } else { &event.plaintext },
@@ -105,6 +112,28 @@ fn report_reference<'a>(
 }
 
 pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageResult<()> {
+    // Most timeline rows have no moderation state. Probe indexed keys before
+    // loading raw content or edits, including when a non-chat event is projected.
+    // Existing state must still be refreshed when its last report is withdrawn.
+    let needs_refresh: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS (
+                SELECT 1 FROM message_modifier_edges
+                WHERE group_id_hex = ?1 AND target_message_id_hex = ?2 AND kind = ?3
+             ) OR EXISTS (
+                SELECT 1 FROM message_timeline
+                WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND deleted = 1
+             ) OR EXISTS (
+                SELECT 1 FROM content_moderation
+                WHERE group_id_hex = ?1 AND message_id_hex = ?2
+             )",
+            params![group, target, u64_to_i64(MARMOT_APP_EVENT_KIND_REPORT)?],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if !needs_refresh {
+        return Ok(());
+    }
     let Some(original) = raw(conn, group, target)?
         .filter(|e| e.kind == MARMOT_APP_EVENT_KIND_CHAT && !e.invalidated)
     else {
@@ -129,11 +158,17 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
     }
     // The reported revision remains stable, while the current revision follows
     // the shared accepted-edit projection (including retracted edits).
-    let latest = conn.query_row_cached(
-        "SELECT json_extract(edit_json, '$.latest_edit_message_id_hex') FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2",
-        params![group,target], |r| r.get::<_, Option<String>>(0),
-    ).optional().storage()?.flatten().unwrap_or_else(||target.to_owned());
-    let deleted: bool = conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2 AND deleted=1)",params![group,target],|r|r.get(0)).storage()?;
+    let (latest, deleted) = conn
+        .query_row_cached(
+            "SELECT json_extract(edit_json, '$.latest_edit_message_id_hex'), deleted
+             FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group, target],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .storage()?
+        .unwrap_or((None, false));
+    let latest = latest.unwrap_or_else(|| target.to_owned());
     let candidates =
         app_events_targeting_message_tx(conn, group, MARMOT_APP_EVENT_KIND_REPORT, target)?;
     // Group duplicates before applying dismissal: a new duplicate event can
@@ -184,9 +219,45 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
         if dismissal.is_none() && !deleted {
             pending += 1;
         }
-        conn.execute_cached("INSERT INTO content_reports(group_id_hex,report_id_hex,message_id_hex,revision_id_hex,reporter,reason,reported_at,dismissed_by) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![group,report.message_id_hex,target,revision,reporter,reason.as_str(),u64_to_i64(report.recorded_at)?,dismissal]).storage()?;
+        conn.execute_cached(
+            "INSERT INTO content_reports (
+                group_id_hex, report_id_hex, message_id_hex, revision_id_hex,
+                reporter, reason, reported_at, dismissed_by
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                group,
+                report.message_id_hex,
+                target,
+                revision,
+                reporter,
+                reason.as_str(),
+                u64_to_i64(report.recorded_at)?,
+                dismissal,
+            ],
+        )
+        .storage()?;
     }
-    conn.execute_cached("INSERT INTO content_moderation(group_id_hex,message_id_hex,revision_id_hex,total_reports,pending_reports,removed) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(group_id_hex,message_id_hex) DO UPDATE SET revision_id_hex=excluded.revision_id_hex,total_reports=excluded.total_reports,pending_reports=excluded.pending_reports,removed=excluded.removed",params![group,target,latest,total,pending,deleted]).storage()?;
+    if total == 0 && !deleted {
+        conn.execute_cached(
+            "DELETE FROM content_moderation WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group, target],
+        )
+        .storage()?;
+    } else {
+        conn.execute_cached(
+            "INSERT INTO content_moderation (
+                group_id_hex, message_id_hex, revision_id_hex,
+                total_reports, pending_reports, removed
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
+                revision_id_hex = excluded.revision_id_hex,
+                total_reports = excluded.total_reports,
+                pending_reports = excluded.pending_reports,
+                removed = excluded.removed",
+            params![group, target, latest, total, pending, deleted],
+        )
+        .storage()?;
+    }
     Ok(())
 }
 
@@ -194,6 +265,15 @@ pub(super) fn hydrate(
     conn: &Connection,
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
+    for message in messages.iter_mut() {
+        // Accepted edits already determine the timeline body. The same metadata
+        // determines its revision even when there is no moderation projection.
+        message.revision_id_hex = message.edit.as_ref().map_or_else(
+            || message.message_id_hex.clone(),
+            |edit| edit.latest_edit_message_id_hex.clone(),
+        );
+        message.moderation = summary(0, 0, message.deleted);
+    }
     let groups: BTreeSet<_> = messages.iter().map(|m| m.group_id_hex.clone()).collect();
     for group in groups {
         let ids: Vec<_> = messages
@@ -202,26 +282,30 @@ pub(super) fn hydrate(
             .map(|m| &m.message_id_hex)
             .collect();
         let json = serde_json::to_string(&ids).map_err(|e| StorageError::Backend(e.to_string()))?;
-        let mut stmt = conn.prepare_cached("SELECT message_id_hex,revision_id_hex,total_reports,pending_reports,removed FROM content_moderation WHERE group_id_hex=?1 AND message_id_hex IN (SELECT value FROM json_each(?2))").storage()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT message_id_hex, total_reports, pending_reports, removed
+             FROM content_moderation
+             WHERE group_id_hex = ?1 AND message_id_hex IN (SELECT value FROM json_each(?2))",
+            )
+            .storage()?;
         let entries = stmt
             .query_map(params![group, json], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, bool>(4)?,
+                    r.get::<_, bool>(3)?,
                 ))
             })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
-        for (id, revision, total, pending, removed) in entries {
+        for (id, total, pending, removed) in entries {
             if let Some(message) = messages
                 .iter_mut()
                 .find(|m| m.group_id_hex == group && m.message_id_hex == id)
             {
-                message.revision_id_hex = revision;
                 message.moderation = summary(total, pending, removed);
             }
         }
@@ -249,15 +333,52 @@ impl SqliteAccountStorage {
             return Ok(None);
         };
         self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            let changed=conn.execute_cached("UPDATE app_events SET authority_state=2,authority_context=?3,moderation_grant=CASE WHEN kind=5 AND authority_state=0 THEN moderation_grant WHEN kind IN (1985,4891) THEN ?4 ELSE 0 END, reporting_allowed=?5 WHERE group_id_hex=?1 AND message_id_hex=?2 AND authority_state != 2",params![group,id,authority.source_context.as_slice(),authority.moderation_grant,authority.reporting_allowed]).storage()?;
-            if changed==0{return Ok(None)};
-            let Some((kind,tags))=app_event_projection_parts_tx(&conn,group,id)? else{return Ok(None)};
-            let ids=affected_timeline_message_ids_for_parts_tx(&conn,group,id,kind,&tags)?;
-            for target in &ids { upsert_message_timeline_projection_for_message_tx(&conn,group,target)?; }
-            let messages=timeline_records_by_ids_tx(&conn,group,ids)?;
-            let changes=messages.iter().cloned().map(|message|TimelineMessageChange::Upsert{trigger:TimelineUpdateTrigger::SnapshotRefresh,message:Box::new(message)}).collect();
-            Ok(Some(TimelineProjectionUpdate{group_id_hex:group.to_owned(),messages,changes}))
+            let conn = self.lock()?;
+            let changed = conn
+                .execute_cached(
+                    "UPDATE app_events SET
+                    authority_state = 2,
+                    authority_context = ?3,
+                    moderation_grant = CASE
+                        WHEN kind = 5 AND authority_state = 0 THEN moderation_grant
+                        WHEN kind IN (1985, 4891) THEN ?4
+                        ELSE 0
+                    END,
+                    reporting_allowed = ?5
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND authority_state != 2",
+                    params![
+                        group,
+                        id,
+                        authority.source_context.as_slice(),
+                        authority.moderation_grant,
+                        authority.reporting_allowed,
+                    ],
+                )
+                .storage()?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let Some((kind, tags)) = app_event_projection_parts_tx(&conn, group, id)? else {
+                return Ok(None);
+            };
+            let ids = affected_timeline_message_ids_for_parts_tx(&conn, group, id, kind, &tags)?;
+            for target in &ids {
+                upsert_message_timeline_projection_for_message_tx(&conn, group, target)?;
+            }
+            let messages = timeline_records_by_ids_tx(&conn, group, ids)?;
+            let changes = messages
+                .iter()
+                .cloned()
+                .map(|message| TimelineMessageChange::Upsert {
+                    trigger: TimelineUpdateTrigger::SnapshotRefresh,
+                    message: Box::new(message),
+                })
+                .collect();
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex: group.to_owned(),
+                messages,
+                changes,
+            }))
         })
     }
     pub fn reported_content(
@@ -269,7 +390,16 @@ impl SqliteAccountStorage {
     ) -> StorageResult<ReportedContentPage> {
         let conn = self.lock()?;
         let limit = limit.clamp(1, 100);
-        let mut stmt=conn.prepare_cached("SELECT message_id_hex,revision_id_hex,total_reports,pending_reports,removed FROM content_moderation WHERE group_id_hex=?1 AND total_reports>0 AND (?2=0 OR pending_reports>0) AND (?3 IS NULL OR message_id_hex>?3) ORDER BY message_id_hex LIMIT ?4").storage()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT message_id_hex, revision_id_hex, total_reports, pending_reports, removed
+             FROM content_moderation
+             WHERE group_id_hex = ?1 AND total_reports > 0
+               AND (?2 = 0 OR pending_reports > 0)
+               AND (?3 IS NULL OR message_id_hex > ?3)
+             ORDER BY message_id_hex LIMIT ?4",
+            )
+            .storage()?;
         let mut items = stmt
             .query_map(
                 params![group, pending_only, after, (limit + 1) as i64],
@@ -290,7 +420,14 @@ impl SqliteAccountStorage {
         } else {
             None
         };
-        let pending_message_count=conn.query_row_cached("SELECT count(*) FROM content_moderation WHERE group_id_hex=?1 AND pending_reports>0",params![group],|r|r.get::<_,i64>(0)).storage()? as u64;
+        let pending_message_count = conn
+            .query_row_cached(
+                "SELECT count(*) FROM content_moderation
+             WHERE group_id_hex = ?1 AND pending_reports > 0",
+                params![group],
+                |row| row.get::<_, i64>(0),
+            )
+            .storage()? as u64;
         Ok(ReportedContentPage {
             items,
             next_cursor,
@@ -306,7 +443,25 @@ impl SqliteAccountStorage {
     ) -> StorageResult<ContentReportPage> {
         let conn = self.lock()?;
         let limit = limit.clamp(1, 100);
-        let mut stmt=conn.prepare_cached("SELECT r.report_id_hex,r.revision_id_hex,r.reporter,r.reason,e.plaintext,r.reported_at,r.dismissed_by,d.sender,CASE WHEN m.removed=0 THEN v.plaintext ELSE NULL END FROM content_reports r JOIN app_events e ON e.group_id_hex=r.group_id_hex AND e.message_id_hex=r.report_id_hex JOIN content_moderation m ON m.group_id_hex=r.group_id_hex AND m.message_id_hex=r.message_id_hex LEFT JOIN app_events d ON d.group_id_hex=r.group_id_hex AND d.message_id_hex=r.dismissed_by LEFT JOIN app_events v ON v.group_id_hex=r.group_id_hex AND v.message_id_hex=r.revision_id_hex WHERE r.group_id_hex=?1 AND r.message_id_hex=?2 AND (?3 IS NULL OR r.report_id_hex>?3) ORDER BY r.report_id_hex LIMIT ?4").storage()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT r.report_id_hex, r.revision_id_hex, r.reporter, r.reason,
+                    e.plaintext, r.reported_at, r.dismissed_by, d.sender,
+                    CASE WHEN m.removed = 0 THEN v.plaintext ELSE NULL END
+             FROM content_reports r
+             JOIN app_events e
+               ON e.group_id_hex = r.group_id_hex AND e.message_id_hex = r.report_id_hex
+             JOIN content_moderation m
+               ON m.group_id_hex = r.group_id_hex AND m.message_id_hex = r.message_id_hex
+             LEFT JOIN app_events d
+               ON d.group_id_hex = r.group_id_hex AND d.message_id_hex = r.dismissed_by
+             LEFT JOIN app_events v
+               ON v.group_id_hex = r.group_id_hex AND v.message_id_hex = r.revision_id_hex
+             WHERE r.group_id_hex = ?1 AND r.message_id_hex = ?2
+               AND (?3 IS NULL OR r.report_id_hex > ?3)
+             ORDER BY r.report_id_hex LIMIT ?4",
+            )
+            .storage()?;
         let mut reports = stmt
             .query_map(params![group, target, after, (limit + 1) as i64], |r| {
                 Ok(ContentReport {
@@ -391,7 +546,14 @@ impl SqliteAccountStorage {
         else {
             return Ok(None);
         };
-        let removed:bool=conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2 AND deleted=1)",params![group,target],|r|r.get(0)).storage()?;
+        let removed: bool = conn
+            .query_row_cached(
+                "SELECT EXISTS (SELECT 1 FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND deleted = 1)",
+                params![group, target],
+                |row| row.get(0),
+            )
+            .storage()?;
         if removed {
             return Ok(None);
         };
@@ -448,11 +610,14 @@ impl SqliteAccountStorage {
         for event in
             app_events_targeting_message_tx(&conn, group, MARMOT_APP_EVENT_KIND_REPORT, target)?
         {
-            if event.sender == reporter
-                && parse_report(&event.tags, &event.plaintext)
-                    .or(report_reference(&conn, &event)?)
-                    .is_some_and(|r| r.revision == revision)
-            {
+            if event.sender != reporter {
+                continue;
+            }
+            let reference = match parse_report(&event.tags, &event.plaintext) {
+                Some(reference) => Some(reference),
+                None => report_reference(&conn, &event)?,
+            };
+            if reference.is_some_and(|reference| reference.revision == revision) {
                 return Ok(Some(event.message_id_hex));
             }
         }
@@ -461,11 +626,24 @@ impl SqliteAccountStorage {
 }
 
 pub(super) fn target_expired(conn: &Connection, group: &str, id: &str) -> StorageResult<bool> {
-    conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM content_expired_targets WHERE group_id_hex=?1 AND message_id_hex=?2)",params![group,id],|r|r.get(0)).storage()
+    conn.query_row_cached(
+        "SELECT EXISTS (SELECT 1 FROM content_expired_targets
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+        params![group, id],
+        |row| row.get(0),
+    )
+    .storage()
 }
 
 pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> StorageResult<()> {
-    let pruned:bool=conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM content_pruned_controls WHERE group_id_hex=?1 AND message_id_hex=?2)",params![group,id],|r|r.get(0)).storage()?;
+    let pruned: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS (SELECT 1 FROM content_pruned_controls
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
+            params![group, id],
+            |row| row.get(0),
+        )
+        .storage()?;
     if !pruned {
         return Ok(());
     }
@@ -497,8 +675,25 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
         )
         .storage()?;
     }
-    conn.execute_cached("UPDATE app_events SET plaintext=zeroblob(length(plaintext)) WHERE group_id_hex=?1 AND message_id_hex=?2 AND kind!=4891",params![group,id]).storage()?;
-    conn.execute_cached("UPDATE app_events SET plaintext=CASE WHEN kind=4891 THEN plaintext ELSE '' END,retention_seconds=NULL,retention_expires_at=NULL WHERE group_id_hex=?1 AND message_id_hex=?2 AND EXISTS(SELECT 1 FROM content_pruned_controls p WHERE p.group_id_hex=app_events.group_id_hex AND p.message_id_hex=app_events.message_id_hex)",params![group,id]).storage()?;
+    conn.execute_cached(
+        "UPDATE app_events SET plaintext = zeroblob(length(plaintext))
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind != 4891",
+        params![group, id],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "UPDATE app_events SET
+            plaintext = CASE WHEN kind = 4891 THEN plaintext ELSE '' END,
+            retention_seconds = NULL,
+            retention_expires_at = NULL
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND EXISTS (
+            SELECT 1 FROM content_pruned_controls p
+            WHERE p.group_id_hex = app_events.group_id_hex
+              AND p.message_id_hex = app_events.message_id_hex
+         )",
+        params![group, id],
+    )
+    .storage()?;
     Ok(())
 }
 pub(super) fn retain_pruned_controls(
@@ -541,33 +736,74 @@ impl SqliteAccountStorage {
         limit: usize,
     ) -> StorageResult<Vec<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            let (after,through):(i64,i64)=conn.query_row_cached("SELECT after_order,through_order FROM content_report_backfill WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).storage()?;
-            if after>=through {return Ok(Vec::new())}
-            let mut stmt=conn.prepare_cached("SELECT group_id_hex,message_id_hex,source_message_id_hex,source_epoch,direction,sender,plaintext,kind,tags_json,recorded_at,received_at,invalidated,invalidation_reason,moderation_grant,insert_order FROM app_events WHERE insert_order>?1 AND insert_order<=?2 ORDER BY insert_order LIMIT ?3").storage()?;
-            let events=stmt.query_map(params![after,through,limit.clamp(1,100) as i64],|r|Ok((raw_event_from_row(r)?,r.get::<_,i64>(14)?))).storage()?.collect::<Result<Vec<_>,_>>().storage()?;
-            let mut affected:BTreeMap<String,BTreeSet<String>>=BTreeMap::new();
-            for (event,_) in &events {
-                backfill_authority_request(&conn,event)?;
-                if matches!(event.kind,1009|1984|1985|4891) {
-                    for target in tag_values(&event.tags,"e") {
-                        conn.execute_cached("INSERT OR IGNORE INTO message_modifier_edges(group_id_hex,modifier_message_id_hex,target_message_id_hex,kind,sender,recorded_at) VALUES(?1,?2,?3,?4,?5,?6)",params![event.group_id_hex,event.message_id_hex,target,event.kind as i64,event.sender,event.recorded_at as i64]).storage()?;
+            let conn = self.lock()?;
+            let (after, through): (i64, i64) = conn.query_row_cached(
+                "SELECT after_order, through_order FROM content_report_backfill WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).storage()?;
+            if after >= through {
+                return Ok(Vec::new());
+            }
+            let mut stmt = conn.prepare_cached(
+                "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
+                        direction, sender, plaintext, kind, tags_json, recorded_at, received_at,
+                        invalidated, invalidation_reason, moderation_grant, insert_order
+                 FROM app_events WHERE insert_order > ?1 AND insert_order <= ?2
+                 ORDER BY insert_order LIMIT ?3",
+            ).storage()?;
+            let events = stmt.query_map(
+                params![after, through, limit.clamp(1, 100) as i64],
+                |row| Ok((raw_event_from_row(row)?, row.get::<_, i64>(14)?)),
+            ).storage()?.collect::<Result<Vec<_>, _>>().storage()?;
+            let mut affected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for (event, _) in &events {
+                backfill_authority_request(&conn, event)?;
+                if matches!(event.kind, 1009 | 1984 | 1985 | 4891) {
+                    for target in tag_values(&event.tags, "e") {
+                        conn.execute_cached(
+                            "INSERT OR IGNORE INTO message_modifier_edges (
+                                group_id_hex, modifier_message_id_hex, target_message_id_hex,
+                                kind, sender, recorded_at
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                event.group_id_hex, event.message_id_hex, target,
+                                event.kind as i64, event.sender, event.recorded_at as i64,
+                            ],
+                        ).storage()?;
                     }
                 }
-                if matches!(event.kind,1984|1985|4891) {
-                    conn.execute_cached("DELETE FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2",params![event.group_id_hex,event.message_id_hex]).storage()?;
+                if matches!(event.kind, 1984 | 1985 | 4891) {
+                    conn.execute_cached(
+                        "DELETE FROM message_timeline
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                        params![event.group_id_hex, event.message_id_hex],
+                    ).storage()?;
                 }
-                affected.entry(event.group_id_hex.clone()).or_default().extend(affected_timeline_message_ids_for_parts_tx(&conn,&event.group_id_hex,&event.message_id_hex,event.kind,&event.tags)?);
+                let ids = affected_timeline_message_ids_for_parts_tx(
+                    &conn, &event.group_id_hex, &event.message_id_hex, event.kind, &event.tags,
+                )?;
+                affected.entry(event.group_id_hex.clone()).or_default().extend(ids);
             }
-            let mut updates=Vec::new();
-            for (group,ids) in affected {
-                for id in &ids {upsert_message_timeline_projection_for_message_tx(&conn,&group,id)?;}
-                let messages=timeline_records_by_ids_tx(&conn,&group,ids)?;
-                let changes=messages.iter().cloned().map(|message|TimelineMessageChange::Upsert{trigger:TimelineUpdateTrigger::SnapshotRefresh,message:Box::new(message)}).collect();
-                updates.push(TimelineProjectionUpdate{group_id_hex:group,messages,changes});
+            let mut updates = Vec::new();
+            for (group, ids) in affected {
+                for id in &ids {
+                    upsert_message_timeline_projection_for_message_tx(&conn, &group, id)?;
+                }
+                let messages = timeline_records_by_ids_tx(&conn, &group, ids)?;
+                let changes = messages.iter().cloned().map(|message| TimelineMessageChange::Upsert {
+                    trigger: TimelineUpdateTrigger::SnapshotRefresh,
+                    message: Box::new(message),
+                }).collect();
+                updates.push(TimelineProjectionUpdate {
+                    group_id_hex: group, messages, changes,
+                });
             }
-            let cursor=events.last().map_or(through,|(_,order)|*order);
-            conn.execute_cached("UPDATE content_report_backfill SET after_order=?1 WHERE singleton=1",params![cursor]).storage()?;
+            let cursor = events.last().map_or(through, |(_, order)| *order);
+            conn.execute_cached(
+                "UPDATE content_report_backfill SET after_order = ?1 WHERE singleton = 1",
+                params![cursor],
+            ).storage()?;
             Ok(updates)
         })
     }
@@ -706,6 +942,139 @@ mod tests {
     fn page(s: &SqliteAccountStorage) -> ReportedContentPage {
         s.reported_content(&id(99), false, None, 100).unwrap()
     }
+    fn moderation_rows(s: &SqliteAccountStorage) -> i64 {
+        s.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM content_moderation", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn unreported_edits_and_retractions_keep_revision_without_moderation_rows() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        for e in [
+            target(),
+            event(2, 10, 1009, vec![vec!["e".into(), id(1)]], "edited"),
+            event(3, 11, 42, vec![], "custom event"),
+        ] {
+            s.record_app_event(&e).unwrap();
+        }
+        for rebuild in [false, true] {
+            if rebuild {
+                // Older projections mirrored every chat. Rebuilding clears those
+                // empty rows without losing the current accepted revision.
+                s.lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO content_moderation VALUES (?1, ?2, ?2, 0, 0, 0)",
+                        params![id(99), id(1)],
+                    )
+                    .unwrap();
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            assert_eq!(moderation_rows(&s), 0);
+            let current = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert_eq!(current.plaintext, "edited");
+            assert_eq!(current.revision_id_hex, id(2));
+            assert_eq!(current.moderation, MessageModerationSummary::default());
+            assert!(page(&s).items.is_empty());
+        }
+        s.record_app_event(&event(4, 10, 5, vec![vec!["e".into(), id(2)]], ""))
+            .unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            let current = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert_eq!(current.plaintext, "original");
+            assert_eq!(current.revision_id_hex, id(1));
+            assert_eq!(current.moderation, MessageModerationSummary::default());
+            assert_eq!(moderation_rows(&s), 0);
+        }
+    }
+
+    #[test]
+    fn withdrawing_last_report_or_removal_clears_sparse_moderation_state() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        // An orphan report becomes materialized only after its target arrives.
+        s.record_app_event(&report(2, 11, 1)).unwrap();
+        assert_eq!(moderation_rows(&s), 0);
+        s.record_app_event(&target()).unwrap();
+        assert_eq!(moderation_rows(&s), 1);
+        s.invalidate_app_event_by_source(&id(2), "losing_branch")
+            .unwrap();
+        assert_eq!(moderation_rows(&s), 0);
+        assert!(
+            s.message_reports(&id(99), &id(1), None, 10)
+                .unwrap()
+                .reports
+                .is_empty()
+        );
+        assert_eq!(
+            s.timeline_message(&id(99), &id(1))
+                .unwrap()
+                .unwrap()
+                .moderation,
+            MessageModerationSummary::default()
+        );
+
+        s.record_app_event(&removal(3, 1)).unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            assert_eq!(moderation_rows(&s), 1);
+            let current = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert_eq!(current.moderation.status, ModerationStatus::Removed);
+            assert_eq!(current.moderation.total_reports, 0);
+            assert!(page(&s).items.is_empty());
+        }
+        s.invalidate_app_event_by_source(&id(3), "losing_branch")
+            .unwrap();
+        assert_eq!(moderation_rows(&s), 0);
+        assert!(
+            !s.timeline_message(&id(99), &id(1))
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+    }
+
+    #[test]
+    fn ordinary_refresh_is_one_bounded_read_for_chat_and_nonchat_events() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static QUERIES: AtomicUsize = AtomicUsize::new(0);
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        cgka_traits::StorageProvider::with_transaction(&s, |store| {
+            for n in 1..=128 {
+                store.record_app_event(&event(n, 10, 9, vec![], "ordinary chat"))?;
+            }
+            store.record_app_event(&event(200, 10, 42, vec![], "custom event"))?;
+            Ok::<_, StorageError>(())
+        })
+        .unwrap();
+        let conn = s.lock().unwrap();
+        conn.flush_prepared_statement_cache();
+        conn.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|event| {
+                if let TraceEvent::Profile(stmt, _) = event {
+                    assert!(stmt.sql().starts_with("SELECT EXISTS"));
+                    assert!(stmt.get_status(rusqlite::StatementStatus::VmStep) < 128);
+                    QUERIES.fetch_add(1, Ordering::Relaxed);
+                }
+            }),
+        );
+        refresh(&conn, &id(99), &id(1)).unwrap();
+        refresh(&conn, &id(99), &id(200)).unwrap();
+        conn.trace_v2(TraceEventCodes::empty(), None);
+        assert_eq!(QUERIES.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn report_and_dismissal_converge_in_every_delivery_order() {
         let events = [target(), report(2, 11, 1), dismiss(3, &[2])];

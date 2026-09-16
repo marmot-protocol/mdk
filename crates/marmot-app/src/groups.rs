@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_traits::agent_text_stream::{
@@ -1897,27 +1897,21 @@ pub(crate) enum GroupConfirmationProjection {
     },
 }
 
-/// Whether a delete may tombstone other members' messages: its authenticated
-/// sender must be in the group's current admin set, and the group must not
-/// look like a direct (two-member, unnamed) conversation.
-///
-/// Known limitation: "direct" is a heuristic over mutable state
-/// (`members.len() == 2 && name.is_empty()`), not an immutable conversation
-/// kind. The creator is always an implicit admin, and the only
-/// create/rename API takes a free-form name for any member count, so an admin
-/// can name — or later rename — a two-member conversation to escape this gate
-/// and gain moderation over the peer's messages, with no signal to the peer.
-/// Closing that fully needs a conversation-kind fixed at creation time
-/// (protocol/engine plus client work); until then this is a deliberate,
-/// documented limitation rather than a guarantee that 1:1 chats can never be
-/// moderated.
+/// Send-time preflight for admin removal: require an active admin and group
+/// reporting eligibility. Eligibility is mutable source-state policy: named
+/// two-account groups are eligible, while unnamed two-account groups are not.
+/// The engine stamps the final authority at encryption time.
 pub(crate) fn delete_moderation_grant(
     group: &Group,
     admins: &[[u8; 32]],
     sender_hex: &str,
 ) -> bool {
-    let direct = group.members.len() == 2 && group.name.trim().is_empty();
-    !direct && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
+    let accounts: HashSet<_> = group.members.iter().map(|member| &member.id).collect();
+    cgka_traits::reporting::group_reporting_allowed(accounts.len(), Some(&group.name))
+        && accounts
+            .iter()
+            .any(|id| hex::encode(id.as_slice()) == sender_hex)
+        && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
 }
 
 #[cfg(test)]
@@ -1948,7 +1942,7 @@ mod delete_moderation_grant_tests {
         }
     }
 
-    const ADMIN: [u8; 32] = [7u8; 32];
+    const ADMIN: [u8; 32] = [0u8; 32];
 
     #[test]
     fn admin_in_named_group_gets_grant() {
@@ -1966,7 +1960,7 @@ mod delete_moderation_grant_tests {
         assert!(!delete_moderation_grant(
             &group,
             &[ADMIN],
-            &hex::encode([9u8; 32])
+            &hex::encode([1u8; 32])
         ));
     }
 
@@ -2000,6 +1994,34 @@ mod delete_moderation_grant_tests {
     #[test]
     fn unnamed_larger_group_is_not_direct() {
         let group = group_with("", 3);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn admin_without_a_current_member_leaf_gets_no_grant() {
+        let group = group_with("ops", 3);
+        let departed_admin = [7u8; 32];
+        assert!(!delete_moderation_grant(
+            &group,
+            &[departed_admin],
+            &hex::encode(departed_admin)
+        ));
+    }
+
+    #[test]
+    fn multiple_devices_do_not_change_two_account_eligibility() {
+        let mut group = group_with("\u{00a0}\u{2007}\u{3000}", 2);
+        group.members.push(group.members[0].clone());
+        assert!(!delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+        group.name = "pair".into();
         assert!(delete_moderation_grant(
             &group,
             &[ADMIN],

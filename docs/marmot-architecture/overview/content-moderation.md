@@ -3,19 +3,25 @@
 The wire contract belongs to Marmot's `foundation/application-messages.md` and
 `features/content-moderation.md`. Merge that companion specification before
 shipping this implementation. All participants need compatible clients for a
-consistent moderation view; older clients can render unknown kinds or retain
-older deletion authorization behavior.
+consistent moderation view; older clients may render unknown kinds, retain
+removed content, or retain older deletion authorization behavior.
 
 ## Runtime boundary
 
 `report_message` resolves the original author from account storage and validates
 the requested original/edit revision. A report targets a whole kind-9 message,
-including media and completed agent messages. Named two-member groups remain
-eligible. `dismiss_reports` accepts explicit report IDs and requires admin
-preflight. Reports use inner kind 1984. Dismissals use NIP-32 kind 1985 with the
+including media and completed agent messages. Eligibility counts distinct
+member accounts, so multiple devices do not turn an unnamed two-account chat
+into a moderatable group. Named two-account groups remain eligible. The shared
+`reporting::group_reporting_allowed` helper pins the protocol's Unicode whitespace
+set for app preflight and engine authorization; an absent profile name is empty
+for this check. `dismiss_reports` accepts explicit report IDs and requires active
+admin preflight. Reports use inner kind 1984. Dismissals use NIP-32 kind 1985 with the
 `dismissed` label in namespace `marmot.report-review.v1`, referencing report IDs.
-The existing delete command sends kind 5 for author self-retraction and kind 4891
-for admin removal of another member's whole chat message. Kind 4891 references
+`delete_message` sends kind 5 for author self-retraction and kind 4891 for active
+admin removal of another account's whole chat message and all its revisions.
+A non-admin targeting another account's message receives an error before
+publication. Kind 4891 references
 the original message and carries `{"v":1,"action":"remove"}`. This does not
 extend NIP-09 authorization.
 
@@ -43,18 +49,31 @@ account publication result, replay observation, durable pending application
 output, and app projection. A queued intent receives its verdict when it is
 actually encrypted. Receive-time current admin lists do not authorize an action.
 
-For a historical receive, the engine restores the retained source snapshot
-under a rollback guard and authenticates the ciphertext and payload there before
-reading its policy. An equal epoch number on a different branch is insufficient.
-The guard restores live ratchets and group state even on failure. Missing proof
-leaves the authority unresolved. A separate durable retry record retains the source ID, sender, epoch and payload
-digest without plaintext. Application outputs can therefore be acknowledged and
-explanations pruned while bounded, rotating recovery batches remain retryable.
-A recovered verdict and its dependent projections commit atomically. Source
-verdicts survive restart, while convergence invalidation still withdraws effects.
-Historical pre-migration deletion decisions remain frozen, including already
-honored admin kind-5 tombstones. New source-authorized kind-5 events cannot gain
-admin deletion privileges.
+Historical source authorization restores the retained source snapshot under a
+rollback guard and authenticates the ciphertext and payload there before reading
+its policy. An equal epoch number on a different branch is insufficient. The
+guard restores live ratchets and group state even on failure. Out-of-epoch replay
+emits unresolved authority instead of nesting another rewind inside replay.
+
+A separate durable retry record retains the source ID, sender, epoch and payload
+digest without plaintext. Only kinds 1984, 1985, and 4891 enter this path;
+ordinary messages and kind-5 author deletion do not. Session/account
+`run_due_maintenance` drives `recover_pending_application_authority` in rotating
+batches of at most 32 pending records, independently of legacy projection
+backfill. Unknown authority stays retryable rather than becoming a denial.
+
+A memory-only attempt cache keys each source message ID to its named snapshot's
+content fingerprint. Repeated attempts that could not authenticate skip the
+rewind until those snapshot bytes change. Resolving authority clears its entry;
+each full cursor pass reclaims entries for retry requests that disappeared.
+Pruning retained source bytes removes their retry requests atomically.
+
+Application outputs can be acknowledged and explanations pruned while recovery
+remains pending. A recovered verdict and its dependent projections commit
+atomically. Source verdicts survive restart, while convergence invalidation
+still withdraws effects. Historical pre-migration deletion decisions remain
+frozen, including already honored admin kind-5 tombstones. New kind-5 events
+cannot gain admin deletion privileges.
 
 ## Persistence and retention
 
@@ -67,12 +86,16 @@ Reports are grouped by original message, revision, and reporter within one
 group. The earliest `(created_at, event_id)` chooses displayed duplicate details.
 A dismissal referencing any duplicate resolves that logical report. Concurrent
 valid dismissals choose the same canonical decision; a later report from a new
-reporter/revision remains pending. Removal wins over edits and review status.
+reporter/revision remains pending unless the target has been removed. Removal
+closes pending review for every revision, and later reports cannot reopen it.
+Removal wins over edits and review status.
 
 Report records contain references and metadata, never a copy of target content.
 Expiration of the target prunes dependent explanations and edits. Expired
-controls retain structural evidence with explanations scrubbed so duplicate
-reports, rebuilds, or late edits cannot resurrect dismissed or removed content.
+controls intentionally retain minimal reference and resolution tombstones with
+explanations scrubbed. These are durable anti-resurrection evidence, not retained
+message content: duplicate reports, rebuilds, or late edits cannot reopen resolved
+review or restore removed content.
 Normal timeline, reply-preview, search, media, and review-detail content is
 suppressed after removal. There is no withdrawal, undo, or restore operation.
 

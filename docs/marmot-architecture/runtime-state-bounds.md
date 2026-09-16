@@ -30,6 +30,12 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | `Engine::canonical_replays`, `Engine::peel_replays` | At most one continuation of each kind per pending group. Each owns one input graph; frontier and completed paths are bounded by the existing cumulative replay-probe budget, with path depth limited by the retained graph. Peel output remains capped at eight contexts. This is an input-relative bound, not a fixed account-wide byte cap. | Removed on completion/error, relevant state or policy invalidation, hydration/repair/removal, or engine drop. Exact source identity and replay-state content fingerprint (or strict MLS mutation generation on other tracking backends) are checked before reuse; a new canonical pass discards the old cursor. No transaction, snapshot guard, or durable scratch row survives a slice. |
 
+### `cgka-engine` moderation authority recovery (`src/app_payload.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `Engine::authority_recovery_attempts`, `Engine::authority_recovery_seen` | At most one entry per durable unresolved moderation control encountered in the current or previous cursor pass; input-relative to retained source records, never ordinary chat history. Each maintenance call visits at most 32 requests. Fingerprints identify one named snapshot rather than the whole live group. | Resolved entries are removed immediately; each completed cursor pass removes entries whose requests disappeared. Source-byte pruning and group deletion remove durable requests atomically. Engine drop clears both caches; restart may retry once against unchanged evidence. No secret-derived fingerprint is logged or persisted. |
+
 ### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
 
 | Structure | Bound | Reclamation |

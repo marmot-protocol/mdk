@@ -3623,7 +3623,11 @@ impl AppClient {
                 ..
             } => {
                 let group = self.runtime.group_record(group_id)?;
-                if group.members.len() == 2 && group.name.trim().is_empty() {
+                let accounts: HashSet<_> = group.members.iter().map(|member| &member.id).collect();
+                if !cgka_traits::reporting::group_reporting_allowed(
+                    accounts.len(),
+                    Some(&group.name),
+                ) {
                     return Err(AppError::InvalidAppMessagePayload(
                         "reporting is unavailable in direct conversations".into(),
                     ));
@@ -4245,6 +4249,10 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Delete one's own target with kind 5, or remove another account's whole
+    /// chat message and all revisions with admin-only kind 4891. A non-admin
+    /// targeting another account's known message receives an error before send.
+    /// Older clients may retain content removed by kind 4891.
     pub async fn delete_message(
         &mut self,
         group_id: &GroupId,

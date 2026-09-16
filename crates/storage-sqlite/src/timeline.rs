@@ -461,9 +461,9 @@ impl SqliteAccountStorage {
     }
 
     /// Like [`record_app_event`], but a conflicting row's `moderation_grant` is
-    /// replaced with this event's value instead of frozen. Used only by the
-    /// local sender's post-publish reconciling projection, where the grant
-    /// recomputed after group sync supersedes the optimistic pre-send one.
+    /// replaced with this event's value instead of frozen. Retained for callers
+    /// using the legacy optimistic-grant reconciliation API. Source-aware
+    /// callers should use [`Self::record_app_event_with_source`] instead.
     pub fn record_app_event_refreshing_moderation_grant(
         &self,
         event: &StoredAppEvent,
@@ -471,6 +471,8 @@ impl SqliteAccountStorage {
         self.record_app_event_inner(event, true, None, None)
     }
 
+    /// Legacy grant reconciliation with retention; see
+    /// [`Self::record_app_event_refreshing_moderation_grant`].
     pub fn record_app_event_refreshing_moderation_grant_with_retention(
         &self,
         event: &StoredAppEvent,
@@ -600,18 +602,38 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let expired_target = match event.kind {
                 MARMOT_APP_EVENT_KIND_CHAT => Some(event.message_id_hex.as_str()),
-                MARMOT_APP_EVENT_KIND_EDIT => tag_value(&event.tags,"e"),
+                MARMOT_APP_EVENT_KIND_EDIT => tag_value(&event.tags, "e"),
                 _ => None,
             };
-            if let Some(target) = expired_target && reports::target_expired(&conn,&event.group_id_hex,target)? {
-                return Ok(TimelineProjectionUpdate{group_id_hex:event.group_id_hex.clone(),messages:Vec::new(),changes:Vec::new()});
+            let is_expired = match expired_target {
+                Some(target) => reports::target_expired(&conn, &event.group_id_hex, target)?,
+                None => false,
+            };
+            if is_expired {
+                return Ok(TimelineProjectionUpdate {
+                    group_id_hex: event.group_id_hex.clone(),
+                    messages: Vec::new(),
+                    changes: Vec::new(),
+                });
             }
             let mut retained_event;
-            let event = if event.kind==MARMOT_APP_EVENT_KIND_REPORT && cgka_traits::reporting::parse_report(&event.tags,&event.plaintext).is_some() && reports::target_expired(&conn,&event.group_id_hex,tag_value(&event.tags,"e").unwrap_or_default())? {
-                conn.execute_cached("INSERT OR IGNORE INTO content_pruned_controls VALUES(?1,?2)",params![event.group_id_hex,event.message_id_hex]).storage()?;
-                retained_event=event.clone();retained_event.plaintext.clear();
+            let event = if event.kind == MARMOT_APP_EVENT_KIND_REPORT
+                && cgka_traits::reporting::parse_report(&event.tags, &event.plaintext).is_some()
+                && reports::target_expired(
+                    &conn, &event.group_id_hex,
+                    tag_value(&event.tags, "e").unwrap_or_default(),
+                )?
+            {
+                conn.execute_cached(
+                    "INSERT OR IGNORE INTO content_pruned_controls VALUES (?1, ?2)",
+                    params![event.group_id_hex, event.message_id_hex],
+                ).storage()?;
+                retained_event = event.clone();
+                retained_event.plaintext.clear();
                 &retained_event
-            } else {event};
+            } else {
+                event
+            };
             let new_affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
             // Upserting an existing app_event may change its kind/tags, so the
             // incremental path must reproject both the old projection dependents
@@ -651,9 +673,17 @@ impl SqliteAccountStorage {
                     source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
-                    plaintext = CASE WHEN EXISTS(SELECT 1 FROM content_pruned_controls p WHERE p.group_id_hex=app_events.group_id_hex AND p.message_id_hex=app_events.message_id_hex) THEN app_events.plaintext ELSE excluded.plaintext END,
+                    plaintext = CASE WHEN EXISTS (
+                        SELECT 1 FROM content_pruned_controls p
+                        WHERE p.group_id_hex = app_events.group_id_hex
+                          AND p.message_id_hex = app_events.message_id_hex
+                    ) THEN app_events.plaintext ELSE excluded.plaintext END,
                     kind = excluded.kind,
-                    tags_json = CASE WHEN EXISTS(SELECT 1 FROM content_pruned_controls p WHERE p.group_id_hex=app_events.group_id_hex AND p.message_id_hex=app_events.message_id_hex) THEN app_events.tags_json ELSE excluded.tags_json END,
+                    tags_json = CASE WHEN EXISTS (
+                        SELECT 1 FROM content_pruned_controls p
+                        WHERE p.group_id_hex = app_events.group_id_hex
+                          AND p.message_id_hex = app_events.message_id_hex
+                    ) THEN app_events.tags_json ELSE excluded.tags_json END,
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
@@ -706,9 +736,30 @@ impl SqliteAccountStorage {
             .storage()?;
             if let Some(authority) = authority {
                 if let Some(authority) = authority {
-                    conn.execute_cached("UPDATE app_events SET authority_state=2, authority_context=?3, moderation_grant=CASE WHEN kind=5 AND authority_state=0 THEN moderation_grant WHEN kind IN (1985,4891) THEN ?4 ELSE 0 END, reporting_allowed=?5 WHERE group_id_hex=?1 AND message_id_hex=?2 AND authority_state != 2",params![event.group_id_hex,event.message_id_hex,authority.source_context.as_slice(),authority.moderation_grant,authority.reporting_allowed]).storage()?;
+                    conn.execute_cached(
+                        "UPDATE app_events SET
+                            authority_state = 2,
+                            authority_context = ?3,
+                            moderation_grant = CASE
+                                WHEN kind = 5 AND authority_state = 0 THEN moderation_grant
+                                WHEN kind IN (1985, 4891) THEN ?4
+                                ELSE 0
+                            END,
+                            reporting_allowed = ?5
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND authority_state != 2",
+                        params![
+                            event.group_id_hex, event.message_id_hex,
+                            authority.source_context.as_slice(), authority.moderation_grant,
+                            authority.reporting_allowed,
+                        ],
+                    ).storage()?;
                 } else if existing_event.is_none() {
-                    conn.execute_cached("UPDATE app_events SET authority_state=1,moderation_grant=0,reporting_allowed=0 WHERE group_id_hex=?1 AND message_id_hex=?2",params![event.group_id_hex,event.message_id_hex]).storage()?;
+                    conn.execute_cached(
+                        "UPDATE app_events SET authority_state = 1, moderation_grant = 0,
+                                               reporting_allowed = 0
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                        params![event.group_id_hex, event.message_id_hex],
+                    ).storage()?;
                 }
             }
             reports::rescrub_control(&conn, &event.group_id_hex, &event.message_id_hex)?;
