@@ -318,6 +318,10 @@ pub struct NotificationUpdate {
     /// Preview of the reacted-to message (resolved via the `e` tag against the
     /// timeline). `None` for non-reactions, an unresolvable target, or a
     /// deleted/invalidated one — removed text must never reach the preview.
+    /// Group-system targets expose only supported parsed `text`; malformed,
+    /// oversized, unsupported-version and blank payloads produce `None`.
+    /// Synthesized system text is an English fallback, not a localization key:
+    /// this notification DTO does not carry the target's structured system event.
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
@@ -2096,6 +2100,9 @@ fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     } else if kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION {
         structured_agent_preview(plaintext, &["preview", "text", "status"])
     } else {
+        // Custom app kinds retain the existing raw-content fallback. A broader
+        // custom-kind preview policy is separate from decoding MDK-owned kinds;
+        // new structured kinds must not rely on this branch for JSON-safe text.
         Some(plaintext.to_owned())
     }
 }

@@ -3005,6 +3005,8 @@ async fn system_reactions_update_live_timeline_through_existing_commands() {
             .len(),
         1
     );
+    // Deliberately replay the same authenticated change. The snapshot and
+    // final history assertions below must still see exactly one original row.
     client.project_group_system_rows(&[event], 1);
     drop(client);
     let runtime = app.runtime();

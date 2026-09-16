@@ -54,8 +54,12 @@ Reaction notifications use the supported system payload's text fallback, never
 its JSON envelope. Only the stored target sender receives an alert; activity
 without an attributable actor does not invent a recipient. Deleted or invalidated
 targets and malformed or unsupported payloads expose no target preview.
-Clients continue to own localization and layout. This adds no binding fields or
-methods and requires no client-owned reaction map.
+For synthesized system rows, `reactedToPreview` is an English fallback. The
+notification DTO has neither the target ID nor a structured system event, so this
+field cannot support client localization; hosts can omit it and use their generic
+localized reaction notification. Conversation rows still expose `groupSystem` for
+client-localized rendering and layout. This adds no binding fields or methods and
+requires no client-owned reaction map.
 
 ## Identity references and profile pseudonyms
 
