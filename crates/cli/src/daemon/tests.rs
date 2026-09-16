@@ -1172,6 +1172,7 @@ fn daemon_test_cli(command: crate::Command) -> Cli {
 #[test]
 fn runtime_message_json_marks_account_label_sender_as_me() {
     let message = marmot_app::ReceivedMessage {
+        authority: None,
         message_id_hex: "01".to_owned(),
         source_message_id_hex: "source-01".to_owned(),
         sender: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -1432,6 +1433,7 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
 #[test]
 fn runtime_message_json_carries_named_peer_display_name() {
     let message = marmot_app::ReceivedMessage {
+        authority: None,
         message_id_hex: "02".to_owned(),
         source_message_id_hex: "source-02".to_owned(),
         sender: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
@@ -1471,6 +1473,7 @@ fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
     let source_recorded_at = 1_700_000_000;
     let source_received_at = 1_700_000_123;
     let message = marmot_app::ReceivedMessage {
+        authority: None,
         message_id_hex: "03".to_owned(),
         source_message_id_hex: "source-03".to_owned(),
         sender: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),

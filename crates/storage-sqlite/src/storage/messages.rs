@@ -12,6 +12,7 @@ use cgka_traits::message::{
 use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
 const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
@@ -535,6 +536,42 @@ impl MessageStorage for SqliteAccountStorage {
         let record = serialize(event)?;
         let write = || {
             let conn = self.lock()?;
+            if let GroupEvent::MessageReceived {
+                group_id,
+                message_id,
+                epoch,
+                sender,
+                payload,
+                authority,
+                retention,
+            } = event
+            {
+                if authority.is_none() {
+                    let request = cgka_traits::app_event::PendingAppMessageAuthority {
+                        group_id: group_id.clone(),
+                        message_id: message_id.clone(),
+                        epoch: *epoch,
+                        sender: sender.clone(),
+                        payload_digest: Sha256::digest(payload).into(),
+                        retention: *retention,
+                    };
+                    conn.execute_cached(
+                        "INSERT OR IGNORE INTO pending_application_authority VALUES(?1,?2,?3)",
+                        params![
+                            message_id.as_slice(),
+                            group_id.as_slice(),
+                            serialize(&request)?
+                        ],
+                    )
+                    .storage()?;
+                } else {
+                    conn.execute_cached(
+                        "DELETE FROM pending_application_authority WHERE message_id=?1",
+                        params![message_id.as_slice()],
+                    )
+                    .storage()?;
+                }
+            }
             let inserted = conn
                 .execute_cached(
                     "INSERT INTO pending_application_events (
@@ -558,6 +595,14 @@ impl MessageStorage for SqliteAccountStorage {
                     .storage()?;
                 return match existing {
                     Some(existing) if existing == record => Ok(()),
+                    Some(existing) if pending_authority_upgrade(&existing, event)? => {
+                        conn.execute_cached(
+                            "UPDATE pending_application_events SET record=?2 WHERE message_id=?1",
+                            params![message_id.as_slice(), record],
+                        )
+                        .storage()?;
+                        Ok(())
+                    }
                     Some(_) => Err(StorageError::Backend(
                         "pending application event id reused with different content".to_owned(),
                     )),
@@ -569,7 +614,7 @@ impl MessageStorage for SqliteAccountStorage {
         if self.connection.is_current_thread_transaction_owner() {
             write()
         } else {
-            retry_on_busy(write)
+            retry_on_busy(|| self.connection.with_transaction(write))
         }
     }
 
@@ -588,6 +633,24 @@ impl MessageStorage for SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         rows.iter().map(|event| deserialize(event)).collect()
+    }
+
+    fn pending_application_authority_batch(
+        &self,
+        after: Option<&MessageId>,
+        limit: usize,
+    ) -> StorageResult<Vec<cgka_traits::app_event::PendingAppMessageAuthority>> {
+        let conn = self.lock()?;
+        let mut stmt=conn.prepare_cached("SELECT record FROM pending_application_authority WHERE (?1 IS NULL OR message_id>?1) ORDER BY message_id LIMIT ?2").storage()?;
+        let rows = stmt
+            .query_map(
+                params![after.map(MessageId::as_slice), limit.min(100) as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.iter().map(|r| deserialize(r)).collect()
     }
 
     fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
@@ -1027,6 +1090,23 @@ fn put_processed_transport_id_on_connection(
         ));
     }
     Ok(())
+}
+
+fn pending_authority_upgrade(existing: &[u8], incoming: &GroupEvent) -> StorageResult<bool> {
+    let mut existing: GroupEvent = deserialize(existing)?;
+    if let (
+        GroupEvent::MessageReceived { authority: old, .. },
+        GroupEvent::MessageReceived {
+            authority: Some(new),
+            ..
+        },
+    ) = (&mut existing, incoming)
+        && old.is_none()
+    {
+        *old = Some(*new);
+        return Ok(&existing == incoming);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1500,6 +1580,7 @@ mod tests {
 
     fn application_event(message_id: cgka_traits::MessageId) -> GroupEvent {
         GroupEvent::MessageReceived {
+            authority: None,
             group_id: gid(1),
             message_id,
             sender: MemberId::new(vec![7; 32]),

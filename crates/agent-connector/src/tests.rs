@@ -305,6 +305,7 @@ fn received_message(
     tags: Vec<Vec<String>>,
 ) -> ReceivedMessage {
     ReceivedMessage {
+        authority: None,
         message_id_hex: "33".repeat(32),
         source_message_id_hex: "44".repeat(32),
         sender: "bb".repeat(32),

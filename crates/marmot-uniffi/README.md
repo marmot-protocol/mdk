@@ -414,3 +414,14 @@ for opening, paging, cancellation, timeout, ownership and draft migration.
 Apple exporters use resource-bearing static framework slices. See the
 [privacy audit and adoption guide](apple-privacy/README.md) for declarations,
 archive validation, host integration changes, and unresolved release questions.
+
+## Group reporting
+
+The generated Swift/Kotlin surface includes `report_message`, `dismiss_reports`,
+`reported_content`, `message_reports`, and `subscribe_reported_content`.
+`ReportReasonFfi` supplies the NIP-56 categories. Timeline records carry
+`revision_id_hex` and `moderation`; review detail records include the current
+message, reported revision, decision IDs and acting administrators. Hosts do not
+need to reconstruct reports from raw events. Page limits are 1–100; cursors are
+exclusive. The C ABI mirrors these operations and owns/deep-frees their returned
+pages through `marmot_reported_content_page_free` and `marmot_content_report_page_free`.

@@ -359,6 +359,8 @@ pub struct ConversationWindowSnapshotFfi {
 // Borrow raw rows so conversion never clones the full reactor/tag collections.
 fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
+        revision_id_hex: row.revision_id_hex.clone(),
+        moderation: row.moderation.clone().into(),
         message_id_hex: row.message_id_hex.clone(),
         source_message_id_hex: row.source_message_id_hex.clone(),
         source_epoch: row.source_epoch,
@@ -557,6 +559,8 @@ mod tests {
         .to_content()
         .unwrap();
         let mut record = app::TimelineMessageRecord {
+            revision_id_hex: String::new(),
+            moderation: marmot_app::MessageModerationSummary::default(),
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),

@@ -7696,3 +7696,6 @@ fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
         && !group.unrecoverable
         && matches!(group.self_membership, crate::SelfMembership::Member)
 }
+
+mod moderation;
+pub use moderation::RuntimeReportedContentSubscription;

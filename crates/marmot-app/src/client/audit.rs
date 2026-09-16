@@ -138,10 +138,13 @@ impl AppClient {
             AppMessageIntent::Unreact { .. } => ("unreact", None),
             AppMessageIntent::DeleteReactions { .. } => ("unreact", None),
             AppMessageIntent::Delete { .. } => ("delete_message", None),
+            AppMessageIntent::RemoveMessage { .. } => ("remove_message", None),
             AppMessageIntent::Media { attachments, .. } => {
                 ("send_media", Some(attachments.len() as u64))
             }
             AppMessageIntent::Custom { .. } => ("send_custom_event", None),
+            AppMessageIntent::Report { .. } => ("report_message", None),
+            AppMessageIntent::DismissReports { .. } => ("dismiss_reports", None),
             AppMessageIntent::StreamStart { .. }
             | AppMessageIntent::StreamFinal { .. }
             | AppMessageIntent::AgentActivity { .. }

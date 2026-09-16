@@ -19,6 +19,13 @@ fun main() {
     val value = AccountAttentionSnapshotFfi("summary", ULong.MAX_VALUE, states.map { AccountAttentionEntryFfi("account", it) })
     val copy = FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
     check(copy == value)
+    for (status in ModerationStatusFfi.entries) {
+        val page = ReportedContentPageFfi(listOf(ReportedContentFfi("message", "edit", MessageModerationSummaryFfi(status, 2uL, 1uL))), "cursor", 1uL)
+        check(FfiConverterTypeReportedContentPageFfi.lift(FfiConverterTypeReportedContentPageFfi.lower(page)) == page)
+    }
+    val report = ContentReportFfi("report", "message", "edit", "member", ReportReasonFfi.OTHER, "explanation", 42uL, "decision", "admin", null, null)
+    val reports = ContentReportPageFfi("delete", "admin", 1uL, null, listOf(report), null)
+    check(FfiConverterTypeContentReportPageFfi.lift(FfiConverterTypeContentReportPageFfi.lower(reports)) == reports)
     conversationRoundTrips()
     println("Kotlin C4/C5 projection round trips passed")
 }
@@ -85,4 +92,11 @@ suspend fun compileBlockCommands(marmot: Marmot, account: String, user: String) 
     marmot.getBlockedUsers(account)
     marmot.isUserBlocked(account, user)
     marmot.subscribeBlockedUsers(account).use { sub -> sub.snapshot(); sub.next() }
+}
+
+suspend fun compileModerationCommands(marmot: Marmot, account: String, group: String) {
+    marmot.reportMessage(account, group, "message", "revision", ReportReasonFfi.SPAM, "")
+    marmot.dismissReports(account, group, listOf("report"))
+    marmot.messageReports(account, group, "message", null, 50u)
+    marmot.subscribeReportedContent(account, group, true, 50u).use { queue -> queue.snapshot(); queue.next() }
 }

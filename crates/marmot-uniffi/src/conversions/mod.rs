@@ -494,6 +494,8 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_preserves_materialized_metadata() {
         let record = TimelineMessageRecord {
+            revision_id_hex: String::new(),
+            moderation: marmot_app::MessageModerationSummary::default(),
             message_id_hex: "message-1".to_owned(),
             source_message_id_hex: Some("source-1".to_owned()),
             source_epoch: Some(7),
@@ -617,6 +619,8 @@ mod tests {
         .to_content()
         .unwrap();
         let record = TimelineMessageRecord {
+            revision_id_hex: String::new(),
+            moderation: marmot_app::MessageModerationSummary::default(),
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
@@ -663,6 +667,8 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
         let record = TimelineMessageRecord {
+            revision_id_hex: String::new(),
+            moderation: marmot_app::MessageModerationSummary::default(),
             message_id_hex: "system-bad".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),

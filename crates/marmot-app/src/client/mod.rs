@@ -3544,6 +3544,9 @@ impl AppClient {
     {
         use crate::{ProductFamily as Family, ProductUnit};
         let (family, operation) = match &intent {
+            AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
+                (Family::MessageAction, "custom")
+            }
             AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
@@ -3551,7 +3554,9 @@ impl AppClient {
                 (Family::MessageAction, "unreact")
             }
             AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
-            AppMessageIntent::Delete { .. } => (Family::MessageAction, "delete"),
+            AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
+                (Family::MessageAction, "delete")
+            }
             AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
             AppMessageIntent::PushTokenUpdate { .. } => (Family::Notification, "update"),
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
@@ -3610,6 +3615,114 @@ impl AppClient {
         // kind-5 delete. Resolve every matching active own reaction from the
         // projection and place all ids in one tombstone so remove-all is atomic.
         let intent = match intent {
+            AppMessageIntent::Report {
+                target_message_id,
+                revision_id,
+                reason,
+                explanation,
+                ..
+            } => {
+                let group = self.runtime.group_record(group_id)?;
+                if group.members.len() == 2 && group.name.trim().is_empty() {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "reporting is unavailable in direct conversations".into(),
+                    ));
+                }
+                let storage = self.app.account_storage(&self.state.label)?;
+                let group_hex = hex::encode(group_id.as_slice());
+                if let Some(id) =
+                    storage.own_report(&group_hex, &target_message_id, &revision_id, &sender)?
+                    && let Some(existing) = storage.app_message(&group_hex, &id)?
+                {
+                    let event = MarmotInnerEvent::new(
+                        existing.sender,
+                        existing.recorded_at,
+                        existing.kind,
+                        existing.tags,
+                        existing.plaintext,
+                    );
+                    return Ok((
+                        event,
+                        SendSummary {
+                            published: 0,
+                            message_ids: vec![id],
+                            accept_disposition: if existing.retention.is_some() {
+                                cgka_traits::SendAcceptDisposition::Published
+                            } else {
+                                cgka_traits::SendAcceptDisposition::AcceptedPending
+                            },
+                            maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
+                        },
+                    ));
+                }
+                let author = storage
+                    .report_target_author(&group_hex, &target_message_id, &revision_id)?
+                    .ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload(
+                            "report target revision is unavailable".into(),
+                        )
+                    })?;
+                AppMessageIntent::Report {
+                    target_message_id,
+                    revision_id,
+                    reason,
+                    explanation,
+                    target_author: Some(author),
+                }
+            }
+            AppMessageIntent::DismissReports { ref report_ids } => {
+                if !self.delete_moderation_grant(group_id, &sender) {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "group admin authority required".into(),
+                    ));
+                }
+                let storage = self.app.account_storage(&self.state.label)?;
+                for id in report_ids {
+                    if !storage.report_is_reviewable(&hex::encode(group_id.as_slice()), id)? {
+                        return Err(AppError::InvalidAppMessagePayload(
+                            "report is unavailable in this group".into(),
+                        ));
+                    }
+                }
+                intent
+            }
+            AppMessageIntent::Delete { target_message_id } => {
+                let storage = self.app.account_storage(&self.state.label)?;
+                if let Some(target) =
+                    storage.app_message(&hex::encode(group_id.as_slice()), &target_message_id)?
+                    && target.sender != sender
+                {
+                    if !self.delete_moderation_grant(group_id, &sender)
+                        || target.kind != cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                    {
+                        return Err(AppError::InvalidAppMessagePayload(
+                            "group admin authority and a chat message target are required".into(),
+                        ));
+                    }
+                    AppMessageIntent::RemoveMessage { target_message_id }
+                } else {
+                    AppMessageIntent::Delete { target_message_id }
+                }
+            }
+            AppMessageIntent::RemoveMessage {
+                ref target_message_id,
+            } => {
+                let storage = self.app.account_storage(&self.state.label)?;
+                if !self.delete_moderation_grant(group_id, &sender)
+                    || storage
+                        .report_target_author(
+                            &hex::encode(group_id.as_slice()),
+                            target_message_id,
+                            target_message_id,
+                        )?
+                        .is_none()
+                {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "group admin authority and a chat message target are required".into(),
+                    ));
+                }
+                intent
+            }
             AppMessageIntent::Unreact {
                 target_message_id,
                 emoji,
@@ -3774,8 +3887,13 @@ impl AppClient {
         });
         let source_message_id_hex =
             published.map(|published| hex::encode(published.message_id.as_slice()));
-        let source_state =
-            published.map(|published| (published.source_epoch.0, published.retention));
+        let source_state = published.map(|published| {
+            (
+                published.source_epoch.0,
+                published.retention,
+                published.authority,
+            )
+        });
         if should_project_locally {
             let projection = (|| {
                 let update = self.record_local_app_event_projection(
@@ -4090,6 +4208,39 @@ impl AppClient {
                     emoji: emoji.map(str::to_owned),
                 },
             )
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn report_message(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &str,
+        revision_id: &str,
+        reason: crate::ReportReason,
+        explanation: &str,
+    ) -> Result<SendSummary, AppError> {
+        let (_, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Report {
+                    target_message_id: message_id.into(),
+                    revision_id: revision_id.into(),
+                    reason,
+                    explanation: explanation.into(),
+                    target_author: None,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+    pub async fn dismiss_reports(
+        &mut self,
+        group_id: &GroupId,
+        report_ids: Vec<String>,
+    ) -> Result<SendSummary, AppError> {
+        let (_, summary) = self
+            .send_app_event(group_id, AppMessageIntent::DismissReports { report_ids })
             .await?;
         Ok(summary)
     }

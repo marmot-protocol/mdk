@@ -14,6 +14,8 @@ fn take_snapshot_recovers_from_poisoned_lock() {
 
 fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        revision_id_hex: String::new(),
+        moderation: marmot_app::MessageModerationSummary::default(),
         message_id_hex: id.to_string(),
         source_message_id_hex: None,
         source_epoch: None,

@@ -234,6 +234,8 @@ mod tests {
 
     fn record() -> TimelineMessageRecord {
         TimelineMessageRecord {
+            revision_id_hex: String::new(),
+            moderation: marmot_app::MessageModerationSummary::default(),
             message_id_hex: "11".repeat(32),
             source_message_id_hex: Some("22".repeat(32)),
             source_epoch: Some(7),

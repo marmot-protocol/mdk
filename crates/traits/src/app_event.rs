@@ -44,6 +44,30 @@ impl AppMessageRetentionDecision {
 
 /// Nostr `kind` values used as Marmot inner app events.
 pub const MARMOT_APP_EVENT_KIND_DELETE: u64 = 5;
+pub const MARMOT_APP_EVENT_KIND_REPORT: u64 = 1984;
+/// NIP-32 labels dismissing content reports in the Marmot review namespace.
+pub const MARMOT_APP_EVENT_KIND_REVIEW: u64 = 1985;
+/// Admin removal; 1984 (reporting) with its digits reversed.
+pub const MARMOT_APP_EVENT_KIND_REMOVE: u64 = 4891;
+
+/// Locally derived evidence, never accepted from inner event tags. The digest
+/// binds this verdict to an authenticated MLS state, not just an epoch number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppMessageAuthority {
+    pub source_context: [u8; 32],
+    pub moderation_grant: bool,
+    pub reporting_allowed: bool,
+}
+/// Minimal durable retry evidence: no report explanation or target plaintext.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAppMessageAuthority {
+    pub group_id: crate::GroupId,
+    pub message_id: crate::MessageId,
+    pub epoch: crate::EpochId,
+    pub sender: crate::MemberId,
+    pub payload_digest: [u8; 32],
+    pub retention: Option<AppMessageRetentionDecision>,
+}
 pub const MARMOT_APP_EVENT_KIND_REACTION: u64 = 7;
 pub const MARMOT_APP_EVENT_KIND_CHAT: u64 = 9;
 /// An edit of a prior message. Carries a single `e` tag referencing the edited

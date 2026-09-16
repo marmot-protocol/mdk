@@ -2585,6 +2585,7 @@ where
                     app_event_id,
                     source_epoch,
                     retention,
+                    authority,
                 } => {
                     let status = Box::pin(self.publish_one(
                         msg,
@@ -2594,6 +2595,7 @@ where
                             app_event_id,
                             source_epoch,
                             retention,
+                            authority,
                         }),
                         output,
                         queue,
@@ -4534,6 +4536,7 @@ fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut Acc
             message_id,
             source_epoch: application.source_epoch,
             retention: application.retention,
+            authority: application.authority,
         });
 }
 
@@ -4863,6 +4866,7 @@ pub struct PublishedApplicationMessage {
     pub message_id: cgka_traits::MessageId,
     pub source_epoch: EpochId,
     pub retention: cgka_traits::app_event::AppMessageRetentionDecision,
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5030,6 +5034,7 @@ mod tests {
 
     fn published_message(id: u8) -> PublishedApplicationMessage {
         PublishedApplicationMessage {
+            authority: None,
             group_id: GroupId::new(vec![id]),
             app_event_id: format!("event-{id}"),
             message_id: cgka_traits::MessageId::new(vec![id]),

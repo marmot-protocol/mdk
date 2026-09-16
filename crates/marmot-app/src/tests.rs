@@ -2791,6 +2791,7 @@ fn recovery_warning_requires_confirmed_replays_and_survives_local_commits_and_re
         effects
             .events
             .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                authority: None,
                 group_id: group_id.clone(),
                 message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
                 sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
@@ -11215,6 +11216,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
             .is_none()
     );
     app.remember_directory_message_sender(&ReceivedMessage {
+        authority: None,
         message_id_hex: "message-id".to_owned(),
         source_message_id_hex: "source-message-id".to_owned(),
         sender: sender.clone(),
@@ -11824,6 +11826,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
         .unwrap();
     legacy
         .record_message(&AppMessageProjection {
+            authority: None,
             message_id_hex: "legacy-message".to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),
@@ -11891,6 +11894,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
 
     legacy
         .record_message(&AppMessageProjection {
+            authority: None,
             message_id_hex: "post-marker".to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),
@@ -12291,6 +12295,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     };
 
     let message = |content: String, sender: &str| ReceivedMessage {
+        authority: None,
         message_id_hex: "11".repeat(32),
         source_message_id_hex: "22".repeat(32),
         sender: sender.to_owned(),
@@ -13260,6 +13265,9 @@ fn custom_intent_rejects_every_reserved_kind() {
         kinds::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
         kinds::MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
         kinds::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        kinds::MARMOT_APP_EVENT_KIND_REPORT,
+        kinds::MARMOT_APP_EVENT_KIND_REVIEW,
+        kinds::MARMOT_APP_EVENT_KIND_REMOVE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
@@ -13662,6 +13670,7 @@ fn source_epoch_retention_is_app_visible_and_returns_media_hashes_when_expired()
     app.record_account_app_event_at(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "old-aa".to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),
@@ -13748,6 +13757,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     let losing_commit_id = cgka_traits::types::MessageId::new(vec![0xBE; 32]);
     let system_row =
         |message_id_hex: &str, origin_commit_id: Option<String>| AppMessageProjection {
+            authority: None,
             message_id_hex: message_id_hex.to_owned(),
             // Synthesized system rows carry no source id (see
             // build_group_system_projection); origin_commit_id is the 1:N link.
@@ -13877,6 +13887,7 @@ fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
     let parked_commit_id = cgka_traits::types::MessageId::new(vec![0xBE; 32]);
     let parked_commit_hex = hex::encode(parked_commit_id.as_slice());
     let system_row = |message_id_hex: &str, origin_commit_id: String| AppMessageProjection {
+        authority: None,
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         direction: "system".to_owned(),
@@ -14025,6 +14036,7 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
 
     let sent = |message_id_hex: &str, source_message_id_hex: Option<String>, recorded_at: u64| {
         AppMessageProjection {
+            authority: None,
             message_id_hex: message_id_hex.to_owned(),
             source_message_id_hex,
             direction: "sent".to_owned(),
@@ -14126,6 +14138,7 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "held".to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -14302,6 +14315,7 @@ async fn an_open_heals_a_held_send_from_an_already_announced_guard() {
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "held".to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -14854,6 +14868,7 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "losing-branch-row".to_owned(),
             source_message_id_hex: Some(source_message_id_hex),
             direction: "received".to_owned(),
@@ -15186,6 +15201,7 @@ async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
             Some((
                 7,
                 crate::AppMessageRetentionDecision::new(1_700_000_000, 300),
+                None,
             )),
             true,
         )
@@ -16597,6 +16613,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
     assert!(fresh.failures.is_empty());
     let effects = marmot_account::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender).unwrap()),
@@ -16704,6 +16721,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         assert!(fresh.failures.is_empty());
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         let historical_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
             group_id: group_id.clone(),
             message_id: historical.reports[0].message_id.clone(),
             sender: sender.clone(),
@@ -16712,6 +16730,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             retention: None,
         };
         let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender,
@@ -16787,6 +16806,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     assert!(fresh.failures.is_empty());
     let message_id = fresh.reports[0].message_id.clone();
     let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        authority: None,
         group_id: group_id.clone(),
         message_id: message_id.clone(),
         sender,
@@ -16869,6 +16889,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
     assert!(fresh.failures.is_empty());
     let message_id = fresh.reports[0].message_id.clone();
     let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        authority: None,
         group_id: group_id.clone(),
         message_id,
         sender,
@@ -17419,6 +17440,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: app_event_id.to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -17438,6 +17460,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: failed_app_event_id.to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -17460,6 +17483,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let retention = AppMessageRetentionDecision::new(10, 0);
     let effects = marmot_account::AccountDeviceEffects {
         published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+            authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
             message_id: published_message_id.clone(),

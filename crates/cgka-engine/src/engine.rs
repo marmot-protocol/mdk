@@ -153,6 +153,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) pending_origin_commits: HashMap<PendingStateRef, MessageId>,
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
+    pub(crate) authority_recovery_cursor: Option<MessageId>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
     /// Standalone proposal messages produced by engine-maintained lifecycle
     /// work. Unlike `auto_publish_buf`, these do not have a pending commit ref.
@@ -568,6 +569,19 @@ impl<S: StorageProvider> EngineBuilder<S> {
         .map_err(EngineError::Other)?;
 
         let pending_application_events = self.storage.list_pending_application_events()?;
+        // Upgrade pending outputs from older databases onto the minimal
+        // authority-retry rail before the app acknowledges their plaintext.
+        for event in &pending_application_events {
+            if matches!(
+                event,
+                GroupEvent::MessageReceived {
+                    authority: None,
+                    ..
+                }
+            ) {
+                self.storage.put_pending_application_event(event)?;
+            }
+        }
 
         #[cfg(feature = "test-policy-overrides")]
         let (
@@ -606,6 +620,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             mls_group_cache: crate::mls_group_cache::MlsGroupCache::default(),
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
+            authority_recovery_cursor: None,
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
             valid_proposal_groups: HashSet::new(),
@@ -3223,6 +3238,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {
+        if self.recover_pending_application_authority().is_err() {
+            tracing::warn!(target: "cgka_engine::engine", method="drain_events", "source authority recovery deferred");
+        }
         self.events_buf.drain(..).collect()
     }
 

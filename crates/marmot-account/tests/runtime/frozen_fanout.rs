@@ -273,6 +273,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
     .unwrap();
     fanout
         .set_application_message(OutboundApplicationMessage {
+ authority: None,
             group_id: group_id.clone(),
             app_event_id: "terminal-app-event".into(),
             source_epoch: EpochId(1),

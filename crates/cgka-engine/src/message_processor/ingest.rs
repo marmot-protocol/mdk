@@ -1372,12 +1372,25 @@ impl<S: StorageProvider> Engine<S> {
                             .map(|seconds| seconds.unwrap_or(0)),
                     }
                 };
+                let authority = if msg_epoch == current_epoch {
+                    Some(crate::app_payload::source_authority(&mls_group, &sender)?)
+                } else {
+                    crate::app_payload::historical_authority(
+                        &self.storage,
+                        &group_id,
+                        msg_epoch,
+                        &sender,
+                        &openmls_msg.payload,
+                        &payload,
+                    )?
+                };
                 let event = GroupEvent::MessageReceived {
                     group_id: group_id.clone(),
                     message_id: msg.id.clone(),
                     sender,
                     epoch: msg_epoch,
                     payload,
+                    authority,
                     retention: retention_seconds.map(|seconds| {
                         AppMessageRetentionDecision::new(app_event.created_at, seconds)
                     }),

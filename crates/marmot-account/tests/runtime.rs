@@ -3845,6 +3845,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         "test adapter must exercise transport id replacement"
     );
     let expected_publication = PublishedApplicationMessage {
+        authority: None,
         group_id: group_id.clone(),
         app_event_id: app_event_id.clone(),
         message_id: reported_message_id,

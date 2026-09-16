@@ -62,6 +62,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
+            authority: None,
             group_id: created.group_id,
             message_id: message_id.clone(),
             epoch: EpochId(1),
@@ -175,6 +176,7 @@ async fn group_delivery_requires_synced_group_subscription() {
     assert_eq!(
         after_sync.effects.events,
         vec![GroupEvent::MessageReceived {
+            authority: None,
             group_id: created.group_id,
             message_id: message_id.clone(),
             epoch: EpochId(1),

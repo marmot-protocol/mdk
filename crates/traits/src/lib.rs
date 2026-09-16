@@ -128,3 +128,5 @@ pub use welcome::PendingWelcome;
 const _: fn(Box<dyn CgkaEngine + Send + Sync>) = |_| {};
 const _: fn(Box<dyn TransportPeeler + Send + Sync>) = |_| {};
 const _: fn(Box<dyn TransportAdapter + Send + Sync>) = |_| {};
+
+pub mod reporting;

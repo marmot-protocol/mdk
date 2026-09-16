@@ -7723,11 +7723,17 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .unwrap_err();
     assert!(empty_reaction.to_string().contains("non-empty emoji"));
 
-    bob.delete_message(&group_id, &target_message_id)
+    assert!(
+        bob.delete_message(&group_id, &target_message_id)
+            .await
+            .is_err()
+    );
+    alice
+        .delete_message(&group_id, &target_message_id)
         .await
         .unwrap();
-    let deletion = alice.sync().await.unwrap();
-    // A delete is a kind-5 tombstone with empty content and an `e` tag.
+    let deletion = bob.sync().await.unwrap();
+    // Author self-retraction remains a kind-5 tombstone with an `e` tag.
     assert_eq!(deletion.messages[0].plaintext, "");
     assert_eq!(deletion.messages[0].kind, MARMOT_APP_EVENT_KIND_DELETE);
     assert_eq!(
@@ -14446,4 +14452,364 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
             .is_some()
     );
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn encrypted_content_reports_share_review_without_chat_rows() {
+    use marmot_app::{ModerationStatus, ReportReason};
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice.create_group("review room", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+    let sent = bob.send(&group, b"content under review").await.unwrap();
+    let target = &sent.message_ids[0];
+    alice.sync().await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let before = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .len();
+    let report = bob
+        .report_message(&group, target, target, ReportReason::Spam, "")
+        .await
+        .unwrap();
+    let retry = bob
+        .report_message(
+            &group,
+            target,
+            target,
+            ReportReason::Other,
+            "different details",
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.message_ids, retry.message_ids);
+    alice.sync().await.unwrap();
+    assert_eq!(
+        runtime
+            .reported_content("alice", &group, true, None, 10)
+            .unwrap()
+            .pending_message_count,
+        1
+    );
+    assert_eq!(
+        app.timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .messages
+        .len(),
+        before
+    );
+    assert!(
+        bob.dismiss_reports(&group, report.message_ids.clone())
+            .await
+            .is_err()
+    );
+    let dismissal = alice
+        .dismiss_reports(&group, report.message_ids.clone())
+        .await
+        .unwrap();
+    let label = app
+        .message_by_id("alice", &group_hex, &dismissal.message_ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(label.kind, 1985);
+    assert_eq!(
+        cgka_traits::reporting::parse_dismissal(&label.tags, &label.plaintext),
+        Some(report.message_ids.clone())
+    );
+    bob.sync().await.unwrap();
+
+    assert_eq!(
+        runtime
+            .reported_content("bob", &group, false, None, 10)
+            .unwrap()
+            .items[0]
+            .moderation
+            .status,
+        ModerationStatus::Reviewed
+    );
+    let removed = alice.delete_message(&group, target).await.unwrap();
+    let removal = app
+        .message_by_id("alice", &group_hex, &removed.message_ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(removal.kind, 4891);
+    assert_eq!(
+        cgka_traits::reporting::parse_removal(&removal.tags, &removal.plaintext).as_deref(),
+        Some(target.as_str())
+    );
+    bob.sync().await.unwrap();
+    let after_removal = bob
+        .report_message(&group, target, target, ReportReason::Spam, "")
+        .await
+        .unwrap();
+    assert_eq!(after_removal.message_ids, report.message_ids);
+    for label in ["alice", "bob"] {
+        let details = runtime
+            .message_reports(label, &group, target, None, 10)
+            .unwrap();
+        assert!(details.current_message.unwrap().plaintext.is_empty());
+        assert!(details.reports[0].reported_revision.is_none());
+        assert_eq!(
+            runtime
+                .reported_content(label, &group, false, None, 10)
+                .unwrap()
+                .items[0]
+                .moderation
+                .status,
+            ModerationStatus::Removed
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_report_queue_updates_without_unread_or_activity_changes() {
+    use marmot_app::ReportReason;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
+    let a = alice.account.account_id_hex;
+    let b = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(&a, "reports", std::slice::from_ref(&b), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::GroupJoined{account_id_hex,group_id,..} if account_id_hex==&b && group_id==&group)).await;
+    accept_group_invite_retrying_busy(&runtime, &b, &group)
+        .await
+        .unwrap();
+    let sent = runtime
+        .send_message(&b, &group, b"review this".to_vec())
+        .await
+        .unwrap();
+    let target = &sent.message_ids[0];
+    wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::MessageReceived(m) if m.account_id_hex==a && m.message.message_id_hex==*target)).await;
+    let group_hex = hex::encode(group.as_slice());
+    let before = runtime.chat_list_row(&a, &group_hex).unwrap().unwrap();
+    let mut queue = runtime
+        .subscribe_reported_content(&a, &group, true, 10)
+        .await
+        .unwrap();
+    assert_eq!(queue.snapshot.pending_message_count, 0);
+    let report = runtime
+        .report_message(&b, &group, target, target, ReportReason::Spam, "")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let page = queue.recv().await.unwrap();
+            if page.pending_message_count == 1 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let after = runtime.chat_list_row(&a, &group_hex).unwrap().unwrap();
+    assert_eq!(before.unread_count, after.unread_count);
+    assert_eq!(before.activity_sort_at, after.activity_sort_at);
+    assert_eq!(before.last_message, after.last_message);
+    runtime
+        .dismiss_reports(&a, &group, report.message_ids)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let page = queue.recv().await.unwrap();
+            if page.pending_message_count == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn offline_member_recovers_shared_review_after_admin_demotion() {
+    use marmot_app::{ModerationStatus, ReportReason};
+    let (_relay, url) = mock_relay().await;
+    let dirs = [
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    ];
+    let apps: Vec<_> = dirs
+        .iter()
+        .map(|dir| {
+            MarmotApp::with_relay_and_config(
+                dir.path(),
+                url.clone(),
+                MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            )
+        })
+        .collect();
+    let alice = MarmotAppRuntime::new(apps[0].clone());
+    let bob = MarmotAppRuntime::new(apps[1].clone());
+    let carol = MarmotAppRuntime::new(apps[2].clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let a = create_network_ready_identity(&alice, setup())
+        .await
+        .account
+        .account_id_hex;
+    let b = create_network_ready_identity(&bob, setup())
+        .await
+        .account
+        .account_id_hex;
+    let c = create_network_ready_identity(&carol, setup())
+        .await
+        .account
+        .account_id_hex;
+    let mut bob_events = bob.subscribe();
+    let mut carol_events = carol.subscribe();
+    let group = alice
+        .create_group(&a, "review room", &[b.clone(), c.clone()], None)
+        .await
+        .unwrap();
+    wait_for_event(
+        &mut bob_events,
+        |event| matches!(event,MarmotAppEvent::GroupJoined{group_id,..} if group_id==&group),
+    )
+    .await;
+    wait_for_event(
+        &mut carol_events,
+        |event| matches!(event,MarmotAppEvent::GroupJoined{group_id,..} if group_id==&group),
+    )
+    .await;
+    accept_group_invite_retrying_busy(&bob, &b, &group)
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&carol, &c, &group)
+        .await
+        .unwrap();
+    carol.shutdown_and_close().await.unwrap();
+    drop(carol);
+    alice.promote_admin(&a, &group, &b).await.unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if bob.group_mls_state(&b, &group).await.unwrap().epoch >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let sent = bob
+        .send_message(&b, &group, b"reported while carol is offline".to_vec())
+        .await
+        .unwrap();
+    let target = &sent.message_ids[0];
+    let report = bob
+        .report_message(&b, &group, target, target, ReportReason::Spam, "")
+        .await
+        .unwrap();
+    bob.dismiss_reports(&b, &group, report.message_ids)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if alice
+                .reported_content(&a, &group, false, None, 10)
+                .unwrap()
+                .items
+                .first()
+                .is_some_and(|i| i.moderation.status == ModerationStatus::Reviewed)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    alice.demote_admin(&a, &group, &b).await.unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if bob.group_mls_state(&b, &group).await.unwrap().epoch >= 3 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let reopened_carol_app = MarmotApp::with_relay_and_config(
+        dirs[2].path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let carol = MarmotAppRuntime::new(reopened_carol_app.clone());
+    carol.reconcile_accounts().await.unwrap();
+    let recovered = timeout(Duration::from_secs(30), async {
+        loop {
+            if carol
+                .reported_content(&c, &group, false, None, 10)
+                .unwrap()
+                .items
+                .first()
+                .is_some_and(|i| i.moderation.status == ModerationStatus::Reviewed)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "offline state: epoch={:?}, queue={:?}, records={:?}",
+        carol.group_mls_state(&c, &group).await.map(|s| s.epoch),
+        carol.reported_content(&c, &group, false, None, 10),
+        reopened_carol_app.messages(&c).map(|messages| messages
+            .into_iter()
+            .map(|m| (m.kind, m.source_epoch, m.invalidated, m.moderation_grant))
+            .collect::<Vec<_>>())
+    );
+    for (runtime, account) in [(&alice, &a), (&bob, &b), (&carol, &c)] {
+        let page = runtime
+            .reported_content(account, &group, false, None, 10)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].moderation.status, ModerationStatus::Reviewed);
+        assert_eq!(page.pending_message_count, 0);
+    }
+    alice.shutdown().await;
+    bob.shutdown().await;
+    carol.shutdown().await;
 }

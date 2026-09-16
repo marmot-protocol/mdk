@@ -410,6 +410,13 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
+            authority: match &sent.publish[0] {
+                PublishWork::ApplicationMessage { authority, .. } => {
+                    assert!(authority.is_some());
+                    *authority
+                }
+                _ => unreachable!(),
+            },
             group_id: created.group_id.clone(),
             message_id,
             epoch: EpochId(1),
@@ -492,6 +499,13 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
+            authority: match &sent.publish[0] {
+                PublishWork::ApplicationMessage { authority, .. } => {
+                    assert!(authority.is_some());
+                    *authority
+                }
+                _ => unreachable!(),
+            },
             group_id: created.group_id,
             message_id,
             epoch: EpochId(1),
@@ -557,6 +571,13 @@ async fn reopened_creator_can_send_valid_group_messages() {
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
+            authority: match &sent.publish[0] {
+                PublishWork::ApplicationMessage { authority, .. } => {
+                    assert!(authority.is_some());
+                    *authority
+                }
+                _ => unreachable!(),
+            },
             group_id: created.group_id,
             message_id,
             epoch: EpochId(1),

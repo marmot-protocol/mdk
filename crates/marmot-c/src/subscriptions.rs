@@ -1377,3 +1377,75 @@ pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
         }
     })
 }
+
+use crate::types::moderation::MarmotReportedContentPage;
+use marmot_uniffi::ReportedContentSubscription;
+// The page exclusively owns every allocation moved into a callback task.
+unsafe impl Send for MarmotReportedContentPage {}
+c_subscription! {
+    MarmotReportedContentSubscription(ReportedContentSubscription),
+    item MarmotReportedContentPage from marmot_uniffi::ReportedContentPageFfi,
+    item_free "marmot_reported_content_page_free",
+    callback MarmotReportedContentCallback,
+    read next,
+    next marmot_reported_content_subscription_next,
+    set_callback marmot_reported_content_subscription_set_callback,
+    clear_callback marmot_reported_content_subscription_clear_callback,
+    free marmot_reported_content_subscription_free
+}
+/// Subscribe to a bounded live reported-content queue.
+/// # Safety
+/// Client, strings and output pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_subscribe_reported_content(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    pending_only: u8,
+    limit: u32,
+    out_sub: *mut *mut MarmotReportedContentSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        match client.block_on(client.marmot.subscribe_reported_content(
+            account,
+            group,
+            crate::memory::c_bool(pending_only),
+            limit,
+        )) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotReportedContentSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
+}
+/// Take the initial snapshot once; subsequent calls return NULL.
+/// # Safety
+/// Subscription and output pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_reported_content_subscription_snapshot(
+    sub: *const MarmotReportedContentSubscription,
+    out: *mut *mut MarmotReportedContentPage,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let value = sub.inner.snapshot().map_or(std::ptr::null_mut(), |v| {
+            boxed(MarmotReportedContentPage::from(v))
+        });
+        match unsafe { write_out(out, value) } {
+            Ok(()) => MarmotStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}

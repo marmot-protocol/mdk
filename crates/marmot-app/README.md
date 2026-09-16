@@ -236,3 +236,20 @@ allow an old relay delivery to create an invitation after unblocking.
 
 Native screens and imports of old White Noise local databases are outside this
 feature. Existing published lists migrate through relay synchronization.
+
+## Group reports and shared review
+
+Reports use kind 1984; shared dismissals label report events with NIP-32 kind
+1985. Admin removals use Marmot kind 4891, while kind 5 remains author deletion.
+
+`report_message` reports a whole message at an explicit original/edit revision
+with a NIP-56 reason and optional explanation (`other` requires one).
+`dismiss_reports` shares an admin's decision for selected report IDs; the existing
+`delete_message` removes all revisions. Reports and reviews use encrypted group
+messages and do not add chat rows, unread activity, or report notifications.
+
+`reported_content`, `message_reports`, and `subscribe_reported_content` expose
+bounded review pages, pending-message counts, reported/current content and shared
+resolution metadata. Personal blocking does not hide these review details.
+See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md)
+for source-state authorization, durable recovery, retention, and rollout order.

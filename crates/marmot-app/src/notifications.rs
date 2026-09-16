@@ -1521,6 +1521,7 @@ pub(crate) fn recover_notification_updates(
                     account_id_hex: account.account_id_hex.clone(),
                     account_label: account.label.clone(),
                     message: ReceivedMessage {
+                        authority: None,
                         message_id_hex: record.message_id_hex,
                         source_message_id_hex: String::new(),
                         sender: record.sender,

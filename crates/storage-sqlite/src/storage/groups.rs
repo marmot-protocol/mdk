@@ -198,6 +198,11 @@ pub(crate) fn delete_group_tx(
         )
         .storage()?;
     tx.execute_cached(
+        "DELETE FROM pending_application_authority WHERE group_id=?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    tx.execute_cached(
         "DELETE FROM pending_application_events WHERE group_id = ?1",
         params![id.as_slice()],
     )
@@ -507,6 +512,7 @@ mod tests {
         store.put_message(&message).unwrap();
         store
             .put_pending_application_event(&GroupEvent::MessageReceived {
+                authority: None,
                 group_id: group.id.clone(),
                 message_id: message.id.clone(),
                 sender: MemberId::new(vec![7; 32]),
@@ -563,6 +569,7 @@ mod tests {
             .unwrap();
         store
             .put_pending_application_event(&GroupEvent::MessageReceived {
+                authority: None,
                 group_id: group.id.clone(),
                 message_id: mid(1),
                 sender: MemberId::new(vec![7; 32]),

@@ -479,6 +479,14 @@ impl MessageStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
         self.inner.list_pending_application_events()
     }
+    fn pending_application_authority_batch(
+        &self,
+        after: Option<&MessageId>,
+        limit: usize,
+    ) -> StorageResult<Vec<cgka_traits::app_event::PendingAppMessageAuthority>> {
+        self.inner.pending_application_authority_batch(after, limit)
+    }
+
     fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
         self.inner.delete_pending_application_events(ids)
     }

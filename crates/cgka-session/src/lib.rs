@@ -258,6 +258,7 @@ pub enum PublishWork {
         app_event_id: String,
         source_epoch: EpochId,
         retention: cgka_traits::app_event::AppMessageRetentionDecision,
+        authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     },
     Proposal {
         msg: TransportMessage,
@@ -1426,6 +1427,7 @@ impl AccountDeviceSession {
                     app_event_id,
                     source_epoch,
                     retention,
+                    authority,
                 } => {
                     let queued_intent = self
                         .engine
@@ -1441,6 +1443,7 @@ impl AccountDeviceSession {
                         app_event_id,
                         source_epoch,
                         retention,
+                        authority,
                     });
                 }
                 SendResult::Proposal { msg } => {

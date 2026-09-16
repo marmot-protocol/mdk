@@ -2074,6 +2074,7 @@ pub(crate) fn decode_received_event(
         return None;
     }
     Some(ReceivedMessage {
+        authority: None,
         message_id_hex: event.id,
         source_message_id_hex: source_message_id_hex.to_owned(),
         sender: sender_hex.to_owned(),
@@ -2136,6 +2137,7 @@ pub(crate) fn observe_event(
             epoch,
             payload,
             retention,
+            authority,
             ..
         } => {
             if let Some(projection) = group_projection {
@@ -2156,7 +2158,7 @@ pub(crate) fn observe_event(
             // frozen V1's message-fatal rule. V2 rejection is attachment-local,
             // and locator-kind policy gates fetchability at download time rather
             // than delivery.
-            let Some(message) = decode_received_event(
+            let Some(mut message) = decode_received_event(
                 payload,
                 &sender_hex,
                 sender_display_name,
@@ -2171,6 +2173,7 @@ pub(crate) fn observe_event(
                 summary.events.push(event.clone());
                 return None;
             };
+            message.authority = *authority;
             summary.messages.push(message.clone());
             summary.events.push(event.clone());
             Some(message)

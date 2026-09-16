@@ -999,6 +999,8 @@ typedef struct MarmotOnboardingSubscription MarmotOnboardingSubscription;
  */
 typedef struct MarmotPresentedChatListSubscription MarmotPresentedChatListSubscription;
 
+typedef struct MarmotReportedContentSubscription MarmotReportedContentSubscription;
+
 /**
  * Opaque handle to one conversation's materialized timeline window.
  * `next` returns the full authoritative window after each update;
@@ -3122,6 +3124,12 @@ typedef struct MarmotTimelineMessageQuery {
   uint32_t limit;
 } MarmotTimelineMessageQuery;
 
+typedef struct MarmotMessageModerationSummary {
+  uint32_t status;
+  uint64_t total_reports;
+  uint64_t pending_reports;
+} MarmotMessageModerationSummary;
+
 /**
  * Why one attachment was rejected. `detail` is privacy-safe
  * presentation text from the shared parser; it never echoes tag
@@ -3257,6 +3265,8 @@ typedef struct MarmotTimelineReactionSummary {
  */
 typedef struct MarmotTimelineMessageRecord {
   char *message_id_hex;
+  char *revision_id_hex;
+  struct MarmotMessageModerationSummary moderation;
   /**
    * Delivery marker for own (`direction == "sent"`) messages: NULL
    * while committed-but-undelivered (render as pending/failed),
@@ -3703,6 +3713,47 @@ typedef struct MarmotProductEvent {
   struct MarmotProductEventProperty *properties;
   uintptr_t properties_len;
 } MarmotProductEvent;
+
+typedef struct MarmotReportedContent {
+  char *message_id_hex;
+  char *revision_id_hex;
+  struct MarmotMessageModerationSummary moderation;
+} MarmotReportedContent;
+
+typedef struct MarmotReportedContentPage {
+  struct MarmotReportedContent *items;
+  uintptr_t items_len;
+  char *next_cursor;
+  uint64_t pending_message_count;
+} MarmotReportedContentPage;
+
+typedef struct MarmotContentReport {
+  char *report_id_hex;
+  char *message_id_hex;
+  char *revision_id_hex;
+  char *reporter;
+  uint32_t reason;
+  char *explanation;
+  uint64_t reported_at;
+  char *dismissed_by_event_id;
+  char *reviewing_admin;
+  char *reported_text;
+  struct MarmotTimelineReplyPreview *reported_revision;
+} MarmotContentReport;
+
+typedef struct MarmotContentReportPage {
+  char *removed_by_event_id;
+  char *removing_account;
+  bool has_removed_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t removed_at;
+  struct MarmotTimelineMessageRecord *current_message;
+  struct MarmotContentReport *reports;
+  uintptr_t reports_len;
+  char *next_cursor;
+} MarmotContentReportPage;
 
 /**
  * Stable stream and start-message identifiers.
@@ -4382,6 +4433,13 @@ typedef struct MarmotBlockListSnapshot {
  * the call) and finally with NULL when the stream closes.
  */
 typedef void (*MarmotBlockListCallback)(const struct MarmotBlockListSnapshot *item, void *user_data);
+
+/**
+ * Callback invoked with each item (borrowed; valid only during
+ * the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotReportedContentCallback)(const struct MarmotReportedContentPage *item,
+                                              void *user_data);
 
 typedef enum MarmotChatListAnchorOutcome_Tag {
   MARMOT_CHAT_LIST_ANCHOR_OUTCOME_TOP,
@@ -7783,6 +7841,67 @@ MarmotStatus marmot_set_product_analytics_activity(const struct MarmotClient *cl
                                                    uint32_t activity);
 
 /**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_dismiss_reports(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *group_id_hex,
+                                    const char *const *report_ids,
+                                    uintptr_t report_ids_len,
+                                    struct MarmotSendSummary **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reported_content(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     uint8_t pending_only,
+                                     const char *after,
+                                     uint32_t limit,
+                                     struct MarmotReportedContentPage **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_message_reports(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *group_id_hex,
+                                    const char *message_id,
+                                    const char *after,
+                                    uint32_t limit,
+                                    struct MarmotContentReportPage **out);
+
+/**
+ * Report one retained message revision. Reason is a MarmotReportReason discriminant.
+ * # Safety
+ * Client, strings and output pointer must be valid. Inputs are borrowed.
+ */
+MarmotStatus marmot_report_message(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   const char *message_id,
+                                   const char *revision_id,
+                                   uint32_t reason,
+                                   const char *explanation,
+                                   struct MarmotSendSummary **out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -8729,6 +8848,75 @@ MarmotStatus marmot_subscribe_blocked_users(const struct MarmotClient *client,
  */
 MarmotStatus marmot_block_list_subscription_snapshot(const struct MarmotBlockListSubscription *sub,
                                                      struct MarmotBlockListSnapshot **out);
+
+/**
+ *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_reported_content_page_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` must be a valid pointer.
+ */
+MarmotStatus marmot_reported_content_subscription_next(const struct MarmotReportedContentSubscription *sub,
+                                                       uint32_t timeout_ms,
+                                                       struct MarmotReportedContentPage **out);
+
+/**
+ * Install a callback pump for this subscription. `callback` runs
+ * on a runtime worker thread with a borrowed item pointer (valid
+ * only during the call; do not store or free it) and a final
+ * NULL item on close. `callback` and `user_data` access must be
+ * thread-safe. Fails if a callback is already installed.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function
+ * pointer. `user_data` must outlive every callback invocation —
+ * clear/free only *request* cancellation without waiting (see
+ * the module docs).
+ */
+MarmotStatus marmot_reported_content_subscription_set_callback(const struct MarmotReportedContentSubscription *sub,
+                                                               MarmotReportedContentCallback callback,
+                                                               void *user_data);
+
+/**
+ * Request cancellation of this subscription's callback pump, if
+ * any. Non-blocking: a callback already running keeps executing
+ * after this returns (see the module docs).
+ *
+ * # Safety
+ * `sub` must be a live handle.
+ */
+MarmotStatus marmot_reported_content_subscription_clear_callback(const struct MarmotReportedContentSubscription *sub);
+
+/**
+ * Free the subscription handle. Requests callback-pump
+ * cancellation without waiting (a callback may still be running
+ * after this returns — do not free `user_data` on that basis).
+ * NULL is a no-op. Free every handle before the client that
+ * created it.
+ *
+ * # Safety
+ * `sub` must be NULL or an unfreed handle pointer.
+ */
+void marmot_reported_content_subscription_free(struct MarmotReportedContentSubscription *sub);
+
+/**
+ * Subscribe to a bounded live reported-content queue.
+ * # Safety
+ * Client, strings and output pointer must be valid.
+ */
+MarmotStatus marmot_subscribe_reported_content(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               uint8_t pending_only,
+                                               uint32_t limit,
+                                               struct MarmotReportedContentSubscription **out_sub);
+
+/**
+ * Take the initial snapshot once; subsequent calls return NULL.
+ * # Safety
+ * Subscription and output pointer must be valid.
+ */
+MarmotStatus marmot_reported_content_subscription_snapshot(const struct MarmotReportedContentSubscription *sub,
+                                                           struct MarmotReportedContentPage **out);
 
 /**
  * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
@@ -9942,6 +10130,26 @@ void marmot_blocked_user_list_free(struct MarmotBlockedUserList *list);
  * this library.
  */
 void marmot_block_list_snapshot_free(struct MarmotBlockListSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_reported_content_page_free(struct MarmotReportedContentPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

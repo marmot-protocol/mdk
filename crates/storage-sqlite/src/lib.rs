@@ -103,3 +103,8 @@ pub(crate) use codec::{
     optional_u64_to_i64, serialize, tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds,
     unix_now_seconds_i64, usize_to_i64,
 };
+
+pub use timeline::reports::{
+    ContentReport, ContentReportPage, MessageModerationSummary, ModerationStatus, ReportedContent,
+    ReportedContentPage,
+};

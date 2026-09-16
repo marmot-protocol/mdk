@@ -2153,7 +2153,7 @@ fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
 }
 
 #[test]
-fn prune_app_events_before_reprojects_survivor_when_delete_is_pruned() {
+fn prune_app_events_preserves_minimal_delete_evidence() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .record_app_event(&app_event("target", "aa", 20))
@@ -2190,8 +2190,8 @@ fn prune_app_events_before_reprojects_survivor_when_delete_is_pruned() {
     assert_eq!(timeline.messages.len(), 1);
     let target = &timeline.messages[0];
     assert_eq!(target.message_id_hex, "target");
-    assert!(!target.deleted);
-    assert_eq!(target.plaintext, "target");
+    assert!(target.deleted);
+    assert!(target.plaintext.is_empty());
 }
 
 #[test]
@@ -2886,6 +2886,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         )
         .unwrap();
     let pending_event = GroupEvent::MessageReceived {
+        authority: None,
         group_id: cgka_traits::GroupId::new(vec![0xaa]),
         message_id: fresh_message_id.clone(),
         sender: MemberId::new(vec![7; 32]),

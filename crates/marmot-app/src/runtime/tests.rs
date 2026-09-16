@@ -607,6 +607,8 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
 
 fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        revision_id_hex: String::new(),
+        moderation: storage_sqlite::MessageModerationSummary::default(),
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         source_epoch: None,
