@@ -251,6 +251,7 @@ mod tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         };
         storage.put_group(&group).unwrap();
         let request = cgka_traits::app_event::PendingAppMessageAuthority {
