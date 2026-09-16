@@ -2080,11 +2080,17 @@ pub(crate) fn message_text_mentions_account(
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
 /// kinds and blank text never produce a preview. Structured agent kinds expose
-/// only approved text/status fields, so raw JSON and tool output never reach a
-/// notification payload.
+/// only approved text/status fields; group-system rows expose supported parsed
+/// text only, so their JSON envelope never reaches a notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
         None
+    } else if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+        // Reuse the bounded, version-checked parser. This is fallback text,
+        // never authority derived from actor/subject claims in the payload.
+        group_system_event_from_message(kind, plaintext)
+            .map(|event| event.text)
+            .filter(|text| !text.trim().is_empty())
     } else if kind == MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY {
         structured_agent_preview(plaintext, &["text", "status"])
     } else if kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION {

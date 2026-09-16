@@ -41,6 +41,22 @@ This adds no wire format or database migration. Regenerate Swift/Kotlin bindings
 and use the matching native library; Android follow-through is tracked in
 [whitenoise-android#1581](https://github.com/marmot-protocol/whitenoise-android/issues/1581).
 
+### Reactions on group activity
+
+Use the existing reaction commands with the activity row's `messageIdHex`.
+Authenticated system rows retain that deterministic ID across reaction changes,
+replay and restart; the same timeline record exposes both `groupSystem` and
+`reactions`. Retraction uses the existing unreact command, and subscriptions
+update the target row without adding a second activity row. Do not synthesize or
+send a kind-1210 event to react to local group activity.
+
+Reaction notifications use the supported system payload's text fallback, never
+its JSON envelope. Only the stored target sender receives an alert; activity
+without an attributable actor does not invent a recipient. Deleted or invalidated
+targets and malformed or unsupported payloads expose no target preview.
+Clients continue to own localization and layout. This adds no binding fields or
+methods and requires no client-owned reaction map.
+
 ## Identity references and profile pseudonyms
 
 `accountIdHex` / `normalizeMemberRef` now accept `nprofile` and

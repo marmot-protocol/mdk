@@ -3751,3 +3751,86 @@ fn accepted_edit_projection_and_history_survive_encrypted_reopen() {
     );
     store.close().unwrap();
 }
+
+#[test]
+fn system_reactions_survive_replay_reopen_and_retract_without_replacing_target() {
+    use cgka_traits::app_event::group_system_event_material;
+    use cgka_traits::engine::GroupStateChange;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("system-reactions.sqlite");
+    let key = crate::SqlCipherKey::new("system reaction persistence key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let group = cgka_traits::GroupId::new(vec![0x11; 32]);
+    let actor = cgka_traits::MemberId::new(vec![0x22; 32]);
+    let material = group_system_event_material(
+        &group,
+        3,
+        Some(&actor),
+        &GroupStateChange::MemberAdded {
+            member: cgka_traits::MemberId::new(vec![0x33; 32]),
+        },
+    )
+    .unwrap();
+    let mut system =
+        group_system_from_commit(&material.message_id_hex, "member_added", 10, "origin");
+    system.sender = material.sender;
+    system.plaintext = material.content;
+    system.tags = material.tags;
+    system.source_epoch = Some(3);
+    store.record_app_event(&system).unwrap();
+    let baseline = store
+        .timeline_message(&system.group_id_hex, &system.message_id_hex)
+        .unwrap()
+        .unwrap();
+    let react = reaction("reaction", "bob", &system.message_id_hex, 20, "👍");
+    for _ in 0..2 {
+        let update = store.record_app_event(&react).unwrap();
+        assert!(update.changes.iter().any(|change| matches!(change,
+            TimelineMessageChange::Upsert { message, .. } if message.message_id_hex == system.message_id_hex)));
+        store.record_app_event(&system).unwrap();
+    }
+    let expected = store
+        .timeline_message(&system.group_id_hex, &system.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expected.reactions.user_reactions.len(), 1);
+    assert_eq!(expected.reactions.by_emoji["👍"], ["bob"]);
+    let mut unchanged = expected.clone();
+    unchanged.reactions = baseline.reactions.clone();
+    assert_eq!(unchanged, baseline, "only the reaction summary changes");
+    store
+        .rebuild_message_timeline_for_group(&system.group_id_hex)
+        .unwrap();
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(system.group_id_hex.clone()),
+            pagination: TimelinePagination {
+                limit: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.messages, [expected]);
+    assert!(!page.has_more_before && !page.has_more_after);
+    store
+        .record_app_event(&delete("forged-retract", "carol", "reaction", 21))
+        .unwrap();
+    assert_eq!(list(&store)[0].reactions.user_reactions.len(), 1);
+    for _ in 0..2 {
+        store
+            .record_app_event(&delete("retract", "bob", "reaction", 22))
+            .unwrap();
+        store.record_app_event(&react).unwrap();
+        store
+            .rebuild_message_timeline_for_group(&system.group_id_hex)
+            .unwrap();
+        assert_eq!(list(&store).as_slice(), std::slice::from_ref(&baseline));
+    }
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(list(&store), [baseline]);
+    store.close().unwrap();
+}
