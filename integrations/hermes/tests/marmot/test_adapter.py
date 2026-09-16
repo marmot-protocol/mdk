@@ -18,7 +18,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
-TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="mdk-hermes-spool-suite-")
+TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="hs-")
 atexit.register(TEST_SPOOL_ROOT.cleanup)
 os.environ.setdefault(
     "HERMES_HOME",
@@ -5138,6 +5138,31 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(
                 adapter._observations.loaded_fingerprint,
                 other._observations.loaded_fingerprint,
+            )
+
+    def test_welcomer_aliases_match_doctor_projection(self):
+        diag = self.adapter_module.marmot_diagnostics
+        cases = (
+            {"welcomer_allowlist": ["aa" * 32]},
+            {"welcomerAllowlist": "bb" * 32},
+            {"dm_allow_from": ["cc" * 32]},
+            {"dmAllowFrom": ""},
+            {"welcomer_allowlist": []},
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.assertEqual(
+                    self.adapter_module.resolve_welcomer_allowlist(extra),
+                    diag.resolve_welcomers(extra),
+                )
+        with unittest.mock.patch.dict(os.environ, {"MARMOT_WELCOMER_ALLOWLIST": "dd" * 32}):
+            self.assertEqual(
+                self.adapter_module.resolve_welcomer_allowlist({"welcomer_allowlist": []}),
+                [],
+            )
+            self.assertEqual(
+                self.adapter_module.resolve_welcomer_allowlist({}),
+                ["dd" * 32],
             )
 
     async def test_recovery_count_increments_through_awaiting_ack(self):

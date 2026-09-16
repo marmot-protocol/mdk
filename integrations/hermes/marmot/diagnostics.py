@@ -54,6 +54,31 @@ REDACT_TOKENS = ("token", "secret", "nsec", "password", "authorization")
 INBOUND_MEDIA_KINDS = ("document", "image", "video", "voice")
 OUTBOUND_MEDIA_KINDS = ("document", "image", "video", "voice")
 ACCOUNT_ID_HEX_LEN = 64
+WELCOMER_ALIASES = ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom")
+WELCOMER_ENV_KEYS = ("MARMOT_WELCOMER_ALLOWLIST", "MARMOT_DM_ALLOW_FROM")
+DOTENV_CONNECTOR_KEYS = frozenset(
+    {
+        "MARMOT_HOME_CHANNEL",
+        "MARMOT_HOME_CHANNEL_NAME",
+        "MARMOT_AGENT_SOCKET",
+        "MARMOT_HOME",
+        "MARMOT_ACCOUNT_ID_HEX",
+        "MARMOT_AGENT_AUTH_TOKEN",
+        "MARMOT_AGENT_AUTH_TOKEN_FILE",
+        "MARMOT_WELCOMER_ALLOWLIST",
+        "MARMOT_DM_ALLOW_FROM",
+        "MARMOT_GROUP_ID_HEX",
+        "MARMOT_ALLOWED_USERS",
+        "MARMOT_ALLOW_ALL_USERS",
+    }
+)
+DOTENV_EXTRA_KEYS = {
+    "MARMOT_AGENT_SOCKET": ("socket_path", "agent_socket", "socket"),
+    "MARMOT_HOME": ("home", "marmot_home"),
+    "MARMOT_ACCOUNT_ID_HEX": ("account_id_hex", "account"),
+    "MARMOT_AGENT_AUTH_TOKEN": ("auth_token", "agent_auth_token"),
+    "MARMOT_AGENT_AUTH_TOKEN_FILE": ("auth_token_file", "agent_auth_token_file"),
+}
 
 
 def redacted(text: str) -> str:
@@ -198,6 +223,37 @@ def first_config_value(extra: dict[str, Any], *keys: str, env: Optional[str] = N
     return None
 
 
+def split_config_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def parse_dotenv_scalar(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value[0] in {"'", '"'}:
+        quote = value[0]
+        end = value.find(quote, 1)
+        if end == -1:
+            return value[1:]
+        return value[1:end]
+    if " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+    return value
+
+
+@dataclass(frozen=True)
+class ParsedHermesEnv:
+    senders: list[str] = field(default_factory=list)
+    allow_all: bool = False
+    error: Optional[str] = None
+    values: dict[str, str] = field(default_factory=dict)
+
+
 def identity_digest(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -320,6 +376,7 @@ def resolve_home_route(
     home_channel: Any = None,
     home_platform: Optional[str] = None,
     override: Optional[str] = None,
+    env_values: Optional[dict[str, str]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     if override:
         route = normalize_home_route(override)
@@ -334,6 +391,12 @@ def resolve_home_route(
                 home_platform = extra_platform
     if home_platform and home_platform not in {"marmot"}:
         return None, "wrong_platform"
+    if home_channel in (None, ""):
+        env_home = os.getenv("MARMOT_HOME_CHANNEL", "").strip()
+        if not env_home and env_values:
+            env_home = str(env_values.get("MARMOT_HOME_CHANNEL") or "").strip()
+        if env_home:
+            home_channel = env_home
     if home_channel in (None, ""):
         return None, None
     route = normalize_home_route(home_channel)
@@ -375,12 +438,12 @@ def resolve_auth_token(
     if token not in (None, ""):
         stripped = str(token).strip()
         return (stripped or None), None if stripped else "empty"
-    if token_file not in (None, ""):
-        return _read_auth_token_file(token_file)
     configured = first_config_value(extra, "auth_token", "agent_auth_token", env="MARMOT_AGENT_AUTH_TOKEN")
     if configured not in (None, ""):
         stripped = str(configured).strip()
         return (stripped or None), None if stripped else "empty"
+    if token_file not in (None, ""):
+        return _read_auth_token_file(token_file)
     configured_file = first_config_value(
         extra, "auth_token_file", "agent_auth_token_file", env="MARMOT_AGENT_AUTH_TOKEN_FILE"
     )
@@ -398,20 +461,35 @@ def _read_auth_token_file(path_value: Any) -> tuple[Optional[str], Optional[str]
     return (loaded or None), None if loaded else "empty"
 
 
-def resolve_welcomers(extra: dict[str, Any]) -> list[str]:
-    raw = extra.get("welcomer_allowlist") or extra.get("allow_welcomers") or extra.get("welcomerAllowlist")
-    if raw in (None, ""):
-        raw = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
-    if isinstance(raw, str):
-        raw = [item.strip() for item in raw.split(",") if item.strip()]
-    if not isinstance(raw, list):
-        return []
-    values = []
-    for item in raw:
-        normalized = normalize_home_route(item)
-        if normalized:
-            values.append(normalized)
-    return values
+def resolve_welcomers(
+    extra: dict[str, Any],
+    *,
+    env_values: Optional[dict[str, str]] = None,
+) -> list[str]:
+    for key in WELCOMER_ALIASES:
+        if key in extra:
+            return split_config_list(extra[key])
+    for name in WELCOMER_ENV_KEYS:
+        value = os.getenv(name)
+        if value:
+            return split_config_list(value)
+    for name in WELCOMER_ENV_KEYS:
+        value = (env_values or {}).get(name)
+        if value:
+            return split_config_list(value)
+    return []
+
+
+def apply_dotenv_connector_values(extra: dict[str, Any], values: dict[str, str]) -> dict[str, Any]:
+    merged = dict(extra)
+    for env_name, keys in DOTENV_EXTRA_KEYS.items():
+        value = str(values.get(env_name) or "").strip()
+        if not value:
+            continue
+        if any(merged.get(key) not in (None, "") for key in keys):
+            continue
+        merged.setdefault(keys[0], value)
+    return merged
 
 
 @dataclass
@@ -710,20 +788,44 @@ def parse_config_safely(path: Path) -> tuple[Optional[dict[str, Any]], Optional[
     return loaded, None
 
 
-def parse_env_safely(path: Path) -> tuple[list[str], bool, Optional[str]]:
+def parse_dotenv_assignments(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if key not in DOTENV_CONNECTOR_KEYS:
+            continue
+        values[key] = parse_dotenv_scalar(value)
+    return values
+
+
+def parse_env_safely(path: Path) -> ParsedHermesEnv:
     if not path.exists():
-        return [], False, "missing"
-    helper = load_configure_helper()
-    if helper is None:
-        return [], False, "helper_unavailable"
+        return ParsedHermesEnv(error="missing")
     try:
         text = path.read_text(encoding="utf-8")
         if len(text.encode("utf-8")) > MAX_CONFIG_BYTES:
-            return [], False, "oversized"
+            return ParsedHermesEnv(error="oversized")
+        values = parse_dotenv_assignments(text)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return ParsedHermesEnv(error="invalid")
+    helper = load_configure_helper()
+    if helper is None:
+        return ParsedHermesEnv(error="helper_unavailable", values=values)
+    try:
         auth = helper.read_hermes_env_auth_from_lines(text.splitlines())
     except (OSError, UnicodeError, ValueError, TypeError):
-        return [], False, "invalid"
-    return list(auth.allowed_users_hex), bool(auth.allow_all_users), None
+        return ParsedHermesEnv(error="invalid", values=values)
+    return ParsedHermesEnv(
+        senders=list(auth.allowed_users_hex),
+        allow_all=bool(auth.allow_all_users),
+        values=values,
+    )
 
 
 async def read_plugin_status(
@@ -766,7 +868,7 @@ async def read_plugin_status(
         try:
             await asyncio.wait_for(writer.wait_closed(), timeout=IO_TIMEOUT_S)
         except (OSError, asyncio.TimeoutError):
-            return None
+            pass
 
 
 def plugin_version_from_manifest(plugin_dir: Path) -> Optional[str]:

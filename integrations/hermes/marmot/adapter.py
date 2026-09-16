@@ -800,11 +800,7 @@ def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) 
 
 
 def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
-    for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
-        if key in extra:
-            return _split_config_list(extra[key])
-    configured = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
-    return _split_config_list(configured) if configured else []
+    return marmot_diagnostics.resolve_welcomers(extra)
 
 
 def open_directory_without_symlinks(path: Path) -> int:

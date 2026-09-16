@@ -50,9 +50,10 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     config_path = hermes_home / "config.yaml"
     env_path = hermes_home / ".env"
     config, config_error = diag.parse_config_safely(config_path)
-    env_senders, env_allow_all, env_error = diag.parse_env_safely(env_path)
+    parsed_env = diag.parse_env_safely(env_path)
+    env_senders, env_allow_all, env_error = parsed_env.senders, parsed_env.allow_all, parsed_env.error
     merged = diag.merge_hermes_marmot_config(config)
-    extra = merged["extra"]
+    extra = diag.apply_dotenv_connector_values(merged["extra"], parsed_env.values)
     senders = env_senders or _split_sender_list(
         extra.get("allowed_users") or extra.get("allowed_users_hex") or os.getenv("MARMOT_ALLOWED_USERS")
     )
@@ -65,10 +66,11 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         home_channel=merged["home_channel"],
         home_platform=merged["home_platform"],
         override=args.group_id_hex,
+        env_values=parsed_env.values,
     )
     account_hex, account_mode = diag.resolve_account_id(extra, override=args.account_id_hex)
     socket_path = diag.resolve_socket_path(extra, fallback=installer_socket) or installer_socket
-    welcomers = diag.resolve_welcomers(extra)
+    welcomers = diag.resolve_welcomers(extra, env_values=parsed_env.values)
     auth_token, auth_error = diag.resolve_auth_token(
         extra,
         token=args.auth_token,
@@ -82,7 +84,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         socket_path=str(socket_path) if socket_path else None,
         home_route=home_route,
     )
-    fingerprint = diag.config_fingerprint(fingerprint_fields) if config_error is None else None
+    fingerprint = None
+    if config_error in (None, "missing"):
+        fingerprint = diag.config_fingerprint(fingerprint_fields)
 
     checks.append(_socket_check(socket_path))
     checks.extend(_file_checks(marmot_home))
