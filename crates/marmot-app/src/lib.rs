@@ -249,7 +249,8 @@ pub use relay_telemetry_export::{
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
     ChatListMessagePreview, ChatListQuery, ChatListRow, ExistingDirectConversation,
-    MAX_TIMELINE_LIMIT, SelfMembership, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
+    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     select_reusable_direct_conversation,
 };
@@ -2484,6 +2485,20 @@ impl MarmotApp {
         Ok(self
             .account_storage(label)?
             .message_timeline_by_wall_clock(query)?)
+    }
+
+    pub fn message_edit_history(
+        &self,
+        label: &str,
+        group: &str,
+        target: &str,
+        before: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<TimelineEditHistoryPage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .message_edit_history(group, target, before, limit)?)
     }
 
     pub fn timeline_message(

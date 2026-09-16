@@ -359,6 +359,7 @@ pub struct ConversationWindowSnapshotFfi {
 // Borrow raw rows so conversion never clones the full reactor/tag collections.
 fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
+        edit: row.edit.clone().map(Into::into),
         message_id_hex: row.message_id_hex.clone(),
         source_message_id_hex: row.source_message_id_hex.clone(),
         source_epoch: row.source_epoch,
@@ -557,6 +558,7 @@ mod tests {
         .to_content()
         .unwrap();
         let mut record = app::TimelineMessageRecord {
+            edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,
             source_epoch: Some(4),
@@ -593,5 +595,25 @@ mod tests {
         assert!(untrusted.reactions.user_reactions.is_empty());
         assert_eq!(record.reactions.by_emoji["👍"].len(), 5000);
         assert_eq!(untrusted.plaintext, record.plaintext);
+    }
+}
+
+#[cfg(test)]
+mod edit_contract_tests {
+    #[test]
+    fn prepared_and_legacy_rows_share_effective_content_and_edit_metadata() {
+        let row: marmot_app::TimelineMessageRecord = serde_json::from_value(serde_json::json!({
+            "message_id_hex":"target","direction":"received","group_id_hex":"11","sender":"alice",
+            "plaintext":"**replacement**","kind":9,"tags":[],"timeline_at":1,"received_at":1,
+            "reactions":{"by_emoji":{},"user_reactions":[]},"deleted":false,
+            "edit":{"edit_count":2,"latest_edit_message_id_hex":"edit","edited_at":5}
+        }))
+        .unwrap();
+        let legacy = super::TimelineMessageRecordFfi::from(row.clone());
+        let prepared = super::presented_timeline(&row, false);
+        assert_eq!(legacy.plaintext, prepared.plaintext);
+        assert_eq!(legacy.content_tokens, prepared.content_tokens);
+        assert_eq!(prepared.edit.unwrap().latest_edit_message_id_hex, "edit");
+        assert_eq!(legacy.edit.unwrap().edit_count, 2);
     }
 }

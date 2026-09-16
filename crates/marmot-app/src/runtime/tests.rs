@@ -607,6 +607,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
 
 fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        edit: None,
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         source_epoch: None,
@@ -2762,5 +2763,128 @@ async fn message_journey_overflow() {
         assert!(page.messages[0].source_message_id_hex.is_some());
     }
     drop(client);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://test.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("edits", &[]).await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let storage = app.account_storage("alice").unwrap();
+    let original = storage_sqlite::StoredAppEvent {
+        group_id_hex: group_hex.clone(),
+        message_id_hex: "01".repeat(32),
+        source_message_id_hex: Some("02".repeat(32)),
+        source_epoch: Some(0),
+        direction: "received".into(),
+        sender: "ee".repeat(32),
+        plaintext: "original".into(),
+        kind: 9,
+        tags: vec![],
+        recorded_at: 1,
+        received_at: 1,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    let update = storage.record_app_event(&original).unwrap();
+    app.app_projection_update("alice", update).unwrap();
+    let runtime = app.runtime();
+    let mut subscription = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    let before = subscription
+        .snapshot
+        .iter()
+        .find(|r| r.group_id_hex == group_hex)
+        .unwrap()
+        .clone();
+    let mut edit = original.clone();
+    edit.message_id_hex = "03".repeat(32);
+    edit.source_message_id_hex = Some("04".repeat(32));
+    edit.kind = 1009;
+    edit.recorded_at = 2;
+    edit.plaintext = "**edited**".into();
+    edit.tags = vec![vec!["e".into(), original.message_id_hex.clone()]];
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&edit).unwrap())
+        .unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::LastMessageContentChanged
+    );
+    runtime
+        .events
+        .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account.account_id_hex.clone(),
+            account_label: "alice".into(),
+            update,
+        }))
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let RuntimeChatListUpdate::Row { trigger, row } = event else {
+        panic!("expected changed row")
+    };
+    assert_eq!(trigger, ChatListUpdateTrigger::LastMessageContentChanged);
+    assert_eq!(row.last_message.as_ref().unwrap().plaintext, "**edited**");
+    assert_eq!(row.unread_count, before.unread_count);
+    assert_eq!(
+        row.last_message.as_ref().unwrap().message_id_hex,
+        before.last_message.as_ref().unwrap().message_id_hex
+    );
+    assert_eq!(
+        row.last_message.as_ref().unwrap().timeline_at,
+        before.last_message.as_ref().unwrap().timeline_at
+    );
+    let recovered = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    assert_eq!(
+        recovered
+            .snapshot
+            .iter()
+            .find(|r| r.group_id_hex == group_hex)
+            .unwrap()
+            .last_message,
+        row.last_message
+    );
+    edit.message_id_hex = "05".repeat(32);
+    edit.source_message_id_hex = Some("06".repeat(32));
+    edit.recorded_at = 3;
+    edit.plaintext = "after lag".into();
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&edit).unwrap())
+        .unwrap();
+    let event = MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+        account_id_hex: account.account_id_hex,
+        account_label: "alice".into(),
+        update,
+    });
+    // No await in this current-thread test: overflow before the subscriber can drain.
+    for _ in 0..4096 {
+        runtime.events.send(event.clone()).unwrap();
+    }
+    let recovered_event = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let RuntimeChatListUpdate::Row {
+        trigger,
+        row: recovered,
+    } = recovered_event
+    else {
+        panic!("expected row reconciled from lag recovery snapshot");
+    };
+    assert_eq!(trigger, ChatListUpdateTrigger::SnapshotRefresh);
+    assert_eq!(
+        recovered.last_message.as_ref().unwrap().plaintext,
+        "after lag"
+    );
+    assert_eq!(recovered.unread_count, before.unread_count);
     runtime.shutdown_and_close().await.unwrap();
 }

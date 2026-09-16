@@ -26,8 +26,14 @@ struct ChatProjectionsSmoke {
             accounts: states.map { AccountAttentionEntryFfi(accountIdHex: "account", state: $0) })
         let copy = try FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
         precondition(copy == value)
+        let edit = TimelineEditSummaryFfi(editCount: 3, latestEditMessageIdHex: "edit", editedAt: 17)
+        let editCopy = try FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit))
+        precondition(editCopy == edit)
+        let history = TimelineEditHistoryPageFfi(versions: [TimelineEditVersionFfi(messageIdHex: "edit", editedAt: 17, plaintext: "replacement")], hasMoreBefore: true)
+        let historyCopy = try FfiConverterTypeTimelineEditHistoryPageFfi.lift(FfiConverterTypeTimelineEditHistoryPageFfi.lower(history))
+        precondition(historyCopy == history)
         try conversationRoundTrips()
-        print("Swift C4/C5 projection round trips passed")
+        print("Swift C4/C5/C6 projection round trips passed")
     }
 }
 
@@ -101,4 +107,11 @@ func compileBlockCommands(_ marmot: Marmot, account: String, user: String) async
     let sub = try marmot.subscribeBlockedUsers(accountRef: account)
     _ = sub.snapshot()
     _ = await sub.next()
+}
+
+func compileEditHistory(_ marmot: Marmot, account: String, group: String, target: String) throws {
+    let page = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: nil, beforeMessageIdHex: nil, limit: 50)
+    if let oldest = page.versions.first {
+        _ = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: oldest.editedAt, beforeMessageIdHex: oldest.messageIdHex, limit: 50)
+    }
 }

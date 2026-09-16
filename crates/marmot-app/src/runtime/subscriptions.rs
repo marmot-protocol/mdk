@@ -748,6 +748,8 @@ pub enum ChatListUpdateTrigger {
     #[default]
     SnapshotRefresh,
     Removed,
+    /// Effective selected-message content changed without new activity.
+    LastMessageContentChanged,
 }
 
 impl ChatListUpdateTrigger {
@@ -782,6 +784,9 @@ impl ChatListUpdateTrigger {
             .any(|change| change_advances_chat_list(change, projects_group_system_activity))
         {
             return Self::NewLastMessage;
+        }
+        if changes.iter().any(|c| matches!(c, TimelineMessageChange::Upsert { trigger: TimelineUpdateTrigger::MessageEditedOrReprojected, message } if message.kind == 9)) {
+            return Self::LastMessageContentChanged;
         }
         Self::SnapshotRefresh
     }

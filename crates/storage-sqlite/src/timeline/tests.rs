@@ -41,7 +41,11 @@ fn modifier_lookup_bounds() {
         }),
     );
     for target in ["missing", "history-0"] {
-        for kind in [MARMOT_APP_EVENT_KIND_REACTION, MARMOT_APP_EVENT_KIND_DELETE] {
+        for kind in [
+            MARMOT_APP_EVENT_KIND_REACTION,
+            MARMOT_APP_EVENT_KIND_DELETE,
+            MARMOT_APP_EVENT_KIND_EDIT,
+        ] {
             let events =
                 app_events_targeting_message_tx(&conn, &"11".repeat(32), kind, target).unwrap();
             let ids = events
@@ -56,7 +60,7 @@ fn modifier_lookup_bounds() {
         }
     }
     conn.trace_v2(TraceEventCodes::empty(), None);
-    assert_eq!(LOOKUPS.load(Ordering::Relaxed), 4);
+    assert_eq!(LOOKUPS.load(Ordering::Relaxed), 6);
 }
 
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
@@ -1865,8 +1869,13 @@ fn edit_event_reprojects_target_without_full_timeline_rebuild() {
             TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
         })
         .collect::<Vec<_>>();
-    assert!(changed_ids.contains(&"edit-1"));
+    assert!(!changed_ids.contains(&"edit-1"));
     assert!(changed_ids.contains(&"target"));
+    let target = store
+        .timeline_message(&"11".repeat(32), "target")
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.plaintext, "edited");
 }
 
 #[test]
@@ -3551,4 +3560,194 @@ fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fen
             .unwrap()
     );
     assert!(store.is_blocked_welcome_dismissed("old-welcome").unwrap());
+}
+
+#[test]
+fn accepted_edits_resolve_authorship_order_and_reply_without_activity() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group = "11".repeat(32);
+    // Edits may precede the target. Timestamp then lexicographic id breaks ties,
+    // independently of arrival order. Only one e tag and the target's author qualify.
+    for event in [
+        edit("z", "alice", "target", 3, "winner"),
+        edit("a", "alice", "target", 3, "older tie"),
+        edit("forged", "bob", "target", 9, "forged"),
+    ] {
+        store.record_app_event(&event).unwrap();
+    }
+    let mut malformed = edit("multi", "alice", "target", 10, "invalid");
+    malformed.tags.push(vec!["e".into(), "unrelated".into()]);
+    store.record_app_event(&malformed).unwrap();
+    let original = chat("target", "alice", 1, "original");
+    store.record_app_event(&original).unwrap();
+    let mut reply = chat("reply", "bob", 2, "reply");
+    reply
+        .tags
+        .push(vec!["e".into(), "target".into(), "".into(), "reply".into()]);
+    store.record_app_event(&reply).unwrap();
+    let target = store.timeline_message(&group, "target").unwrap().unwrap();
+    assert_eq!(target.plaintext, "winner");
+    assert_eq!(target.timeline_at, original.recorded_at);
+    assert_eq!(target.source_message_id_hex, original.source_message_id_hex);
+    assert_eq!(target.edit.as_ref().unwrap().edit_count, 2);
+    assert_eq!(
+        target.edit.as_ref().unwrap().latest_edit_message_id_hex,
+        "z"
+    );
+    assert_eq!(
+        list(&store).len(),
+        2,
+        "edits must not become transcript rows"
+    );
+    let update = store
+        .record_app_event(&edit("new", "alice", "target", 12, "new body"))
+        .unwrap();
+    assert!(update.messages.iter().any(|m| m.message_id_hex == "reply"
+        && m.reply_preview.as_ref().unwrap().plaintext == "new body"));
+    let before = list(&store);
+    store.rebuild_message_timeline_for_group(&group).unwrap();
+    assert_eq!(list(&store), before, "repair must use the same resolver");
+    store
+        .invalidate_app_event_by_message_id(&group, "new", "LosingBranch")
+        .unwrap();
+    assert_eq!(
+        store
+            .timeline_message(&group, "target")
+            .unwrap()
+            .unwrap()
+            .plaintext,
+        "winner"
+    );
+}
+
+#[test]
+fn accepted_edit_history_is_paged_and_retraction_and_target_deletion_are_safe() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group = "11".repeat(32);
+    store
+        .record_app_event(&chat("target", "alice", 1, "original"))
+        .unwrap();
+    for i in 0..5 {
+        store
+            .record_app_event(&edit(
+                &format!("edit-{i}"),
+                "alice",
+                "target",
+                2 + i,
+                &format!("body {i}"),
+            ))
+            .unwrap();
+    }
+    let page = store
+        .message_edit_history(&group, "target", None, 2)
+        .unwrap();
+    assert!(page.has_more_before);
+    assert_eq!(
+        page.versions
+            .iter()
+            .map(|v| v.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["edit-3", "edit-4"]
+    );
+    let cursor = (
+        page.versions[0].edited_at,
+        page.versions[0].message_id_hex.clone(),
+    );
+    store
+        .record_app_event(&delete("retract", "alice", "edit-4", 9))
+        .unwrap();
+    assert_eq!(
+        store
+            .timeline_message(&group, "target")
+            .unwrap()
+            .unwrap()
+            .plaintext,
+        "body 3"
+    );
+    let before = list(&store);
+    store.rebuild_message_timeline_for_group(&group).unwrap();
+    assert_eq!(list(&store), before);
+    let page = store
+        .message_edit_history(&group, "target", Some(cursor), 2)
+        .unwrap();
+    assert_eq!(
+        page.versions
+            .iter()
+            .map(|v| v.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["edit-1", "edit-2"]
+    );
+    store
+        .record_app_event(&delete("delete-target", "alice", "target", 10))
+        .unwrap();
+    let row = store.timeline_message(&group, "target").unwrap().unwrap();
+    assert!(row.deleted && row.plaintext.is_empty() && row.edit.is_none());
+    assert!(
+        store
+            .message_edit_history(&group, "target", None, 100)
+            .unwrap()
+            .versions
+            .is_empty()
+    );
+    assert!(
+        store
+            .message_edit_history(&group, "target", None, 101)
+            .is_err()
+    );
+}
+
+#[test]
+fn pruning_accepted_edit_reverts_surviving_target_and_history() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group = "11".repeat(32);
+    store
+        .record_app_event(&chat("target", "alice", 100, "original"))
+        .unwrap();
+    store
+        .record_app_event(&edit("edit", "alice", "target", 10, "edited"))
+        .unwrap();
+    store
+        .prune_app_events_before(&group, 50, "local", &|_, _| false)
+        .unwrap();
+    let row = store.timeline_message(&group, "target").unwrap().unwrap();
+    assert_eq!(row.plaintext, "original");
+    assert!(row.edit.is_none());
+    assert!(
+        store
+            .message_edit_history(&group, "target", None, 10)
+            .unwrap()
+            .versions
+            .is_empty()
+    );
+}
+
+#[test]
+fn accepted_edit_projection_and_history_survive_encrypted_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edits.sqlite");
+    let key = crate::SqlCipherKey::new("accepted edit persistence key").unwrap();
+    let group = "11".repeat(32);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "original"))
+        .unwrap();
+    store
+        .record_app_event(&edit("edit", "alice", "target", 2, "replacement"))
+        .unwrap();
+    let expected = store.timeline_message(&group, "target").unwrap().unwrap();
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(
+        store.timeline_message(&group, "target").unwrap().unwrap(),
+        expected
+    );
+    assert_eq!(
+        store
+            .message_edit_history(&group, "target", None, 1)
+            .unwrap()
+            .versions[0]
+            .plaintext,
+        "replacement"
+    );
+    store.close().unwrap();
 }

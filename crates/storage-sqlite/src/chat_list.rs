@@ -1811,7 +1811,7 @@ fn unread_membership_for_message_tx(
         };
     let activity_filter = chat_list_activity_filter_sql("");
     let sql = format!(
-        "SELECT plaintext, tags_json, kind, timeline_order_class,
+        "SELECT COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext), tags_json, kind, timeline_order_class,
                 timeline_order_primary, timeline_order_phase, timeline_order_at
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
@@ -1918,7 +1918,7 @@ fn rebuild_unread_membership_tx(
     // incremental reconciliation does.
     let activity_filter = chat_list_activity_filter_sql("");
     let scan_sql = format!(
-        "SELECT message_id_hex, plaintext, tags_json, kind,
+        "SELECT message_id_hex, COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext), tags_json, kind,
                 timeline_order_class, timeline_order_primary,
                 timeline_order_phase, timeline_order_at
          FROM message_timeline

@@ -6,6 +6,40 @@ use crate::{Marmot, timeline_query_from_ffi};
 
 #[uniffi::export]
 impl Marmot {
+    /// Accepted edit versions, oldest first within a latest-first page (1..=100).
+    /// Supply both cursor fields from the first version to load older versions.
+    /// Run this synchronous details query off the UI thread; screens already carry effective content.
+    pub fn message_edit_history(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        before_edited_at: Option<u64>,
+        before_message_id_hex: Option<String>,
+        limit: u32,
+    ) -> Result<crate::conversions::TimelineEditHistoryPageFfi, MarmotKitError> {
+        let group = crate::conversions::group_id_from_hex(&group_id_hex)?;
+        let before = match (before_edited_at, before_message_id_hex) {
+            (Some(at), Some(id)) => Some((at, id)),
+            (None, None) => None,
+            _ => {
+                return Err(MarmotKitError::Runtime {
+                    details: "edit cursor requires timestamp and id".into(),
+                });
+            }
+        };
+        Ok(self
+            .runtime
+            .message_edit_history(
+                &account_ref,
+                &hex::encode(group.as_slice()),
+                &target_message_id_hex,
+                before,
+                limit as usize,
+            )?
+            .into())
+    }
+
     /// Materialized conversation timeline for a group or account-wide tail.
     ///
     /// This is the app-facing aggregated view: kind-9 chat/reply/media rows,

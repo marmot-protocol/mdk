@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
+  compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
+  not create transcript rows, move conversations or generate unread/mention activity; raw events remain available.
+  Migration 76 repairs existing edited targets/previews. Regenerate native sources/headers with matching libraries.
+
 ## [0.10.0] - 2026-09-16
 
 This minor release establishes a new compatibility cohort. Update generated Swift/Kotlin source and native libraries together; review changed records, enums, and CLI JSON before upgrading. Account storage advances through migration 75. Back up before upgrade; downgrade is unsupported (re-upgrade or restore a pre-upgrade backup). See [0.10.0 release notes](../../docs/release/0.10.0.md).

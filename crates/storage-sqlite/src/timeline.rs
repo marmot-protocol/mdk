@@ -1,7 +1,9 @@
 mod capture;
 pub use capture::ConversationAccountSnapshot;
+mod edits;
 mod opening;
 mod presentation;
+pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenSnapshot,
@@ -207,6 +209,8 @@ pub struct TimelineMessageRecord {
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub reactions: TimelineReactionSummary,
+    #[serde(default)]
+    pub edit: Option<TimelineEditSummary>,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
     /// Set when convergence invalidated this message (e.g. it landed on a losing
@@ -394,6 +398,7 @@ struct TimelineRow {
     media: Option<Value>,
     agent_text_stream: Option<Value>,
     reactions: TimelineReactionSummary,
+    edit: Option<TimelineEditSummary>,
     deleted: bool,
     deleted_by_message_id_hex: Option<String>,
     invalidation_status: Option<String>,
@@ -1445,7 +1450,7 @@ impl SqliteAccountStorage {
                         timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                        timeline.deleted_by_message_id_hex, timeline.invalidation_status
+                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
                  FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
                    ON source.group_id_hex = timeline.group_id_hex
@@ -1868,7 +1873,7 @@ fn app_event_projection_parts_tx(
     .storage()
 }
 
-fn upsert_message_timeline_projection_for_message_tx(
+pub(crate) fn upsert_message_timeline_projection_for_message_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
@@ -1899,12 +1904,12 @@ fn upsert_message_timeline_projection_for_message_tx(
     Ok(())
 }
 
-fn project_single_message_timeline_tx(
+fn raw_app_event_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<Option<(TimelineRow, Option<StreamStartRow>)>> {
-    let Some(event) = tx
+) -> StorageResult<Option<RawAppEvent>> {
+    tx
         .query_row_cached(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
@@ -1915,8 +1920,15 @@ fn project_single_message_timeline_tx(
             raw_event_from_row,
         )
         .optional()
-        .storage()?
-    else {
+        .storage()
+}
+
+fn project_single_message_timeline_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<Option<(TimelineRow, Option<StreamStartRow>)>> {
+    let Some(event) = raw_app_event_tx(tx, group_id_hex, message_id_hex)? else {
         return Ok(None);
     };
 
@@ -1925,8 +1937,7 @@ fn project_single_message_timeline_tx(
         MARMOT_APP_EVENT_KIND_CHAT => timeline_row_from_chat(&event),
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
         | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-        | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
-        | MARMOT_APP_EVENT_KIND_EDIT => timeline_row_from_app_event(&event),
+        | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => timeline_row_from_app_event(&event),
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
             let Some(stream_id_hex) = tag_value(&event.tags, STREAM_TAG) else {
                 return Ok(None);
@@ -1948,7 +1959,9 @@ fn project_single_message_timeline_tx(
         // Modifier kinds never get a row of their own: reactions aggregate onto
         // their target and deletes tombstone it. Every other kind — including
         // app-defined custom kinds — projects a generic row.
-        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE => return Ok(None),
+        MARMOT_APP_EVENT_KIND_REACTION
+        | MARMOT_APP_EVENT_KIND_DELETE
+        | MARMOT_APP_EVENT_KIND_EDIT => return Ok(None),
         _ => timeline_row_from_custom_event(&event),
     };
 
@@ -1959,7 +1972,7 @@ fn project_single_message_timeline_tx(
     Ok(Some((row, stream_start)))
 }
 
-/// Mirror a REACTION/DELETE event's `EVENT_REF_TAG` ("e") targets into the
+/// Mirror a REACTION/DELETE/EDIT event's `EVENT_REF_TAG` ("e") targets into the
 /// indexed `message_modifier_edges` table so modifier lookups can run as an
 /// indexed equality join instead of a JSON `LIKE` substring scan. Non-modifier
 /// events have no edges. `record_app_event` upserts the owning `app_events` row,
@@ -1974,7 +1987,7 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
     .storage()?;
     if !matches!(
         event.kind,
-        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE
+        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE | MARMOT_APP_EVENT_KIND_EDIT
     ) {
         return Ok(());
     }
@@ -2002,6 +2015,8 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
 }
 
 fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
+    let edits = edits::accepted_versions_tx(tx, row)?;
+    edits::apply(row, &edits);
     let reactions = app_events_targeting_message_tx(
         tx,
         &row.group_id_hex,
@@ -2055,6 +2070,7 @@ fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> Storag
         row.deleted = true;
         row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
         row.plaintext.clear();
+        row.edit = None;
         row.media = None;
         row.agent_text_stream = None;
         row.reactions = TimelineReactionSummary::default();
@@ -2176,9 +2192,9 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
             plaintext, kind, tags_json, timeline_at, received_at,
             reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-            deleted, deleted_by_message_id_hex, invalidation_status
+            deleted, deleted_by_message_id_hex, invalidation_status, edit_json
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
             source_message_id_hex = excluded.source_message_id_hex,
             source_epoch = excluded.source_epoch,
@@ -2195,7 +2211,8 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             reactions_json = excluded.reactions_json,
             deleted = excluded.deleted,
             deleted_by_message_id_hex = excluded.deleted_by_message_id_hex,
-            invalidation_status = excluded.invalidation_status",
+            invalidation_status = excluded.invalidation_status,
+            edit_json = excluded.edit_json",
         params![
             &row.group_id_hex,
             &row.message_id_hex,
@@ -2215,6 +2232,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             if row.deleted { 1_i64 } else { 0_i64 },
             &row.deleted_by_message_id_hex,
             &row.invalidation_status,
+            row.edit.as_ref().map(serde_json::to_string).transpose().map_err(|e| StorageError::Serialization(e.to_string()))?,
         ],
     )
     .storage()?;
@@ -2473,6 +2491,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
                          ELSE zeroblob(length(agent_stream_json))
                      END,
                      reactions_json = zeroblob(length(reactions_json)),
+                     edit_json = NULL,
                      deleted_by_message_id_hex = NULL,
                      invalidation_status = NULL
                  WHERE group_id_hex = ?
@@ -2642,11 +2661,8 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
             reply_preview_targets.insert(message_id_hex.to_owned());
         }
         MARMOT_APP_EVENT_KIND_EDIT => {
-            // The edit row itself is the new timeline entry; its e-tag targets
-            // are also affected so the original bubble re-renders with the
-            // overlaid body the client computes from the edit chain.
-            ids.insert(message_id_hex.to_owned());
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+            reply_preview_targets.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         MARMOT_APP_EVENT_KIND_REACTION => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
@@ -2658,6 +2674,7 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
                 if let Some(reaction_target) =
                     reaction_target_message_id_tx(tx, group_id_hex, target)?
                 {
+                    reply_preview_targets.insert(reaction_target.clone());
                     ids.insert(reaction_target);
                 }
             }
@@ -2808,6 +2825,7 @@ fn timeline_trigger_for_invalidation_row(
                 | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                 | MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_EDIT
         )
     {
         return TimelineUpdateTrigger::ReplyPreviewChanged;
@@ -2851,6 +2869,7 @@ fn timeline_trigger_for_event_row(
                 | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                 | MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_EDIT
         )
     {
         return TimelineUpdateTrigger::ReplyPreviewChanged;
@@ -2869,6 +2888,7 @@ fn timeline_trigger_for_event_row(
         MARMOT_APP_EVENT_KIND_AGENT_OPERATION => TimelineUpdateTrigger::AgentOperation,
         MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => TimelineUpdateTrigger::GroupSystem,
         MARMOT_APP_EVENT_KIND_REACTION => TimelineUpdateTrigger::ReactionAdded,
+        MARMOT_APP_EVENT_KIND_EDIT => TimelineUpdateTrigger::MessageEditedOrReprojected,
         MARMOT_APP_EVENT_KIND_DELETE => {
             if event_targets
                 .iter()
@@ -2947,7 +2967,10 @@ fn reaction_target_message_id_tx(
     let Some((kind, tags)) = row else {
         return Ok(None);
     };
-    if kind != MARMOT_APP_EVENT_KIND_REACTION {
+    if !matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_EDIT
+    ) {
         return Ok(None);
     }
     Ok(tag_value(&tags, EVENT_REF_TAG).map(ToOwned::to_owned))
@@ -2974,7 +2997,7 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3234,7 +3257,7 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3303,8 +3326,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             }
             MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
             | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
-            | MARMOT_APP_EVENT_KIND_EDIT => {
+            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
                 let mut row = timeline_row_from_app_event(event);
                 if event.invalidated {
                     row.invalidation_status = Some(invalidation_status(event));
@@ -3340,7 +3362,9 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
             // Modifier kinds never get a row of their own. Every other kind —
             // including app-defined custom kinds — projects a generic row.
-            MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE => {}
+            MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_DELETE
+            | MARMOT_APP_EVENT_KIND_EDIT => {}
             _ => {
                 let mut row = timeline_row_from_custom_event(event);
                 if event.invalidated {
@@ -3350,6 +3374,8 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             }
         }
     }
+
+    edits::apply_group(&mut timeline, &events);
 
     let events_by_id = events
         .iter()
@@ -3416,6 +3442,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             row.deleted = true;
             row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
             row.plaintext.clear();
+            row.edit = None;
             row.media = None;
             row.agent_text_stream = None;
             row.reactions = TimelineReactionSummary::default();
@@ -3455,6 +3482,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         media: media_metadata(&event.tags),
         agent_text_stream: agent_stream_final_metadata(&event.tags),
         reactions: TimelineReactionSummary::default(),
+        edit: None,
         deleted: false,
         deleted_by_message_id_hex: None,
         invalidation_status: None,
@@ -3478,6 +3506,7 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         media: None,
         agent_text_stream: None,
         reactions: TimelineReactionSummary::default(),
+        edit: None,
         deleted: false,
         deleted_by_message_id_hex: None,
         invalidation_status: None,
@@ -3512,6 +3541,7 @@ fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
         media: None,
         agent_text_stream: agent_stream_start_metadata(event),
         reactions: TimelineReactionSummary::default(),
+        edit: None,
         deleted: false,
         deleted_by_message_id_hex: None,
         invalidation_status: None,
@@ -3648,6 +3678,17 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         deleted: row.get::<_, i64>(17)? != 0,
         deleted_by_message_id_hex: row.get(18)?,
         invalidation_status: row.get(19)?,
+        edit: row
+            .get::<_, Option<String>>(20)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    20,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
     })
 }
 
