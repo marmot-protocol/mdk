@@ -197,6 +197,20 @@ jobs:
             --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
             --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
 
+      - name: Verify complete iOS SwiftPM package in an app archive
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python3 crates/marmot-uniffi/test-apple-swift-package.py
+          python3 crates/marmot-uniffi/validate-apple-archive.py ios \
+            "dist/marmotkit-swiftpm-ios-$RELEASE_ID.zip" - \
+            "$RUNNER_TEMP/marmotkit-ios-swiftpm-archive" \
+            --swiftpm-package \
+            --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
+            --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
+
       - name: Upload iOS bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -300,6 +314,20 @@ jobs:
             "dist/$PRIVACY_BINARY_NAME" \
             packaged-source/crates/marmot-uniffi/output/macos/MarmotKit.swift \
             "$RUNNER_TEMP/marmotkit-macos-privacy-archive" \
+            --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
+            --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
+
+      - name: Verify complete macOS SwiftPM package in an app archive
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.metadata.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python3 crates/marmot-uniffi/test-apple-swift-package.py
+          python3 crates/marmot-uniffi/validate-apple-archive.py macos \
+            "dist/marmotkit-swiftpm-macos-$RELEASE_ID.zip" - \
+            "$RUNNER_TEMP/marmotkit-macos-swiftpm-archive" \
+            --swiftpm-package \
             --privacy-dir packaged-source/crates/marmot-uniffi/apple-privacy \
             --product-analytics "$PRODUCT_ANALYTICS_EXPORT"
 
@@ -594,12 +622,14 @@ jobs:
           iOS assets:
           - \`$BINARY_NAME\`: SwiftPM-compatible binary target archive.
           - \`marmotkit-ios-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
+          - \`marmotkit-swiftpm-ios-$version.zip\`: complete local Swift package with static code and its privacy resource bundle.
 
           iOS SwiftPM checksum: \`$checksum\`
 
           macOS assets (arm64):
           - \`$MACOS_BINARY_NAME\`: SwiftPM-compatible binary target archive.
           - \`marmotkit-macos-$version.zip\`: complete XCFramework, Swift source, and provenance bundle.
+          - \`marmotkit-swiftpm-macos-$version.zip\`: complete local Swift package with static code and its privacy resource bundle.
 
           macOS SwiftPM checksum: \`$macos_checksum\`
 
@@ -614,6 +644,11 @@ jobs:
           \`marmotkit-macos-$version.manifest.json\`, and the matching \`.checksums.txt\` assets.
           Verify the Android archive with its sibling \`.sha256\`; its embedded \`manifest.json\` records the exact
           source and workflow builder commits.
+          For new SwiftPM integrations, download the complete platform Swift package ZIP, verify its sibling
+          \`.sha256\`, extract it, and add the enclosed \`MarmotKit\` directory as a local package dependency.
+          Keep its source, privacy resource and binary together. Existing binary-target framework assets remain
+          available, but can produce an empty framework stub and a missing-dSYM warning in Xcode 27.
+          These checks validate local archives, not App Store export or upload. The Rust debug policy is unchanged.
           Assets on this release are immutable.
           EOF
 

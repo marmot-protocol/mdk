@@ -157,6 +157,15 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
 }
 EOF
 
+# Complete local Swift package: raw static libraries plus wrapper-owned privacy.
+# Keep existing framework assets intact for consumers that have not migrated.
+swiftpm_package_name="marmotkit-swiftpm-macos-${RELEASE_ID}.zip"
+python3 "$TOOL_DIR/apple-swift-package.py" \
+  "$XCFRAMEWORK" "$SWIFT_BINDING" "$DIST_DIR/$manifest_name" \
+  "$DIST_DIR/$swiftpm_package_name" \
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
+swiftpm_package_sha="$(shasum -a 256 "$DIST_DIR/$swiftpm_package_name" | awk '{print $1}')"
+
 cp -R "$XCFRAMEWORK" "$bundle_dir/MarmotKit.xcframework"
 cp "$SWIFT_BINDING" "$bundle_dir/MarmotKit.swift"
 cp "$DIST_DIR/$manifest_name" "$bundle_dir/manifest.json"
@@ -174,6 +183,7 @@ swiftpm $swiftpm_checksum  $binary_name
 sha256  $swift_sha  $swift_name
 sha256  $manifest_sha  $manifest_name
 sha256  $bundle_sha  $bundle_name
+sha256  $swiftpm_package_sha  $swiftpm_package_name
 EOF
 
 printf '%s\n' "$binary_sha  $binary_name" > "$DIST_DIR/$binary_name.sha256"

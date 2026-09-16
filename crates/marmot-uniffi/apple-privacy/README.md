@@ -83,6 +83,26 @@ No UserDefaults, ActiveKeyboards or DiskSpace declaration is fabricated.
 
 ## Packaging contract
 
+The complete SwiftPM packages described in [DISTRIBUTION.md](../DISTRIBUTION.md#complete-apple-swiftpm-packages)
+are the preferred integration for avoiding Xcode's empty framework stub. They contain the same static archive bytes,
+matching Swift source and feature-selected privacy declarations, with the manifest explicitly owned by the Swift
+target. Existing framework assets remain unchanged and continue to follow the framework contract below. No privacy
+policy declaration, native required-reason assessment, Rust debug profile or published release is changed by this
+additional distribution format.
+
+Validate a complete release package directly (the `-` means the matching binding comes from inside the package):
+
+```sh
+python3 crates/marmot-uniffi/validate-apple-archive.py ios /path/marmotkit-swiftpm-ios-<id>.zip - /tmp/new-ios-consumer --swiftpm-package --product-analytics 1
+python3 crates/marmot-uniffi/validate-apple-archive.py macos /path/marmotkit-swiftpm-macos-<id>.zip - /tmp/new-macos-consumer --swiftpm-package --product-analytics 1
+```
+
+Pass `--privacy-dir` for the packaged source checkout and select the actual build's analytics feature. The validator
+checks real Rust calls, privacy resources in each consumer, static linkage and matching executable/dSYM UUIDs,
+and rejects any embedded Marmot framework stub. It writes `archive-checks.json`. It does not require new Rust source
+line information: that policy change belongs in a separate PR. Complete-package adoption replaces steps 2–3 in the
+framework host-adoption checklist below; the remaining host privacy and release checks still apply.
+
 Raw `.a` slices cannot carry resources. Each exporter now stages a static
 `marmot_uniffiFFI.framework` around the **byte-identical Cargo archive**, with
 the generated header and a framework-form module map preserving the C module
