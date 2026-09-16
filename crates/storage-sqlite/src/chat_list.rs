@@ -697,6 +697,35 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Refresh and classify a selected body change in one transaction. Comparing the
+    /// stored preview avoids treating older edits or invalidations as content-only updates.
+    pub fn refresh_chat_list_row_for_messages_with_content_change(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        message_ids_hex: &[String],
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<(Option<ChatListRow>, bool)> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let before: Option<(String, String, i64, i64)> = conn.query_row_cached(
+                "SELECT last_message_id_hex,last_message_preview,last_message_timeline_at,activity_sort_at
+                 FROM chat_list_rows WHERE group_id_hex=?1 AND last_message_kind=9
+                 AND last_message_deleted=0 AND last_message_id_hex IS NOT NULL",
+                [group_id_hex], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            ).optional().storage()?;
+            let row = refresh_chat_list_row_for_messages_tx(
+                &conn, local_account_id_hex, group_id_hex, message_ids_hex, mention_classifier,
+            )?;
+            let changed = before.is_some_and(|(id, body, at, activity)| {
+                row.as_ref().is_some_and(|r| Some(r.activity_sort_at) == u64::try_from(activity).ok() &&
+                    r.last_message.as_ref().is_some_and(|m| m.kind == 9 && !m.deleted &&
+                        m.message_id_hex == id && Some(m.timeline_at) == u64::try_from(at).ok() && m.plaintext != body))
+            });
+            Ok((row, changed))
+        })
+    }
+
     /// Persist an exact account-projection delta and materialize one chat-list
     /// row in the same SQLCipher transaction, returning the committed row.
     ///
@@ -1762,6 +1791,9 @@ fn reconcile_unread_messages_tx(
     })
 }
 
+// Edits affect presentation, while mention eligibility stays on the original message.
+const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext)";
+
 fn unread_membership_for_message_tx(
     tx: &Connection,
     local_account_id_hex: &str,
@@ -1811,7 +1843,7 @@ fn unread_membership_for_message_tx(
         };
     let activity_filter = chat_list_activity_filter_sql("");
     let sql = format!(
-        "SELECT COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext), tags_json, kind, timeline_order_class,
+        "SELECT {ORIGINAL_PLAINTEXT_SQL}, tags_json, kind, timeline_order_class,
                 timeline_order_primary, timeline_order_phase, timeline_order_at
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
@@ -1918,7 +1950,7 @@ fn rebuild_unread_membership_tx(
     // incremental reconciliation does.
     let activity_filter = chat_list_activity_filter_sql("");
     let scan_sql = format!(
-        "SELECT message_id_hex, COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext), tags_json, kind,
+        "SELECT message_id_hex, {ORIGINAL_PLAINTEXT_SQL}, tags_json, kind,
                 timeline_order_class, timeline_order_primary,
                 timeline_order_phase, timeline_order_at
          FROM message_timeline

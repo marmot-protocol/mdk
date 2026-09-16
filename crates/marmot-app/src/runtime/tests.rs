@@ -2886,5 +2886,58 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
         "after lag"
     );
     assert_eq!(recovered.unread_count, before.unread_count);
+    let mut older = original.clone();
+    older.message_id_hex = "07".repeat(32);
+    older.source_message_id_hex = Some("08".repeat(32));
+    older.recorded_at = 0;
+    app.app_projection_update("alice", storage.record_app_event(&older).unwrap())
+        .unwrap();
+    let mut older_edit = edit.clone();
+    older_edit.message_id_hex = "09".repeat(32);
+    older_edit.source_message_id_hex = Some("0a".repeat(32));
+    older_edit.tags[0][1] = older.message_id_hex;
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&older_edit).unwrap())
+        .unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::SnapshotRefresh,
+        "older edits do not change the selected preview"
+    );
+    let mut retract = edit.clone();
+    retract.message_id_hex = "0b".repeat(32);
+    retract.source_message_id_hex = Some("0c".repeat(32));
+    retract.kind = 5;
+    retract.tags[0][1] = edit.message_id_hex;
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&retract).unwrap())
+        .unwrap();
+    assert_eq!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::LastMessageContentChanged,
+        "retracting the winner changes effective content"
+    );
+    assert_eq!(
+        update
+            .chat_list_row
+            .unwrap()
+            .last_message
+            .unwrap()
+            .plaintext,
+        "**edited**"
+    );
+    let update = app
+        .invalidate_timeline_source_message(
+            "alice",
+            original.source_message_id_hex.as_ref().unwrap(),
+            "losing branch",
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        update.chat_list_trigger,
+        ChatListUpdateTrigger::LastMessageContentChanged,
+        "invalidation can replace the selected message"
+    );
     runtime.shutdown_and_close().await.unwrap();
 }

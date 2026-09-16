@@ -2664,19 +2664,19 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
         message_ids_hex: &[String],
-    ) -> Result<Option<ChatListRow>, AppError> {
+    ) -> Result<(Option<ChatListRow>, bool), AppError> {
         let account = self.account_home().account(label)?;
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
-        let mut row = self
+        let (mut row, content_changed) = self
             .account_storage(&account.label)?
-            .refresh_chat_list_row_for_messages(
+            .refresh_chat_list_row_for_messages_with_content_change(
                 &account.account_id_hex,
                 group_id_hex,
                 message_ids_hex,
                 &classifier,
             )?;
         self.hydrate_chat_list_row(row.as_mut());
-        Ok(row)
+        Ok((row, content_changed))
     }
 
     pub fn initialize_chat_read_state(
@@ -5625,7 +5625,7 @@ impl MarmotApp {
                 TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.clone(),
             })
             .collect::<Vec<_>>();
-        let chat_list_row = self.refresh_chat_list_row_for_messages(
+        let (chat_list_row, content_changed) = self.refresh_chat_list_row_for_messages(
             label,
             &storage_update.group_id_hex,
             &changed_message_ids,
@@ -5633,10 +5633,14 @@ impl MarmotApp {
         let projects_group_system_activity = chat_list_row
             .as_ref()
             .is_some_and(|row| row.conversation_kind == ChatConversationKind::Group);
-        let chat_list_trigger = ChatListUpdateTrigger::from_timeline_changes(
-            &storage_update.changes,
-            projects_group_system_activity,
-        );
+        let chat_list_trigger = if content_changed {
+            ChatListUpdateTrigger::LastMessageContentChanged
+        } else {
+            ChatListUpdateTrigger::from_timeline_changes(
+                &storage_update.changes,
+                projects_group_system_activity,
+            )
+        };
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,

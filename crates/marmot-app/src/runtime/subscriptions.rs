@@ -785,9 +785,6 @@ impl ChatListUpdateTrigger {
         {
             return Self::NewLastMessage;
         }
-        if changes.iter().any(|c| matches!(c, TimelineMessageChange::Upsert { trigger: TimelineUpdateTrigger::MessageEditedOrReprojected, message } if message.kind == 9)) {
-            return Self::LastMessageContentChanged;
-        }
         Self::SnapshotRefresh
     }
 }

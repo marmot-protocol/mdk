@@ -2671,11 +2671,13 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
             for target in tag_values(tags, EVENT_REF_TAG) {
                 ids.insert(target.to_owned());
                 reply_preview_targets.insert(target.to_owned());
-                if let Some(reaction_target) =
-                    reaction_target_message_id_tx(tx, group_id_hex, target)?
+                if let Some((kind, modifier_target)) =
+                    modifier_target_message_id_tx(tx, group_id_hex, target)?
                 {
-                    reply_preview_targets.insert(reaction_target.clone());
-                    ids.insert(reaction_target);
+                    if kind == MARMOT_APP_EVENT_KIND_EDIT {
+                        reply_preview_targets.insert(modifier_target.clone());
+                    }
+                    ids.insert(modifier_target);
                 }
             }
         }
@@ -2939,11 +2941,11 @@ fn reply_message_ids_for_targets_tx(
     Ok(message_ids)
 }
 
-fn reaction_target_message_id_tx(
+fn modifier_target_message_id_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<Option<String>> {
+) -> StorageResult<Option<(u64, String)>> {
     let row: Option<(u64, Vec<Vec<String>>)> = tx
         .query_row_cached(
             "SELECT kind, tags_json
@@ -2973,7 +2975,7 @@ fn reaction_target_message_id_tx(
     ) {
         return Ok(None);
     }
-    Ok(tag_value(&tags, EVENT_REF_TAG).map(ToOwned::to_owned))
+    Ok(tag_value(&tags, EVENT_REF_TAG).map(|target| (kind, target.to_owned())))
 }
 
 fn timeline_records_by_ids_tx(

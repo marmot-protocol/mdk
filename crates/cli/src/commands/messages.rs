@@ -826,6 +826,7 @@ pub(crate) fn timeline_message_record_json(
         "media": message.media,
         "agent_text_stream": message.agent_text_stream,
         "reactions": message.reactions,
+        "edit": message.edit,
         "deleted": message.deleted,
         "deleted_by_message_id": message.deleted_by_message_id_hex,
         "retention_seconds": message.retention_seconds,
