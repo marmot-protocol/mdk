@@ -9,14 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
-- Group report/dismiss commands, paginated report details and shared queue subscriptions,
-  plus message revision and moderation summaries. Regenerate headers with the matching
-  library for the changed output layouts. Admin removal uses kind 4891; author deletion
-  remains kind 5. Cross-author non-admin deletion now returns an error, and mixed-version
-  groups can disagree on either the old admin kind-5 or new kind-4891 removal behavior.
-  Eligible admins use kind 4891 for their own chat messages too. Cross-author removal is limited
-  to whole kind-9 messages; stream starts, activity, operations, system and custom-kind rows
-  are no longer admin-removal targets.
+- `marmot_report_message` and `marmot_dismiss_reports`, paginated `marmot_content_reports`
+  and `marmot_report_dismissals`, and the deletion-masked `marmot_reported_message` lookup.
+  Report records expose `MarmotReportReason` and individual dismissal state; timeline records
+  gain `has_reports`. Use existing projection subscriptions to refresh report views.
+  Regenerate headers with the matching library for the changed output layouts.
 
 - Typed group-system chat previews and explicit `MarmotGroupSystemEventProvenance`
   on timeline and preview events. Authenticated actor/subject IDs remain distinct;

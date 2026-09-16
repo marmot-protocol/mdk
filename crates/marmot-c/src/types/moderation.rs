@@ -10,7 +10,7 @@ c_mirror! { MarmotContentReport from ContentReportFfi {
     str message_id_hex,
     str message_author,
     str reporter,
-    enum_val reason: MarmotReportReason,
+    copy reason: MarmotReportReason,
     str explanation,
     copy reported_at: u64,
     copy dismissed: bool,

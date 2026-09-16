@@ -12,8 +12,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Added
 
 - Encrypted group reports (1984), shared dismissal labels (1985), and admin removal (4891),
-  with report queues, revision details and moderation summaries in Rust, Swift/Kotlin and C.
-  Migration 77 adds the indexed projections; regenerate bindings and headers with the matching library.
+  with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
+  and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 78 adds the indexed
+  projections; regenerate bindings and headers with the matching library.
 
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
   compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
@@ -24,6 +25,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - `messages delete` / `delete_message` use kind 5 for author deletion and kind 4891 for
   an eligible admin removing any chat, including their own. A non-author non-admin now receives an error.
+  Admins can also remove a peer's messages in unnamed two-member conversations.
   Cross-author admin removal is limited to whole kind-9 messages; agent-stream starts, activity,
   operations, system events, and custom-kind rows are no longer admin-removal targets.
   Older peers may retain 4891-removed content; upgraded peers reject newly received cross-author

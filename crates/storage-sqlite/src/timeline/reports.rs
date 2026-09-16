@@ -767,6 +767,53 @@ mod tests {
         assert!(page(&s).reports[0].dismissed);
     }
     #[test]
+    fn removal_requires_resolved_source_authority_in_both_projections() {
+        // Exercise controls both before and after their target arrives.
+        for control_first in [false, true] {
+            let s = SqliteAccountStorage::in_memory().unwrap();
+            if !control_first {
+                record(&s, &target());
+            }
+            s.record_app_event_with_source(&removal(2, 1), None, Some(authority(false)))
+                .unwrap();
+            s.record_app_event_with_source(&removal(3, 1), None, None)
+                .unwrap();
+            if control_first {
+                record(&s, &target());
+            }
+            let assert_projection = |deleted: bool| {
+                for rebuild in [false, true] {
+                    if rebuild {
+                        s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                    }
+                    let m = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+                    assert_eq!(m.deleted, deleted);
+                    assert_eq!(m.plaintext, if deleted { "" } else { "original" });
+                }
+            };
+            assert_projection(false);
+            // Unavailable proof is retryable and has no deletion effect.
+            s.finalize_app_event_authority(&id(99), &id(3), None)
+                .unwrap();
+            assert_projection(false);
+            // A resolved denial cannot later be promoted to a grant.
+            s.finalize_app_event_authority(&id(99), &id(2), Some(authority(true)))
+                .unwrap();
+            assert_projection(false);
+            // Only the pending control can acquire its source-state verdict.
+            s.finalize_app_event_authority(&id(99), &id(3), Some(authority(true)))
+                .unwrap();
+            assert_projection(true);
+            s.finalize_app_event_authority(&id(99), &id(3), Some(authority(false)))
+                .unwrap();
+            assert_projection(true);
+            // Convergence withdrawal, unlike demotion, removes its effect.
+            s.invalidate_app_event_by_source(&id(3), "withdrawn")
+                .unwrap();
+            assert_projection(false);
+        }
+    }
+    #[test]
     fn removal_hides_original_and_late_edits_without_erasing_reports() {
         let events = [
             target(),

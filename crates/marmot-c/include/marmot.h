@@ -675,6 +675,16 @@ typedef enum MarmotProductRecordResult {
   MARMOT_PRODUCT_RECORD_RESULT_DROPPED_CAPACITY,
 } MarmotProductRecordResult;
 
+typedef enum MarmotReportReason {
+  MARMOT_REPORT_REASON_NUDITY,
+  MARMOT_REPORT_REASON_MALWARE,
+  MARMOT_REPORT_REASON_PROFANITY,
+  MARMOT_REPORT_REASON_ILLEGAL,
+  MARMOT_REPORT_REASON_SPAM,
+  MARMOT_REPORT_REASON_IMPERSONATION,
+  MARMOT_REPORT_REASON_OTHER,
+} MarmotReportReason;
+
 /**
  * Why a timeline delta fired.
  */
@@ -3751,7 +3761,7 @@ typedef struct MarmotContentReport {
   char *message_id_hex;
   char *message_author;
   char *reporter;
-  uint32_t reason;
+  enum MarmotReportReason reason;
   char *explanation;
   uint64_t reported_at;
   bool dismissed;

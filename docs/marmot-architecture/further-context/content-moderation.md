@@ -54,13 +54,10 @@ cannot gain admin deletion privileges.
 
 ## Persistence and retention
 
-Migration 0078 introduced source-authority metadata and a durable backfill cursor.
-Migration 0079 replaces its logical-report and aggregate-summary tables with one
-indexed row per report event. It preserves account history and established
-source-authority verdicts, drops the former group-eligibility flag, and resets the
-bounded backfill cursor over the existing prefix. Old eligibility denials for
-admin actions are re-evaluated against source state. Legacy deletion verdicts
-remain untouched.
+Migration 0078 adds source-authority metadata, one indexed row per report event,
+and a durable cursor over the existing event prefix. Account history and legacy
+kind-5 deletion verdicts remain untouched. Historical admin controls begin with
+unresolved authority and are re-evaluated against their authenticated source state.
 
 Maintenance advances at most 100 old events per batch. Normal receive updates
 only affected targets through modifier edges. Report lookup is indexed by group,

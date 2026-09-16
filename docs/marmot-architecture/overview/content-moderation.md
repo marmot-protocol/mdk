@@ -20,7 +20,11 @@ The existing `delete_message` API sends kind 4891 when an active admin deletes a
 whole chat message, including an unreported message or their own message. This
 hides its original content, edits, and attachments in message projections. Other
 authors still retract their own content with kind 5. Kind 4891 does not extend
-NIP-09, and a dismissal cannot undo a deletion.
+NIP-09, and a dismissal cannot undo a deletion. Admin deletion intentionally uses
+one moderation operation for all whole-chat targets, regardless of authorship.
+This includes self-deletion: older peers may keep that content visible, and a
+demotion before encryption rejects the operation rather than changing it to an
+author retraction.
 
 Timeline records expose `has_reports`. Existing timeline and projection events
 carry updates; there is no dedicated shared review queue, pending count, or
@@ -28,6 +32,8 @@ message moderation status. Clients choose their grouping, counters, review UI,
 and notification policy. MDK does not insert control events as chat rows or add
 unread activity. `reported_message` returns the current deletion-masked projection
 for a reported target even when personal blocking hides its normal timeline row.
+This lookup is available to all members, including non-admins; hosts choose whether
+to expose it outside admin review.
 Neither report records nor labels contain a stored copy of target content.
 
 Admin authorization is derived from authenticated source-group state. Demotion

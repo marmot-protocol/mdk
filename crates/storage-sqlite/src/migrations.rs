@@ -162,13 +162,10 @@ mod migration_0074_chat_list_invite_attention;
 mod migration_0075_user_blocks;
 #[path = "migrations/0076_accepted_edits.rs"]
 mod migration_0076_accepted_edits;
-#[path = "migrations/0078_content_reports.rs"]
-mod migration_0078_content_reports;
-#[path = "migrations/0079_simple_content_reports.rs"]
-mod migration_0079_simple_content_reports;
-
 #[path = "migrations/0077_avatar_cache.rs"]
 mod migration_0077_avatar_cache;
+#[path = "migrations/0078_content_reports.rs"]
+mod migration_0078_content_reports;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -566,11 +563,6 @@ const MIGRATIONS: &[Migration] = &[
         version: 78,
         name: "0078_content_reports",
         apply: migration_0078_content_reports::apply,
-    },
-    Migration {
-        version: 79,
-        name: "0079_simple_content_reports",
-        apply: migration_0079_simple_content_reports::apply,
     },
 ];
 
@@ -3182,22 +3174,22 @@ mod group_reset_tests {
 }
 
 #[cfg(test)]
-mod simple_content_reports_tests {
+mod content_reports_tests {
     use super::*;
     #[test]
-    fn simplifies_populated_schema_without_resetting_history_or_legacy_deletions() {
+    fn adds_reports_without_resetting_history_or_legacy_deletions() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-        run(&mut conn, &MIGRATIONS[..78]).unwrap();
-        for (id, kind, grant, allowed, state) in [
-            ("chat", 9, 0, 1, 0),
-            ("report", 1984, 0, 1, 2),
-            ("label", 1985, 1, 1, 2),
-            ("pair-removal", 4891, 0, 0, 2),
-            ("legacy-delete", 5, 1, 1, 0),
+        run(&mut conn, &MIGRATIONS[..77]).unwrap();
+        for (id, kind, grant) in [
+            ("chat", 9, 0),
+            ("report", 1984, 0),
+            ("label", 1985, 1),
+            ("removal", 4891, 1),
+            ("legacy-delete", 5, 1),
         ] {
-            conn.execute("INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at,moderation_grant,reporting_allowed,authority_state,authority_context)
-                VALUES('group',?1,'received','author','retained history',?2,'[]',1,1,?3,?4,?5,x'aa')",rusqlite::params![id,kind,grant,allowed,state]).unwrap();
+            conn.execute("INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at,moderation_grant)
+                VALUES('group',?1,'received','author','retained history',?2,'[]',1,1,?3)",rusqlite::params![id,kind,grant]).unwrap();
         }
         run(&mut conn, MIGRATIONS).unwrap();
         let count: i64 = conn
@@ -3210,16 +3202,21 @@ mod simple_content_reports_tests {
         assert_eq!(count, 5);
         let legacy:(i64,i64)=conn.query_row("SELECT moderation_grant,authority_state FROM app_events WHERE message_id_hex='legacy-delete'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(legacy, (1, 0));
-        let label:(i64,Vec<u8>)=conn.query_row("SELECT moderation_grant,authority_context FROM app_events WHERE message_id_hex='label'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(label, (1, vec![0xaa]));
-        let pending: i64 = conn
+        for id in ["label", "removal"] {
+            let verdict: (i64, i64, Option<Vec<u8>>) = conn.query_row(
+                "SELECT moderation_grant,authority_state,authority_context FROM app_events WHERE message_id_hex=?1",
+                [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            assert_eq!(verdict, (0, 1, None));
+        }
+        let report_state: i64 = conn
             .query_row(
-                "SELECT authority_state FROM app_events WHERE message_id_hex='pair-removal'",
+                "SELECT authority_state FROM app_events WHERE message_id_hex='report'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(pending, 1);
+        assert_eq!(report_state, 0);
         let progress: (i64, i64) = conn
             .query_row(
                 "SELECT after_order,through_order FROM content_report_backfill",
