@@ -21991,3 +21991,64 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
 
 #[path = "tests/conversation_cold_open.rs"]
 mod conversation_cold_open;
+
+/// Undecryptable traffic older than this copy's Welcome is not stall evidence.
+///
+/// The detector's undecryptable signal means "this device is behind the group".
+/// After a join — and especially after a re-add, where the relay serves the
+/// whole absent stretch — a device is handed traffic sealed under epochs its
+/// copy never entered and never will. That is expected, it is not evidence of
+/// being behind, and counting it arms a full-history backfill that can only
+/// re-fetch more of what this copy cannot open. The copy still lands its epoch
+/// with the rest of the non-evidence outcomes; it just does not accuse itself.
+///
+/// The signal is deliberately soft: an application message carries its sender's
+/// compose time, so a message drained from the offline outbox can look old
+/// while being perfectly live. Dropping one piece of stall evidence is free —
+/// every other undecryptable message that device receives still arms.
+#[tokio::test]
+async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_backfill() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let (app, mut client, route) =
+        undecryptable_probe_route(&dir, &relay, backfill_drain_test_config()).await;
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+
+    // Model a welcome-installed copy: the route's group is created locally, and
+    // a copy this device created has no Welcome time to compare against.
+    let storage = app.account_storage("alice").unwrap();
+    let welcome_at = crate::unix_now_seconds();
+    let mut record = storage.get_group(&route.group_id).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+
+    let before_the_welcome = welcome_at - 4 * 60 * 60;
+    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+        client
+            .ingest_received_delivery(
+                route.probe(before_the_welcome + probe as u64, &format!("gap-{probe}")),
+            )
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert!(
+        !client.has_pending_epoch_backfill(),
+        "traffic this copy was never able to open is not evidence it is behind",
+    );
+
+    // The same device, the same group, the same undecryptable outcome — only
+    // the envelope time differs — still arms.
+    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+        client
+            .ingest_received_delivery(
+                route.probe(welcome_at + probe as u64, &format!("live-{probe}")),
+            )
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "undecryptable traffic from this copy's own era is still a stall signal",
+    );
+}
