@@ -142,13 +142,19 @@ impl TransportPeeler for EpochSealedPeeler {
         })
     }
 
+    /// Welcomes stay pass-through, and the invitation creation time is taken
+    /// from the envelope timestamp — the same shape the Nostr binding has,
+    /// where `created_at` is read off the sender-signed welcome rumor. Tests
+    /// that care about that time stamp the welcome they route; an unstamped one
+    /// keeps the zero `wrap_welcome` writes and surfaces `None`, which is what
+    /// a transport that cannot establish the value reports.
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
         Ok(PeeledMessage {
             id: msg.id.clone(),
             group_id: None,
             sender: None,
             content: PeeledContent::Welcome {
-                created_at: None,
+                created_at: (msg.timestamp.0 != 0).then_some(msg.timestamp),
                 bytes: msg.payload.clone(),
             },
             origin: msg.clone(),

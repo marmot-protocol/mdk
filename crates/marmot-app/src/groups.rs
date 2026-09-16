@@ -1034,6 +1034,7 @@ mod prior_nostr_route_tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         }
     }
 
@@ -1888,6 +1889,7 @@ mod delete_moderation_grant_tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         }
     }
 

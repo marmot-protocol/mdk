@@ -19,7 +19,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{GroupStorage, MessageStorage};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use std::collections::HashMap;
 use storage_sqlite::SqliteAccountStorage;
@@ -544,5 +544,349 @@ async fn a_reopened_row_this_copy_can_no_longer_peel_lands_in_the_deferred_peel_
         bob.epoch(&group_id).unwrap(),
         alice.epoch(&group_id).unwrap(),
         "the re-joined copy is live at the group's epoch"
+    );
+}
+
+/// Wall-clock second the re-add Welcome in the tests below is minted at.
+const WELCOME_CREATED_AT: u64 = 1_700_000_000;
+
+/// Route a group message and stamp the envelope time the transport carries.
+fn route_at(msg: TransportMessage, group_id: &GroupId, at: u64) -> TransportMessage {
+    TransportMessage {
+        timestamp: Timestamp(at),
+        ..route(msg, group_id)
+    }
+}
+
+/// Stamp a Welcome with the invitation time the sender signed it at.
+fn welcome_created_at(msg: TransportMessage, at: u64) -> TransportMessage {
+    TransportMessage {
+        timestamp: Timestamp(at),
+        ..msg
+    }
+}
+
+fn chat_payload(engine: &Engine<SqliteAccountStorage>, body: &str) -> Vec<u8> {
+    cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        WELCOME_CREATED_AT,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        body.to_string(),
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+/// Commit one group evolution and confirm it published.
+async fn evolve(engine: &mut Engine<SqliteAccountStorage>, intent: SendIntent) -> TransportMessage {
+    match engine.send(intent).await.unwrap() {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            engine.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+}
+
+async fn chat(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    body: &str,
+) -> TransportMessage {
+    let payload = chat_payload(engine, body);
+    match engine
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => msg,
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    }
+}
+
+/// Create a two-member group, remove bob, and let him realize the removal.
+/// Returns the pair plus bob's storage and the group id.
+async fn alice_and_a_removed_bob(
+    tag: &[u8],
+) -> (
+    Engine<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+) {
+    let mut alice = build_client(&[b"sealed-alice-", tag].concat());
+    let (mut bob, bob_storage) = build_client_with_storage(&[b"sealed-bob-", tag].concat());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: String::from_utf8_lossy(tag).into_owned(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("unexpected create result: {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+
+    let removal = evolve(
+        &mut alice,
+        SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        },
+    )
+    .await;
+    bob.ingest(route(removal, &group_id)).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+    bob.drain_events();
+
+    (alice, bob, bob_storage, group_id)
+}
+
+/// Re-add bob and hand back the Welcome stamped with its invitation time.
+async fn readd(
+    alice: &mut Engine<SqliteAccountStorage>,
+    bob: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    created_at: u64,
+) -> TransportMessage {
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let welcome = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("unexpected invite result: {other:?}"),
+    };
+    welcome_created_at(welcome, created_at)
+}
+
+fn deferred_rows(storage: &SqliteAccountStorage, group_id: &GroupId) -> usize {
+    storage
+        .list_messages_in_states(group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len()
+}
+
+/// "Unopenable" is not "below this copy's history".
+///
+/// A message sealed under an epoch whose commit has not arrived yet is just as
+/// opaque as one from the gap, and refusing it would drop live traffic on the
+/// floor. The floor must separate the two on the only axis that distinguishes
+/// them — the envelope time against this copy's Welcome — and leave everything
+/// at or after the Welcome in the deferred lifecycle, where the commit's
+/// arrival re-peels it.
+#[tokio::test]
+async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"future").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+
+    // Alice advances the group and speaks from the new epoch. Bob is served
+    // the message first; its commit is still in flight.
+    let commit = route_at(
+        evolve(
+            &mut alice,
+            SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            },
+        )
+        .await,
+        &group_id,
+        WELCOME_CREATED_AT + 60,
+    );
+    let ahead = route_at(
+        chat(&mut alice, &group_id, "from the epoch ahead").await,
+        &group_id,
+        WELCOME_CREATED_AT + 90,
+    );
+
+    let outcome = bob.ingest(ahead.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::TransportDeferred { .. }),
+        "a message this copy cannot open YET must keep its retry, got {outcome:?}"
+    );
+    assert_eq!(deferred_rows(&bob_storage, &group_id), 1);
+
+    bob.ingest(commit).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    bob.drain_events();
+
+    bob.retry_deferred_peels(&group_id).await.unwrap();
+    assert!(
+        bob.drain_events().iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::MessageReceived { group_id: id, .. } if *id == group_id
+        )),
+        "once the commit lands, the deferred message opens"
+    );
+    assert_eq!(
+        deferred_rows(&bob_storage, &group_id),
+        0,
+        "and it leaves the deferred lifecycle"
+    );
+}
+
+/// An unopenable row from before this copy's Welcome is released quietly.
+///
+/// A device removed at epoch N and re-added at N+k is served the whole gap by
+/// relay redelivery and by the re-join replay, and none of it peels: the
+/// install epoch's secrets only exist from the Add commit onward. Those rows
+/// are still retained and still released on their own budget — nothing about
+/// that changes, because pre-peel this seam cannot tell a commit from an
+/// application message, and an application message carries its sender's
+/// compose time, which the offline outbox can leave hours behind the moment it
+/// actually went out. Refusing on time would eventually drop a live message
+/// for good.
+///
+/// What the timestamp is good enough for is the *notification*. A release
+/// raises `TransportObjectResourceRefused`, which the application reads as
+/// recovery evidence and arms a history backfill from. For traffic older than
+/// this copy's Welcome that backfill can only re-fetch history this copy can
+/// never open, so the release happens either way and only the announcement is
+/// suppressed — a decision that costs nothing when the guess is wrong.
+#[tokio::test]
+async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"release").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+
+    // Alice advances and speaks from the new epoch; the commit is withheld, so
+    // neither message peels on bob's copy. They differ only in envelope time.
+    let _withheld = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let predating = route_at(
+        chat(&mut alice, &group_id, "from before this copy").await,
+        &group_id,
+        WELCOME_CREATED_AT - 4 * 3600,
+    );
+    let live = route_at(
+        chat(&mut alice, &group_id, "from after this copy").await,
+        &group_id,
+        WELCOME_CREATED_AT + 60,
+    );
+    // Their residence budget is spent the moment they are retained.
+    bob.set_deferred_peel_residence_ms(0);
+    for msg in [&predating, &live] {
+        assert!(
+            matches!(
+                bob.ingest(msg.clone()).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ),
+            "both rows are retained: a timestamp is never grounds to refuse one"
+        );
+    }
+    assert_eq!(deferred_rows(&bob_storage, &group_id), 2);
+    bob.drain_events();
+
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        bob.retry_deferred_peels(&group_id).await.unwrap();
+        events.extend(bob.drain_events());
+        if deferred_rows(&bob_storage, &group_id) == 0 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        deferred_rows(&bob_storage, &group_id),
+        0,
+        "both rows are released on the same budget"
+    );
+    let refused: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                message_id, ..
+            } => Some(message_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vec![live.id.clone()],
+        "only the row that could plausibly be this copy's history announces its release"
+    );
+}
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after the Unix epoch")
+        .as_secs()
+}
+
+/// A Welcome dated in the future records this device's clock, not the claim.
+///
+/// The value is the NIP-59 welcome rumor's `created_at`, and no relay validates
+/// it. An inviter running fast — or lying outright — would otherwise place the
+/// floor ahead of every message that follows, and the copy would treat its own
+/// live traffic as the group's history.
+#[tokio::test]
+async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"clamp").await;
+
+    let far_future = u64::MAX;
+    let welcome = readd(&mut alice, &mut bob, &group_id, far_future).await;
+    let before_join = unix_seconds_now();
+    bob.join_welcome(welcome).await.unwrap();
+    let after_join = unix_seconds_now();
+
+    let recorded = bob_storage
+        .get_group(&group_id)
+        .unwrap()
+        .local_copy_welcome_created_at
+        .expect("a welcome-installed copy records its invitation time");
+    assert!(
+        (before_join..=after_join).contains(&recorded.0),
+        "an unvalidated future claim is replaced by this device's clock at the join, got {recorded:?}"
+    );
+    assert!(
+        !bob_storage
+            .get_group(&group_id)
+            .unwrap()
+            .transport_message_predates_local_copy(cgka_traits::transport::Timestamp(recorded.0)),
+        "and nothing arriving now may look like this copy's history"
     );
 }

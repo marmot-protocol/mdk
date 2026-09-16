@@ -5787,3 +5787,43 @@ async fn rows_beyond_the_reopen_bound_are_released_for_redelivery() {
         "and the re-opened chatter behind it surfaces once the commit lands"
     );
 }
+
+/// An application message from below this copy's install epoch is classified
+/// against the copy, not against a retention window it was never inside.
+///
+/// A replacement Welcome deliberately records `join_epoch = 0` so
+/// prior-interval messages stay decryptable from retained anchors, which left
+/// the direct-apply seam's past-epoch refinement with only that one floor: on
+/// every replacement copy it reads "unknown", and the eviction era's traffic —
+/// epochs this copy holds no state for and never will — comes back as
+/// `BeyondAppRetention`, i.e. "you were a member, the secrets aged out". The
+/// other floor the commit path already uses, `local_copy_install_epoch`, is
+/// exactly the missing statement.
+#[tokio::test]
+async fn an_app_message_from_below_this_copys_install_epoch_is_not_a_retention_expiry() {
+    let (mut alice, mut bob, _bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"below-install-app").await;
+
+    bob.ingest(routed_commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Spoken while bob was out, from an epoch his replacement copy never held.
+    let era_chat = post_eviction_app_message(&mut alice, &group_id, b"while you were out").await;
+
+    let (rejoin_welcome, _) =
+        readd_bob_then_commit_ahead_of_the_welcome(&mut alice, &mut bob, &group_id).await;
+    bob.join_welcome(rejoin_welcome).await.unwrap();
+    bob.drain_events();
+
+    let outcome = bob.ingest(era_chat).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::PredatesLocalCopy
+            }
+        ),
+        "got {outcome:?}"
+    );
+}
