@@ -674,7 +674,10 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::StreamFinal { .. } => {
             Some(notifications::NotificationTrigger::NewMessage)
         }
-        AppMessageIntent::Reaction { .. }
+        AppMessageIntent::Report { .. }
+        | AppMessageIntent::DismissReports { .. }
+        | AppMessageIntent::RemoveMessage { .. }
+        | AppMessageIntent::Reaction { .. }
         | AppMessageIntent::Unreact { .. }
         | AppMessageIntent::DeleteReactions { .. }
         | AppMessageIntent::Edit { .. }

@@ -304,6 +304,7 @@ pub(crate) struct GroupRouteRefresh {
 }
 
 pub struct AppClient {
+    pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
@@ -3535,6 +3536,9 @@ impl AppClient {
     {
         use crate::{ProductFamily as Family, ProductUnit};
         let (family, operation) = match &intent {
+            AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
+                (Family::MessageAction, "custom")
+            }
             AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
@@ -3542,7 +3546,9 @@ impl AppClient {
                 (Family::MessageAction, "unreact")
             }
             AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
-            AppMessageIntent::Delete { .. } => (Family::MessageAction, "delete"),
+            AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
+                (Family::MessageAction, "delete")
+            }
             AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
             AppMessageIntent::PushTokenUpdate { .. } => (Family::Notification, "update"),
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
@@ -3601,6 +3607,68 @@ impl AppClient {
         // kind-5 delete. Resolve every matching active own reaction from the
         // projection and place all ids in one tombstone so remove-all is atomic.
         let intent = match intent {
+            AppMessageIntent::Report {
+                target_message_id,
+                reason,
+                explanation,
+                ..
+            } => {
+                let storage = self.app.account_storage(&self.state.label)?;
+                let group_hex = hex::encode(group_id.as_slice());
+                let author = storage
+                    .report_target_author(&group_hex, &target_message_id)?
+                    .ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload("report target is unavailable".into())
+                    })?;
+                AppMessageIntent::Report {
+                    target_message_id,
+                    reason,
+                    explanation,
+                    target_author: Some(author),
+                }
+            }
+            AppMessageIntent::DismissReports { ref report_ids, .. } => {
+                if !self.delete_moderation_grant(group_id, &sender) {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "group admin authority required".into(),
+                    ));
+                }
+                let storage = self.app.account_storage(&self.state.label)?;
+                for id in report_ids {
+                    if !storage.report_is_reviewable(&hex::encode(group_id.as_slice()), id)? {
+                        return Err(AppError::InvalidAppMessagePayload(
+                            "report is unavailable in this group".into(),
+                        ));
+                    }
+                }
+                intent
+            }
+            AppMessageIntent::Delete { target_message_id } => {
+                let storage = self.app.account_storage(&self.state.label)?;
+                let target =
+                    storage.app_message(&hex::encode(group_id.as_slice()), &target_message_id)?;
+                if target.as_ref().is_some_and(|target| {
+                    target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                }) && self.delete_moderation_grant(group_id, &sender)
+                    && storage
+                        .report_target_author(
+                            &hex::encode(group_id.as_slice()),
+                            &target_message_id,
+                        )?
+                        .is_some()
+                {
+                    AppMessageIntent::RemoveMessage { target_message_id }
+                } else {
+                    if target.is_some_and(|target| target.sender != sender) {
+                        return Err(AppError::InvalidAppMessagePayload(
+                            "an available chat message and group admin authority are required to remove another account's content".into(),
+                        ));
+                    }
+                    // An unavailable moderation target does not take away the
+                    // author's ordinary retraction path after invalidation or pruning.
+                    AppMessageIntent::Delete { target_message_id }
+                }
+            }
             AppMessageIntent::Unreact {
                 target_message_id,
                 emoji,
@@ -3668,6 +3736,7 @@ impl AppClient {
         if should_project_locally {
             let update = self.record_send_intent_projection(group_id, &sender, &event)?;
             on_local_projection(update);
+            self.publish_conversation_captures(group_id);
         }
 
         let send_result = match self.sync_runtime_groups().await {
@@ -3765,8 +3834,13 @@ impl AppClient {
         });
         let source_message_id_hex =
             published.map(|published| hex::encode(published.message_id.as_slice()));
-        let source_state =
-            published.map(|published| (published.source_epoch.0, published.retention));
+        let source_state = published.map(|published| {
+            (
+                published.source_epoch.0,
+                published.retention,
+                published.authority,
+            )
+        });
         if should_project_locally {
             let projection = (|| {
                 let update = self.record_local_app_event_projection(
@@ -3808,6 +3882,11 @@ impl AppClient {
             .await;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
+            // A checkpoint is needed only when another transport wait follows;
+            // otherwise the worker can service the already-invalidated window.
+            if should_project_locally {
+                self.publish_conversation_captures(group_id);
+            }
             self.publish_notification_trigger_best_effort(
                 group_id,
                 notifications::NotificationTrigger::NewMessage,
@@ -4085,6 +4164,48 @@ impl AppClient {
         Ok(summary)
     }
 
+    pub async fn report_message(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &str,
+        reason: crate::ReportReason,
+        explanation: &str,
+    ) -> Result<SendSummary, AppError> {
+        let (_, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Report {
+                    target_message_id: message_id.into(),
+                    reason,
+                    explanation: explanation.into(),
+                    target_author: None,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+    pub async fn dismiss_reports(
+        &mut self,
+        group_id: &GroupId,
+        report_ids: Vec<String>,
+        explanation: &str,
+    ) -> Result<SendSummary, AppError> {
+        let (_, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::DismissReports {
+                    report_ids,
+                    explanation: explanation.into(),
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    /// Remove a whole chat with kind 4891 when an eligible admin, including one's
+    /// own chat. Otherwise delete one's own target with kind 5. A non-admin
+    /// targeting another account's known message receives an error before send.
+    /// Older clients may retain content removed by kind 4891.
     pub async fn delete_message(
         &mut self,
         group_id: &GroupId,

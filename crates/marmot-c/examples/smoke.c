@@ -28,6 +28,14 @@ _Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER == 0, "older ABI value")
 _Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_NEWER == 1, "newer ABI value");
 _Static_assert(MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED == 92, "missing target ABI value");
 
+_Static_assert(MARMOT_REPORT_REASON_NUDITY == 0, "report reason ABI value");
+_Static_assert(MARMOT_REPORT_REASON_MALWARE == 1, "report reason ABI value");
+_Static_assert(MARMOT_REPORT_REASON_PROFANITY == 2, "report reason ABI value");
+_Static_assert(MARMOT_REPORT_REASON_ILLEGAL == 3, "report reason ABI value");
+_Static_assert(MARMOT_REPORT_REASON_SPAM == 4, "report reason ABI value");
+_Static_assert(MARMOT_REPORT_REASON_IMPERSONATION == 5, "report reason ABI value");
+_Static_assert(MARMOT_REPORT_REASON_OTHER == 6, "report reason ABI value");
+
 static int failures = 0;
 
 static void ok(const char *what) {

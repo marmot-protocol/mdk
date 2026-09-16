@@ -55,6 +55,7 @@ pub struct PresentationVersionFfi {
 pub struct PresentedChatRowFfi {
     pub row: ChatListRowFfi,
     pub presentation: ConversationPresentationFfi,
+    pub avatar_asset: Option<super::AvatarAssetFfi>,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct PresentedChatListSnapshotFfi {
@@ -158,6 +159,7 @@ impl From<app::ChatPresentationVersion> for PresentationVersionFfi {
 impl From<app::PresentedChatRow> for PresentedChatRowFfi {
     fn from(v: app::PresentedChatRow) -> Self {
         Self {
+            avatar_asset: v.avatar_asset.map(Into::into),
             row: v.row.into(),
             presentation: v.presentation.into(),
         }

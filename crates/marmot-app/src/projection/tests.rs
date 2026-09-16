@@ -265,6 +265,7 @@ fn prune_group_messages_before_removes_only_expired_group_rows() {
         ("old-bb", "bb", 10),
     ] {
         db.record_message(&AppMessageProjection {
+            authority: None,
             message_id_hex: message_id_hex.to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),

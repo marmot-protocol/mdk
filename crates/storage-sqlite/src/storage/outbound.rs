@@ -401,6 +401,7 @@ mod tests {
         let mut expected = sample_fanout(8);
         expected
             .set_application_message(OutboundApplicationMessage {
+                authority: None,
                 group_id: gid(1),
                 app_event_id: "durable-app-event".into(),
                 source_epoch: EpochId(7),

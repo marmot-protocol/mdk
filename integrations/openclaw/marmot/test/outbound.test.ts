@@ -109,6 +109,7 @@ describe("createMarmotMessageAdapter", () => {
       nowMs: () => 1234,
     });
 
+    markMarmotInboundStarting("default");
     const ctx = {
       cfg: {},
       to: HEX32("cc"),
@@ -302,6 +303,7 @@ describe("createMarmotMessageAdapter", () => {
       const filePath = join(tmpRoot, "cat.png");
       await writeFile(filePath, Buffer.from("png-bytes"));
       const calls = emptyClientCalls();
+      markMarmotInboundStarting("default");
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
         nowMs: () => 5678,

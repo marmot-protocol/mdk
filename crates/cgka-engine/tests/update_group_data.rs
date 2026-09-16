@@ -1793,6 +1793,7 @@ async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
             app_event_id,
             source_epoch,
             retention,
+            ..
         } => {
             assert_eq!(group_id, gid);
             assert_eq!(app_event_id, before_enable_event_id);
@@ -1861,6 +1862,7 @@ async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
             app_event_id,
             source_epoch,
             retention,
+            ..
         } => {
             assert_eq!(group_id, gid);
             assert_eq!(app_event_id, before_disable_event_id);
@@ -3379,4 +3381,594 @@ async fn invalid_group_avatar_url_component_is_rejected() {
         .unwrap();
 
     assert!(matches!(err, EngineError::Serialize(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn moderation_uses_authenticated_source_policy_after_admin_demotion() {
+    let (mut alice, _alice_storage, mut bob, bob_storage, gid) =
+        create_admin_pair_with_storage().await;
+    alice.drain_events();
+    bob.drain_events();
+    let payload = MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        1,
+        4891,
+        vec![vec!["e".into(), "11".repeat(32)]],
+        r#"{"v":1,"action":"remove"}"#,
+    )
+    .encode()
+    .unwrap();
+    let (message, sent_authority) = match bob
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, authority, .. } => {
+            (route_to_group(&msg, &gid), authority.unwrap())
+        }
+        _ => unreachable!(),
+    };
+    assert!(sent_authority.moderation_grant);
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match update {
+        SendResult::GroupEvolution { msg, pending, .. } => (route_to_group(&msg, &gid), pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(commit).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    alice.ingest(message).await.unwrap();
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { authority, .. } => authority,
+            _ => None,
+        })
+        .expect("delayed authority is recovered");
+    assert_eq!(received, sent_authority);
+    // Restart the demoted sender and reject a new review at encryption time.
+    drop(bob);
+    let mut bob = build_with_storage_and_peeler(b"bob", bob_storage, mock_peeler());
+    bob.converge_stored_openmls_messages_at(&gid, 1_000_001)
+        .unwrap();
+    let payload = MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        2,
+        4891,
+        vec![vec!["e".into(), "22".repeat(32)]],
+        r#"{"v":1,"action":"remove"}"#,
+    )
+    .encode()
+    .unwrap();
+    assert!(
+        bob.send(SendIntent::AppMessage {
+            group_id: gid,
+            payload,
+            expected_epoch: None
+        })
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unavailable_moderation_authority_survives_restart_and_resolves_later() {
+    let (mut alice, alice_storage, mut bob, _bob_storage, gid) =
+        create_admin_pair_with_storage().await;
+    alice_storage
+        .create_group_state_snapshot(&gid, "test-authority-source")
+        .unwrap();
+    alice.drain_events();
+    bob.drain_events();
+    let payload = MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        1,
+        4891,
+        vec![vec!["e".into(), "11".repeat(32)]],
+        r#"{"v":1,"action":"remove"}"#,
+    )
+    .encode()
+    .unwrap();
+    let (message, sent_authority) = match bob
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, authority, .. } => {
+            (route_to_group(&msg, &gid), authority.unwrap())
+        }
+        _ => unreachable!(),
+    };
+    assert!(sent_authority.moderation_grant);
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match update {
+        SendResult::GroupEvolution { msg, pending, .. } => (route_to_group(&msg, &gid), pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(commit).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    alice_storage
+        .release_group_snapshot(&gid, "openmls-retained-anchor-1")
+        .unwrap();
+    alice.ingest(message).await.unwrap();
+    assert!(alice.drain_events().iter().any(|event| matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
+            ..
+        }
+    )));
+    let ids = alice_storage
+        .list_pending_application_events()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                Some(message_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    alice_storage
+        .delete_pending_application_events(&ids)
+        .unwrap();
+    let requests = alice_storage
+        .pending_application_authority_batch(None, 10)
+        .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!serde_json::to_string(&requests).unwrap().contains("remove"));
+    drop(alice);
+    let mut alice = build_with_storage_and_peeler(b"alice", alice_storage.clone(), mock_peeler());
+    assert!(alice.drain_events().is_empty());
+    alice.recover_pending_application_authority().unwrap();
+    assert!(alice.drain_events().is_empty());
+    // A present but wrong source snapshot must not cause a rewind on every
+    // maintenance pass. Replacement under the same name must remain retryable.
+    alice_storage
+        .create_group_state_snapshot(&gid, "openmls-retained-anchor-1")
+        .unwrap();
+    alice.recover_pending_application_authority().unwrap(); // wrap cursor
+    alice.recover_pending_application_authority().unwrap(); // attempt bad evidence
+    let generation = alice_storage.mls_write_generation();
+    assert!(generation.is_some());
+    alice.recover_pending_application_authority().unwrap(); // wrap cursor
+    alice.recover_pending_application_authority().unwrap(); // unchanged evidence
+    assert_eq!(generation, alice_storage.mls_write_generation());
+    assert!(alice.drain_events().is_empty());
+    alice_storage
+        .create_group_state_snapshot(&gid, "test-authority-live")
+        .unwrap();
+    alice_storage
+        .rollback_group_state_to_snapshot(&gid, "test-authority-source")
+        .unwrap();
+    alice_storage
+        .create_group_state_snapshot(&gid, "openmls-retained-anchor-1")
+        .unwrap();
+    alice_storage
+        .rollback_group_state_to_snapshot(&gid, "test-authority-live")
+        .unwrap();
+    // The bounded cursor wraps after an unresolved pass, then retries.
+    assert!(alice.drain_events().is_empty());
+    alice.recover_pending_application_authority().unwrap();
+    alice.recover_pending_application_authority().unwrap();
+    let received = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { authority, .. } => authority,
+            _ => None,
+        })
+        .expect("delayed authority is recovered");
+    assert_eq!(received, sent_authority);
+}
+
+#[tokio::test]
+async fn unresolved_moderation_proof_preserves_source_epoch_retention() {
+    use tls_codec::Deserialize as _;
+    let (mut alice, storage, mut bob, _, gid) = create_admin_pair_with_storage().await;
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match update {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(route_to_group(&commit, &gid)).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    let payload = MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        100,
+        1985,
+        vec![
+            vec!["L".into(), "marmot.report-review.v1".into()],
+            vec![
+                "l".into(),
+                "dismissed".into(),
+                "marmot.report-review.v1".into(),
+            ],
+            vec!["e".into(), "11".repeat(32)],
+        ],
+        "expiring explanation",
+    )
+    .encode()
+    .unwrap();
+    let (message, epoch) = match bob
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage {
+            msg, source_epoch, ..
+        } => (route_to_group(&msg, &gid), source_epoch),
+        _ => unreachable!(),
+    };
+    // An otherwise correct source snapshot can no longer authenticate a
+    // ciphertext once its sender ratchet has consumed it. The live receiver
+    // still has its unused past-epoch ratchet and can deliver the report.
+    storage
+        .create_group_state_snapshot(&gid, "test-before-report")
+        .unwrap();
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let protocol = openmls::prelude::MlsMessageIn::tls_deserialize_exact(&message.payload)
+        .unwrap()
+        .try_into_protocol_message()
+        .unwrap();
+    group.process_message(&provider, protocol).unwrap();
+    storage
+        .create_group_state_snapshot(&gid, "test-consumed-report")
+        .unwrap();
+    storage
+        .rollback_group_state_to_snapshot(&gid, "test-before-report")
+        .unwrap();
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 0u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let pending = match update {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    storage
+        .create_group_state_snapshot(&gid, "test-current-report-state")
+        .unwrap();
+    storage
+        .rollback_group_state_to_snapshot(&gid, "test-consumed-report")
+        .unwrap();
+    storage
+        .create_group_state_snapshot(&gid, &format!("openmls-retained-anchor-{}", epoch.0))
+        .unwrap();
+    storage
+        .rollback_group_state_to_snapshot(&gid, "test-current-report-state")
+        .unwrap();
+    alice.drain_events();
+    alice.ingest(message).await.unwrap();
+    let (authority, retention) = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived {
+                authority,
+                retention,
+                ..
+            } => Some((authority, retention)),
+            _ => None,
+        })
+        .expect("report remains deliverable using live past-epoch secrets");
+    assert!(
+        authority.is_none(),
+        "consumed snapshot cannot prove moderation authority"
+    );
+    assert_eq!(retention, Some(AppMessageRetentionDecision::new(100, 60)));
+    let pending = storage
+        .pending_application_authority_batch(None, 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].retention, retention);
+}
+
+#[tokio::test]
+async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
+    let (mut alice, _, mut bob, bob_storage, gid) = create_admin_pair_with_storage().await;
+    // Bob loses admin authority in the source epoch of the malicious removal.
+    let demote = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match demote {
+        SendResult::GroupEvolution { msg, pending, .. } => (route_to_group(&msg, &gid), pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(commit).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    alice.drain_events();
+    bob.drain_events();
+    let payload = MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        1,
+        4891,
+        vec![vec!["e".into(), "11".repeat(32)]],
+        r#"{"v":1,"action":"remove"}"#,
+    )
+    .encode()
+    .unwrap();
+    assert!(matches!(
+        bob.send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await,
+        Err(EngineError::InvalidAppMessagePayload(_))
+    ));
+    // A hostile client can bypass send preflight. Authenticate its real MLS
+    // ciphertext on receive; never substitute the later promoted policy.
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, bob_storage.mls_storage());
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = bob_storage
+        .account_device_signer(&bob.self_id())
+        .unwrap()
+        .unwrap();
+    let signer = SignatureKeyPair::read(
+        bob_storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let wire = group
+        .create_message(&provider, &signer, &payload)
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+    let message = TransportMessage {
+        id: hash_id(&wire),
+        payload: wire,
+        timestamp: Timestamp(1),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+    };
+    let promote = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[
+                    alice.self_id().as_slice().to_vec(),
+                    bob.self_id().as_slice().to_vec(),
+                ]),
+            }],
+        })
+        .await
+        .unwrap();
+    let pending = match promote {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice.ingest(message).await.unwrap();
+    let authority = alice
+        .drain_events()
+        .into_iter()
+        .find_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { authority, .. } => authority,
+            _ => None,
+        })
+        .expect("source authority is authenticated even when it denies the removal");
+
+    assert!(!authority.moderation_grant);
+}
+
+#[tokio::test]
+async fn ordinary_messages_and_author_deletion_omit_moderation_authority() {
+    let (mut alice, alice_storage, mut bob, _, gid) = create_admin_pair_with_storage().await;
+    alice.drain_events();
+    for kind in [9, 7, 1009, 5, 1984] {
+        let payload = MarmotAppEvent::new(
+            hex::encode(bob.self_id().as_slice()),
+            1,
+            kind,
+            vec![vec!["e".into(), "11".repeat(32)]],
+            "ordinary",
+        )
+        .encode()
+        .unwrap();
+        let sent = bob
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let message = match sent {
+            SendResult::ApplicationMessage { msg, authority, .. } => {
+                assert!(
+                    authority.is_none(),
+                    "only moderation controls get policy evidence"
+                );
+                route_to_group(&msg, &gid)
+            }
+            _ => unreachable!(),
+        };
+        alice.ingest(message).await.unwrap();
+        assert!(alice.drain_events().iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::MessageReceived {
+                authority: None,
+                ..
+            }
+        )));
+    }
+    assert!(
+        alice_storage
+            .pending_application_authority_batch(None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn engine_allows_moderation_in_unnamed_two_account_groups() {
+    let (mut alice, _, gid) = create_pair().await;
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some(" ".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let pending = match rename {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    for kind in [1984, 1985, 4891] {
+        let payload = MarmotAppEvent::new(
+            hex::encode(alice.self_id().as_slice()),
+            1,
+            kind,
+            vec![vec!["e".into(), "11".repeat(32)]],
+            "",
+        )
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: gid.clone(),
+                    payload,
+                    expected_epoch: None
+                })
+                .await,
+            Ok(SendResult::ApplicationMessage { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn moderation_authority_distinguishes_same_epoch_sibling_branches() {
+    let (mut alice, _a, mut bob, _b, gid) = create_admin_pair_with_storage().await;
+    for (engine, name) in [(&mut alice, "branch a"), (&mut bob, "branch b")] {
+        let result = engine
+            .send(SendIntent::UpdateGroupData {
+                group_id: gid.clone(),
+                name: Some(name.into()),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let pending = match result {
+            SendResult::GroupEvolution { pending, .. } => pending,
+            _ => unreachable!(),
+        };
+        engine.confirm_published(pending).await.unwrap();
+    }
+    let mut contexts = Vec::new();
+    for engine in [&mut alice, &mut bob] {
+        let payload = MarmotAppEvent::new(
+            hex::encode(engine.self_id().as_slice()),
+            1,
+            4891,
+            vec![vec!["e".into(), "11".repeat(32)]],
+            r#"{"v":1,"action":"remove"}"#,
+        )
+        .encode()
+        .unwrap();
+        match engine
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::ApplicationMessage {
+                source_epoch,
+                authority: Some(authority),
+                ..
+            } => {
+                assert!(authority.moderation_grant);
+                contexts.push((source_epoch, authority.source_context));
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(contexts[0].0, contexts[1].0);
+    assert_ne!(contexts[0].1, contexts[1].1);
 }

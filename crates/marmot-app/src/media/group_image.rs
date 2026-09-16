@@ -13,7 +13,7 @@ use cgka_traits::app_components::canonicalize_marmot_media_type;
 
 use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{
-    BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_with_transport, upload_blossom_blob,
+    BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_bounded, upload_blossom_blob,
 };
 use crate::{AppError, AppGroupImageInput};
 
@@ -31,6 +31,13 @@ fn canonical_group_image_media_type(value: &str) -> Result<String, AppError> {
 }
 
 fn validate_group_image_input(plaintext: &[u8], media_type: &str) -> Result<String, AppError> {
+    inspect_group_image_input(plaintext, Some(media_type)).map(|(media_type, _, _)| media_type)
+}
+
+pub(super) fn inspect_group_image_input(
+    plaintext: &[u8],
+    media_type: Option<&str>,
+) -> Result<(String, u32, u32), AppError> {
     if plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "group image cannot be empty".into(),
@@ -41,13 +48,27 @@ fn validate_group_image_input(plaintext: &[u8], media_type: &str) -> Result<Stri
             "group image exceeds {MAX_GROUP_IMAGE_BYTES}-byte size limit"
         )));
     }
-    let media_type = canonical_group_image_media_type(media_type)?;
     let reader = image::ImageReader::new(Cursor::new(plaintext))
         .with_guessed_format()
         .map_err(|_| AppError::InvalidEncryptedMedia("group image format is invalid".into()))?;
     let detected_format = reader.format().ok_or_else(|| {
         AppError::InvalidEncryptedMedia("group image format is not recognized".into())
     })?;
+    let media_type = match media_type {
+        Some(value) => canonical_group_image_media_type(value)?,
+        None => match detected_format {
+            image::ImageFormat::Png => "image/png",
+            image::ImageFormat::Jpeg => "image/jpeg",
+            image::ImageFormat::Gif => "image/gif",
+            image::ImageFormat::WebP => "image/webp",
+            _ => {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "unsupported avatar image".into(),
+                ));
+            }
+        }
+        .to_owned(),
+    };
     let declared_format = match media_type.as_str() {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -76,7 +97,7 @@ fn validate_group_image_input(plaintext: &[u8], media_type: &str) -> Result<Stri
             "group image dimensions exceed {MAX_GROUP_IMAGE_DIMENSION}px or {MAX_GROUP_IMAGE_PIXELS} pixels"
         )));
     }
-    Ok(media_type)
+    Ok((media_type, width, height))
 }
 
 /// Result of encrypting + uploading a group avatar. Maps directly onto the
@@ -258,8 +279,14 @@ pub(crate) async fn fetch_group_image_with_transport(
     // Group images are content-addressed over the public default Blossom server
     // and are not part of the loopback-blob-endpoint dev/test path, so loopback
     // HTTP is never permitted here.
-    let encrypted =
-        fetch_blossom_blob_with_transport(&url, &transport.with_loopback_disabled()).await?;
+    let encrypted = fetch_blossom_blob_bounded(
+        &url,
+        &transport.with_loopback_disabled(),
+        None,
+        tokio::time::Instant::now() + transport.transfer_timeout(),
+        MAX_GROUP_IMAGE_BYTES as u64 + 16,
+    )
+    .await?;
     let actual_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_hash != image_hash_hex.to_ascii_lowercase() {
         return Err(AppError::InvalidEncryptedMedia(

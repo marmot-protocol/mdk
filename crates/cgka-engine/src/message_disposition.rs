@@ -16,6 +16,17 @@ pub(crate) enum MessageDisposition {
     /// that epoch is now outside the retained app-payload decryption window.
     /// Terminal under the active convergence policy.
     AppPayloadRetentionExpired,
+    /// Two readings, one meaning: the message belongs to the group's history
+    /// from before this local copy was installed. As a verdict, an application
+    /// message that opened but whose source epoch lies below
+    /// `Group::local_copy_install_epoch`, refused by OpenMLS as too distant in
+    /// the past; terminal like `AppPayloadRetentionExpired`. As a release
+    /// reason, a `PeelDeferred` row whose envelope predates the Welcome
+    /// (`Group::local_copy_welcome_created_at`) and left on its own residence
+    /// or retry budget; that release raises no resource-refusal, because such
+    /// traffic is expected after a join and is not evidence of a stall. Time
+    /// never decides a terminal state here.
+    PredatesLocalCopy,
     /// The transport bytes failed to peel against the current epoch context
     /// and every retained snapshot. Retained as `PeelDeferred`; retried only
     /// when the (epoch, snapshot-set) peel context actually changes.
@@ -43,6 +54,7 @@ impl MessageDisposition {
         match self {
             Self::PreMembershipEvent => "pre_membership_event",
             Self::AppPayloadRetentionExpired => "app_payload_retention_expired",
+            Self::PredatesLocalCopy => "predates_local_copy",
             // Historical audit string, kept for dashboard continuity.
             Self::RetryPending => "peel_failed_no_snapshot",
             Self::RetryBudgetRefused => "resource_refused_retry_budget",

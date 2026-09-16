@@ -20,12 +20,14 @@ pub const MAX_AVATAR_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Bounds missing source mappings as well as populated images.
 pub const MAX_AVATAR_CACHE_ENTRIES: u64 = 2048;
 pub const MAX_AVATAR_DIMENSION: u32 = 4096;
+/// Maximum explicit identity registrations returned in one maintenance page.
+pub const AVATAR_IDENTITY_BATCH_LIMIT: usize = 64;
 const MAX_KEY_BYTES: usize = 512;
 
 /// A source generation, scoped to the existing account store epoch. Neither the
 /// owner key nor image material is exposed. A reference is not an authorization
 /// grant: callers must still select the correct account using the host contract.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AvatarAssetRef {
     store_epoch: Vec<u8>,
     token: Vec<u8>,
@@ -120,7 +122,7 @@ impl fmt::Debug for AvatarImage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AvatarAvailability {
     Missing,
     Ready,
@@ -128,7 +130,7 @@ pub enum AvatarAvailability {
     Invalidated,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AvatarAssetStatus {
     pub availability: AvatarAvailability,
     /// Use together with the source reference to key a decoded-image cache.
@@ -139,6 +141,8 @@ pub struct AvatarAssetStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvatarAssetRead {
+    /// This read discarded corrupt stored bytes. Ordinary cache misses are false.
+    pub repaired: bool,
     pub status: AvatarAssetStatus,
     pub image: Option<AvatarImage>,
 }
@@ -186,37 +190,36 @@ impl SqliteAccountStorage {
     ) -> StorageResult<AvatarAssetRef> {
         validate_key(owner)?;
         validate_key(source)?;
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let accessed = next_access(&tx)?;
-        let unchanged: bool = tx.query_row(
+        self.connection.with_transaction(|| {
+            let tx = self.lock()?;
+            let accessed = next_access(&tx)?;
+            let unchanged: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM avatar_assets WHERE owner_key = ?1 AND source_key = ?2)",
             params![owner, source], |r| r.get(0),
         ).storage()?;
-        if !unchanged {
-            tx.execute(
-                "INSERT INTO avatar_assets(owner_key, source_key, token)
+            if !unchanged {
+                tx.execute(
+                    "INSERT INTO avatar_assets(owner_key, source_key, token)
                  VALUES(?1, ?2, randomblob(16))
                  ON CONFLICT(owner_key) DO UPDATE SET
                     token = excluded.token, source_key = excluded.source_key,
                     content_revision = 0, bytes = NULL, digest = NULL, media_type = NULL,
                     width = NULL, height = NULL, refresh_at = NULL",
-                params![owner, source],
-            )
-            .storage()?;
-        }
-        let reference =
-            reference_for_owner(&tx, owner)?.ok_or_else(|| invalid("avatar binding missing"))?;
-        touch_access(&tx, &reference.token, accessed)?;
-        // Repeated bindings cannot grow the cache: avoid scanning usage or
-        // rewriting a blob just because another screen asks for the same source.
-        if unchanged {
-            tx.commit().storage()?;
-            return Ok(reference);
-        }
-        evict(&tx, &reference.token, limits)?;
-        tx.commit().storage()?;
-        Ok(reference)
+                    params![owner, source],
+                )
+                .storage()?;
+            }
+            let reference = reference_for_owner(&tx, owner)?
+                .ok_or_else(|| invalid("avatar binding missing"))?;
+            touch_access(&tx, &reference.token, accessed)?;
+            // Repeated bindings cannot grow the cache: avoid scanning usage or
+            // rewriting a blob just because another screen asks for the same source.
+            if unchanged {
+                return Ok(reference);
+            }
+            evict(&tx, &reference.token, limits)?;
+            Ok(reference)
+        })
     }
 
     /// Metadata-only lookup. It neither creates demand nor changes recency.
@@ -269,37 +272,37 @@ impl SqliteAccountStorage {
             return Err(invalid("avatar exceeds cache capacity"));
         }
         let digest = Sha256::digest(image.bytes());
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let accessed = next_access(&tx)?;
-        let changed = tx
-            .execute(
-                "UPDATE avatar_assets SET bytes = ?1, digest = ?2, media_type = ?3,
+        self.connection.with_transaction(|| {
+            let tx = self.lock()?;
+            let changed = tx
+                .execute(
+                    "UPDATE avatar_assets SET bytes = ?1, digest = ?2, media_type = ?3,
                 width = ?4, height = ?5, refresh_at = ?6,
                 content_revision = content_revision + 1
              WHERE token = ?7 AND content_revision = ?8
                 AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?9",
-                params![
-                    image.bytes(),
-                    digest.as_slice(),
-                    image.format.media_type(),
-                    image.width,
-                    image.height,
-                    refresh_at,
-                    reference.token,
-                    expected,
-                    reference.store_epoch
-                ],
-            )
-            .storage()?;
-        if changed == 0 {
-            return Ok(AvatarPublishResult::Superseded);
-        }
-        touch_access(&tx, &reference.token, accessed)?;
-        evict(&tx, &reference.token, limits)?;
-        tx.commit().storage()?;
-        Ok(AvatarPublishResult::Published {
-            content_revision: expected as u64 + 1,
+                    params![
+                        image.bytes(),
+                        digest.as_slice(),
+                        image.format.media_type(),
+                        image.width,
+                        image.height,
+                        refresh_at,
+                        reference.token,
+                        expected,
+                        reference.store_epoch
+                    ],
+                )
+                .storage()?;
+            if changed == 0 {
+                return Ok(AvatarPublishResult::Superseded);
+            }
+            let accessed = next_access(&tx)?;
+            touch_access(&tx, &reference.token, accessed)?;
+            evict(&tx, &reference.token, limits)?;
+            Ok(AvatarPublishResult::Published {
+                content_revision: expected as u64 + 1,
+            })
         })
     }
 
@@ -311,10 +314,29 @@ impl SqliteAccountStorage {
         reference: &AvatarAssetRef,
         now: u64,
     ) -> StorageResult<AvatarAssetRead> {
+        self.read_avatar_bounded(reference, now, MAX_AVATAR_BYTES as u64)
+    }
+
+    /// A budget miss returns ready/stale metadata with no image and does not
+    /// read the BLOB, touch recency, or invalidate usable bytes.
+    pub fn read_avatar_bounded(
+        &self,
+        reference: &AvatarAssetRef,
+        now: u64,
+        max_bytes: u64,
+    ) -> StorageResult<AvatarAssetRead> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let mut state = status(&tx, reference, now)?;
+        if state.byte_count > max_bytes && state.byte_count <= MAX_AVATAR_BYTES as u64 {
+            return Ok(AvatarAssetRead {
+                status: state,
+                image: None,
+                repaired: false,
+            });
+        }
         let mut image = None;
+        let mut repaired = false;
         if matches!(
             state.availability,
             AvatarAvailability::Ready | AvatarAvailability::Stale
@@ -361,10 +383,12 @@ impl SqliteAccountStorage {
                 )
                 .storage()?;
                 state = status(&tx, reference, now)?;
+                repaired = true;
             }
         }
         tx.commit().storage()?;
         Ok(AvatarAssetRead {
+            repaired,
             status: state,
             image,
         })
@@ -385,10 +409,15 @@ impl SqliteAccountStorage {
     /// Discard all account avatar bytes/mappings. Existing references and late
     /// completions become invalid; rebinding creates new random generations.
     pub fn clear_avatar_cache(&self) -> StorageResult<()> {
-        self.lock()?
-            .execute("DELETE FROM avatar_assets", [])
-            .storage()?;
-        Ok(())
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute("DELETE FROM avatar_assets", []).storage()?;
+            conn.execute("DELETE FROM avatar_identity_demand", [])
+                .storage()?;
+            conn.execute("DELETE FROM avatar_acquisition_bootstrap", [])
+                .storage()?;
+            Ok(())
+        })
     }
 
     pub fn avatar_cache_usage(&self) -> StorageResult<AvatarCacheUsage> {
@@ -427,6 +456,33 @@ fn reference_for_owner(conn: &Connection, owner: &str) -> StorageResult<Option<A
         [owner], |r| Ok(AvatarAssetRef { store_epoch: r.get(0)?, token: r.get(1)? }),
     ).optional().storage()
 }
+// Both screen metadata and byte reads derive availability from the same columns.
+fn status_columns(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+    now: u64,
+) -> rusqlite::Result<AvatarAssetStatus> {
+    let content_revision = nonnegative(row, first)?;
+    let byte_count = nonnegative(row, first + 1)?;
+    let refresh_at = row
+        .get::<_, Option<i64>>(first + 2)?
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(first + 2, value))
+        })
+        .transpose()?;
+    Ok(AvatarAssetStatus {
+        availability: if byte_count == 0 {
+            AvatarAvailability::Missing
+        } else if refresh_at.is_some_and(|deadline| now >= deadline) {
+            AvatarAvailability::Stale
+        } else {
+            AvatarAvailability::Ready
+        },
+        content_revision,
+        byte_count,
+    })
+}
 fn status(
     conn: &Connection,
     reference: &AvatarAssetRef,
@@ -437,28 +493,7 @@ fn status(
             "SELECT content_revision, coalesce(length(bytes), 0), refresh_at FROM avatar_assets
          WHERE token = ?1 AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?2",
             params![reference.token, reference.store_epoch],
-            |r| {
-                let content_revision = nonnegative(r, 0)?;
-                let byte_count = nonnegative(r, 1)?;
-                let refresh_at = r
-                    .get::<_, Option<i64>>(2)?
-                    .map(|v| {
-                        u64::try_from(v).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, v))
-                    })
-                    .transpose()?;
-                let availability = if byte_count == 0 {
-                    AvatarAvailability::Missing
-                } else if refresh_at.is_some_and(|deadline| now >= deadline) {
-                    AvatarAvailability::Stale
-                } else {
-                    AvatarAvailability::Ready
-                };
-                Ok(AvatarAssetStatus {
-                    availability,
-                    content_revision,
-                    byte_count,
-                })
-            },
+            |r| status_columns(r, 0, now),
         )
         .optional()
         .storage()?;
@@ -507,3 +542,9 @@ fn evict(conn: &Connection, protected: &[u8], limits: Limits) -> StorageResult<(
 
 #[cfg(test)]
 mod tests;
+
+mod acquisition;
+pub use acquisition::{AvatarAcquisition, AvatarAcquisitionState, AvatarIdentityDemand};
+
+pub(crate) mod access;
+pub use access::{AvatarAssetPresentation, AvatarAssetTarget};

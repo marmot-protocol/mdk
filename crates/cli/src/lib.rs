@@ -2205,6 +2205,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, id)| AppMessageRecord {
+                authority: None,
                 message_id_hex: id.to_owned(),
                 direction: "received".to_owned(),
                 group_id_hex: "group".to_owned(),

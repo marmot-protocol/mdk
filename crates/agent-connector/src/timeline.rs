@@ -234,6 +234,7 @@ mod tests {
 
     fn record() -> TimelineMessageRecord {
         TimelineMessageRecord {
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "11".repeat(32),

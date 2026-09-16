@@ -108,6 +108,36 @@ pub struct Group {
     /// `join_epoch`.
     #[serde(default)]
     pub local_copy_install_epoch: EpochId,
+    /// When the Welcome that installed this local copy was created, in Unix
+    /// seconds, clamped at join to no later than the joining device's own
+    /// clock. `None` on a copy this device created itself, on transports that
+    /// cannot establish the value, and on records persisted before this field
+    /// existed.
+    ///
+    /// A **soft** signal, and only ever that. The epoch fields above are the
+    /// post-peel floor: they can classify only a message the device managed to
+    /// open, and the traffic published while a removed device was away never
+    /// peels at all, so it never reaches them. This is the one thing known
+    /// about such a message before decryption — but it is not enough to refuse
+    /// it, because pre-peel a commit and an application message are
+    /// indistinguishable and their envelope times mean different things: a
+    /// commit carries wrap time, while an application message carries the
+    /// sender's compose time (`peeler::GroupMessageMetadata::outer_created_at`).
+    /// The offline outbox holds plaintext and re-encrypts at drain, so a
+    /// message composed hours before it was sent is ordinary live traffic
+    /// wearing an old timestamp. Anything terminal keyed on this value would
+    /// eventually lose one of those for good.
+    ///
+    /// Use it only where being wrong is free: see
+    /// [`Group::transport_message_predates_local_copy`].
+    ///
+    /// The clamp is why the inviter's clock cannot become this device's
+    /// problem. The value is the NIP-59 welcome rumor's `created_at`, which no
+    /// relay validates, so an inviter running fast — or lying — would otherwise
+    /// place the floor in the future and make every later message look like
+    /// history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_copy_welcome_created_at: Option<crate::transport::Timestamp>,
 }
 
 impl Group {
@@ -122,7 +152,49 @@ impl Group {
     pub fn is_terminal(&self) -> bool {
         self.removed || self.disbanded.is_some()
     }
+
+    /// Does `timestamp` sit far enough before this copy's Welcome that traffic
+    /// carrying it is more likely the group's history than this copy's?
+    ///
+    /// This copy's epochs begin at the commit that minted its Welcome, so a
+    /// message genuinely published before then can never be opened here. But
+    /// the converse does not hold — an application message carries its
+    /// sender's compose time, which the offline outbox can leave hours behind
+    /// the moment the message actually went out — so a `true` here is a guess,
+    /// not a verdict.
+    ///
+    /// Every caller must therefore be one for which a wrong guess costs
+    /// nothing in either direction. Today that is two: dropping one piece of
+    /// stall evidence, and suppressing a refusal notification for a release
+    /// that happens either way. Never gate persistence, decryption, retry, or
+    /// any terminal classification on it.
+    pub fn transport_message_predates_local_copy(
+        &self,
+        timestamp: crate::transport::Timestamp,
+    ) -> bool {
+        self.local_copy_welcome_created_at.is_some_and(|welcome| {
+            timestamp.0.saturating_add(PRE_WELCOME_CLOCK_SKEW_SECS) < welcome.0
+        })
+    }
 }
+
+/// Clock-skew tolerance for [`Group::transport_message_predates_local_copy`].
+///
+/// Both decisions this margin gates are reversible, which sets its size from a
+/// direction opposite to the usual one. A margin that is too *wide* leaves more
+/// false stall arms and more refusal notifications for expected traffic —
+/// exactly what the signal exists to reduce. A margin that is too *narrow*
+/// costs one piece of stall evidence from a sender whose clock trails the
+/// inviter's, or from a message composed offline; every other message that
+/// device receives still arms, so the detector still fires on a real stall.
+/// The cheap direction is therefore the tight one.
+///
+/// Five minutes is the sender-clock tolerance this project already assumes
+/// elsewhere — `marmot-app`'s transport cursor allows the same drift. That
+/// constant is deliberately not imported: it bounds a different quantity and
+/// lives above the transport boundary, while this one must stay
+/// transport-agnostic. Only the shared assumption about real clocks is reused.
+pub const PRE_WELCOME_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
 /// Durable evidence and read-only projection material retained after a
 /// selected disband Commit deletes live MLS state.
@@ -163,4 +235,59 @@ pub struct DisbandTombstone {
 pub struct Member {
     pub id: MemberId,
     pub credential: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::GroupCapabilities;
+    use crate::transport::Timestamp;
+
+    fn copy_installed_at(welcome: Option<u64>) -> Group {
+        Group {
+            id: GroupId::new(vec![7; 16]),
+            name: String::new(),
+            description: String::new(),
+            epoch: EpochId(4),
+            members: Vec::new(),
+            required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
+            removed: false,
+            unrecoverable: false,
+            disbanded: None,
+            join_epoch: EpochId(4),
+            local_copy_install_epoch: EpochId(4),
+            local_copy_welcome_created_at: welcome.map(Timestamp),
+        }
+    }
+
+    const WELCOME: u64 = 1_700_000_000;
+
+    #[test]
+    fn a_copy_this_device_created_never_predates_itself() {
+        let created_here = copy_installed_at(None);
+
+        assert!(!created_here.transport_message_predates_local_copy(Timestamp(0)));
+        assert!(!created_here.transport_message_predates_local_copy(Timestamp(WELCOME - 99_999)));
+    }
+
+    #[test]
+    fn the_tolerance_band_ends_one_second_before_the_margin() {
+        let joined = copy_installed_at(Some(WELCOME));
+        let margin = PRE_WELCOME_CLOCK_SKEW_SECS;
+
+        // Inside the band, including its exact edge: not old enough to say.
+        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME)));
+        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME - margin)));
+        // One second beyond it.
+        assert!(joined.transport_message_predates_local_copy(Timestamp(WELCOME - margin - 1)));
+    }
+
+    #[test]
+    fn a_message_newer_than_the_welcome_never_predates_it() {
+        let joined = copy_installed_at(Some(WELCOME));
+
+        assert!(!joined.transport_message_predates_local_copy(Timestamp(WELCOME + 1)));
+        assert!(!joined.transport_message_predates_local_copy(Timestamp(u64::MAX)));
+    }
 }

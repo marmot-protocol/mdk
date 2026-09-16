@@ -174,6 +174,7 @@ mod tests {
         let failure = SyncFailure::new(
             SyncSummary {
                 messages: vec![ReceivedMessage {
+                    authority: None,
                     message_id_hex: "11".repeat(32),
                     source_message_id_hex: "22".repeat(32),
                     sender: account.account_id_hex.clone(),
@@ -274,6 +275,7 @@ mod tests {
         let summary = SyncSummary {
             messages: vec![
                 ReceivedMessage {
+                    authority: None,
                     message_id_hex: "11".repeat(32),
                     source_message_id_hex: "22".repeat(32),
                     sender: "alice\u{1b}[31m".to_owned(),
@@ -288,6 +290,7 @@ mod tests {
                     received_at: 2,
                 },
                 ReceivedMessage {
+                    authority: None,
                     message_id_hex: "33".repeat(32),
                     source_message_id_hex: "44".repeat(32),
                     sender: "bob".to_owned(),

@@ -25,7 +25,8 @@ Migration 76 repairs existing projections. Raw edit events remain available, but
 See the [native edit contract](../../../crates/marmot-uniffi/CONVERSATION-WINDOW.md#accepted-edits-c6a).
 
 C7-A adds protected avatar-byte storage and bounded local reads in `storage-sqlite`, with source-generation
-fencing and separate narrow LRU bookkeeping. Download maintenance and native integration remain C7-B/C;
+fencing and separate narrow LRU bookkeeping. C7-B adds durable download/retry intent, selected-source maintenance,
+validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C native integration remains pending;
 existing clients should keep their image-loading paths until that handoff.
 See [avatar cache storage](../further-context/avatar-cache-storage.md).
 
@@ -368,3 +369,8 @@ Usage and diagnostics now has a shared consent receipt and independent OTLP and
 stock-Aptabase exporter paths; see [the host contract](../usage-diagnostics.md).
 Native consent UI adoption and deployed Aptabase retention verification remain
 separate rollout work.
+
+
+C7-C adds screen avatar metadata, bounded local encoded-byte batches and acquisition/cache invalidation delivery to
+resolved chat and conversation subscriptions, with matching UniFFI/C surfaces. C7-B's durable worker remains the
+network owner. Client cache migration and flagship-device evidence remain C9 follow-through; this is not a release.

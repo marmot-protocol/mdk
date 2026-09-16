@@ -1,6 +1,7 @@
 mod draft_lifecycle;
 mod key_package_inventory;
 mod message_journeys;
+mod report_backfill;
 mod user_blocks;
 
 use super::*;
@@ -509,6 +510,7 @@ pub(crate) struct ScriptedPushRelayClient {
     block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     block_account_group_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
+    reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     batch_calls: std::sync::atomic::AtomicUsize,
@@ -754,6 +756,11 @@ impl ScriptedPushRelayClient {
 
     fn zero_ack_next_publish(&self) {
         self.zero_ack_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn reject_next_publish(&self) {
+        self.reject_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1025,6 +1032,26 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
             self.publish_release.notified().await;
+        }
+        if self
+            .reject_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(NostrPublishOutcome {
+                failed: endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        endpoint,
+                        reason: "injected terminal rejection".into(),
+                        kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                        rejection_category: Some(
+                            cgka_traits::TransportEndpointRejectionCategory::Invalid,
+                        ),
+                    })
+                    .collect(),
+                ..Default::default()
+            });
         }
         if self
             .zero_ack_next_publish
@@ -2791,6 +2818,7 @@ fn recovery_warning_requires_confirmed_replays_and_survives_local_commits_and_re
         effects
             .events
             .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                authority: None,
                 group_id: group_id.clone(),
                 message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
                 sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
@@ -11216,6 +11244,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
             .is_none()
     );
     app.remember_directory_message_sender(&ReceivedMessage {
+        authority: None,
         message_id_hex: "message-id".to_owned(),
         source_message_id_hex: "source-message-id".to_owned(),
         sender: sender.clone(),
@@ -11825,6 +11854,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
         .unwrap();
     legacy
         .record_message(&AppMessageProjection {
+            authority: None,
             message_id_hex: "legacy-message".to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),
@@ -11892,6 +11922,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
 
     legacy
         .record_message(&AppMessageProjection {
+            authority: None,
             message_id_hex: "post-marker".to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),
@@ -12292,6 +12323,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     };
 
     let message = |content: String, sender: &str| ReceivedMessage {
+        authority: None,
         message_id_hex: "11".repeat(32),
         source_message_id_hex: "22".repeat(32),
         sender: sender.to_owned(),
@@ -13261,6 +13293,9 @@ fn custom_intent_rejects_every_reserved_kind() {
         kinds::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
         kinds::MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
         kinds::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        kinds::MARMOT_APP_EVENT_KIND_REPORT,
+        kinds::MARMOT_APP_EVENT_KIND_REVIEW,
+        kinds::MARMOT_APP_EVENT_KIND_REMOVE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
@@ -13663,6 +13698,7 @@ fn source_epoch_retention_is_app_visible_and_returns_media_hashes_when_expired()
     app.record_account_app_event_at(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "old-aa".to_owned(),
             source_message_id_hex: None,
             direction: "received".to_owned(),
@@ -13749,6 +13785,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     let losing_commit_id = cgka_traits::types::MessageId::new(vec![0xBE; 32]);
     let system_row =
         |message_id_hex: &str, origin_commit_id: Option<String>| AppMessageProjection {
+            authority: None,
             message_id_hex: message_id_hex.to_owned(),
             // Synthesized system rows carry no source id (see
             // build_group_system_projection); origin_commit_id is the 1:N link.
@@ -13878,6 +13915,7 @@ fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
     let parked_commit_id = cgka_traits::types::MessageId::new(vec![0xBE; 32]);
     let parked_commit_hex = hex::encode(parked_commit_id.as_slice());
     let system_row = |message_id_hex: &str, origin_commit_id: String| AppMessageProjection {
+        authority: None,
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,
         direction: "system".to_owned(),
@@ -14026,6 +14064,7 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
 
     let sent = |message_id_hex: &str, source_message_id_hex: Option<String>, recorded_at: u64| {
         AppMessageProjection {
+            authority: None,
             message_id_hex: message_id_hex.to_owned(),
             source_message_id_hex,
             direction: "sent".to_owned(),
@@ -14127,6 +14166,7 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "held".to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -14303,6 +14343,7 @@ async fn an_open_heals_a_held_send_from_an_already_announced_guard() {
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "held".to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -14855,6 +14896,7 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: "losing-branch-row".to_owned(),
             source_message_id_hex: Some(source_message_id_hex),
             direction: "received".to_owned(),
@@ -15187,6 +15229,7 @@ async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
             Some((
                 7,
                 crate::AppMessageRetentionDecision::new(1_700_000_000, 300),
+                None,
             )),
             true,
         )
@@ -16598,6 +16641,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
     assert!(fresh.failures.is_empty());
     let effects = marmot_account::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender).unwrap()),
@@ -16705,6 +16749,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         assert!(fresh.failures.is_empty());
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         let historical_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
             group_id: group_id.clone(),
             message_id: historical.reports[0].message_id.clone(),
             sender: sender.clone(),
@@ -16713,6 +16758,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             retention: None,
         };
         let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender,
@@ -16788,6 +16834,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     assert!(fresh.failures.is_empty());
     let message_id = fresh.reports[0].message_id.clone();
     let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        authority: None,
         group_id: group_id.clone(),
         message_id: message_id.clone(),
         sender,
@@ -16870,6 +16917,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
     assert!(fresh.failures.is_empty());
     let message_id = fresh.reports[0].message_id.clone();
     let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        authority: None,
         group_id: group_id.clone(),
         message_id,
         sender,
@@ -17420,6 +17468,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: app_event_id.to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -17439,6 +17488,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     app.record_account_app_event(
         "alice",
         &AppMessageProjection {
+            authority: None,
             message_id_hex: failed_app_event_id.to_owned(),
             source_message_id_hex: None,
             direction: "sent".to_owned(),
@@ -17461,6 +17511,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let retention = AppMessageRetentionDecision::new(10, 0);
     let effects = marmot_account::AccountDeviceEffects {
         published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+            authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
             message_id: published_message_id.clone(),
@@ -21965,3 +22016,64 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
 
 #[path = "tests/conversation_cold_open.rs"]
 mod conversation_cold_open;
+
+/// Undecryptable traffic older than this copy's Welcome is not stall evidence.
+///
+/// The detector's undecryptable signal means "this device is behind the group".
+/// After a join — and especially after a re-add, where the relay serves the
+/// whole absent stretch — a device is handed traffic sealed under epochs its
+/// copy never entered and never will. That is expected, it is not evidence of
+/// being behind, and counting it arms a full-history backfill that can only
+/// re-fetch more of what this copy cannot open. The copy still lands its epoch
+/// with the rest of the non-evidence outcomes; it just does not accuse itself.
+///
+/// The signal is deliberately soft: an application message carries its sender's
+/// compose time, so a message drained from the offline outbox can look old
+/// while being perfectly live. Dropping one piece of stall evidence is free —
+/// every other undecryptable message that device receives still arms.
+#[tokio::test]
+async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_backfill() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let (app, mut client, route) =
+        undecryptable_probe_route(&dir, &relay, backfill_drain_test_config()).await;
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+
+    // Model a welcome-installed copy: the route's group is created locally, and
+    // a copy this device created has no Welcome time to compare against.
+    let storage = app.account_storage("alice").unwrap();
+    let welcome_at = crate::unix_now_seconds();
+    let mut record = storage.get_group(&route.group_id).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+
+    let before_the_welcome = welcome_at - 4 * 60 * 60;
+    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+        client
+            .ingest_received_delivery(
+                route.probe(before_the_welcome + probe as u64, &format!("gap-{probe}")),
+            )
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert!(
+        !client.has_pending_epoch_backfill(),
+        "traffic this copy was never able to open is not evidence it is behind",
+    );
+
+    // The same device, the same group, the same undecryptable outcome — only
+    // the envelope time differs — still arms.
+    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+        client
+            .ingest_received_delivery(
+                route.probe(welcome_at + probe as u64, &format!("live-{probe}")),
+            )
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert!(
+        client.has_pending_epoch_backfill(),
+        "undecryptable traffic from this copy's own era is still a stall signal",
+    );
+}

@@ -1034,6 +1034,7 @@ mod prior_nostr_route_tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         }
     }
 
@@ -1849,27 +1850,18 @@ pub(crate) enum GroupConfirmationProjection {
     },
 }
 
-/// Whether a delete may tombstone other members' messages: its authenticated
-/// sender must be in the group's current admin set, and the group must not
-/// look like a direct (two-member, unnamed) conversation.
-///
-/// Known limitation: "direct" is a heuristic over mutable state
-/// (`members.len() == 2 && name.is_empty()`), not an immutable conversation
-/// kind. The creator is always an implicit admin, and the only
-/// create/rename API takes a free-form name for any member count, so an admin
-/// can name — or later rename — a two-member conversation to escape this gate
-/// and gain moderation over the peer's messages, with no signal to the peer.
-/// Closing that fully needs a conversation-kind fixed at creation time
-/// (protocol/engine plus client work); until then this is a deliberate,
-/// documented limitation rather than a guarantee that 1:1 chats can never be
-/// moderated.
+/// Send-time preflight for admin actions. The engine stamps final authority
+/// from the authenticated source state when the event is encrypted.
 pub(crate) fn delete_moderation_grant(
     group: &Group,
     admins: &[[u8; 32]],
     sender_hex: &str,
 ) -> bool {
-    let direct = group.members.len() == 2 && group.name.trim().is_empty();
-    !direct && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
+    group
+        .members
+        .iter()
+        .any(|member| hex::encode(member.id.as_slice()) == sender_hex)
+        && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
 }
 
 #[cfg(test)]
@@ -1897,10 +1889,11 @@ mod delete_moderation_grant_tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         }
     }
 
-    const ADMIN: [u8; 32] = [7u8; 32];
+    const ADMIN: [u8; 32] = [0u8; 32];
 
     #[test]
     fn admin_in_named_group_gets_grant() {
@@ -1918,21 +1911,21 @@ mod delete_moderation_grant_tests {
         assert!(!delete_moderation_grant(
             &group,
             &[ADMIN],
-            &hex::encode([9u8; 32])
+            &hex::encode([1u8; 32])
         ));
     }
 
     #[test]
-    fn direct_conversation_never_grants_even_to_admin() {
+    fn unnamed_pair_allows_admin_removal() {
         let group = group_with("", 2);
-        assert!(!delete_moderation_grant(
+        assert!(delete_moderation_grant(
             &group,
             &[ADMIN],
             &hex::encode(ADMIN)
         ));
-        // A whitespace-only name is still an unnamed direct conversation.
+        // Display names do not affect protocol authorization.
         let group = group_with("  ", 2);
-        assert!(!delete_moderation_grant(
+        assert!(delete_moderation_grant(
             &group,
             &[ADMIN],
             &hex::encode(ADMIN)
@@ -1940,7 +1933,7 @@ mod delete_moderation_grant_tests {
     }
 
     #[test]
-    fn two_member_named_group_is_not_direct() {
+    fn named_pair_allows_admin_removal() {
         let group = group_with("pair", 2);
         assert!(delete_moderation_grant(
             &group,
@@ -1950,8 +1943,36 @@ mod delete_moderation_grant_tests {
     }
 
     #[test]
-    fn unnamed_larger_group_is_not_direct() {
+    fn unnamed_larger_group_allows_admin_removal() {
         let group = group_with("", 3);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn admin_without_a_current_member_leaf_gets_no_grant() {
+        let group = group_with("ops", 3);
+        let departed_admin = [7u8; 32];
+        assert!(!delete_moderation_grant(
+            &group,
+            &[departed_admin],
+            &hex::encode(departed_admin)
+        ));
+    }
+
+    #[test]
+    fn multiple_devices_and_display_name_do_not_change_admin_authority() {
+        let mut group = group_with("\u{00a0}\u{2007}\u{3000}", 2);
+        group.members.push(group.members[0].clone());
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+        group.name = "pair".into();
         assert!(delete_moderation_grant(
             &group,
             &[ADMIN],
@@ -2026,6 +2047,7 @@ pub(crate) fn decode_received_event(
         return None;
     }
     Some(ReceivedMessage {
+        authority: None,
         message_id_hex: event.id,
         source_message_id_hex: source_message_id_hex.to_owned(),
         sender: sender_hex.to_owned(),
@@ -2088,6 +2110,7 @@ pub(crate) fn observe_event(
             epoch,
             payload,
             retention,
+            authority,
             ..
         } => {
             if let Some(projection) = group_projection {
@@ -2108,7 +2131,7 @@ pub(crate) fn observe_event(
             // frozen V1's message-fatal rule. V2 rejection is attachment-local,
             // and locator-kind policy gates fetchability at download time rather
             // than delivery.
-            let Some(message) = decode_received_event(
+            let Some(mut message) = decode_received_event(
                 payload,
                 &sender_hex,
                 sender_display_name,
@@ -2123,6 +2146,7 @@ pub(crate) fn observe_event(
                 summary.events.push(event.clone());
                 return None;
             };
+            message.authority = *authority;
             summary.messages.push(message.clone());
             summary.events.push(event.clone());
             Some(message)

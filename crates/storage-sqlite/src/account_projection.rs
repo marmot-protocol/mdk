@@ -287,6 +287,8 @@ impl SecurePruneAppEventsMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppMessageRecord {
+    /// Authenticated source-state evidence; absent for legacy/unresolved rows.
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
     pub direction: String,
     pub group_id_hex: String,
@@ -322,13 +324,12 @@ impl StoredAppMessageRecord {
     }
 }
 
-/// Column list for [`SqliteAccountStorage::app_messages`], ending in
-/// `insert_order`, `moderation_grant`, and `invalidated` (column indexes
-/// 12-14, read by
-/// `app_message_from_row`).
+/// Column list for [`SqliteAccountStorage::app_messages`], decoded by
+/// `app_message_from_row` (including resolved source authority at indexes 15–16).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
-     received_at, insert_order, moderation_grant, invalidated";
+     received_at, insert_order, moderation_grant, invalidated, authority_state, \
+     authority_context";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
@@ -2038,7 +2039,7 @@ impl SqliteAccountStorage {
         // Single-source the column list + replay ordering so the query order and
         // the runtime recovery watermark/suppression (via `AppEventReplayCursor`)
         // cannot drift (#630, #736). The limited variants take the newest-first
-        // `LIMIT` window, then re-sort ascending into replay order.
+        // `LIMIT` window, then reverse that bounded page into replay order.
         let cols = APP_EVENT_REPLAY_COLUMNS;
         let asc = APP_EVENT_REPLAY_ORDER_ASC;
         let desc = APP_EVENT_REPLAY_ORDER_DESC;
@@ -2069,13 +2070,7 @@ impl SqliteAccountStorage {
             format!("WHERE {}", conditions.join(" AND "))
         };
         let sql = match query.limit {
-            Some(_) => format!(
-                "SELECT {cols} FROM (
-                    SELECT {cols} FROM app_events
-                    {where_sql}
-                    ORDER BY {desc} LIMIT ?
-                 ) ORDER BY {asc}"
-            ),
+            Some(_) => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {desc} LIMIT ?"),
             None => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {asc}"),
         };
         if let Some(limit) = query.limit {
@@ -2086,7 +2081,13 @@ impl SqliteAccountStorage {
         let rows = statement
             .query_map(params_from_iter(values.iter()), app_message_from_row)
             .storage()?;
-        rows.collect::<Result<Vec<_>, _>>().storage()
+        let mut records = rows.collect::<Result<Vec<_>, _>>().storage()?;
+        if query.limit.is_some() {
+            // DESC reverses every component of the unique replay key. Reversing
+            // the selected page avoids copying wide rows through a SQL sorter.
+            records.reverse();
+        }
+        Ok(records)
     }
 
     /// Resolve one durable raw app event without scanning group history.
@@ -3752,7 +3753,27 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
     let retention_expires_at = row
         .get::<_, Option<i64>>(9)?
         .and_then(|expires_at| expires_at.try_into().ok());
+    let authority = if row.get::<_, i64>(15)? == 2 {
+        let context = row.get::<_, Vec<u8>>(16)?;
+        let source_context = context.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                16,
+                Type::Blob,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid source authority context length",
+                )),
+            )
+        })?;
+        Some(cgka_traits::app_event::AppMessageAuthority {
+            source_context,
+            moderation_grant: row.get::<_, i64>(13)? != 0,
+        })
+    } else {
+        None
+    };
     Ok(StoredAppMessageRecord {
+        authority,
         message_id_hex: row.get(0)?,
         direction: row.get(1)?,
         group_id_hex: row.get(2)?,

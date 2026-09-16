@@ -236,3 +236,27 @@ allow an old relay delivery to create an invitation after unblocking.
 
 Native screens and imports of old White Noise local databases are outside this
 feature. Existing published lists migrate through relay synchronization.
+
+## Group reports and admin deletion
+
+`report_message` sends a kind-1984 NIP-56 report with a category and optional
+explanation. It references a message event directly, without a revision tag or
+per-reporter deduplication. Admins use `dismiss_reports` to label specific report
+events with kind 1985 and an optional explanation. Each label is independent.
+
+The existing `delete_message` API sends kind 4891 for admin deletion of a whole
+chat, including an unreported message or the admin's own message. Kind 5 remains
+author-only retraction. Admin authorization comes from authenticated source state;
+later demotion does not revoke an established verdict. Group size and name do not
+affect authorization.
+
+`content_reports` lists individual reports, optionally filtered to a message.
+`report_dismissals` lists admin labels. `reported_message` returns a reported
+target's current deletion-masked projection, bypassing personal blocking.
+Timeline records expose `has_reports` through existing subscriptions. There is no
+shared queue, counter, or aggregate review status. Hosts choose review UI and
+notifications. Report explanations follow their own retention and survive target
+deletion while retained.
+
+See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md)
+for source-state authorization, durable recovery, retention, and client compatibility.

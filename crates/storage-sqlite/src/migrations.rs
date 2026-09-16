@@ -162,9 +162,14 @@ mod migration_0074_chat_list_invite_attention;
 mod migration_0075_user_blocks;
 #[path = "migrations/0076_accepted_edits.rs"]
 mod migration_0076_accepted_edits;
-
 #[path = "migrations/0077_avatar_cache.rs"]
 mod migration_0077_avatar_cache;
+#[path = "migrations/0078_avatar_acquisition.rs"]
+mod migration_0078_avatar_acquisition;
+#[path = "migrations/0079_content_reports.rs"]
+mod migration_0079_content_reports;
+#[path = "migrations/0080_avatar_target_lookup.rs"]
+mod migration_0080_avatar_target_lookup;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -557,6 +562,21 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "0077_avatar_cache",
         apply: migration_0077_avatar_cache::apply,
+    },
+    Migration {
+        version: 78,
+        name: "0078_avatar_acquisition",
+        apply: migration_0078_avatar_acquisition::apply,
+    },
+    Migration {
+        version: 79,
+        name: "0079_content_reports",
+        apply: migration_0079_content_reports::apply,
+    },
+    Migration {
+        version: 80,
+        name: "0080_avatar_target_lookup",
+        apply: migration_0080_avatar_target_lookup::apply,
     },
 ];
 
@@ -1026,6 +1046,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "Retained group");
+    }
+
+    #[test]
+    fn avatar_acquisition_upgrade_bootstraps_once_and_preserves_cached_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avatar-acquisition-upgrade.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..77]).unwrap();
+        let value = crate::StoredChatPresentation {
+            presentation: crate::ConversationPresentation {
+                title: crate::PresentationText::Literal("Chat".into()),
+                avatar: crate::SelectedAvatar::RemoteImage {
+                    url: "https://example.com/avatar.png".into(),
+                    cache_key: "source".into(),
+                },
+                title_source: crate::PresentationSource::Group,
+                avatar_source: crate::PresentationSource::Group,
+                peer_id: None,
+                resolution: crate::PresentationResolution::Cached,
+            },
+            profile_version: None,
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({"format": 1, "value": value})).unwrap();
+        conn.execute_batch("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES('aabb', 'fixture', 'Chat', 7, 3);
+            INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at) VALUES('aabb', 19, 7);").unwrap();
+        conn.execute("UPDATE chat_list_rows SET presentation_json = ?1, presentation_applied_source_revision = presentation_source_revision WHERE group_id_hex = 'aabb'", [bytes]).unwrap();
+        run_all(&mut conn).unwrap();
+        drop(conn);
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        let storage = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(!storage.bootstrap_avatar_acquisition().unwrap());
+        let job = storage.claim_avatar_acquisition(0).unwrap().unwrap();
+        let image =
+            crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
+        storage
+            .complete_avatar_acquisition(&job, &image, None)
+            .unwrap();
+        storage.close().unwrap();
+        let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            reopened.read_avatar(&job.reference, 0).unwrap().image,
+            Some(image)
+        );
+        reopened.remove_avatar_source(&job.reference).unwrap();
+        reopened.close().unwrap();
+        let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(!reopened.bootstrap_avatar_acquisition().unwrap());
+        assert!(reopened.claim_avatar_acquisition(0).unwrap().is_none());
     }
 
     fn keyed_connection(path: &Path) -> rusqlite::Connection {
@@ -3164,5 +3232,76 @@ mod group_reset_tests {
             )
             .unwrap();
         assert_eq!(unchanged, cutoff);
+    }
+}
+
+#[cfg(test)]
+mod content_reports_tests {
+    use super::*;
+    #[test]
+    fn adds_reports_without_resetting_history_or_legacy_deletions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        run(&mut conn, &MIGRATIONS[..78]).unwrap();
+        for (id, kind, grant) in [
+            ("chat", 9, 0),
+            ("report", 1984, 0),
+            ("label", 1985, 1),
+            ("removal", 4891, 1),
+            ("legacy-delete", 5, 1),
+        ] {
+            conn.execute("INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at,moderation_grant)
+                VALUES('group',?1,'received','author','retained history',?2,'[]',1,1,?3)",rusqlite::params![id,kind,grant]).unwrap();
+        }
+        run(&mut conn, MIGRATIONS).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM app_events WHERE plaintext='retained history'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 5);
+        let legacy:(i64,i64)=conn.query_row("SELECT moderation_grant,authority_state FROM app_events WHERE message_id_hex='legacy-delete'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(legacy, (1, 0));
+        for id in ["label", "removal"] {
+            let verdict: (i64, i64, Option<Vec<u8>>) = conn.query_row(
+                "SELECT moderation_grant,authority_state,authority_context FROM app_events WHERE message_id_hex=?1",
+                [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            assert_eq!(verdict, (0, 1, None));
+        }
+        let report_state: i64 = conn
+            .query_row(
+                "SELECT authority_state FROM app_events WHERE message_id_hex='report'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(report_state, 0);
+        let progress: (i64, i64) = conn
+            .query_row(
+                "SELECT after_order,through_order FROM content_report_backfill",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(progress, (0, 5));
+        assert!(conn.prepare("SELECT * FROM content_moderation").is_err());
+        assert!(
+            conn.prepare("SELECT revision_id_hex FROM content_reports")
+                .is_err()
+        );
+        assert!(
+            conn.prepare("SELECT reporting_allowed FROM app_events")
+                .is_err()
+        );
+        run(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM app_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
     }
 }

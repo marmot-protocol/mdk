@@ -494,6 +494,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_preserves_materialized_metadata() {
         let record = TimelineMessageRecord {
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "message-1".to_owned(),
@@ -619,6 +620,7 @@ mod tests {
         .to_content()
         .unwrap();
         let record = TimelineMessageRecord {
+            has_reports: false,
             group_system: Some({
                 let mut event =
                     marmot_app::group_system_event_from_message(1210, &content).unwrap();
@@ -672,6 +674,7 @@ mod tests {
     #[test]
     fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
         let record = TimelineMessageRecord {
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "system-bad".to_owned(),
@@ -705,6 +708,7 @@ mod tests {
     #[test]
     fn app_message_record_ffi_leaves_non_chat_tokens_empty() {
         let record = AppMessageRecord {
+            authority: None,
             message_id_hex: "reaction-1".to_owned(),
             direction: "sent".to_owned(),
             group_id_hex: "11".repeat(32),
@@ -788,3 +792,6 @@ pub use chat_window::*;
 
 pub mod conversation_window;
 pub use conversation_window::*;
+
+mod avatar;
+pub use avatar::*;

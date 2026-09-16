@@ -21,6 +21,7 @@ fn graph_fixture(history: u64) -> (SqliteAccountStorage, GroupId, Vec<MessageId>
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         })
         .unwrap();
     let mut admitted = Vec::new();

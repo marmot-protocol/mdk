@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
@@ -2686,7 +2686,12 @@ impl AppClient {
         if refused_group.is_none() {
             client.remember_transport_cursor(outer_transport_at);
         }
-        client.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
+        client.detect_epoch_stall(
+            group_id_hint,
+            &source_message_id_hex,
+            &effects.outcome,
+            cgka_traits::transport::Timestamp(outer_transport_at),
+        );
         // A delivery can contain several application events. If projection
         // fails after an earlier event staged its acknowledgement, keep that
         // event in the durable engine outbox so a retained or reopened client
@@ -2765,6 +2770,7 @@ impl AppClient {
         group_id_hint: Option<cgka_traits::GroupId>,
         message_id_hex: &str,
         outcome: &IngestOutcome,
+        transport_at: cgka_traits::transport::Timestamp,
     ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
@@ -2788,6 +2794,24 @@ impl AppClient {
         }
         let now_ms = epoch_stall_now_ms();
         let decision = match outcome {
+            // Traffic older than this copy's Welcome is expected after a join,
+            // and after a re-add it is most of what the relay serves: the
+            // absent stretch was sealed under epochs this copy never entered
+            // and never will. Unopenable, but not evidence this device is
+            // behind — and a backfill armed from it could only re-fetch more of
+            // the same. Land the epoch like every other non-evidence outcome
+            // below and stop there. Soft by design: an application message
+            // carries its sender's compose time, so a message drained from the
+            // offline outbox can look old while being live. Dropping one piece
+            // of evidence costs nothing, because every other undecryptable
+            // message this device receives still arms.
+            IngestOutcome::TransportDeferred { .. }
+                if record.transport_message_predates_local_copy(transport_at) =>
+            {
+                self.epoch_stall
+                    .observe_group_epoch(&group_id, record.epoch);
+                BackfillDecision::Skip
+            }
             IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
                 group_id.clone(),
                 message_id_hex.to_owned(),
@@ -4424,6 +4448,7 @@ impl AppClient {
             epoch,
             payload,
             retention,
+            ..
         } = event
         else {
             return Ok(false);
@@ -4529,9 +4554,9 @@ impl AppClient {
                 "projecting message without directory enrichment",
             );
         }
-        let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
-            && self.delete_moderation_grant(&message.group_id, &message.sender);
+        let moderation_grant = message.authority.is_some_and(|a| a.moderation_grant);
         let message_projection = AppMessageProjection {
+            authority: message.authority,
             message_id_hex: message.message_id_hex.clone(),
             source_message_id_hex: Some(message.source_message_id_hex.clone()),
             direction: "received".to_owned(),
@@ -5667,6 +5692,7 @@ mod tests {
             effects
                 .events
                 .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                    authority: None,
                     group_id: group_id.clone(),
                     message_id: sent.reports[0].message_id.clone(),
                     sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),

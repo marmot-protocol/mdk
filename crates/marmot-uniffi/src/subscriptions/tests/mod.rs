@@ -14,6 +14,7 @@ fn take_snapshot_recovers_from_poisoned_lock() {
 
 fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        has_reports: false,
         group_system: None,
         edit: None,
         message_id_hex: id.to_string(),

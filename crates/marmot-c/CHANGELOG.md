@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_report_message` and `marmot_dismiss_reports`, paginated `marmot_content_reports`
+  and `marmot_report_dismissals`, and the deletion-masked `marmot_reported_message` lookup.
+  Report records expose `MarmotReportReason` and individual dismissal state; timeline records
+  gain `has_reports`. Use existing projection subscriptions to refresh report views.
+  Regenerate headers with the matching library for the changed output layouts.
+
 - Typed group-system chat previews and explicit `MarmotGroupSystemEventProvenance`
   on timeline and preview events. Authenticated actor/subject IDs remain distinct;
   chat previews include locally prepared names, while clients localize wording.

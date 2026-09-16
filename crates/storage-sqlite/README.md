@@ -56,8 +56,8 @@ tracks legacy writes too; queued/fanout acceptance clears only its submitted rev
 ## Avatar storage
 
 The [local avatar storage contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md) covers account-encrypted bytes, generation-scoped
-references, atomic publication, offline local reads and bounded eviction. This is the C7-A foundation;
-download maintenance and native screen integration land separately.
+references, atomic publication, offline local reads, bounded eviction and C7-B durable acquisition intent.
+Selected presentation and source demand commit together; native screen integration remains C7-C.
 
 ## Migrations
 

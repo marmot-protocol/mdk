@@ -74,12 +74,16 @@ pub use account_attention::{
 };
 mod chat_list_window;
 mod conversation_window;
+pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+mod avatar;
+mod avatar_access;
+pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
 mod event_routing;
 mod onboarding;
@@ -7769,3 +7773,5 @@ fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
         && !group.unrecoverable
         && matches!(group.self_membership, crate::SelfMembership::Member)
 }
+
+mod moderation;

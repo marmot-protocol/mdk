@@ -836,6 +836,7 @@ pub struct EpochStallEscalation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedMessage {
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
     pub source_message_id_hex: String,
     pub sender: String,
@@ -898,6 +899,10 @@ pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) -> std::vec::Drai
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppMessageRecord {
+    /// Authenticated source-state evidence. Legacy and unresolved rows remain
+    /// `None`; recovery must never infer this from current group policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
     pub direction: String,
     pub group_id_hex: String,
@@ -929,8 +934,8 @@ pub struct AppMessageRecord {
     /// losing-branch tombstone.
     #[serde(default)]
     pub invalidated: bool,
-    /// Whether this delete carried an authenticated moderation grant when it
-    /// was recorded. False for every non-delete event.
+    /// Whether this admin deletion or dismissal label carried an authenticated
+    /// source-state moderation grant when it was recorded.
     #[serde(default)]
     pub moderation_grant: bool,
 }
@@ -1141,6 +1146,7 @@ pub(crate) struct AccountState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppMessageProjection {
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub(crate) message_id_hex: String,
     pub(crate) source_message_id_hex: Option<String>,
     pub(crate) direction: String,
@@ -1649,6 +1655,7 @@ impl MarmotApp {
         };
         let _ = open.runtime.take_maintenance_activity();
         let mut client = AppClient {
+            conversation_captures: Vec::new(),
             send_telemetry: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
@@ -5426,18 +5433,17 @@ impl MarmotApp {
         // must leave the accepted fanout able to reconstruct its completion.
         let storage = self.account_storage(label)?;
         cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let storage_update = storage.record_app_event_with_retention(
+            let storage_update = storage.record_app_event_with_source(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
+                message.authority,
             )?;
             self.app_projection_update(label, storage_update)
         })
     }
 
-    /// As [`Self::record_account_app_event`], but a conflicting row's
-    /// `moderation_grant` is replaced rather than frozen. Used by the local
-    /// sender's post-publish reconciling projection so a moderation grant
-    /// recomputed after group sync supersedes the optimistic pre-send value.
+    /// Reconcile a local publication with its engine-stamped source authority.
+    /// A resolved verdict stays immutable across later echoes and admin changes.
     pub(crate) fn record_account_app_event_refreshing_moderation_grant(
         &self,
         label: &str,
@@ -5446,15 +5452,16 @@ impl MarmotApp {
         let now = unix_now_seconds();
         let storage = self.account_storage(label)?;
         cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let storage_update = storage
-                .record_app_event_refreshing_moderation_grant_with_retention(
-                    &stored_app_event_from_projection(message, now),
-                    message.retention,
-                )?;
+            let storage_update = storage.record_app_event_with_source(
+                &stored_app_event_from_projection(message, now),
+                message.retention,
+                message.authority,
+            )?;
             self.app_projection_update(label, storage_update)
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_account_app_event_source_retention(
         &self,
         label: &str,
@@ -5463,6 +5470,7 @@ impl MarmotApp {
         source_message_id_hex: Option<&str>,
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
+        authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let observation = self
             .product_analytics
@@ -5474,14 +5482,17 @@ impl MarmotApp {
             .map(ProductObservation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            storage
-                .finalize_app_event_source_retention(
-                    group_id_hex,
-                    message_id_hex,
-                    source_message_id_hex,
-                    source_epoch,
-                    retention,
-                )?
+            let authority_update =
+                storage.finalize_app_event_authority(group_id_hex, message_id_hex, authority)?;
+            let retention_update = storage.finalize_app_event_source_retention(
+                group_id_hex,
+                message_id_hex,
+                source_message_id_hex,
+                source_epoch,
+                retention,
+            )?;
+            retention_update
+                .or(authority_update)
                 .map(|update| self.app_projection_update(label, update))
                 .transpose()
         })?;
@@ -6690,3 +6701,11 @@ fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), App
 
 #[cfg(test)]
 mod tests;
+
+pub use cgka_traits::reporting::ReportReason;
+pub use runtime::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
+pub use storage_sqlite::{
+    AvatarAcquisitionState, AvatarAssetPresentation, AvatarAssetRef, AvatarAssetStatus,
+    AvatarAssetTarget, AvatarAvailability,
+};
+pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};

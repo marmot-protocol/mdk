@@ -11,6 +11,10 @@ use cgka_traits::app_event::{
     STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
     STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
 };
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
+};
+use cgka_traits::reporting::ReportReason;
 use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
 
@@ -172,6 +176,19 @@ const STREAM_FINAL_KIND_CHAT: &str = "9";
 /// the account worker, which owns the authoring account id and the clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppMessageIntent {
+    Report {
+        target_message_id: String,
+        reason: ReportReason,
+        explanation: String,
+        target_author: Option<String>,
+    },
+    RemoveMessage {
+        target_message_id: String,
+    },
+    DismissReports {
+        report_ids: Vec<String>,
+        explanation: String,
+    },
     Chat {
         content: String,
     },
@@ -328,6 +345,65 @@ pub(crate) fn build_inner_event_with_media_reply(
             let mut tags = vec![event_ref_tag(target_message_id)];
             tags.extend(mention_p_tags(content));
             Ok(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
+        }
+        AppMessageIntent::Report {
+            target_message_id,
+            reason,
+            explanation,
+            target_author,
+        } => {
+            validate_message_ref(target_message_id)?;
+            let author = target_author.as_ref().ok_or_else(|| {
+                AppError::InvalidAppMessagePayload("report target has not been resolved".into())
+            })?;
+            validate_message_ref(author)?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REPORT,
+                vec![
+                    vec![
+                        "e".into(),
+                        target_message_id.clone(),
+                        reason.as_str().into(),
+                    ],
+                    vec!["p".into(), author.clone()],
+                ],
+                explanation.clone(),
+            ))
+        }
+        AppMessageIntent::DismissReports {
+            report_ids,
+            explanation,
+        } => {
+            if report_ids.is_empty() || report_ids.len() > 100 {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "review requires between 1 and 100 reports".into(),
+                ));
+            }
+            for id in report_ids {
+                validate_message_ref(id)?;
+            }
+            let mut ids = report_ids.clone();
+            ids.sort();
+            ids.dedup();
+            let namespace = cgka_traits::reporting::REPORT_REVIEW_NAMESPACE;
+            let mut tags = vec![
+                vec!["L".into(), namespace.into()],
+                vec!["l".into(), "dismissed".into(), namespace.into()],
+            ];
+            tags.extend(ids.iter().map(|id| event_ref_tag(id)));
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REVIEW,
+                tags,
+                explanation.clone(),
+            ))
+        }
+        AppMessageIntent::RemoveMessage { target_message_id } => {
+            validate_message_ref(target_message_id)?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REMOVE,
+                vec![event_ref_tag(target_message_id)],
+                r#"{"v":1,"action":"remove"}"#.into(),
+            ))
         }
         AppMessageIntent::Delete { target_message_id } => {
             validate_message_ref(target_message_id)?;
@@ -599,6 +675,9 @@ pub(crate) fn build_inner_event_with_media_reply(
 /// kind-447 push-token update that other members' clients would act on under
 /// MDK's interpretation.
 const RESERVED_APP_EVENT_KINDS: &[u64] = &[
+    MARMOT_APP_EVENT_KIND_REPORT,
+    MARMOT_APP_EVENT_KIND_REVIEW,
+    MARMOT_APP_EVENT_KIND_REMOVE,
     MARMOT_APP_EVENT_KIND_DELETE,
     MARMOT_APP_EVENT_KIND_REACTION,
     MARMOT_APP_EVENT_KIND_CHAT,
@@ -903,5 +982,54 @@ mod mention_tests {
             "]".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES + 1024)
         );
         assert!(mention_p_tags(&input).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+    #[test]
+    fn report_and_label_builders_follow_the_simple_wire_contract() {
+        let target = "11".repeat(32);
+        let author = "22".repeat(32);
+        let reporter = "33".repeat(32);
+        let report = build_inner_event(
+            &AppMessageIntent::Report {
+                target_message_id: target.clone(),
+                target_author: Some(author.clone()),
+                reason: ReportReason::Other,
+                explanation: String::new(),
+            },
+            &reporter,
+            1,
+        )
+        .unwrap();
+        assert_eq!(report.kind, 1984);
+        assert_eq!(
+            report.tags,
+            vec![
+                vec!["e".to_owned(), target, "other".into()],
+                vec!["p".to_owned(), author]
+            ]
+        );
+        assert!(report.content.is_empty());
+        let label = build_inner_event(
+            &AppMessageIntent::DismissReports {
+                report_ids: vec![report.id.clone()],
+                explanation: "reviewed".into(),
+            },
+            &reporter,
+            2,
+        )
+        .unwrap();
+        assert_eq!(label.kind, 1985);
+        assert_eq!(label.content, "reviewed");
+        assert_eq!(
+            cgka_traits::reporting::parse_dismissal(&label.tags, &label.content),
+            Some(vec![report.id])
+        );
+        for kind in [1984, 1985, 4891] {
+            assert!(is_reserved_app_event_kind(kind));
+        }
     }
 }

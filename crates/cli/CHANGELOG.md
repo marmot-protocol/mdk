@@ -13,6 +13,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Hermes Marmot doctor now exits 0 on a healthy report, reads the configured home channel instead of the inbound filter, uses the same effective socket/account/auth and config fingerprint as the running plugin, treats an absent systemd unit as unknown, and keeps ACK-only diagnostic readiness from changing reconnect backoff.
 - Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
+- OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
+  managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
+  no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch. Failed
+  inbound setup attempts dispose their abort listeners and reservations before retry, so a replaced
+  generation cannot be stopped by a late account lookup from the previous attempt.
 
 ### Added
 
@@ -20,10 +25,25 @@ versioning through the workspace version in the root `Cargo.toml`.
   installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
   `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
   a private diagnostics socket.
+- Encrypted group reports (1984), shared dismissal labels (1985), and admin removal (4891),
+  with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
+  and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 79 adds the indexed
+  projections; regenerate bindings and headers with the matching library.
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
   compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
   not create transcript rows, move conversations or generate unread/mention activity; raw events remain available.
   Migration 76 repairs existing edited targets/previews. Regenerate native sources/headers with matching libraries.
+
+### Changed
+
+- `messages delete` / `delete_message` use kind 5 for author deletion and kind 4891 for
+  an eligible admin removing any chat, including their own. A non-author non-admin now receives an error.
+  Admins can also remove a peer's messages in unnamed two-member conversations.
+  Cross-author admin removal is limited to whole kind-9 messages; agent-stream starts, activity,
+  operations, system events, and custom-kind rows are no longer admin-removal targets.
+  Older peers may retain 4891-removed content; upgraded peers reject newly received cross-author
+  admin kind-5 requests. Previously honored legacy tombstones remain. Upgrade all participants
+  for consistent moderation.
 
 ## [0.10.0] - 2026-09-16
 

@@ -1,12 +1,12 @@
 // Marmot channel gateway lifecycle. OpenClaw starts one long-lived task per
-// configured channel account; that task owns exactly one wn-agent subscription.
+// configured channel account; that task owns exactly one wn-agent subscription
+// and serialized allowlist-reconciliation recovery for that account.
 
 import {
   createAccountStatusSink,
   runPassiveAccountLifecycle,
 } from "openclaw/plugin-sdk/channel-lifecycle";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
-import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
 
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
 import { createMarmotInboundDispatcher, type OpenClawChannelRuntime } from "./dispatch.js";
@@ -14,8 +14,36 @@ import {
   startMarmotInbound,
   syncMarmotAllowlist,
   type InboundPluginApi,
+  type MarmotAllowlistSyncResult,
 } from "./inbound-runtime.js";
-import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
+import {
+  beginMarmotAccountLifecycle,
+  DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
+  markMarmotAllowlistSyncResult,
+  markMarmotInboundStopped,
+  marmotInboundRuntimeSnapshot,
+} from "./runtime-state.js";
+
+export const MARMOT_ALLOWLIST_RETRY_BASE_MS = 1_000;
+export const MARMOT_ALLOWLIST_RETRY_MAX_MS = 30_000;
+
+export interface MarmotGatewayAccountHooks {
+  delay?: (ms: number, signal: AbortSignal) => Promise<void>;
+  random?: () => number;
+  syncAllowlist?: typeof syncMarmotAllowlist;
+  startInbound?: typeof startMarmotInbound;
+}
+
+interface AccountRecoveryLane {
+  generation: number;
+  syncTail: Promise<void>;
+}
+
+const recoveryLanes = new Map<string, AccountRecoveryLane>();
+
+export function resetMarmotGatewayRecoveryForTests(): void {
+  recoveryLanes.clear();
+}
 
 function resolveConfiguredAgentName(cfg: unknown): string | null {
   const agents = (cfg as { agents?: { list?: Array<{ name?: string; default?: boolean }> } })
@@ -24,35 +52,165 @@ function resolveConfiguredAgentName(cfg: unknown): string | null {
   return agentList.find((entry) => entry.default)?.name ?? agentList[0]?.name ?? null;
 }
 
+function defaultDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export function allowlistRetryDelayMs(attempt: number, random: () => number = Math.random): number {
+  const exp = Math.min(
+    MARMOT_ALLOWLIST_RETRY_MAX_MS,
+    MARMOT_ALLOWLIST_RETRY_BASE_MS * 2 ** Math.max(0, attempt),
+  );
+  return Math.min(MARMOT_ALLOWLIST_RETRY_MAX_MS, exp * (0.5 + random() * 0.5));
+}
+
+function laneFor(accountId: string): AccountRecoveryLane {
+  const existing = recoveryLanes.get(accountId);
+  if (existing) {
+    return existing;
+  }
+  const created = { generation: 0, syncTail: Promise.resolve() };
+  recoveryLanes.set(accountId, created);
+  return created;
+}
+
 /** Start and own the inbound subscription for one OpenClaw Marmot account. */
 export async function startMarmotGatewayAccount(
   ctx: ChannelGatewayContext<ResolvedMarmotAccount>,
+  hooks: MarmotGatewayAccountHooks = {},
 ): Promise<void> {
   const statusSink = createAccountStatusSink({
     accountId: ctx.accountId,
     setStatus: ctx.setStatus,
   });
-  const markRunning = (patch: Partial<ChannelAccountSnapshot> = {}) => {
-    statusSink({
-      running: true,
-      connected: patch.connected ?? false,
-      lastStartAt: patch.lastStartAt ?? Date.now(),
-      lastStopAt: null,
-      lastError: null,
-      ...patch,
-    });
+  const delay = hooks.delay ?? defaultDelay;
+  const random = hooks.random ?? Math.random;
+  const syncAllowlist = hooks.syncAllowlist ?? syncMarmotAllowlist;
+  const startInbound = hooks.startInbound ?? startMarmotInbound;
+  const publishStatus = (): void => {
+    statusSink(marmotInboundRuntimeSnapshot(ctx.accountId));
   };
-  const markStopped = (lastError: string | null = null) => {
+  const markStartupFailed = (): void => {
+    markMarmotInboundStopped(ctx.accountId);
     statusSink({
+      ...marmotInboundRuntimeSnapshot(ctx.accountId),
       running: false,
       connected: false,
       lastStopAt: Date.now(),
-      lastError,
+      lastError: "inbound startup failed",
     });
   };
 
-  markRunning();
+  beginMarmotAccountLifecycle(ctx.accountId);
+  publishStatus();
   ctx.log?.info?.("marmot: starting inbound subscription");
+
+  const lane = laneFor(ctx.accountId);
+  const generation = lane.generation + 1;
+  lane.generation = generation;
+  await lane.syncTail.catch(() => undefined);
+
+  const abortController = new AbortController();
+  const onHostAbort = (): void => {
+    abortController.abort();
+  };
+  if (ctx.abortSignal.aborted) {
+    abortController.abort();
+  } else {
+    ctx.abortSignal.addEventListener("abort", onHostAbort, { once: true });
+  }
+
+  let closed = false;
+  let allowlistAttempt = 0;
+  let allowlistRetryPending = false;
+  let inboundAttempt = 0;
+  let inboundRetrying = false;
+  let inboundStop: () => void = () => {};
+
+  const isCurrent = (): boolean =>
+    !closed && lane.generation === generation && !abortController.signal.aborted;
+
+  const applySyncResult = (result: MarmotAllowlistSyncResult): void => {
+    if (!isCurrent()) {
+      return;
+    }
+    markMarmotAllowlistSyncResult(ctx.accountId, result);
+    publishStatus();
+  };
+
+  const enqueueSync = (): Promise<MarmotAllowlistSyncResult | null> => {
+    let result: MarmotAllowlistSyncResult | null = null;
+    const run = lane.syncTail.then(async () => {
+      if (!isCurrent()) {
+        return;
+      }
+      const api: InboundPluginApi = {
+        config: ctx.cfg,
+        logger: {
+          info: (message) => ctx.log?.info?.(message),
+          warn: (message) => ctx.log?.warn?.(message),
+        },
+      };
+      result = await syncAllowlist(api, { channelAccountId: ctx.accountId });
+      applySyncResult(result);
+    });
+    lane.syncTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run.then(() => result);
+  };
+
+  const scheduleAllowlistRetry = (): void => {
+    if (!isCurrent() || allowlistRetryPending) {
+      return;
+    }
+    allowlistRetryPending = true;
+    const waitMs = allowlistRetryDelayMs(allowlistAttempt, random);
+    allowlistAttempt += 1;
+    void delay(waitMs, abortController.signal)
+      .then(async () => {
+        allowlistRetryPending = false;
+        if (!isCurrent()) {
+          return;
+        }
+        try {
+          const result = await enqueueSync();
+          if (result?.state === "failed") {
+            scheduleAllowlistRetry();
+          }
+        } catch {
+          // Typed sync results cannot throw; swallow unexpected hook failures
+          // so a voided retry cannot become an unhandled rejection.
+        }
+      })
+      .catch(() => {
+        allowlistRetryPending = false;
+      });
+  };
+
+  const cancelRetries = (): void => {
+    closed = true;
+    if (lane.generation === generation) {
+      lane.generation += 1;
+    }
+    abortController.abort();
+    allowlistRetryPending = false;
+  };
 
   try {
     const api: InboundPluginApi = {
@@ -62,7 +220,16 @@ export async function startMarmotGatewayAccount(
         warn: (message) => ctx.log?.warn?.(message),
       },
     };
-    await syncMarmotAllowlist(api, { channelAccountId: ctx.accountId });
+    const first = await enqueueSync();
+    if (!isCurrent()) {
+      cancelRetries();
+      markMarmotInboundStopped(ctx.accountId);
+      publishStatus();
+      return;
+    }
+    if (first?.state === "failed") {
+      scheduleAllowlistRetry();
+    }
 
     const channelRuntime = ctx.channelRuntime as unknown as OpenClawChannelRuntime | undefined;
     if (!channelRuntime) {
@@ -84,29 +251,77 @@ export async function startMarmotGatewayAccount(
       log: (message) => ctx.log?.info?.(message),
     });
 
+    const startInboundOnce = (): void => {
+      if (!isCurrent()) {
+        return;
+      }
+      const previousStop = inboundStop;
+      inboundStop = () => {};
+      previousStop();
+      inboundStop = startInbound(api, dispatch, {
+        signal: abortController.signal,
+        channelAccountId: ctx.accountId,
+        configuredAgentName,
+        invalidateGroupActivation: dispatch.invalidateGroupActivation,
+        clearGroupActivationCache: dispatch.clearGroupActivationCache,
+        statusSink: () => {
+          if (!isCurrent()) {
+            return;
+          }
+          publishStatus();
+        },
+        onSetupFailed: () => {
+          if (!isCurrent() || inboundRetrying) {
+            return;
+          }
+          inboundRetrying = true;
+          const waitMs = allowlistRetryDelayMs(inboundAttempt, random);
+          inboundAttempt += 1;
+          void delay(waitMs, abortController.signal)
+            .then(() => {
+              inboundRetrying = false;
+              if (!isCurrent()) {
+                return;
+              }
+              try {
+                startInboundOnce();
+              } catch {
+                // Defense-in-depth: startMarmotInbound catches known setup
+                // failures. Do not surface an injected throw as unhandled.
+              }
+            })
+            .catch(() => {
+              inboundRetrying = false;
+            });
+        },
+      });
+    };
+
     await runPassiveAccountLifecycle({
       abortSignal: ctx.abortSignal,
-      start: async () =>
-        startMarmotInbound(api, dispatch, {
-          signal: ctx.abortSignal,
-          channelAccountId: ctx.accountId,
-          configuredAgentName,
-          invalidateGroupActivation: dispatch.invalidateGroupActivation,
-          clearGroupActivationCache: dispatch.clearGroupActivationCache,
-          statusSink: (patch) => {
-            statusSink({ running: true, ...patch });
-          },
-        }),
+      start: async () => {
+        startInboundOnce();
+        return () => {
+          inboundStop();
+        };
+      },
       stop: (stopInbound) => {
+        cancelRetries();
         stopInbound();
       },
       onStop: () => {
-        markStopped();
+        markMarmotInboundStopped(ctx.accountId);
+        publishStatus();
       },
     });
   } catch (error) {
-    markStopped("inbound startup failed");
+    cancelRetries();
+    inboundStop();
+    markStartupFailed();
     ctx.log?.error?.("marmot: inbound startup failed");
     throw error;
+  } finally {
+    ctx.abortSignal.removeEventListener("abort", onHostAbort);
+    inboundStop();
   }
 }

@@ -274,6 +274,8 @@ pub struct OutboundApplicationMessage {
     pub app_event_id: String,
     pub source_epoch: EpochId,
     pub retention: AppMessageRetentionDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<crate::app_event::AppMessageAuthority>,
 }
 
 impl OutboundFanout {
@@ -1448,6 +1450,7 @@ mod tests {
     fn frozen_fanout_round_trip_preserves_application_message_context() {
         let mut fanout = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();
         let application = OutboundApplicationMessage {
+            authority: None,
             group_id: GroupId::new(vec![0xD4; 16]),
             app_event_id: "app-event-1".into(),
             source_epoch: EpochId(7),

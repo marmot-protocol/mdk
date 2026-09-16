@@ -1,6 +1,15 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    for (state in AvatarAvailabilityFfi.entries) {
+        for (acquisition in AvatarAcquisitionStateFfi.entries) {
+            val asset = AvatarAssetFfi("opaque-target", "opaque-reference", state, acquisition, 7u, 4u)
+            check(FfiConverterTypeAvatarAssetFfi.lift(FfiConverterTypeAvatarAssetFfi.lower(asset)) == asset)
+        }
+        val image = AvatarBytesFfi("opaque-reference", state, 7u, 4u, false, byteArrayOf(1,2,3,4), "image/png", 1u, 1u)
+        val copy = FfiConverterTypeAvatarBytesFfi.lift(FfiConverterTypeAvatarBytesFfi.lower(image))
+        check(copy.bytes.contentEquals(image.bytes) && copy.copy(bytes = image.bytes) == image)
+    }
     for (provenance in GroupSystemEventProvenanceFfi.entries) {
         val event = GroupSystemEventFfi(provenance, "Actor", "Subject", "member_added", "Member added", "actor", "subject", null, null, null, null)
         val preview = ChatListMessagePreviewFfi(event, "selected", "actor", null, "raw", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
@@ -33,6 +42,11 @@ fun main() {
     val value = AccountAttentionSnapshotFfi("summary", ULong.MAX_VALUE, states.map { AccountAttentionEntryFfi("account", it) })
     val copy = FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
     check(copy == value)
+    val report = ContentReportFfi("report", "message", "author", "member", ReportReasonFfi.OTHER, "explanation", 42uL, true)
+    val reports = ContentReportPageFfi(listOf(report), null)
+    check(FfiConverterTypeContentReportPageFfi.lift(FfiConverterTypeContentReportPageFfi.lower(reports)) == reports)
+    val labels = ReportDismissalPageFfi(listOf(ReportDismissalFfi("label", "admin", "reviewed", 43uL)), "cursor")
+    check(FfiConverterTypeReportDismissalPageFfi.lift(FfiConverterTypeReportDismissalPageFfi.lower(labels)) == labels)
     conversationRoundTrips()
     println("Kotlin C4/C5/C6 projection round trips passed")
 }
@@ -101,9 +115,23 @@ suspend fun compileBlockCommands(marmot: Marmot, account: String, user: String) 
     marmot.subscribeBlockedUsers(account).use { sub -> sub.snapshot(); sub.next() }
 }
 
+suspend fun compileModerationCommands(marmot: Marmot, account: String, group: String) {
+    marmot.reportMessage(account, group, "message", ReportReasonFfi.SPAM, "")
+    marmot.dismissReports(account, group, listOf("report"), "reviewed")
+    marmot.contentReports(account, group, "message", null, 50u)
+    marmot.reportedMessage(account, group, "message")
+    marmot.reportDismissals(account, group, "report", null, 50u)
+}
+
 fun compileEditHistory(marmot: Marmot, account: String, group: String, target: String) {
     val page = marmot.messageEditHistory(account, group, target, null, null, 50u)
     page.versions.firstOrNull()?.let { oldest ->
         marmot.messageEditHistory(account, group, target, oldest.editedAt, oldest.messageIdHex, 50u)
     }
+}
+
+suspend fun compileAvatarCommands(marmot: Marmot, account: String, asset: AvatarAssetFfi) {
+    val requested = marmot.requestAvatarAssets(account, listOf(asset.target))
+    marmot.readAvatarAssets(account, requested.mapNotNull { it.reference }, 1024uL * 1024uL)
+    marmot.clearAvatarCache(account)
 }

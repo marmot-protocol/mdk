@@ -171,6 +171,14 @@ pub enum StaleReason {
     /// The message predates this account-device's membership and can never
     /// decrypt on this local copy.
     PreMembership,
+    /// The message opened, but its source epoch lies below
+    /// `Group::local_copy_install_epoch`: it belongs to the group's history
+    /// from before this local copy was installed — the epochs a
+    /// removed-then-re-added device was absent for, or a first joiner's
+    /// pre-Welcome history. OpenMLS refuses it as too distant in the past, and
+    /// on a replacement copy `join_epoch` is zero, so this floor is the one
+    /// that names the verdict. Terminal, never retried.
+    PredatesLocalCopy,
     /// Convergence excluded the input below the retained anchor.
     BeyondAnchor,
     /// Convergence excluded the input beyond the rollback horizon.

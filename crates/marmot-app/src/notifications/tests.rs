@@ -601,6 +601,7 @@ fn normalized_relay_hint_duplicates_are_deduplicated_before_verification_and_app
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let message = ReceivedMessage {
+        authority: None,
         message_id_hex: "11".repeat(32),
         source_message_id_hex: "22".repeat(32),
         sender: owner_id.clone(),
@@ -716,6 +717,7 @@ fn mixed_entry_permutations_apply_the_same_valid_winner() {
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let message = ReceivedMessage {
+            authority: None,
             message_id_hex: "11".repeat(32),
             source_message_id_hex: "22".repeat(32),
             sender: owner_id.clone(),
@@ -783,6 +785,7 @@ fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
 
 fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
     ReceivedMessage {
+        authority: None,
         message_id_hex: "ff".repeat(32),
         source_message_id_hex: "ff".repeat(32),
         sender: "bb".repeat(32),
@@ -800,6 +803,7 @@ fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
 
 fn received_chat(plaintext: &str, tags: Vec<Vec<String>>) -> ReceivedMessage {
     ReceivedMessage {
+        authority: None,
         message_id_hex: "ee".repeat(32),
         source_message_id_hex: "ee".repeat(32),
         sender: "bb".repeat(32),
@@ -1203,6 +1207,7 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
         account_id_hex: account_id_hex.clone(),
         account_label: account_label.to_owned(),
         message: ReceivedMessage {
+            authority: None,
             message_id_hex: "ff".repeat(32),
             source_message_id_hex: "ff".repeat(32),
             sender: sender_id_hex.clone(),
@@ -1726,6 +1731,7 @@ fn signed_record_survives_wire_round_trip_and_verifies() {
 #[test]
 fn recovery_skips_rows_before_the_subscription_watermark() {
     let mut record = AppMessageRecord {
+        authority: None,
         message_id_hex: "11".repeat(32),
         direction: "received".to_owned(),
         group_id_hex: "22".repeat(16),
@@ -2009,6 +2015,7 @@ fn group_state_live_and_recovery_share_a_deterministic_key() {
         account_label,
         &local,
         &AppMessageRecord {
+            authority: None,
             message_id_hex: material.message_id_hex.clone(),
             direction: "system".to_owned(),
             group_id_hex,
@@ -2036,6 +2043,7 @@ fn group_state_live_and_recovery_share_a_deterministic_key() {
 #[test]
 fn recovery_skips_invalidated_group_system_rows() {
     let mut record = AppMessageRecord {
+        authority: None,
         message_id_hex: "11".repeat(32),
         direction: "system".to_owned(),
         group_id_hex: "22".repeat(16),
@@ -2181,6 +2189,7 @@ fn recover_notification_updates_rebuilds_fresh_kind_1210_rows() {
     app.record_account_app_event_at(
         "alice",
         &crate::AppMessageProjection {
+            authority: None,
             message_id_hex: material.message_id_hex.clone(),
             source_message_id_hex: None,
             direction: "system".to_owned(),
@@ -2299,6 +2308,7 @@ fn system_reaction_notifications_use_stored_actor_and_respect_origin_withdrawal(
         .unwrap();
         let origin = cgka_traits::MessageId::new(vec![index as u8 + 1; 32]);
         let projection = crate::AppMessageProjection {
+            authority: None,
             message_id_hex: material.message_id_hex.clone(),
             source_message_id_hex: None,
             group_id_hex: group_hex.clone(),
