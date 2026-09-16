@@ -624,7 +624,6 @@ test-convergence-policy-pin:
 
 apple-privacy-gate:
     python3 crates/marmot-uniffi/test-apple-privacy.py
-    python3 crates/marmot-uniffi/test-apple-swift-package.py
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.

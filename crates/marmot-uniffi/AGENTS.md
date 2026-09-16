@@ -9,8 +9,8 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
   XCFramework), `kotlin-bindings.sh` (Android JNI libs + generated Kotlin), `package-ios-artifacts.sh`,
   `package-macos-artifacts.sh`, `validate-ios-artifact.sh`, `validate-macos-artifact.sh`, `validate-swift-package.sh`,
   and `validate-swift-package-macos.sh`.
-- Own `apple-framework.py`, `apple-privacy/`, `validate-apple-privacy.py`, `validate-apple-archive.py`,
-  `apple-swift-package.py`, `test-apple-swift-package.py`, and `test-apple-privacy.py` for SDK declarations and
+- Own `apple-privacy.py`, `apple-privacy/`, `validate-apple-privacy.py`, `validate-apple-archive.py`,
+  and `test-apple-privacy.py` for SDK declarations and
   resource delivery into Apple app archives.
 - Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
 - Own `chat-projections-smoke.sh`, the host Swift/Kotlin chat-screen DTO round-trip check.
@@ -29,14 +29,12 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 - Package Apple static libraries exactly as cargo produced them. Neither `xcframework.sh` nor `xcframework-macos.sh`
   strips post-link: `marmotkit-release-profile.env` pins `strip=none` and `debug=0`, and the packagers publish that
   profile as provenance, so a post-link strip would make the manifest describe an artifact that was not shipped.
-  Stage those unchanged archives inside resource-bearing static frameworks; preserve macOS versioned symlinks.
-  Validate privacy declarations against the packaged source and build features, then validate resources in a
-  consuming app archived from the packaged ZIP. Existing binary-target assets keep their framework layout.
-  Both legacy-framework and complete-package archive fixtures call real Rust code so resource checks also exercise linking.
-  Complete `marmotkit-swiftpm-<platform>-<id>.zip` packages use byte-identical raw-library slices and a Swift
-  target-owned privacy resource. Treat that entire package as the distribution unit; never ship only its raw library.
-  Validate its app/notification-extension resources and reject embedded codeless framework stubs. Keep the Rust
-  debug-information policy separate from privacy packaging changes.
+  Package unchanged archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
+  from the packaged source's `apple-privacy/` and publish it separately with a checksum; also include it in the
+  existing provenance bundle. Never stage resource-bearing framework wrappers or another complete-package ZIP.
+  Consumers must synchronize binary, Swift and privacy inputs and declare the privacy resource in their Swift target.
+  Validate the actual released inputs in app/notification-extension archives: privacy delivery, static linking, real
+  Rust references, dSYM UUIDs, and no codeless framework stub. Keep Rust debug policy separate from privacy packaging.
 - The generated Swift binding is platform-independent, so releases publish `MarmotKit-<id>.swift` exactly once, from
   the iOS job. `package-macos-artifacts.sh` records its SHA-256 in the macOS manifest but must not emit the file;
   emitting it would collide with the iOS asset name on the shared release. The release job asserts both hashes match.

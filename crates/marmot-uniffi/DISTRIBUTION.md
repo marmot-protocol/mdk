@@ -1,92 +1,59 @@
 # MarmotKit Binary Distribution
 
-MarmotKit releases publish the generated Swift and Kotlin APIs with their matching native libraries as immutable
-GitHub Release assets. New SwiftPM integrations should use the complete platform Swift package described below.
-The existing framework binary-target assets remain available for current/manual integrations; Android consumers
-unpack the Kotlin and JNI bundle into their app build.
+MarmotKit releases publish generated Swift/Kotlin APIs with matching native libraries as immutable GitHub Release
+assets. Apple consumers use a binary-target XCFramework ZIP, generated Swift, and a separate SDK privacy manifest.
+Android consumers unpack the Kotlin and JNI bundle into their app build.
 
-## Complete Apple SwiftPM packages
+## Apple privacy migration
 
-Releases built with this packaging change additionally publish:
+**Migration required for releases built with this change.** Apple XCFrameworks now contain raw static-library slices,
+not resource-bearing frameworks. Updating only the binary URL loses SDK privacy delivery. Keep the remote SwiftPM
+binary target, but update all three matching release inputs and the wrapper's resource declaration together:
 
-```text
-marmotkit-swiftpm-ios-<identifier>.zip
-marmotkit-swiftpm-ios-<identifier>.zip.sha256
-marmotkit-swiftpm-macos-<identifier>.zip
-marmotkit-swiftpm-macos-<identifier>.zip.sha256
-```
+- `MarmotKitFFI-<identifier>.xcframework.zip` for iOS, or `MarmotKitFFI-macos-<identifier>.xcframework.zip` for macOS.
+- `MarmotKit-<identifier>.swift`, shared by both platforms.
+- `PrivacyInfo-ios-<identifier>.xcprivacy` or `PrivacyInfo-macos-<identifier>.xcprivacy`, for that platform's build.
 
-Use the same exact release/snapshot tag and identifier as the other assets. These files are **not retroactively
-available in 0.10.0 or earlier releases**. A complete package ZIP is not a `.binaryTarget(url:)` archive.
-Download it and its sibling `.sha256`, verify them with `shasum -a 256 -c <filename>.sha256`, then extract it.
-Add the enclosed `MarmotKit` directory as a **local Swift package**, for example:
+Download from the same exact release/snapshot tag. Verify the privacy asset with its sibling `.sha256` using
+`shasum -a 256 -c <filename>.sha256`, and verify Swift/binary hashes against the platform manifest. SwiftPM also checks
+the binary ZIP against its `.swiftpm-checksum`. The platform privacy files are separately named so each build's
+feature selection and provenance remain explicit; their contents match when their privacy-relevant features match.
+
+Place the Swift binding and the privacy asset in the existing Swift wrapper target, renaming them to `MarmotKit.swift`
+and `PrivacyInfo.xcprivacy`. Preserve the SDK declaration separately from the host application's own privacy manifest.
+The wrapper target must declare:
 
 ```swift
-// In the host's Package.swift dependencies:
-.package(path: "Vendored/MarmotKit")
-// In each app/extension target's dependencies:
-.product(name: "MarmotKit", package: "MarmotKit")
+.target(
+    name: "MarmotKit",
+    dependencies: ["MarmotKitFFI"],
+    resources: [.copy("PrivacyInfo.xcprivacy")],
+    linkerSettings: [
+        .linkedFramework("Security", .when(platforms: [.macOS])),
+        .linkedFramework("SystemConfiguration", .when(platforms: [.macOS]))
+    ]
+)
 ```
 
-For Xcode projects, use Add Local Package and assign the MarmotKit product to the app and notification extension.
-Replace the old MarmotKit wrapper dependency; do not compile an additional copy of `MarmotKit.swift` in the host.
-If retaining an existing package wrapper is necessary, copy **all** the matching package inputs and retain its
-`resources: [.copy("PrivacyInfo.xcprivacy")]` declaration and platform linker settings.
+Assign that wrapper's product to each consuming app and notification extension. Do not add an extra host-compiled copy
+of the generated Swift. SwiftPM delivers the target's manifest in a resource bundle; Rust remains statically linked
+into each executable. No additional complete-package ZIP or new Rust binary is published. Existing provenance bundle
+ZIPs include all three inputs plus `manifest.json`, but are not themselves binary-target archives.
 
-The package contains:
+Platform manifests identify this layout with `distribution: static-library-and-privacy-v1` and hash the privacy asset
+alongside Swift, the ZIP and each static library. Keep all inputs on one identifier; automate their synchronization.
+Consumers of 0.10.0 and earlier retain the old framework layout. No published release is modified. Direct Xcode
+consumers must provide and validate an equivalent SDK resource bundle or use the Swift wrapper.
 
-```text
-MarmotKit/
-  Package.swift
-  manifest.json
-  MarmotKit.xcframework/                 # raw, unchanged static-library slices
-  Sources/MarmotKit/MarmotKit.swift
-  Sources/MarmotKit/PrivacyInfo.xcprivacy # owned and copied by the Swift target
-```
+Release CI builds a simulator consumer and archives iOS app/notification-extension and macOS consumers from the
+released ZIP, matching Swift and privacy assets. It checks resource content in each consumer, unchanged static
+linkage, real Rust references, executable/dSYM UUIDs, and absence of the empty framework stub. The fixture uses a local
+binary target after checking the downloaded ZIP's hash; existing remote SwiftPM link checks still exercise the URL and
+checksum path. Signed export, Organizer privacy report and App Store Connect upload remain separate host checks.
+Rust source-level debug information is unchanged and belongs in the crash-symbol PR.
 
-This keeps Rust statically linked into each consuming executable. SwiftPM copies the SDK manifest into its
-`MarmotKit_MarmotKit.bundle`, avoiding the codeless framework that Xcode otherwise replaces with an empty dynamic
-stub. No privacy declaration is removed or changed. The generated Swift and archive bytes match the corresponding
-framework distribution; Rust release/debug settings are unchanged. Crash source maps are separate work.
-
-The package's `manifest.json` retains source/builder SHA, feature selection, toolchain and profile provenance, and
-adds hashes of every payload file and the original static archives. Its `distribution: swiftpm-resources-v1` field
-versions this contract; it does not inherit the framework manifest's `schema_version`. The platform release manifest records the package
-ZIP SHA-256 under `swiftpm_package`; its checksums file also lists that ZIP. macOS embeds the same generated Swift
-source in this complete package, while the standalone `.swift` release asset remains owned by the iOS job.
-
-A complete package is the unit of integration. A raw library cannot carry resources by itself; copying only its
-XCFramework loses the privacy resource. Keep the host's own privacy manifest and declarations too. The framework
-assets documented below retain their current formats and manifests for compatibility, but their codeless resource
-framework can still trigger a missing-dSYM warning on Xcode 27. Adopting this package is the migration provided by
-this release to avoid that stub; updating only an old binary URL does not change resource ownership.
-
-### Distribution tradeoffs and compatibility
-
-The complete ZIP keeps generated Swift, unchanged native code and the SDK-owned privacy declaration together in
-one verifiable release asset. The cost is an explicit download/update step: a local package has no remote SwiftPM
-version resolution or automatic binary-download checksum verification. Host synchronization must verify the sibling
-SHA-256 and pin provenance on every update. The extracted package can be an ignored, reproducibly downloaded build
-input; committing binary blobs to the host repository is not required.
-
-Alternative distribution designs and the reason for choosing a complete package are recorded in
-[PR #1872](https://github.com/marmot-protocol/mdk/pull/1872).
-
-Existing framework assets remain available during migration, including for direct Xcode integrations. Retire them
-only in a future announced release after White Noise and other known consumers have migrated, host privacy reports
-and signed uploads have been checked, and any required remote-wrapper replacement is available. No removal version
-is set here; [migration and retirement issue #1874](https://github.com/marmot-protocol/mdk/issues/1874) tracks
-consumer adoption, release evidence, and the eventual removal version. Already-published assets remain immutable.
-
-Release CI archives the complete package on both Apple platforms. iOS checks the app and notification extension;
-macOS checks the app and its ad-hoc signature. The checks require correct SDK resources, unchanged static linkage,
-actual Rust function references, matching consumer dSYM UUIDs, and no embedded Marmot framework stub. They do not
-claim source-line debug coverage or App Store acceptance. Signed distribution export, Organizer privacy-report
-verification and a real staging upload remain host release checks.
-
-Each release carries a separate iOS and macOS XCFramework under distinct asset names, and a single shared
-`MarmotKit-<identifier>.swift`. The generated Swift is platform-independent, so both platforms consume the same file:
-there is no macOS-specific Swift asset to look for.
+[Consumer migration tracking](https://github.com/marmot-protocol/mdk/issues/1874) records downstream adoption and host
+release evidence. See the [privacy audit and adoption guide](apple-privacy/README.md) for outstanding privacy questions.
 
 ## iOS
 
@@ -113,10 +80,8 @@ These URLs always contain an exact tag or snapshot identifier. Do not use a `lat
 
 ### SwiftPM
 
-Use the [complete local Swift package](#complete-apple-swiftpm-packages) for the privacy-resource migration.
-The compatibility recipe below retains the framework layout and can still produce the Xcode 27 empty-stub warning.
-
-#### Legacy framework binary target
+Follow the [privacy migration](#apple-privacy-migration) as well as this binary declaration; the binary alone does not
+carry the SDK privacy resource.
 
 Download the sibling `.swiftpm-checksum` asset or read the `swiftpm` record in
 `marmotkit-ios-<identifier>.checksums.txt`, then declare:
@@ -134,14 +99,14 @@ inspection and provenance; they are not `shasum -c` input. Use the sibling `.sha
 verification.
 
 Add the matching `MarmotKit-<identifier>.swift` file to a Swift source target that depends on `MarmotKitFFI`. Update
-the binary URL, checksum, and generated Swift source together. Mixing source and binary identifiers can compile
+the binary URL, checksum, generated Swift source, and platform privacy file together. Mixing source and binary identifiers can compile
 against the wrong UniFFI ABI and is unsupported.
 
 For manual verification, compare the ZIP with its `.sha256` asset. The separately published
 `marmotkit-ios-<identifier>.manifest.json` records the full MDK source SHA, workspace version, `Cargo.lock` SHA-256,
 toolchain versions, enabled features, iOS targets and deployment target, effective Rust release profile, and hashes
 of the binary and generated Swift artifacts. The complete `marmotkit-ios-<identifier>.zip` retains the XCFramework,
-matching Swift source, and the same manifest for consumers that prefer a single provenance bundle.
+matching Swift source, `PrivacyInfo.xcprivacy`, and the same manifest for consumers that prefer a single provenance bundle.
 
 ## macOS
 
@@ -164,10 +129,8 @@ https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha
 
 ### SwiftPM
 
-Use the [complete local Swift package](#complete-apple-swiftpm-packages) for the privacy-resource migration.
-The compatibility recipe below retains the framework layout and can still produce the Xcode 27 empty-stub warning.
-
-#### Legacy framework binary target
+Follow the [privacy migration](#apple-privacy-migration) as well as this binary declaration; the binary alone does not
+carry the SDK privacy resource.
 
 Download the sibling `.swiftpm-checksum` asset or read the `swiftpm` record in
 `marmotkit-macos-<identifier>.checksums.txt`, then declare:
@@ -200,7 +163,7 @@ For manual verification, compare the ZIP with its `.sha256` asset. The separatel
 `marmotkit-macos-<identifier>.manifest.json` records the full MDK source SHA, workspace version, `Cargo.lock` SHA-256,
 toolchain versions, enabled features, macOS targets and deployment target, effective Rust release profile, and hashes
 of the binary and shared generated Swift artifacts. The complete `marmotkit-macos-<identifier>.zip` retains the
-XCFramework, matching Swift source, and the same manifest for consumers that prefer a single provenance bundle.
+XCFramework, matching Swift source, `PrivacyInfo.xcprivacy`, and the same manifest for consumers that prefer a single provenance bundle.
 
 ## Android
 
@@ -256,7 +219,6 @@ SHA so the generated API and JNI libraries remain a matched set.
 
 ## Apple privacy resources
 
-Apple exporters retain resource-bearing static framework slices and additionally package a complete SwiftPM
-distribution with target-owned privacy resources. See the
-[privacy audit and adoption guide](apple-privacy/README.md) for declarations,
-archive validation, host integration changes, and unresolved release questions.
+Apple exporters publish raw static libraries and the reviewed SDK manifest as separate matching release inputs.
+The consuming Swift wrapper owns the privacy resource. See the [privacy audit and adoption guide](apple-privacy/README.md)
+for declarations, archive validation and unresolved release questions.

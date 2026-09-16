@@ -55,7 +55,7 @@ index=0
 while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryIdentifier" "$PLIST" 2>/dev/null)"; do
   platform="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:SupportedPlatform" "$PLIST")"
   variant="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:SupportedPlatformVariant" "$PLIST" 2>/dev/null || true)"
-  binary_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:BinaryPath" "$PLIST")"
+  binary_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryPath" "$PLIST")"
   library="$XCFRAMEWORK/$identifier/$binary_path"
 
   [[ "$platform" == "ios" ]] || { echo "error: unexpected platform $platform" >&2; exit 1; }
@@ -65,9 +65,9 @@ while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index
     exit 1
   }
 
-  library_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryPath" "$PLIST")"
-  [[ -f "$XCFRAMEWORK/$identifier/$library_path/Modules/module.modulemap" ]] || {
-    echo "error: missing framework module map for $identifier" >&2
+  headers_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:HeadersPath" "$PLIST")"
+  [[ -f "$XCFRAMEWORK/$identifier/$headers_path/module.modulemap" ]] || {
+    echo "error: missing library module map for $identifier" >&2
     exit 1
   }
 

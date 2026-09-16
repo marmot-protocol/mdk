@@ -83,114 +83,59 @@ No UserDefaults, ActiveKeyboards or DiskSpace declaration is fabricated.
 
 ## Packaging contract
 
-The complete SwiftPM packages described in [DISTRIBUTION.md](../DISTRIBUTION.md#complete-apple-swiftpm-packages)
-are the preferred integration for avoiding Xcode's empty framework stub. They contain the same static archive bytes,
-matching Swift source and feature-selected privacy declarations, with the manifest explicitly owned by the Swift
-target. Existing framework assets remain unchanged and continue to follow the framework contract below. No privacy
-policy declaration, native required-reason assessment, Rust debug profile or published release is changed by this
-additional distribution format.
+The release contains raw static-library XCFramework slices and a separately published, feature-selected privacy file.
+`apple-privacy.py` renders the reviewed declaration from the packaged source checkout. The packagers validate it and
+publish `PrivacyInfo-<platform>-<id>.xcprivacy` plus `.sha256`, record its hash in the platform manifest, and include it
+as `PrivacyInfo.xcprivacy` in the existing provenance bundle. Generated Swift and Cargo archive bytes remain unchanged.
+No resource-bearing framework or additional complete-package ZIP is produced. Previously published releases remain
+immutable; this migration ships only in a new release.
 
-Validate a complete release package directly (the `-` means the matching binding comes from inside the package):
+## Validation
 
-```sh
-python3 crates/marmot-uniffi/validate-apple-archive.py ios /path/marmotkit-swiftpm-ios-<id>.zip - /tmp/new-ios-consumer --swiftpm-package --product-analytics 1
-python3 crates/marmot-uniffi/validate-apple-archive.py macos /path/marmotkit-swiftpm-macos-<id>.zip - /tmp/new-macos-consumer --swiftpm-package --product-analytics 1
-```
-
-Pass `--privacy-dir` for the packaged source checkout and select the actual build's analytics feature. The validator
-checks real Rust calls, privacy resources in each consumer, static linkage and matching executable/dSYM UUIDs,
-and rejects any embedded Marmot framework stub. It writes `archive-checks.json`. It does not require new Rust source
-line information: that policy change belongs in a separate PR. Follow the White Noise adoption checklist below.
-Do not pass raw-library slices to `validate-apple-privacy.py --archive`, which expects the legacy framework layout.
-
-The fixture validates SDK packaging, not White Noise's integration. In the actual host archive, verify the reviewed
-declarations in `MarmotKit_MarmotKit.bundle/PrivacyInfo.xcprivacy` within both the iOS app and each consuming extension
-(macOS: `Contents/Resources/MarmotKit_MarmotKit.bundle/Contents/Resources/PrivacyInfo.xcprivacy`). Check that the empty
-FFI framework is absent and each executable has its matching dSYM. The host privacy assessment, Organizer privacy
-report and signed export/upload checks in the adoption checklist still apply.
-
-## Legacy framework layout and validation
-
-This compatibility path retains the Xcode 27 empty-stub behavior. Raw `.a` slices cannot carry resources.
-The legacy exporter stages a static
-`marmot_uniffiFFI.framework` around the **byte-identical Cargo archive**, with
-the generated header and a framework-form module map preserving the C module
-name. It does not regenerate or edit Swift API declarations. `xcodebuild
--create-xcframework -framework` packages these resource-bearing slices:
-
-* iOS/device and simulator: framework root `PrivacyInfo.xcprivacy`.
-* macOS: `Versions/A/Resources/PrivacyInfo.xcprivacy`, with versioned framework
-  symlinks.
-
-Privacy inputs come from the **packaged source checkout** (`MARMOTKIT_CRATE_DIR`),
-not the workflow builder's newer declarations. Building an older snapshot that
-lacks these inputs fails rather than attaching current claims to an old binary.
-ZIP checksums cover the resources as well as code. No generated files or binaries
-are committed, no version is bumped, and no existing release is modified.
-
-Xcode 15+ supports linking and embedding static frameworks while omitting the
-static binary from the embedded resource bundle. A standalone `.a`, copied ZIP,
-or a successful SwiftPM library link is not archive evidence.
-
-### Legacy artifact and archive checks
-
-Run the resource-loss tests and both platform validators. For full artifact and
-app-archive checks (XcodeGen is required; local validation used 2.44.1):
+Run `python3 crates/marmot-uniffi/test-apple-privacy.py` for resource-loss, raw-library, provenance and archive regressions.
+The existing artifact validators check ARM64 slices and native-object deployment targets. The archive fixture consumes
+three release assets, checks their hashes against the release manifest, then creates a Swift wrapper with
+`resources: [.copy("PrivacyInfo.xcprivacy")]`. It invokes real Rust in the app and iOS notification extension.
 
 ```sh
-python3 crates/marmot-uniffi/test-apple-privacy.py
-OTLP_EXPORT=1 PRODUCT_ANALYTICS_EXPORT=1 ./crates/marmot-uniffi/xcframework.sh
-OTLP_EXPORT=1 PRODUCT_ANALYTICS_EXPORT=1 ./crates/marmot-uniffi/xcframework-macos.sh
-./crates/marmot-uniffi/validate-ios-artifact.sh crates/marmot-uniffi/output/MarmotKit.xcframework 18.0
-./crates/marmot-uniffi/validate-macos-artifact.sh crates/marmot-uniffi/output/macos/MarmotKit.xcframework 15.0
-python3 crates/marmot-uniffi/validate-apple-archive.py ios crates/marmot-uniffi/output/MarmotKit.xcframework crates/marmot-uniffi/output/MarmotKit.swift /tmp/mdk-ios-privacy-consumer
-python3 crates/marmot-uniffi/validate-apple-archive.py macos crates/marmot-uniffi/output/macos/MarmotKit.xcframework crates/marmot-uniffi/output/macos/MarmotKit.swift /tmp/mdk-macos-privacy-consumer
+python3 crates/marmot-uniffi/validate-apple-archive.py ios \
+  /path/MarmotKitFFI-<id>.xcframework.zip /path/MarmotKit-<id>.swift /tmp/new-ios-consumer \
+  --privacy-manifest /path/PrivacyInfo-ios-<id>.xcprivacy \
+  --release-manifest /path/marmotkit-ios-<id>.manifest.json --product-analytics 1
+python3 crates/marmot-uniffi/validate-apple-archive.py macos \
+  /path/MarmotKitFFI-macos-<id>.xcframework.zip /path/MarmotKit-<id>.swift /tmp/new-macos-consumer \
+  --privacy-manifest /path/PrivacyInfo-macos-<id>.xcprivacy \
+  --release-manifest /path/marmotkit-macos-<id>.manifest.json --product-analytics 1
 ```
 
-The archive validator also accepts the packaged `.xcframework.zip` in place of
-the XCFramework directory; use that ZIP for release validation. Pass
-`--privacy-dir <packaged-source>/crates/marmot-uniffi/apple-privacy` when the
-source differs from the builder, and `--product-analytics 1` (or `0`) to require
-the declarations for the built feature. The shell artifact validators honor
-`MARMOTKIT_CRATE_DIR` and, when supplied, `PRODUCT_ANALYTICS_EXPORT`.
-
-Each archive work directory must be new. The generated test app has no host
-privacy manifest or custom resource-copy phase. CI builds the consumer from the packaged SwiftPM ZIP before
-uploading Apple artifacts. macOS uses ad-hoc signing and strict signature
-verification. The device iOS fixture is unsigned because development signing
-requires a certificate/profile; a signed host archive remains a release check. The checker inspects only `Products/Applications`
-in the archive and compares the embedded SDK manifest to the artifact's manifest.
-It fails if resources exist only in the input XCFramework or DerivedData.
+Each work directory must be new. Pass `--privacy-dir` for the packaged source checkout and select the actual build's
+analytics feature. Xcode and XcodeGen are required. Release CI runs this before artifact upload; regular PR CI runs the
+Python regressions. iOS includes a simulator build and unsigned device archive; macOS uses ad-hoc signing with strict
+signature verification. `archive-checks.json` records per-image UUIDs, SDK privacy delivery and static linkage. These
+checks reject the empty FFI framework and embedded static archives. They do not assert Rust source-line coverage.
 
 ## White Noise adoption
 
-After resolving the release questions above and publishing a **new immutable** release:
-
-1. Pin its exact tag and download `marmotkit-swiftpm-ios-<id>.zip` (or `marmotkit-swiftpm-macos-<id>.zip`)
-   plus its sibling `.sha256`. In the download directory, run `shasum -a 256 -c <filename>.sha256` before extracting.
-   Verify the source/builder provenance in the package manifest. Update the complete package as one unit in the
-   binding synchronization flow; do not apply a legacy binary-target checksum to this ZIP.
-2. Add the extracted `MarmotKit` directory as a local Swift package and assign its product to the app and notification
-   extension. Replace the old wrapper dependency and remove the extra host-compiled `MarmotKit.swift` copy. Preserve
-   the package's `Package.swift`, raw-library XCFramework, generated Swift, and target-owned `PrivacyInfo.xcprivacy`.
-3. Run the complete-package fixture commands above with the matching source privacy declarations and build features.
-   Archive the actual host app and check the SDK bundle in every consuming app/extension, absence of the empty FFI
-   framework, and matching executable/dSYM UUIDs. Fixture success alone does not verify host integration.
-4. Keep the host's manifest and review its app/app-group file access, app-owned collection and extensions separately.
-   Keep MDK's root in an app/app-group container. **The SDK manifest does not declare DiskSpace:** SQLCipher's
-   `statfs`/`fstatfs` purpose remains unresolved. Resolve that before App Store submission; a green resource check does
-   not close it. Adding a host declaration is valid only if its approved reason actually covers those native calls.
-   Do not substitute a host low-disk-space feature for SQLCipher's unrelated locking/filesystem use.
-5. In Organizer choose **Generate Privacy Report** and compare its aggregated collection to consent screens, policy,
-   configured services and App Store privacy answers. Validate a signed distribution export, then perform a staging
-   App Store Connect/TestFlight upload. Record each result separately; a local archive/report does not establish
-   upload acceptance. Track migration evidence in [#1874](https://github.com/marmot-protocol/mdk/issues/1874).
-
-For consumers temporarily retaining the legacy format, preserve the whole resource-bearing XCFramework and versioned
-macOS symlinks, update the binary/checksum/generated Swift together, and use the legacy validator commands above.
-Direct Xcode integrations still link and **Embed & Sign** that framework. For an existing host archive use
-`validate-apple-privacy.py <new.xcframework> --archive <host.xcarchive>`. These compatibility steps preserve its privacy
-resource but do not implement the empty-stub fix; they are not the White Noise migration path.
+1. Pin a new exact release tag and synchronize the binary ZIP, shared Swift binding and platform privacy asset.
+   Verify the binary's SwiftPM checksum, the privacy file's sibling `.sha256` with `shasum -a 256 -c <filename>.sha256`,
+   and source/builder provenance. Update all three inputs together; a binary-URL-only update loses privacy delivery.
+2. Keep the remote `.binaryTarget(url:checksum:)` in the existing wrapper. Put `MarmotKit.swift` and the renamed
+   `PrivacyInfo.xcprivacy` in its Swift target; add `resources: [.copy("PrivacyInfo.xcprivacy")]` and preserve the macOS
+   system-framework settings. See [the wrapper example](../DISTRIBUTION.md#apple-privacy-migration). Assign its product
+   to both the app and notification extension. Remove any old manual FFI framework embedding/copy step.
+3. Run the fixture above, then archive the actual host. Verify the SDK manifest in each consumer's
+   `MarmotKit_MarmotKit.bundle/PrivacyInfo.xcprivacy` (macOS:
+   `Contents/Resources/MarmotKit_MarmotKit.bundle/Contents/Resources/PrivacyInfo.xcprivacy`). Bundle names follow the
+   package/target names if the host uses different names. Check absence of the empty FFI framework and matched
+   executable/dSYM UUIDs. A host-owned manifest cannot stand in for SDK resource delivery.
+4. Keep the host's manifest and review app/app-group file access, collection and extensions separately. Keep MDK's root
+   in an app/app-group container. **The SDK manifest does not declare DiskSpace:** SQLCipher's `statfs`/`fstatfs` purpose
+   remains unresolved. Resolve that before App Store submission; a green resource check does not close it. A host
+   declaration is valid only if its approved reason covers those native calls, not an unrelated low-disk-space feature.
+5. Generate the Organizer privacy report and compare it to consent screens, policy, configured services and App Store
+   privacy answers. Validate a signed distribution export and a staging App Store Connect/TestFlight upload. Record
+   each result separately in [#1874](https://github.com/marmot-protocol/mdk/issues/1874); local archive success does not
+   establish upload acceptance.
 
 ## Official sources verified 2026-09-15
 

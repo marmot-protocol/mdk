@@ -449,8 +449,8 @@ The release job creates these assets:
 - `marmotkit-ios-<version>.checksums.txt`
 - `marmotkit-ios-<version>.zip`
 - `marmotkit-ios-<version>.zip.sha256`
-- `marmotkit-swiftpm-ios-<version>.zip` (complete local Swift package)
-- `marmotkit-swiftpm-ios-<version>.zip.sha256`
+- `PrivacyInfo-ios-<version>.xcprivacy` (SDK privacy resource for the Swift wrapper)
+- `PrivacyInfo-ios-<version>.xcprivacy.sha256`
 - `MarmotKitFFI-macos-<version>.xcframework.zip` (macOS, Apple Silicon)
 - `MarmotKitFFI-macos-<version>.xcframework.zip.sha256`
 - `MarmotKitFFI-macos-<version>.xcframework.zip.swiftpm-checksum`
@@ -458,8 +458,8 @@ The release job creates these assets:
 - `marmotkit-macos-<version>.checksums.txt`
 - `marmotkit-macos-<version>.zip`
 - `marmotkit-macos-<version>.zip.sha256`
-- `marmotkit-swiftpm-macos-<version>.zip` (complete local Swift package)
-- `marmotkit-swiftpm-macos-<version>.zip.sha256`
+- `PrivacyInfo-macos-<version>.xcprivacy` (SDK privacy resource for the Swift wrapper)
+- `PrivacyInfo-macos-<version>.xcprivacy.sha256`
 - `MarmotKit-<version>.swift` (shared by iOS and macOS)
 - `marmotkit-android-<version>.zip`
 - `marmotkit-android-<version>.zip.sha256`
@@ -473,29 +473,25 @@ Snapshot assets use `snapshot-<full-sha>` in place of `<version>` and are publis
 for SwiftPM. Android snapshots publish `marmotkit-android-snapshot-<full-sha>.zip` and its sibling `.sha256` under the
 same release tag. See `crates/marmot-uniffi/DISTRIBUTION.md` for exact URLs and consumer examples.
 
-The legacy `marmotkit-ios-<version>.zip` contains:
+The `marmotkit-ios-<version>.zip` contains:
 
 - `MarmotKit.xcframework`
 - `MarmotKit.swift`
+- `PrivacyInfo.xcprivacy`
 - `manifest.json`
 
-The legacy `marmotkit-macos-<version>.zip` contains:
+The `marmotkit-macos-<version>.zip` contains:
 
 - `MarmotKit.xcframework`
 - `MarmotKit.swift`
+- `PrivacyInfo.xcprivacy`
 - `manifest.json`
 
-Each complete `marmotkit-swiftpm-<platform>-<version>.zip` contains a `MarmotKit/` package root with:
-
-- `Package.swift`
-- `manifest.json`
-- `MarmotKit.xcframework` (raw static-library slices)
-- `Sources/MarmotKit/MarmotKit.swift`
-- `Sources/MarmotKit/PrivacyInfo.xcprivacy`
-
-Verify its sibling `.sha256` before extraction and use the whole directory as a local Swift package. The complete ZIP
-is not a remote `.binaryTarget(url:)` archive. This is the integration that avoids Xcode 27's empty FFI framework stub;
-the legacy framework assets remain available during [consumer migration](https://github.com/marmot-protocol/mdk/issues/1874).
+Apple binary-target ZIPs now contain raw static-library slices. Publish the matching privacy asset and its checksum
+with each platform's assets; platform manifests use `distribution: static-library-and-privacy-v1`. No additional complete
+Swift package ZIP is published. Consumers must update their wrapper's privacy resource declaration as well as the
+binary and Swift inputs. Merely changing the binary URL loses SDK privacy delivery. See the
+[consumer migration guide](crates/marmot-uniffi/DISTRIBUTION.md#apple-privacy-migration).
 
 The Android zip contains:
 
@@ -521,16 +517,14 @@ App repos should pin an exact formal MarmotKit tag or SHA-addressed snapshot, ve
 the generated source and native libraries into ignored build inputs or another repository-approved generated-artifact
 location. Never mix generated source and native libraries from different release identifiers.
 
-Apple SwiftPM consumers should stage the complete package for their platform, preserving its SDK-owned privacy
-resource and manifest. Add it as a local package dependency to every consuming app/extension; remove the old wrapper
-and extra generated Swift copy. For example:
+Apple SwiftPM consumers can retain the remote binary target and stage the matching generated Swift and privacy file
+in its existing wrapper target. Rename the privacy asset to `PrivacyInfo.xcprivacy`, declare
+`resources: [.copy("PrivacyInfo.xcprivacy")]`, and assign the wrapper product to every consuming app/extension.
+The two staged sources are:
 
 ```text
-Vendored/MarmotKit/Package.swift
-Vendored/MarmotKit/manifest.json
-Vendored/MarmotKit/MarmotKit.xcframework
-Vendored/MarmotKit/Sources/MarmotKit/MarmotKit.swift
-Vendored/MarmotKit/Sources/MarmotKit/PrivacyInfo.xcprivacy
+Sources/MarmotKit/MarmotKit.swift
+Sources/MarmotKit/PrivacyInfo.xcprivacy
 ```
 
 Android expects the staged equivalent of:
@@ -605,8 +599,8 @@ name reusable.
 
 - The workspace is not published to crates.io.
 - The whole-workspace release is tag- and source-archive-based.
-- MarmotKit publishes complete local Swift package ZIPs, but no remote version-resolved Swift package repository or
-  Maven package. Legacy binary-target ZIPs remain SwiftPM-compatible and can retain Xcode 27's empty framework stub.
+- MarmotKit publishes SwiftPM binary-target ZIPs and separate Swift/privacy assets, but no remote version-resolved
+  Swift wrapper package repository or Maven package. Hosts must synchronize the matching inputs and own resource wiring.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
 - The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the
   MarmotKit binding release.

@@ -27,6 +27,7 @@ CRATE_DIR="${MARMOTKIT_CRATE_DIR:-$WORKSPACE_DIR/crates/marmot-uniffi}"
 OUTPUT_DIR="$CRATE_DIR/output"
 XCFRAMEWORK="$OUTPUT_DIR/MarmotKit.xcframework"
 SWIFT_BINDING="$OUTPUT_DIR/MarmotKit.swift"
+PRIVACY_MANIFEST="$OUTPUT_DIR/PrivacyInfo.xcprivacy"
 
 if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "error: source SHA must be a full lowercase 40-character Git commit SHA" >&2
@@ -36,12 +37,13 @@ if [[ ! "$BUILDER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "error: builder SHA must be a full lowercase 40-character Git commit SHA" >&2
   exit 1
 fi
-if [[ ! -d "$XCFRAMEWORK" || ! -f "$SWIFT_BINDING" ]]; then
+if [[ ! -d "$XCFRAMEWORK" || ! -f "$SWIFT_BINDING" || ! -f "$PRIVACY_MANIFEST" ]]; then
   echo "error: run crates/marmot-uniffi/xcframework.sh before packaging" >&2
   exit 1
 fi
 
 python3 "$TOOL_DIR/validate-apple-privacy.py" "$XCFRAMEWORK" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}" --privacy-dir "$CRATE_DIR/apple-privacy"
+python3 "$TOOL_DIR/validate-apple-privacy.py" "$PRIVACY_MANIFEST" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}" --privacy-dir "$CRATE_DIR/apple-privacy"
 
 workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_DIR/Cargo.toml" | head -n 1)"
 lock_sha="$(shasum -a 256 "$WORKSPACE_DIR/Cargo.lock" | awk '{print $1}')"
@@ -59,7 +61,7 @@ manifest_name="marmotkit-ios-${RELEASE_ID}.manifest.json"
 bundle_name="marmotkit-ios-${RELEASE_ID}.zip"
 checksums_name="marmotkit-ios-${RELEASE_ID}.checksums.txt"
 
-swiftpm_package_name="marmotkit-swiftpm-ios-${RELEASE_ID}.zip"
+privacy_name="PrivacyInfo-ios-${RELEASE_ID}.xcprivacy"
 
 stage_parent="$(mktemp -d)"
 trap 'rm -rf "$stage_parent"' EXIT
@@ -68,8 +70,8 @@ bundle_dir="$stage_parent/marmotkit-ios-$RELEASE_ID"
 mkdir -p "$DIST_DIR" "$bundle_dir"
 DIST_DIR="$(cd "$DIST_DIR" && pwd)"
 rm -f \
-  "$DIST_DIR/$swiftpm_package_name" \
-  "$DIST_DIR/$swiftpm_package_name.sha256" \
+  "$DIST_DIR/$privacy_name" \
+  "$DIST_DIR/$privacy_name.sha256" \
   "$DIST_DIR/$binary_name" \
   "$DIST_DIR/$binary_name.sha256" \
   "$DIST_DIR/$binary_name.swiftpm-checksum" \
@@ -88,6 +90,8 @@ rm -f \
 binary_sha="$(shasum -a 256 "$DIST_DIR/$binary_name" | awk '{print $1}')"
 swiftpm_checksum="$(swift package compute-checksum "$DIST_DIR/$binary_name")"
 swift_sha="$(shasum -a 256 "$SWIFT_BINDING" | awk '{print $1}')"
+privacy_sha="$(shasum -a 256 "$PRIVACY_MANIFEST" | awk '{print $1}')"
+cp "$PRIVACY_MANIFEST" "$DIST_DIR/$privacy_name"
 plist="$XCFRAMEWORK/Info.plist"
 device_artifact=""
 simulator_artifact=""
@@ -95,7 +99,7 @@ index=0
 while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryIdentifier" "$plist" 2>/dev/null)"; do
   platform="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:SupportedPlatform" "$plist")"
   variant="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:SupportedPlatformVariant" "$plist" 2>/dev/null || true)"
-  binary_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:BinaryPath" "$plist")"
+  binary_path="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index:LibraryPath" "$plist")"
   [[ "$platform" == "ios" ]] || { echo "error: unexpected XCFramework platform $platform" >&2; exit 1; }
   artifact="MarmotKit.xcframework/$identifier/$binary_path"
   if [[ "$variant" == "simulator" ]]; then
@@ -126,6 +130,7 @@ fi
 cat > "$DIST_DIR/$manifest_name" <<EOF
 {
   "schema_version": 1,
+  "distribution": "static-library-and-privacy-v1",
   "name": "marmotkit-ios",
   "release_identifier": "$RELEASE_ID",
   "release_tag": "$RELEASE_TAG",
@@ -153,6 +158,9 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
       "sha256": "$binary_sha",
       "swiftpm_checksum": "$swiftpm_checksum"
     },
+    "$privacy_name": {
+      "sha256": "$privacy_sha"
+    },
     "$swift_name": {
       "sha256": "$swift_sha"
     },
@@ -165,20 +173,13 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
       "architecture": "arm64"
     }
   },
-  "contents": ["MarmotKit.xcframework", "MarmotKit.swift", "manifest.json"]
+  "contents": ["MarmotKit.xcframework", "MarmotKit.swift", "PrivacyInfo.xcprivacy", "manifest.json"]
 }
 EOF
 
-# Complete local Swift package: raw static libraries plus wrapper-owned privacy.
-# Keep existing framework assets intact for consumers that have not migrated.
-python3 "$TOOL_DIR/apple-swift-package.py" \
-  "$XCFRAMEWORK" "$SWIFT_BINDING" "$DIST_DIR/$manifest_name" \
-  "$DIST_DIR/$swiftpm_package_name" \
-  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
-swiftpm_package_sha="$(shasum -a 256 "$DIST_DIR/$swiftpm_package_name" | awk '{print $1}')"
-
 cp -R "$XCFRAMEWORK" "$bundle_dir/MarmotKit.xcframework"
 cp "$SWIFT_BINDING" "$bundle_dir/MarmotKit.swift"
+cp "$PRIVACY_MANIFEST" "$bundle_dir/PrivacyInfo.xcprivacy"
 cp "$DIST_DIR/$manifest_name" "$bundle_dir/manifest.json"
 (
   cd "$stage_parent"
@@ -194,9 +195,10 @@ swiftpm $swiftpm_checksum  $binary_name
 sha256  $swift_sha  $swift_name
 sha256  $manifest_sha  $manifest_name
 sha256  $bundle_sha  $bundle_name
-sha256  $swiftpm_package_sha  $swiftpm_package_name
+sha256  $privacy_sha  $privacy_name
 EOF
 
+printf '%s\n' "$privacy_sha  $privacy_name" > "$DIST_DIR/$privacy_name.sha256"
 printf '%s\n' "$binary_sha  $binary_name" > "$DIST_DIR/$binary_name.sha256"
 printf '%s\n' "$swiftpm_checksum" > "$DIST_DIR/$binary_name.swiftpm-checksum"
 printf '%s\n' "$bundle_sha  $bundle_name" > "$DIST_DIR/$bundle_name.sha256"
