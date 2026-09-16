@@ -385,14 +385,11 @@ impl SqliteAccountStorage {
     /// completions become invalid; rebinding creates new random generations.
     pub fn clear_avatar_cache(&self) -> StorageResult<()> {
         self.connection.with_transaction(|| {
-            self.lock()?
-                .execute("DELETE FROM avatar_assets", [])
+            let conn = self.lock()?;
+            conn.execute("DELETE FROM avatar_assets", []).storage()?;
+            conn.execute("DELETE FROM avatar_identity_demand", [])
                 .storage()?;
-            self.lock()?
-                .execute("DELETE FROM avatar_identity_demand", [])
-                .storage()?;
-            self.lock()?
-                .execute("DELETE FROM avatar_acquisition_bootstrap", [])
+            conn.execute("DELETE FROM avatar_acquisition_bootstrap", [])
                 .storage()?;
             Ok(())
         })

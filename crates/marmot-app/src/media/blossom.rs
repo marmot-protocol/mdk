@@ -108,7 +108,7 @@ pub(crate) struct BlossomHttpTransport {
     pub(super) allow_loopback_http: bool,
     address_lease: Duration,
     candidate_startup_timeout: Duration,
-    pub(super) transfer_timeout: Duration,
+    transfer_timeout: Duration,
     kind: MediaHttpKind,
 }
 
@@ -461,7 +461,7 @@ pub(crate) async fn fetch_blossom_blob(
 
 /// Fetch a bounded blob through a caller-owned transport without collecting
 /// telemetry, primarily for internal callers and deterministic tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "media-benchmarks"))]
 pub(crate) async fn fetch_blossom_blob_with_transport(
     url: &str,
     transport: &BlossomHttpTransport,
@@ -470,7 +470,7 @@ pub(crate) async fn fetch_blossom_blob_with_transport(
 }
 
 /// Fetch a bounded blob while recording privacy-safe transport phase totals.
-#[cfg(test)]
+#[cfg(any(test, feature = "media-benchmarks"))]
 pub(super) async fn fetch_blossom_blob_with_observer(
     url: &str,
     transport: &BlossomHttpTransport,

@@ -1,30 +1,22 @@
 //! Acquisition admission for avatar bytes. Clients still own full frame decoding.
 use super::{blossom::BlossomHttpTransport, group_image};
 use crate::AppError;
-use std::io::Cursor;
 use storage_sqlite::{AvatarImage, AvatarImageFormat, MAX_AVATAR_BYTES, SelectedAvatar};
 
 pub(crate) fn validate(bytes: Vec<u8>, declared: Option<&str>) -> Result<AvatarImage, AppError> {
     let mut bytes = zeroize::Zeroizing::new(bytes);
-    let detected = image::guess_format(&bytes)
-        .map_err(|_| AppError::InvalidEncryptedMedia("unrecognized avatar image".into()))?;
-    let format = match detected {
-        image::ImageFormat::Png => AvatarImageFormat::Png,
-        image::ImageFormat::Jpeg => AvatarImageFormat::Jpeg,
-        image::ImageFormat::Gif => AvatarImageFormat::Gif,
-        image::ImageFormat::WebP => AvatarImageFormat::Webp,
+    let (media_type, width, height) = group_image::inspect_group_image_input(&bytes, declared)?;
+    let format = match media_type.as_str() {
+        "image/png" => AvatarImageFormat::Png,
+        "image/jpeg" => AvatarImageFormat::Jpeg,
+        "image/gif" => AvatarImageFormat::Gif,
+        "image/webp" => AvatarImageFormat::Webp,
         _ => {
             return Err(AppError::InvalidEncryptedMedia(
                 "unsupported avatar image".into(),
             ));
         }
     };
-    group_image::validate_group_image_input(&bytes, declared.unwrap_or(format.media_type()))?;
-    let (width, height) = image::ImageReader::new(Cursor::new(bytes.as_slice()))
-        .with_guessed_format()
-        .map_err(|_| AppError::InvalidEncryptedMedia("invalid avatar image".into()))?
-        .into_dimensions()
-        .map_err(|_| AppError::InvalidEncryptedMedia("invalid avatar dimensions".into()))?;
     Ok(AvatarImage::new(
         std::mem::take(&mut *bytes),
         format,
@@ -82,6 +74,7 @@ pub(crate) fn retryable(error: &AppError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn encoded(format: image::ImageFormat, width: u32) -> Vec<u8> {
         let image = image::DynamicImage::new_rgb8(width, 1);

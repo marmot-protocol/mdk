@@ -83,10 +83,7 @@ impl SqliteAccountStorage {
     /// keys use its fixed-size row epoch, never an artificial MLS group-ID limit.
     pub fn chat_avatar_reference(&self, group: &str) -> StorageResult<Option<AvatarAssetRef>> {
         let conn = self.lock()?;
-        let owner: Option<String> = conn.query_row(
-            "SELECT 'chat:' || lower(hex(presentation_row_epoch)) FROM chat_list_rows WHERE group_id_hex = ?1",
-            [group], |r| r.get(0),
-        ).optional().storage()?;
+        let owner = owner_for_chat(&conn, group)?;
         match owner {
             Some(owner) => reference_for_owner(&conn, &owner),
             None => Ok(None),
@@ -94,10 +91,7 @@ impl SqliteAccountStorage {
     }
 
     fn avatar_chat_owner(&self, group: &str) -> StorageResult<Option<String>> {
-        self.lock()?.query_row(
-            "SELECT 'chat:' || lower(hex(presentation_row_epoch)) FROM chat_list_rows WHERE group_id_hex = ?1",
-            [group], |r| r.get(0),
-        ).optional().storage()
+        owner_for_chat(&*self.lock()?, group)
     }
 
     /// Same-source maintenance does not bind or re-demand evicted entries.
@@ -125,6 +119,17 @@ impl SqliteAccountStorage {
     /// One bounded upgrade pass. The durable bootstrap ledger is consumed once;
     /// reopening never recreates demand for images subsequently evicted.
     pub fn bootstrap_avatar_acquisition(&self) -> StorageResult<bool> {
+        let pending: bool = self
+            .lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM avatar_acquisition_bootstrap)",
+                [],
+                |r| r.get(0),
+            )
+            .storage()?;
+        if !pending {
+            return Ok(false);
+        }
         self.connection.with_transaction(|| {
             let groups = self.lock()?.prepare(
                 "SELECT group_id_hex FROM avatar_acquisition_bootstrap ORDER BY group_id_hex LIMIT 64"
@@ -158,6 +163,17 @@ impl SqliteAccountStorage {
     /// Claim at most one due attempt. Call only after reserving media capacity.
     pub fn claim_avatar_acquisition(&self, now: u64) -> StorageResult<Option<AvatarAcquisition>> {
         let now = u64_to_i64(now)?;
+        let due: bool = self
+            .lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM avatar_acquisition WHERE due <= ?1)",
+                [now],
+                |r| r.get(0),
+            )
+            .storage()?;
+        if !due {
+            return Ok(None);
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let row = conn.query_row(
@@ -218,6 +234,7 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let failures: u32 = conn.query_row("SELECT failures FROM avatar_acquisition WHERE token = ?1", [&job.reference.token], |r| r.get(0)).storage()?;
             let delay = (60_u64 << failures.min(6)).min(3600);
+            let retryable = retryable && failures < 15;
             let due = retryable.then(|| now.saturating_add(delay)).map(u64_to_i64).transpose()?;
             conn.execute("UPDATE avatar_acquisition SET state = ?1, due = ?2, failures = min(failures + 1, 16), priority = 0, attempt = NULL WHERE token = ?3",
                 params![if retryable { 3 } else { 4 }, due, job.reference.token]).storage()?;
@@ -273,14 +290,18 @@ impl SqliteAccountStorage {
             let chat_owner = self.avatar_chat_owner(group)?.ok_or_else(|| invalid("avatar conversation missing"))?;
             let owner = format!("identity:{chat_owner}:{member}");
             validate_key(&owner)?;
-            if !self.identity_avatar_version_current(&owner, version)? { return self.avatar_reference(&owner); }
-            let reference = self.request_avatar_acquisition(&owner, selected, true)?;
+            let current = self.identity_avatar_version_current(&owner, version)?;
+            // Preserve the explicit registration even while presentation is
+            // adopting a new directory incarnation. Never publish that stale
+            // selection or downgrade a newer registration's profile version.
+            let reference = if current { self.request_avatar_acquisition(&owner, selected, true)? } else { None };
             let conn = self.lock()?;
             let accessed = next_access(&conn)?;
             conn.execute("INSERT INTO avatar_identity_demand(owner_key, group_id_hex, member_id_hex, accessed, profile_epoch, profile_revision)
                 VALUES(?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(owner_key) DO UPDATE SET accessed = excluded.accessed,
-                    profile_epoch = excluded.profile_epoch, profile_revision = excluded.profile_revision",
-                params![owner, group, member, accessed, version.store_epoch, u64_to_i64(version.revision)?]).storage()?;
+                    profile_epoch = CASE WHEN ?7 THEN excluded.profile_epoch ELSE profile_epoch END,
+                    profile_revision = CASE WHEN ?7 THEN excluded.profile_revision ELSE profile_revision END",
+                params![owner, group, member, accessed, version.store_epoch, u64_to_i64(version.revision)?, current]).storage()?;
             conn.execute("DELETE FROM avatar_identity_demand WHERE owner_key IN
                 (SELECT owner_key FROM avatar_identity_demand ORDER BY accessed DESC, owner_key DESC LIMIT -1 OFFSET 2048)", []).storage()?;
             Ok(reference)
@@ -377,6 +398,13 @@ impl SqliteAccountStorage {
             }),
         )
     }
+}
+
+fn owner_for_chat(conn: &Connection, group: &str) -> StorageResult<Option<String>> {
+    conn.query_row(
+        "SELECT 'chat:' || lower(hex(presentation_row_epoch)) FROM chat_list_rows WHERE group_id_hex = ?1",
+        [group], |r| r.get(0),
+    ).optional().storage()
 }
 
 /// A registered identity, not a roster enumeration. Debug omits identifiers.

@@ -1071,8 +1071,7 @@ async fn run_app_runtime_account_worker(
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut presentation_due = true;
-    let mut avatar_tick = interval(Duration::from_secs(1));
-    avatar_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut avatar_due = true;
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
@@ -1138,6 +1137,7 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        avatar_due = true;
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -1632,19 +1632,23 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
-            _ = avatar_tick.tick(), if !lifecycle.is_stopping() => {
+            _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
+                avatar_due = false;
                 let identities = avatar_identities.run(&client, &account_id_hex);
                 let acquisition = schedule_avatar_acquisition(&client, &media_http, &mut avatar_resumed);
+                avatar_due |= identities.as_ref().is_ok_and(|more| *more)
+                    || acquisition.as_ref().is_ok_and(|more| *more);
                 if identities.is_err() || acquisition.is_err() {
                     tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
                         "avatar maintenance failed; retrying on the next tick");
                 }
             }
             result = presentation_wakeups.changed() => {
-                if result.is_ok() { presentation_due = true; }
+                if result.is_ok() { presentation_due = true; avatar_due = true; }
             }
             _ = tokio::task::yield_now(), if presentation_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
+                avatar_due = true;
                 presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
                     Ok(more) => more,
                     Err(_) => {
@@ -1656,6 +1660,7 @@ async fn run_app_runtime_account_worker(
             }
             _ = maintenance_tick.tick() => {
                 presentation_due = true;
+                avatar_due = true;
                 // Periodic maintenance is never urgent, and its longest legs
                 // run well past the whole shutdown budget: the key-package
                 // catch-up below is capped at 15s, and an armed epoch-gap
@@ -2514,7 +2519,7 @@ fn schedule_avatar_acquisition(
     client: &AppClient,
     media_http: &MediaHttpContext,
     resumed: &mut bool,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let transport = client.blossom_http_transport.clone();
     dispatch_avatar_acquisition(&storage, media_http, resumed, move |descriptor| {
@@ -2528,7 +2533,7 @@ fn dispatch_avatar_acquisition<F, Fut>(
     media_http: &MediaHttpContext,
     resumed: &mut bool,
     fetch: F,
-) -> Result<(), AppError>
+) -> Result<bool, AppError>
 where
     F: Fn(storage_sqlite::SelectedAvatar) -> Fut,
     Fut: std::future::Future<Output = Result<storage_sqlite::AvatarImage, AppError>>
@@ -2539,10 +2544,14 @@ where
         storage.resume_avatar_acquisition()?;
         *resumed = true;
     }
-    storage.bootstrap_avatar_acquisition()?;
+    let more_bootstrap = storage.bootstrap_avatar_acquisition()?;
     // Command demand gets first admission; this shares the existing four permits
     // and completion channel rather than starting a second HTTP pool.
     for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
+        // Keep a foreground slot free even across repeated dispatch passes.
+        if media_http.permits.available_permits() <= 1 {
+            break;
+        }
         let Ok(permit) = media_http.permits.clone().try_acquire_owned() else {
             break;
         };
@@ -2554,7 +2563,7 @@ where
             MediaHttpCompletion::Avatar { job, result }
         });
     }
-    Ok(())
+    Ok(more_bootstrap)
 }
 
 fn spawn_media_http<T>(
@@ -5962,7 +5971,8 @@ mod tests {
         }
         let (media_http, mut completions) = media_http_context(4);
         let foreground = reserve_media_http(&media_http);
-        dispatch_avatar_acquisition(&store, &media_http, &mut false, |_| async {
+        let mut resumed = false;
+        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, |_| async {
             Ok(storage_sqlite::AvatarImage::new(
                 vec![1; 8],
                 storage_sqlite::AvatarImageFormat::Png,
@@ -5972,14 +5982,18 @@ mod tests {
             .unwrap())
         })
         .unwrap();
-        assert_eq!(media_http.permits.available_permits(), 0);
+        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, |_| async {
+            panic!("another background pass must preserve the foreground slot")
+        })
+        .unwrap();
+        assert_eq!(media_http.permits.available_permits(), 1);
         let mut reserved = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             let done = timeout(Duration::from_secs(2), completions.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(media_http.permits.available_permits(), 0);
+            assert_eq!(media_http.permits.available_permits(), 1);
             let MediaHttpCompletion::Avatar { job, result } = &done.completion else {
                 panic!("avatar completion");
             };
@@ -5991,7 +6005,7 @@ mod tests {
             reserved.push(reserve_media_http(&media_http));
         }
         drop(foreground);
-        assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 24);
+        assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 16);
         assert!(
             store
                 .claim_avatar_acquisition(crate::unix_now_seconds())
@@ -6014,7 +6028,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let (media_http, mut completions) = media_http_context(1);
+        let (media_http, mut completions) = media_http_context(2);
         let permits = media_http.permits.clone();
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
@@ -6043,7 +6057,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(permits.available_permits(), 1);
+        assert_eq!(permits.available_permits(), 2);
         assert!(completions.recv().await.is_none());
         assert_eq!(
             store.avatar_status(&reference, 0).unwrap().availability,

@@ -63,10 +63,35 @@ fn selected_identity(
 #[derive(Default)]
 pub(super) struct IdentityAvatarMaintenance {
     after: String,
+    directory_version: Option<storage_sqlite::ChatPresentationVersion>,
 }
 impl IdentityAvatarMaintenance {
-    pub(super) fn run(&mut self, client: &crate::AppClient, account: &str) -> Result<(), AppError> {
+    pub(super) fn run(
+        &mut self,
+        client: &crate::AppClient,
+        account: &str,
+    ) -> Result<bool, AppError> {
         let storage = client.app.account_storage(&client.state.label)?;
+        if self.after.is_empty() {
+            let head = client
+                .app
+                .shared_storage()?
+                .directory_presentation_version()?;
+            if self.directory_version.as_ref() == Some(&head) {
+                return Ok(false);
+            }
+            let checkpoint = storage.chat_presentation_checkpoint()?;
+            if !checkpoint.state.shared_epoch.is_empty()
+                && checkpoint.state.shared_epoch != head.store_epoch
+            {
+                // Presentation maintenance has not adopted the new directory
+                // incarnation yet. Do not memoize a pass whose writes would all
+                // be rejected by the storage generation guard.
+                self.directory_version = None;
+                return Ok(false);
+            }
+            self.directory_version = Some(head);
+        }
         let identities = storage.requested_avatar_identities_after(&self.after)?;
         self.after = if identities.len() == 64 {
             identities.last().unwrap().owner.clone()
@@ -88,9 +113,10 @@ impl IdentityAvatarMaintenance {
             }
         }
         if let Some(error) = failure {
+            self.directory_version = None;
             return Err(error);
         }
-        Ok(())
+        Ok(!self.after.is_empty())
     }
 }
 
@@ -147,9 +173,32 @@ mod tests {
                 follows: vec![],
             })
             .unwrap();
-        IdentityAvatarMaintenance::default()
-            .run(&client, &account.account_id_hex)
+        let checkpoint = storage.chat_presentation_checkpoint().unwrap();
+        let mut transition = checkpoint.state.clone();
+        transition.shared_epoch = vec![1; 16];
+        storage
+            .commit_chat_presentation_batch(&checkpoint, &transition, &[])
             .unwrap();
+        let mut maintenance = IdentityAvatarMaintenance::default();
+        assert!(!maintenance.run(&client, &account.account_id_hex).unwrap());
+        assert!(storage.avatar_reference(&owner).unwrap().is_none());
+        let checkpoint = storage.chat_presentation_checkpoint().unwrap();
+        transition.shared_epoch = app
+            .shared_storage()
+            .unwrap()
+            .directory_presentation_version()
+            .unwrap()
+            .store_epoch;
+        storage
+            .commit_chat_presentation_batch(&checkpoint, &transition, &[])
+            .unwrap();
+        maintenance.run(&client, &account.account_id_hex).unwrap();
+        use cgka_traits::StorageProvider;
+        assert!(
+            !storage
+                .with_read_snapshot(|_| maintenance.run(&client, &account.account_id_hex))
+                .unwrap()
+        );
         let reference = storage.avatar_reference(&owner).unwrap().unwrap();
         assert_eq!(
             storage

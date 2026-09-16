@@ -21,7 +21,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         WHEN OLD.bytes IS NOT NULL AND NEW.bytes IS NULL BEGIN
             UPDATE avatar_acquisition SET state = 1, due = 0, attempt = NULL WHERE token = NEW.token;
         END;
-        CREATE INDEX avatar_acquisition_due ON avatar_acquisition(due, priority) WHERE due IS NOT NULL;
+        CREATE INDEX avatar_acquisition_due ON avatar_acquisition(priority DESC, due, token) WHERE due IS NOT NULL;
         CREATE TABLE avatar_acquisition_bootstrap (
             group_id_hex TEXT PRIMARY KEY NOT NULL REFERENCES chat_list_rows(group_id_hex) ON DELETE CASCADE
         );

@@ -63,14 +63,19 @@ invitations. No failure selects a lower-priority group URL. A one-time upgrade l
 batches of 64. It is consumed durably, so restart and unrelated title changes do not refill evicted entries.
 
 `MarmotApp::request_identity_avatar` explicitly registers a conversation identity using local profile evidence.
-Maintenance revisits at most 64 registered identities per tick, never historical rosters. Placeholder registrations
+Maintenance revisits at most 64 registered identities per batch after shared profile versions change, never historical
+rosters. Unchanged directory versions skip the scan. Native demand producers remain C7-C work; Rust callers can
+already use the explicit request API. Placeholder registrations
 can acquire a later profile picture. Profile versions reject stale maintenance, and eviction deletes registration;
 local conversation deletion removes its chat/identity assets, and account cache clear drops registrations and unfinished
 upgrade demand. Registrations are capped at 2,048.
 The basic bind/read APIs still do not imply download demand.
 
-The account worker polls due work every second after its existing startup path. Downloads reuse its four shared media
-permits, completion channel and worker-lifetime cancellation; results hold capacity through publication. Each attempt
+After its existing startup path, the account worker wakes acquisition on presentation work signals, committed
+presentation maintenance, media completion and the existing 15-second maintenance tick. Bounded bootstrap/identity
+batches yield between passes. Empty bootstrap and no-due-job probes are read-only and acquire no write transaction.
+Downloads reuse the four shared media permits, completion channel and worker-lifetime cancellation, while always
+leaving one permit free for foreground media. Results hold capacity through publication. Each attempt
 has a 60-second wall-clock ceiling and a 120-second durable lease, so a failed completion write cannot strand it
 permanently. Metadata and
 byte reads remain independent of that worker. A restart requeues interrupted attempts and rotates attempt tokens,
@@ -80,7 +85,8 @@ close remains terminal; completion cannot reopen storage.
 URL images are refresh-eligible after 24 hours. Encrypted content-addressed images have no periodic refresh. Transient
 failures persist exponential backoff from 60 seconds to one hour, in addition to the HTTP helper's bounded attempt
 budget. Integrity/decryption/image-admission failures also retry after backoff because the same URL or endpoint may
-later serve the correct bytes; unsafe-source policy failures block until source replacement. Same-source failures retain usable bytes.
+later serve the correct bytes. Unsafe-source policy failures or 16 consecutive failed attempts block until source
+replacement, which resets the budget. Same-source failures retain usable bytes.
 Repeated visible demand raises priority but does not defeat retry deadlines or create duplicate fetches.
 
 Fetches retain the existing public-address/DNS-pinning/redirect policy. Encrypted downloads verify the ciphertext

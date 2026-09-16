@@ -1056,3 +1056,90 @@ fn avatar_identity_bytes_are_removed_with_the_local_conversation() {
     );
     assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 0);
 }
+
+#[test]
+fn avatar_idle_maintenance_needs_no_write_transaction() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .pragma_update(None, "query_only", true)
+        .unwrap();
+    assert!(
+        !store
+            .bootstrap_avatar_acquisition()
+            .expect("empty bootstrap is read-only")
+    );
+    assert!(
+        store
+            .claim_avatar_acquisition(100)
+            .expect("no due demand is read-only")
+            .is_none()
+    );
+}
+
+#[test]
+fn avatar_retry_budget_eventually_blocks_repeated_failures() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let reference = store
+        .request_avatar_acquisition("owner", &selected_url("a"), false)
+        .unwrap()
+        .unwrap();
+    for n in 0..16 {
+        let now = n * 3600;
+        let job = store.claim_avatar_acquisition(now).unwrap().unwrap();
+        store.fail_avatar_acquisition(&job, now, true).unwrap();
+    }
+    assert_eq!(
+        store.avatar_acquisition_state(&reference).unwrap(),
+        Some(AvatarAcquisitionState::Blocked)
+    );
+    assert!(
+        store
+            .claim_avatar_acquisition(u32::MAX as u64)
+            .unwrap()
+            .is_none()
+    );
+    store
+        .request_avatar_acquisition("owner", &selected_url("new"), false)
+        .unwrap();
+    assert!(store.claim_avatar_acquisition(0).unwrap().is_some());
+}
+
+#[test]
+fn avatar_identity_demand_survives_directory_generation_catchup() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed_avatar_group(&store);
+    let checkpoint = store.chat_presentation_checkpoint().unwrap();
+    let mut state = checkpoint.state.clone();
+    state.shared_epoch = vec![1; 16];
+    store
+        .commit_chat_presentation_batch(&checkpoint, &state, &[])
+        .unwrap();
+    let version = crate::ChatPresentationVersion {
+        store_epoch: vec![9; 16],
+        revision: 1,
+    };
+    assert!(
+        store
+            .request_identity_avatar_acquisition("group", "member", &selected_url("a"), &version)
+            .unwrap()
+            .is_none()
+    );
+    let registered = store.requested_avatar_identities_after("").unwrap();
+    assert_eq!(registered.len(), 1);
+    let checkpoint = store.chat_presentation_checkpoint().unwrap();
+    state.shared_epoch = version.store_epoch.clone();
+    store
+        .commit_chat_presentation_batch(&checkpoint, &state, &[])
+        .unwrap();
+    store
+        .maintain_identity_avatar_acquisition(&registered[0], &selected_url("a"), &version)
+        .unwrap();
+    assert!(
+        store
+            .avatar_reference(&registered[0].owner)
+            .unwrap()
+            .is_some()
+    );
+}
