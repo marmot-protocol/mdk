@@ -327,6 +327,28 @@ fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
 }
 
 #[test]
+fn avatar_schema_rejects_text_payloads_and_digests() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let reference = bind(&store, "owner");
+    let original = image(42, 16);
+    publish(&store, &reference, &original);
+
+    for sql in [
+        // SQLite length(TEXT) counts characters, which would undercount bytes.
+        "UPDATE avatar_assets SET bytes = '🦫🦫'",
+        "UPDATE avatar_assets SET digest = '01234567890123456789012345678901'",
+    ] {
+        let error = store.lock().unwrap().execute(sql, []).unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 16);
+        assert_eq!(ready(&store, &reference).image, Some(original.clone()));
+    }
+}
+
+#[test]
 fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let reference = bind(&store, "owner");

@@ -17,8 +17,10 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             token BLOB NOT NULL UNIQUE CHECK(length(token) = 16),
             content_revision INTEGER NOT NULL DEFAULT 0
                 CHECK(typeof(content_revision) = 'integer' AND content_revision >= 0),
-            bytes BLOB CHECK(bytes IS NULL OR length(bytes) BETWEEN 1 AND 10485760),
-            digest BLOB CHECK(digest IS NULL OR length(digest) = 32),
+            bytes BLOB CHECK(bytes IS NULL OR
+                (typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 10485760)),
+            digest BLOB CHECK(digest IS NULL OR
+                (typeof(digest) = 'blob' AND length(digest) = 32)),
             media_type TEXT,
             width INTEGER,
             height INTEGER,
