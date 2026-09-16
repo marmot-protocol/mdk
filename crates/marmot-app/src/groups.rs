@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_traits::agent_text_stream::{
@@ -1856,10 +1856,10 @@ pub(crate) fn delete_moderation_grant(
     admins: &[[u8; 32]],
     sender_hex: &str,
 ) -> bool {
-    let accounts: HashSet<_> = group.members.iter().map(|member| &member.id).collect();
-    accounts
+    group
+        .members
         .iter()
-        .any(|id| hex::encode(id.as_slice()) == sender_hex)
+        .any(|member| hex::encode(member.id.as_slice()) == sender_hex)
         && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
 }
 
@@ -1931,7 +1931,7 @@ mod delete_moderation_grant_tests {
     }
 
     #[test]
-    fn two_member_named_group_is_not_direct() {
+    fn named_pair_allows_admin_removal() {
         let group = group_with("pair", 2);
         assert!(delete_moderation_grant(
             &group,
@@ -1941,7 +1941,7 @@ mod delete_moderation_grant_tests {
     }
 
     #[test]
-    fn unnamed_larger_group_is_not_direct() {
+    fn unnamed_larger_group_allows_admin_removal() {
         let group = group_with("", 3);
         assert!(delete_moderation_grant(
             &group,

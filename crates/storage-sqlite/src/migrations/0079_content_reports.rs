@@ -18,6 +18,7 @@ CREATE TABLE content_reports (
 );
 CREATE INDEX content_reports_target ON content_reports(group_id_hex, message_id_hex, report_id_hex);
 CREATE INDEX content_report_labels ON message_modifier_edges(group_id_hex, target_message_id_hex, modifier_message_id_hex) WHERE kind=1985;
+CREATE INDEX content_report_backfill_candidates ON app_events(insert_order) WHERE kind IN (5,1009,1984,1985,4891);
 CREATE TABLE content_report_backfill (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1), after_order INTEGER NOT NULL, through_order INTEGER NOT NULL
 );

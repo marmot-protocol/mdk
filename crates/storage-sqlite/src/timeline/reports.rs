@@ -476,12 +476,13 @@ pub(super) fn retain_pruned_controls(
 }
 
 impl SqliteAccountStorage {
-    /// Upgrade only the pre-migration prefix, committing progress with each
-    /// bounded batch. Normal sync never scans account history.
+    /// Repair only indexed deletion, edit and moderation events in the captured
+    /// pre-migration prefix. Ordinary history is neither scanned nor reprojected.
     pub fn backfill_content_reports(
         &self,
         limit: usize,
     ) -> StorageResult<Vec<TimelineProjectionUpdate>> {
+        let limit = limit.clamp(1, 100);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let (after, through): (i64, i64) = conn.query_row_cached(
@@ -497,10 +498,11 @@ impl SqliteAccountStorage {
                         direction, sender, plaintext, kind, tags_json, recorded_at, received_at,
                         invalidated, invalidation_reason, moderation_grant, insert_order
                  FROM app_events WHERE insert_order > ?1 AND insert_order <= ?2
+                   AND kind IN (5,1009,1984,1985,4891)
                  ORDER BY insert_order LIMIT ?3",
             ).storage()?;
             let events = stmt.query_map(
-                params![after, through, limit.clamp(1, 100) as i64],
+                params![after, through, limit as i64],
                 |row| Ok((raw_event_from_row(row)?, row.get::<_, i64>(14)?)),
             ).storage()?.collect::<Result<Vec<_>, _>>().storage()?;
             let mut affected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -546,7 +548,11 @@ impl SqliteAccountStorage {
                     group_id_hex: group, messages, changes,
                 });
             }
-            let cursor = events.last().map_or(through, |(_, order)| *order);
+            let cursor = if events.len() < limit {
+                through
+            } else {
+                events.last().map_or(through, |(_, order)| *order)
+            };
             conn.execute_cached(
                 "UPDATE content_report_backfill SET after_order = ?1 WHERE singleton = 1",
                 params![cursor],
@@ -989,11 +995,17 @@ mod tests {
     #[test]
     fn bounded_backfill_restores_individual_reports_and_progress() {
         let s = SqliteAccountStorage::in_memory().unwrap();
-        for e in [target(), report(2), dismiss(3, &[2])] {
+        for e in [
+            target(),
+            report(2),
+            dismiss(3, &[2]),
+            event(4, 10, 1009, vec![vec!["e".into(), id(1)]], "edit"),
+            event(5, 10, 5, vec![vec!["e".into(), id(1)]], ""),
+        ] {
             record(&s, &e);
         }
-        s.lock().unwrap().execute_batch("DELETE FROM content_reports; DELETE FROM message_modifier_edges WHERE kind IN (1984,1985,4891); UPDATE content_report_backfill SET after_order=0,through_order=(SELECT MAX(insert_order) FROM app_events)").unwrap();
-        for expected in 1..=3 {
+        s.lock().unwrap().execute_batch("DELETE FROM content_reports; DELETE FROM message_modifier_edges WHERE kind IN (1009,1984,1985,4891); UPDATE message_timeline SET deleted=0,plaintext='stale'; UPDATE content_report_backfill SET after_order=0,through_order=(SELECT MAX(insert_order) FROM app_events)").unwrap();
+        for expected in 2..=5 {
             s.backfill_content_reports(1).unwrap();
             let progress: i64 = s
                 .lock()
@@ -1005,6 +1017,9 @@ mod tests {
             assert_eq!(progress, expected);
         }
         assert!(page(&s).reports[0].dismissed);
+        let message = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+        assert!(message.deleted && message.plaintext.is_empty());
+        assert!(s.timeline_message(&id(99), &id(4)).unwrap().is_none());
         assert!(s.backfill_content_reports(1).unwrap().is_empty());
     }
     #[test]

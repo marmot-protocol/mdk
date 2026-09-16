@@ -1046,7 +1046,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("avatar-acquisition-upgrade.db");
         let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..78]).unwrap();
+        run(&mut conn, &MIGRATIONS[..77]).unwrap();
         let value = crate::StoredChatPresentation {
             presentation: crate::ConversationPresentation {
                 title: crate::PresentationText::Literal("Chat".into()),

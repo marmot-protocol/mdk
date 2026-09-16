@@ -693,3 +693,40 @@ fn pinned_chat_query_work() {
         assert_eq!(archived.pinned_position, None);
     }
 }
+
+#[test]
+fn report_backfill_skips_ordinary_history_with_bounded_query_work() {
+    let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    let mut previous_steps = None;
+    for count in [256, 4_096] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed_query_history(&store.lock().unwrap(), count);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE content_report_backfill SET after_order=0,
+             through_order=(SELECT MAX(insert_order) FROM app_events)",
+            )
+            .unwrap();
+        let (updates, steps) = measure(&store, || store.backfill_content_reports(100).unwrap());
+        assert!(
+            updates.is_empty(),
+            "ordinary history must not be rebroadcast"
+        );
+        assert!(steps < 200, "empty candidate scan used {steps} VM steps");
+        if let Some(previous) = previous_steps.replace(steps) {
+            assert_eq!(steps, previous, "work must not grow with ordinary history");
+        }
+        let finished: bool = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT after_order=through_order FROM content_report_backfill",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(finished, "an empty candidate prefix completes in one tick");
+    }
+}

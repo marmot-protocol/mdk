@@ -59,7 +59,9 @@ and a durable cursor over the existing event prefix. Account history and legacy
 kind-5 deletion verdicts remain untouched. Historical admin controls begin with
 unresolved authority and are re-evaluated against their authenticated source state.
 
-Maintenance advances at most 100 old events per batch. The app converts every
+Maintenance selects at most 100 old deletion, edit, report, label, and removal
+events per batch through a partial index. Ordinary history is not scanned or
+reprojected; a short candidate batch finishes the captured prefix. The app converts every
 update inside the account transaction before committing the cursor, then queues
 the complete batch. Conversion failure rolls back both progress and projections.
 Normal receive updates
