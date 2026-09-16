@@ -12,6 +12,7 @@ pub use opening::{
 pub use presentation::ConversationPresentationPage;
 
 use crate::connection::CachedSql;
+use crate::group_system::AUTHENTICATED_TIMELINE_SYSTEM_SQL;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
@@ -1446,27 +1447,21 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         let mut message = conn
             .query_row_cached(
-                "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                &format!("SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
                         source.retention_seconds, source.retention_expires_at,
                         timeline.direction, timeline.group_id_hex, timeline.sender,
                         timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                         timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
-                    COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
-                      AND timeline.source_message_id_hex IS NULL
-                      AND source.kind = timeline.kind AND source.direction = 'system'
-                      AND source.source_message_id_hex IS NULL
-                      AND length(source.origin_commit_id) > 0
-                      AND source.plaintext = timeline.plaintext
-                      AND source.source_epoch IS timeline.source_epoch, 0) AS authenticated_group_system
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
                  FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
                    ON source.group_id_hex = timeline.group_id_hex
                   AND source.message_id_hex = timeline.message_id_hex
                  WHERE timeline.group_id_hex = ?1
                    AND timeline.message_id_hex = ?2
-                 LIMIT 1",
+                 LIMIT 1"),
                 params![group_id_hex, message_id_hex],
                 timeline_record_from_row,
             )
@@ -3053,13 +3048,7 @@ fn timeline_records_by_ids_tx(
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
-                    COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
-                      AND timeline.source_message_id_hex IS NULL
-                      AND source.kind = timeline.kind AND source.direction = 'system'
-                      AND source.source_message_id_hex IS NULL
-                      AND length(source.origin_commit_id) > 0
-                      AND source.plaintext = timeline.plaintext
-                      AND source.source_epoch IS timeline.source_epoch, 0) AS authenticated_group_system
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3320,13 +3309,7 @@ fn timeline_query_sql(
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
-                    COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
-                      AND timeline.source_message_id_hex IS NULL
-                      AND source.kind = timeline.kind AND source.direction = 'system'
-                      AND source.source_message_id_hex IS NULL
-                      AND length(source.origin_commit_id) > 0
-                      AND source.plaintext = timeline.plaintext
-                      AND source.source_epoch IS timeline.source_epoch, 0) AS authenticated_group_system
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex

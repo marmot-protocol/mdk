@@ -2503,10 +2503,7 @@ macro_rules! chat_list_columns {
             CASE WHEN row.last_message_kind = 1210 THEN EXISTS (SELECT 1 FROM app_events AS system_source
               WHERE system_source.group_id_hex = row.group_id_hex
                 AND system_source.message_id_hex = row.last_message_id_hex
-                AND system_source.kind = 1210
-                AND system_source.direction = 'system'
-                AND system_source.source_message_id_hex IS NULL
-                AND length(system_source.origin_commit_id) > 0
+                AND ", crate::group_system::authenticated_system_source_sql!("system_source"), "
                 AND system_source.plaintext = row.last_message_preview
                 AND system_source.recorded_at = row.last_message_timeline_at
             ) ELSE 0 END AS authenticated_group_system,"

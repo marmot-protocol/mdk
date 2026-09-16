@@ -23,7 +23,10 @@ No generated Swift or Kotlin files are committed here.
 ## Group-system previews
 
 `ChatListMessagePreviewFfi.groupSystem` and timeline `groupSystem` now carry
-`GroupSystemEventProvenanceFfi`. Render authenticated membership/admin changes
+`GroupSystemEventProvenanceFfi`. MDK verifies local synthesis against the exact
+stored row and payload. The optional commit link is for rollback invalidation;
+self-removal and reorg-derived rows remain authenticated without it.
+Render authenticated membership/admin changes
 only for `AuthenticatedGroupState`; `MemberAuthored` is an assertion and carries
 no trusted actor/subject IDs on projected records. Malformed, oversized and deleted
 payloads have no typed event. Provenance records origin; timeline invalidation

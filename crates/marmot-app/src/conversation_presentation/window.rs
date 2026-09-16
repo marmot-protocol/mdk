@@ -68,7 +68,7 @@ pub struct ConversationMessageReferences {
     pub reply_mentions: Vec<String>,
     /// Same conservative completeness meaning as `mentions_truncated`.
     pub reply_mentions_truncated: bool,
-    /// Only backed by the stored synthesized-event origin, never arbitrary
+    /// Only backed by the stored local synthesized-event identity, never arbitrary
     /// kind-1210 JSON. Invalidation remains on the accompanying timeline row.
     pub system: Option<ConversationSystemReferences>,
     pub reactions: ConversationReactions,

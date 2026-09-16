@@ -1,6 +1,36 @@
 //! Local presentation of kind-1210 content. This is not a wire-format change.
-use cgka_traits::app_event::*;
+use cgka_traits::app_event::{
+    GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS,
+    GROUP_SYSTEM_DATA_OLD_NAME, GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS, GROUP_SYSTEM_DATA_SUBJECT,
+    GROUP_SYSTEM_EVENT_VERSION, GroupSystemEvent, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+};
 use serde::{Deserialize, Serialize};
+
+// Only the local authenticated GroupStateChanged projector writes system
+// direction without an inner source. origin_commit_id is optional rollback
+// linkage (self-eviction/reorg/Welcome rows can lack it), not authentication.
+// Callers also bind the exact requested group, row id, payload and time/epoch.
+macro_rules! authenticated_system_source_sql {
+    ($source:literal) => {
+        concat!(
+            $source,
+            ".kind = 1210 AND ",
+            $source,
+            ".direction = 'system' AND ",
+            $source,
+            ".source_message_id_hex IS NULL"
+        )
+    };
+}
+pub(crate) use authenticated_system_source_sql;
+
+pub(crate) const AUTHENTICATED_TIMELINE_SYSTEM_SQL: &str = concat!(
+    "COALESCE(timeline.kind = 1210 AND timeline.direction = 'system'
+       AND timeline.source_message_id_hex IS NULL AND ",
+    authenticated_system_source_sql!("source"),
+    " AND source.plaintext = timeline.plaintext
+       AND source.source_epoch IS timeline.source_epoch, 0)"
+);
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

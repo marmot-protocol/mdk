@@ -32,8 +32,8 @@ impl ConversationPresentationPage {
     }
 }
 impl SqliteAccountStorage {
-    /// Batch-check synthesized direction, absent inner source, commit
-    /// attribution, exact payload and epoch using one bounded VALUES join.
+    /// Batch-check locally synthesized direction, absent inner source,
+    /// exact payload and epoch using one bounded VALUES join.
     /// No roster/history scan, no row-by-row locks and no payload copies.
     /// The caller's transaction, if any, remains caller-owned.
     pub fn conversation_presentation_page(
@@ -85,7 +85,7 @@ pub(super) fn presentation_page_tx(
         .map(|(index, m)| Ok((index, m, optional_u64_to_i64(m.source_epoch)?)))
         .collect::<StorageResult<Vec<_>>>()?;
     if let Some((_, first, _)) = eligible.first() {
-        // 2 fixed parameters + 3 per eligible row <= 602, below the shared
+        // 1 fixed parameter + 3 per eligible row <= 601, below the shared
         // SQLite parameter budget. All interpolated values are local indices.
         let values = eligible
             .iter()
@@ -93,23 +93,22 @@ pub(super) fn presentation_page_tx(
             .map(|(slot, (index, _, _))| {
                 format!(
                     "({index}, ?{}, ?{}, ?{})",
+                    2 + slot * 3,
                     3 + slot * 3,
-                    4 + slot * 3,
-                    5 + slot * 3
+                    4 + slot * 3
                 )
             })
             .collect::<Vec<_>>()
             .join(",");
+        let authenticated_source = crate::group_system::authenticated_system_source_sql!("a");
         let sql = format!(
             "WITH requested(idx, message_id, plaintext, epoch) AS (VALUES {values})
             SELECT requested.idx FROM requested JOIN app_events a
               ON a.group_id_hex = ?1 AND a.message_id_hex = requested.message_id
-            WHERE a.kind = ?2 AND a.direction = 'system' AND a.source_message_id_hex IS NULL
-              AND a.origin_commit_id IS NOT NULL AND length(a.origin_commit_id) > 0
+            WHERE {authenticated_source}
               AND a.plaintext = requested.plaintext AND a.source_epoch IS requested.epoch"
         );
-        let kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM as i64;
-        let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&first.group_id_hex, &kind];
+        let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&first.group_id_hex];
         for (_, message, epoch) in &eligible {
             parameters.extend([
                 &message.message_id_hex as &dyn rusqlite::ToSql,

@@ -21882,12 +21882,15 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
     ];
     for (i, change) in changes.into_iter().enumerate() {
         let epoch = i as u64 + 2;
+        // Real self-eviction has neither a committer nor a rollback link.
+        // Reorg-derived admin/retention changes can also lack the link.
+        let event_actor = (i != 5).then_some(actor.clone());
         let event = GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(epoch),
-            actor: Some(actor.clone()),
+            actor: event_actor.clone(),
             change: change.clone(),
-            origin_commit_id: Some(cgka_traits::MessageId::new(vec![i as u8; 32])),
+            origin_commit_id: (i % 2 == 0).then(|| cgka_traits::MessageId::new(vec![i as u8; 32])),
         };
         assert_eq!(
             client
@@ -21898,7 +21901,7 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
         let material = cgka_traits::app_event::group_system_event_material(
             &group_id,
             epoch,
-            Some(&actor),
+            event_actor.as_ref(),
             &change,
         )
         .unwrap();

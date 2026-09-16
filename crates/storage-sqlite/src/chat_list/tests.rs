@@ -4840,3 +4840,48 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
         before
     );
 }
+
+#[test]
+fn authenticated_system_preview_without_commit_attribution_keeps_subject() {
+    let store = setup_store();
+    let payload = r#"{"v":1,"system_type":"member_removed","text":"You were removed","data":{"subject":"aa"}}"#;
+    let mut event = group_system(
+        "self-removal-no-commit",
+        "",
+        70,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+        payload,
+    );
+    event.origin_commit_id = None;
+    store.record_app_event(&event).unwrap();
+    let preview = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    let system = preview.group_system.unwrap();
+    assert_eq!(
+        system.provenance,
+        crate::GroupSystemEventProvenance::AuthenticatedGroupState
+    );
+    assert_eq!(system.subject_account_id_hex.as_deref(), Some(LOCAL));
+    assert!(system.actor_account_id_hex.is_none());
+    let row = store
+        .timeline_message(GROUP, &preview.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.group_system.as_ref(), Some(&system));
+    let captured = store
+        .conversation_presentation_page(crate::TimelinePage {
+            messages: vec![row],
+            has_more_before: false,
+            has_more_after: false,
+        })
+        .unwrap();
+    assert_eq!(captured.authenticated_system_content(0), Some(payload));
+    assert_eq!(
+        captured.page().messages[0].group_system.as_ref(),
+        Some(&system)
+    );
+}
