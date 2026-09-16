@@ -205,8 +205,8 @@ pub use groups::{
     AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
     AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
     AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
-    GroupRejoinInvitation, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite,
-    group_system_event_from_message,
+    GroupRejoinInvitation, GroupSystemEventProvenance, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
+    PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -4898,7 +4898,64 @@ impl MarmotApp {
         (message.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).then_some(message.sender.as_str())
     }
 
+    fn hydrate_chat_system_names(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+        use chat_presentation::canonical_identity;
+        let ids = rows
+            .iter()
+            .filter_map(|r| r.last_message.as_ref())
+            .filter_map(|m| m.group_system.as_ref())
+            .filter(|e| e.provenance == GroupSystemEventProvenance::AuthenticatedGroupState)
+            .flat_map(|e| {
+                [
+                    e.actor_account_id_hex.as_deref(),
+                    e.subject_account_id_hex.as_deref(),
+                ]
+            })
+            .flatten()
+            .filter_map(canonical_identity)
+            .collect::<HashSet<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let caches = self.directory_caches()?;
+        let shared = self.shared_storage()?;
+        let local = self.local_account_labels_by_id()?;
+        let mut names = HashMap::new();
+        for id in ids {
+            let profile = self
+                .directory_entry_for_account_id_with_handles(&id, &caches, &shared)?
+                .and_then(|entry| entry.profile);
+            let name = conversation_presentation::identity_display_name(
+                &id,
+                profile.as_ref(),
+                local.get(&id).map(String::as_str),
+            );
+            names.insert(id, name);
+        }
+        for event in rows
+            .iter_mut()
+            .filter_map(|r| r.last_message.as_mut())
+            .filter_map(|m| m.group_system.as_mut())
+        {
+            if event.provenance != GroupSystemEventProvenance::AuthenticatedGroupState {
+                continue;
+            }
+            event.actor_display_name = event
+                .actor_account_id_hex
+                .as_deref()
+                .and_then(canonical_identity)
+                .and_then(|id| names.get(&id).cloned());
+            event.subject_display_name = event
+                .subject_account_id_hex
+                .as_deref()
+                .and_then(canonical_identity)
+                .and_then(|id| names.get(&id).cloned());
+        }
+        Ok(())
+    }
+
     fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+        self.hydrate_chat_system_names(rows)?;
         let senders = rows
             .iter()
             .filter_map(|row| {
@@ -4927,6 +4984,9 @@ impl MarmotApp {
         let Some(row) = row else {
             return;
         };
+        if let Err(error) = self.hydrate_chat_system_names(std::slice::from_mut(row)) {
+            tracing::warn!(target: "marmot_app::client", method = "hydrate_chat_list_row", error_kind = error.privacy_safe_kind(), "projecting system preview without display names");
+        }
         let Some(message) = row.last_message.as_mut() else {
             return;
         };

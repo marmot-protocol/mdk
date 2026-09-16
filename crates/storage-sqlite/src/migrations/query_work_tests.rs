@@ -618,7 +618,9 @@ fn pinned_chat_query_work() {
             let rows = measured(
                 &store,
                 &format!("pinned chats rows={count}"),
-                count * 170,
+                // One bounded kind guard/output column for system provenance;
+                // ordinary/empty previews still skip the app-event lookup.
+                count * 176,
                 || {
                     store
                         .chat_list_rows(crate::ChatListQuery::default())

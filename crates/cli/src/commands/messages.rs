@@ -1052,6 +1052,7 @@ mod tests {
         .to_content()
         .unwrap();
         let message = TimelineMessageRecord {
+            group_system: None,
             edit: None,
             message_id_hex: "system-1".to_owned(),
             source_message_id_hex: None,

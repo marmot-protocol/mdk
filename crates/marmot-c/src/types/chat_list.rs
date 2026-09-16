@@ -9,6 +9,7 @@ use marmot_uniffi::conversions::{
 
 use super::group::{MarmotDisbandRequest, MarmotGroupLifecycleState, MarmotSelfMembership};
 use super::markdown::MarmotMarkdownDocument;
+use super::timeline::MarmotGroupSystemEvent;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, free_vec, owned_c_string, owned_vec};
 
@@ -106,6 +107,7 @@ c_enum! {
 c_mirror! {
     /// Preview of a chat row's last message.
     MarmotChatListMessagePreview from ChatListMessagePreviewFfi {
+        opt_rec group_system: MarmotGroupSystemEvent,
         str message_id_hex,
         str sender,
         opt_str sender_display_name,
@@ -263,6 +265,57 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_update_free(
 mod tests {
     use super::*;
     use crate::memory::boxed;
+
+    #[test]
+    fn system_preview_deep_free_preserves_provenance_and_subject() {
+        use marmot_uniffi::MarkdownDocumentFfi;
+        use marmot_uniffi::conversions::{GroupSystemEventFfi, GroupSystemEventProvenanceFfi};
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let mut mirror: MarmotChatListMessagePreview = ChatListMessagePreviewFfi {
+            group_system: Some(GroupSystemEventFfi {
+                provenance: GroupSystemEventProvenanceFfi::AuthenticatedGroupState,
+                actor_display_name: Some("Actor".into()),
+                subject_display_name: Some("Subject".into()),
+                system_type: "member_added".into(),
+                text: "Member added".into(),
+                actor_account_id_hex: Some("actor".into()),
+                subject_account_id_hex: Some("subject".into()),
+                name: None,
+                old_name: None,
+                old_retention_seconds: None,
+                new_retention_seconds: None,
+            }),
+            message_id_hex: "selected".into(),
+            sender: "actor".into(),
+            sender_display_name: None,
+            plaintext: "raw".into(),
+            content_tokens: MarkdownDocumentFfi::default(),
+            kind: 1210,
+            timeline_at: 50,
+            deleted: false,
+            attachment_kind: None,
+            attachment_count: 0,
+            delivery_state: ChatListMessageDeliveryStateFfi::NotApplicable,
+        }
+        .into();
+        unsafe {
+            assert!(matches!(
+                (*mirror.group_system).provenance,
+                super::super::timeline::MarmotGroupSystemEventProvenance::AuthenticatedGroupState
+            ));
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*mirror.group_system).subject_account_id_hex)
+                    .to_str()
+                    .unwrap(),
+                "subject"
+            );
+            mirror.free_in_place();
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
 
     #[test]
     fn pin_state_deep_roundtrip() {

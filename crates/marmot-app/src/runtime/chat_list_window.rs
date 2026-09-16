@@ -458,7 +458,15 @@ impl Sources {
         loop {
             tokio::select! {
                 profile = self.profiles.recv() => match profile {
-                    Ok(profile) if rows.iter().any(|r|r.row.last_message.as_ref().is_some_and(|m|m.sender.eq_ignore_ascii_case(&profile))) => return,
+                    Ok(profile) if rows.iter().any(|r| {
+                        r.row.last_message.as_ref().is_some_and(|m| {
+                            m.sender.eq_ignore_ascii_case(&profile)
+                                || m.group_system.as_ref().is_some_and(|e| {
+                                    [e.actor_account_id_hex.as_deref(), e.subject_account_id_hex.as_deref()]
+                                        .into_iter().flatten().any(|id| id.eq_ignore_ascii_case(&profile))
+                                })
+                        })
+                    }) => return,
                     Err(_) => return,
                     _ => {},
                 },

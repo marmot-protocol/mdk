@@ -54,6 +54,7 @@ impl From<ChatListAvatar> for ChatListAvatarFfi {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct ChatListMessagePreviewFfi {
+    pub group_system: Option<super::timeline::GroupSystemEventFfi>,
     pub message_id_hex: String,
     pub sender: String,
     pub sender_display_name: Option<String>,
@@ -111,6 +112,7 @@ impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         Self {
+            group_system: value.group_system.map(Into::into),
             message_id_hex: value.message_id_hex,
             sender: value.sender,
             sender_display_name: value.sender_display_name,
