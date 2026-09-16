@@ -13,7 +13,7 @@ use cgka_traits::app_components::canonicalize_marmot_media_type;
 
 use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{
-    BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_with_transport, upload_blossom_blob,
+    BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_bounded, upload_blossom_blob,
 };
 use crate::{AppError, AppGroupImageInput};
 
@@ -30,7 +30,10 @@ fn canonical_group_image_media_type(value: &str) -> Result<String, AppError> {
     canonicalize_marmot_media_type(value).map_err(AppError::InvalidEncryptedMedia)
 }
 
-fn validate_group_image_input(plaintext: &[u8], media_type: &str) -> Result<String, AppError> {
+pub(super) fn validate_group_image_input(
+    plaintext: &[u8],
+    media_type: &str,
+) -> Result<String, AppError> {
     if plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "group image cannot be empty".into(),
@@ -258,8 +261,14 @@ pub(crate) async fn fetch_group_image_with_transport(
     // Group images are content-addressed over the public default Blossom server
     // and are not part of the loopback-blob-endpoint dev/test path, so loopback
     // HTTP is never permitted here.
-    let encrypted =
-        fetch_blossom_blob_with_transport(&url, &transport.with_loopback_disabled()).await?;
+    let encrypted = fetch_blossom_blob_bounded(
+        &url,
+        &transport.with_loopback_disabled(),
+        None,
+        tokio::time::Instant::now() + transport.transfer_timeout,
+        MAX_GROUP_IMAGE_BYTES as u64 + 16,
+    )
+    .await?;
     let actual_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_hash != image_hash_hex.to_ascii_lowercase() {
         return Err(AppError::InvalidEncryptedMedia(

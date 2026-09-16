@@ -165,6 +165,8 @@ mod migration_0076_accepted_edits;
 
 #[path = "migrations/0077_avatar_cache.rs"]
 mod migration_0077_avatar_cache;
+#[path = "migrations/0078_avatar_acquisition.rs"]
+mod migration_0078_avatar_acquisition;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -557,6 +559,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "0077_avatar_cache",
         apply: migration_0077_avatar_cache::apply,
+    },
+    Migration {
+        version: 78,
+        name: "0078_avatar_acquisition",
+        apply: migration_0078_avatar_acquisition::apply,
     },
 ];
 
@@ -1026,6 +1033,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "Retained group");
+    }
+
+    #[test]
+    fn avatar_acquisition_upgrade_bootstraps_once_and_preserves_cached_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avatar-acquisition-upgrade.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..77]).unwrap();
+        let value = crate::StoredChatPresentation {
+            presentation: crate::ConversationPresentation {
+                title: crate::PresentationText::Literal("Chat".into()),
+                avatar: crate::SelectedAvatar::RemoteImage {
+                    url: "https://example.com/avatar.png".into(),
+                    cache_key: "source".into(),
+                },
+                title_source: crate::PresentationSource::Group,
+                avatar_source: crate::PresentationSource::Group,
+                peer_id: None,
+                resolution: crate::PresentationResolution::Cached,
+            },
+            profile_version: None,
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({"format": 1, "value": value})).unwrap();
+        conn.execute_batch("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES('aabb', 'fixture', 'Chat', 7, 3);
+            INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at) VALUES('aabb', 19, 7);").unwrap();
+        conn.execute("UPDATE chat_list_rows SET presentation_json = ?1, presentation_applied_source_revision = presentation_source_revision WHERE group_id_hex = 'aabb'", [bytes]).unwrap();
+        run_all(&mut conn).unwrap();
+        drop(conn);
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        let storage = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(!storage.bootstrap_avatar_acquisition().unwrap());
+        let job = storage.claim_avatar_acquisition(0).unwrap().unwrap();
+        let image =
+            crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
+        storage
+            .complete_avatar_acquisition(&job, &image, None)
+            .unwrap();
+        storage.close().unwrap();
+        let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            reopened.read_avatar(&job.reference, 0).unwrap().image,
+            Some(image)
+        );
+        reopened.remove_avatar_source(&job.reference).unwrap();
+        reopened.close().unwrap();
+        let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(!reopened.bootstrap_avatar_acquisition().unwrap());
+        assert!(reopened.claim_avatar_acquisition(0).unwrap().is_none());
     }
 
     fn keyed_connection(path: &Path) -> rusqlite::Connection {

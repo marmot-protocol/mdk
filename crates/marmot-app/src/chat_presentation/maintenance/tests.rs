@@ -479,3 +479,27 @@ fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean()
     assert!(group.presentation_member_ids_hex.is_none());
     assert!(group.direct_member_ids_hex.is_none());
 }
+
+#[test]
+fn avatar_maintenance_tracks_profile_removal_without_a_screen_subscription() {
+    let account = SqliteAccountStorage::in_memory().unwrap();
+    let shared = SqliteSharedStorage::in_memory().unwrap();
+    profile(&shared, Some("Avatar"));
+    seed(&account, "11", "");
+    drain(&account, &shared);
+    let reference = account.chat_avatar_reference("11").unwrap().unwrap();
+    let job = account.claim_avatar_acquisition(0).unwrap().unwrap();
+    assert_eq!(job.reference, reference);
+    profile(&shared, None);
+    drain(&account, &shared);
+    assert!(account.chat_avatar_reference("11").unwrap().is_none());
+    let image =
+        storage_sqlite::AvatarImage::new(vec![1; 8], storage_sqlite::AvatarImageFormat::Png, 1, 1)
+            .unwrap();
+    assert_eq!(
+        account
+            .complete_avatar_acquisition(&job, &image, None)
+            .unwrap(),
+        storage_sqlite::AvatarPublishResult::Superseded
+    );
+}

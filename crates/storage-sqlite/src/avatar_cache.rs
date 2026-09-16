@@ -186,37 +186,36 @@ impl SqliteAccountStorage {
     ) -> StorageResult<AvatarAssetRef> {
         validate_key(owner)?;
         validate_key(source)?;
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let accessed = next_access(&tx)?;
-        let unchanged: bool = tx.query_row(
+        self.connection.with_transaction(|| {
+            let tx = self.lock()?;
+            let accessed = next_access(&tx)?;
+            let unchanged: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM avatar_assets WHERE owner_key = ?1 AND source_key = ?2)",
             params![owner, source], |r| r.get(0),
         ).storage()?;
-        if !unchanged {
-            tx.execute(
-                "INSERT INTO avatar_assets(owner_key, source_key, token)
+            if !unchanged {
+                tx.execute(
+                    "INSERT INTO avatar_assets(owner_key, source_key, token)
                  VALUES(?1, ?2, randomblob(16))
                  ON CONFLICT(owner_key) DO UPDATE SET
                     token = excluded.token, source_key = excluded.source_key,
                     content_revision = 0, bytes = NULL, digest = NULL, media_type = NULL,
                     width = NULL, height = NULL, refresh_at = NULL",
-                params![owner, source],
-            )
-            .storage()?;
-        }
-        let reference =
-            reference_for_owner(&tx, owner)?.ok_or_else(|| invalid("avatar binding missing"))?;
-        touch_access(&tx, &reference.token, accessed)?;
-        // Repeated bindings cannot grow the cache: avoid scanning usage or
-        // rewriting a blob just because another screen asks for the same source.
-        if unchanged {
-            tx.commit().storage()?;
-            return Ok(reference);
-        }
-        evict(&tx, &reference.token, limits)?;
-        tx.commit().storage()?;
-        Ok(reference)
+                    params![owner, source],
+                )
+                .storage()?;
+            }
+            let reference = reference_for_owner(&tx, owner)?
+                .ok_or_else(|| invalid("avatar binding missing"))?;
+            touch_access(&tx, &reference.token, accessed)?;
+            // Repeated bindings cannot grow the cache: avoid scanning usage or
+            // rewriting a blob just because another screen asks for the same source.
+            if unchanged {
+                return Ok(reference);
+            }
+            evict(&tx, &reference.token, limits)?;
+            Ok(reference)
+        })
     }
 
     /// Metadata-only lookup. It neither creates demand nor changes recency.
@@ -269,37 +268,37 @@ impl SqliteAccountStorage {
             return Err(invalid("avatar exceeds cache capacity"));
         }
         let digest = Sha256::digest(image.bytes());
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let accessed = next_access(&tx)?;
-        let changed = tx
-            .execute(
-                "UPDATE avatar_assets SET bytes = ?1, digest = ?2, media_type = ?3,
+        self.connection.with_transaction(|| {
+            let tx = self.lock()?;
+            let changed = tx
+                .execute(
+                    "UPDATE avatar_assets SET bytes = ?1, digest = ?2, media_type = ?3,
                 width = ?4, height = ?5, refresh_at = ?6,
                 content_revision = content_revision + 1
              WHERE token = ?7 AND content_revision = ?8
                 AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?9",
-                params![
-                    image.bytes(),
-                    digest.as_slice(),
-                    image.format.media_type(),
-                    image.width,
-                    image.height,
-                    refresh_at,
-                    reference.token,
-                    expected,
-                    reference.store_epoch
-                ],
-            )
-            .storage()?;
-        if changed == 0 {
-            return Ok(AvatarPublishResult::Superseded);
-        }
-        touch_access(&tx, &reference.token, accessed)?;
-        evict(&tx, &reference.token, limits)?;
-        tx.commit().storage()?;
-        Ok(AvatarPublishResult::Published {
-            content_revision: expected as u64 + 1,
+                    params![
+                        image.bytes(),
+                        digest.as_slice(),
+                        image.format.media_type(),
+                        image.width,
+                        image.height,
+                        refresh_at,
+                        reference.token,
+                        expected,
+                        reference.store_epoch
+                    ],
+                )
+                .storage()?;
+            if changed == 0 {
+                return Ok(AvatarPublishResult::Superseded);
+            }
+            let accessed = next_access(&tx)?;
+            touch_access(&tx, &reference.token, accessed)?;
+            evict(&tx, &reference.token, limits)?;
+            Ok(AvatarPublishResult::Published {
+                content_revision: expected as u64 + 1,
+            })
         })
     }
 
@@ -385,10 +384,18 @@ impl SqliteAccountStorage {
     /// Discard all account avatar bytes/mappings. Existing references and late
     /// completions become invalid; rebinding creates new random generations.
     pub fn clear_avatar_cache(&self) -> StorageResult<()> {
-        self.lock()?
-            .execute("DELETE FROM avatar_assets", [])
-            .storage()?;
-        Ok(())
+        self.connection.with_transaction(|| {
+            self.lock()?
+                .execute("DELETE FROM avatar_assets", [])
+                .storage()?;
+            self.lock()?
+                .execute("DELETE FROM avatar_identity_demand", [])
+                .storage()?;
+            self.lock()?
+                .execute("DELETE FROM avatar_acquisition_bootstrap", [])
+                .storage()?;
+            Ok(())
+        })
     }
 
     pub fn avatar_cache_usage(&self) -> StorageResult<AvatarCacheUsage> {
@@ -507,3 +514,6 @@ fn evict(conn: &Connection, protected: &[u8], limits: Limits) -> StorageResult<(
 
 #[cfg(test)]
 mod tests;
+
+mod acquisition;
+pub use acquisition::{AvatarAcquisition, AvatarAcquisitionState, AvatarIdentityDemand};

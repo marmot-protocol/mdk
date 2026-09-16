@@ -7,10 +7,10 @@ status: implementation
 
 # Avatar cache storage foundation
 
-C7-A of [#1554](https://github.com/marmot-protocol/mdk/issues/1554) adds protected local bytes to the existing
+C7-A/B of [#1554](https://github.com/marmot-protocol/mdk/issues/1554) adds protected local bytes to the existing
 account SQLCipher store. [The Rust API](../../../crates/storage-sqlite/src/avatar_cache.rs) documents source
-references, publication preconditions, status and removal. C7-B still owns download validation, coalescing,
-retry intent and source maintenance; C7-C owns screen/native integration. Keep existing client caches until
+references, publication preconditions, status and removal. C7-B connects selected sources to validated downloads,
+durable retry intent and background maintenance; C7-C still owns screen/native integration. Keep existing client caches until
 that replacement is integrated and verified.
 
 ## Bounds and eviction
@@ -44,22 +44,58 @@ first-frame latency. File allocation/reuse, total storage pressure and foregroun
 `AvatarImage::new` enforces storage bounds only. Acquisition must authenticate encrypted data and validate fetched
 image format/MIME/dimensions before publication. The stored checksum detects logical payload/record mismatches;
 it is not a replacement for SQLCipher page authentication or image validation. Byte reads currently hash up to
-10 MiB while holding the account connection; C7-B must measure this cost with realistic image sizes before native
-adoption. Read-time bounds protect the allocation/typed decoding boundary even though valid writes satisfy schema checks.
+10 MiB while holding the account connection. The C7-B optimized, file-backed SQLCipher host probe (20 warm reads per
+size) measured p50/p95 of 0.79/2.42 ms at 256 KiB, 2.55/2.84 ms at 1 MiB and 36.95/38.76 ms at 10 MiB. These are total
+local-read durations, including checksum/recency, not isolated SHA timings or device evidence. Keep verification for
+now; C7-C must bound visible batches, retain client decoded caches and validate account-lock latency on flagship devices
+before adoption. Read-time bounds protect the allocation/typed decoding boundary even though valid writes satisfy schema checks.
 
 Account references retain explicit store-epoch scoping, consistent with other projection handles. Production does
 not rotate `chat_presentation_meta.store_epoch` in place: account recreation gets a fresh store, and explicit cache
 clear removes all mappings. The epoch-update trigger is a defensive database invariant, exercised directly by a test,
 not an additional runtime reset mechanism. Existing terminal close, encrypted WAL and account-removal policies apply.
 
-## C7-B/C integration constraints
+## Acquisition and maintenance (C7-B)
 
-`bind_avatar_source`, `publish_avatar` and `read_avatar` own transactions. Do not call them inside an existing
-`with_transaction`/read snapshot. If source binding is composed with presentation writes, first adapt it to the
-existing nestable transaction helper and add rollback coverage for the combined operation. Reference/status reads
-remain metadata-only; the new methods alone do not observe group/profile changes.
+Migration 0078 adds versioned selected descriptors and retry state in the account SQLCipher store. Selected chat
+presentation commits bind changed avatars and queue their acquisition in the same transaction, including pending
+invitations. No failure selects a lower-priority group URL. A one-time upgrade ledger initializes existing chats in
+batches of 64. It is consumed durably, so restart and unrelated title changes do not refill evicted entries.
 
-The app must publish changes after committed source replacement, acquisition, corruption repair or eviction, and
-fence stale completions against current authority. Bind/read APIs do not create durable download demand. Native
-references and decoded-image caches must include content revision, not only the source reference. C7-C provides
-bounded/batched visible-byte access and snapshot/update recovery; it must not embed every avatar in screen payloads.
+`MarmotApp::request_identity_avatar` explicitly registers a conversation identity using local profile evidence.
+Maintenance revisits at most 64 registered identities per tick, never historical rosters. Placeholder registrations
+can acquire a later profile picture. Profile versions reject stale maintenance, and eviction deletes registration;
+local conversation deletion removes its chat/identity assets, and account cache clear drops registrations and unfinished
+upgrade demand. Registrations are capped at 2,048.
+The basic bind/read APIs still do not imply download demand.
+
+The account worker polls due work every second after its existing startup path. Downloads reuse its four shared media
+permits, completion channel and worker-lifetime cancellation; results hold capacity through publication. Each attempt
+has a 60-second wall-clock ceiling and a 120-second durable lease, so a failed completion write cannot strand it
+permanently. Metadata and
+byte reads remain independent of that worker. A restart requeues interrupted attempts and rotates attempt tokens,
+rejecting old completions. Source replacement, removal and eviction also delete the corresponding work. Account
+close remains terminal; completion cannot reopen storage.
+
+URL images are refresh-eligible after 24 hours. Encrypted content-addressed images have no periodic refresh. Transient
+failures persist exponential backoff from 60 seconds to one hour, in addition to the HTTP helper's bounded attempt
+budget. Integrity/decryption/image-admission failures also retry after backoff because the same URL or endpoint may
+later serve the correct bytes; unsafe-source policy failures block until source replacement. Same-source failures retain usable bytes.
+Repeated visible demand raises priority but does not defeat retry deadlines or create duplicate fetches.
+
+Fetches retain the existing public-address/DNS-pinning/redirect policy. Encrypted downloads verify the ciphertext
+hash and authenticated decryption with a streaming ceiling of 10 MiB plus the 16-byte tag; URL downloads cap at
+10 MiB. Both apply the existing PNG/JPEG/GIF/WebP header, declared encrypted MIME and dimension checks before atomic
+publication. These checks do not assert that every animation frame fully decodes. Image decoding/rendering remains
+client-owned. Malformed stored job envelopes become blocked so later jobs can progress.
+
+`bind_avatar_source` and `publish_avatar` now use the existing nestable transaction helper. Callers must propagate
+errors to the enclosing transaction; combined source/presentation and publication/job-state rollback tests cover
+that composition. `read_avatar` still owns its read/recency transaction and must not be nested in a snapshot.
+
+## Remaining C7-C integration
+
+C7-C must publish committed source/acquisition/repair/eviction changes, add versioned asset references and availability
+to screen/native DTOs, provide bounded/batched visible-byte access, and cover snapshot/update recovery. Decoded-image
+caches must include content revision, not only source reference. Do not embed every avatar in screen payloads or
+remove host persistent caches before native replacement is integrated and verified.

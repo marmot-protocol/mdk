@@ -108,7 +108,7 @@ pub(crate) struct BlossomHttpTransport {
     pub(super) allow_loopback_http: bool,
     address_lease: Duration,
     candidate_startup_timeout: Duration,
-    transfer_timeout: Duration,
+    pub(super) transfer_timeout: Duration,
     kind: MediaHttpKind,
 }
 
@@ -461,6 +461,7 @@ pub(crate) async fn fetch_blossom_blob(
 
 /// Fetch a bounded blob through a caller-owned transport without collecting
 /// telemetry, primarily for internal callers and deterministic tests.
+#[cfg(test)]
 pub(crate) async fn fetch_blossom_blob_with_transport(
     url: &str,
     transport: &BlossomHttpTransport,
@@ -469,6 +470,7 @@ pub(crate) async fn fetch_blossom_blob_with_transport(
 }
 
 /// Fetch a bounded blob while recording privacy-safe transport phase totals.
+#[cfg(test)]
 pub(super) async fn fetch_blossom_blob_with_observer(
     url: &str,
     transport: &BlossomHttpTransport,
@@ -491,13 +493,31 @@ pub(super) async fn fetch_blossom_blob_with_observer_until(
     telemetry: Option<&AppPerformanceTelemetry>,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, AppError> {
+    fetch_blossom_blob_bounded(
+        url,
+        transport,
+        telemetry,
+        deadline,
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+    )
+    .await
+}
+
+/// Shared dial/redirect discipline with a caller-specific streaming ceiling.
+pub(super) async fn fetch_blossom_blob_bounded(
+    url: &str,
+    transport: &BlossomHttpTransport,
+    telemetry: Option<&AppPerformanceTelemetry>,
+    deadline: tokio::time::Instant,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, transport.allow_loopback_http)
         .map_err(|err| AppError::UnsafeMediaFetch(format!("unsafe Blossom URL: {err}")))?;
     fetch_http_with_bounded_redirects(
         current,
-        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        max_bytes,
         deadline,
         Some(transport.candidate_startup_timeout),
         telemetry,

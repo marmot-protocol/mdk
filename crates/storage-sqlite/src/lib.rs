@@ -42,9 +42,10 @@ pub use account_projection::{
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use avatar_cache::{
-    AvatarAssetRead, AvatarAssetRef, AvatarAssetStatus, AvatarAvailability, AvatarCacheUsage,
-    AvatarImage, AvatarImageFormat, AvatarPublishResult, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES,
-    MAX_AVATAR_CACHE_ENTRIES, MAX_AVATAR_DIMENSION,
+    AvatarAcquisition, AvatarAcquisitionState, AvatarAssetRead, AvatarAssetRef, AvatarAssetStatus,
+    AvatarAvailability, AvatarCacheUsage, AvatarIdentityDemand, AvatarImage, AvatarImageFormat,
+    AvatarPublishResult, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
+    MAX_AVATAR_DIMENSION,
 };
 pub use chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,

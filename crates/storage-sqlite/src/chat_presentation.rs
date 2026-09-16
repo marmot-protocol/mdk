@@ -368,6 +368,12 @@ impl SqliteAccountStorage {
                 )
                 .storage()?;
             }
+            drop(conn);
+            self.maintain_chat_avatar(
+                &input.group_id_hex,
+                old.as_ref().map(|old| &old.value.presentation.avatar),
+                &value.presentation.avatar,
+            )?;
             Ok(ChatPresentationWrite::Applied)
         })
     }

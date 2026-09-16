@@ -1,3 +1,4 @@
+pub(crate) mod avatar;
 use std::time::Instant;
 
 use bytes::Bytes;
