@@ -15,6 +15,7 @@ pub struct ConversationAccountSnapshot {
     pub anchors: Vec<ConversationAnchor>,
     pub draft: SelectedMessageDraft,
     pub archived: bool,
+    pub disbanded: bool,
     pub leave_request_pending: bool,
     /// Persisted admin projection; app selection derives the local scalar role.
     pub admin_keys_hex: String,
@@ -58,13 +59,14 @@ fn capture_tx(
     let presentation_input = crate::chat_presentation::presentation_input_tx(conn, group)?
         .ok_or(StorageError::NotFound)?;
     let draft = crate::message_drafts::revisioned::selected_tx(conn, group)?;
-    let (archived, admin_keys_hex, leave_request_pending) = conn
+    let (archived, admin_keys_hex, leave_request_pending, disbanded) = conn
         .query_row_cached(
             "SELECT archived, admin_keys_hex,
-             EXISTS(SELECT 1 FROM cgka_leave_requests WHERE group_id = ?2)
+             EXISTS(SELECT 1 FROM cgka_leave_requests WHERE group_id = ?2),
+             EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?2)
          FROM account_groups WHERE group_id_hex = ?1",
             params![group, group_bytes],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .storage()?;
     Ok(ConversationAccountSnapshot {
@@ -76,6 +78,7 @@ fn capture_tx(
         anchors: opening.anchors,
         draft,
         archived,
+        disbanded,
         leave_request_pending,
         admin_keys_hex,
     })

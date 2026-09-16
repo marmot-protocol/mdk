@@ -675,6 +675,61 @@ mod tests {
     }
 
     #[test]
+    fn system_reactions_native_row_keeps_identity_and_summary() {
+        let actor = cgka_traits::MemberId::new(vec![0x22; 32]);
+        let material = cgka_traits::app_event::group_system_event_material(
+            &cgka_traits::GroupId::new(vec![0x11; 16]),
+            3,
+            Some(&actor),
+            &cgka_traits::engine::GroupStateChange::AdminAdded {
+                member: actor.clone(),
+            },
+        )
+        .unwrap();
+        let mut row = record_with_media(Some(3), None, None);
+        row.message_id_hex = material.message_id_hex.clone();
+        row.direction = "system".into();
+        row.sender = material.sender.clone();
+        row.kind = 1210;
+        row.plaintext = material.content;
+        row.tags = material.tags;
+        row.group_id_hex = material.group_id_hex;
+        let mut system = marmot_app::group_system_event_from_message(1210, &row.plaintext).unwrap();
+        // Storage/runtime tests establish this provenance; this test pins its
+        // conversion alongside reactions without changing the binding layout.
+        system.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
+        row.group_system = Some(system);
+        row.reactions
+            .by_emoji
+            .insert("👍".into(), vec!["66".repeat(32)]);
+        row.reactions.user_reactions.push(TimelineUserReaction {
+            reaction_message_id_hex: "44".repeat(32),
+            target_message_id_hex: material.message_id_hex.clone(),
+            sender: "66".repeat(32),
+            emoji: "👍".into(),
+            reacted_at: 20,
+        });
+        let native = TimelineMessageRecordFfi::from(row);
+        assert_eq!(native.message_id_hex, material.message_id_hex);
+        let activity = native.group_system.unwrap();
+        assert_eq!(
+            activity.provenance,
+            GroupSystemEventProvenanceFfi::AuthenticatedGroupState
+        );
+        assert_eq!(
+            activity.actor_account_id_hex.as_deref(),
+            Some(material.sender.as_str())
+        );
+        assert_eq!(native.reactions.by_emoji.len(), 1);
+        assert_eq!(native.reactions.by_emoji[0].count, 1);
+        assert_eq!(native.reactions.by_emoji[0].emoji, "👍");
+        assert_eq!(
+            native.reactions.user_reactions[0].target_message_id_hex,
+            material.message_id_hex
+        );
+    }
+
+    #[test]
     fn timeline_message_record_ffi_resolves_media_with_source_epoch() {
         let media = imeta_metadata(&[imeta_tag(0x11, "image/png", "diagram.png")]);
         let record: TimelineMessageRecordFfi = record_with_media(Some(7), Some(media), None).into();

@@ -18,6 +18,27 @@ structured text, and index `identities` by `account_id_hex`. Every identity refe
 in `messages[*].references` is resolved there or explicitly absent. These are
 window-scoped display identities, not a roster or a source of mutation authority.
 
+The first snapshot reads the durable account projection directly, without waiting
+for worker startup, group hydration or relay catch-up. Render its messages immediately.
+`header.epoch == None` means live authority is not yet available: membership and
+invitation/departure display come from that same local read, all send/management
+capabilities are false, and non-disbanded lifecycle is conservatively `Recovering`.
+Do not show an MLS recovery warning solely from that local-only lifecycle value.
+Do not interpret this as removal, wait for `can_send` to display history, or restore
+an independent client timeline cache. MDK retries authority in the background and
+publishes a complete replacement with an epoch and current capabilities when ready.
+That upgrade commonly supersedes the initial revision immediately: install it before
+issuing revisioned commands, or handle `StaleWindow` by consuming the latest replacement.
+Before the first live capture, paging and local updates remain available during
+catch-up: captures have a 50 ms wait budget before falling back to fresh local data.
+After live authority arrives, queued captures await the worker without that display
+timeout, retaining the last complete snapshot. They never downgrade the composer or
+combine stale permissions with newer local rows. An explicit `NotReady` response
+from the worker still schedules a quiet retry. Worker acquisition runs to completion
+outside the capture timeout and retries transient failures; closing the window never
+abandons worker teardown. A missing/dirty local read projection uses the existing
+keyed preparation/retry path.
+
 Timeline content uses the existing Markdown/media converters. For this screen,
 raw tags, full reactor lists and raw `media_json` are omitted from the compatibility timeline record;
 use the bounded `references.reactions` tallies/previews and truncation flags.
@@ -62,8 +83,9 @@ error without creating a handle.
 is retryable, not a terminal query error. Keep the installed window and keep
 receiving: MDK repairs dirty read state and retries accepted work in the background.
 Reassess a failed command after the next successful replacement instead of opening
-another handle or immediately repeating it. Opening itself waits through this state
-until it succeeds, is cancelled, or reaches its deadline.
+another handle or immediately repeating it. Opening retries only if its durable
+local projection is not yet readable, until it succeeds, is cancelled, or reaches
+its deadline. Unavailable live authority does not delay the initial local snapshot.
 `ConversationWindowAnchorOutside` (C `MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE`)
 rejects an anchor outside the current retained rows without closing or changing the
 window. Use the latest installed replacement and report an actually visible retained

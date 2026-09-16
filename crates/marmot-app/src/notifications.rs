@@ -318,6 +318,10 @@ pub struct NotificationUpdate {
     /// Preview of the reacted-to message (resolved via the `e` tag against the
     /// timeline). `None` for non-reactions, an unresolvable target, or a
     /// deleted/invalidated one — removed text must never reach the preview.
+    /// Group-system targets expose only supported parsed `text`; malformed,
+    /// oversized, unsupported-version and blank payloads produce `None`.
+    /// Synthesized system text is an English fallback, not a localization key:
+    /// this notification DTO does not carry the target's structured system event.
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
@@ -2080,16 +2084,25 @@ pub(crate) fn message_text_mentions_account(
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
 /// kinds and blank text never produce a preview. Structured agent kinds expose
-/// only approved text/status fields, so raw JSON and tool output never reach a
-/// notification payload.
+/// only approved text/status fields; group-system rows expose supported parsed
+/// text only, so their JSON envelope never reaches a notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
         None
+    } else if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+        // Reuse the bounded, version-checked parser. This is fallback text,
+        // never authority derived from actor/subject claims in the payload.
+        group_system_event_from_message(kind, plaintext)
+            .map(|event| event.text)
+            .filter(|text| !text.trim().is_empty())
     } else if kind == MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY {
         structured_agent_preview(plaintext, &["text", "status"])
     } else if kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION {
         structured_agent_preview(plaintext, &["preview", "text", "status"])
     } else {
+        // Custom app kinds retain the existing raw-content fallback. A broader
+        // custom-kind preview policy is separate from decoding MDK-owned kinds;
+        // new structured kinds must not rely on this branch for JSON-safe text.
         Some(plaintext.to_owned())
     }
 }

@@ -2519,6 +2519,42 @@ async fn open_runtime_local_test_client(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn cancelled_startup_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let account = app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    wait_for_test_signal(reached, "account open before cancellation").await;
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    let old_commands = {
+        let workers = manager.workers.lock().await;
+        let worker = workers.get(&account.account_id_hex).unwrap();
+        assert!(!worker.ready);
+        worker.commands.clone()
+    };
+
+    let retrying = manager.clone();
+    let mut lookup = tokio::spawn(async move { retrying.worker_commands("alice").await });
+    // Reaping must wait for the abandoned open to release its session guard.
+    let premature = timeout(Duration::from_millis(50), &mut lookup).await;
+    proceed.send(()).unwrap();
+    assert!(premature.is_err());
+    let commands = timeout(Duration::from_secs(10), lookup)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!commands.same_channel(&old_commands));
+    assert!(manager.workers.lock().await[&account.account_id_hex].ready);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reconcile_failure_releases_spawned_worker_session_guards() {
     let dir = tempfile::tempdir().expect("tempdir");
     marmot_account::AccountHome::open(dir.path())
@@ -3055,5 +3091,128 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
         ChatListUpdateTrigger::LastMessageContentChanged,
         "invalidation can replace the selected message"
     );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn system_reactions_update_live_timeline_through_existing_commands() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, group_system_event_material};
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://test.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("system reactions", &[]).await.unwrap();
+    let actor = cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let change = GroupStateChange::GroupRenamed {
+        name: "renamed".into(),
+        previous_name: Some("system reactions".into()),
+    };
+    let material = group_system_event_material(&group, 0, Some(&actor), &change).unwrap();
+    let event = GroupEvent::GroupStateChanged {
+        group_id: group.clone(),
+        epoch: cgka_traits::EpochId(0),
+        actor: Some(actor),
+        change,
+        origin_commit_id: None,
+    };
+    assert_eq!(
+        client
+            .project_group_system_rows(std::slice::from_ref(&event), 1)
+            .len(),
+        1
+    );
+    // Deliberately replay the same authenticated change. The snapshot and
+    // final history assertions below must still see exactly one original row.
+    client.project_group_system_rows(&[event], 1);
+    drop(client);
+    let runtime = app.runtime();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(material.group_id_hex.clone()),
+                pagination: storage_sqlite::TimelinePagination {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let baseline = timeline.take_snapshot();
+    assert_eq!(baseline.messages.len(), 1);
+    assert_eq!(baseline.messages[0].message_id_hex, material.message_id_hex);
+    assert_eq!(
+        baseline.messages[0].kind,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+    );
+    let first = runtime
+        .react_to_message("alice", &group, &material.message_id_hex, "👍")
+        .await
+        .unwrap();
+    let duplicate = runtime
+        .react_to_message("alice", &group, &material.message_id_hex, "👍")
+        .await
+        .unwrap();
+    assert_eq!(first.message_ids, duplicate.message_ids);
+    assert_eq!(duplicate.published, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            timeline.recv().await.expect("live reaction update");
+            let page = timeline.take_snapshot();
+            assert_eq!(page.messages.len(), 1);
+            if !page.messages[0].reactions.user_reactions.is_empty() {
+                let mut row = page.messages[0].clone();
+                assert_eq!(row.reactions.user_reactions.len(), 1);
+                assert_eq!(
+                    row.reactions.user_reactions[0].target_message_id_hex,
+                    material.message_id_hex
+                );
+                row.reactions = baseline.messages[0].reactions.clone();
+                assert_eq!(row, baseline.messages[0]);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    runtime
+        .unreact_from_message("alice", &group, &material.message_id_hex)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            timeline.recv().await.expect("live reaction removal");
+            let page = timeline.take_snapshot();
+            if page.messages[0].reactions.user_reactions.is_empty() {
+                assert_eq!(page.messages, baseline.messages);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // The only transmitted application intents are kind 7 and kind 5. The
+    // kind-1210 target remains the one locally synthesized row with no source.
+    let records = app.messages("alice").unwrap();
+    let system = records
+        .iter()
+        .filter(|r| r.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)
+        .collect::<Vec<_>>();
+    assert_eq!(system.len(), 1);
+    assert_eq!(system[0].direction, "system");
+    assert!(baseline.messages[0].source_message_id_hex.is_none());
+    let mut sent_kinds = records
+        .iter()
+        .filter(|r| r.direction == "sent")
+        .map(|r| r.kind)
+        .collect::<Vec<_>>();
+    sent_kinds.sort_unstable();
+    assert_eq!(sent_kinds, [5, 7]);
     runtime.shutdown_and_close().await.unwrap();
 }

@@ -5848,7 +5848,12 @@ impl AccountManager {
                 let stale_account_ids = workers
                     .iter()
                     .filter_map(|(account_id, worker)| {
-                        if active_account_ids.contains(account_id) && !worker.handle.is_finished() {
+                        // A previous cancelled reconcile may have left startup unsettled.
+                        if active_account_ids.contains(account_id)
+                            && worker.ready
+                            && !worker.handle.is_finished()
+                            && !worker.commands.is_closed()
+                        {
                             None
                         } else {
                             Some(account_id.clone())
@@ -6266,6 +6271,7 @@ impl AccountManager {
         let workers = self.workers.lock().await;
         workers
             .get(&account.account_id_hex)
+            .filter(|worker| worker.ready)
             .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
             .ok_or_else(|| {
                 AppError::RelayDirectory(

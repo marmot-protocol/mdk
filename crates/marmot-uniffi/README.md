@@ -5,10 +5,12 @@ UniFFI bindings for the Marmot app runtime.
 The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
 package that shared surface:
 
-- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` for iOS.
+- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
+  `output/PrivacyInfo.xcprivacy` for iOS.
 - `./crates/marmot-uniffi/xcframework-macos.sh` builds `output/macos/MarmotKit.xcframework` plus
-  `output/macos/MarmotKit.swift` for macOS on Apple Silicon (`aarch64-apple-darwin`). Its output directory is separate
-  from the iOS one so building both in one workspace cannot clobber either artifact.
+  `output/macos/MarmotKit.swift` and `output/macos/PrivacyInfo.xcprivacy` for macOS on Apple Silicon
+  (`aarch64-apple-darwin`). Its output directory is separate from the iOS one so building both in one workspace
+  cannot clobber either artifact.
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
   `jniLibs` shared libraries.
 
@@ -40,6 +42,26 @@ Conversation windows continue to supply their bounded identity dictionary.
 This adds no wire format or database migration. Regenerate Swift/Kotlin bindings
 and use the matching native library; Android follow-through is tracked in
 [whitenoise-android#1581](https://github.com/marmot-protocol/whitenoise-android/issues/1581).
+
+### Reactions on group activity
+
+Use the existing reaction commands with the activity row's `messageIdHex`.
+Authenticated system rows retain that deterministic ID across reaction changes,
+replay and restart; the same timeline record exposes both `groupSystem` and
+`reactions`. Retraction uses the existing unreact command, and subscriptions
+update the target row without adding a second activity row. Do not synthesize or
+send a kind-1210 event to react to local group activity.
+
+Reaction notifications use the supported system payload's text fallback, never
+its JSON envelope. Only the stored target sender receives an alert; activity
+without an attributable actor does not invent a recipient. Deleted or invalidated
+targets and malformed or unsupported payloads expose no target preview.
+For synthesized system rows, `reactedToPreview` is an English fallback. The
+notification DTO has neither the target ID nor a structured system event, so this
+field cannot support client localization; hosts can omit it and use their generic
+localized reaction notification. Conversation rows still expose `groupSystem` for
+client-localized rendering and layout. This adds no binding fields or methods and
+requires no client-owned reaction map.
 
 ## Identity references and profile pseudonyms
 
@@ -432,6 +454,6 @@ for opening, paging, cancellation, timeout, ownership and draft migration.
 
 ## Apple privacy resources
 
-Apple exporters use resource-bearing static framework slices. See the
+Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target. See the
 [privacy audit and adoption guide](apple-privacy/README.md) for declarations,
 archive validation, host integration changes, and unresolved release questions.

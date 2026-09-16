@@ -26,6 +26,7 @@ const MAX_NAME_BYTES: usize = 256;
 pub struct ConversationHeaderState {
     pub authority: ConversationAuthority,
     pub archived: bool,
+    /// None denotes local-only presentation; live action capabilities are suppressed.
     pub epoch: Option<u64>,
 }
 
@@ -35,6 +36,7 @@ pub struct ConversationHeader {
     pub selected: ConversationPresentation,
     pub member_count: Option<u64>,
     pub archived: bool,
+    /// None denotes local-only presentation; live action capabilities are suppressed.
     pub epoch: Option<u64>,
     pub lifecycle: AppGroupLifecycleState,
     pub disbanding: bool,
@@ -244,6 +246,20 @@ impl MarmotApp {
             peer.as_deref().zip(peer_profile.as_ref()),
         );
         let mut capabilities = state.authority.capabilities();
+        if state.epoch.is_none() {
+            capabilities = ConversationCapabilities {
+                participation: capabilities.participation,
+                is_self_admin: false,
+                is_last_admin: false,
+                can_send: false,
+                can_invite: false,
+                can_edit_group: false,
+                can_leave: false,
+                requires_self_demote_before_leave: false,
+                can_enable_disbanding: false,
+                can_disband: false,
+            };
+        }
         if let Some(peer) = peer.as_deref()
             && storage.is_user_blocked(peer).map_err(AppError::from)?
         {
