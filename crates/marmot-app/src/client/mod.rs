@@ -3719,7 +3719,6 @@ impl AppClient {
                     &app_event_id,
                     &mut on_local_projection,
                 );
-                self.publish_conversation_captures(group_id);
                 return Err(err);
             }
         };
@@ -3754,7 +3753,6 @@ impl AppClient {
                 &app_event_id,
                 &mut on_local_projection,
             );
-            self.publish_conversation_captures(group_id);
             return Err(publish_err);
         }
         if let Some(context) = &audit_context {
@@ -3811,12 +3809,12 @@ impl AppClient {
         self.observe_send_applied_effects_best_effort(&effects)
             .await;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        // Publish the settled projection independently of notification policy,
-        // before notification delivery can introduce another transport wait.
-        if should_project_locally {
-            self.publish_conversation_captures(group_id);
-        }
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
+            // A checkpoint is needed only when another transport wait follows;
+            // otherwise the worker can service the already-invalidated window.
+            if should_project_locally {
+                self.publish_conversation_captures(group_id);
+            }
             self.publish_notification_trigger_best_effort(
                 group_id,
                 notifications::NotificationTrigger::NewMessage,

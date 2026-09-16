@@ -1011,7 +1011,9 @@ async fn run(
                 authority_pending = current.presentation.header.epoch.is_none();
                 // A checkpoint predates sources.drain(), so it may not include
                 // invalidations discarded there. Follow it with a fresh capture
-                // even when no further event or send completion arrives.
+                // even when no further event or send completion arrives. This
+                // conservative extra read is self-limiting: sends publish only
+                // finitely many checkpoints, each before a transport wait.
                 dirty = checkpoint;
                 failed = false;
                 retry_delayed = false;

@@ -34,8 +34,9 @@ catch-up: captures have a 50 ms wait budget before falling back to fresh local d
 After live authority arrives, queued captures await the worker without that display
 timeout, retaining the last complete snapshot. During an outgoing send, the worker
 captures registered open windows for the sending group after the local pending
-projection and before awaiting transport, then again after settlement or retraction
-and before notification publication. These reads use
+projection and before awaiting transport, then again after settlement if
+notification publication introduces another transport wait. Retraction and sends
+with no remaining transport wait use the normal invalidated worker read. These reads use
 the same live authority/account boundary as normal captures, so pending rows can
 reach the open screen while publication is stalled. Checkpoints coalesce per
 window, respect its current viewport, and are discarded when that viewport changes.
@@ -170,6 +171,11 @@ even when delivery, media, or other row metadata changes. Header, draft, identit
 read-state and bounded reaction references always come from the new snapshot.
 Paging prunes departed rows, older command replies cannot roll back the cache,
 and cancellation releases it. Raw tags and full reactor lists do not enter it.
+The cache retains normalized source rows and converted rows, including two additional
+copies of each row's plaintext alongside the runtime snapshot, for up to 200 rows
+per subscription. Departed rows are released on replacement; cancellation clears all rows.
+This reuse is justified by host conversion benchmarks so far; it does not complete
+C9's device measurement gate or establish a device latency improvement.
 The public API still delivers complete replacements: cloning, serialization and
 native UI reconciliation remain proportional to the returned content. C9 must
 measure end-to-end device latency at 50 and 200 rows, including long Markdown;
