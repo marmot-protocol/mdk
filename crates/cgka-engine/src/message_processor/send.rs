@@ -932,10 +932,22 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
-        let authority = Some(crate::app_payload::source_authority(
-            &mls_group,
-            self.identity.self_id(),
-        )?);
+        let authority = if cgka_traits::reporting::requires_source_authority(app_event.kind) {
+            Some(crate::app_payload::source_authority(
+                &mls_group,
+                self.identity.self_id(),
+            )?)
+        } else {
+            None
+        };
+        if app_event.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REPORT
+            && !authority.is_some_and(|a| a.reporting_allowed)
+        {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::InvalidAppMessagePayload(
+                "reporting is unavailable in direct conversations".into(),
+            ));
+        }
         if matches!(
             app_event.kind,
             cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REVIEW

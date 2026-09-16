@@ -412,7 +412,10 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
         vec![GroupEvent::MessageReceived {
             authority: match &sent.publish[0] {
                 PublishWork::ApplicationMessage { authority, .. } => {
-                    assert!(authority.is_some());
+                    assert!(
+                        authority.is_none(),
+                        "ordinary chat does not need moderation authority"
+                    );
                     *authority
                 }
                 _ => unreachable!(),
@@ -501,7 +504,10 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         vec![GroupEvent::MessageReceived {
             authority: match &sent.publish[0] {
                 PublishWork::ApplicationMessage { authority, .. } => {
-                    assert!(authority.is_some());
+                    assert!(
+                        authority.is_none(),
+                        "ordinary chat does not need moderation authority"
+                    );
                     *authority
                 }
                 _ => unreachable!(),
@@ -573,7 +579,10 @@ async fn reopened_creator_can_send_valid_group_messages() {
         vec![GroupEvent::MessageReceived {
             authority: match &sent.publish[0] {
                 PublishWork::ApplicationMessage { authority, .. } => {
-                    assert!(authority.is_some());
+                    assert!(
+                        authority.is_none(),
+                        "ordinary chat does not need moderation authority"
+                    );
                     *authority
                 }
                 _ => unreachable!(),

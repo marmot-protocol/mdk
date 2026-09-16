@@ -603,6 +603,8 @@ impl SqliteAccountStorage {
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            // Only erased targets with retained moderation evidence have a
+            // replay fence here; ordinary dedup and expiry belong to ingress.
             let expired_target = match event.kind {
                 MARMOT_APP_EVENT_KIND_CHAT => Some(event.message_id_hex.as_str()),
                 MARMOT_APP_EVENT_KIND_EDIT => tag_value(&event.tags, "e"),
@@ -1688,13 +1690,6 @@ fn secure_prune_selected_app_events_tx(
     let mut media_ciphertext_sha256 = BTreeSet::new();
     let mut retiring_media_epochs = BTreeSet::new();
     for event in &pruned_events {
-        if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
-            tx.execute_cached(
-                "INSERT OR IGNORE INTO content_expired_targets VALUES(?1,?2)",
-                params![group_id_hex, event.message_id_hex],
-            )
-            .storage()?;
-        }
         pruned_message_ids.insert(event.message_id_hex.clone());
         if event.kind == MARMOT_APP_EVENT_KIND_EDIT {
             retained_edit_targets
@@ -1723,6 +1718,17 @@ fn secure_prune_selected_app_events_tx(
                 pruned_message_ids.insert(dependent.message_id_hex);
             }
         }
+    }
+    // Retain only structural control evidence. Removing these rows would let
+    // a delayed duplicate reopen a review or resurrect a removed message.
+    let pruned_controls =
+        reports::retain_pruned_controls(tx, group_id_hex, &mut pruned_message_ids)?;
+    for event in &pruned_events {
+        if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+            reports::retain_expired_target(tx, group_id_hex, &event.message_id_hex)?;
+        }
+    }
+    for root in &roots {
         tx.execute_cached(
             "DELETE FROM content_reports WHERE group_id_hex=?1 AND message_id_hex=?2",
             params![group_id_hex, root],
@@ -1734,10 +1740,6 @@ fn secure_prune_selected_app_events_tx(
         )
         .storage()?;
     }
-    // Retain only structural control evidence. Removing these rows would let
-    // a delayed duplicate reopen a review or resurrect a removed message.
-    let pruned_controls =
-        reports::retain_pruned_controls(tx, group_id_hex, &mut pruned_message_ids)?;
     retain_pruned_chat_activity_tx(tx, group_id_hex, &pruned_message_ids)?;
     scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     // `message_timeline.plaintext` is indexed for search; overwriting it

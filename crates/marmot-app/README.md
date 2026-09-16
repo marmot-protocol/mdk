@@ -248,7 +248,11 @@ with a NIP-56 reason and optional explanation (`other` requires one).
 `delete_message` sends kind 5 for the caller's own content and kind 4891 for an
 active admin removing another account's chat message and all its revisions.
 A non-admin attempting the latter receives an error before publication. Older
-clients may retain content removed by kind 4891. Reports and reviews use encrypted
+clients may retain content removed by kind 4891. Conversely, upgraded clients
+reject a newly received older client's admin kind-5 deletion of another author's
+message. Previously honored legacy tombstones stay honored locally. Mixed versions
+can therefore disagree in either direction; upgrade all group participants for
+consistent moderation. Reports and reviews use encrypted
 group messages and do not add chat rows, unread activity, or report notifications.
 
 `reported_content`, `message_reports`, and `subscribe_reported_content` expose

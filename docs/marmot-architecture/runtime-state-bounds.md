@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-15
+updated: 2026-09-16
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -35,6 +35,23 @@ Tracking issue: marmot-protocol/mdk#381.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `Engine::authority_recovery_attempts`, `Engine::authority_recovery_seen` | At most one entry per durable unresolved moderation control encountered in the current or previous cursor pass; input-relative to retained source records, never ordinary chat history. Each maintenance call visits at most 32 requests. Fingerprints identify one named snapshot rather than the whole live group. | Resolved entries are removed immediately; each completed cursor pass removes entries whose requests disappeared. Source-byte pruning and group deletion remove durable requests atomically. Engine drop clears both caches; restart may retry once against unchanged evidence. No secret-derived fingerprint is logged or persisted. |
+
+### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
+
+These are input-relative durable bounds, not fixed account-wide row or byte caps. Moderation evidence must remain
+stable under delayed delivery and convergence; ordinary chat expiry must not create a moderation history ledger.
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `content_moderation`, `content_reports` | One summary per reported or removed target; one report per logical `(target, revision, reporter)`. Unreported, unremoved chats have no row. | Recomputed from authenticated controls; invalidation removes withdrawn reports and empty summaries. Target pruning clears both projections; group deletion removes all rows. |
+| `content_pruned_controls` and retained control `app_events` | One marker and minimal structural record per retained deletion/report/review/removal control. Input-relative to actual controls, not chat traffic. | Retention and explicit secure erasure scrub report/review explanations and unrelated tags but preserve ids, decision references, authority verdicts and authenticated source-context provenance. Group deletion reclaims the evidence. |
+| `content_expired_targets` | At most one marker per erased chat target that had a report/moderation projection or a retained control targeting it. Ordinary expired chats create no marker. | Retained until group deletion so late target/edit/report delivery cannot resurrect moderated content or its scrubbed explanations. Repeated pruning or delivery reuses the same marker. |
+| `content_report_backfill` | One cursor row per account database. | Advances through the captured pre-migration prefix in batches of at most 100 events; completion retains only that progress row. |
+
+Explicit secure erasure intentionally retains these minimal moderation identifiers and branch-provenance records;
+it does not promise to erase every trace of a moderation decision. Message bodies, report/review explanations and media remain subject to
+secure erasure. The moderation replay fence applies only to targets with this retained evidence. Ordinary message
+re-delivery and expiry continue through the existing ingress deduplication and retention lifecycle.
 
 ### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
 

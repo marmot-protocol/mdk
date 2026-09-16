@@ -4,7 +4,10 @@ The wire contract belongs to Marmot's `foundation/application-messages.md` and
 `features/content-moderation.md`. Merge that companion specification before
 shipping this implementation. All participants need compatible clients for a
 consistent moderation view; older clients may render unknown kinds, retain
-removed content, or retain older deletion authorization behavior.
+removed content, or retain older deletion authorization behavior. Compatibility
+runs both ways: older clients ignore kind-4891 removal, while upgraded clients
+reject newly received cross-author admin kind-5 requests. Only previously honored
+legacy tombstones remain frozen; no receive-time admin fallback is introduced.
 
 ## Runtime boundary
 
@@ -43,6 +46,12 @@ The engine derives `AppMessageAuthority` from the MLS state used at encryption
 or authenticated receive. It binds the verdict to a SHA-256 digest of that
 state's epoch authenticator, and records group eligibility and admin authority.
 This evidence is local metadata, never an author-supplied event claim.
+
+The branch digest is retained with moderation verdicts as provenance of the
+policy decision, including when the original source snapshot has been pruned.
+It is not an admin credential or an alternate branch-selection input. Ordinary
+chat, reaction, edit, and author-deletion events omit this evidence; only the
+three moderation kinds pay for its member/policy lookup and persistence.
 
 The verdict travels through the session publish work, durable outbound fanout,
 account publication result, replay observation, durable pending application

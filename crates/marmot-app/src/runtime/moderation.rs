@@ -24,12 +24,20 @@ impl RuntimeReportedContentSubscription {
                         Err(broadcast::error::RecvError::Closed) => return None,
                         _ => continue,
                     }
-                    let storage=self.storage.clone(); let group=self.group.clone();
-                    let pending=self.pending_only; let limit=self.limit;
-                    return match blocking_app_task(move || Ok(storage.reported_content(&group,pending,None,limit)?)).await {
-                        Ok(page)=>Some(page),
-                        Err(_)=> {
-                            tracing::warn!(target:"marmot_app::moderation",method="recv","report subscription read failed");
+                    let storage = self.storage.clone();
+                    let group = self.group.clone();
+                    let pending = self.pending_only;
+                    let limit = self.limit;
+                    return match blocking_app_task(move || {
+                        Ok(storage.reported_content(&group, pending, None, limit)?)
+                    }).await {
+                        Ok(page) => Some(page),
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app::moderation",
+                                method = "recv",
+                                "report subscription read failed"
+                            );
                             None
                         }
                     };

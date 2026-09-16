@@ -3594,34 +3594,83 @@ async fn unavailable_moderation_authority_survives_restart_and_resolves_later() 
 
 #[tokio::test]
 async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
-    let (mut alice, mut bob, gid) = create_pair().await;
+    let (mut alice, _, mut bob, bob_storage, gid) = create_admin_pair_with_storage().await;
+    // Bob loses admin authority in the source epoch of the malicious removal.
+    let demote = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match demote {
+        SendResult::GroupEvolution { msg, pending, .. } => (route_to_group(&msg, &gid), pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(commit).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
     alice.drain_events();
     bob.drain_events();
     let payload = MarmotAppEvent::new(
         hex::encode(bob.self_id().as_slice()),
         1,
-        5,
+        4891,
         vec![vec!["e".into(), "11".repeat(32)]],
-        "",
+        r#"{"v":1,"action":"remove"}"#,
     )
     .encode()
     .unwrap();
-    let (msg, authority) = match bob
-        .send(SendIntent::AppMessage {
+    assert!(matches!(
+        bob.send(SendIntent::AppMessage {
             group_id: gid.clone(),
-            payload,
+            payload: payload.clone(),
             expected_epoch: None,
         })
-        .await
+        .await,
+        Err(EngineError::InvalidAppMessagePayload(_))
+    ));
+    // A hostile client can bypass send preflight. Authenticate its real MLS
+    // ciphertext on receive; never substitute the later promoted policy.
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, bob_storage.mls_storage());
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = bob_storage
+        .account_device_signer(&bob.self_id())
         .unwrap()
-    {
-        SendResult::ApplicationMessage { msg, authority, .. } => {
-            (route_to_group(&msg, &gid), authority.unwrap())
-        }
-        _ => unreachable!(),
+        .unwrap();
+    let signer = SignatureKeyPair::read(
+        bob_storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let wire = group
+        .create_message(&provider, &signer, &payload)
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+    let message = TransportMessage {
+        id: hash_id(&wire),
+        payload: wire,
+        timestamp: Timestamp(1),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
     };
-    assert!(!authority.moderation_grant);
-    let update = alice
+    let promote = alice
         .send(SendIntent::UpdateAppComponents {
             group_id: gid.clone(),
             updates: vec![AppComponentData {
@@ -3634,21 +3683,110 @@ async fn later_admin_promotion_does_not_authorize_an_earlier_removal() {
         })
         .await
         .unwrap();
-    let pending = match update {
+    let pending = match promote {
         SendResult::GroupEvolution { pending, .. } => pending,
         _ => unreachable!(),
     };
     alice.confirm_published(pending).await.unwrap();
-    alice.ingest(msg).await.unwrap();
-    let received = alice
+    alice.ingest(message).await.unwrap();
+    let authority = alice
         .drain_events()
         .into_iter()
         .find_map(|event| match event {
             cgka_traits::engine::GroupEvent::MessageReceived { authority, .. } => authority,
             _ => None,
         })
+        .expect("source authority is authenticated even when it denies the removal");
+    assert!(authority.reporting_allowed);
+    assert!(!authority.moderation_grant);
+}
+
+#[tokio::test]
+async fn ordinary_messages_and_author_deletion_omit_moderation_authority() {
+    let (mut alice, alice_storage, mut bob, _, gid) = create_admin_pair_with_storage().await;
+    alice.drain_events();
+    for kind in [9, 7, 1009, 5] {
+        let payload = MarmotAppEvent::new(
+            hex::encode(bob.self_id().as_slice()),
+            1,
+            kind,
+            vec![vec!["e".into(), "11".repeat(32)]],
+            "ordinary",
+        )
+        .encode()
         .unwrap();
-    assert_eq!(received, authority);
+        let sent = bob
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let message = match sent {
+            SendResult::ApplicationMessage { msg, authority, .. } => {
+                assert!(
+                    authority.is_none(),
+                    "only moderation controls get policy evidence"
+                );
+                route_to_group(&msg, &gid)
+            }
+            _ => unreachable!(),
+        };
+        alice.ingest(message).await.unwrap();
+        assert!(alice.drain_events().iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::MessageReceived {
+                authority: None,
+                ..
+            }
+        )));
+    }
+    assert!(
+        alice_storage
+            .pending_application_authority_batch(None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn engine_rejects_moderation_in_unnamed_two_account_groups() {
+    let (mut alice, _, gid) = create_pair().await;
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some(" ".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let pending = match rename {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    for kind in [1984, 1985, 4891] {
+        let payload = MarmotAppEvent::new(
+            hex::encode(alice.self_id().as_slice()),
+            1,
+            kind,
+            vec![vec!["e".into(), "11".repeat(32)]],
+            "",
+        )
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: gid.clone(),
+                    payload,
+                    expected_epoch: None
+                })
+                .await,
+            Err(EngineError::InvalidAppMessagePayload(_))
+        ));
+    }
 }
 
 #[tokio::test]

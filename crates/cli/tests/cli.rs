@@ -4983,7 +4983,7 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
         .expect("unreact delete message");
     assert_eq!(message_e_tag(unreact), Some(reaction_message_id.as_str()));
 
-    run_json(
+    let rejected = run_json_error(
         home.path(),
         &[
             "--account",
@@ -4994,9 +4994,21 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
             target_message_id,
         ],
     );
+    assert_eq!(rejected["code"], "invalid_app_message_payload");
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "delete",
+            group_id,
+            target_message_id,
+        ],
+    );
     // A delete is a kind-5 tombstone with empty content and an `e` tag.
     let delete_sync =
-        sync_until_message_with_kind(home.path(), test_relay_url(), &alice, 5, target_message_id);
+        sync_until_message_with_kind(home.path(), test_relay_url(), &bob, 5, target_message_id);
     let delete = first_message_with_kind_and_target(&delete_sync, 5, target_message_id)
         .expect("delete message");
     assert_eq!(delete["plaintext"], "");

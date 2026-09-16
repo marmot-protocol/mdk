@@ -4227,7 +4227,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         source_epoch,
                         sender: sender.as_slice().to_vec(),
                         payload: payload.clone(),
-                        authority: if source_epoch == mls_group.epoch().as_u64() {
+                        authority: if cgka_traits::reporting::requires_source_authority(
+                            app_event.kind,
+                        ) && source_epoch == mls_group.epoch().as_u64()
+                        {
                             Some(
                                 crate::app_payload::source_authority(&mls_group, sender)
                                     .map_err(|e| OpenMlsProjectionError::Replay(e.to_string()))?,

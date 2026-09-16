@@ -150,10 +150,10 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
         return Ok(());
     };
     let edits = app_events_targeting_message_tx(conn, group, MARMOT_APP_EVENT_KIND_EDIT, target)?;
-    let mut revisions = BTreeMap::from([(target.to_owned(), &original)]);
+    let mut revisions = BTreeSet::from([target.to_owned()]);
     for edit in &edits {
         if edit.sender == original.sender && tag_values(&edit.tags, "e").count() == 1 {
-            revisions.insert(edit.message_id_hex.clone(), edit);
+            revisions.insert(edit.message_id_hex.clone());
         }
     }
     // The reported revision remains stable, while the current revision follows
@@ -173,16 +173,18 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
         app_events_targeting_message_tx(conn, group, MARMOT_APP_EVENT_KIND_REPORT, target)?;
     // Group duplicates before applying dismissal: a new duplicate event can
     // never reopen a logical report already resolved under another event id.
-    let mut logical: BTreeMap<(String, String), Vec<&RawAppEvent>> = BTreeMap::new();
+    let mut logical: BTreeMap<(String, String), (ReportReason, Vec<&RawAppEvent>)> =
+        BTreeMap::new();
     for report in &candidates {
         if let Some(reference) = report_reference(conn, report)?
             && reference.target == target
             && reference.author == original.sender
-            && revisions.contains_key(reference.revision)
+            && revisions.contains(reference.revision)
         {
             logical
                 .entry((reference.revision.to_owned(), report.sender.clone()))
-                .or_default()
+                .or_insert_with(|| (reference.reason, Vec::new()))
+                .1
                 .push(report);
         }
     }
@@ -193,12 +195,9 @@ pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageRe
     .storage()?;
     let mut pending = 0i64;
     let total = logical.len() as i64;
-    for ((revision, reporter), mut duplicates) in logical {
+    for ((revision, reporter), (reason, mut duplicates)) in logical {
         duplicates.sort_by_key(|e| (e.recorded_at, &e.message_id_hex));
         let report = duplicates[0];
-        let reason = report_reference(conn, report)?
-            .expect("validated above")
-            .reason;
         let mut dismissals = Vec::new();
         for duplicate in duplicates {
             for decision in app_events_targeting_message_tx(
@@ -623,6 +622,35 @@ impl SqliteAccountStorage {
         }
         Ok(None)
     }
+}
+
+/// Keep replay fencing only for targets with moderation evidence. Call this
+/// after identifying retained controls and before deleting their projections.
+pub(super) fn retain_expired_target(
+    conn: &Connection,
+    group: &str,
+    target: &str,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "INSERT OR IGNORE INTO content_expired_targets (group_id_hex, message_id_hex)
+         SELECT ?1, ?2 WHERE EXISTS (
+            SELECT 1 FROM content_moderation
+            WHERE group_id_hex = ?1 AND message_id_hex = ?2
+         ) OR EXISTS (
+            SELECT 1 FROM content_reports
+            WHERE group_id_hex = ?1 AND message_id_hex = ?2
+         ) OR EXISTS (
+            SELECT 1 FROM message_modifier_edges AS edges
+            CROSS JOIN content_pruned_controls AS controls
+              ON controls.group_id_hex = edges.group_id_hex
+             AND controls.message_id_hex = edges.modifier_message_id_hex
+            WHERE edges.group_id_hex = ?1 AND edges.target_message_id_hex = ?2
+              AND edges.kind IN (5, 1984, 4891)
+         )",
+        params![group, target],
+    )
+    .storage()?;
+    Ok(())
 }
 
 pub(super) fn target_expired(conn: &Connection, group: &str, id: &str) -> StorageResult<bool> {
@@ -1649,9 +1677,188 @@ mod tests {
     }
 
     #[test]
+    fn mixed_review_targets_resolve_each_report_independently() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        let mut cross_target = target();
+        cross_target.group_id_hex = id(98);
+        cross_target.source_message_id_hex = Some(id(50));
+        let mut cross_report = report(5, 12, 1);
+        cross_report.group_id_hex = id(98);
+        for e in [
+            target(),
+            report(2, 11, 1),
+            event(4, 10, 9, vec![], "not a report"),
+            cross_target,
+            cross_report,
+            dismiss(6, &[2, 3, 4, 5]),
+        ] {
+            s.record_app_event(&e).unwrap();
+        }
+        assert_eq!(
+            page(&s).items[0].moderation.status,
+            ModerationStatus::Reviewed
+        );
+        assert_eq!(page(&s).items[0].moderation.total_reports, 1);
+        // The unknown reference remains in the control and applies on arrival.
+        s.record_app_event(&report(3, 13, 1)).unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                s.rebuild_message_timeline_for_group(&id(98)).unwrap();
+            }
+            let moderation = &page(&s).items[0].moderation;
+            assert_eq!(moderation.status, ModerationStatus::Reviewed);
+            assert_eq!(moderation.total_reports, 2);
+            let details = s.message_reports(&id(99), &id(1), None, 10).unwrap();
+            assert!(
+                details
+                    .reports
+                    .iter()
+                    .all(|r| r.dismissed_by_event_id == Some(id(6)))
+            );
+            let untouched = s.timeline_message(&id(99), &id(4)).unwrap().unwrap();
+            assert_eq!(untouched.moderation.status, ModerationStatus::Unreported);
+            assert!(!untouched.deleted);
+            let cross = s.reported_content(&id(98), false, None, 10).unwrap();
+            assert_eq!(cross.items[0].moderation.status, ModerationStatus::Pending);
+            assert_eq!(cross.pending_message_count, 1);
+        }
+    }
+
+    #[test]
+    fn kind_five_cannot_withdraw_reports_reviews_or_removals() {
+        for control_kind in [1984, 1985, 4891] {
+            let s = SqliteAccountStorage::in_memory().unwrap();
+            s.record_app_event(&target()).unwrap();
+            s.record_app_event(&report(2, 11, 1)).unwrap();
+            let (control, expected_status, expected_pending) = match control_kind {
+                1984 => (report(2, 11, 1), ModerationStatus::Pending, 1),
+                1985 => (dismiss(3, &[2]), ModerationStatus::Reviewed, 0),
+                4891 => (removal(4, 1), ModerationStatus::Removed, 0),
+                _ => unreachable!(),
+            };
+            s.record_app_event(&control).unwrap();
+            let mut deletion = event(
+                10,
+                0,
+                5,
+                vec![vec!["e".into(), control.message_id_hex.clone()]],
+                "",
+            );
+            deletion.sender = control.sender.clone();
+            s.record_app_event(&deletion).unwrap();
+            for rebuild in [false, true] {
+                if rebuild {
+                    s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                }
+                let moderation = &page(&s).items[0].moderation;
+                assert_eq!(moderation.total_reports, 1);
+                assert_eq!(moderation.pending_reports, expected_pending);
+                assert_eq!(moderation.status, expected_status);
+                let raw_control = raw(&s.lock().unwrap(), &id(99), &control.message_id_hex)
+                    .unwrap()
+                    .unwrap();
+                assert!(!raw_control.invalidated);
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_and_explicit_erasure_keep_only_moderated_target_markers() {
+        for expire_by_policy in [false, true] {
+            let s = SqliteAccountStorage::in_memory().unwrap();
+            for n in [1, 3, 5].into_iter().chain(30..50) {
+                let chat = event(n, 10, 9, vec![], "expiring chat");
+                s.record_app_event_with_retention(
+                    &chat,
+                    Some(AppMessageRetentionDecision::new(chat.recorded_at, 1)),
+                )
+                .unwrap();
+            }
+            let authority = AppMessageAuthority {
+                source_context: [7; 32],
+                moderation_grant: false,
+                reporting_allowed: true,
+            };
+            s.record_app_event_with_source(&report(2, 11, 1), None, Some(authority))
+                .unwrap();
+            let mut unresolved = report(4, 11, 3);
+            unresolved.tags[0][1] = id(3);
+            s.record_app_event_with_source(&unresolved, None, None)
+                .unwrap();
+            assert_eq!(moderation_rows(&s), 1);
+            s.record_app_event(&removal(6, 5)).unwrap();
+            if expire_by_policy {
+                s.secure_prune_expired_app_events(&id(99), 100, "local", &|_, _| false)
+                    .unwrap();
+            } else {
+                s.secure_prune_app_events_before(&id(99), 100, "local", &|_, _| false)
+                    .unwrap();
+            }
+            {
+                let conn = s.lock().unwrap();
+                let mut stmt = conn.prepare(
+                    "SELECT message_id_hex FROM content_expired_targets ORDER BY message_id_hex",
+                ).unwrap();
+                let ids = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(ids, vec![id(1), id(3), id(5)]);
+                let provenance: Vec<u8> = conn
+                    .query_row(
+                        "SELECT authority_context FROM app_events WHERE message_id_hex = ?1",
+                        params![id(2)],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(provenance, authority.source_context);
+            }
+            assert_eq!(moderation_rows(&s), 0);
+            assert!(
+                s.message_timeline(TimelineMessageQuery::default())
+                    .unwrap()
+                    .messages
+                    .is_empty()
+            );
+            // Both approved and unresolved reports retain only structural evidence.
+            for n in [2, 4] {
+                assert!(
+                    s.app_message(&id(99), &id(n))
+                        .unwrap()
+                        .unwrap()
+                        .plaintext
+                        .is_empty()
+                );
+            }
+            for n in [1, 3, 5] {
+                s.record_app_event(&event(n, 10, 9, vec![], "late duplicate"))
+                    .unwrap();
+                assert!(s.timeline_message(&id(99), &id(n)).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_erased_chat_has_no_moderation_replay_fence() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        s.record_app_event(&target()).unwrap();
+        s.secure_prune_app_events_before(&id(99), 2, "local", &|_, _| false)
+            .unwrap();
+        assert!(!target_expired(&s.lock().unwrap(), &id(99), &id(1)).unwrap());
+        // Generic dedup/retention remains owned by the existing ingress rails.
+        // The moderation projection does not veto an ordinary record operation.
+        s.record_app_event(&target()).unwrap();
+        assert!(s.timeline_message(&id(99), &id(1)).unwrap().is_some());
+        assert_eq!(moderation_rows(&s), 0);
+    }
+
+    #[test]
     fn late_reports_cannot_retain_explanations_or_restore_expired_targets() {
         let s = SqliteAccountStorage::in_memory().unwrap();
         s.record_app_event(&target()).unwrap();
+        s.record_app_event(&report(4, 11, 1)).unwrap();
         s.secure_prune_expired_app_events(&id(99), 10, "local", &|_, _| false)
             .unwrap();
         // Exercise the explicit erasure rail, which also records the marker.

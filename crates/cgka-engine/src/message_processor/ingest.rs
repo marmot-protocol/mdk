@@ -1412,7 +1412,7 @@ impl<S: StorageProvider> Engine<S> {
                             .map(|seconds| seconds.unwrap_or(0)),
                     }
                 };
-                let authority = if msg_epoch == current_epoch {
+                let authority = if needs_authority && msg_epoch == current_epoch {
                     Some(crate::app_payload::source_authority(&mls_group, &sender)?)
                 } else {
                     historical_source.map(|source| source.authority)

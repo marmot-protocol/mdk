@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Group report/dismiss commands, paginated report details and shared queue subscriptions,
+  plus message revision and moderation summaries. Regenerate headers with the matching
+  library for the changed output layouts. Admin removal uses kind 4891; author deletion
+  remains kind 5. Cross-author non-admin deletion now returns an error, and mixed-version
+  groups can disagree on either the old admin kind-5 or new kind-4891 removal behavior.
+
 - Typed group-system chat previews and explicit `MarmotGroupSystemEventProvenance`
   on timeline and preview events. Authenticated actor/subject IDs remain distinct;
   chat previews include locally prepared names, while clients localize wording.
