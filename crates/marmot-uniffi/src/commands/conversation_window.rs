@@ -237,11 +237,16 @@ mod tests {
         assert!(!initial.header.capabilities.can_send);
         // Commands below test a quiet live window. Consume the independent
         // authority replacement first, so their revision cannot race it.
-        initial = tokio::time::timeout(std::time::Duration::from_secs(10), window.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        initial = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let replacement = window.next().await.unwrap().unwrap();
+                if replacement.header.epoch.is_some() {
+                    break replacement;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert!(initial.header.epoch.is_some());
         assert!(initial.header.capabilities.can_send);
         let mut wrong = initial.revision.clone();

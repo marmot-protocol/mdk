@@ -78,10 +78,11 @@ storage can advance. Zipping its MLS state with a fresh account capture is there
 Opening first reads the durable account snapshot directly. `header.epoch = None` marks local-only
 presentation and suppresses all live permissions, preserving persisted membership/invitation/departure
 status. The actor then acquires the worker and uses its session capture callback for coherent live
-authority. It retains a 50 ms capture wait budget and a one-second quiet retry when authority is
-unavailable. Before first authority, paging and updates fall back to fresh local snapshots; after
-first authority, a busy worker retains the last complete snapshot and retries without capability
-flicker or mixing old permissions with new rows. Worker acquisition runs continuously, joined with
+authority. Before first authority, captures have a 50 ms wait budget, paging/updates can fall back
+to fresh local snapshots, and quiet retries check readiness every second. Established windows
+await queued live captures without that display timeout; explicit `NotReady` responses still
+schedule a quiet retry. They retain the last complete snapshot without capability flicker or
+mixing old permissions with new rows. Worker acquisition runs continuously, joined with
 the actor but outside its display timeout. Admitted reconciliation finishes even after window close,
 so worker teardown and its lifecycle lock cannot be abandoned; transient acquisition failures retry.
 The initial read deliberately never spends the 50 ms authority budget, even on a warm open: local
@@ -123,12 +124,14 @@ retains a one-second retry obligation even without traffic. An accepted command 
 cancellation; transient failure retains its requested position. If a deferred explicit target
 expires before retry, the stream reports that error and resumes the last successful viewport.
 
-Opening performs no network request of its own. It can remain pending while an existing startup
-or recovery operation exclusively borrows the account client; retrying avoids publishing stale
-permissions. Cancel the opening future to abandon that wait. Later capture failures are stream
-errors followed by timed recovery. Shutdown, store eviction/replacement, a lost reset signal,
-or dropping the subscription terminates the actor even if a command clone survives. The worker
-sender is pinned and is never reacquired for an existing window.
+Opening reads the durable local projection without waiting for account startup, engine hydration
+or relay catch-up. Only unavailable local read state can keep that first read pending; cancelling
+the opening future abandons it. Live authority arrives later. Once established, a window retains
+its last complete snapshot while awaiting the worker; explicit `NotReady` retries quietly, while
+other transient capture errors are reported and retried. Shutdown, store eviction/replacement,
+a lost reset signal, or dropping the subscription terminates the actor even if a command clone
+survives. Initial worker acquisition retries transient failures; once acquired, the sender is
+pinned and a closed worker terminates the existing window rather than rebinding it.
 
 ## Validation and work bounds
 

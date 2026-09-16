@@ -50,6 +50,10 @@ impl Fixture {
                         Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, respond }) => {
                             n.fetch_add(1, Ordering::SeqCst);
                             let mode = m.load(Ordering::SeqCst);
+                            if mode == 5 {
+                                reached.notify_one();
+                                tokio::select! { _ = resume.notified() => {}, _ = &mut stop => return }
+                            }
                             let result = match mode {
                                 1 => Err(ConversationWindowError::NotReady),
                                 2 => Err(StorageError::Busy("test contention".into()).into()),
@@ -1050,20 +1054,21 @@ async fn busy_live_window_keeps_complete_snapshot_until_coherent_membership_upda
     let f = Fixture::new(8).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
     assert!(sub.snapshot.presentation.header.capabilities.can_send);
-    f.mode.store(3, Ordering::SeqCst);
+    f.mode.store(5, Ordering::SeqCst);
     let handle = sub.window_handle();
     let revision = sub.snapshot.revision.clone();
-    let read = tokio::spawn(async move { handle.return_to_latest(&revision).await });
+    let mut read = tokio::spawn(async move { handle.return_to_latest(&revision).await });
     timeout(Duration::from_secs(5), f.captured.notified())
         .await
         .unwrap();
     f.app
         .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
         .unwrap();
-    assert!(matches!(
-        read.await.unwrap(),
-        Err(ConversationWindowError::NotReady)
-    ));
+    assert!(
+        timeout(Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
+    );
     // A delayed live capture must not publish either downgraded permissions
     // or fresh membership combined with the old live authority.
     assert!(
@@ -1073,13 +1078,20 @@ async fn busy_live_window_keeps_complete_snapshot_until_coherent_membership_upda
     );
     f.mode.store(0, Ordering::SeqCst);
     f.release.notify_one();
-    loop {
-        let update = next(&mut sub).await;
-        assert!(!update.presentation.header.capabilities.can_send);
-        if update.presentation.header.epoch.is_some() {
-            break;
-        }
-    }
+    let updated = timeout(Duration::from_millis(500), read)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(updated.presentation.header.epoch.is_some());
+    assert!(!updated.presentation.header.capabilities.can_send);
+    assert_eq!(
+        updated.presentation.header.capabilities.participation,
+        crate::conversation_presentation::ConversationParticipation::Removed
+    );
+    let streamed = next(&mut sub).await;
+    assert_eq!(streamed.revision.sequence, updated.revision.sequence);
+    assert!(!streamed.presentation.header.capabilities.can_send);
     f.close().await;
 }
 
@@ -1230,4 +1242,67 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn live_window_waits_for_queue_capacity_without_a_display_retry_delay() {
+    let f = Fixture::new(8).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let sender = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .get(&f.account)
+        .unwrap()
+        .commands
+        .clone();
+    let permits = sender.reserve_many(8).await.unwrap();
+    let handle = sub.window_handle();
+    let revision = sub.snapshot.revision.clone();
+    let mut read = tokio::spawn(async move { handle.return_to_latest(&revision).await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut read)
+            .await
+            .is_err(),
+        "an established window must retain its queued capture beyond the display budget"
+    );
+    f.add(8);
+    f.draft("stored while command queue was full");
+    drop(permits);
+    let updated = timeout(Duration::from_millis(500), read)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(updated.presentation.header.capabilities.can_send);
+    assert!(updated.presentation.header.epoch.is_some());
+    assert_eq!(ids(&updated).last(), Some(&id(8)));
+    assert_eq!(
+        updated.draft.draft.as_ref().unwrap().content,
+        "stored while command queue was full"
+    );
+
+    // Waiting for capacity is still interrupted by window closure, even if
+    // an outstanding command clone keeps its own channel alive.
+    let permits = sender.reserve_many(8).await.unwrap();
+    let handle = sub.window_handle();
+    let mut closing_read =
+        tokio::spawn(async move { handle.return_to_latest(&updated.revision).await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut closing_read)
+            .await
+            .is_err()
+    );
+    drop(sub);
+    assert!(matches!(
+        timeout(Duration::from_millis(500), closing_read)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ConversationWindowError::Closed)
+    ));
+    drop(permits);
+    f.close().await;
 }

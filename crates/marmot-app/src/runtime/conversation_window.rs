@@ -21,8 +21,8 @@ pub use storage_sqlite::{
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-// A busy worker may enrich a local window later; never put its queue or
-// network work on the unbounded display path. This is not a command deadline.
+// Before first authority, a busy worker may enrich the local window later.
+// Bound that display wait, not the lifetime of an established window command.
 const AUTHORITY_WAIT: Duration = Duration::from_millis(50);
 const DRAIN_LIMIT: usize = 1024;
 pub const CONVERSATION_WINDOW_MAX_ROWS: usize = 200;
@@ -394,16 +394,14 @@ impl Reader {
         };
         let (respond, rx) = oneshot::channel();
         worker
-            .try_send(AccountWorkerCommand::CaptureConversation {
+            .send(AccountWorkerCommand::CaptureConversation {
                 group_id: self.group.clone(),
                 query: query.clone(),
                 store_epoch: self.store_epoch.clone(),
                 respond,
             })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ConversationWindowError::NotReady,
-                mpsc::error::TrySendError::Closed(_) => ConversationWindowError::Closed,
-            })?;
+            .await
+            .map_err(|_| ConversationWindowError::Closed)?;
         rx.await.map_err(|_| ConversationWindowError::Closed)?
     }
 
@@ -413,17 +411,17 @@ impl Reader {
         revision: ConversationWindowRevision,
         allow_local: bool,
     ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
+        if !allow_local {
+            // Established windows await their queued capture. Abandoning it at
+            // the display deadline would add a full retry interval after an
+            // ordinary send. The actor still cancels on close/reset/shutdown.
+            let captured = self.capture_live(query).await?;
+            return self.present(captured, revision).await;
+        }
         match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query)).await {
             Ok(Ok(captured)) => self.present(captured, revision).await,
             Ok(Err(ConversationWindowError::NotReady)) | Err(_) => {
-                if allow_local {
-                    self.read_local(query, revision).await
-                } else {
-                    // Keep the last complete live snapshot while the worker is
-                    // busy. Never attach stale permissions to newer local rows,
-                    // or grey out a live composer on ordinary queue contention.
-                    Err(ConversationWindowError::NotReady)
-                }
+                self.read_local(query, revision).await
             }
             Ok(Err(error)) => Err(error),
         }
