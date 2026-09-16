@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-15
+updated: 2026-09-16
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,11 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
+previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.
+Migration 76 repairs existing projections. Raw edit events remain available, but edits are no longer transcript rows.
+See the [native edit contract](../../../crates/marmot-uniffi/CONVERSATION-WINDOW.md#accepted-edits-c6a).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

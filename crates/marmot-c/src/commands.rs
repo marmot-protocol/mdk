@@ -2780,6 +2780,49 @@ pub unsafe extern "C" fn marmot_set_product_analytics_activity(
     })
 }
 
+/// Read accepted edit versions separately from screen snapshots. Supply both
+/// cursor values, or has_before=0 and a NULL id for the newest page. Limit 1..=100.
+/// Free with marmot_timeline_edit_history_page_free.
+/// # Safety
+/// Client and strings must be valid, before_message_id nullable, out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_message_edit_history(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    target_message_id_hex: *const c_char,
+    has_before: u8,
+    before_edited_at: u64,
+    before_message_id_hex: *const c_char,
+    limit: u32,
+    out: *mut *mut crate::types::timeline::MarmotTimelineEditHistoryPage,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let target = try_arg!(unsafe { required_str(target_message_id_hex) });
+        let before = try_arg!(unsafe { crate::memory::optional_str(before_message_id_hex) });
+        if (has_before != 0) != before.is_some() || !(1..=100).contains(&limit) {
+            return MarmotStatus::InvalidArgument;
+        }
+        unsafe {
+            deliver(
+                client.marmot.message_edit_history(
+                    account_ref,
+                    group,
+                    target,
+                    (has_before != 0).then_some(before_edited_at),
+                    before,
+                    limit,
+                ),
+                out,
+            )
+        }
+    })
+}
+
 #[cfg(test)]
 mod identity_pointer_tests {
     use super::{

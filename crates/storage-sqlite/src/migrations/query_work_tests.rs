@@ -492,10 +492,14 @@ fn retention_indexes_upgrade() {
             let mut stmt = conn
                 .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
                 .unwrap();
-            let columns = stmt.column_count();
+            let columns = (0..stmt.column_count())
+                .filter(|&i| stmt.column_name(i).unwrap() != "edit_json")
+                .collect::<Vec<_>>();
             rows.extend(
                 stmt.query_map([], |row| {
-                    (0..columns)
+                    columns
+                        .iter()
+                        .copied()
                         .map(|i| row.get::<_, rusqlite::types::Value>(i))
                         .collect::<rusqlite::Result<Vec<_>>>()
                 })

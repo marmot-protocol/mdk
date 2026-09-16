@@ -386,6 +386,7 @@ pub enum ChatListUpdateTriggerFfi {
     PinOrderChanged,
     SnapshotRefresh,
     Removed,
+    LastMessageContentChanged,
 }
 
 impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
@@ -409,6 +410,9 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
                 Self::LatestMessageDeliveryChanged
             }
             marmot_app::ChatListUpdateTrigger::PinOrderChanged => Self::PinOrderChanged,
+            marmot_app::ChatListUpdateTrigger::LastMessageContentChanged => {
+                Self::LastMessageContentChanged
+            }
             marmot_app::ChatListUpdateTrigger::SnapshotRefresh => Self::SnapshotRefresh,
             marmot_app::ChatListUpdateTrigger::Removed => Self::Removed,
         }

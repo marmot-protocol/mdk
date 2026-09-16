@@ -230,6 +230,9 @@
         },
         "upload_trigger": {
           "type": "string"
+        },
+        "local_member_ref": {
+          "$ref": "#/$defs/refHex16"
         }
       }
     },

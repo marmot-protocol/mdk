@@ -8491,19 +8491,25 @@ fn messages_edit_publishes_replacement_and_enforces_local_authorship() {
     assert_eq!(edit["message_id"], edit_message_id);
     assert_eq!(edit["from"], alice);
 
-    // The materialized timeline carries the edit row, so edited state is
-    // visible to timeline consumers as well as the raw message list.
+    // Raw edits stay available above; the transcript exposes the original row
+    // with effective content and metadata instead of a separate modifier row.
     let timeline = run_json(
         home.path(),
         &["--account", &bob, "messages", "timeline", "list", group_id],
     );
-    let timeline_edit = timeline["messages"]
-        .as_array()
-        .expect("timeline rows")
+    let rows = timeline["messages"].as_array().expect("timeline rows");
+    assert!(rows.iter().all(|row| row["kind"] != 1009));
+    let target = rows
         .iter()
-        .find(|row| row["kind"] == 1009 && message_e_tag(row) == Some(target_message_id))
-        .expect("timeline edit row");
-    assert_eq!(timeline_edit["plaintext"], "original --text");
+        .find(|row| row["message_id"] == target_message_id)
+        .expect("original row");
+    assert_eq!(target["kind"], 9);
+    assert_eq!(target["plaintext"], "original --text");
+    assert_eq!(target["edit"]["edit_count"], 1);
+    assert_eq!(
+        target["edit"]["latest_edit_message_id_hex"],
+        edit_message_id
+    );
 
     // Kind 1009 stays reserved on the custom-event path.
     let reserved = run_json_error(

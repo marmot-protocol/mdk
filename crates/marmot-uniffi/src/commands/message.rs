@@ -164,13 +164,12 @@ impl Marmot {
     /// Edit `target_message_id` by publishing a kind-1009 event that
     /// references it and carries the replacement plaintext in `content`.
     /// Recipients honour the edit only when its authenticated author matches
-    /// the target's author; mismatched edits are ignored client-side.
+    /// the target's author; MDK ignores mismatched edits.
     ///
-    /// The chat-list preview deliberately does not bump on an edit — an edit
-    /// to a stale message must not reorder a conversation back to the top of
-    /// the list. Host apps that aggregate edit history (e.g. an "(edited · N)"
-    /// affordance) read the kind-1009 versions back from the timeline
-    /// projection and resolve the latest text per target message id.
+    /// MDK overlays accepted edits on the target timeline row and selected list
+    /// preview, without changing its identity, activity order or unread state.
+    /// Timeline rows carry compact edit metadata; `message_edit_history` returns
+    /// accepted versions separately. Raw kind-1009 events remain in `messages`.
     pub async fn edit_message(
         &self,
         account_ref: String,

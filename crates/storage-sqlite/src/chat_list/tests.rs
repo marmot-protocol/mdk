@@ -4608,3 +4608,47 @@ fn account_attention_missing_base_rows_are_explicit_and_acceptance_reveals_retai
     assert_eq!(total.unread_conversations, 1);
     assert_eq!(total.attention_only_conversations, 0);
 }
+
+#[test]
+fn accepted_edit_changes_selected_preview_without_activity_or_unread() {
+    let store = setup_store();
+    let mentions = |body: &str, _: &[Vec<String>]| body.contains("@me");
+    store
+        .record_app_event(&chat("older", REMOTE, 1, "older"))
+        .unwrap();
+    store
+        .record_app_event(&chat("latest", REMOTE, 2, "original"))
+        .unwrap();
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions)
+        .unwrap()
+        .unwrap();
+    let mut edit = chat_with_tags(
+        "edit",
+        REMOTE,
+        3,
+        "**edited @me**",
+        vec![vec!["e".into(), "latest".into()]],
+    );
+    edit.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT;
+    store.record_app_event(&edit).unwrap();
+    let after = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions)
+        .unwrap()
+        .unwrap();
+    let mut expected = before.clone();
+    // Refresh bookkeeping is not the user-visible activity timestamp.
+    expected.updated_at = after.updated_at;
+    expected.last_message.as_mut().unwrap().plaintext = "**edited @me**".into();
+    assert_eq!(after, expected, "only the effective preview body changes");
+    edit.message_id_hex = "edit-older".into();
+    edit.source_message_id_hex = Some("source-edit-older".into());
+    edit.tags[0][1] = "older".into();
+    store.record_app_event(&edit).unwrap();
+    let mut older_edit_row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions)
+        .unwrap()
+        .unwrap();
+    older_edit_row.updated_at = after.updated_at;
+    assert_eq!(older_edit_row, after);
+}

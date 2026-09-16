@@ -1,6 +1,10 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val edit = TimelineEditSummaryFfi(3u, "edit", 17u)
+    check(FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit)) == edit)
+    val history = TimelineEditHistoryPageFfi(listOf(TimelineEditVersionFfi("edit", 17u, "replacement")), true)
+    check(FfiConverterTypeTimelineEditHistoryPageFfi.lift(FfiConverterTypeTimelineEditHistoryPageFfi.lower(history)) == history)
     val blocks = BlockListSnapshotFfi(ULong.MAX_VALUE, listOf(BlockedUserFfi("key", true, 123L)))
     check(FfiConverterTypeBlockListSnapshotFfi.lift(FfiConverterTypeBlockListSnapshotFfi.lower(blocks)) == blocks)
     val anchors = listOf(ChatListAnchorOutcomeFfi.Top, ChatListAnchorOutcomeFfi.Retained("aabb", 0u),
@@ -20,7 +24,7 @@ fun main() {
     val copy = FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
     check(copy == value)
     conversationRoundTrips()
-    println("Kotlin C4/C5 projection round trips passed")
+    println("Kotlin C4/C5/C6 projection round trips passed")
 }
 
 suspend fun compileScreenCommands(marmot: Marmot, account: String) {
@@ -85,4 +89,11 @@ suspend fun compileBlockCommands(marmot: Marmot, account: String, user: String) 
     marmot.getBlockedUsers(account)
     marmot.isUserBlocked(account, user)
     marmot.subscribeBlockedUsers(account).use { sub -> sub.snapshot(); sub.next() }
+}
+
+fun compileEditHistory(marmot: Marmot, account: String, group: String, target: String) {
+    val page = marmot.messageEditHistory(account, group, target, null, null, 50u)
+    page.versions.firstOrNull()?.let { oldest ->
+        marmot.messageEditHistory(account, group, target, oldest.editedAt, oldest.messageIdHex, 50u)
+    }
 }

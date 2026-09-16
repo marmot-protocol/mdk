@@ -1,7 +1,7 @@
 use marmot_account::AccountHome;
 use marmot_app::{
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
-    MarmotAppRuntime, MarmotServiceEndpoints,
+    AuditLogDeleteOutcome, AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource,
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, MarmotServiceEndpoints,
 };
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
@@ -1713,4 +1713,213 @@ async fn redirect_trap_observes_raw_tcp_accept_without_http() {
         .expect("observer closed before reporting accept");
     drop(stream);
     observer.await.unwrap();
+}
+
+fn decode_account_id_hex(value: &str) -> Vec<u8> {
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).expect("account id hex"))
+        .collect()
+}
+
+fn source_events(path: &str) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["kind"]["type"] == "source_context")
+        .collect()
+}
+
+async fn wait_for_audit_file_quiesce(path: &str) -> String {
+    let mut body = std::fs::read_to_string(path).unwrap();
+    let mut unchanged = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let next = std::fs::read_to_string(path).unwrap();
+        if next == body {
+            unchanged += 1;
+            if unchanged >= 10 {
+                return body;
+            }
+        } else {
+            unchanged = 0;
+            body = next;
+        }
+    }
+    body
+}
+
+#[tokio::test]
+async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let _client = app.client(&account.label).await.unwrap();
+    let files = app.audit_log_files().unwrap();
+    assert_eq!(files.len(), 1);
+    let events = source_events(&files[0].path);
+    assert_eq!(events.len(), 1, "startup should write one source row");
+    let expected =
+        marmot_forensics::member_ref_hex(&decode_account_id_hex(&account.account_id_hex));
+    assert_eq!(events[0]["kind"]["source"]["local_member_ref"], expected);
+    assert_ne!(events[0]["account_ref"], expected);
+    let body = std::fs::read_to_string(&files[0].path).unwrap();
+    assert!(!body.contains(&account.account_id_hex));
+    assert!(!body.contains("\"account_label\""));
+}
+
+fn assert_source_linkage(actual: &Value, expected: &Value) {
+    assert_eq!(
+        actual["kind"]["source"]["local_member_ref"],
+        expected["kind"]["source"]["local_member_ref"]
+    );
+    assert_eq!(actual["account_ref"], expected["account_ref"]);
+    assert_eq!(actual["engine_id"], expected["engine_id"]);
+}
+
+#[tokio::test]
+async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let client = app.client(&account.label).await.unwrap();
+    let path = app.audit_log_files().unwrap()[0].path.clone();
+    let first = source_events(&path);
+    assert_eq!(first.len(), 1, "startup should write one source row");
+    drop(client);
+
+    let client = app.client(&account.label).await.unwrap();
+    let reopened = source_events(&path);
+    assert_eq!(
+        reopened.len(),
+        first.len() + 1,
+        "reopen must append a new source_context"
+    );
+    assert_source_linkage(reopened.last().unwrap(), &first[0]);
+    assert_ne!(
+        reopened.last().unwrap()["recorder_session_id"],
+        first[0]["recorder_session_id"]
+    );
+    drop(client);
+
+    let live_tmp = tempfile::tempdir().unwrap();
+    let live_home = AccountHome::open(live_tmp.path());
+    let live_account = live_home.create_account("alice").unwrap();
+    let live_app = MarmotApp::with_relay(live_tmp.path(), "wss://relay.example");
+    live_app
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(live_app);
+    runtime.start().await.unwrap();
+    runtime.sign_in_account(&live_account.label).await.unwrap();
+    let live_path = runtime.audit_log_files().unwrap()[0].path.clone();
+    let before_disable_body = wait_for_audit_file_quiesce(&live_path).await;
+    let before_toggle = source_events(&live_path);
+    assert_eq!(
+        before_toggle.len(),
+        1,
+        "live worker startup should write one source row"
+    );
+    let before_toggle_row = before_toggle[0].clone();
+
+    runtime
+        .set_audit_log_settings(AuditLogSettings { enabled: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(source_events(&live_path).len(), before_toggle.len());
+    assert_eq!(
+        std::fs::read_to_string(&live_path).unwrap(),
+        before_disable_body,
+        "live disable must stop further audit rows"
+    );
+
+    runtime
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
+        .await
+        .unwrap();
+    let restored = source_events(&live_path);
+    assert_eq!(
+        restored.len(),
+        before_toggle.len() + 1,
+        "live re-enable must append a new source_context"
+    );
+    let latest = restored.last().unwrap();
+    assert_source_linkage(latest, &before_toggle_row);
+    assert_ne!(
+        latest["recorder_session_id"],
+        before_toggle_row["recorder_session_id"]
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_delete_rotates_and_replays_source_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.start().await.unwrap();
+    runtime.sign_in_account(&account.label).await.unwrap();
+    let files = runtime.audit_log_files().unwrap();
+    assert_eq!(files.len(), 1);
+    let path = files[0].path.clone();
+    let before = source_events(&path);
+    assert_eq!(before.len(), 1);
+    let outcome = runtime.delete_audit_log_file(&path).await.unwrap();
+    assert_eq!(
+        outcome,
+        AuditLogDeleteOutcome {
+            still_recording: true
+        }
+    );
+    let after = source_events(&path);
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0]["kind"]["source"]["local_member_ref"],
+        before[0]["kind"]["source"]["local_member_ref"]
+    );
+    assert_eq!(after[0]["account_ref"], before[0]["account_ref"]);
+    assert_eq!(after[0]["engine_id"], before[0]["engine_id"]);
+    assert_ne!(
+        after[0]["recorder_session_id"],
+        before[0]["recorder_session_id"]
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn upload_accepts_populated_local_member_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    let mut row = v4_source_row();
+    row["kind"]["source"]["local_member_ref"] = "8e66aded45480108db05bdf8af61c8d8".into();
+    let path = home.account_dir("alice").join("audit-member-ref-v4.jsonl");
+    std::fs::write(&path, jsonl_row(&row)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/v1/audit-logs/",
+        listener.local_addr().unwrap()
+    );
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(capture_one_request(listener, tx));
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let result = app
+        .post_audit_log_file(path.to_str().unwrap(), &endpoint)
+        .await
+        .unwrap();
+    assert_eq!(result.status, 204);
+    assert_eq!(rx.await.unwrap().body, jsonl_row(&row));
+    server.await.unwrap();
 }

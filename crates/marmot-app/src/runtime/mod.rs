@@ -4277,6 +4277,20 @@ impl MarmotAppRuntime {
             .timeline_messages_with_query(&account.label, query)
     }
 
+    pub fn message_edit_history(
+        &self,
+        account_ref: &str,
+        group: &str,
+        target: &str,
+        before: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<crate::TimelineEditHistoryPage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .message_edit_history(&account.label, group, target, before, limit)
+    }
+
     pub fn timeline_message(
         &self,
         account_ref: &str,

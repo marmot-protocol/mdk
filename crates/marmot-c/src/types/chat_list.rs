@@ -187,6 +187,7 @@ c_enum! {
         PinOrderChanged,
         SnapshotRefresh,
         Removed,
+        LastMessageContentChanged,
     }
 }
 

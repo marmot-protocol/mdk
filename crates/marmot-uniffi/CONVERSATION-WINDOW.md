@@ -141,3 +141,24 @@ replacement during message bursts at 50 and 200 rows, including long Markdown;
 see #1838. No incremental-conversion or device-latency guarantee is implied. The binding layer owns
 an initial converted snapshot and the runtime subscription; do not open duplicate
 handles for one screen. No new durable projection or media cache is introduced.
+
+## Accepted edits (C6a)
+
+Timeline `plaintext` and Markdown tokens now carry the accepted effective text; reply and selected chat-list
+previews use the same durable projection. `edit` contains the accepted edit count, latest edit id and edit timestamp.
+Render that metadata directly; do not overlay raw edit events again. Ordering, delivery, media and message identity
+stay attached to the original message. Unread and mention eligibility use its original content.
+
+`message_edit_history` / `messageEditHistory` returns 1–100 accepted replacement versions, oldest first within a
+latest-first page. Pass the first entry's timestamp and id as the exclusive cursor for older versions. C uses
+`marmot_message_edit_history` and `marmot_timeline_edit_history_page_free`. This synchronous details query should run
+off the UI thread. It resolves retained edits scoped to the requested target, then bounds the returned page; it is
+not a constant-work history query. Normal screen reads use persisted compact metadata, not that history resolver.
+
+The same account author and exactly one `e` target are required. Invalidated and self-retracted edits are excluded;
+latest inner timestamp wins, with lexicographically greatest event id breaking ties. Removing/invalidation of a
+winning edit falls back to the next accepted version, or original content. Deleted/invalidated/hidden targets expose
+no accepted history. Raw kind-1009 events remain available through `messages`, but no longer appear as standalone
+materialized timeline rows. This is a deliberate timeline behavior change; regenerate bindings and update clients
+together. `LastMessageContentChanged` is a non-activity chat-list trigger. Migration 76 repairs persisted targets and
+previews without replaying relays. C6b system preview semantics and C7/C8 asset acquisition remain separate.
