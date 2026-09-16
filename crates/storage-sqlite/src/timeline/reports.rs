@@ -80,16 +80,47 @@ pub(super) fn hydrate(
     conn: &Connection,
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
-    // Indexed existence probes; reports never turn into counters or review state.
-    for message in messages {
-        message.has_reports = conn
-            .query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM content_reports
-             WHERE group_id_hex=?1 AND message_id_hex=?2 AND message_author=?3)",
-                params![message.group_id_hex, message.message_id_hex, message.sender],
-                |r| r.get(0),
+    // Batch indexed probes, scoped to the exact group, message and author.
+    // EXISTS stops at the first report, even when a target has many reports.
+    let mut reported = HashSet::new();
+    for chunk in messages.chunks(SQLITE_BIND_PARAMETER_CHUNK / 3) {
+        let values = vec!["(?, ?, ?)"; chunk.len()].join(",");
+        let sql = format!(
+            "WITH report_targets(group_id_hex, message_id_hex, message_author) AS (VALUES {values})
+             SELECT t.group_id_hex, t.message_id_hex, t.message_author FROM report_targets t
+             WHERE EXISTS (SELECT 1 FROM content_reports c
+               WHERE c.group_id_hex=t.group_id_hex AND c.message_id_hex=t.message_id_hex
+                 AND c.message_author=t.message_author)"
+        );
+        let mut statement = conn.prepare_cached(&sql).storage()?;
+        let rows = statement
+            .query_map(
+                params_from_iter(chunk.iter().flat_map(|m| {
+                    [
+                        m.group_id_hex.as_str(),
+                        m.message_id_hex.as_str(),
+                        m.sender.as_str(),
+                    ]
+                })),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .storage()?;
+        for row in rows {
+            reported.insert(row.storage()?);
+        }
+    }
+    for message in messages {
+        message.has_reports = reported.contains(&(
+            message.group_id_hex.clone(),
+            message.message_id_hex.clone(),
+            message.sender.clone(),
+        ));
     }
     Ok(())
 }
@@ -865,6 +896,48 @@ mod tests {
         s.secure_prune_app_events_before(&id(99), 3, &id(10), &|_, _| false)
             .unwrap();
         assert!(page(&s).reports.is_empty());
+    }
+    #[test]
+    fn report_hydration_batches_queries_and_matches_group_message_and_author() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::cell::Cell;
+        thread_local! { static QUERIES: Cell<usize> = const { Cell::new(0) }; }
+        fn trace(event: TraceEvent<'_>) {
+            if let TraceEvent::Stmt(statement, _) = event
+                && statement.sql().starts_with("WITH report_targets")
+            {
+                QUERIES.with(|count| count.set(count.get() + 1));
+            }
+        }
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        record(&s, &target());
+        record(&s, &report(2));
+        record(&s, &report(3));
+        let template = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+        let count = 2 * (SQLITE_BIND_PARAMETER_CHUNK / 3) + 1;
+        let mut messages = (0..count)
+            .map(|n| {
+                let mut m = template.clone();
+                match n % 4 {
+                    1 => m.group_id_hex = id(98),
+                    2 => m.message_id_hex = id(4),
+                    3 => m.sender = id(12),
+                    _ => {}
+                }
+                m
+            })
+            .collect::<Vec<_>>();
+        let conn = s.lock().unwrap();
+        QUERIES.with(|count| count.set(0));
+        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace));
+        hydrate(&conn, &mut messages).unwrap();
+        assert_eq!(QUERIES.with(Cell::get), 3);
+        for (n, m) in messages.iter().enumerate() {
+            assert_eq!(m.has_reports, n % 4 == 0);
+        }
+        hydrate(&conn, &mut []).unwrap();
+        assert_eq!(QUERIES.with(Cell::get), 3, "empty pages need no query");
+        conn.trace_v2(TraceEventCodes::empty(), None);
     }
     #[test]
     fn indexed_report_and_label_pages_are_bounded() {

@@ -12,7 +12,10 @@ use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use cgka_engine::group_authority::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 use storage_sqlite::{ConversationAccountSnapshot, ConversationOpenError, ConversationWindowQuery};
 pub use storage_sqlite::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenQuery,
@@ -155,6 +158,97 @@ impl ConversationWindowSnapshot {
 pub(crate) struct CapturedConversation {
     account: ConversationAccountSnapshot,
     authority: Option<GroupAuthoritySnapshot>,
+}
+
+// A worker-owned send can yield a coherent read before awaiting transport. Each
+// open window retains at most one such capture, and only for its current query.
+// The worker holds weak references so closing a window releases its rows.
+pub(crate) struct SendCapture {
+    group: GroupId,
+    epoch: Vec<u8>,
+    state: Mutex<SendCaptureState>,
+    changed: watch::Sender<()>,
+}
+struct SendCaptureState {
+    query: ConversationWindowQuery,
+    generation: u64,
+    pending: Option<CapturedConversation>,
+}
+impl SendCapture {
+    fn new(group: GroupId, epoch: Vec<u8>, query: ConversationWindowQuery) -> Self {
+        Self {
+            group,
+            epoch,
+            state: Mutex::new(SendCaptureState {
+                query,
+                generation: 0,
+                pending: None,
+            }),
+            changed: watch::channel(()).0,
+        }
+    }
+    fn set_query(&self, query: &ConversationWindowQuery) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.query != *query {
+            state.query = query.clone();
+            state.generation += 1;
+            state.pending = None;
+        }
+    }
+    fn take(&self) -> Option<CapturedConversation> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .take()
+    }
+}
+impl AppClient {
+    pub(crate) fn register_conversation_capture(&mut self, observer: Option<Weak<SendCapture>>) {
+        self.conversation_captures
+            .retain(|capture| capture.strong_count() > 0);
+        if let Some(observer) = observer
+            && let Some(capture) = observer.upgrade()
+        {
+            // A normal worker read supersedes earlier send checkpoints.
+            capture.take();
+            if !self
+                .conversation_captures
+                .iter()
+                .any(|old| old.ptr_eq(&observer))
+            {
+                self.conversation_captures.push(observer);
+            }
+        }
+    }
+    pub(crate) fn publish_conversation_captures(&mut self, group: &GroupId) {
+        self.conversation_captures
+            .retain(|capture| capture.strong_count() > 0);
+        let observers: Vec<_> = self
+            .conversation_captures
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|observer| observer.group == *group)
+            .collect();
+        for observer in observers {
+            let (query, generation) = {
+                let state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+                (state.query.clone(), state.generation)
+            };
+            // Use the same live engine/account read boundary as a normal window
+            // capture. Never combine frozen permissions with newer account rows.
+            // Best effort: the normal read path still owns capture errors.
+            if let Ok(captured) =
+                capture_conversation(self, &observer.group, query, &observer.epoch)
+            {
+                let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.generation == generation {
+                    state.pending = Some(captured);
+                    observer.changed.send_replace(());
+                }
+            }
+        }
+    }
 }
 /// Only called with the live client. Frozen startup/recovery snapshots return
 /// NotReady at their dispatch sites instead of entering this path.
@@ -381,28 +475,52 @@ struct Reader {
     group: GroupId,
     store_epoch: Vec<u8>,
     worker: WorkerConnection,
+    send_capture: Arc<SendCapture>,
 }
 impl Reader {
     async fn capture_live(
         &mut self,
         query: &ConversationWindowQuery,
-    ) -> Result<CapturedConversation, ConversationWindowError> {
+        allow_checkpoint: bool,
+    ) -> Result<(CapturedConversation, bool), ConversationWindowError> {
         let worker = match self.worker.borrow().as_ref() {
             Some(Ok(worker)) => worker.clone(),
             Some(Err(error)) if error.terminal() => return Err(error.clone()),
             _ => return Err(ConversationWindowError::NotReady),
         };
+        if worker.is_closed() {
+            return Err(ConversationWindowError::Closed);
+        }
+        self.send_capture.set_query(query);
+        let mut changed = self.send_capture.changed.subscribe();
+        if allow_checkpoint && let Some(captured) = self.send_capture.take() {
+            return Ok((captured, true));
+        }
         let (respond, rx) = oneshot::channel();
-        worker
-            .send(AccountWorkerCommand::CaptureConversation {
-                group_id: self.group.clone(),
-                query: query.clone(),
-                store_epoch: self.store_epoch.clone(),
-                respond,
-            })
-            .await
-            .map_err(|_| ConversationWindowError::Closed)?;
-        rx.await.map_err(|_| ConversationWindowError::Closed)?
+        let capture = async {
+            worker
+                .send(AccountWorkerCommand::CaptureConversation {
+                    group_id: self.group.clone(),
+                    query: query.clone(),
+                    store_epoch: self.store_epoch.clone(),
+                    observer: Some(Arc::downgrade(&self.send_capture)),
+                    respond,
+                })
+                .await
+                .map_err(|_| ConversationWindowError::Closed)?;
+            rx.await.map_err(|_| ConversationWindowError::Closed)?
+        };
+        tokio::pin!(capture);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut capture => return result.map(|captured| (captured, false)),
+                _ = changed.changed(), if allow_checkpoint => {
+                    if worker.is_closed() { return Err(ConversationWindowError::Closed); }
+                    if let Some(captured) = self.send_capture.take() { return Ok((captured, true)); }
+                }
+            }
+        }
     }
 
     async fn read(
@@ -410,19 +528,28 @@ impl Reader {
         query: &ConversationWindowQuery,
         revision: ConversationWindowRevision,
         allow_local: bool,
-    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
+        allow_checkpoint: bool,
+    ) -> Result<(ConversationWindowSnapshot, bool), ConversationWindowError> {
         if !allow_local {
-            // Established windows await their queued capture. Abandoning it at
-            // the display deadline would add a full retry interval after an
-            // ordinary send. The actor still cancels on close/reset/shutdown.
-            let captured = self.capture_live(query).await?;
-            return self.present(captured, revision).await;
+            // Established windows require a coherent live capture, including
+            // checkpoints supplied by an in-flight send. The actor still
+            // cancels on close/reset/shutdown; never downgrade to a local read.
+            let (captured, checkpoint) = self.capture_live(query, allow_checkpoint).await?;
+            return self
+                .present(captured, revision)
+                .await
+                .map(|snapshot| (snapshot, checkpoint));
         }
-        match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query)).await {
-            Ok(Ok(captured)) => self.present(captured, revision).await,
-            Ok(Err(ConversationWindowError::NotReady)) | Err(_) => {
-                self.read_local(query, revision).await
-            }
+        match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query, allow_checkpoint)).await
+        {
+            Ok(Ok((captured, checkpoint))) => self
+                .present(captured, revision)
+                .await
+                .map(|snapshot| (snapshot, checkpoint)),
+            Ok(Err(ConversationWindowError::NotReady)) | Err(_) => self
+                .read_local(query, revision)
+                .await
+                .map(|snapshot| (snapshot, false)),
             Ok(Err(error)) => Err(error),
         }
     }
@@ -615,6 +742,11 @@ impl MarmotAppRuntime {
             .await?;
             let (ready, worker) = watch::channel(None);
             let reader = Reader {
+                send_capture: Arc::new(SendCapture::new(
+                    group.clone(),
+                    epoch.clone(),
+                    position.clone(),
+                )),
                 app: self.accounts.app.clone(),
                 label: account.label.clone(),
                 account_id: account.account_id_hex,
@@ -809,6 +941,8 @@ async fn run(
     updates: watch::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 ) {
     let mut worker_updates = reader.worker.clone();
+    let mut send_updates = reader.send_capture.changed.subscribe();
+    reader.send_capture.set_query(&position);
     let mut worker_updates_open = true;
     let mut dirty = true; // enrich the initial local snapshot without delaying it
     let mut authority_pending = false;
@@ -823,6 +957,7 @@ async fn run(
             _ = wait_for_account_reset(&mut resets, &reader.label) => return,
             _ = updates.closed() => return,
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
+            _ = send_updates.changed() => { dirty = true; continue; },
             result = worker_updates.changed(), if worker_updates_open => {
                 if result.is_err() { worker_updates_open = false; }
                 else { dirty = true; }
@@ -851,10 +986,10 @@ async fn run(
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return,
             _ = wait_for_account_reset(&mut resets, &reset_label) => return,
             _ = updates.closed() => return,
-            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none()) => result,
+            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), command.is_none()) => result,
         };
         match result {
-            Ok(mut replacement) => {
+            Ok((mut replacement, checkpoint)) => {
                 let changed = command.is_some() || !replacement.same_content(&current);
                 if changed {
                     replacement.revision.sequence = current
@@ -864,6 +999,7 @@ async fn run(
                         .expect("window sequence exhausted");
                 }
                 position = retain_anchor(next, &replacement);
+                reader.send_capture.set_query(&position);
                 last_good_position = position.clone();
                 current = replacement;
                 if changed || failed {
@@ -873,7 +1009,12 @@ async fn run(
                     let _ = command.reply.send(Ok(current.clone()));
                 }
                 authority_pending = current.presentation.header.epoch.is_none();
-                dirty = false; // local invalidations stay prompt during quiet authority retries
+                // A checkpoint predates sources.drain(), so it may not include
+                // invalidations discarded there. Follow it with a fresh capture
+                // even when no further event or send completion arrives. This
+                // conservative extra read is self-limiting: sends publish only
+                // finitely many checkpoints, each before a transport wait.
+                dirty = checkpoint;
                 failed = false;
                 retry_delayed = false;
             }

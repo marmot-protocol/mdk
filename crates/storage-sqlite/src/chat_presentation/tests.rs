@@ -790,3 +790,68 @@ fn dirty_fallback_remains_fallback_in_both_presentation_reads() {
         PresentationResolution::Fallback
     );
 }
+
+#[test]
+fn selected_avatar_and_demand_commit_atomically_even_for_pending_invitations() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE chat_list_rows SET pending_confirmation = 1 WHERE group_id_hex = '11'",
+            [],
+        )
+        .unwrap();
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let mut selected = value("bb", "Invite", 1);
+    selected.presentation.avatar = SelectedAvatar::RemoteImage {
+        url: "https://example.com/a.png".into(),
+        cache_key: "a".into(),
+    };
+    store.store_chat_presentation(&input, &selected).unwrap();
+    let reference = store.chat_avatar_reference("11").unwrap().unwrap();
+    let job = store.claim_avatar_acquisition(0).unwrap().unwrap();
+    assert_eq!(job.reference, reference);
+    store.lock().unwrap().execute_batch("CREATE TRIGGER reject_avatar_demand BEFORE INSERT ON avatar_acquisition BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    let mut changed = selected.clone();
+    changed.presentation.avatar = SelectedAvatar::RemoteImage {
+        url: "https://example.com/b.png".into(),
+        cache_key: "b".into(),
+    };
+    assert!(store.store_chat_presentation(&input, &changed).is_err());
+    assert_eq!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(Box::new(selected))
+    );
+    assert_eq!(store.chat_avatar_reference("11").unwrap(), Some(reference));
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_avatar_demand;")
+        .unwrap();
+    store.store_chat_presentation(&input, &changed).unwrap();
+    let image = crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
+    assert_eq!(
+        store
+            .complete_avatar_acquisition(&job, &image, None)
+            .unwrap(),
+        crate::AvatarPublishResult::Superseded
+    );
+}
+
+#[test]
+fn avatar_ownership_does_not_limit_opaque_group_id_length() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group = "ab".repeat(300);
+    seed(&store, &group);
+    let input = store.chat_presentation_input(&group).unwrap().unwrap();
+    let mut selected = value("bb", "Group", 1);
+    selected.presentation.avatar = SelectedAvatar::RemoteImage {
+        url: "https://example.com/avatar.png".into(),
+        cache_key: "source".into(),
+    };
+    store
+        .store_chat_presentation(&input, &selected)
+        .expect("avatar ownership must not impose a new MLS group ID bound");
+}

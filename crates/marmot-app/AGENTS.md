@@ -13,7 +13,8 @@ App runtime bridge for the first real Marmot app surfaces.
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
-  tracker upload worker), and `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers). Keep `mod.rs`
+  tracker upload worker), `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers), and `avatar.rs`
+  (local identity-avatar demand and bounded maintenance). Keep `mod.rs`
   re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
@@ -41,7 +42,7 @@ App runtime bridge for the first real Marmot app surfaces.
   by kind through `AppMessageQuery::kinds`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
-  (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).
+  (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
 - Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
   typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
   `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment

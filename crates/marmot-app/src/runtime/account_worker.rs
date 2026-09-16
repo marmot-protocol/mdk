@@ -159,6 +159,7 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         query: storage_sqlite::ConversationWindowQuery,
         store_epoch: Vec<u8>,
+        observer: Option<std::sync::Weak<super::SendCapture>>,
         respond: oneshot::Sender<Result<CapturedConversation, ConversationWindowError>>,
     },
     GroupMlsState {
@@ -1071,6 +1072,10 @@ async fn run_app_runtime_account_worker(
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut presentation_due = true;
+    let mut avatar_due = true;
+    let mut avatar_resumed = false;
+    let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
+
     // Prepare exact Welcome attempts under the serialized owner, then let only
     // relay I/O run independently. The worker stays available for inbound
     // delivery, maintenance, media completions, timers, and commands while a
@@ -1133,6 +1138,7 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        avatar_due = true;
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -1627,11 +1633,23 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
+            _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
+                avatar_due = false;
+                let identities = avatar_identities.run(&client, &account_id_hex);
+                let acquisition = schedule_avatar_acquisition(&client, &media_http, &mut avatar_resumed);
+                avatar_due |= identities.as_ref().is_ok_and(|more| *more)
+                    || acquisition.as_ref().is_ok_and(|more| *more);
+                if identities.is_err() || acquisition.is_err() {
+                    tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
+                        "avatar maintenance failed; retrying on the next tick");
+                }
+            }
             result = presentation_wakeups.changed() => {
-                if result.is_ok() { presentation_due = true; }
+                if result.is_ok() { presentation_due = true; avatar_due = true; }
             }
             _ = tokio::task::yield_now(), if presentation_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
+                avatar_due = true;
                 presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
                     Ok(more) => more,
                     Err(_) => {
@@ -1643,6 +1661,7 @@ async fn run_app_runtime_account_worker(
             }
             _ = maintenance_tick.tick() => {
                 presentation_due = true;
+                avatar_due = true;
                 // Periodic maintenance is never urgent, and its longest legs
                 // run well past the whole shutdown budget: the key-package
                 // catch-up below is capped at 15s, and an armed epoch-gap
@@ -2389,9 +2408,11 @@ async fn handle_startup_hydration_command(
             group_id,
             query,
             store_epoch,
+            observer,
             respond,
         } => {
             if !respond.is_closed() {
+                client.register_conversation_capture(observer);
                 let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
             }
         }
@@ -2477,6 +2498,10 @@ struct MediaHttpDone {
 }
 
 enum MediaHttpCompletion {
+    Avatar {
+        job: storage_sqlite::AvatarAcquisition,
+        result: Result<storage_sqlite::AvatarImage, AppError>,
+    },
     Upload {
         finish: EncryptedMediaUploadFinish,
         result: Result<MediaUploadResult, AppError>,
@@ -2498,6 +2523,57 @@ enum MediaHttpCompletion {
         respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
         started_at: Instant,
     },
+}
+
+fn schedule_avatar_acquisition(
+    client: &AppClient,
+    media_http: &MediaHttpContext,
+    resumed: &mut bool,
+) -> Result<bool, AppError> {
+    let storage = client.app.account_storage(&client.state.label)?;
+    let transport = client.blossom_http_transport.clone();
+    dispatch_avatar_acquisition(&storage, media_http, resumed, move |descriptor| {
+        let transport = transport.clone();
+        async move { crate::media::avatar::fetch(&descriptor, &transport).await }
+    })
+}
+
+fn dispatch_avatar_acquisition<F, Fut>(
+    storage: &storage_sqlite::SqliteAccountStorage,
+    media_http: &MediaHttpContext,
+    resumed: &mut bool,
+    fetch: F,
+) -> Result<bool, AppError>
+where
+    F: Fn(storage_sqlite::SelectedAvatar) -> Fut,
+    Fut: std::future::Future<Output = Result<storage_sqlite::AvatarImage, AppError>>
+        + Send
+        + 'static,
+{
+    if !*resumed {
+        storage.resume_avatar_acquisition()?;
+        *resumed = true;
+    }
+    let more_bootstrap = storage.bootstrap_avatar_acquisition()?;
+    // Command demand gets first admission; this shares the existing four permits
+    // and completion channel rather than starting a second HTTP pool.
+    for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
+        // Keep a foreground slot free even across repeated dispatch passes.
+        if media_http.permits.available_permits() <= 1 {
+            break;
+        }
+        let Ok(permit) = media_http.permits.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some(job) = storage.claim_avatar_acquisition(crate::unix_now_seconds())? else {
+            break;
+        };
+        let descriptor = job.descriptor.clone();
+        spawn_media_http(media_http, permit, fetch(descriptor), move |result| {
+            MediaHttpCompletion::Avatar { job, result }
+        });
+    }
+    Ok(more_bootstrap)
 }
 
 fn spawn_media_http<T>(
@@ -2596,6 +2672,33 @@ async fn complete_media_http(
         cancellation.discard();
     }
     match completion {
+        MediaHttpCompletion::Avatar { job, result } => {
+            if let Ok(storage) = client.app.account_storage(&client.state.label) {
+                let now = crate::unix_now_seconds();
+                let completed = match result {
+                    Ok(image) => {
+                        let refresh = matches!(
+                            job.descriptor,
+                            storage_sqlite::SelectedAvatar::RemoteImage { .. }
+                        )
+                        .then(|| now.saturating_add(24 * 60 * 60));
+                        storage
+                            .complete_avatar_acquisition(&job, &image, refresh)
+                            .map(|_| ())
+                    }
+                    Err(error) => storage
+                        .fail_avatar_acquisition(&job, now, crate::media::avatar::retryable(&error))
+                        .map(|_| ()),
+                };
+                if completed.is_err() {
+                    // Publication failure leaves the old bytes untouched. Avoid
+                    // stranding a fetching row until process reconstruction.
+                    let _ = storage.fail_avatar_acquisition(&job, now, true);
+                    tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
+                        "avatar completion could not be committed");
+                }
+            }
+        }
         MediaHttpCompletion::Upload {
             finish,
             result,
@@ -3285,9 +3388,11 @@ fn account_worker_command_future<'a>(
             group_id,
             query,
             store_epoch,
+            observer,
             respond,
         } => Box::pin(async move {
             if !respond.is_closed() {
+                client.register_conversation_capture(observer);
                 let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
             }
             true
@@ -5399,6 +5504,7 @@ mod tests {
                     group_id: GroupId::new(vec![1; 16]),
                     query: Default::default(),
                     store_epoch: vec![],
+                    observer: None,
                     respond,
                 })
                 .unwrap();
@@ -5859,6 +5965,126 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn avatar_dispatch_shares_media_capacity_and_holds_it_through_publication() {
+        let store = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+        for n in 0..5 {
+            store
+                .request_avatar_acquisition(
+                    &format!("owner-{n}"),
+                    &storage_sqlite::SelectedAvatar::RemoteImage {
+                        url: "https://example.com/avatar".into(),
+                        cache_key: format!("source-{n}"),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let (media_http, mut completions) = media_http_context(4);
+        let foreground = reserve_media_http(&media_http);
+        let mut resumed = false;
+        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, |_| async {
+            Ok(storage_sqlite::AvatarImage::new(
+                vec![1; 8],
+                storage_sqlite::AvatarImageFormat::Png,
+                1,
+                1,
+            )
+            .unwrap())
+        })
+        .unwrap();
+        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, |_| async {
+            panic!("another background pass must preserve the foreground slot")
+        })
+        .unwrap();
+        assert_eq!(media_http.permits.available_permits(), 1);
+        let mut reserved = Vec::new();
+        for _ in 0..2 {
+            let done = timeout(Duration::from_secs(2), completions.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(media_http.permits.available_permits(), 1);
+            let MediaHttpCompletion::Avatar { job, result } = &done.completion else {
+                panic!("avatar completion");
+            };
+            store
+                .complete_avatar_acquisition(job, result.as_ref().unwrap(), None)
+                .unwrap();
+            drop(done);
+            // Reserve the freed slot to keep the assertion identical each pass.
+            reserved.push(reserve_media_http(&media_http));
+        }
+        drop(foreground);
+        assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 16);
+        assert!(
+            store
+                .claim_avatar_acquisition(crate::unix_now_seconds())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn avatar_shutdown_cancels_io_and_leaves_resumable_intent() {
+        let store = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+        let reference = store
+            .request_avatar_acquisition(
+                "owner",
+                &storage_sqlite::SelectedAvatar::RemoteImage {
+                    url: "https://example.com/avatar".into(),
+                    cache_key: "source".into(),
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let (media_http, mut completions) = media_http_context(2);
+        let permits = media_http.permits.clone();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        struct CancelProbe(mpsc::UnboundedSender<()>);
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        dispatch_avatar_acquisition(&store, &media_http, &mut false, |_| {
+            let started = started_tx.clone();
+            let dropped = dropped_tx.clone();
+            async move {
+                let _guard = CancelProbe(dropped);
+                started.send(()).unwrap();
+                std::future::pending().await
+            }
+        })
+        .unwrap();
+        timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(media_http);
+        timeout(Duration::from_secs(2), dropped_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permits.available_permits(), 2);
+        assert!(completions.recv().await.is_none());
+        assert_eq!(
+            store.avatar_status(&reference, 0).unwrap().availability,
+            storage_sqlite::AvatarAvailability::Missing
+        );
+        store.resume_avatar_acquisition().unwrap();
+        assert_eq!(
+            store
+                .claim_avatar_acquisition(0)
+                .unwrap()
+                .unwrap()
+                .reference,
+            reference
+        );
     }
 
     #[test]

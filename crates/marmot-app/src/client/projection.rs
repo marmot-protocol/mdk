@@ -1256,14 +1256,17 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
 
 impl super::AppClient {
     pub(crate) fn backfill_content_reports(&mut self) -> Result<(), crate::AppError> {
-        let updates = self
-            .app
-            .account_storage(&self.state.label)?
-            .backfill_content_reports(100)?;
-        for update in updates {
-            self.pending_projection_updates
-                .push(self.app.app_projection_update(&self.state.label, update)?);
-        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        // A failed chat-list conversion must roll back the backfill cursor and
+        // all projections. Queue the complete batch only after it commits.
+        let updates = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .backfill_content_reports(100)?
+                .into_iter()
+                .map(|update| self.app.app_projection_update(&self.state.label, update))
+                .collect::<Result<Vec<_>, crate::AppError>>()
+        })?;
+        self.pending_projection_updates.extend(updates);
         Ok(())
     }
 }

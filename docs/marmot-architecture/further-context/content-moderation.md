@@ -54,14 +54,19 @@ cannot gain admin deletion privileges.
 
 ## Persistence and retention
 
-Migration 0078 adds source-authority metadata, one indexed row per report event,
+Migration 0079 adds source-authority metadata, one indexed row per report event,
 and a durable cursor over the existing event prefix. Account history and legacy
 kind-5 deletion verdicts remain untouched. Historical admin controls begin with
 unresolved authority and are re-evaluated against their authenticated source state.
 
-Maintenance advances at most 100 old events per batch. Normal receive updates
+Maintenance advances at most 100 old events per batch. The app converts every
+update inside the account transaction before committing the cursor, then queues
+the complete batch. Conversion failure rolls back both progress and projections.
+Normal receive updates
 only affected targets through modifier edges. Report lookup is indexed by group,
-message, and report ID; pagination is exclusive and capped at 100. Dismissal labels
+message, and report ID; pagination is exclusive and capped at 100. Timeline report
+indicators use one batched query per SQLite parameter chunk, matching group, target,
+and author without scanning unrelated reports. Dismissal labels
 are read from the existing indexed event/edge store with source authorization,
 without a separate resolution table. Multiple labels remain independent.
 

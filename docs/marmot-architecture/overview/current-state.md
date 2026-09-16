@@ -25,7 +25,8 @@ Migration 76 repairs existing projections. Raw edit events remain available, but
 See the [native edit contract](../../../crates/marmot-uniffi/CONVERSATION-WINDOW.md#accepted-edits-c6a).
 
 C7-A adds protected avatar-byte storage and bounded local reads in `storage-sqlite`, with source-generation
-fencing and separate narrow LRU bookkeeping. Download maintenance and native integration remain C7-B/C;
+fencing and separate narrow LRU bookkeeping. C7-B adds durable download/retry intent, selected-source maintenance,
+validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C native integration remains pending;
 existing clients should keep their image-loading paths until that handoff.
 See [avatar cache storage](../further-context/avatar-cache-storage.md).
 

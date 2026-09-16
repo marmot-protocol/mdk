@@ -47,8 +47,9 @@ impl Fixture {
                 tokio::select! {
                     _ = &mut stop => return,
                     command = rx.recv() => match command {
-                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, respond }) => {
+                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, observer, respond }) => {
                             n.fetch_add(1, Ordering::SeqCst);
+                            client.register_conversation_capture(observer);
                             let mode = m.load(Ordering::SeqCst);
                             if mode == 5 {
                                 reached.notify_one();
@@ -869,6 +870,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
                 group_id: f.group.clone(),
                 query: Default::default(),
                 store_epoch: f.store.chat_presentation_version().unwrap().store_epoch,
+                observer: None,
                 respond,
             })
             .unwrap();
@@ -1047,6 +1049,181 @@ async fn cold_capture_does_not_force_group_hydration() {
     );
     drop(client);
     f.close().await;
+}
+
+#[tokio::test]
+async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
+    let f = Fixture::new(20).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let observer = Arc::new(SendCapture::new(
+        f.group.clone(),
+        f.store.chat_presentation_version().unwrap().store_epoch,
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    assert_eq!(client.conversation_captures.len(), 1);
+    client.publish_conversation_captures(&f.group);
+    let captured = observer.take().unwrap();
+    assert!(captured.authority.is_some());
+    assert_eq!(captured.account.page.page().messages.len(), 5);
+
+    let other_group = client.create_group("unrelated window", &[]).await.unwrap();
+    f.store
+        .refresh_chat_list_row(&f.account, &hex::encode(other_group.as_slice()), &|_, _| {
+            false
+        })
+        .unwrap();
+    let other = Arc::new(SendCapture::new(
+        other_group.clone(),
+        f.store.chat_presentation_version().unwrap().store_epoch,
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&other)));
+    client.publish_conversation_captures(&f.group);
+    assert!(
+        other.take().is_none(),
+        "sending must not recapture unrelated groups"
+    );
+    client.publish_conversation_captures(&other_group);
+    assert!(
+        other.take().is_some(),
+        "the unrelated window is a valid registered capture"
+    );
+    drop(other);
+
+    // A viewport change invalidates the previous capture, including a change
+    // that fails to resolve. It must not fall back to the previous viewport.
+    client.publish_conversation_captures(&f.group);
+    let mut missing = query.clone();
+    missing.opening.target = ConversationOpenTarget::Message("ff".repeat(32));
+    observer.set_query(&missing);
+    assert!(observer.take().is_none());
+    client.publish_conversation_captures(&f.group);
+    assert!(observer.take().is_none());
+    observer.set_query(&query);
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    client.publish_conversation_captures(&f.group);
+    let captured = observer.take().unwrap();
+    assert_eq!(
+        captured.account.presentation_input.self_membership,
+        crate::SelfMembership::Removed
+    );
+    assert!(captured.authority.is_some());
+    client.publish_conversation_captures(&f.group);
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    assert!(
+        observer.take().is_none(),
+        "normal reads supersede earlier checkpoints"
+    );
+    let weak = Arc::downgrade(&observer);
+    drop(observer);
+    client.publish_conversation_captures(&f.group);
+    assert!(weak.upgrade().is_none());
+    assert!(client.conversation_captures.is_empty());
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh_read() {
+    let f = Fixture::new(5).await;
+    let initial = f.open(ConversationOpenTarget::Latest, 5).await.snapshot;
+    let worker = f.runtime.accounts.workers.lock().await[&f.account]
+        .commands
+        .clone();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let (respond, response) = oneshot::channel();
+    worker
+        .send(AccountWorkerCommand::CaptureConversation {
+            group_id: f.group.clone(),
+            query: query.clone(),
+            store_epoch: epoch.clone(),
+            observer: None,
+            respond,
+        })
+        .await
+        .unwrap();
+    let checkpoint = response.await.unwrap().unwrap();
+    let capture = Arc::new(SendCapture::new(
+        f.group.clone(),
+        epoch.clone(),
+        query.clone(),
+    ));
+    capture.state.lock().unwrap().pending = Some(checkpoint);
+    let reader = Reader {
+        app: f.app.clone(),
+        label: "alice".into(),
+        account_id: f.account.clone(),
+        group: f.group.clone(),
+        store_epoch: epoch,
+        worker: watch::channel(Some(Ok(worker))).1,
+        send_capture: capture,
+    };
+    let sources = Sources {
+        events: f.runtime.events.subscribe(),
+        profiles: f.app.presentation_signals.profile_updates.subscribe(),
+        presentation: f.app.presentation_signals.updates.subscribe(),
+        drafts: f.app.presentation_signals.drafts.subscribe(),
+        stopping: f.runtime.shared.lifecycle().subscribe_shutdown(),
+    };
+    let resets = f.app.presentation_signals.account_resets.subscribe();
+    // Deliberately enqueue this between the checkpoint and run's first drain.
+    // No subsequent invalidation or send completion will rescue a stale read.
+    f.draft("written after checkpoint");
+    let (commands, command_rx) = mpsc::channel(8);
+    let (updates, mut changes) = watch::channel(Ok(initial.clone()));
+    let actor = tokio::spawn(run(
+        reader, query, initial, sources, resets, command_rx, updates,
+    ));
+    let updated = timeout(Duration::from_secs(3), async {
+        loop {
+            changes.changed().await.unwrap();
+            let snapshot = changes.borrow_and_update().clone().unwrap();
+            if snapshot
+                .draft
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.content == "written after checkpoint")
+            {
+                return snapshot;
+            }
+        }
+    })
+    .await;
+    drop(commands);
+    drop(changes);
+    actor.await.unwrap();
+    f.close().await;
+    assert!(
+        updated.is_ok(),
+        "a checkpoint must not swallow a later draft invalidation"
+    );
 }
 
 #[tokio::test]

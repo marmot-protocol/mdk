@@ -304,6 +304,7 @@ pub(crate) struct GroupRouteRefresh {
 }
 
 pub struct AppClient {
+    pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
@@ -3735,6 +3736,7 @@ impl AppClient {
         if should_project_locally {
             let update = self.record_send_intent_projection(group_id, &sender, &event)?;
             on_local_projection(update);
+            self.publish_conversation_captures(group_id);
         }
 
         let send_result = match self.sync_runtime_groups().await {
@@ -3880,6 +3882,11 @@ impl AppClient {
             .await;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
+            // A checkpoint is needed only when another transport wait follows;
+            // otherwise the worker can service the already-invalidated window.
+            if should_project_locally {
+                self.publish_conversation_captures(group_id);
+            }
             self.publish_notification_trigger_best_effort(
                 group_id,
                 notifications::NotificationTrigger::NewMessage,

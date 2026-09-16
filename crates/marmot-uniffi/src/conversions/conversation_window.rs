@@ -358,6 +358,18 @@ pub struct ConversationWindowSnapshotFfi {
 }
 // Borrow raw rows so conversion never clones the full reactor/tag collections.
 fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
+    presented_timeline_with_tokens(
+        row,
+        trusted,
+        super::common::markdown_content_tokens(row.kind, &row.plaintext),
+    )
+}
+
+fn presented_timeline_with_tokens(
+    row: &app::TimelineMessageRecord,
+    trusted: bool,
+    content_tokens: crate::markdown::MarkdownDocumentFfi,
+) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
         has_reports: row.has_reports,
         edit: row.edit.clone().map(Into::into),
@@ -370,7 +382,7 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
         group_id_hex: row.group_id_hex.clone(),
         sender: row.sender.clone(),
         plaintext: row.plaintext.clone(),
-        content_tokens: super::common::markdown_content_tokens(row.kind, &row.plaintext),
+        content_tokens,
         kind: row.kind,
         tags: vec![],
         timeline_at: row.timeline_at,
@@ -412,6 +424,15 @@ impl From<&app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
                 references: references.clone().into(),
             })
             .collect();
+        Self::with_messages(v, messages)
+    }
+}
+impl ConversationWindowSnapshotFfi {
+    fn with_messages(
+        v: &app::ConversationWindowSnapshot,
+        messages: Vec<ConversationMessageFfi>,
+    ) -> Self {
+        let page = v.page.page();
         Self {
             revision: v.revision.clone().into(),
             header: v.presentation.header.clone().into(),
@@ -432,6 +453,186 @@ impl From<&app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
         }
     }
 }
+/// Subscription-local cache. Command replies and stream echoes share it; older
+/// replies never replace the cache retained for a newer window.
+#[derive(Default)]
+pub(crate) struct ConversationConversionCache {
+    sequence: Option<u64>,
+    rows: std::collections::HashMap<String, CachedConversationRow>,
+    closed: bool,
+    #[cfg(test)]
+    conversions: usize,
+    #[cfg(test)]
+    parses: usize,
+}
+struct CachedConversationRow {
+    source: app::TimelineMessageRecord,
+    converted: TimelineMessageRecordFfi,
+}
+impl ConversationConversionCache {
+    pub(crate) fn close(&mut self) {
+        self.rows.clear();
+        self.closed = true;
+    }
+    pub(crate) fn convert(
+        &mut self,
+        v: &app::ConversationWindowSnapshot,
+    ) -> ConversationWindowSnapshotFfi {
+        if self.closed
+            || self
+                .sequence
+                .is_some_and(|sequence| sequence > v.revision.sequence)
+        {
+            return v.into();
+        }
+        let messages = v
+            .page
+            .page()
+            .messages
+            .iter()
+            .zip(&v.presentation.messages)
+            .enumerate()
+            .map(|(i, (row, references))| ConversationMessageFfi {
+                timeline: self.row(row, v.page.authenticated_system_content(i).is_some()),
+                references: references.clone().into(),
+            })
+            .collect();
+        let retained: std::collections::HashSet<_> = v
+            .page
+            .page()
+            .messages
+            .iter()
+            .map(|row| &row.message_id_hex)
+            .collect();
+        self.rows.retain(|id, _| retained.contains(id));
+        self.sequence = Some(v.revision.sequence);
+        ConversationWindowSnapshotFfi::with_messages(v, messages)
+    }
+    fn row(&mut self, row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
+        let cached = self.rows.get(&row.message_id_hex);
+        if let Some(cached) = cached
+            .filter(|cached| visible_row_key(&cached.source, true) == visible_row_key(row, trusted))
+        {
+            return cached.converted.clone();
+        }
+        let source = app::TimelineMessageRecord {
+            message_id_hex: row.message_id_hex.clone(),
+            source_message_id_hex: row.source_message_id_hex.clone(),
+            source_epoch: row.source_epoch,
+            retention_seconds: row.retention_seconds,
+            retention_expires_at: row.retention_expires_at,
+            direction: row.direction.clone(),
+            group_id_hex: row.group_id_hex.clone(),
+            sender: row.sender.clone(),
+            plaintext: row.plaintext.clone(),
+            kind: row.kind,
+            tags: vec![],
+            timeline_at: row.timeline_at,
+            received_at: row.received_at,
+            reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
+            reply_preview: row.reply_preview.clone(),
+            media: row.media.clone(),
+            agent_text_stream: row.agent_text_stream.clone(),
+            group_system: if trusted {
+                row.group_system.clone()
+            } else {
+                None
+            },
+            reactions: Default::default(),
+            edit: row.edit.clone(),
+            has_reports: row.has_reports,
+            deleted: row.deleted,
+            deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
+            invalidation_status: row.invalidation_status.clone(),
+        };
+        let tokens = match cached.filter(|cached| {
+            cached.source.kind == row.kind && cached.source.plaintext == row.plaintext
+        }) {
+            Some(cached) => cached.converted.content_tokens.clone(),
+            None => {
+                #[cfg(test)]
+                {
+                    self.parses += 1;
+                }
+                super::common::markdown_content_tokens(row.kind, &row.plaintext)
+            }
+        };
+        #[cfg(test)]
+        {
+            self.conversions += 1;
+        }
+        let converted = presented_timeline_with_tokens(&source, trusted, tokens);
+        self.rows.insert(
+            row.message_id_hex.clone(),
+            CachedConversationRow {
+                source,
+                converted: converted.clone(),
+            },
+        );
+        converted
+    }
+}
+
+// Borrow the visible fields so cache hits do not allocate a second source row.
+// Exhaustive destructuring makes additions to the source record a compile error
+// until their effect on conversion reuse is explicitly considered.
+fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl PartialEq + '_ {
+    let app::TimelineMessageRecord {
+        message_id_hex,
+        source_message_id_hex,
+        source_epoch,
+        retention_seconds,
+        retention_expires_at,
+        direction,
+        group_id_hex,
+        sender,
+        plaintext,
+        kind,
+        tags: _,
+        timeline_at,
+        received_at,
+        reply_to_message_id_hex,
+        reply_preview,
+        media,
+        agent_text_stream,
+        group_system,
+        reactions: _,
+        edit,
+        has_reports,
+        deleted,
+        deleted_by_message_id_hex,
+        invalidation_status,
+    } = row;
+    (
+        (
+            message_id_hex,
+            source_message_id_hex,
+            source_epoch,
+            retention_seconds,
+            retention_expires_at,
+            direction,
+            group_id_hex,
+            sender,
+            plaintext,
+            kind,
+        ),
+        (
+            timeline_at,
+            received_at,
+            reply_to_message_id_hex,
+            reply_preview,
+            media,
+            agent_text_stream,
+            edit,
+            has_reports,
+            deleted,
+            deleted_by_message_id_hex,
+            invalidation_status,
+        ),
+        if trusted { group_system.as_ref() } else { None },
+    )
+}
+
 impl std::fmt::Debug for ConversationCapabilitiesFfi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversationCapabilitiesFfi")
@@ -628,3 +829,7 @@ mod edit_contract_tests {
         assert_eq!(legacy.edit.unwrap().edit_count, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "conversation_window/tests.rs"]
+mod conversion_cache_tests;

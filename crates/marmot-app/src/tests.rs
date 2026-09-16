@@ -1,6 +1,7 @@
 mod draft_lifecycle;
 mod key_package_inventory;
 mod message_journeys;
+mod report_backfill;
 mod user_blocks;
 
 use super::*;
@@ -509,6 +510,7 @@ pub(crate) struct ScriptedPushRelayClient {
     block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     block_account_group_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
+    reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     batch_calls: std::sync::atomic::AtomicUsize,
@@ -754,6 +756,11 @@ impl ScriptedPushRelayClient {
 
     fn zero_ack_next_publish(&self) {
         self.zero_ack_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn reject_next_publish(&self) {
+        self.reject_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1025,6 +1032,26 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
             self.publish_release.notified().await;
+        }
+        if self
+            .reject_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(NostrPublishOutcome {
+                failed: endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        endpoint,
+                        reason: "injected terminal rejection".into(),
+                        kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                        rejection_category: Some(
+                            cgka_traits::TransportEndpointRejectionCategory::Invalid,
+                        ),
+                    })
+                    .collect(),
+                ..Default::default()
+            });
         }
         if self
             .zero_ack_next_publish

@@ -13,7 +13,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Encrypted group reports (1984), shared dismissal labels (1985), and admin removal (4891),
   with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
-  and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 78 adds the indexed
+  and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 79 adds the indexed
   projections; regenerate bindings and headers with the matching library.
 
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
