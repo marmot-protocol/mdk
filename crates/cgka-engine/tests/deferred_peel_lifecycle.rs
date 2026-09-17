@@ -2222,9 +2222,7 @@ async fn unrecoverable_group_does_not_charge_the_account_byte_budget() {
     );
     drop(carol);
 
-    let mut halted = storage.get_group(&group_a).unwrap();
-    halted.unrecoverable = true;
-    storage.put_group(&halted).unwrap();
+    halt_group_durably(&storage, &group_a);
 
     let mut restarted =
         restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(2));
@@ -2369,6 +2367,15 @@ fn row_with_id(template: &TransportMessage, tag: &str) -> TransportMessage {
     }
 }
 
+/// Write the durable `unrecoverable` marker a `MissingRetainedAnchor` halt
+/// leaves behind, so reopening restores the halt.
+#[cfg(feature = "test-policy-overrides")]
+fn halt_group_durably(storage: &SqliteAccountStorage, group_id: &GroupId) {
+    let mut halted = storage.get_group(group_id).unwrap();
+    halted.unrecoverable = true;
+    storage.put_group(&halted).unwrap();
+}
+
 /// Undo [`quarantine_group_on_next_open`] so `retry_hydrate_quarantined_group`
 /// can actually recover the group: the quarantine reason is the stored record,
 /// so restoring the record is the repair.
@@ -2501,6 +2508,134 @@ async fn lifting_a_quarantine_restores_its_account_bytes() {
             }
         ),
         "a repaired group's rows must charge the account budget again"
+    );
+}
+
+/// A group can be both halted and quarantined (the halt comes first — a
+/// quarantined group cannot converge, so it cannot newly halt). Lifting the
+/// quarantine then leaves the group blocked by the halt, so the sweep still
+/// refuses it and its bytes must stay out of the account total.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn lifting_a_quarantine_on_a_halted_group_restores_nothing() {
+    let (carol, storage, group_a, _template_a, bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    halt_group_durably(&storage, &group_a);
+    quarantine_group_on_next_open(&storage, &group_a);
+    let mut restarted =
+        restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(3));
+    assert!(bytes_a > 0 && bytes_a <= bytes_b);
+    assert!(
+        !restarted.quarantined_groups().is_empty(),
+        "group A must be quarantined on top of its halt"
+    );
+
+    // Reconstruction runs here, with group A blocked and therefore excluded.
+    let second_b = row_with_id(&template_b, "hqlift-b-2");
+    assert!(matches!(
+        restarted.ingest(second_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        storage.get_message(&second_b.id).unwrap().payload.len(),
+        bytes_b,
+        "every group-B row must cost the same, or the budget arithmetic below is wrong"
+    );
+
+    repair_quarantined_group(&storage, &group_a);
+    assert!(restarted.retry_hydrate_quarantined_group(&group_a).unwrap());
+    assert!(
+        restarted.quarantined_groups().is_empty(),
+        "the quarantine must have lifted"
+    );
+    assert!(
+        storage.get_group(&group_a).unwrap().unrecoverable,
+        "the halt must outlive the quarantine — it is the precondition of this test"
+    );
+
+    let third_b = row_with_id(&template_b, "hqlift-b-3");
+    assert!(
+        matches!(
+            restarted.ingest(third_b).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "lifting a quarantine on a still-halted group must recharge nothing: the sweep \
+         refuses it exactly as before"
+    );
+
+    let overflow_b = row_with_id(&template_b, "hqlift-b-4");
+    assert!(
+        matches!(
+            restarted.ingest(overflow_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "the account budget is still enforced past that point"
+    );
+}
+
+/// The entry side of the same pairing. A halted group is already excluded by
+/// the reconstruction, so quarantining it later must discharge nothing —
+/// otherwise the account is credited bytes it never charged and the budget
+/// silently grows.
+///
+/// The budget is sized so the correct total refuses the last row and an
+/// under-counted one would admit it.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn quarantining_an_already_halted_group_discharges_nothing() {
+    let (carol, storage, group_a, _template_a, bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    halt_group_durably(&storage, &group_a);
+    quarantine_group_on_next_open(&storage, &group_a);
+    assert!(bytes_a > 0 && bytes_a <= bytes_b);
+    let account_byte_limit = bytes_b.saturating_mul(3).saturating_sub(bytes_a);
+    let mut restarted = restart_carol_unhydrated(storage.clone(), account_byte_limit);
+
+    // Cheap pass only: group A's halt is restored, but per-group hydration has
+    // not run, so it is not quarantined yet.
+    restarted.hydrate_stable_groups_from_storage().unwrap();
+    assert!(restarted.quarantined_groups().is_empty());
+
+    // Reconstruction runs here and excludes group A via the halt.
+    let second_b = row_with_id(&template_b, "hqentr-b-2");
+    assert!(matches!(
+        restarted.ingest(second_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        storage.get_message(&second_b.id).unwrap().payload.len(),
+        bytes_b,
+        "every group-B row must cost the same, or the budget arithmetic below is wrong"
+    );
+
+    // Per-group hydration now quarantines the already-halted group.
+    restarted.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        restarted.quarantined_groups(),
+        vec![(
+            group_a,
+            GroupHydrationQuarantineReason::MemberValidationFailed
+        )]
+    );
+
+    let third_b = row_with_id(&template_b, "hqentr-b-3");
+    assert!(
+        matches!(
+            restarted.ingest(third_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "quarantining an already-halted group must discharge nothing: its bytes were \
+         never in the total to begin with"
     );
 }
 

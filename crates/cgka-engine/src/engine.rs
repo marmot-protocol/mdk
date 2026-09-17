@@ -2492,7 +2492,9 @@ impl<S: StorageProvider> Engine<S> {
     /// after it, so this transition is what keeps the two orders equivalent.
     ///
     /// Idempotent: re-recording the reason for an already-quarantined group
-    /// moves nothing.
+    /// moves nothing, and a group that is also halted moves nothing either —
+    /// the halt already kept it out of the total, and lifting the quarantine
+    /// leaves the sweep refusing it just the same.
     fn enter_hydration_quarantine(
         &mut self,
         group_id: &GroupId,
@@ -2540,7 +2542,9 @@ impl<S: StorageProvider> Engine<S> {
         // A quarantined group must not retain an epoch entry: the cheap-pass
         // seed (and any partial transition applied before the failure) would
         // otherwise keep it listed in `live_group_ids` while every accessor
-        // rejects it (mdk#1161).
+        // rejects it (mdk#1161). The quarantine's account adjustment does not
+        // depend on this order: it reads the durable halt marker when the
+        // in-memory one is gone.
         self.epoch_manager.clear_group_state(group_id);
         self.enter_hydration_quarantine(group_id, reason);
         self.events_buf

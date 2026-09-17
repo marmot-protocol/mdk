@@ -400,6 +400,10 @@ pub(crate) struct DeferredPeelAccountState {
     /// account cap by at most one per-group cap per un-sweepable group, since
     /// an un-sweepable group cannot grow past its own per-group cap.
     ///
+    /// Those quarantine moves are keyed on the whole predicate, not on the
+    /// quarantine alone, so a group that is also halted moves no bytes in
+    /// either direction.
+    ///
     /// One approximation remains. `Unrecoverable` transitions are raw record
     /// writes with no such hook, so a group halted mid-session keeps the charge
     /// it already had, and a group halted before the reconstruction that later
@@ -3052,6 +3056,24 @@ impl<S: StorageProvider> Engine<S> {
 
     fn charged_deferred_peel_bytes(&self, group_id: &GroupId) -> usize {
         if !self.deferred_peel_account.counted {
+            return 0;
+        }
+        // A group that is *also* halted contributes nothing either way: the
+        // reconstruction and the per-row add both skipped it for the halt, and
+        // lifting its quarantine leaves the sweep refusing it just the same. So
+        // the amount a quarantine transition moves is keyed on the rest of the
+        // predicate, not on the quarantine alone.
+        //
+        // The durable marker is the fallback because `Engine::ensure_hydrated`
+        // retracts the provisional epoch entry before re-deriving it, so the
+        // in-memory halt is absent for exactly the window in which a failed
+        // hydration lands a quarantine. A storage error here can only move
+        // bytes that the next reconstruction puts back.
+        if self.epoch_manager.is_unrecoverable(group_id)
+            || self
+                .stored_group_record(group_id)
+                .is_ok_and(|group| group.is_some_and(|group| group.unrecoverable))
+        {
             return 0;
         }
         self.deferred_peel
