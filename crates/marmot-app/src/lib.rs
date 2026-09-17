@@ -4835,15 +4835,35 @@ impl MarmotApp {
         let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
         let local_accounts = self.local_accounts_by_id()?;
+        let mut profiles = HashMap::<String, Option<UserProfileMetadata>>::new();
+        let mut missing = account_ids.clone();
+        for cache in caches {
+            profiles.extend(cache.profiles_for_ids(&missing)?);
+            // The first cache row wins even when it contains no profile.
+            missing.retain(|id| !profiles.contains_key(id));
+            if missing.is_empty() {
+                break;
+            }
+        }
+        for record in shared_storage.directory_profiles_for_ids(&account_ids)? {
+            let Some(json) = record.profile_json else {
+                continue;
+            };
+            let candidate: UserProfileMetadata = serde_json::from_str(&json)?;
+            let profile = profiles.entry(record.account_id_hex).or_default();
+            // Match select_newer_directory_entry: account-cache ties win.
+            if profile
+                .as_ref()
+                .is_none_or(|current| candidate.created_at > current.created_at)
+            {
+                *profile = Some(candidate);
+            }
+        }
         let mut names = HashMap::new();
 
         for account_id in account_ids {
-            if let Some(entry) = self.directory_entry_for_account_id_with_handles(
-                &account_id,
-                &caches,
-                &shared_storage,
-                &local_accounts,
-            )? && let Some(name) = display_name_for_profile(entry.profile.as_ref())
+            if let Some(name) =
+                display_name_for_profile(profiles.get(&account_id).and_then(Option::as_ref))
             {
                 names.insert(account_id, name);
                 continue;

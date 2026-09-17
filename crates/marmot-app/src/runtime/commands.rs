@@ -583,8 +583,8 @@ impl AccountManager {
     }
 
     /// Capture the group record, member projection, and MLS state in one
-    /// account-worker command, then enrich member display names without an
-    /// await or worker queue re-entry.
+    /// account-worker command, then enrich member display names on a blocking
+    /// task without worker queue re-entry.
     pub async fn group_conversation_snapshot(
         &self,
         account_ref: &str,
@@ -608,10 +608,11 @@ impl AccountManager {
             .collect::<Vec<_>>();
         // Display names are optional directory enrichment; preserve the
         // authoritative roster if that cache is unavailable.
-        let display_names = self
-            .app
-            .display_names_for_account_ids(&member_ids)
-            .unwrap_or_default();
+        let app = self.app.clone();
+        let display_names =
+            crate::blocking_app_task(move || app.display_names_for_account_ids(&member_ids))
+                .await
+                .unwrap_or_default();
         Ok(AppGroupConversationSnapshot {
             my_account_id_hex: account.account_id_hex,
             group: session.group_record,
