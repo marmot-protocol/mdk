@@ -487,7 +487,8 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
 
     match error {
         EngineError::Storage(error) => storage_error_class(error),
-        EngineError::Peeler(
+        EngineError::MissingWelcomeKeyPackage
+        | EngineError::Peeler(
             PeelerError::DecryptFailed
             | PeelerError::MissingContext { .. }
             | PeelerError::InvalidSignature,
@@ -606,6 +607,18 @@ mod tests {
     use crate::SyncFailureClassification;
     use cgka_traits::error::EngineError;
     use cgka_traits::types::{EpochId, GroupId};
+
+    #[test]
+    fn missing_welcome_key_package() {
+        let error = AppError::Account(AccountError::Engine(EngineError::MissingWelcomeKeyPackage));
+        assert_eq!(error.privacy_safe_kind(), "missing_welcome_key_package");
+        assert_eq!(error.sync_error_class(), crate::SyncErrorClass::Crypto);
+        assert_eq!(
+            EngineError::MissingWelcomeKeyPackage.to_string(),
+            "missing local key package for invitation; publish a new key package and ask the sender to invite you again"
+        );
+        assert!(!EngineError::MissingWelcomeKeyPackage.is_transient());
+    }
 
     #[test]
     fn invalid_key_package_capabilities_preserve_member_and_protocol_classification() {

@@ -322,6 +322,9 @@ impl<S: StorageProvider> Engine<S> {
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
                 let category = match error {
+                    EngineError::MissingWelcomeKeyPackage => {
+                        InputRejectionCategory::MissingWelcomeKeyPackage
+                    }
                     EngineError::Peeler(PeelerError::InvalidSignature)
                     | EngineError::InvalidCredentialIdentity(_)
                     | EngineError::InvalidAccountIdentityProof(_) => {

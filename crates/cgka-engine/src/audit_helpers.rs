@@ -379,6 +379,9 @@ pub(crate) fn ingest_outcome_event(
                     InputRejectionCategory::WrongRecipient => "wrong_recipient",
                     InputRejectionCategory::UnknownGroup => "unknown_group",
                     InputRejectionCategory::InvalidEncoding => "invalid_encoding",
+                    InputRejectionCategory::MissingWelcomeKeyPackage => {
+                        "missing_welcome_key_package"
+                    }
                     InputRejectionCategory::InvalidSignature => "invalid_signature",
                     InputRejectionCategory::UnsupportedRequiredFeature => {
                         "unsupported_required_feature"

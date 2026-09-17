@@ -210,6 +210,13 @@ pub enum EngineError {
     #[error("invalid welcome")]
     InvalidWelcome,
 
+    /// This device has no private bundle for any KeyPackage referenced by the
+    /// Welcome. Retrying the same invitation cannot recreate that material.
+    #[error(
+        "missing local key package for invitation; publish a new key package and ask the sender to invite you again"
+    )]
+    MissingWelcomeKeyPackage,
+
     #[error("welcome already processed")]
     WelcomeAlreadyProcessed,
 
@@ -274,6 +281,7 @@ impl EngineError {
             EngineError::Peeler(_) => "peeler",
             EngineError::Serialize(_) => "serialize",
             EngineError::InvalidWelcome => "invalid_welcome",
+            EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
             EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
             EngineError::Backend(_) => "backend",
             EngineError::Other(_) => "other",

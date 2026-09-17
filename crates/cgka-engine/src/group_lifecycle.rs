@@ -128,6 +128,7 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
             | EngineError::Serialize(_)
             | EngineError::InvalidWelcome
+            | EngineError::MissingWelcomeKeyPackage
             | EngineError::InvalidCredentialIdentity(_)
             | EngineError::InvalidAccountIdentityProof(_)
             | EngineError::MissingRequiredCapabilities { .. }
@@ -140,6 +141,7 @@ fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
     error: WelcomeError<StorageError>,
 ) -> EngineError {
     match error {
+        WelcomeError::NoMatchingKeyPackage => EngineError::MissingWelcomeKeyPackage,
         WelcomeError::StorageError(_)
         | WelcomeError::PublicGroupError(CreationFromExternalError::WriteToStorageError(_)) => {
             // OpenMLS storage errors are backend-specific and cannot be converted
@@ -1142,7 +1144,7 @@ impl<S: StorageProvider> Engine<S> {
                 }
             }
             let consumed_key_package_ref =
-                consumed_key_package_ref.ok_or(EngineError::InvalidWelcome)?;
+                consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?;
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
@@ -2086,5 +2088,12 @@ mod tests {
         let invalid = classify_openmls_welcome_error(WelcomeError::<&str>::UnableToDecrypt);
         assert!(matches!(invalid, EngineError::InvalidWelcome));
         assert!(terminal_welcome_error(&invalid));
+    }
+
+    #[test]
+    fn missing_welcome_key_package() {
+        let error = classify_openmls_welcome_error(WelcomeError::<&str>::NoMatchingKeyPackage);
+        assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
+        assert!(terminal_welcome_error(&error));
     }
 }

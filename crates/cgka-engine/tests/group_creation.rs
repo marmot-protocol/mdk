@@ -2316,6 +2316,77 @@ async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
 }
 
 #[tokio::test]
+async fn missing_welcome_key_package() {
+    use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
+    use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+
+    let mut alice = build_current_client(b"alice");
+    let mut bob = build_current_client(b"bob");
+    let (_, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "missing key package".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("expected founding welcome");
+    };
+    let welcome = welcomes.remove(0);
+
+    // The account identity matches, but these fresh stores lack Bob's bundle.
+    let error = build_current_client(b"bob")
+        .join_welcome(welcome.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut missing = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"bob"))
+        .account_identity_proof_signer(proof_signer(b"bob"))
+        .peeler(Box::new(MockPeeler::default()))
+        .recorder(Box::new(
+            JsonlRecorder::open(&path, "missing-kp".into()).unwrap(),
+        ))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        missing.ingest(welcome.clone()).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::MissingWelcomeKeyPackage
+        }
+    ));
+    assert!(storage.list_groups().unwrap().is_empty());
+    assert!(storage.has_ingress_dedup_marker(&welcome.id).unwrap());
+    drop(missing);
+    let audit = std::fs::read_to_string(path).unwrap();
+    assert!(audit.lines().any(|line| {
+        let event: AuditEvent = serde_json::from_str(line).unwrap();
+        matches!(event.kind, AuditEventKind::IngestOutcome { stale_reason: Some(reason), .. }
+            if reason == "missing_welcome_key_package")
+    }));
+
+    let mut reopened = build_profile_client_on_storage(b"bob", storage, ProtocolProfile::Current);
+    assert!(matches!(
+        reopened.ingest(welcome.clone()).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    ));
+    assert!(matches!(
+        bob.ingest(welcome).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
+
+#[tokio::test]
 async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_state() {
     let bob_storage = SqliteAccountStorage::in_memory().unwrap();
     let mut legacy_bob = build_profile_client_on_storage(

@@ -103,6 +103,9 @@ pub enum InputRejectionCategory {
     InvalidSignature,
     UnsupportedRequiredFeature,
     AuthorizationFailed,
+    /// The invitation references no private KeyPackage bundle on this device.
+    /// Publish a fresh KeyPackage and request a new invitation.
+    MissingWelcomeKeyPackage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
