@@ -5133,6 +5133,8 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 account_id_hex=adapter.account_id_hex,
                 socket_path=adapter.socket_path,
                 home_route="cc" * 16,
+                inbound_media_dir=str(adapter._inbound_media_dir),
+                outbound_media_dir=str(adapter._outbound_media_dir),
             )
             self.assertEqual(
                 adapter._observations.loaded_fingerprint,
@@ -5154,6 +5156,57 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 adapter._observations.loaded_fingerprint,
                 other._observations.loaded_fingerprint,
             )
+
+    def test_media_path_resolvers_match_diagnostics(self):
+        diag = self.adapter_module.marmot_diagnostics
+        extra = {
+            "home": "/tmp/custom-home",
+            "inbound_media_dir": "/tmp/in-media",
+            "outbound_media_dir": "/tmp/out-media",
+        }
+        socket = "/tmp/custom-home/dev/wn-agent.sock"
+        self.assertEqual(
+            self.adapter_module.resolve_inbound_media_dir(extra, socket),
+            diag.resolve_inbound_media_dir(extra, socket),
+        )
+        self.assertEqual(
+            self.adapter_module.resolve_outbound_media_dir(extra, socket),
+            diag.resolve_outbound_media_dir(extra, socket),
+        )
+        self.assertEqual(
+            self.adapter_module.resolve_marmot_home({}, socket),
+            diag.resolve_marmot_home({}, socket),
+        )
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "MARMOT_INBOUND_MEDIA_DIR": "/tmp/env-in",
+                "MARMOT_OUTBOUND_MEDIA_DIR": "/tmp/env-out",
+            },
+        ):
+            self.assertEqual(
+                self.adapter_module.resolve_inbound_media_dir({}, socket),
+                diag.resolve_inbound_media_dir({}, socket),
+            )
+            self.assertEqual(
+                str(self.adapter_module.resolve_inbound_media_dir({}, socket)),
+                "/tmp/env-in",
+            )
+
+    async def test_diagnostics_endpoint_retries_after_failed_bind(self):
+        adapter = self._adapter(type("Client", (), {})())
+        server = unittest.mock.Mock()
+        server.start = unittest.mock.AsyncMock(side_effect=[False, True])
+        with unittest.mock.patch.object(
+            self.adapter_module.marmot_diagnostics,
+            "DiagnosticSocketServer",
+            return_value=server,
+        ):
+            await adapter._ensure_diagnostics_endpoint()
+            self.assertIsNone(adapter._diagnostic_server)
+            await adapter._ensure_diagnostics_endpoint()
+            self.assertIs(adapter._diagnostic_server, server)
+        self.assertEqual(server.start.await_count, 2)
 
     def test_welcomer_aliases_match_doctor_projection(self):
         diag = self.adapter_module.marmot_diagnostics

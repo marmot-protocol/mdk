@@ -14,6 +14,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Hermes Marmot doctor now exits 0 on a healthy report, reads the configured home channel instead of the inbound filter, uses the same effective socket/account/auth and config fingerprint as the running plugin, treats an absent systemd unit as unknown, and keeps ACK-only diagnostic readiness from changing reconnect backoff.
 - Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
 - Hermes Marmot doctor now applies the same Hermes enablement-seed and user-dotenv override order as the running plugin, so a process or installed `.env` home/socket/account/token wins over conflicting YAML values.
+- Hermes Marmot doctor now preserves explicit empty dotenv assignments, expands supported dotenv variable references, and inspects the adapter's configured media directories instead of installer defaults.
 
 ### Added
 

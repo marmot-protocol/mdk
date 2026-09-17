@@ -125,7 +125,44 @@ impl ReconcileTelemetry {
         }
         Self::bump(&self.catch_up_errors);
     }
+}
 
+/// Marks catch-up as running and finishes it even if the caller future is dropped.
+pub(crate) struct CatchUpInFlightGuard<'a> {
+    telemetry: &'a ReconcileTelemetry,
+    finished: bool,
+}
+
+impl<'a> CatchUpInFlightGuard<'a> {
+    pub(crate) fn begin(telemetry: &'a ReconcileTelemetry) -> Self {
+        telemetry.begin_catch_up();
+        Self {
+            telemetry,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish_ok(mut self) {
+        self.telemetry.finish_catch_up_ok();
+        self.finished = true;
+    }
+
+    pub(crate) fn finish_err(mut self, reason: &'static str) {
+        self.telemetry.finish_catch_up_err(reason);
+        self.finished = true;
+    }
+}
+
+impl Drop for CatchUpInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            ReconcileTelemetry::bump(&self.telemetry.catch_up_cancelled);
+            self.telemetry.finish_catch_up_err("cancelled");
+        }
+    }
+}
+
+impl ReconcileTelemetry {
     pub(crate) fn diagnostic_replay(&self) -> AgentControlDiagnosticReplay {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let state = if self.catch_up_in_flight.load(Ordering::Relaxed) {
@@ -174,7 +211,7 @@ impl ReconcileTelemetry {
 
 #[cfg(test)]
 mod tests {
-    use super::ReconcileTelemetry;
+    use super::{CatchUpInFlightGuard, ReconcileTelemetry};
 
     #[test]
     fn diagnostic_replay_recovers_from_failure() {
@@ -191,5 +228,49 @@ mod tests {
         assert_eq!(idle.state, "idle");
         assert!(idle.last_reason.is_none());
         assert!(idle.error_count >= 1);
+    }
+
+    #[test]
+    fn dropping_unfinished_guard_marks_catch_up_cancelled() {
+        let telemetry = ReconcileTelemetry::default();
+        {
+            let _guard = CatchUpInFlightGuard::begin(&telemetry);
+            assert_eq!(telemetry.diagnostic_replay().state, "running");
+        }
+        let replay = telemetry.diagnostic_replay();
+        assert_eq!(replay.state, "failed");
+        assert_eq!(replay.last_reason.as_deref(), Some("cancelled"));
+        assert_eq!(replay.cancelled_count, 1);
+        assert!(
+            !telemetry
+                .catch_up_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_catch_up_future_clears_in_flight() {
+        let telemetry = std::sync::Arc::new(ReconcileTelemetry::default());
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task_telemetry = telemetry.clone();
+        let task_started = started.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = CatchUpInFlightGuard::begin(&task_telemetry);
+            task_started.notify_one();
+            std::future::pending::<()>().await
+        });
+        started.notified().await;
+        assert_eq!(telemetry.diagnostic_replay().state, "running");
+        handle.abort();
+        let _ = handle.await;
+        let replay = telemetry.diagnostic_replay();
+        assert_eq!(replay.state, "failed");
+        assert_eq!(replay.last_reason.as_deref(), Some("cancelled"));
+        assert_eq!(replay.cancelled_count, 1);
+        assert!(
+            !telemetry
+                .catch_up_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }

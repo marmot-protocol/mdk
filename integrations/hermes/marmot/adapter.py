@@ -754,24 +754,15 @@ async def sync_allowlist(
 
 
 def resolve_marmot_home(extra: Dict[str, Any], socket_path: str | Path) -> Path:
-    home = _first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME")
-    if home:
-        return Path(str(home)).expanduser()
-    return Path(socket_path).expanduser().parent.parent
+    return marmot_diagnostics.resolve_marmot_home(extra, socket_path)
 
 
 def resolve_inbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
-    configured = _first_config_value(extra, "inbound_media_dir", env="MARMOT_INBOUND_MEDIA_DIR")
-    if configured:
-        return Path(str(configured)).expanduser()
-    return resolve_marmot_home(extra, socket_path) / "dev" / "inbound-media"
+    return marmot_diagnostics.resolve_inbound_media_dir(extra, socket_path)
 
 
 def resolve_outbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
-    configured = _first_config_value(extra, "outbound_media_dir", env="MARMOT_OUTBOUND_MEDIA_DIR")
-    if configured:
-        return Path(str(configured)).expanduser()
-    return resolve_marmot_home(extra, socket_path) / "dev" / "outbound-media"
+    return marmot_diagnostics.resolve_outbound_media_dir(extra, socket_path)
 
 
 def resolve_inbound_spool_path(extra: Dict[str, Any], socket_path: str | Path) -> Path:
@@ -1669,6 +1660,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             account_id_hex=self.account_id_hex,
             socket_path=self.socket_path,
             home_route=home_route,
+            inbound_media_dir=str(self._inbound_media_dir),
+            outbound_media_dir=str(self._outbound_media_dir),
         )
         self._observations.loaded_fingerprint = marmot_diagnostics.config_fingerprint(fields)
         self._observations.sender_count = len(fields["senders"])
@@ -1708,11 +1701,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._observations,
         )
         try:
-            await server.start()
+            started = await server.start()
         except Exception:
             logger.debug("Marmot diagnostics endpoint unavailable", exc_info=True)
             return
-        self._diagnostic_server = server
+        if started:
+            self._diagnostic_server = server
 
     async def _stop_diagnostics_endpoint(self) -> None:
         server, self._diagnostic_server = self._diagnostic_server, None
@@ -3915,8 +3909,6 @@ def _observation_reason(exc: BaseException) -> str:
     if isinstance(exc, AgentControlError):
         if exc.code in {"timeout", "socket_closed", "socket_io", "unauthorized"}:
             return exc.code
-        if exc.code == "timeout":
-            return "timeout"
         return "transport"
     return "transport"
 

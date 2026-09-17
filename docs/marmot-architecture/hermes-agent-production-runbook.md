@@ -1,7 +1,7 @@
 ---
 title: "Hermes Agent Production Runbook"
 created: 2026-06-08
-updated: 2026-09-16
+updated: 2026-09-17
 tags: [marmot, architecture, agents, hermes, runbook, deployment]
 status: draft-runbook
 ---
@@ -244,10 +244,13 @@ unknown observations, partial relays, missing or mismatched home, restart
 required, reconciliation failure, and transient inbound recovery.
 
 A missing service-manager unit on a manual install is unknown, not proof that
-`wn-agent` is stopped. Restart Hermes after plugin or sender-authorization
-changes. The doctor never starts Hermes, never repairs, and never proves
-delivery: inbound receipt, Hermes dispatch, reply acceptance, relay
-acknowledgement, and recipient delivery remain separate checkpoints.
+`wn-agent` is stopped. Media directory checks follow the adapter's configured or
+socket-derived inbound and outbound paths, including environment and dotenv
+overrides; missing lazy directories stay unknown rather than unsafe. Restart
+Hermes after plugin or sender-authorization changes. The doctor never starts
+Hermes, never repairs, and never proves delivery: inbound receipt, Hermes
+dispatch, reply acceptance, relay acknowledgement, and recipient delivery remain
+separate checkpoints.
 
 ## Rollback
 

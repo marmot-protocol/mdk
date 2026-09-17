@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import socket
 import stat
 import sys
@@ -71,15 +72,19 @@ DOTENV_CONNECTOR_KEYS = frozenset(
         "MARMOT_GROUP_ID_HEX",
         "MARMOT_ALLOWED_USERS",
         "MARMOT_ALLOW_ALL_USERS",
+        "MARMOT_INBOUND_MEDIA_DIR",
+        "MARMOT_OUTBOUND_MEDIA_DIR",
     }
 )
-DOTENV_EXTRA_KEYS = {
-    "MARMOT_AGENT_SOCKET": ("socket_path", "agent_socket", "socket"),
-    "MARMOT_HOME": ("home", "marmot_home"),
-    "MARMOT_ACCOUNT_ID_HEX": ("account_id_hex", "account"),
-    "MARMOT_AGENT_AUTH_TOKEN": ("auth_token", "agent_auth_token"),
-    "MARMOT_AGENT_AUTH_TOKEN_FILE": ("auth_token_file", "agent_auth_token_file"),
-}
+_DOTENV_INTERPOLATION = re.compile(
+    r"(?P<escape>\\)?"
+    r"\$(?:"
+    r"(?P<escaped>\$)|"
+    r"(?P<named>[_A-Za-z][_A-Za-z0-9]*)|"
+    r"\{(?P<braced>[_A-Za-z][_A-Za-z0-9]*)\}|"
+    r"\{(?P<braced_default>[_A-Za-z][_A-Za-z0-9]*):-(?P<default>[^}]*)\}"
+    r")"
+)
 
 
 def redacted(text: str) -> str:
@@ -251,9 +256,8 @@ def project_effective_env(
     for key, value in (dotenv_values or {}).items():
         if key not in DOTENV_CONNECTOR_KEYS:
             continue
-        stripped = str(value).strip()
-        if stripped:
-            projected[key] = stripped
+        # Hermes load_dotenv(override=True) writes explicit empty assignments.
+        projected[key] = str(value).strip()
     return projected
 
 
@@ -347,18 +351,54 @@ def split_config_list(value: Any) -> list[str]:
 
 
 def parse_dotenv_scalar(raw_value: str) -> str:
+    value, _interpolate = _parse_dotenv_scalar(raw_value)
+    return value
+
+
+def _parse_dotenv_scalar(raw_value: str) -> tuple[str, bool]:
     value = raw_value.strip()
     if not value:
-        return ""
+        return "", True
     if value[0] in {"'", '"'}:
         quote = value[0]
         end = value.find(quote, 1)
-        if end == -1:
-            return value[1:]
-        return value[1:end]
+        inner = value[1:] if end == -1 else value[1:end]
+        return inner, quote != "'"
     if " #" in value:
         value = value.split(" #", 1)[0].rstrip()
-    return value
+    return value, True
+
+
+def interpolate_dotenv_value(value: str, lookup) -> tuple[str, bool]:
+    """Expand python-dotenv POSIX variables without sourcing the file.
+
+    Returns ``(expanded, supported)``. Unsupported syntax is left unchanged
+    and flagged so callers do not treat the literal as a resolved secret.
+    """
+
+    if "${" in value and _DOTENV_INTERPOLATION.search(value) is None:
+        return value, False
+    parts: list[str] = []
+    cursor = 0
+    for match in _DOTENV_INTERPOLATION.finditer(value):
+        parts.append(value[cursor : match.start()])
+        if match.group("escape"):
+            parts.append(match.group(0)[1:])
+        elif match.group("escaped"):
+            parts.append("$")
+        elif match.group("named"):
+            parts.append(lookup(match.group("named")))
+        elif match.group("braced"):
+            parts.append(lookup(match.group("braced")))
+        else:
+            found = lookup(match.group("braced_default"))
+            parts.append(found if found else (match.group("default") or ""))
+        cursor = match.end()
+    parts.append(value[cursor:])
+    expanded = "".join(parts)
+    if "${" in expanded:
+        return expanded, False
+    return expanded, True
 
 
 @dataclass(frozen=True)
@@ -427,8 +467,12 @@ def nonsecret_config_fields(
     socket_path: Optional[str],
     home_route: Optional[str],
     media: Optional[dict[str, Any]] = None,
+    inbound_media_dir: Optional[str] = None,
+    outbound_media_dir: Optional[str] = None,
 ) -> dict[str, Any]:
     normalized_socket = str(Path(socket_path).expanduser()) if socket_path else ""
+    inbound = str(Path(inbound_media_dir).expanduser()) if inbound_media_dir else ""
+    outbound = str(Path(outbound_media_dir).expanduser()) if outbound_media_dir else ""
     return {
         "senders": sorted({item.lower() for item in senders if item}),
         "allow_all": bool(allow_all),
@@ -437,7 +481,68 @@ def nonsecret_config_fields(
         "socket": identity_digest(normalized_socket),
         "home_route": home_route or "",
         "media": media if media is not None else media_fingerprint_value(),
+        "inbound_media_dir": identity_digest(inbound),
+        "outbound_media_dir": identity_digest(outbound),
     }
+
+
+def resolve_marmot_home(
+    extra: dict[str, Any],
+    socket_path: str | Path | None = None,
+    *,
+    env_values: Optional[dict[str, str]] = None,
+    fallback_home: Optional[Path] = None,
+) -> Path:
+    home = first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME", env_values=env_values)
+    if home:
+        return Path(str(home)).expanduser()
+    if socket_path not in (None, ""):
+        return Path(str(socket_path)).expanduser().parent.parent
+    if fallback_home is not None:
+        return Path(fallback_home).expanduser()
+    return Path("~/.marmot").expanduser()
+
+
+def resolve_inbound_media_dir(
+    extra: dict[str, Any],
+    socket_path: str | Path | None = None,
+    *,
+    env_values: Optional[dict[str, str]] = None,
+    fallback_home: Optional[Path] = None,
+) -> Path:
+    configured = first_config_value(
+        extra, "inbound_media_dir", env="MARMOT_INBOUND_MEDIA_DIR", env_values=env_values
+    )
+    if configured:
+        return Path(str(configured)).expanduser()
+    return (
+        resolve_marmot_home(
+            extra, socket_path, env_values=env_values, fallback_home=fallback_home
+        )
+        / "dev"
+        / "inbound-media"
+    )
+
+
+def resolve_outbound_media_dir(
+    extra: dict[str, Any],
+    socket_path: str | Path | None = None,
+    *,
+    env_values: Optional[dict[str, str]] = None,
+    fallback_home: Optional[Path] = None,
+) -> Path:
+    configured = first_config_value(
+        extra, "outbound_media_dir", env="MARMOT_OUTBOUND_MEDIA_DIR", env_values=env_values
+    )
+    if configured:
+        return Path(str(configured)).expanduser()
+    return (
+        resolve_marmot_home(
+            extra, socket_path, env_values=env_values, fallback_home=fallback_home
+        )
+        / "dev"
+        / "outbound-media"
+    )
 
 
 def merge_hermes_marmot_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -604,18 +709,6 @@ def resolve_welcomers(
     return []
 
 
-def apply_dotenv_connector_values(extra: dict[str, Any], values: dict[str, str]) -> dict[str, Any]:
-    merged = dict(extra)
-    for env_name, keys in DOTENV_EXTRA_KEYS.items():
-        value = str(values.get(env_name) or "").strip()
-        if not value:
-            continue
-        if any(merged.get(key) not in (None, "") for key in keys):
-            continue
-        merged.setdefault(keys[0], value)
-    return merged
-
-
 @dataclass
 class PluginObservations:
     state: str = "stopped"
@@ -698,13 +791,14 @@ class DiagnosticSocketServer:
         self._limiter = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         self._bound_inode: Optional[int] = None
 
-    async def start(self) -> None:
+    async def start(self) -> bool:
         try:
             sock = _bind_private_socket(self.path)
         except OSError:
-            return
+            return False
         self._bound_inode = _socket_inode(self.path)
         self._server = await asyncio.start_unix_server(self._handle, sock=sock)
+        return True
 
     async def stop(self) -> None:
         server, self._server = self._server, None
@@ -912,30 +1006,54 @@ def parse_config_safely(path: Path) -> tuple[Optional[dict[str, Any]], Optional[
     return loaded, None
 
 
-def parse_dotenv_assignments(text: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+def parse_dotenv_assignments(
+    text: str,
+    *,
+    environ: Optional[dict[str, str]] = None,
+) -> tuple[dict[str, str], Optional[str]]:
+    raw: dict[str, tuple[str, bool]] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
-        key, value = line.split("=", 1)
+        key, value = stripped.split("=", 1)
         key = key.strip()
         if key.startswith("export "):
             key = key[7:].strip()
         if key not in DOTENV_CONNECTOR_KEYS:
             continue
-        values[key] = parse_dotenv_scalar(value)
-    return values
+        raw[key] = _parse_dotenv_scalar(value)
+    source = environ if environ is not None else os.environ
+    parsed = {key: item[0] for key, item in raw.items()}
+
+    def lookup(name: str) -> str:
+        if name in parsed:
+            return parsed[name]
+        return str(source.get(name) or "")
+
+    values: dict[str, str] = {}
+    unsupported = False
+    for key, (value, interpolate) in raw.items():
+        if not interpolate:
+            values[key] = value
+            continue
+        expanded, supported = interpolate_dotenv_value(value, lookup)
+        if not supported:
+            unsupported = True
+            continue
+        values[key] = expanded
+    return values, ("unsupported" if unsupported else None)
 
 
 def parse_env_safely(path: Path) -> ParsedHermesEnv:
     if not path.exists():
         return ParsedHermesEnv(error="missing")
+    interpolation_error: Optional[str] = None
     try:
         text = path.read_text(encoding="utf-8")
         if len(text.encode("utf-8")) > MAX_CONFIG_BYTES:
             return ParsedHermesEnv(error="oversized")
-        values = parse_dotenv_assignments(text)
+        values, interpolation_error = parse_dotenv_assignments(text)
     except (OSError, UnicodeError, ValueError, TypeError):
         return ParsedHermesEnv(error="invalid")
     helper = load_configure_helper()
@@ -949,6 +1067,7 @@ def parse_env_safely(path: Path) -> ParsedHermesEnv:
         senders=list(auth.allowed_users_hex),
         allow_all=bool(auth.allow_all_users),
         values=values,
+        error=interpolation_error,
     )
 
 

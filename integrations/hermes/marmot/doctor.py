@@ -92,6 +92,12 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         token_file=args.auth_token_file,
         env_values=effective_env,
     )
+    inbound_dir = diag.resolve_inbound_media_dir(
+        extra, socket_path, env_values=effective_env, fallback_home=marmot_home
+    )
+    outbound_dir = diag.resolve_outbound_media_dir(
+        extra, socket_path, env_values=effective_env, fallback_home=marmot_home
+    )
     fingerprint_fields = diag.nonsecret_config_fields(
         senders=senders,
         allow_all=allow_all,
@@ -99,13 +105,22 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         account_id_hex=account_hex,
         socket_path=str(socket_path) if socket_path else None,
         home_route=home_route,
+        inbound_media_dir=str(inbound_dir),
+        outbound_media_dir=str(outbound_dir),
     )
     fingerprint = None
     if config_error in (None, "missing"):
         fingerprint = diag.config_fingerprint(fingerprint_fields)
 
     checks.append(_socket_check(socket_path))
-    checks.extend(_file_checks(marmot_home))
+    checks.extend(
+        _file_checks(
+            extra,
+            socket_path,
+            installer_home=marmot_home,
+            env_values=effective_env,
+        )
+    )
     checks.extend(_config_checks(config_error, env_error, senders, allow_all, home_route, home_error))
     connector_attempted = False
     connector = None
@@ -329,15 +344,30 @@ def _socket_check(path: Path) -> dict[str, Any]:
     )
 
 
-def _file_checks(marmot_home: Path) -> list[dict[str, Any]]:
+def _file_checks(
+    extra: dict[str, Any],
+    socket_path: Path,
+    *,
+    installer_home: Path,
+    env_values: Optional[dict[str, str]] = None,
+) -> list[dict[str, Any]]:
+    effective_home = diag.resolve_marmot_home(
+        extra, socket_path, env_values=env_values, fallback_home=installer_home
+    )
+    inbound = diag.resolve_inbound_media_dir(
+        extra, socket_path, env_values=env_values, fallback_home=installer_home
+    )
+    outbound = diag.resolve_outbound_media_dir(
+        extra, socket_path, env_values=env_values, fallback_home=installer_home
+    )
+    staging = effective_home / "dev" / "media-staging"
     checks = []
-    for name, relative in (
-        ("files.home", Path()),
-        ("files.inbound_dir", Path("dev") / "inbound-media"),
-        ("files.outbound_dir", Path("dev") / "outbound-media"),
-        ("files.staging_dir", Path("dev") / "media-staging"),
+    for name, path in (
+        ("files.home", effective_home),
+        ("files.inbound_dir", inbound),
+        ("files.outbound_dir", outbound),
+        ("files.staging_dir", staging),
     ):
-        path = marmot_home / relative if relative.parts else marmot_home
         inspected = diag.inspect_path(path, expect_dir=True)
         code = inspected["code"]
         status = inspected["status"]
@@ -414,6 +444,8 @@ def _config_checks(
         )
     if env_error == "missing":
         auth_status, auth_code = ("unknown", "missing") if not (senders or allow_all) else ("healthy", "present")
+    elif env_error == "unsupported":
+        auth_status, auth_code = "unknown", "unsupported"
     elif env_error:
         auth_status, auth_code = "fatal", env_error
     elif allow_all or senders:

@@ -80,6 +80,37 @@ def _short_tempdir(prefix: str = "d-") -> tempfile.TemporaryDirectory:
     return _budgeted_tempdir("h/marmot/diagnostics.sock", prefix=prefix)
 
 
+def _media_kwargs(
+    socket_path,
+    extra=None,
+    env_values=None,
+    fallback_home=None,
+) -> dict[str, str]:
+    extra = extra or {}
+    inbound = diag.resolve_inbound_media_dir(
+        extra, socket_path, env_values=env_values, fallback_home=fallback_home
+    )
+    outbound = diag.resolve_outbound_media_dir(
+        extra, socket_path, env_values=env_values, fallback_home=fallback_home
+    )
+    return {
+        "inbound_media_dir": str(inbound),
+        "outbound_media_dir": str(outbound),
+    }
+
+
+def _private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _unsafe_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o777)
+    return path
+
+
 class _ConnectorFixture:
     def __init__(
         self,
@@ -1050,6 +1081,7 @@ class DoctorReportTests(unittest.TestCase):
                 account_id_hex=None,
                 socket_path=str(connector_socket),
                 home_route=env_home,
+                **_media_kwargs(connector_socket, fallback_home=home),
             )
             observations.loaded_fingerprint = diag.config_fingerprint(fields)
             connector = _ConnectorFixture(connector_socket)
@@ -1140,6 +1172,7 @@ class DoctorReportTests(unittest.TestCase):
                 account_id_hex=dotenv_account,
                 socket_path=str(dotenv_socket),
                 home_route=dotenv_home,
+                **_media_kwargs(dotenv_socket, fallback_home=home),
             )
             observations.loaded_fingerprint = diag.config_fingerprint(fields)
             connector = _ConnectorFixture(dotenv_socket)
@@ -1204,6 +1237,7 @@ class DoctorReportTests(unittest.TestCase):
                 account_id_hex=None,
                 socket_path=str(_args(root).socket),
                 home_route=home_route,
+                **_media_kwargs(_args(root).socket, fallback_home=home),
             )
             observations.loaded_fingerprint = diag.config_fingerprint(alias_fields)
             observations.loaded_home_digest = diag.identity_digest(home_route)
@@ -1254,6 +1288,7 @@ class DoctorReportTests(unittest.TestCase):
                         account_id_hex=None,
                         socket_path=str(_args(root).socket),
                         home_route=home_route,
+                        **_media_kwargs(_args(root).socket, fallback_home=home),
                     )
                 )
                 with mock.patch.object(diag, "bounded_run", return_value=None), mock.patch.object(
@@ -1266,6 +1301,264 @@ class DoctorReportTests(unittest.TestCase):
                 )
             finally:
                 plugin_server.stop()
+
+    def test_dotenv_scalar_interpolation_and_quotes(self) -> None:
+        environ = {"SYNTHETIC_TOKEN": "expanded-secret", "OTHER": "xy"}
+        values, error = diag.parse_dotenv_assignments(
+            "MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\n"
+            "MARMOT_HOME_CHANNEL=$OTHER\n"
+            "MARMOT_AGENT_SOCKET='${SYNTHETIC_TOKEN}'\n"
+            "MARMOT_ACCOUNT_ID_HEX=\"${OTHER}\"\n"
+            "MARMOT_HOME=\\$OTHER\n"
+            "MARMOT_INBOUND_MEDIA_DIR=${MISSING:-/fallback}\n",
+            environ=environ,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(values["MARMOT_AGENT_AUTH_TOKEN"], "expanded-secret")
+        self.assertEqual(values["MARMOT_HOME_CHANNEL"], "xy")
+        self.assertEqual(values["MARMOT_AGENT_SOCKET"], "${SYNTHETIC_TOKEN}")
+        self.assertEqual(values["MARMOT_ACCOUNT_ID_HEX"], "xy")
+        self.assertEqual(values["MARMOT_HOME"], "$OTHER")
+        self.assertEqual(values["MARMOT_INBOUND_MEDIA_DIR"], "/fallback")
+        empty, empty_error = diag.parse_dotenv_assignments(
+            "MARMOT_AGENT_AUTH_TOKEN=\nMARMOT_AGENT_SOCKET=\"\"\n",
+            environ={"MARMOT_AGENT_AUTH_TOKEN": "stale"},
+        )
+        self.assertIsNone(empty_error)
+        self.assertEqual(empty["MARMOT_AGENT_AUTH_TOKEN"], "")
+        self.assertEqual(empty["MARMOT_AGENT_SOCKET"], "")
+        projected = diag.project_effective_env(
+            empty, environ={"MARMOT_AGENT_AUTH_TOKEN": "stale", "MARMOT_AGENT_SOCKET": "/stale.sock"}
+        )
+        self.assertEqual(projected["MARMOT_AGENT_AUTH_TOKEN"], "")
+        self.assertEqual(projected["MARMOT_AGENT_SOCKET"], "")
+
+    def test_collect_empty_dotenv_clears_inherited_and_uses_yaml(self) -> None:
+        yaml_home = "aa" * 16
+        yaml_account = "11" * 32
+        stale_home = "bb" * 16
+        stale_account = "22" * 32
+        with _short_tempdir("ee-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            home = _private_dir(Path(args.home))
+            hermes = _private_dir(Path(args.hermes_home))
+            _private_dir(Path(args.plugin_dir))
+            yaml_socket = root / "y.sock"
+            stale_socket = root / "s.sock"
+            _write(
+                hermes / "config.yaml",
+                "platforms:\n  marmot:\n    home_channel:\n      platform: marmot\n"
+                "      chat_id: " + yaml_home + "\n    extra:\n"
+                "      socket_path: " + str(yaml_socket) + "\n"
+                "      account_id_hex: " + yaml_account + "\n"
+                "      auth_token: yaml-inline-token\n",
+            )
+            _write(
+                hermes / ".env",
+                "MARMOT_AGENT_SOCKET=\n"
+                "MARMOT_ACCOUNT_ID_HEX=\n"
+                "MARMOT_HOME_CHANNEL=\n"
+                "MARMOT_AGENT_AUTH_TOKEN=\n",
+            )
+            connector = _ConnectorFixture(yaml_socket, expected_token="yaml-inline-token")
+            connector.start()
+            try:
+                env = {
+                    "MARMOT_AGENT_SOCKET": str(stale_socket),
+                    "MARMOT_ACCOUNT_ID_HEX": stale_account,
+                    "MARMOT_HOME_CHANNEL": stale_home,
+                    "MARMOT_AGENT_AUTH_TOKEN": "stale-inherited-token",
+                }
+                with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                    diag, "bounded_run", return_value=None
+                ):
+                    report = doctor.collect(args)
+                self.assertTrue(connector.requests)
+                self.assertEqual(connector.requests[0].get("auth_token"), "yaml-inline-token")
+                self.assertEqual(connector.requests[0].get("account_id_hex"), yaml_account)
+                self.assertEqual(connector.requests[0].get("home_group_id_hex"), yaml_home)
+                by_id = {item["id"]: item for item in report["checks"]}
+                self.assertNotEqual(by_id["account.selection"]["code"], "unauthorized")
+                encoded = json.dumps(report) + diag.render_human(report)
+                self.assertNotIn("yaml-inline-token", encoded)
+                self.assertNotIn("stale-inherited-token", encoded)
+                self.assertNotIn(str(yaml_socket), encoded)
+                self.assertNotIn(yaml_account, encoded)
+            finally:
+                connector.stop()
+
+    def test_collect_dotenv_interpolation_matches_host_expansion(self) -> None:
+        yaml_home = "aa" * 16
+        expanded_home = "cc" * 16
+        expanded_account = "33" * 32
+        with _short_tempdir("ei-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            _private_dir(Path(args.home))
+            hermes = _private_dir(Path(args.hermes_home))
+            _private_dir(Path(args.plugin_dir))
+            yaml_socket = root / "y.sock"
+            expanded_socket = root / "e.sock"
+            _write(
+                hermes / "config.yaml",
+                "platforms:\n  marmot:\n    home_channel:\n      platform: marmot\n"
+                "      chat_id: " + yaml_home + "\n    extra:\n"
+                "      socket_path: " + str(yaml_socket) + "\n"
+                "      auth_token: yaml-inline-token\n",
+            )
+            _write(
+                hermes / ".env",
+                "MARMOT_AGENT_SOCKET=${SYNTHETIC_SOCKET}\n"
+                "MARMOT_ACCOUNT_ID_HEX=${SYNTHETIC_ACCOUNT}\n"
+                "MARMOT_HOME_CHANNEL=${SYNTHETIC_HOME}\n"
+                "MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\n",
+            )
+            connector = _ConnectorFixture(expanded_socket, expected_token="expanded-secret")
+            connector.start()
+            try:
+                env = {
+                    "SYNTHETIC_SOCKET": str(expanded_socket),
+                    "SYNTHETIC_ACCOUNT": expanded_account,
+                    "SYNTHETIC_HOME": expanded_home,
+                    "SYNTHETIC_TOKEN": "expanded-secret",
+                    "MARMOT_AGENT_SOCKET": "",
+                    "MARMOT_ACCOUNT_ID_HEX": "",
+                    "MARMOT_HOME_CHANNEL": "",
+                    "MARMOT_AGENT_AUTH_TOKEN": "stale-inherited-token",
+                }
+                with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                    diag, "bounded_run", return_value=None
+                ):
+                    for key in (
+                        "MARMOT_AGENT_SOCKET",
+                        "MARMOT_ACCOUNT_ID_HEX",
+                        "MARMOT_HOME_CHANNEL",
+                    ):
+                        os.environ.pop(key, None)
+                    report = doctor.collect(args)
+                self.assertTrue(connector.requests)
+                self.assertEqual(connector.requests[0].get("auth_token"), "expanded-secret")
+                self.assertEqual(connector.requests[0].get("account_id_hex"), expanded_account)
+                self.assertEqual(connector.requests[0].get("home_group_id_hex"), expanded_home)
+                by_id = {item["id"]: item for item in report["checks"]}
+                self.assertNotEqual(by_id["account.selection"]["code"], "unauthorized")
+                encoded = json.dumps(report) + diag.render_human(report)
+                self.assertNotIn("expanded-secret", encoded)
+                self.assertNotIn("${SYNTHETIC_TOKEN}", encoded)
+                self.assertNotIn("yaml-inline-token", encoded)
+                self.assertNotIn(str(expanded_socket), encoded)
+                self.assertNotIn(expanded_account, encoded)
+            finally:
+                connector.stop()
+
+    def test_collect_inspects_configured_media_dirs_not_defaults(self) -> None:
+        with _short_tempdir("md-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            home = _private_dir(Path(args.home))
+            hermes = _private_dir(Path(args.hermes_home))
+            _private_dir(Path(args.plugin_dir))
+            default_in = _private_dir(home / "dev" / "inbound-media")
+            default_out = _private_dir(home / "dev" / "outbound-media")
+            configured_in = _unsafe_dir(root / "in-media")
+            configured_out = _unsafe_dir(root / "out-media")
+            missing = root / "lazy-media"
+            _write(
+                hermes / "config.yaml",
+                "platforms:\n  marmot:\n    extra:\n"
+                "      inbound_media_dir: " + str(configured_in) + "\n"
+                "      outbound_media_dir: " + str(configured_out) + "\n",
+            )
+            before = _tree_signature(root)
+            with mock.patch.object(diag, "bounded_run", return_value=None), mock.patch.object(
+                doctor, "_connector_report", return_value={"unsupported": True}
+            ):
+                report = doctor.collect(args)
+            after = _tree_signature(root)
+            self.assertEqual(before, after)
+            by_id = {item["id"]: item for item in report["checks"]}
+            self.assertEqual(by_id["files.inbound_dir"]["status"], "fatal")
+            self.assertEqual(by_id["files.inbound_dir"]["code"], "unsafe_mode")
+            self.assertEqual(by_id["files.outbound_dir"]["status"], "fatal")
+            self.assertEqual(by_id["files.outbound_dir"]["code"], "unsafe_mode")
+            self.assertEqual(diag.inspect_path(default_in, expect_dir=True)["status"], "healthy")
+            self.assertEqual(diag.inspect_path(default_out, expect_dir=True)["status"], "healthy")
+            extra = {"inbound_media_dir": str(configured_in), "outbound_media_dir": str(configured_out)}
+            adapter_in = diag.resolve_inbound_media_dir(extra, args.socket, fallback_home=home)
+            adapter_out = diag.resolve_outbound_media_dir(extra, args.socket, fallback_home=home)
+            self.assertEqual(diag.inspect_path(adapter_in, expect_dir=True)["code"], "unsafe_mode")
+            self.assertEqual(diag.inspect_path(adapter_out, expect_dir=True)["code"], "unsafe_mode")
+            encoded = json.dumps(report) + diag.render_human(report)
+            self.assertNotIn(str(configured_in), encoded)
+            self.assertNotIn(str(configured_out), encoded)
+            self.assertFalse(missing.exists())
+            env = {
+                "MARMOT_INBOUND_MEDIA_DIR": str(missing),
+                "MARMOT_OUTBOUND_MEDIA_DIR": str(configured_out),
+            }
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                diag, "bounded_run", return_value=None
+            ), mock.patch.object(doctor, "_connector_report", return_value={"unsupported": True}):
+                env_report = doctor.collect(args)
+            env_ids = {item["id"]: item for item in env_report["checks"]}
+            self.assertEqual(env_ids["files.inbound_dir"]["code"], "not_created")
+            self.assertEqual(env_ids["files.inbound_dir"]["status"], "unknown")
+            self.assertFalse(missing.exists())
+            _write(
+                hermes / ".env",
+                "MARMOT_INBOUND_MEDIA_DIR=" + str(configured_in) + "\n"
+                "MARMOT_OUTBOUND_MEDIA_DIR=" + str(configured_out) + "\n",
+            )
+            _write(hermes / "config.yaml", "platforms:\n  marmot:\n    extra: {}\n")
+            with mock.patch.object(diag, "bounded_run", return_value=None), mock.patch.object(
+                doctor, "_connector_report", return_value={"unsupported": True}
+            ):
+                dotenv_report = doctor.collect(args)
+            dotenv_ids = {item["id"]: item for item in dotenv_report["checks"]}
+            self.assertEqual(dotenv_ids["files.inbound_dir"]["code"], "unsafe_mode")
+            self.assertEqual(dotenv_ids["files.outbound_dir"]["code"], "unsafe_mode")
+            link = root / "link-media"
+            link.symlink_to(configured_in)
+            extra_link = {"inbound_media_dir": str(link)}
+            link_checks = doctor._file_checks(
+                extra_link, Path(args.socket), installer_home=home
+            )
+            link_ids = {item["id"]: item for item in link_checks}
+            self.assertEqual(link_ids["files.inbound_dir"]["code"], "symlink")
+            custom_socket = root / "custom" / "dev" / "wn-agent.sock"
+            socket_home = custom_socket.parent.parent
+            _private_dir(socket_home)
+            socket_media = _unsafe_dir(socket_home / "dev" / "inbound-media")
+            _unsafe_dir(socket_home / "dev" / "outbound-media")
+            socket_checks = doctor._file_checks(
+                {}, custom_socket, installer_home=home
+            )
+            socket_ids = {item["id"]: item for item in socket_checks}
+            self.assertEqual(socket_ids["files.inbound_dir"]["code"], "unsafe_mode")
+            self.assertEqual(diag.inspect_path(socket_media, expect_dir=True)["code"], "unsafe_mode")
+            default_fields = diag.nonsecret_config_fields(
+                senders=[],
+                allow_all=False,
+                welcomers=[],
+                account_id_hex=None,
+                socket_path=str(args.socket),
+                home_route=None,
+                **_media_kwargs(args.socket, fallback_home=home),
+            )
+            configured_fields = diag.nonsecret_config_fields(
+                senders=[],
+                allow_all=False,
+                welcomers=[],
+                account_id_hex=None,
+                socket_path=str(args.socket),
+                home_route=None,
+                **_media_kwargs(args.socket, extra=extra, fallback_home=home),
+            )
+            self.assertNotEqual(
+                diag.config_fingerprint(default_fields),
+                diag.config_fingerprint(configured_fields),
+            )
 
 
 class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
@@ -1280,7 +1573,7 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                 diag.diagnostics_socket_path(hermes_home),
                 observations,
             )
-            await server.start()
+            self.assertTrue(await server.start())
             self.assertIsNotNone(server._server)
             self.addAsyncCleanup(server.stop)
             path = diag.diagnostics_socket_path(hermes_home)
@@ -1307,7 +1600,7 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                 diag.diagnostics_socket_path(hermes_home),
                 diag.PluginObservations(),
             )
-            await server.start()
+            self.assertTrue(await server.start())
             self.assertIsNotNone(server._server)
             self.addAsyncCleanup(server.stop)
             reader = mock.Mock()
@@ -1353,7 +1646,7 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                     diag.diagnostics_socket_path(hermes_home),
                     diag.PluginObservations(),
                 )
-                await server.start()
+                self.assertTrue(await server.start())
                 self.assertIsNotNone(server._server)
                 self.addAsyncCleanup(server.stop)
                 path = diag.diagnostics_socket_path(hermes_home)
@@ -1361,6 +1654,27 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             finally:
                 os.umask(previous)
+
+    async def test_start_returns_false_after_failed_bind_and_can_retry(self) -> None:
+        with _short_tempdir("db-") as raw:
+            hermes_home = Path(raw) / "h"
+            hermes_home.mkdir(mode=0o700)
+            first = diag.DiagnosticSocketServer(
+                diag.diagnostics_socket_path(hermes_home),
+                diag.PluginObservations(),
+            )
+            self.assertTrue(await first.start())
+            self.addAsyncCleanup(first.stop)
+            second = diag.DiagnosticSocketServer(
+                diag.diagnostics_socket_path(hermes_home),
+                diag.PluginObservations(),
+            )
+            self.assertFalse(await second.start())
+            self.assertIsNone(second._server)
+            await first.stop()
+            self.assertTrue(await second.start())
+            self.assertIsNotNone(second._server)
+            self.addAsyncCleanup(second.stop)
 
 
 class InstallerDoctorDispatchTests(unittest.TestCase):
