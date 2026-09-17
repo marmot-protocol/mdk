@@ -57,10 +57,12 @@ WHERE t.kind=9 AND t.source_message_id_hex IS NOT NULL
   AND t.deleted=0 AND t.invalidation_status IS NULL;
 
 CREATE TRIGGER attachment_history_added AFTER INSERT ON attachment_history BEGIN
-    INSERT INTO attachment_history_versions(group_id_hex,revision) VALUES(NEW.group_id_hex,1)
-    ON CONFLICT(group_id_hex) DO UPDATE SET revision=revision+1;
+    -- Even wholly hidden groups need a version row for a later unblock.
+    INSERT INTO attachment_history_versions(group_id_hex,revision) VALUES(NEW.group_id_hex,NEW.visible)
+    ON CONFLICT(group_id_hex) DO UPDATE SET revision=revision+NEW.visible;
 END;
-CREATE TRIGGER attachment_history_removed AFTER DELETE ON attachment_history BEGIN
+CREATE TRIGGER attachment_history_removed AFTER DELETE ON attachment_history
+WHEN OLD.visible=1 BEGIN
     UPDATE attachment_history_versions SET revision=revision+1 WHERE group_id_hex=OLD.group_id_hex;
 END;
 CREATE TRIGGER attachment_history_visibility AFTER UPDATE OF visible ON attachment_history
@@ -115,8 +117,13 @@ CREATE TRIGGER attachment_invite_unblocked AFTER DELETE ON blocked_pending_invit
     UPDATE attachment_history SET visible=(sender NOT IN (SELECT public_key FROM user_blocks)) WHERE group_id_hex=OLD.group_id_hex;
 END;
 CREATE TRIGGER attachment_group_deleted AFTER DELETE ON account_groups BEGIN
-    DELETE FROM attachment_history WHERE group_id_hex=OLD.group_id_hex;
-    DELETE FROM attachment_history_versions WHERE group_id_hex=OLD.group_id_hex;
+    -- Snapshot reconciliation may drop account_groups while retaining the
+    -- timeline. Preserve that source's index, but fence handles across the group
+    -- lifecycle boundary. Ordinary local deletion removes the timeline first.
+    UPDATE attachment_history_versions SET generation=randomblob(16),revision=revision+1
+    WHERE group_id_hex=OLD.group_id_hex;
+    DELETE FROM attachment_history_versions WHERE group_id_hex=OLD.group_id_hex
+        AND NOT EXISTS(SELECT 1 FROM attachment_history WHERE group_id_hex=OLD.group_id_hex);
 END;
 "#).storage()
 }

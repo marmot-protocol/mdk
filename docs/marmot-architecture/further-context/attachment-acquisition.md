@@ -1,5 +1,9 @@
 ---
+title: "Attachment discovery and acquisition"
+created: 2026-09-17
 updated: 2026-09-17
+tags: [marmot, attachments, projections]
+status: implementation-plan
 ---
 
 # C8: attachment discovery, acquisition and local access
@@ -58,6 +62,14 @@ history refresh, repair and restart must not undo explicit removal.
 The storage migration backfills the derived index once from the existing materialized
 timeline. Subsequent source writes maintain it incrementally; page reads do not
 rebuild or rescan history. This migration adds no bytes or transfer jobs.
+
+## Decision before runtime/native discovery
+
+Audit client Photos/Videos/Files tab requirements before C8-B. Opaque slots keep
+protocol classification in the shared app parser. Do not scan unlimited pages to
+fill a filtered tab: either expose bounded scanned pages with explicit continuation,
+or add a parser-owned classification index if the contract requires full typed
+pages. Storage must not invent a second MIME/voice-note parser.
 
 ## Decisions before acquisition implementation
 

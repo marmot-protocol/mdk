@@ -47,20 +47,26 @@ struct SortKey {
     attachment_order: i64,
 }
 
-macro_rules! redacted_debug {
-    ($($name:ty),* $(,)?) => {$(
-        impl std::fmt::Debug for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct(stringify!($name)).finish_non_exhaustive()
-            }
-        }
-    )*};
+impl std::fmt::Debug for AttachmentHistoryEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentHistoryEntry")
+            .finish_non_exhaustive()
+    }
 }
-redacted_debug!(
-    AttachmentHistoryEntry,
-    AttachmentHistoryVersion,
-    AttachmentHistoryCursor
-);
+
+impl std::fmt::Debug for AttachmentHistoryVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentHistoryVersion")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AttachmentHistoryCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentHistoryCursor")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AttachmentHistoryPage {

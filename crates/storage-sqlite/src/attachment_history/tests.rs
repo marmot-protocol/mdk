@@ -163,7 +163,14 @@ fn blocking_and_invite_visibility_are_revisioned_without_read_time_scans() {
     );
     assert!(page(&store).entries.is_empty());
     sql(&store, "DELETE FROM blocked_pending_invites");
-    assert_eq!(page(&store).entries.len(), 1);
+    assert_eq!(
+        store
+            .attachment_history_page("aa", 100, None)
+            .unwrap()
+            .entries
+            .len(),
+        3
+    );
     sql(
         &store,
         "INSERT INTO user_blocks VALUES('bob',0,0); UPDATE user_blocks SET public_key='alice'",
@@ -388,4 +395,83 @@ fn authenticated_epoch_order_wins_over_wall_clock_and_legacy_rows() {
             .collect::<Vec<_>>(),
         [("000001", 0), ("000001", 1), ("000002", 0), ("000003", 0)]
     );
+}
+
+#[test]
+fn hidden_attachment_changes_preserve_visible_cursors_and_unblock_still_invalidates() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, 1, 2);
+    sql(&store, "INSERT INTO user_blocks VALUES('bob',0,0)");
+    let before = page(&store);
+    sql(
+        &store,
+        "INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json) VALUES('aa','hidden','source-hidden','received','bob','',9,'[]',1,1,'[]','{\"imeta\":[[\"imeta\"]]}')",
+    );
+    assert_eq!(page(&store).version, before.version);
+    sql(
+        &store,
+        "UPDATE message_timeline SET media_json='{\"imeta\":[[\"imeta\",\"changed\"]]}' WHERE message_id_hex='hidden'",
+    );
+    assert_eq!(page(&store).version, before.version);
+    assert!(
+        store
+            .attachment_history_page("aa", 1, before.next_cursor.as_ref())
+            .is_ok()
+    );
+    sql(&store, "DELETE FROM user_blocks");
+    assert_ne!(page(&store).version, before.version);
+    assert_eq!(
+        store
+            .attachment_history_page("aa", 100, None)
+            .unwrap()
+            .entries
+            .len(),
+        3
+    );
+    // A group whose first and only attachments are hidden still needs a durable
+    // version row so unblocking can announce the newly visible source.
+    sql(
+        &store,
+        "INSERT INTO user_blocks VALUES('bob',0,0); UPDATE message_timeline SET group_id_hex='bb' WHERE message_id_hex='hidden'",
+    );
+    let hidden = store.attachment_history_version("bb").unwrap();
+    sql(&store, "DELETE FROM user_blocks");
+    assert_ne!(store.attachment_history_version("bb").unwrap(), hidden);
+    assert_eq!(
+        store
+            .attachment_history_page("bb", 100, None)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn removing_account_group_projection_preserves_retained_attachment_sources() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    sql(
+        &store,
+        "INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES('aa','',0)",
+    );
+    seed(&store, 1, 3);
+    let before = page(&store);
+    // Full account-snapshot reconciliation can remove this row without deleting
+    // app_events or message_timeline. Retained discovery must follow its source.
+    sql(&store, "DELETE FROM account_groups WHERE group_id_hex='aa'");
+    let after = store.attachment_history_page("aa", 100, None).unwrap();
+    assert_eq!(after.entries.len(), 3);
+    assert_ne!(after.version, before.version);
+    assert!(matches!(
+        store.attachment_history_page("aa", 1, before.next_cursor.as_ref()),
+        Err(AttachmentHistoryError::StaleCursor)
+    ));
+    sql(&store, "INSERT INTO user_blocks VALUES('alice',0,0)");
+    assert!(page(&store).entries.is_empty());
+    assert_ne!(page(&store).version, after.version);
+    sql(
+        &store,
+        "DELETE FROM user_blocks; DELETE FROM message_timeline",
+    );
+    assert!(page(&store).entries.is_empty());
 }
