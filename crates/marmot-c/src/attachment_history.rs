@@ -105,7 +105,7 @@ impl CFree for MarmotAttachmentPageRead {
 pub unsafe extern "C" fn marmot_attachment_page_read_free(value: *mut MarmotAttachmentPageRead) {
     free_guard(|| unsafe { free_boxed(value) });
 }
-/// Free a standalone version returned by marmot_attachment_history_version, not a page field.
+/// Free a standalone version returned by a version read or clone, not a page field.
 /// # Safety
 /// Value must be NULL or a standalone owned version, with no active borrows.
 #[unsafe(no_mangle)]
@@ -113,6 +113,24 @@ pub unsafe extern "C" fn marmot_attachment_history_version_free(
     value: *mut MarmotAttachmentHistoryVersion,
 ) {
     free_guard(|| unsafe { free_boxed(value) });
+}
+/// Retain a standalone baseline version without retaining its owning page.
+/// Free the result with marmot_attachment_history_version_free.
+/// # Safety
+/// Value must be a live standalone version or borrowed page field; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_attachment_history_version_clone(
+    value: *const MarmotAttachmentHistoryVersion,
+    out: *mut *mut MarmotAttachmentHistoryVersion,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let Some(value) = (unsafe { value.as_ref() }) else {
+            return MarmotStatus::NullPointer;
+        };
+        unsafe { *out = boxed(value.inner.clone().into()) };
+        MarmotStatus::Ok
+    })
 }
 /// Blocking local read. Call off the UI thread; limit is 1..=100 slots.
 /// NULL cursor starts at the head. Cursor is borrowed for this call; no network work starts.
@@ -359,12 +377,33 @@ mod tests {
                 ),
                 MarmotStatus::NullPointer
             );
+            let mut baseline = ptr::null_mut();
+            assert_eq!(
+                marmot_attachment_history_version_clone(page.version, &mut baseline),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                marmot_attachment_history_version_clone(page.version, ptr::null_mut()),
+                MarmotStatus::NullPointer
+            );
+            let mut invalid = baseline;
+            assert_eq!(
+                marmot_attachment_history_version_clone(ptr::null(), &mut invalid),
+                MarmotStatus::NullPointer
+            );
+            assert!(invalid.is_null());
             marmot_attachment_history_version_free(version);
             // Child cursor/version are released with the page; the next result is independent.
             marmot_attachment_page_read_free(first);
             let MarmotAttachmentPageRead::Page { page } = &*second else {
                 panic!("page")
             };
+            assert_eq!(
+                marmot_attachment_history_version_change_since(page.version, baseline, &mut change),
+                MarmotStatus::Ok
+            );
+            assert_eq!(change, MarmotAttachmentHistoryChange::Unchanged as u32);
+            marmot_attachment_history_version_free(baseline);
             assert!(!page.has_more);
             assert!(page.next_cursor.is_null());
             marmot_attachment_page_read_free(second);

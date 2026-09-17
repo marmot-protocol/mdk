@@ -229,6 +229,18 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
             .unwrap()
             .requires_restart_since(&fresh.version)
     );
+    let AttachmentPageRead::Page(after_invalidation) = runtime
+        .attachment_history_page("alice", &group, 100, None)
+        .await
+        .unwrap()
+    else {
+        panic!("page")
+    };
+    assert_eq!(after_invalidation.entries.len(), fresh.entries.len() - 3);
+    assert!(after_invalidation.entries.iter().all(|entry| {
+        entry.message_id_hex != format!("{:064x}", 14)
+            && entry.message_id_hex != format!("{:064x}", 7)
+    }));
     runtime.shutdown_and_close().await.unwrap();
     assert!(matches!(
         runtime

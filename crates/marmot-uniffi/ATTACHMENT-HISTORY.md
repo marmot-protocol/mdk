@@ -12,6 +12,10 @@ Group IDs are opaque MLS IDs, including 16-byte IDs, rather than 32-byte route I
    slots, including rejected attachments. Each entry includes source/message IDs,
    sender, display/received timestamps, optional source epoch, MDK category and the
    shared parser's accepted reference or typed rejection with its original index.
+   Discovery honors the runtime's explicit loopback-development flag. The existing
+   timeline/chat-list classification paths use strict public-endpoint policy;
+   loopback fixtures can therefore have different verdicts across those surfaces.
+   Production configurations keep loopback disabled.
 2. Preserve MDK's canonical order and use `(message_id_hex, attachment_index)` as
    the item identity. Do not sort by display timestamps or renumber rejected slots.
 3. `has_more` means `next_cursor` is present. Filter each page by category if needed;
@@ -60,8 +64,11 @@ at account removal/reset. All reads fail after terminal `shutdown_and_close`.
 `marmot_attachment_history_page` returns a `MarmotAttachmentPageRead`. A successful
 page owns entries, version and optional cursor. Borrow those handles only while the
 owning result is alive; the next result is independent. Free the result once with
-`marmot_attachment_page_read_free`; never free its fields separately. Keep the
-initial page alive if retaining its version as the collection baseline.
+`marmot_attachment_page_read_free`; never free its fields separately. Use
+`marmot_attachment_history_version_clone` to retain the page's exact baseline as
+an independently owned handle before freeing the page. Free that clone with
+`marmot_attachment_history_version_free`. Do not replace it with a later version
+read: that could conceal a deletion between the page and version reads.
 
 `marmot_attachment_history_version` returns a standalone version, freed with
 `marmot_attachment_history_version_free`. Compare it against the borrowed baseline

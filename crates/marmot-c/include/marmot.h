@@ -5012,11 +5012,20 @@ void marmot_bytes_free(uint8_t *data, uintptr_t len);
 void marmot_attachment_page_read_free(struct MarmotAttachmentPageRead *value);
 
 /**
- * Free a standalone version returned by marmot_attachment_history_version, not a page field.
+ * Free a standalone version returned by a version read or clone, not a page field.
  * # Safety
  * Value must be NULL or a standalone owned version, with no active borrows.
  */
 void marmot_attachment_history_version_free(struct MarmotAttachmentHistoryVersion *value);
+
+/**
+ * Retain a standalone baseline version without retaining its owning page.
+ * Free the result with marmot_attachment_history_version_free.
+ * # Safety
+ * Value must be a live standalone version or borrowed page field; out must be writable.
+ */
+MarmotStatus marmot_attachment_history_version_clone(const struct MarmotAttachmentHistoryVersion *value,
+                                                     struct MarmotAttachmentHistoryVersion **out);
 
 /**
  * Blocking local read. Call off the UI thread; limit is 1..=100 slots.

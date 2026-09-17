@@ -55,12 +55,14 @@ fn present(
     })?;
     // Run the same parser used by timeline rows, keeping even malformed slot verdicts.
     let media = serde_json::json!({"imeta": [entry.slot]});
-    let mut outcomes = crate::media_attachment_outcomes_from_media_json(
+    let outcomes = crate::media_attachment_outcomes_from_media_json(
         Some(&media),
         entry.source_epoch,
         allow_loopback,
     );
-    let mut attachment = outcomes.remove(0);
+    let mut attachment = outcomes.into_iter().next().ok_or_else(|| {
+        AppError::InvalidEncryptedMedia("attachment slot produced no outcome".into())
+    })?;
     let category = match &mut attachment {
         MediaAttachmentOutcome::Accepted {
             attachment_index,
