@@ -2186,8 +2186,28 @@ async fn assert_group_b_owns_the_whole_account_budget(
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn unrecoverable_group_does_not_charge_the_account_byte_budget() {
-    let (carol, storage, group_a, template_a, bytes_a, _group_b, template_b, bytes_b) =
+    let (mut carol, storage, group_a, template_a, bytes_a, _group_b, template_b, bytes_b) =
         carol_deferring_in_two_live_groups().await;
+
+    // The per-group peak metric is a maximum across groups, and group B admits
+    // two rows below. Only a group-A backlog strictly larger than that makes
+    // the metric assertion at the end speak about group A at all.
+    let mut bytes_a_total = bytes_a;
+    for id in ["unsweepable-a-0002", "unsweepable-a-0003"] {
+        let row = TransportMessage {
+            id: MessageId::new(id.as_bytes().to_vec()),
+            ..template_a.clone()
+        };
+        assert!(matches!(
+            carol.ingest(row.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        bytes_a_total += storage.get_message(&row.id).unwrap().payload.len();
+    }
+    assert!(
+        bytes_a_total > bytes_b.saturating_mul(2),
+        "group A's backlog must exceed group B's two admitted rows for the peak to distinguish it"
+    );
     drop(carol);
 
     let mut halted = storage.get_group(&group_a).unwrap();
@@ -2212,7 +2232,7 @@ async fn unrecoverable_group_does_not_charge_the_account_byte_budget() {
         restarted
             .engine_metrics()
             .deferred_peel_peak_bytes_per_group
-            >= bytes_a as u64,
+            >= bytes_a_total as u64,
         "the halted group's rows are still real per-group usage and stay visible as such"
     );
 }
