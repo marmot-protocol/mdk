@@ -3608,8 +3608,10 @@ impl<S: StorageProvider> Engine<S> {
                     // group's deferred-peel cap had no slot for this row right
                     // now. Leave it exactly as ingest found it — still awaiting
                     // retry, still the redelivery source — and release nothing:
-                    // a refused row was never admitted, so it holds no cap slot
-                    // to give back.
+                    // only a `PeelDeferred` row holds a cap slot, and such a row
+                    // cannot be refused here, because re-ingesting an already
+                    // retained row asks `has_peel_deferred_capacity` for no
+                    // additional rows or bytes.
                     //
                     // Never relabel it `Processed`, for the same reason as the
                     // `Removed` arm above: `recorded_message_outcome` answers
