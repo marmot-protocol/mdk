@@ -3,14 +3,16 @@
 //! before claiming, and authenticate/decrypt the complete body before publishing.
 //! Bytes stay in the account's SQLCipher store; there is no attachment LRU.
 use crate::chat_presentation::nonnegative;
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-/// Storage safety ceiling; the existing transport's stricter ciphertext limit
-/// still applies. This is not permission to negotiate larger media.
+/// Storage plaintext safety ceiling, independent of transport admission. The
+/// current transport also caps ciphertext at 512 MiB, including its AEAD overhead;
+/// transport-valid plaintext is therefore smaller. This is not a size negotiation.
 pub const MAX_RETAINED_ATTACHMENT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
 pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
@@ -33,10 +35,15 @@ pub enum AttachmentAcquisitionState {
     Fetching,
     RetryScheduled,
     Ready,
+    /// Failed until explicit retry; ordinary demand preserves this state.
     Blocked,
+    /// Temporarily ineligible at claim time; eligible demand requeues it.
+    Parked,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachmentDemand {
+    /// Existing or newly admitted demand. Inspect status for ready/failed work;
+    /// this does not imply that a download is currently queued.
     Requested(AttachmentAssetRef),
     Suppressed,
     Unavailable,
@@ -106,7 +113,14 @@ pub(crate) fn reconcile_attachment_acquisition_tx(
     message: Option<&str>,
 ) -> StorageResult<()> {
     // Historical migrations invoke timeline rebuild before migration 82 exists.
-    let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='attachment_acquisition')", [], |r| r.get(0)).storage()?;
+    let present: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='table' AND name='attachment_acquisition')",
+            [],
+            |r| r.get(0),
+        )
+        .storage()?;
     if !present {
         return Ok(());
     }
@@ -137,7 +151,13 @@ impl SqliteAccountStorage {
     /// Persist source-bound demand after the app has validated this exact slot
     /// and its plaintext digest with the shared parser. Pending invitations,
     /// hidden/expired/missing sources and legacy unknown epochs are not admitted.
-    /// Repeated demand preserves a ready asset, active attempt and retry deadline.
+    /// Repeated demand preserves ready assets, active attempts, retry deadlines
+    /// and explicit-retry failures; it resumes a temporarily parked job.
+    ///
+    /// The digest MUST be the shared parser's plaintext hash for `selected.slot`.
+    /// Storage verifies source identity, not imeta semantics. A mismatched digest
+    /// is an unrecoverable caller bug, not a transport failure to retry; the caller
+    /// must re-parse that same authoritative slot and submit corrected demand.
     pub fn request_attachment_acquisition(
         &self,
         group: &str,
@@ -151,32 +171,97 @@ impl SqliteAccountStorage {
         let now = u64_to_i64(now)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let suppressed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression
-                WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)", params![group,message,index], |r| r.get(0)).storage()?;
-            if suppressed { return Ok(AttachmentDemand::Suppressed); }
-            let source = conn.query_row("SELECT h.source_message_id_hex,h.source_epoch,h.slot_json,a.retention_expires_at
-                FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
-                JOIN account_groups g USING(group_id_hex)
-                WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3
-                AND h.visible=1 AND h.source_epoch IS NOT NULL AND g.pending_confirmation=0
-                AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?4)",
-                params![group,message,index,now], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<i64>>(3)?))).optional().storage()?;
-            let Some((source,source_epoch,slot,expires)) = source else { return Ok(AttachmentDemand::Unavailable) };
-            if slot.len()>MAX_DESCRIPTOR_BYTES || source_epoch<0 { return Err(invalid("attachment descriptor exceeds storage bounds")); }
-            let current_slot: serde_json::Value = serde_json::from_str(&slot).map_err(|_|invalid("invalid stored attachment slot"))?;
-            if selected.source_message_id_hex != source || selected.source_epoch != Some(source_epoch as u64) || selected.slot != current_slot {
+            let suppressed: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
+                    params![group, message, index],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if suppressed {
+                return Ok(AttachmentDemand::Suppressed);
+            }
+            let source = conn.query_row(
+                "SELECT h.source_message_id_hex,h.source_epoch,h.slot_json,a.retention_expires_at
+                 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
+                 JOIN account_groups g USING(group_id_hex)
+                 WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3
+                   AND h.visible=1 AND h.source_epoch IS NOT NULL AND g.pending_confirmation=0
+                   AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?4)",
+                params![group, message, index, now],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                )),
+            ).optional().storage()?;
+            let Some((source, source_epoch, slot, expires)) = source else {
+                return Ok(AttachmentDemand::Unavailable);
+            };
+            if slot.len() > MAX_DESCRIPTOR_BYTES || source_epoch < 0 {
+                return Err(invalid("attachment descriptor exceeds storage bounds"));
+            }
+            let current_slot: serde_json::Value = serde_json::from_str(&slot)
+                .map_err(|_| invalid("invalid stored attachment slot"))?;
+            if selected.source_message_id_hex != source
+                || selected.source_epoch != Some(source_epoch as u64)
+                || selected.slot != current_slot
+            {
                 return Ok(AttachmentDemand::Unavailable);
             }
-            conn.execute("DELETE FROM attachment_acquisition WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3
-                AND (source_message_id_hex<>?4 OR source_epoch<>?5 OR slot_json<>?6 OR plaintext_digest<>?7)",
-                params![group,message,index,source,source_epoch,slot,&plaintext_digest[..]]).storage()?;
-            conn.execute("INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,
-                source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at)
-                VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(group_id_hex,message_id_hex,attachment_index) DO NOTHING",
-                params![group,message,index,source,source_epoch,slot,&plaintext_digest[..],expires]).storage()?;
-            let token = conn.query_row("SELECT token FROM attachment_acquisition WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
-                params![group,message,index], |r| r.get(0)).storage()?;
-            Ok(AttachmentDemand::Requested(AttachmentAssetRef { store_epoch: epoch(&conn)?,token }))
+            conn.execute(
+                "DELETE FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3
+                   AND (source_message_id_hex<>?4 OR source_epoch<>?5
+                        OR slot_json<>?6 OR plaintext_digest<>?7)",
+                params![
+                    group,
+                    message,
+                    index,
+                    source,
+                    source_epoch,
+                    slot,
+                    &plaintext_digest[..]
+                ],
+            )
+            .storage()?;
+            // Only policy parking is resumable through ordinary demand. Failed
+            // jobs still require explicit retry; backoff and leases stay intact.
+            conn.execute(
+                "INSERT INTO attachment_acquisition(
+                    token,group_id_hex,message_id_hex,attachment_index,
+                    source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due)
+                 VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
+                 DO UPDATE SET state=0,due=excluded.due
+                 WHERE attachment_acquisition.state=5",
+                params![
+                    group,
+                    message,
+                    index,
+                    source,
+                    source_epoch,
+                    slot,
+                    &plaintext_digest[..],
+                    expires,
+                    now
+                ],
+            )
+            .storage()?;
+            let token = conn
+                .query_row(
+                    "SELECT token FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
+                    params![group, message, index],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            Ok(AttachmentDemand::Requested(AttachmentAssetRef {
+                store_epoch: epoch(&conn)?,
+                token,
+            }))
         })
     }
 
@@ -192,7 +277,9 @@ impl SqliteAccountStorage {
         }
         let conn = self.lock()?;
         let store_epoch = epoch(&conn)?;
-        let mut statement=conn.prepare("SELECT token FROM attachment_acquisition WHERE due<=?1 ORDER BY due,token LIMIT ?2").storage()?;
+        let mut statement = conn.prepare(
+            "SELECT token FROM attachment_acquisition WHERE due<=?1 ORDER BY due,token LIMIT ?2",
+        ).storage()?;
         let tokens = statement
             .query_map(params![u64_to_i64(now)?, limit as i64], |r| {
                 r.get::<_, Vec<u8>>(0)
@@ -223,20 +310,71 @@ impl SqliteAccountStorage {
         let now = u64_to_i64(now)?;
         let deadline = u64_to_i64(lease_until)?;
         self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            if !matches_store(&conn,reference)? { return Ok(None); }
-            let claimable:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND due<=?2 AND {SOURCE_MATCH} AND {ACCEPTED}
-                AND (expires_at IS NULL OR expires_at>?2))"),params![reference.token,now],|r|r.get(0)).storage()?;
-            if !claimable {
-                // Park a due ineligible job instead of repeatedly returning it and
-                // starving later candidates. Explicit retry re-evaluates policy.
-                conn.execute("UPDATE attachment_acquisition SET state=4,due=NULL,attempt=NULL WHERE token=?1 AND due<=?2", params![reference.token,now]).storage()?;
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
                 return Ok(None);
             }
-            conn.execute("UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),attempts=min(attempts+1,2147483647) WHERE token=?1",params![reference.token,deadline]).storage()?;
-            let job=conn.query_row("SELECT group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,attempt,plaintext_digest FROM attachment_acquisition WHERE token=?1",[&reference.token],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,nonnegative(r,4)?,r.get::<_,String>(5)?,r.get::<_,Vec<u8>>(6)?,r.get::<_,Vec<u8>>(7)?))).storage()?;
-            Ok(Some(AttachmentAcquisition { reference:reference.clone(),group_id_hex:job.0,message_id_hex:job.1,attachment_index:job.2,source_message_id_hex:job.3,source_epoch:job.4,
-                slot:serde_json::from_str(&job.5).map_err(|_|invalid("invalid stored attachment slot"))?,attempt:job.6,digest:job.7 }))
+            let claimable: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
+                    WHERE token=?1 AND due<=?2 AND {SOURCE_MATCH} AND {ACCEPTED}
+                    AND (expires_at IS NULL OR expires_at>?2))"
+                    ),
+                    params![reference.token, now],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if !claimable {
+                // Keep ineligible work off the due page without conflating it
+                // with terminal failure. Re-admission after policy change
+                // requeues a parked job while preserving explicit removal.
+                conn.execute(
+                    "UPDATE attachment_acquisition SET state=5,due=NULL,attempt=NULL
+                     WHERE token=?1 AND due<=?2",
+                    params![reference.token, now],
+                )
+                .storage()?;
+                return Ok(None);
+            }
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),
+                    attempts=min(attempts+1,2147483647) WHERE token=?1",
+                params![reference.token, deadline],
+            )
+            .storage()?;
+            let job = conn
+                .query_row(
+                    "SELECT group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
+                    source_epoch,slot_json,attempt,plaintext_digest
+                 FROM attachment_acquisition WHERE token=?1",
+                    [&reference.token],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, String>(3)?,
+                            nonnegative(r, 4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, Vec<u8>>(6)?,
+                            r.get::<_, Vec<u8>>(7)?,
+                        ))
+                    },
+                )
+                .storage()?;
+            Ok(Some(AttachmentAcquisition {
+                reference: reference.clone(),
+                group_id_hex: job.0,
+                message_id_hex: job.1,
+                attachment_index: job.2,
+                source_message_id_hex: job.3,
+                source_epoch: job.4,
+                slot: serde_json::from_str(&job.5)
+                    .map_err(|_| invalid("invalid stored attachment slot"))?,
+                attempt: job.6,
+                digest: job.7,
+            }))
         })
     }
 
@@ -244,6 +382,8 @@ impl SqliteAccountStorage {
     /// verifies the parser-supplied plaintext hash, but cannot authenticate AEAD.
     /// Quota counts retained plaintext bytes, not SQLite/WAL filesystem overhead;
     /// runtime disk-pressure admission must reserve that overhead separately.
+    /// Publication binds the complete plaintext and SQLite may copy it; the
+    /// runtime must budget full-object memory, unlike incremental local reads.
     pub fn complete_attachment_acquisition(
         &self,
         job: &AttachmentAcquisition,
@@ -259,15 +399,45 @@ impl SqliteAccountStorage {
         }
         let now = u64_to_i64(now)?;
         self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            if !matches_store(&conn,&job.reference)? { return Ok(AttachmentPublishResult::Superseded); }
-            let valid:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND state=1 AND attempt=?2 AND due>?3
-                AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?3))"),params![job.reference.token,job.attempt,now],|r|r.get(0)).storage()?;
-            if !valid { return Ok(AttachmentPublishResult::Superseded); }
-            let used:u64=conn.query_row("SELECT byte_count FROM attachment_retention_usage WHERE id=1",[],|r|nonnegative(r,0)).storage()?;
-            if used.saturating_add(plaintext.len() as u64)>byte_budget { return Ok(AttachmentPublishResult::CapacityBlocked); }
-            conn.execute("INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",params![job.reference.token,plaintext]).storage()?;
-            conn.execute("UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",[&job.reference.token]).storage()?;
+            let conn = self.lock()?;
+            if !matches_store(&conn, &job.reference)? {
+                return Ok(AttachmentPublishResult::Superseded);
+            }
+            let valid: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
+                    WHERE token=?1 AND state=1 AND attempt=?2 AND due>?3
+                    AND {SOURCE_MATCH} AND {ACCEPTED}
+                    AND (expires_at IS NULL OR expires_at>?3))"
+                    ),
+                    params![job.reference.token, job.attempt, now],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if !valid {
+                return Ok(AttachmentPublishResult::Superseded);
+            }
+            let used: u64 = conn
+                .query_row(
+                    "SELECT byte_count FROM attachment_retention_usage WHERE id=1",
+                    [],
+                    |r| nonnegative(r, 0),
+                )
+                .storage()?;
+            if used.saturating_add(plaintext.len() as u64) > byte_budget {
+                return Ok(AttachmentPublishResult::CapacityBlocked);
+            }
+            conn.execute(
+                "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
+                params![job.reference.token, plaintext],
+            )
+            .storage()?;
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+                [&job.reference.token],
+            )
+            .storage()?;
             Ok(AttachmentPublishResult::Published)
         })
     }
@@ -284,10 +454,21 @@ impl SqliteAccountStorage {
         if !matches_store(&conn, &job.reference)? {
             return Ok(false);
         }
-        Ok(conn.execute("UPDATE attachment_acquisition SET state=?3,due=?4,attempt=NULL WHERE token=?1 AND state=1 AND attempt=?2",
-            params![job.reference.token,job.attempt,if due.is_some(){2}else{4},due]).storage()?==1)
+        Ok(conn
+            .execute(
+                "UPDATE attachment_acquisition SET state=?3,due=?4,attempt=NULL
+             WHERE token=?1 AND state=1 AND attempt=?2",
+                params![
+                    job.reference.token,
+                    job.attempt,
+                    if due.is_some() { 2 } else { 4 },
+                    due
+                ],
+            )
+            .storage()?
+            == 1)
     }
-    /// Explicit retry of an existing blocked/delayed job. Ready bytes and active
+    /// Explicit retry of an existing failed/parked/delayed job. Ready bytes and active
     /// attempts are not changed; this never clears explicit-removal suppression.
     pub fn retry_attachment_acquisition(
         &self,
@@ -298,7 +479,14 @@ impl SqliteAccountStorage {
         if !matches_store(&conn, reference)? {
             return Ok(false);
         }
-        Ok(conn.execute("UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL WHERE token=?1 AND state IN (2,4)",params![reference.token,u64_to_i64(now)?]).storage()?==1)
+        Ok(conn
+            .execute(
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL
+             WHERE token=?1 AND state IN (2,4,5)",
+                params![reference.token, u64_to_i64(now)?],
+            )
+            .storage()?
+            == 1)
     }
 
     /// Suppress this original message slot durably even when it has no bytes yet.
@@ -311,17 +499,29 @@ impl SqliteAccountStorage {
         index: u32,
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history
-                WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
-                OR EXISTS(SELECT 1 FROM attachment_acquisition
-                WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
-                OR EXISTS(SELECT 1 FROM attachment_removal_suppression
-                WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
-                params![group,message,index],|r|r.get(0)).storage()?;
-            if !exists {return Ok(false);}
-            conn.execute("INSERT INTO attachment_removal_suppression VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",params![group,message,index]).storage()?;
-            conn.execute("DELETE FROM attachment_acquisition WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",params![group,message,index]).storage()?;
+            let conn = self.lock()?;
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attachment_history
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
+                 OR EXISTS(SELECT 1 FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
+                 OR EXISTS(SELECT 1 FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
+                params![group, message, index],
+                |r| r.get(0),
+            ).storage()?;
+            if !exists {
+                return Ok(false);
+            }
+            conn.execute(
+                "INSERT INTO attachment_removal_suppression VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",
+                params![group, message, index],
+            ).storage()?;
+            conn.execute(
+                "DELETE FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
+                params![group, message, index],
+            ).storage()?;
             Ok(true)
         })
     }
@@ -337,8 +537,14 @@ impl SqliteAccountStorage {
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {
-            self.lock()?.execute("DELETE FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",params![group,selected.message_id_hex,index]).storage()?;
-            self.request_attachment_acquisition(group,selected,digest,now)
+            self.lock()?
+                .execute(
+                    "DELETE FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
+                    params![group, selected.message_id_hex, index],
+                )
+                .storage()?;
+            self.request_attachment_acquisition(group, selected, digest, now)
         })
     }
 
@@ -352,7 +558,18 @@ impl SqliteAccountStorage {
         if !matches_store(&conn, reference)? {
             return Ok(None);
         }
-        let row=conn.query_row("SELECT state,attempts,due,COALESCE((SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0) FROM attachment_acquisition q WHERE token=?1",[&reference.token],|r|Ok((r.get::<_,u8>(0)?,nonnegative(r,1)?,r.get::<_,Option<i64>>(2)?,nonnegative(r,3)?))).optional().storage()?;
+        let row = conn.query_row(
+            "SELECT state,attempts,due,
+                COALESCE((SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0)
+             FROM attachment_acquisition q WHERE token=?1",
+            [&reference.token],
+            |r| Ok((
+                r.get::<_, u8>(0)?,
+                nonnegative(r, 1)?,
+                r.get::<_, Option<i64>>(2)?,
+                nonnegative(r, 3)?,
+            )),
+        ).optional().storage()?;
         row.map(|(state, attempts, due, byte_count)| {
             Ok(AttachmentAcquisitionStatus {
                 state: match state {
@@ -361,6 +578,7 @@ impl SqliteAccountStorage {
                     2 => AttachmentAcquisitionState::RetryScheduled,
                     3 => AttachmentAcquisitionState::Ready,
                     4 => AttachmentAcquisitionState::Blocked,
+                    5 => AttachmentAcquisitionState::Parked,
                     _ => return Err(invalid("invalid attachment state")),
                 },
                 attempts,
@@ -434,7 +652,14 @@ impl SqliteAccountStorage {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid attachment cleanup limit"));
         }
-        self.lock()?.execute("DELETE FROM attachment_acquisition WHERE token IN (SELECT token FROM attachment_acquisition WHERE expires_at<=?1 ORDER BY expires_at,token LIMIT ?2)",params![u64_to_i64(now)?,limit as i64]).storage()
+        self.lock()?
+            .execute(
+                "DELETE FROM attachment_acquisition WHERE token IN (
+                SELECT token FROM attachment_acquisition WHERE expires_at<=?1
+                ORDER BY expires_at,token LIMIT ?2)",
+                params![u64_to_i64(now)?, limit as i64],
+            )
+            .storage()
     }
     pub fn retained_attachment_byte_count(&self) -> StorageResult<u64> {
         self.lock()?

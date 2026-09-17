@@ -14,14 +14,14 @@ CREATE TABLE attachment_acquisition (
     slot_json TEXT NOT NULL CHECK(length(CAST(slot_json AS BLOB))<=16384),
     plaintext_digest BLOB NOT NULL CHECK(length(plaintext_digest)=32),
     expires_at INTEGER,
-    state INTEGER NOT NULL DEFAULT 0 CHECK(state BETWEEN 0 AND 4),
+    state INTEGER NOT NULL DEFAULT 0 CHECK(state BETWEEN 0 AND 5),
     due INTEGER DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
     attempt BLOB CHECK(attempt IS NULL OR length(attempt)=16),
     UNIQUE(group_id_hex,message_id_hex,attachment_index),
     FOREIGN KEY(group_id_hex,message_id_hex) REFERENCES app_events(group_id_hex,message_id_hex) ON DELETE CASCADE,
     CHECK((state IN (0,1,2) AND due IS NOT NULL AND due>=0)
-       OR (state IN (3,4) AND due IS NULL)),
+       OR (state IN (3,4,5) AND due IS NULL)),
     CHECK((state=1 AND attempt IS NOT NULL) OR (state<>1 AND attempt IS NULL))
 );
 CREATE INDEX attachment_acquisition_due ON attachment_acquisition(due,token) WHERE due IS NOT NULL;

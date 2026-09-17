@@ -70,7 +70,7 @@ fn request(store: &SqliteAccountStorage, message: &str) -> AttachmentAssetRef {
 }
 fn publish(store: &SqliteAccountStorage, r: &AttachmentAssetRef) {
     let job = store
-        .claim_attachment_acquisition(r, 11, 100)
+        .claim_attachment_acquisition(r, 12, 100)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -647,5 +647,75 @@ fn attachment_small_reads_do_not_materialize_the_whole_blob() {
             .unwrap()
             .as_slice(),
         &[7; 17]
+    );
+}
+
+#[test]
+fn attachment_policy_park_resumes_on_readmission_but_terminal_failure_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = SqlCipherKey::new("policy-park-test-key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "one");
+    let reference = request(&store, "one");
+    sql(&store, "UPDATE account_groups SET pending_confirmation=1");
+    assert!(
+        store
+            .claim_attachment_acquisition(&reference, 11, 20)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .due_attachment_acquisitions(11, 64)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&reference)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttachmentAcquisitionState::Parked,
+    );
+    assert_eq!(
+        store
+            .request_attachment_acquisition(GROUP, &selected("one"), digest(), 11)
+            .unwrap(),
+        AttachmentDemand::Unavailable,
+    );
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    sql(&store, "UPDATE account_groups SET pending_confirmation=0");
+    assert_eq!(request(&store, "one"), reference);
+    assert_eq!(
+        store.due_attachment_acquisitions(11, 64).unwrap(),
+        vec![reference.clone()]
+    );
+    let job = store
+        .claim_attachment_acquisition(&reference, 11, 20)
+        .unwrap()
+        .unwrap();
+    assert!(store.fail_attachment_acquisition(&job, None).unwrap());
+    assert_eq!(request(&store, "one"), reference);
+    assert!(
+        store
+            .due_attachment_acquisitions(11, 64)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&reference)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttachmentAcquisitionState::Blocked
+    );
+    assert!(store.retry_attachment_acquisition(&reference, 12).unwrap());
+    assert_eq!(
+        store.due_attachment_acquisitions(12, 64).unwrap(),
+        vec![reference]
     );
 }

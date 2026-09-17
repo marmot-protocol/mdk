@@ -112,8 +112,10 @@ clients adopt paging and distinguish partially loaded tabs from truly empty tabs
 
 Migration 82 adds source-bound demand, leases, retry deadlines and protected bytes
 inside each account's SQLCipher database. It creates no transfer jobs on upgrade.
-The caller supplies a shared-parser-validated slot and digest; admission compares
-that exact source against the current index. Unknown source epochs, pending
+The caller supplies a shared-parser-validated slot and its exact plaintext digest;
+a mismatched digest is a caller bug to fix by re-parsing, not a download failure to
+retry. Storage does not implement a second imeta parser. Admission compares that
+exact source against the current index. Unknown source epochs, pending
 invitations, hidden and expired sources are not admitted. No engine or network is
 needed to inspect job state or read retained bytes.
 
@@ -123,12 +125,18 @@ the plaintext digest and atomically commits the bytes and ready state. The futur
 worker must still authenticate/decrypt the entire body using the existing media
 pipeline before publication. Interrupted leases become due again after reopen;
 ordinary repeated demand cannot reset retry deadlines or replace ready bytes.
+Claim-time policy ineligibility parks work separately from an explicit-retry
+failure. Successful re-admission requeues only parked jobs. Worker integration
+must re-admit affected canonical sources after acceptance/unblocking/rejoin and
+on startup; a due-only sweep cannot discover policy changes.
 
 Bytes have no LRU. Publication enforces a caller-supplied account payload-byte
 budget and a 512 MiB storage ceiling per object; the existing stricter transport
-ciphertext cap remains in force. Capacity refusal preserves existing objects and
+ciphertext cap remains in force (also 512 MiB, including AEAD overhead). Capacity refusal preserves existing objects and
 requires the caller to pause/retry. Filesystem free-space and WAL overhead admission
-belong to worker integration. Local storage reads return at most 1 MiB and recheck
+belong to worker integration. Publication still binds the complete verified
+plaintext and SQLite can copy it; worker admission must account for that peak
+memory cost. Local storage reads return at most 1 MiB and recheck
 source visibility/expiry. Stored job status alone is not authorization to read.
 Due/expiry maintenance pages contain at most 64 entries and use dedicated indexes.
 
