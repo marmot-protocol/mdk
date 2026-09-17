@@ -6994,6 +6994,69 @@ class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"added": [], "removed": []})
         self.assertEqual(current, ["33" * 32])
 
+    async def test_whitespace_primary_env_matches_legacy_and_skips_sync(self):
+        diag = self.adapter_module.marmot_diagnostics
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+        legacy_id = "bb" * 32
+
+        def legacy_resolve(extra):
+            for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
+                if key in extra:
+                    return self.adapter_module._split_config_list(extra[key])
+            configured = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
+            return self.adapter_module._split_config_list(configured) if configured else []
+
+        cases = (
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "   ", "MARMOT_DM_ALLOW_FROM": legacy_id}, []),
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "\t", "MARMOT_DM_ALLOW_FROM": legacy_id}, []),
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "", "MARMOT_DM_ALLOW_FROM": legacy_id}, [legacy_id]),
+            ({}, {"MARMOT_DM_ALLOW_FROM": legacy_id}, [legacy_id]),
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "cc" * 32, "MARMOT_DM_ALLOW_FROM": legacy_id}, ["cc" * 32]),
+            ({"welcomer_allowlist": []}, {"MARMOT_WELCOMER_ALLOWLIST": "cc" * 32}, []),
+            ({"dm_allow_from": ""}, {"MARMOT_DM_ALLOW_FROM": legacy_id}, []),
+            ({"dmAllowFrom": [legacy_id]}, {"MARMOT_WELCOMER_ALLOWLIST": "cc" * 32}, [legacy_id]),
+        )
+        for extra, env, expected in cases:
+            with self.subTest(extra=extra, env=env):
+                with unittest.mock.patch.dict(os.environ, env, clear=False):
+                    for name in ("MARMOT_WELCOMER_ALLOWLIST", "MARMOT_DM_ALLOW_FROM"):
+                        if name not in env:
+                            os.environ.pop(name, None)
+                    live = self.adapter_module.resolve_welcomer_allowlist(extra)
+                    doctor = diag.resolve_welcomers(extra)
+                    projected = diag.project_effective_env({}, environ=dict(os.environ))
+                    self.assertEqual(live, expected)
+                    self.assertEqual(doctor, expected)
+                    self.assertEqual(legacy_resolve(extra), expected)
+                    self.assertEqual(diag.resolve_welcomers(extra, env_values=projected), expected)
+
+        calls: list[str] = []
+
+        class RecordingClient:
+            async def allowlist_list(self, account_id_hex):
+                calls.append("list")
+                return {"welcomer_account_ids_hex": ["aa" * 32]}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                calls.append("add")
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                calls.append("remove")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"MARMOT_WELCOMER_ALLOWLIST": "   ", "MARMOT_DM_ALLOW_FROM": legacy_id},
+            clear=False,
+        ):
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                config_cls(extra={"account_id_hex": "11" * 32}),
+                client=RecordingClient(),
+            )
+            self.assertEqual(adapter.welcomer_allowlist, [])
+            await adapter._sync_welcomer_allowlist()
+        self.assertEqual(calls, [])
+        self.assertEqual(adapter._observations.reconciliation, "not_configured")
+
 
 class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

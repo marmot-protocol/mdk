@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import io
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -878,6 +880,27 @@ class DoctorReportTests(unittest.TestCase):
                 diag.resolve_welcomers({"welcomer_allowlist": []}, env_values={"MARMOT_WELCOMER_ALLOWLIST": "kk" * 32}),
                 [],
             )
+        legacy_id = "ll" * 32
+        for primary in ("   ", "\t", " \t "):
+            with self.subTest(primary=repr(primary)):
+                with mock.patch.dict(
+                    os.environ,
+                    {"MARMOT_WELCOMER_ALLOWLIST": primary, "MARMOT_DM_ALLOW_FROM": legacy_id},
+                    clear=False,
+                ):
+                    self.assertEqual(diag.resolve_welcomers({}), [])
+                    projected = diag.project_effective_env({}, environ=dict(os.environ))
+                    self.assertEqual(diag.resolve_welcomers({}, env_values=projected), [])
+        with mock.patch.dict(
+            os.environ,
+            {"MARMOT_WELCOMER_ALLOWLIST": "", "MARMOT_DM_ALLOW_FROM": legacy_id},
+            clear=False,
+        ):
+            self.assertEqual(diag.resolve_welcomers({}), [legacy_id])
+        with mock.patch.dict(os.environ, {"MARMOT_WELCOMER_ALLOWLIST": "", "MARMOT_DM_ALLOW_FROM": ""}, clear=False):
+            os.environ.pop("MARMOT_WELCOMER_ALLOWLIST", None)
+            os.environ.pop("MARMOT_DM_ALLOW_FROM", None)
+            self.assertEqual(diag.resolve_welcomers({}), [])
 
     def test_collect_dotenv_connector_and_home_without_yaml(self) -> None:
         with _short_tempdir("de-") as raw:
@@ -1316,10 +1339,10 @@ class DoctorReportTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(unsupported, frozenset())
         self.assertEqual(values["MARMOT_AGENT_AUTH_TOKEN"], "expanded-secret")
-        self.assertEqual(values["MARMOT_HOME_CHANNEL"], "xy")
-        self.assertEqual(values["MARMOT_AGENT_SOCKET"], "${SYNTHETIC_TOKEN}")
+        self.assertEqual(values["MARMOT_HOME_CHANNEL"], "$OTHER")
+        self.assertEqual(values["MARMOT_AGENT_SOCKET"], "expanded-secret")
         self.assertEqual(values["MARMOT_ACCOUNT_ID_HEX"], "xy")
-        self.assertEqual(values["MARMOT_HOME"], "$OTHER")
+        self.assertEqual(values["MARMOT_HOME"], "\\$OTHER")
         self.assertEqual(values["MARMOT_INBOUND_MEDIA_DIR"], "/fallback")
         empty, empty_error, empty_unsupported = diag.parse_dotenv_assignments(
             "MARMOT_AGENT_AUTH_TOKEN=\nMARMOT_AGENT_SOCKET=\"\"\n",
@@ -1334,6 +1357,193 @@ class DoctorReportTests(unittest.TestCase):
         )
         self.assertEqual(projected["MARMOT_AGENT_AUTH_TOKEN"], "")
         self.assertEqual(projected["MARMOT_AGENT_SOCKET"], "")
+
+    def test_dotenv_assignments_match_python_dotenv_1_2_2(self) -> None:
+        host_braced = re.compile(r"\$\{(?P<name>[^}:]*)(?::-(?P<default>[^}]*))?\}")
+        single_quoted = re.compile(r"'((?:\\'|[^'])*)'")
+        double_quoted = re.compile(r'"((?:\\"|[^"])*)"')
+        single_escapes = re.compile(r"\\[\\']")
+        double_escapes = re.compile(r"\\[\\'\"abfnrtv]")
+
+        def decode(regex: re.Pattern[str], value: str) -> str:
+            return regex.sub(lambda match: codecs.decode(match.group(0), "unicode-escape"), value)
+
+        def host_parse_scalar(raw: str) -> str | None:
+            value = raw.lstrip()
+            if not value:
+                return ""
+            if value[0] == "'":
+                match = single_quoted.match(value)
+                return None if match is None else decode(single_escapes, match.group(1))
+            if value[0] == '"':
+                match = double_quoted.match(value)
+                return None if match is None else decode(double_escapes, match.group(1))
+            return re.sub(r"\s+#.*", "", value).rstrip()
+
+        def host_dotenv_values(text: str, environ: dict[str, str]) -> dict[str, str]:
+            resolved: dict[str, str] = {}
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, raw = stripped.split("=", 1)
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[7:].strip()
+                parsed = host_parse_scalar(raw)
+                if parsed is None:
+                    continue
+                env = dict(environ)
+                env.update(resolved)
+                parts: list[str] = []
+                cursor = 0
+                for match in host_braced.finditer(parsed):
+                    parts.append(parsed[cursor : match.start()])
+                    name = match.group("name")
+                    default = match.group("default")
+                    if name in env:
+                        found = env[name]
+                        parts.append("" if found is None else str(found))
+                    else:
+                        parts.append(default if default is not None else "")
+                    cursor = match.end()
+                parts.append(parsed[cursor:])
+                resolved[key] = "".join(parts)
+            return resolved
+
+        environ = {
+            "SYNTHETIC_TOKEN": "expanded-secret",
+            "OTHER": "xy",
+            "BASE": "/host-base",
+            "EMPTY_ENV": "",
+        }
+        cases = (
+            "MARMOT_HOME_CHANNEL=$OTHER\nMARMOT_HOME=\"$OTHER\"\nMARMOT_GROUP_ID_HEX='$OTHER'\n",
+            "MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\nMARMOT_AGENT_SOCKET='${SYNTHETIC_TOKEN}'\nMARMOT_HOME=\"${OTHER}\"\n",
+            "MARMOT_HOME=\\$OTHER\nMARMOT_GROUP_ID_HEX=$$\nMARMOT_AGENT_SOCKET=pre$${OTHER}post\n",
+            "MARMOT_INBOUND_MEDIA_DIR=${MISSING:-/fallback}\nEMPTY_FILE=\nMARMOT_OUTBOUND_MEDIA_DIR=${EMPTY_FILE:-/default}\nMARMOT_HOME=${EMPTY_ENV:-/env-default}\n",
+            "BASE=/file-base\nMARMOT_AGENT_SOCKET=${BASE}/dev/wn-agent.sock\n",
+            "MARMOT_AGENT_SOCKET=${LATER}/dev/wn-agent.sock\nLATER=/later\n",
+            "MARMOT_AGENT_AUTH_TOKEN='it\\'s-secret'\nMARMOT_HOME_CHANNEL=\"quote\\\"d\"\n",
+            "MARMOT_HOME=first\nMARMOT_HOME=second\nMARMOT_GROUP_ID_HEX=${MARMOT_HOME}\n",
+            "export MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\nMARMOT_HOME=plain # comment\n",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                host = host_dotenv_values(text, environ)
+                values, error, unsupported = diag.parse_dotenv_assignments(text, environ=environ)
+                leftover = {
+                    key
+                    for key, value in host.items()
+                    if key in diag.DOTENV_CONNECTOR_KEYS and "${" in value
+                }
+                expected = {
+                    key: value
+                    for key, value in host.items()
+                    if key in diag.DOTENV_CONNECTOR_KEYS and key not in leftover
+                }
+                self.assertEqual(values, expected)
+                self.assertEqual(unsupported, leftover)
+                self.assertEqual(error, "unsupported" if leftover else None)
+                try:
+                    import dotenv
+                except ImportError:
+                    dotenv = None
+                if dotenv is not None and getattr(dotenv, "__version__", "") == "1.2.2":
+                    with mock.patch.dict(os.environ, environ, clear=False):
+                        live = dotenv.dotenv_values(stream=io.StringIO(text))
+                    for key, value in expected.items():
+                        self.assertEqual(live.get(key), value)
+
+    def test_collect_bare_dollar_socket_does_not_use_expanded_path(self) -> None:
+        expanded_home = "cc" * 16
+        expanded_account = "33" * 32
+        with _short_tempdir("bv-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            _private_dir(Path(args.home))
+            hermes = _private_dir(Path(args.hermes_home))
+            _private_dir(Path(args.plugin_dir))
+            real_socket = root / "real.sock"
+            _write(
+                hermes / ".env",
+                "MARMOT_AGENT_SOCKET=$BASE\n"
+                "MARMOT_ACCOUNT_ID_HEX=${SYNTHETIC_ACCOUNT}\n"
+                "MARMOT_HOME_CHANNEL=${SYNTHETIC_HOME}\n"
+                "MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\n",
+            )
+            connector = _ConnectorFixture(real_socket, expected_token="expanded-secret")
+            connector.start()
+            try:
+                env = {
+                    "BASE": str(real_socket),
+                    "SYNTHETIC_ACCOUNT": expanded_account,
+                    "SYNTHETIC_HOME": expanded_home,
+                    "SYNTHETIC_TOKEN": "expanded-secret",
+                }
+                with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                    diag, "bounded_run", return_value=None
+                ):
+                    report = doctor.collect(args)
+                self.assertEqual(connector.requests, [])
+                by_id = {item["id"]: item for item in report["checks"]}
+                self.assertNotEqual(by_id["account.selection"]["status"], "healthy")
+                encoded = json.dumps(report) + diag.render_human(report)
+                self.assertNotIn("expanded-secret", encoded)
+                self.assertNotIn(str(real_socket), encoded)
+                self.assertNotIn(expanded_account, encoded)
+            finally:
+                connector.stop()
+
+    def test_collect_host_equivalent_dotenv_sends_adapter_selected_token(self) -> None:
+        expanded_home = "cc" * 16
+        expanded_account = "33" * 32
+        with _short_tempdir("ht-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            _private_dir(Path(args.home))
+            hermes = _private_dir(Path(args.hermes_home))
+            _private_dir(Path(args.plugin_dir))
+            expanded_socket = root / "e.sock"
+            _write(
+                hermes / ".env",
+                "BASE=/ignored\n"
+                "MARMOT_AGENT_SOCKET='${SYNTHETIC_SOCKET}'\n"
+                "MARMOT_ACCOUNT_ID_HEX=${SYNTHETIC_ACCOUNT}\n"
+                "MARMOT_HOME_CHANNEL=${SYNTHETIC_HOME}\n"
+                "MARMOT_AGENT_AUTH_TOKEN='it\\'s-secret'\n",
+            )
+            connector = _ConnectorFixture(expanded_socket, expected_token="it's-secret")
+            connector.start()
+            try:
+                env = {
+                    "SYNTHETIC_SOCKET": str(expanded_socket),
+                    "SYNTHETIC_ACCOUNT": expanded_account,
+                    "SYNTHETIC_HOME": expanded_home,
+                    "SYNTHETIC_TOKEN": "unused",
+                }
+                values, error, unsupported = diag.parse_dotenv_assignments(
+                    (hermes / ".env").read_text(encoding="utf-8"),
+                    environ=env,
+                )
+                self.assertIsNone(error)
+                self.assertEqual(unsupported, frozenset())
+                projected = diag.project_effective_env(values, environ=env)
+                token, token_error = diag.resolve_auth_token({}, env_values=projected)
+                self.assertEqual(token, "it's-secret")
+                self.assertIsNone(token_error)
+                with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                    diag, "bounded_run", return_value=None
+                ):
+                    report = doctor.collect(args)
+                self.assertTrue(connector.requests)
+                self.assertEqual(connector.requests[0].get("auth_token"), "it's-secret")
+                self.assertEqual(connector.requests[0].get("account_id_hex"), expanded_account)
+                encoded = json.dumps(report) + diag.render_human(report)
+                self.assertNotIn("it's-secret", encoded)
+                self.assertNotIn(str(expanded_socket), encoded)
+            finally:
+                connector.stop()
 
     def test_collect_empty_dotenv_clears_inherited_and_uses_yaml(self) -> None:
         yaml_home = "aa" * 16

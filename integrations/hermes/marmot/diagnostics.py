@@ -7,6 +7,7 @@ gateway. The running adapter owns the private status socket and lifecycle state.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import socket
 import stat
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -92,15 +94,19 @@ DOTENV_MEDIA_KEYS = frozenset(
         "MARMOT_HOME",
     }
 )
+# Pinned python-dotenv 1.2.2 expands only ${VAR} / ${VAR:-default}. Bare $VAR,
+# $$, and \$ stay literal. Interpolation runs after quote decoding.
 _DOTENV_INTERPOLATION = re.compile(
-    r"(?P<escape>\\)?"
-    r"\$(?:"
-    r"(?P<escaped>\$)|"
-    r"(?P<named>[_A-Za-z][_A-Za-z0-9]*)|"
-    r"\{(?P<braced>[_A-Za-z][_A-Za-z0-9]*)\}|"
-    r"\{(?P<braced_default>[_A-Za-z][_A-Za-z0-9]*):-(?P<default>[^}]*)\}"
-    r")"
+    r"\$\{"
+    r"(?P<name>[^}:]*)"
+    r"(?::-(?P<default>[^}]*)"
+    r")?"
+    r"\}"
 )
+_DOTENV_SINGLE_QUOTED = re.compile(r"'((?:\\'|[^'])*)'")
+_DOTENV_DOUBLE_QUOTED = re.compile(r'"((?:\\"|[^"])*)"')
+_DOTENV_SINGLE_ESCAPES = re.compile(r"\\[\\']")
+_DOTENV_DOUBLE_ESCAPES = re.compile(r"\\[\\'\"abfnrtv]")
 
 
 def redacted(text: str) -> str:
@@ -278,7 +284,8 @@ def project_effective_env(
         if key not in DOTENV_CONNECTOR_KEYS:
             continue
         # Hermes load_dotenv(override=True) writes explicit empty assignments.
-        projected[key] = str(value).strip()
+        # Keep welcomer values raw so whitespace remains distinct from absence.
+        projected[key] = str(value) if key in WELCOMER_ENV_KEYS else str(value).strip()
     return projected
 
 
@@ -372,29 +379,54 @@ def split_config_list(value: Any) -> list[str]:
 
 
 def parse_dotenv_scalar(raw_value: str) -> str:
-    value, _interpolate = _parse_dotenv_scalar(raw_value)
+    value, _supported = _parse_dotenv_scalar(raw_value)
     return value
 
 
+def _decode_dotenv_escapes(regex: re.Pattern[str], value: str) -> str:
+    def decode_match(match: re.Match[str]) -> str:
+        return codecs.decode(match.group(0), "unicode-escape")
+
+    return regex.sub(decode_match, value)
+
+
 def _parse_dotenv_scalar(raw_value: str) -> tuple[str, bool]:
-    value = raw_value.strip()
+    value = raw_value.lstrip()
     if not value:
         return "", True
-    if value[0] in {"'", '"'}:
-        quote = value[0]
-        end = value.find(quote, 1)
-        inner = value[1:] if end == -1 else value[1:end]
-        return inner, quote != "'"
-    if " #" in value:
-        value = value.split(" #", 1)[0].rstrip()
-    return value, True
+    if value[0] == "'":
+        match = _DOTENV_SINGLE_QUOTED.match(value)
+        if match is None:
+            return value, False
+        return _decode_dotenv_escapes(_DOTENV_SINGLE_ESCAPES, match.group(1)), True
+    if value[0] == '"':
+        match = _DOTENV_DOUBLE_QUOTED.match(value)
+        if match is None:
+            return value, False
+        return _decode_dotenv_escapes(_DOTENV_DOUBLE_ESCAPES, match.group(1)), True
+    return re.sub(r"\s+#.*", "", value).rstrip(), True
+
+
+def _dotenv_lookup(name: str, env: Mapping[str, Any] | Any, default: Optional[str]) -> str:
+    if isinstance(env, Mapping):
+        if name in env:
+            found = env[name]
+            return "" if found is None else str(found)
+        return default if default is not None else ""
+    found = env(name)
+    if found not in (None, ""):
+        return str(found)
+    if default is not None:
+        return default
+    return "" if found is None else str(found)
 
 
 def interpolate_dotenv_value(value: str, lookup) -> tuple[str, bool]:
-    """Expand python-dotenv POSIX variables without sourcing the file.
+    """Expand python-dotenv 1.2.2 ${VAR} / ${VAR:-default} forms.
 
-    Returns ``(expanded, supported)``. Unsupported syntax is left unchanged
-    and flagged so callers do not treat the literal as a resolved secret.
+    Bare ``$VAR``, ``$$``, and ``\\$`` stay literal. Returns
+    ``(expanded, supported)``. Syntax the host would leave with a stray
+    ``${`` is flagged unsupported so callers do not use a different value.
     """
 
     if "${" in value and _DOTENV_INTERPOLATION.search(value) is None:
@@ -403,17 +435,7 @@ def interpolate_dotenv_value(value: str, lookup) -> tuple[str, bool]:
     cursor = 0
     for match in _DOTENV_INTERPOLATION.finditer(value):
         parts.append(value[cursor : match.start()])
-        if match.group("escape"):
-            parts.append(match.group(0)[1:])
-        elif match.group("escaped"):
-            parts.append("$")
-        elif match.group("named"):
-            parts.append(lookup(match.group("named")))
-        elif match.group("braced"):
-            parts.append(lookup(match.group("braced")))
-        else:
-            found = lookup(match.group("braced_default"))
-            parts.append(found if found else (match.group("default") or ""))
+        parts.append(_dotenv_lookup(match.group("name"), lookup, match.group("default")))
         cursor = match.end()
     parts.append(value[cursor:])
     expanded = "".join(parts)
@@ -716,6 +738,17 @@ def _read_auth_token_file(path_value: Any) -> tuple[Optional[str], Optional[str]
     return (loaded or None), None if loaded else "empty"
 
 
+def _raw_env_value(name: str, env_values: Optional[dict[str, str]] = None) -> Optional[str]:
+    """Return the raw environment value, preserving whitespace-only entries."""
+
+    if env_values is not None:
+        if name not in env_values:
+            return None
+        value = env_values[name]
+        return None if value is None else str(value)
+    return os.getenv(name)
+
+
 def resolve_welcomers(
     extra: dict[str, Any],
     *,
@@ -724,11 +757,11 @@ def resolve_welcomers(
     for key in WELCOMER_ALIASES:
         if key in extra:
             return split_config_list(extra[key])
-    for name in WELCOMER_ENV_KEYS:
-        value = env_lookup(name, env_values)
-        if value:
-            return split_config_list(value)
-    return []
+    # Match the pre-doctor adapter: first raw truthy environment value, then split.
+    configured = _raw_env_value(WELCOMER_ENV_KEYS[0], env_values) or _raw_env_value(
+        WELCOMER_ENV_KEYS[1], env_values
+    )
+    return split_config_list(configured) if configured else []
 
 
 @dataclass
@@ -1033,7 +1066,10 @@ def parse_dotenv_assignments(
     *,
     environ: Optional[dict[str, str]] = None,
 ) -> tuple[dict[str, str], Optional[str], frozenset[str]]:
-    raw: dict[str, tuple[str, bool]] = {}
+    source = dict(environ if environ is not None else os.environ)
+    resolved: dict[str, str] = {}
+    values: dict[str, str] = {}
+    unsupported_keys: set[str] = set()
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -1042,28 +1078,24 @@ def parse_dotenv_assignments(
         key = key.strip()
         if key.startswith("export "):
             key = key[7:].strip()
-        if key not in DOTENV_CONNECTOR_KEYS:
+        if not key:
             continue
-        raw[key] = _parse_dotenv_scalar(value)
-    source = environ if environ is not None else os.environ
-    parsed = {key: item[0] for key, item in raw.items()}
-
-    def lookup(name: str) -> str:
-        if name in parsed:
-            return parsed[name]
-        return str(source.get(name) or "")
-
-    values: dict[str, str] = {}
-    unsupported_keys: set[str] = set()
-    for key, (value, interpolate) in raw.items():
-        if not interpolate:
-            values[key] = value
+        parsed, supported_scalar = _parse_dotenv_scalar(value)
+        if not supported_scalar:
+            if key in DOTENV_CONNECTOR_KEYS:
+                unsupported_keys.add(key)
             continue
-        expanded, supported = interpolate_dotenv_value(value, lookup)
+        # override=True: process environment, then preceding file assignments.
+        env_map = dict(source)
+        env_map.update(resolved)
+        expanded, supported = interpolate_dotenv_value(parsed, env_map)
         if not supported:
-            unsupported_keys.add(key)
+            if key in DOTENV_CONNECTOR_KEYS:
+                unsupported_keys.add(key)
             continue
-        values[key] = expanded
+        resolved[key] = expanded
+        if key in DOTENV_CONNECTOR_KEYS:
+            values[key] = expanded
     return values, ("unsupported" if unsupported_keys else None), frozenset(unsupported_keys)
 
 
