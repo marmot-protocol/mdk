@@ -170,6 +170,8 @@ mod migration_0078_avatar_acquisition;
 mod migration_0079_content_reports;
 #[path = "migrations/0080_avatar_target_lookup.rs"]
 mod migration_0080_avatar_target_lookup;
+#[path = "migrations/0081_attachment_history.rs"]
+mod migration_0081_attachment_history;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -577,6 +579,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 80,
         name: "0080_avatar_target_lookup",
         apply: migration_0080_avatar_target_lookup::apply,
+    },
+    Migration {
+        version: 81,
+        name: "0081_attachment_history",
+        apply: migration_0081_attachment_history::apply,
     },
 ];
 
@@ -3302,6 +3309,42 @@ mod content_reports_tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             5
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_history_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_history_upgrade_indexes_existing_delivered_slots_and_tracks_removal() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..80]).unwrap();
+        conn.execute_batch(r#"
+            INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,
+                direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json)
+            VALUES('aa','old','source','received','alice','',9,'[]',1,2,'[]',
+                '{"imeta":[["imeta","url https://example.com/a"],null]}');
+        "#).unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM attachment_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "legacy delivered slots, including a rejected slot, stay discoverable"
+        );
+        conn.execute(
+            "UPDATE message_timeline SET deleted=1 WHERE message_id_hex='old'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM attachment_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 }

@@ -62,6 +62,17 @@ event per addressable slot in the validated fetch window. `account_key_package_r
 window's current and superseded public events so a client can delete a superseded event id without targeting
 the current winner or inventing a second Published row.
 
+Local-first hosts should call `local_account_key_packages` immediately, then independently await
+`refresh_account_key_packages` and replace the displayed snapshot. The local read is storage-only: it does
+not wait for network startup, start a worker, or query relays. It is synchronous SQLCipher I/O on the
+caller's thread, so hosts should keep it off a UI or main thread. All local rows have `relay == false`.
+`local_state` is the durable lifecycle (`Current`, `PendingReplacement`, `RetainedPrivateMaterial`,
+`OtherOwned`); `record.relay` is a validated relay observation. Do not infer lifecycle from empty event IDs
+or `published_at`. A failed or cancelled refresh must keep the local result. Empty bootstrap relays remain
+network-enabled. After a mutation, re-read local inventory rather than applying an older refresh. A retained
+row stays `RetainedPrivateMaterial` even when that exact event is observed; `record.relay` becomes true
+while local state remains retained.
+
 Account open performs the strict profile cutover before transport processing: the encrypted session transactionally
 retires every locally stored legacy KeyPackage private bundle, then the app best-effort deletes cached and
 relay-discoverable legacy kind `30443` events. A private owner-only retry marker is written before relay cleanup, so a

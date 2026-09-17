@@ -325,6 +325,11 @@ impl BrokerState {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) async fn mark_room_finished_for_test(&self, key: &BrokerStreamKey) -> bool {
+        self.mark_room_finished(key).await
+    }
+
     async fn mark_room_finished(&self, key: &BrokerStreamKey) -> bool {
         let mut inner = self.inner.lock().await;
         self.purge_expired_rooms(&mut inner);
@@ -388,6 +393,17 @@ impl BrokerState {
     #[cfg(test)]
     pub(crate) async fn room_count(&self) -> usize {
         self.inner.lock().await.rooms.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn live_subscriber_count_for_test(&self, key: &BrokerStreamKey) -> usize {
+        self.inner
+            .lock()
+            .await
+            .rooms
+            .get(key)
+            .map(|room| room.subscribers.len())
+            .unwrap_or(0)
     }
 
     #[cfg(test)]

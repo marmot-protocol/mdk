@@ -382,6 +382,39 @@ impl Marmot {
             .collect())
     }
 
+    /// Local-storage KeyPackage inventory with typed durable provenance.
+    /// Does not wait for network startup or issue a directory query.
+    /// Synchronous SQLCipher I/O on the calling thread; keep it off a UI or
+    /// main thread.
+    pub fn local_account_key_packages(
+        &self,
+        account_ref: String,
+    ) -> Result<Vec<conversions::AccountKeyPackageInventoryEntryFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .local_account_key_packages(&account_ref)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Fetch validated relay observations, then merge a fresh local snapshot.
+    /// Empty `bootstrap_relays` remains network-enabled. On failure, keep the
+    /// previously rendered local result.
+    pub async fn refresh_account_key_packages(
+        &self,
+        account_ref: String,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<Vec<conversions::AccountKeyPackageInventoryEntryFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .refresh_account_key_packages(&account_ref, endpoints(&bootstrap_relays))
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Observed relay history for `account_ref`: current and superseded
     /// kind-30443 events from one validated fetch window. Clients can pass a
     /// superseded event id and its source relays to the existing deletion API.
@@ -716,6 +749,53 @@ mod tests {
         assert_eq!(summary[0].unread_conversations, 0);
         assert_eq!(summary[0].attention_only_conversations, 0);
         assert!(!summary[0].has_unread);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_and_refresh_key_package_inventory_bindings() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url.clone());
+        let account = kit
+            .runtime
+            .create_identity(marmot_app::AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..marmot_app::AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+
+        let local = kit
+            .local_account_key_packages(account.account.account_id_hex.clone())
+            .expect("local inventory");
+        assert_eq!(local.len(), 1);
+        assert_eq!(
+            local[0].local_state,
+            conversions::AccountKeyPackageLocalStateFfi::Current
+        );
+        assert!(local[0].record.local);
+        assert!(!local[0].record.relay);
+
+        let refreshed = kit
+            .refresh_account_key_packages(account.account.account_id_hex.clone(), vec![relay_url])
+            .await
+            .expect("explicit refresh");
+        let current = refreshed
+            .iter()
+            .find(|entry| entry.local_state == conversions::AccountKeyPackageLocalStateFfi::Current)
+            .expect("current row");
+        assert!(current.record.local);
+        assert_eq!(
+            current.record.key_package_ref_hex,
+            local[0].record.key_package_ref_hex
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

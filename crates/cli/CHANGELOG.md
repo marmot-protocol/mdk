@@ -9,19 +9,25 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Local-first KeyPackage inventory across Rust, Swift/Kotlin and C, including
+  `localAccountKeyPackages`, `refreshAccountKeyPackages` and typed ownership via
+  `AccountKeyPackageLocalStateFfi`. Hosts can display a consistent local snapshot
+  immediately and add relay observations after refresh; retain the local result
+  if refresh fails. Regenerate bindings and headers with the matching library.
+  Android settings adoption remains a separate consumer change.
+- Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
+  installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
+  `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
+  a private diagnostics socket.
+
 ### Fixed
 
 - Hermes Marmot doctor now exits 0 on a healthy report, reads the configured home channel instead of the inbound filter, uses the same effective socket/account/auth and config fingerprint as the running plugin, treats an absent systemd unit as unknown, and keeps ACK-only diagnostic readiness from changing reconnect backoff.
 - Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
 - Hermes Marmot doctor now applies the same Hermes enablement-seed and user-dotenv override order as the running plugin, so a process or installed `.env` home/socket/account/token wins over conflicting YAML values.
 - Hermes Marmot doctor now preserves explicit empty dotenv assignments, expands supported dotenv variable references, and inspects the adapter's configured media directories instead of installer defaults. Unsupported dotenv interpolations are reported unknown and do not send inherited or YAML credentials.
-
-### Added
-
-- Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
-  installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
-  `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
-  a private diagnostics socket.
 
 ## [0.10.1] - 2026-09-16
 
@@ -66,6 +72,10 @@ This minor release establishes a new compatibility cohort. Update generated Swif
 
 ### Changed
 
+- The QUIC preview broker now bounds each subscriber backlog or live record write to the 120-second application
+  quiet-gap deadline. A stalled write resets and unsubscribes that subscriber so its stream permit can be reused;
+  transport keepalives do not extend the deadline, quiet waits for the next record stay unbounded, and the
+  connection permit of a still-open multiplexed connection is unchanged.
 - Forensic audit-log uploads now resolve, validate, and pin a fresh client for each attempt, with redirects and
   system proxies disabled. Private, retired, or redirected collector endpoints fail closed instead of following
   `Location` or dialing an unchecked address. Local loopback testing and the existing 60-second upload deadline remain.

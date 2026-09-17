@@ -92,8 +92,26 @@ superseded `eventIdHex` and its `sourceRelays` to the existing delete API.
 This does not change the Published-list filter (`relay == true`) and does not
 replace Android history UI work.
 
-Regenerate Swift/Kotlin bindings after pulling this surface. Android
-mention/QR/edit-profile migration remains
+`localAccountKeyPackages` is the local-first inventory: render it immediately.
+It is a synchronous SQLCipher read on the calling thread; do not invoke it on a
+UI or main thread. `refreshAccountKeyPackages` is the explicit network merge;
+replace the displayed snapshot with its result. On refresh failure or
+cancellation, keep the local result. Both return
+`AccountKeyPackageInventoryEntryFfi` (`record` plus `localState`). Existing
+`AccountKeyPackageFfi` is unchanged. `localState` and `record.relay` are the
+authoritative display distinctions; empty event IDs and `publishedAt` are not
+publication proof. A retained package stays `RetainedPrivateMaterial` even when
+that exact event is observed; `record.relay` becomes true while `localState`
+remains retained. Empty bootstrap relays remain network-enabled. After a
+mutation, re-read the local inventory instead of applying an out-of-order
+refresh.
+
+Regenerate Swift/Kotlin bindings after pulling this surface. Hosts must use a
+matching library: the new methods and enum are additive, but older generated
+sources cannot call them. Android device rendering remains a separate consumer
+adoption issue.
+
+Android mention/QR/edit-profile migration remains
 [whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
 MDK completion enables that follow-through but does not replace it.
 

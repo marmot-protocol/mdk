@@ -1,9 +1,10 @@
 //! Account summary, send summary, key-package, and user-profile FFI conversions.
 
 use marmot_app::{
-    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountSetupReadiness, AccountUnread,
-    GroupLeaveFailure, LocalCleanupReport, RelayFailure, SendSummary, SignOutOutcome,
-    UserProfileMetadata, WipeOutcome,
+    AccountKeyPackageInventoryEntry, AccountKeyPackageLocalState, AccountKeyPackageRecord,
+    AccountKeyPackageRelayEvent, AccountSetupReadiness, AccountUnread, GroupLeaveFailure,
+    LocalCleanupReport, RelayFailure, SendSummary, SignOutOutcome, UserProfileMetadata,
+    WipeOutcome,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -159,6 +160,47 @@ impl From<AccountKeyPackageRecord> for AccountKeyPackageFfi {
             source_relays: value.source_relays,
             local: value.local,
             relay: value.relay,
+        }
+    }
+}
+
+/// Durable ownership classification for one inventory row.
+///
+/// Hosts should render `local_state` and `record.relay` rather than inferring
+/// lifecycle from empty event IDs or `published_at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AccountKeyPackageLocalStateFfi {
+    NotLocal,
+    Current,
+    PendingReplacement,
+    RetainedPrivateMaterial,
+    OtherOwned,
+}
+
+impl From<AccountKeyPackageLocalState> for AccountKeyPackageLocalStateFfi {
+    fn from(value: AccountKeyPackageLocalState) -> Self {
+        match value {
+            AccountKeyPackageLocalState::NotLocal => Self::NotLocal,
+            AccountKeyPackageLocalState::Current => Self::Current,
+            AccountKeyPackageLocalState::PendingReplacement => Self::PendingReplacement,
+            AccountKeyPackageLocalState::RetainedPrivateMaterial => Self::RetainedPrivateMaterial,
+            AccountKeyPackageLocalState::OtherOwned => Self::OtherOwned,
+        }
+    }
+}
+
+/// One KeyPackage inventory row plus its typed local provenance.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AccountKeyPackageInventoryEntryFfi {
+    pub record: AccountKeyPackageFfi,
+    pub local_state: AccountKeyPackageLocalStateFfi,
+}
+
+impl From<AccountKeyPackageInventoryEntry> for AccountKeyPackageInventoryEntryFfi {
+    fn from(value: AccountKeyPackageInventoryEntry) -> Self {
+        Self {
+            record: value.record.into(),
+            local_state: value.local_state.into(),
         }
     }
 }
@@ -442,6 +484,57 @@ mod tests {
             vec!["wss://a.example".to_owned(), "wss://b.example".to_owned()]
         );
         assert!(!ffi.is_current);
+    }
+
+    #[test]
+    fn inventory_entry_maps_nested_record_and_every_local_state() {
+        let record = AccountKeyPackageRecord {
+            account_label: Some("device".into()),
+            account_id_hex: "aa".repeat(32),
+            key_package_id: "stable-slot".into(),
+            key_package_ref_hex: "bb".repeat(32),
+            key_package_event_id: "cc".repeat(32),
+            published_at: 7,
+            key_package_bytes: 64,
+            source_relays: vec!["wss://relay.example".into()],
+            local: true,
+            relay: false,
+        };
+        for (state, expected) in [
+            (
+                AccountKeyPackageLocalState::NotLocal,
+                AccountKeyPackageLocalStateFfi::NotLocal,
+            ),
+            (
+                AccountKeyPackageLocalState::Current,
+                AccountKeyPackageLocalStateFfi::Current,
+            ),
+            (
+                AccountKeyPackageLocalState::PendingReplacement,
+                AccountKeyPackageLocalStateFfi::PendingReplacement,
+            ),
+            (
+                AccountKeyPackageLocalState::RetainedPrivateMaterial,
+                AccountKeyPackageLocalStateFfi::RetainedPrivateMaterial,
+            ),
+            (
+                AccountKeyPackageLocalState::OtherOwned,
+                AccountKeyPackageLocalStateFfi::OtherOwned,
+            ),
+        ] {
+            let ffi = AccountKeyPackageInventoryEntryFfi::from(AccountKeyPackageInventoryEntry {
+                record: record.clone(),
+                local_state: state,
+            });
+            assert_eq!(ffi.record.account_ref.as_deref(), Some("device"));
+            assert_eq!(ffi.record.key_package_id, "stable-slot");
+            assert_eq!(ffi.record.event_id_hex, "cc".repeat(32));
+            assert_eq!(ffi.record.published_at, 7);
+            assert_eq!(ffi.record.key_package_bytes, 64);
+            assert!(ffi.record.local);
+            assert!(!ffi.record.relay);
+            assert_eq!(ffi.local_state, expected);
+        }
     }
 
     #[test]

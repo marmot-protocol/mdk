@@ -1,11 +1,11 @@
 //! C mirrors of the account conversions.
 
 use marmot_uniffi::conversions::{
-    AccountKeyPackageFfi, AccountKeyPackageRelayEventFfi, AccountSetupReadinessFfi,
-    AccountSummaryFfi, AccountUnreadFfi, GroupLeaveFailureFfi, IdentityCreationResultFfi,
-    LocalCleanupReportFfi, RelayFailureFfi, SendAcceptDispositionFfi,
-    SendMaintenanceDispositionFfi, SendSummaryFfi, SignOutOutcomeFfi, UserProfileMetadataFfi,
-    WipeOutcomeFfi,
+    AccountKeyPackageFfi, AccountKeyPackageInventoryEntryFfi, AccountKeyPackageLocalStateFfi,
+    AccountKeyPackageRelayEventFfi, AccountSetupReadinessFfi, AccountSummaryFfi, AccountUnreadFfi,
+    GroupLeaveFailureFfi, IdentityCreationResultFfi, LocalCleanupReportFfi, RelayFailureFfi,
+    SendAcceptDispositionFfi, SendMaintenanceDispositionFfi, SendSummaryFfi, SignOutOutcomeFfi,
+    UserProfileMetadataFfi, WipeOutcomeFfi,
 };
 
 use crate::MarmotStatus;
@@ -89,6 +89,27 @@ c_mirror! {
         str_vec source_relays/source_relays_len,
         copy local: bool,
         copy relay: bool,
+    }
+}
+
+c_enum! {
+    /// Durable ownership classification for one inventory row.
+    MarmotAccountKeyPackageLocalState from AccountKeyPackageLocalStateFfi {
+        NotLocal,
+        Current,
+        PendingReplacement,
+        RetainedPrivateMaterial,
+        OtherOwned,
+    }
+}
+
+c_mirror! {
+    /// One KeyPackage inventory row plus its typed local provenance.
+    /// The nested record is released by the list's deep-free.
+    MarmotAccountKeyPackageInventoryEntry from AccountKeyPackageInventoryEntryFfi,
+    list(MarmotAccountKeyPackageInventoryEntryList, marmot_account_key_package_inventory_entry_list_free) {
+        rec record: MarmotAccountKeyPackage,
+        copy local_state: MarmotAccountKeyPackageLocalState,
     }
 }
 
@@ -291,6 +312,48 @@ mod tests {
         assert_eq!(list.len, 0);
         let root = boxed(list);
         unsafe { marmot_account_summary_list_free(root) };
+    }
+
+    #[test]
+    fn inventory_entry_list_deep_roundtrip_and_null_free() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let mirror: MarmotAccountKeyPackageInventoryEntryList =
+            vec![AccountKeyPackageInventoryEntryFfi {
+                record: AccountKeyPackageFfi {
+                    account_ref: Some("device".into()),
+                    account_id_hex: "aa".repeat(32),
+                    key_package_id: "stable-slot".into(),
+                    key_package_ref_hex: "bb".repeat(32),
+                    event_id_hex: "cc".repeat(32),
+                    published_at: 7,
+                    key_package_bytes: 64,
+                    source_relays: vec!["wss://relay.example".into()],
+                    local: true,
+                    relay: false,
+                },
+                local_state: AccountKeyPackageLocalStateFfi::Current,
+            }]
+            .into();
+        assert_eq!(mirror.len, 1);
+        assert!(!mirror.items.is_null());
+        let first = unsafe { &*mirror.items };
+        assert_eq!(first.record.published_at, 7);
+        assert_eq!(first.record.key_package_bytes, 64);
+        assert!(first.record.local);
+        assert!(!first.record.relay);
+        assert_eq!(
+            first.local_state,
+            MarmotAccountKeyPackageLocalState::Current
+        );
+        let root = boxed(mirror);
+        unsafe { marmot_account_key_package_inventory_entry_list_free(root) };
+        unsafe { marmot_account_key_package_inventory_entry_list_free(std::ptr::null_mut()) };
+
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
     }
 
     #[test]
