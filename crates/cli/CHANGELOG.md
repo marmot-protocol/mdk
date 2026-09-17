@@ -13,6 +13,21 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Hermes Marmot doctor now exits 0 on a healthy report, reads the configured home channel instead of the inbound filter, uses the same effective socket/account/auth and config fingerprint as the running plugin, treats an absent systemd unit as unknown, and keeps ACK-only diagnostic readiness from changing reconnect backoff.
 - Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
+- Hermes Marmot doctor now applies the same Hermes enablement-seed and user-dotenv override order as the running plugin, so a process or installed `.env` home/socket/account/token wins over conflicting YAML values.
+
+### Added
+
+- Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
+  installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
+  `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
+  a private diagnostics socket.
+
+## [0.10.1] - 2026-09-16
+
+Update generated bindings, native libraries, and C headers together. Apple consumers must also stage the matching privacy resource in their Swift wrapper. Account storage advances through migration 80; back up before upgrade because downgrade is unsupported. See [0.10.1 release notes](../../docs/release/0.10.1.md).
+
+### Fixed
+
 - OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
   managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
   no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch. Failed
@@ -21,10 +36,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
-- Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
-  installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
-  `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
-  a private diagnostics socket.
+- Durable, account-scoped avatar assets and validated local asset access across native chat lists and conversation windows in Rust, Swift/Kotlin and C.
+- Authenticated group-system previews with prepared actor and subject identities.
+
 - Encrypted group reports (1984), shared dismissal labels (1985), and admin removal (4891),
   with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
   and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 79 adds the indexed

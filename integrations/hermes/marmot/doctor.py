@@ -52,29 +52,45 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     config, config_error = diag.parse_config_safely(config_path)
     parsed_env = diag.parse_env_safely(env_path)
     env_senders, env_allow_all, env_error = parsed_env.senders, parsed_env.allow_all, parsed_env.error
+    effective_env = diag.project_effective_env(parsed_env.values)
     merged = diag.merge_hermes_marmot_config(config)
-    extra = diag.apply_dotenv_connector_values(merged["extra"], parsed_env.values)
+    seed = diag.env_enablement_seed(
+        diag.plugin_settings_from_config(config),
+        env_values=effective_env,
+    )
+    effective = diag.apply_enablement_seed(merged, seed)
+    extra = effective["extra"]
     senders = env_senders or _split_sender_list(
-        extra.get("allowed_users") or extra.get("allowed_users_hex") or os.getenv("MARMOT_ALLOWED_USERS")
+        extra.get("allowed_users")
+        or extra.get("allowed_users_hex")
+        or effective_env.get("MARMOT_ALLOWED_USERS")
     )
     allow_all = env_allow_all or diag.parse_config_bool(
-        diag.first_config_value(extra, "allow_all_users", env="MARMOT_ALLOW_ALL_USERS"),
+        diag.first_config_value(
+            extra, "allow_all_users", env="MARMOT_ALLOW_ALL_USERS", env_values=effective_env
+        ),
         default=False,
     )
     home_route, home_error = diag.resolve_home_route(
         extra,
-        home_channel=merged["home_channel"],
-        home_platform=merged["home_platform"],
+        home_channel=effective["home_channel"],
+        home_platform=effective["home_platform"],
         override=args.group_id_hex,
-        env_values=parsed_env.values,
+        env_values=effective_env,
     )
-    account_hex, account_mode = diag.resolve_account_id(extra, override=args.account_id_hex)
-    socket_path = diag.resolve_socket_path(extra, fallback=installer_socket) or installer_socket
-    welcomers = diag.resolve_welcomers(extra, env_values=parsed_env.values)
+    account_hex, account_mode = diag.resolve_account_id(
+        extra, override=args.account_id_hex, env_values=effective_env
+    )
+    socket_path = (
+        diag.resolve_socket_path(extra, fallback=installer_socket, env_values=effective_env)
+        or installer_socket
+    )
+    welcomers = diag.resolve_welcomers(extra, env_values=effective_env)
     auth_token, auth_error = diag.resolve_auth_token(
         extra,
         token=args.auth_token,
         token_file=args.auth_token_file,
+        env_values=effective_env,
     )
     fingerprint_fields = diag.nonsecret_config_fields(
         senders=senders,
@@ -107,10 +123,10 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         checks.append(
             diag.check(
                 "account.selection",
-                owner="wn_agent",
+                owner="hermes_config",
                 provenance="observed",
                 status="fatal",
-                code="unauthorized",
+                code=auth_error if auth_error in {"unreadable", "empty"} else "unauthorized",
             )
         )
     elif time.monotonic() < deadline:

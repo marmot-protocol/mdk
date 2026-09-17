@@ -40,10 +40,10 @@ from marmot import doctor  # noqa: E402
 
 def _args(root: Path, **overrides) -> SimpleNamespace:
     values = {
-        "home": str(root / "marmot-home"),
-        "hermes_home": str(root / "hermes-home"),
-        "plugin_dir": str(root / "plugin"),
-        "socket": str(root / "marmot-home" / "dev" / "wn-agent.sock"),
+        "home": str(root / "m"),
+        "hermes_home": str(root / "h"),
+        "plugin_dir": str(root / "p"),
+        "socket": str(root / "m" / "dev" / "wn-agent.sock"),
         "prefix": str(root / "prefix"),
         "service_name": "wn-agent-hermes",
         "launchd_label": "org.marmot.wn-agent.hermes",
@@ -64,8 +64,20 @@ def _write(path: Path, text: str, mode: int = 0o600) -> None:
     os.chmod(path, mode)
 
 
+def _budgeted_tempdir(suffix: str, prefix: str = "h") -> tempfile.TemporaryDirectory:
+    tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    directory = tempfile.TemporaryDirectory(prefix=prefix, dir=tmp)
+    staged = str(Path(directory.name) / suffix.lstrip("/"))
+    if len(staged.encode("utf-8")) > diag.UNIX_SOCKET_PATH_MAX:
+        directory.cleanup()
+        raise AssertionError(
+            f"staged unix path exceeds {diag.UNIX_SOCKET_PATH_MAX} bytes under {tmp}"
+        )
+    return directory
+
+
 def _short_tempdir(prefix: str = "d-") -> tempfile.TemporaryDirectory:
-    return tempfile.TemporaryDirectory(prefix=prefix)
+    return _budgeted_tempdir("h/marmot/diagnostics.sock", prefix=prefix)
 
 
 class _ConnectorFixture:
@@ -93,8 +105,13 @@ class _ConnectorFixture:
         self.error: BaseException | None = None
 
     def start(self) -> None:
+        encoded = str(self.socket_path).encode("utf-8")
+        if len(encoded) > diag.UNIX_SOCKET_PATH_MAX:
+            raise RuntimeError(f"connector fixture path too long ({len(encoded)})")
         self._thread.start()
         if not self._ready.wait(2):
+            raise RuntimeError(f"connector fixture failed: {self.error}")
+        if self.error:
             raise RuntimeError(f"connector fixture failed: {self.error}")
 
     def stop(self) -> None:
@@ -156,9 +173,16 @@ class _PluginFixture:
         self.server: diag.DiagnosticSocketServer | None = None
 
     def start(self) -> None:
+        path = diag.diagnostics_socket_path(self.hermes_home)
+        if len(str(path).encode("utf-8")) > diag.UNIX_SOCKET_PATH_MAX:
+            raise RuntimeError(f"plugin fixture path too long ({path})")
         self._thread.start()
         if not self._ready.wait(2):
             raise RuntimeError(f"plugin fixture failed: {self.error}")
+        if self.error:
+            raise RuntimeError(f"plugin fixture failed: {self.error}")
+        if self.server is None or getattr(self.server, "_server", None) is None:
+            raise RuntimeError(f"plugin fixture socket did not bind: {path}")
 
     def stop(self) -> None:
         self._stop.set()
@@ -266,9 +290,9 @@ class DoctorReportTests(unittest.TestCase):
     def test_collect_missing_paths_is_non_mutating_and_redacts_canaries(self) -> None:
         with tempfile.TemporaryDirectory(prefix="d-") as raw:
             root = Path(raw)
-            home = root / "marmot-home"
-            hermes = root / "hermes-home"
-            plugin = root / "plugin"
+            home = root / "m"
+            hermes = root / "h"
+            plugin = root / "p"
             home.mkdir(mode=0o700)
             hermes.mkdir(mode=0o700)
             plugin.mkdir(mode=0o700)
@@ -523,9 +547,9 @@ class DoctorReportTests(unittest.TestCase):
     def test_collect_uses_configured_socket_token_and_account(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dc-") as raw:
             root = Path(raw)
-            home = root / "marmot-home"
-            hermes = root / "hermes-home"
-            plugin = root / "plugin"
+            home = root / "m"
+            hermes = root / "h"
+            plugin = root / "p"
             home.mkdir(mode=0o700)
             hermes.mkdir(mode=0o700)
             plugin.mkdir(mode=0o700)
@@ -711,31 +735,66 @@ class DoctorReportTests(unittest.TestCase):
         plugin_home = "bb" * 16
         env_home = "cc" * 16
         dotenv_home = "dd" * 16
-        extra = {"home_channel": platform_home}
-        with mock.patch.dict(os.environ, {"MARMOT_HOME_CHANNEL": env_home}, clear=False):
-            route, error = diag.resolve_home_route(
-                extra,
-                home_channel=platform_home,
-                home_platform="marmot",
-                env_values={"MARMOT_HOME_CHANNEL": dotenv_home},
-            )
-        self.assertEqual(route, platform_home)
-        self.assertIsNone(error)
-        route, error = diag.resolve_home_route(
-            {"home_channel": plugin_home},
-            home_channel=plugin_home,
-            home_platform="marmot",
-            env_values={"MARMOT_HOME_CHANNEL": dotenv_home},
+        config = {
+            "platforms": {
+                "marmot": {
+                    "home_channel": {"platform": "marmot", "chat_id": platform_home},
+                    "extra": {"socket_path": "/tmp/yaml.sock"},
+                }
+            },
+            "plugins": {"entries": {"marmot": {"settings": {"home_channel": plugin_home}}}},
+        }
+        cases = (
+            ({"MARMOT_AGENT_SOCKET": "/tmp/env.sock", "MARMOT_HOME_CHANNEL": env_home}, {}, env_home),
+            (
+                {"MARMOT_AGENT_SOCKET": "/tmp/env.sock", "MARMOT_HOME_CHANNEL": env_home},
+                {"MARMOT_HOME_CHANNEL": dotenv_home, "MARMOT_AGENT_SOCKET": "/tmp/dot.sock"},
+                dotenv_home,
+            ),
+            ({}, {"MARMOT_HOME_CHANNEL": dotenv_home, "MARMOT_AGENT_SOCKET": "/tmp/dot.sock"}, dotenv_home),
+            ({"MARMOT_HOME_CHANNEL": env_home}, {}, plugin_home),
+            ({}, {}, plugin_home),
         )
-        self.assertEqual(route, plugin_home)
-        with mock.patch.dict(os.environ, {"MARMOT_HOME_CHANNEL": env_home}, clear=False):
-            route, error = diag.resolve_home_route({}, env_values={"MARMOT_HOME_CHANNEL": dotenv_home})
-        self.assertEqual(route, env_home)
-        self.assertIsNone(error)
-        with mock.patch.dict(os.environ, {"MARMOT_HOME_CHANNEL": ""}, clear=False):
-            os.environ.pop("MARMOT_HOME_CHANNEL", None)
-            route, error = diag.resolve_home_route({}, env_values={"MARMOT_HOME_CHANNEL": dotenv_home})
-        self.assertEqual(route, dotenv_home)
+        for process_env, dotenv_values, expected in cases:
+            with self.subTest(process_env=process_env, dotenv=bool(dotenv_values)):
+                environ = {key: "" for key in ("MARMOT_AGENT_SOCKET", "MARMOT_HOME", "MARMOT_HOME_CHANNEL")}
+                environ.update(process_env)
+                projected = diag.project_effective_env(dotenv_values, environ=environ)
+                merged = diag.merge_hermes_marmot_config(config)
+                seed = diag.env_enablement_seed(
+                    diag.plugin_settings_from_config(config),
+                    env_values=projected,
+                )
+                effective = diag.apply_enablement_seed(merged, seed)
+                route, error = diag.resolve_home_route(
+                    effective["extra"],
+                    home_channel=effective["home_channel"],
+                    home_platform=effective["home_platform"],
+                    env_values=projected,
+                )
+                self.assertEqual(route, expected)
+                self.assertIsNone(error)
+        yaml_only = {
+            "platforms": {
+                "marmot": {
+                    "home_channel": {"platform": "marmot", "chat_id": platform_home},
+                    "extra": {"socket_path": "/tmp/yaml.sock"},
+                }
+            }
+        }
+        projected = diag.project_effective_env({}, environ={"MARMOT_HOME_CHANNEL": env_home})
+        merged = diag.merge_hermes_marmot_config(yaml_only)
+        effective = diag.apply_enablement_seed(
+            merged,
+            diag.env_enablement_seed(diag.plugin_settings_from_config(yaml_only), env_values=projected),
+        )
+        route, error = diag.resolve_home_route(
+            effective["extra"],
+            home_channel=effective["home_channel"],
+            home_platform=effective["home_platform"],
+            env_values=projected,
+        )
+        self.assertEqual(route, platform_home)
         self.assertIsNone(error)
 
     def test_auth_token_inline_beats_file_argument(self) -> None:
@@ -848,6 +907,123 @@ class DoctorReportTests(unittest.TestCase):
             self.assertEqual(by_id["home.syntax"]["status"], "healthy")
             self.assertEqual(by_id["home.configured_route"]["code"], "present")
 
+    def test_collect_conflicting_yaml_dotenv_and_process_matches_adapter(self) -> None:
+        yaml_home = "aa" * 16
+        dotenv_home = "bb" * 16
+        process_home = "cc" * 16
+        yaml_account = "11" * 32
+        dotenv_account = "22" * 32
+        process_account = "33" * 32
+        with _short_tempdir("cx-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            home = Path(args.home)
+            hermes = Path(args.hermes_home)
+            plugin = Path(args.plugin_dir)
+            home.mkdir(mode=0o700)
+            hermes.mkdir(mode=0o700)
+            plugin.mkdir(mode=0o700)
+            yaml_socket = root / "y.sock"
+            dotenv_socket = root / "d.sock"
+            process_socket = root / "e.sock"
+            yaml_token_file = hermes / "yaml.token"
+            dotenv_token_file = hermes / "dot.token"
+            process_token_file = hermes / "env.token"
+            _write(yaml_token_file, "yaml-file-token\n")
+            _write(dotenv_token_file, "dotenv-file-token\n")
+            _write(process_token_file, "process-file-token\n")
+            _write(
+                hermes / "config.yaml",
+                "platforms:\n  marmot:\n    home_channel:\n      platform: marmot\n"
+                "      chat_id: " + yaml_home + "\n    extra:\n"
+                "      socket_path: " + str(yaml_socket) + "\n"
+                "      account_id_hex: " + yaml_account + "\n"
+                "      auth_token: yaml-inline-token\n"
+                "      auth_token_file: " + str(yaml_token_file) + "\n",
+            )
+            _write(
+                hermes / ".env",
+                "MARMOT_AGENT_SOCKET=" + str(dotenv_socket) + "\n"
+                "MARMOT_ACCOUNT_ID_HEX=" + dotenv_account + "\n"
+                "MARMOT_HOME_CHANNEL=" + dotenv_home + "\n"
+                "MARMOT_AGENT_AUTH_TOKEN=dotenv-inline-token\n"
+                "MARMOT_AGENT_AUTH_TOKEN_FILE=" + str(dotenv_token_file) + "\n",
+            )
+            captured: dict[str, object] = {}
+
+            def fake_report(socket_path, account_hex, home_route, auth_token):
+                captured["socket"] = str(socket_path)
+                captured["account"] = account_hex
+                captured["home"] = home_route
+                captured["token"] = auth_token
+                return {"unsupported": True}
+
+            process_env = {
+                "MARMOT_AGENT_SOCKET": str(process_socket),
+                "MARMOT_ACCOUNT_ID_HEX": process_account,
+                "MARMOT_HOME_CHANNEL": process_home,
+                "MARMOT_AGENT_AUTH_TOKEN": "process-inline-token",
+                "MARMOT_AGENT_AUTH_TOKEN_FILE": str(process_token_file),
+                "MARMOT_HOME": "",
+            }
+            with mock.patch.dict(os.environ, process_env, clear=False), mock.patch.object(
+                diag, "bounded_run", return_value=None
+            ), mock.patch.object(doctor, "_connector_report", side_effect=fake_report):
+                report = doctor.collect(args)
+                projected = diag.project_effective_env(diag.parse_env_safely(hermes / ".env").values)
+                extra = {
+                    "socket_path": str(yaml_socket),
+                    "account_id_hex": yaml_account,
+                    "auth_token": "yaml-inline-token",
+                    "auth_token_file": str(yaml_token_file),
+                }
+                expected_socket = diag.resolve_socket_path(extra, env_values=projected)
+                expected_account, _mode = diag.resolve_account_id(extra, env_values=projected)
+                expected_token, token_error = diag.resolve_auth_token(extra, env_values=projected)
+                expected_seed = diag.env_enablement_seed(env_values=projected)
+            self.assertEqual(captured["socket"], str(dotenv_socket))
+            self.assertEqual(captured["account"], dotenv_account)
+            self.assertEqual(captured["home"], dotenv_home)
+            self.assertEqual(captured["token"], "dotenv-inline-token")
+            self.assertEqual(str(expected_socket), str(dotenv_socket))
+            self.assertEqual(expected_account, dotenv_account)
+            self.assertEqual(expected_token, "dotenv-inline-token")
+            self.assertIsNone(token_error)
+            self.assertEqual(expected_seed["home_channel"]["chat_id"], dotenv_home)
+            encoded = json.dumps(report) + diag.render_human(report)
+            self.assertNotIn("dotenv-inline-token", encoded)
+            self.assertNotIn("yaml-inline-token", encoded)
+            self.assertNotIn("process-inline-token", encoded)
+            self.assertNotIn(str(dotenv_socket), encoded)
+            self.assertNotIn(dotenv_account, encoded)
+
+    def test_local_token_file_errors_are_not_unauthorized(self) -> None:
+        with _short_tempdir("tf-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            Path(args.home).mkdir(mode=0o700)
+            Path(args.hermes_home).mkdir(mode=0o700)
+            Path(args.plugin_dir).mkdir(mode=0o700)
+            missing = Path(args.hermes_home) / "missing.token"
+            empty = Path(args.hermes_home) / "empty.token"
+            _write(empty, "\n")
+            with mock.patch.object(diag, "bounded_run", return_value=None), mock.patch.dict(
+                os.environ, {"MARMOT_AGENT_AUTH_TOKEN_FILE": str(missing), "MARMOT_AGENT_AUTH_TOKEN": ""}, clear=False
+            ):
+                os.environ.pop("MARMOT_AGENT_AUTH_TOKEN", None)
+                missing_report = doctor.collect(args)
+            missing_ids = {item["id"]: item for item in missing_report["checks"]}
+            self.assertEqual(missing_ids["account.selection"]["owner"], "hermes_config")
+            self.assertEqual(missing_ids["account.selection"]["code"], "unreadable")
+            with mock.patch.object(diag, "bounded_run", return_value=None), mock.patch.dict(
+                os.environ, {"MARMOT_AGENT_AUTH_TOKEN_FILE": str(empty), "MARMOT_AGENT_AUTH_TOKEN": ""}, clear=False
+            ):
+                os.environ.pop("MARMOT_AGENT_AUTH_TOKEN", None)
+                empty_report = doctor.collect(args)
+            empty_ids = {item["id"]: item for item in empty_report["checks"]}
+            self.assertEqual(empty_ids["account.selection"]["owner"], "hermes_config")
+            self.assertEqual(empty_ids["account.selection"]["code"], "empty")
+
     def test_collect_live_home_env_agrees_and_detects_mismatch(self) -> None:
         env_home = "33" * 16
         other_home = "44" * 16
@@ -917,6 +1093,82 @@ class DoctorReportTests(unittest.TestCase):
                     {item["id"]: item for item in recovered["checks"]}["home.live_agreement"]["code"],
                     "matching",
                 )
+            finally:
+                plugin_server.stop()
+                connector.stop()
+
+    def test_collect_live_dotenv_overrides_yaml_and_recovers_after_change(self) -> None:
+        yaml_home = "66" * 16
+        dotenv_home = "77" * 16
+        other_home = "88" * 16
+        yaml_account = "11" * 32
+        dotenv_account = "22" * 32
+        with _short_tempdir("ld-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            home = Path(args.home)
+            hermes = Path(args.hermes_home)
+            plugin = Path(args.plugin_dir)
+            home.mkdir(mode=0o700)
+            hermes.mkdir(mode=0o700)
+            plugin.mkdir(mode=0o700)
+            _write(plugin / "plugin.yaml", "version: 0.1.0\n")
+            yaml_socket = root / "y.sock"
+            dotenv_socket = root / "d.sock"
+            _write(
+                hermes / "config.yaml",
+                "platforms:\n  marmot:\n    home_channel:\n      platform: marmot\n"
+                "      chat_id: " + yaml_home + "\n    extra:\n"
+                "      socket_path: " + str(yaml_socket) + "\n"
+                "      account_id_hex: " + yaml_account + "\n",
+            )
+            _write(
+                hermes / ".env",
+                "MARMOT_AGENT_SOCKET=" + str(dotenv_socket) + "\n"
+                "MARMOT_ACCOUNT_ID_HEX=" + dotenv_account + "\n"
+                "MARMOT_HOME_CHANNEL=" + dotenv_home + "\n",
+            )
+            observations = diag.PluginObservations()
+            observations.mark("established")
+            observations.reconciliation = "succeeded"
+            observations.plugin_version = "0.1.0"
+            observations.loaded_home_digest = diag.identity_digest(dotenv_home)
+            fields = diag.nonsecret_config_fields(
+                senders=[],
+                allow_all=False,
+                welcomers=[],
+                account_id_hex=dotenv_account,
+                socket_path=str(dotenv_socket),
+                home_route=dotenv_home,
+            )
+            observations.loaded_fingerprint = diag.config_fingerprint(fields)
+            connector = _ConnectorFixture(dotenv_socket)
+            plugin_server = _PluginFixture(hermes, observations)
+            connector.start()
+            plugin_server.start()
+            try:
+                with mock.patch.object(diag, "bounded_run", return_value=None):
+                    first = doctor.collect(args)
+                self.assertTrue(connector.requests)
+                self.assertEqual(connector.requests[0].get("home_group_id_hex"), dotenv_home)
+                self.assertEqual(connector.requests[0].get("account_id_hex"), dotenv_account)
+                by_id = {item["id"]: item for item in first["checks"]}
+                self.assertEqual(by_id["home.live_agreement"]["code"], "matching")
+                self.assertEqual(by_id["restart.required"]["code"], "matching")
+                observations.loaded_home_digest = diag.identity_digest(other_home)
+                with mock.patch.object(diag, "bounded_run", return_value=None):
+                    mismatched = doctor.collect(args)
+                self.assertEqual(
+                    {item["id"]: item for item in mismatched["checks"]}["home.live_agreement"]["code"],
+                    "mismatch",
+                )
+                observations.loaded_home_digest = diag.identity_digest(dotenv_home)
+                observations.loaded_fingerprint = diag.config_fingerprint(fields)
+                with mock.patch.object(diag, "bounded_run", return_value=None):
+                    recovered = doctor.collect(args)
+                recovered_ids = {item["id"]: item for item in recovered["checks"]}
+                self.assertEqual(recovered_ids["home.live_agreement"]["code"], "matching")
+                self.assertEqual(recovered_ids["restart.required"]["code"], "matching")
             finally:
                 plugin_server.stop()
                 connector.stop()
@@ -1018,9 +1270,9 @@ class DoctorReportTests(unittest.TestCase):
 
 class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_socket_caps_and_refuses_foreign_paths(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="ds-") as raw:
+        with _short_tempdir("ds-") as raw:
             root = Path(raw)
-            hermes_home = root / "hermes"
+            hermes_home = root / "h"
             hermes_home.mkdir(mode=0o700)
             observations = diag.PluginObservations()
             observations.mark("awaiting_ack")
@@ -1029,6 +1281,7 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                 observations,
             )
             await server.start()
+            self.assertIsNotNone(server._server)
             self.addAsyncCleanup(server.stop)
             path = diag.diagnostics_socket_path(hermes_home)
             self.assertTrue(stat.S_ISSOCK(path.lstat().st_mode))
@@ -1047,14 +1300,15 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                 diag._bind_private_socket(foreign)
 
     async def test_status_socket_swallows_readline_value_error(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="do-") as raw:
-            hermes_home = Path(raw) / "hermes"
+        with _short_tempdir("do-") as raw:
+            hermes_home = Path(raw) / "h"
             hermes_home.mkdir(mode=0o700)
             server = diag.DiagnosticSocketServer(
                 diag.diagnostics_socket_path(hermes_home),
                 diag.PluginObservations(),
             )
             await server.start()
+            self.assertIsNotNone(server._server)
             self.addAsyncCleanup(server.stop)
             reader = mock.Mock()
             writer = mock.Mock()
@@ -1089,10 +1343,10 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
             writer.close.assert_called()
 
     async def test_status_socket_survives_permissive_umask(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="dm-") as raw:
+        with _short_tempdir("dm-") as raw:
             previous = os.umask(0o022)
             try:
-                hermes_home = Path(raw) / "hermes"
+                hermes_home = Path(raw) / "h"
                 hermes_home.mkdir(mode=0o700)
                 os.chmod(hermes_home, 0o700)
                 server = diag.DiagnosticSocketServer(
@@ -1100,6 +1354,7 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
                     diag.PluginObservations(),
                 )
                 await server.start()
+                self.assertIsNotNone(server._server)
                 self.addAsyncCleanup(server.stop)
                 path = diag.diagnostics_socket_path(hermes_home)
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)

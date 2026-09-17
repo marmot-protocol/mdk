@@ -2061,6 +2061,7 @@ mod tests {
         manager.workers.lock().await.insert(
             account.account_id_hex.clone(),
             ManagedAccountWorker {
+                ready: true,
                 media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     super::super::MEDIA_COMMAND_QUEUE_LIMIT,
                 )),
@@ -2168,6 +2169,7 @@ mod tests {
         manager.workers.lock().await.insert(
             account.account_id_hex.clone(),
             ManagedAccountWorker {
+                ready: true,
                 media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     super::super::MEDIA_COMMAND_QUEUE_LIMIT,
                 )),

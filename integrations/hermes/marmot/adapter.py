@@ -4079,53 +4079,13 @@ async def probe_readiness(
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
-    socket = os.getenv("MARMOT_AGENT_SOCKET", "").strip()
-    home = os.getenv("MARMOT_HOME", "").strip()
-    account = os.getenv("MARMOT_ACCOUNT_ID_HEX", "").strip()
-    group = os.getenv("MARMOT_GROUP_ID_HEX", "").strip()
-    candidates = os.getenv("MARMOT_QUIC_CANDIDATES", "").strip() or os.getenv("MARMOT_QUIC_CANDIDATE", "").strip()
-    if not (socket or home):
-        return None
-
-    seed: Dict[str, Any] = {}
-    if socket:
-        seed["socket_path"] = socket
-    if home:
-        seed["home"] = home
-    if account:
-        seed["account_id_hex"] = account
-    if group:
-        seed["group_id_hex"] = group
-    if candidates:
-        seed["quic_candidates"] = _split_config_list(candidates)
-    auth_token_file = os.getenv("MARMOT_AGENT_AUTH_TOKEN_FILE", "").strip()
-    if auth_token_file:
-        seed["auth_token_file"] = auth_token_file
-
-    home_channel = os.getenv("MARMOT_HOME_CHANNEL", "").strip()
-    if home_channel:
-        seed["home_channel"] = {
-            "chat_id": home_channel,
-            "name": os.getenv("MARMOT_HOME_CHANNEL_NAME", "Marmot"),
-        }
-    return seed
+    return marmot_diagnostics.env_enablement_seed()
 
 
 def _enablement_seed(plugin_settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Layer namespaced plugin settings behind higher-priority environment values."""
 
-    seed = dict(_env_enablement() or {})
-    for key in ("socket_path", "home", "account_id_hex", "group_id_hex"):
-        value = plugin_settings.get(key)
-        if value not in (None, ""):
-            seed.setdefault(key, value)
-    home_channel = plugin_settings.get("home_channel")
-    if home_channel not in (None, ""):
-        seed.setdefault(
-            "home_channel",
-            {"chat_id": str(home_channel), "name": "Marmot"},
-        )
-    return seed or None
+    return marmot_diagnostics.env_enablement_seed(plugin_settings)
 
 
 async def _standalone_send(

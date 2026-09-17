@@ -49,6 +49,7 @@ use crate::{
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
 pub(crate) struct ManagedAccountWorker {
+    pub(super) ready: bool,
     pub(crate) handle: JoinHandle<()>,
     pub(crate) commands: mpsc::Sender<AccountWorkerCommand>,
     pub(crate) media_admission: Arc<Semaphore>,
@@ -6244,6 +6245,7 @@ mod tests {
         manager.workers.lock().await.insert(
             account.account_id_hex.clone(),
             ManagedAccountWorker {
+                ready: true,
                 handle: worker,
                 commands: commands.clone(),
                 shutdown,

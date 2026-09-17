@@ -5890,7 +5890,12 @@ impl AccountManager {
                 let stale_account_ids = workers
                     .iter()
                     .filter_map(|(account_id, worker)| {
-                        if active_account_ids.contains(account_id) && !worker.handle.is_finished() {
+                        // A previous cancelled reconcile may have left startup unsettled.
+                        if active_account_ids.contains(account_id)
+                            && worker.ready
+                            && !worker.handle.is_finished()
+                            && !worker.commands.is_closed()
+                        {
                             None
                         } else {
                             Some(account_id.clone())
@@ -5949,6 +5954,7 @@ impl AccountManager {
                     workers.insert(
                         account.account_id_hex,
                         ManagedAccountWorker {
+                            ready: false,
                             handle,
                             commands: command_tx,
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
@@ -6000,6 +6006,13 @@ impl AccountManager {
                             "account worker startup timed out".into(),
                         ));
                     }
+                }
+            }
+            // Publish fast-path eligibility only after the entire startup batch succeeds.
+            let mut workers = self.workers.lock().await;
+            for account_id in spawned_account_ids {
+                if let Some(worker) = workers.get_mut(&account_id) {
+                    worker.ready = true;
                 }
             }
             Ok(())
@@ -6300,10 +6313,26 @@ impl AccountManager {
         if account.signed_out {
             return Err(AppError::RelayDirectory("account is signed out".into()));
         }
+        {
+            let workers = self.workers.lock().await;
+            self.shared.lifecycle().ensure_running()?;
+            if let Some(worker) = workers.get(&account.account_id_hex)
+                && worker.ready
+                && !worker.handle.is_finished()
+                && !worker.commands.is_closed()
+                && !self.account_is_tearing_down(&account.account_id_hex)
+                && (!account.external_signing
+                    || self.app.has_external_signer(&account.account_id_hex))
+                && self.onboarding_worker_allowed(&account.label)?
+            {
+                return Ok((worker.commands.clone(), worker.media_admission.clone()));
+            }
+        }
         self.reconcile().await?;
         let workers = self.workers.lock().await;
         workers
             .get(&account.account_id_hex)
+            .filter(|worker| worker.ready)
             .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
             .ok_or_else(|| {
                 AppError::RelayDirectory(

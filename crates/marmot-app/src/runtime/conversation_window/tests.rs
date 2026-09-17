@@ -76,6 +76,7 @@ impl Fixture {
         runtime.accounts.workers.lock().await.insert(
             account.account_id_hex.clone(),
             ManagedAccountWorker {
+                ready: true,
                 handle,
                 commands,
                 media_admission: Arc::new(Semaphore::new(1)),
@@ -1357,6 +1358,16 @@ async fn transient_worker_acquisition_failure_retries_without_closing_local_wind
 #[tokio::test]
 async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
     let f = Fixture::new(8).await;
+    // A missing requested worker forces reconciliation of the stale worker.
+    f.runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap()
+        .shutdown()
+        .await;
     let (commands, _rx) = mpsc::channel(8);
     let (shutdown, stopping) = oneshot::channel();
     let entered = Arc::new(Notify::new());
@@ -1371,6 +1382,7 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
     f.runtime.accounts.workers.lock().await.insert(
         "stale account".into(),
         ManagedAccountWorker {
+            ready: true,
             handle,
             commands,
             shutdown,

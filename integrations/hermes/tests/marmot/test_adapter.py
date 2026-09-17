@@ -18,11 +18,26 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
-TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="hs-")
+UNIX_SOCKET_PATH_MAX = 104
+
+
+def _unix_tempdir(suffix: str, prefix: str = "hs"):
+    tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    directory = tempfile.TemporaryDirectory(prefix=prefix, dir=tmp)
+    staged = str(Path(directory.name) / suffix.lstrip("/"))
+    if len(staged.encode("utf-8")) > UNIX_SOCKET_PATH_MAX:
+        directory.cleanup()
+        raise AssertionError(
+            f"staged unix path exceeds {UNIX_SOCKET_PATH_MAX} bytes under {tmp}"
+        )
+    return directory
+
+
+TEST_SPOOL_ROOT = _unix_tempdir("h/marmot/diagnostics.sock", prefix="hs")
 atexit.register(TEST_SPOOL_ROOT.cleanup)
 os.environ.setdefault(
     "HERMES_HOME",
-    str(Path(TEST_SPOOL_ROOT.name) / "hermes-home"),
+    str(Path(TEST_SPOOL_ROOT.name) / "h"),
 )
 
 
@@ -231,7 +246,7 @@ async def write_json_line(writer, value):
 class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter = load_adapter_module()
-        self.tempdir = tempfile.TemporaryDirectory()
+        self.tempdir = _unix_tempdir("wn-agent.sock", prefix="ac")
         self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
         self.server = None
 
@@ -5165,6 +5180,40 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 ["dd" * 32],
             )
 
+    def test_enablement_seed_matches_diagnostics_and_replaces_yaml_home(self):
+        diag = self.adapter_module.marmot_diagnostics
+        plugin_settings = {
+            "socket_path": "/tmp/plugin.sock",
+            "account_id_hex": "11" * 32,
+            "home_channel": "aa" * 16,
+        }
+        env = {
+            "MARMOT_AGENT_SOCKET": "/tmp/env.sock",
+            "MARMOT_HOME_CHANNEL": "bb" * 16,
+            "MARMOT_ACCOUNT_ID_HEX": "22" * 32,
+            "MARMOT_HOME": "",
+            "MARMOT_GROUP_ID_HEX": "",
+            "MARMOT_AGENT_AUTH_TOKEN_FILE": "",
+            "MARMOT_HOME_CHANNEL_NAME": "",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(
+                self.adapter_module._enablement_seed(plugin_settings),
+                diag.env_enablement_seed(plugin_settings),
+            )
+            seed = self.adapter_module._enablement_seed(plugin_settings)
+        self.assertEqual(seed["socket_path"], "/tmp/env.sock")
+        self.assertEqual(seed["account_id_hex"], "22" * 32)
+        self.assertEqual(seed["home_channel"]["chat_id"], "bb" * 16)
+        merged = {
+            "extra": {"socket_path": "/tmp/yaml.sock", "account_id_hex": "33" * 32},
+            "home_channel": "aa" * 16,
+            "home_platform": "marmot",
+        }
+        effective = diag.apply_enablement_seed(merged, seed)
+        self.assertEqual(effective["extra"]["socket_path"], "/tmp/env.sock")
+        self.assertEqual(effective["home_channel"], "bb" * 16)
+
     async def test_recovery_count_increments_through_awaiting_ack(self):
         observations = self.adapter_module.marmot_diagnostics.PluginObservations()
         observations.mark("starting")
@@ -8405,7 +8454,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
-        self.tempdir = tempfile.TemporaryDirectory()
+        self.tempdir = _unix_tempdir("wn-agent.sock", prefix="ac")
         self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
         self.server = None
 

@@ -28,6 +28,7 @@ SUBPROCESS_TIMEOUT_S = 3.0
 CONNECTOR_TIMEOUT_S = 5.0
 DOCTOR_DEADLINE_S = 20.0
 MAX_CONFIG_BYTES = 256 * 1024
+UNIX_SOCKET_PATH_MAX = 104
 CHECK_OWNERS = ("installer", "service", "wn_agent", "hermes_config", "hermes_plugin")
 CHECK_PROVENANCE = ("observed", "inferred")
 CHECK_STATUSES = ("healthy", "degraded", "fatal", "unknown")
@@ -211,9 +212,20 @@ def parse_config_bool(value: Any, *, default: bool = False) -> bool:
     return text not in {"0", "false", "no", "off", "disabled"}
 
 
-def first_config_value(extra: dict[str, Any], *keys: str, env: Optional[str] = None) -> Any:
+def env_lookup(name: str, env_values: Optional[dict[str, str]] = None) -> str:
+    if env_values is not None:
+        return str(env_values.get(name) or "").strip()
+    return os.getenv(name, "").strip()
+
+
+def first_config_value(
+    extra: dict[str, Any],
+    *keys: str,
+    env: Optional[str] = None,
+    env_values: Optional[dict[str, str]] = None,
+) -> Any:
     if env:
-        value = os.getenv(env)
+        value = env_lookup(env, env_values)
         if value:
             return value
     for key in keys:
@@ -221,6 +233,109 @@ def first_config_value(extra: dict[str, Any], *keys: str, env: Optional[str] = N
         if value:
             return value
     return None
+
+
+def project_effective_env(
+    dotenv_values: Optional[dict[str, str]] = None,
+    *,
+    environ: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Project Hermes user-dotenv loading without mutating the process.
+
+    The pinned current-candidate loader applies ``~/.hermes/.env`` with
+    ``override=True``. Only connector keys are overlaid; other host or managed
+    overrides stay unmodeled.
+    """
+
+    projected = dict(environ if environ is not None else os.environ)
+    for key, value in (dotenv_values or {}).items():
+        if key not in DOTENV_CONNECTOR_KEYS:
+            continue
+        stripped = str(value).strip()
+        if stripped:
+            projected[key] = stripped
+    return projected
+
+
+def plugin_settings_from_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict) or not isinstance(plugins.get("entries"), dict):
+        return {}
+    plugin = plugins["entries"].get("marmot")
+    if not isinstance(plugin, dict) or not isinstance(plugin.get("settings"), dict):
+        return {}
+    return {
+        key: value
+        for key, value in plugin["settings"].items()
+        if value not in (None, "")
+    }
+
+
+def env_enablement_seed(
+    plugin_settings: Optional[dict[str, Any]] = None,
+    *,
+    env_values: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the same enablement seed Hermes applies from env plus plugin settings."""
+
+    socket = env_lookup("MARMOT_AGENT_SOCKET", env_values)
+    home = env_lookup("MARMOT_HOME", env_values)
+    account = env_lookup("MARMOT_ACCOUNT_ID_HEX", env_values)
+    group = env_lookup("MARMOT_GROUP_ID_HEX", env_values)
+    candidates = env_lookup("MARMOT_QUIC_CANDIDATES", env_values) or env_lookup(
+        "MARMOT_QUIC_CANDIDATE", env_values
+    )
+    seed: dict[str, Any] = {}
+    if socket or home:
+        if socket:
+            seed["socket_path"] = socket
+        if home:
+            seed["home"] = home
+        if account:
+            seed["account_id_hex"] = account
+        if group:
+            seed["group_id_hex"] = group
+        if candidates:
+            seed["quic_candidates"] = split_config_list(candidates)
+        auth_token_file = env_lookup("MARMOT_AGENT_AUTH_TOKEN_FILE", env_values)
+        if auth_token_file:
+            seed["auth_token_file"] = auth_token_file
+        home_channel = env_lookup("MARMOT_HOME_CHANNEL", env_values)
+        if home_channel:
+            seed["home_channel"] = {
+                "chat_id": home_channel,
+                "name": env_lookup("MARMOT_HOME_CHANNEL_NAME", env_values) or "Marmot",
+            }
+    for key in ("socket_path", "home", "account_id_hex", "group_id_hex"):
+        value = (plugin_settings or {}).get(key)
+        if value not in (None, ""):
+            seed.setdefault(key, value)
+    plugin_home = (plugin_settings or {}).get("home_channel")
+    if plugin_home not in (None, ""):
+        seed.setdefault("home_channel", {"chat_id": str(plugin_home), "name": "Marmot"})
+    return seed or None
+
+
+def apply_enablement_seed(
+    merged: dict[str, Any],
+    seed: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply Hermes ``extra.update(seed)`` plus home-channel replacement."""
+
+    extra = dict(merged.get("extra") or {})
+    home_channel = merged.get("home_channel")
+    home_platform = merged.get("home_platform")
+    if not seed:
+        return {"extra": extra, "home_channel": home_channel, "home_platform": home_platform}
+    applied = dict(seed)
+    home = applied.pop("home_channel", None)
+    extra.update(applied)
+    if isinstance(home, dict) and home.get("chat_id"):
+        home_channel = home.get("chat_id")
+        home_platform = "marmot"
+    return {"extra": extra, "home_channel": home_channel, "home_platform": home_platform}
 
 
 def split_config_list(value: Any) -> list[str]:
@@ -392,9 +507,7 @@ def resolve_home_route(
     if home_platform and home_platform not in {"marmot"}:
         return None, "wrong_platform"
     if home_channel in (None, ""):
-        env_home = os.getenv("MARMOT_HOME_CHANNEL", "").strip()
-        if not env_home and env_values:
-            env_home = str(env_values.get("MARMOT_HOME_CHANNEL") or "").strip()
+        env_home = env_lookup("MARMOT_HOME_CHANNEL", env_values)
         if env_home:
             home_channel = env_home
     if home_channel in (None, ""):
@@ -407,9 +520,10 @@ def resolve_account_id(
     extra: dict[str, Any],
     *,
     override: Optional[str] = None,
+    env_values: Optional[dict[str, str]] = None,
 ) -> tuple[Optional[str], str]:
     candidate = override if override not in (None, "") else first_config_value(
-        extra, "account_id_hex", "account", env="MARMOT_ACCOUNT_ID_HEX"
+        extra, "account_id_hex", "account", env="MARMOT_ACCOUNT_ID_HEX", env_values=env_values
     )
     if candidate in (None, ""):
         return None, "auto"
@@ -419,11 +533,18 @@ def resolve_account_id(
     return account, "explicit"
 
 
-def resolve_socket_path(extra: dict[str, Any], *, fallback: Optional[Path] = None) -> Optional[Path]:
-    configured = first_config_value(extra, "socket_path", "agent_socket", "socket", env="MARMOT_AGENT_SOCKET")
+def resolve_socket_path(
+    extra: dict[str, Any],
+    *,
+    fallback: Optional[Path] = None,
+    env_values: Optional[dict[str, str]] = None,
+) -> Optional[Path]:
+    configured = first_config_value(
+        extra, "socket_path", "agent_socket", "socket", env="MARMOT_AGENT_SOCKET", env_values=env_values
+    )
     if configured:
         return Path(str(configured)).expanduser()
-    home = first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME")
+    home = first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME", env_values=env_values)
     if home:
         return Path(str(home)).expanduser() / "dev" / "wn-agent.sock"
     return Path(fallback).expanduser() if fallback is not None else None
@@ -434,18 +555,25 @@ def resolve_auth_token(
     *,
     token: Optional[str] = None,
     token_file: Optional[str] = None,
+    env_values: Optional[dict[str, str]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     if token not in (None, ""):
         stripped = str(token).strip()
         return (stripped or None), None if stripped else "empty"
-    configured = first_config_value(extra, "auth_token", "agent_auth_token", env="MARMOT_AGENT_AUTH_TOKEN")
+    configured = first_config_value(
+        extra, "auth_token", "agent_auth_token", env="MARMOT_AGENT_AUTH_TOKEN", env_values=env_values
+    )
     if configured not in (None, ""):
         stripped = str(configured).strip()
         return (stripped or None), None if stripped else "empty"
     if token_file not in (None, ""):
         return _read_auth_token_file(token_file)
     configured_file = first_config_value(
-        extra, "auth_token_file", "agent_auth_token_file", env="MARMOT_AGENT_AUTH_TOKEN_FILE"
+        extra,
+        "auth_token_file",
+        "agent_auth_token_file",
+        env="MARMOT_AGENT_AUTH_TOKEN_FILE",
+        env_values=env_values,
     )
     if configured_file in (None, ""):
         return None, None
@@ -470,11 +598,7 @@ def resolve_welcomers(
         if key in extra:
             return split_config_list(extra[key])
     for name in WELCOMER_ENV_KEYS:
-        value = os.getenv(name)
-        if value:
-            return split_config_list(value)
-    for name in WELCOMER_ENV_KEYS:
-        value = (env_values or {}).get(name)
+        value = env_lookup(name, env_values)
         if value:
             return split_config_list(value)
     return []

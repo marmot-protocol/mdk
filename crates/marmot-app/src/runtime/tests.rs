@@ -10,6 +10,88 @@ use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
 
 #[tokio::test]
+async fn worker_lookup_skips_reconcile() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    let account = app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (commands, received) = mpsc::channel(1);
+    let (shutdown, stopped) = oneshot::channel();
+    manager.workers.lock().await.insert(
+        account.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: true,
+            handle: tokio::spawn(async move {
+                let _ = stopped.await;
+            }),
+            commands: commands.clone(),
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+    // A lifecycle transaction for another account must not hold up this worker.
+    let transaction = manager.worker_transactions.lock().await;
+    let found = timeout(Duration::from_millis(100), async {
+        assert!(
+            manager
+                .worker_commands("alice")
+                .await?
+                .same_channel(&commands)
+        );
+        assert!(
+            manager
+                .worker_commands_for_setup("alice")
+                .await?
+                .same_channel(&commands)
+        );
+        manager.media_worker_commands("alice").await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(found.0.same_channel(&commands));
+    drop(found);
+
+    for ready in [false, true] {
+        manager
+            .workers
+            .lock()
+            .await
+            .get_mut(&account.account_id_hex)
+            .unwrap()
+            .ready = ready;
+        manager.set_account_tearing_down(&account.account_id_hex, ready);
+        assert!(
+            timeout(Duration::from_millis(10), manager.worker_commands("alice"))
+                .await
+                .is_err()
+        );
+    }
+    manager.set_account_tearing_down(&account.account_id_hex, false);
+    drop(received);
+    assert!(
+        timeout(Duration::from_millis(10), manager.worker_commands("alice"))
+            .await
+            .is_err()
+    );
+    let worker = manager
+        .workers
+        .lock()
+        .await
+        .remove(&account.account_id_hex)
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(10), manager.worker_commands("alice"))
+            .await
+            .is_err()
+    );
+    drop(transaction);
+    worker.shutdown().await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn message_journey_early_errors() {
     let root = tempfile::tempdir().unwrap();
     let runtime = MarmotApp::with_relays(root.path(), vec![]).runtime();
@@ -571,6 +653,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         std::future::pending::<()>().await;
     });
     let worker = ManagedAccountWorker {
+        ready: true,
         media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
             crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
         )),
@@ -2066,6 +2149,7 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
         workers.lock().await.insert(
             "replacement".to_owned(),
             ManagedAccountWorker {
+                ready: true,
                 media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
                 )),
@@ -2435,6 +2519,42 @@ async fn open_runtime_local_test_client(
     app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle())
         .await
         .expect("open local test client")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_startup_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let account = app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    wait_for_test_signal(reached, "account open before cancellation").await;
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    let old_commands = {
+        let workers = manager.workers.lock().await;
+        let worker = workers.get(&account.account_id_hex).unwrap();
+        assert!(!worker.ready);
+        worker.commands.clone()
+    };
+
+    let retrying = manager.clone();
+    let mut lookup = tokio::spawn(async move { retrying.worker_commands("alice").await });
+    // Reaping must wait for the abandoned open to release its session guard.
+    let premature = timeout(Duration::from_millis(50), &mut lookup).await;
+    proceed.send(()).unwrap();
+    assert!(premature.is_err());
+    let commands = timeout(Duration::from_secs(10), lookup)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!commands.same_channel(&old_commands));
+    assert!(manager.workers.lock().await[&account.account_id_hex].ready);
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
