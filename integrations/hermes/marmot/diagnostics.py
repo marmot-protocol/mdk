@@ -7,7 +7,6 @@ gateway. The running adapter owns the private status socket and lifecycle state.
 from __future__ import annotations
 
 import asyncio
-import codecs
 import hashlib
 import json
 import os
@@ -383,11 +382,27 @@ def parse_dotenv_scalar(raw_value: str) -> str:
     return value
 
 
-def _decode_dotenv_escapes(regex: re.Pattern[str], value: str) -> str:
-    def decode_match(match: re.Match[str]) -> str:
-        return codecs.decode(match.group(0), "unicode-escape")
+_DOTENV_SINGLE_ESCAPE_MAP = {"\\\\": "\\", "\\'": "'"}
+_DOTENV_DOUBLE_ESCAPE_MAP = {
+    "\\\\": "\\",
+    "\\'": "'",
+    '\\"': '"',
+    "\\a": "\a",
+    "\\b": "\b",
+    "\\f": "\f",
+    "\\n": "\n",
+    "\\r": "\r",
+    "\\t": "\t",
+    "\\v": "\v",
+}
 
-    return regex.sub(decode_match, value)
+
+def _decode_dotenv_escapes(
+    regex: re.Pattern[str],
+    value: str,
+    table: Mapping[str, str],
+) -> str:
+    return regex.sub(lambda match: table.get(match.group(0), match.group(0)), value)
 
 
 def _parse_dotenv_scalar(raw_value: str) -> tuple[str, bool]:
@@ -398,12 +413,16 @@ def _parse_dotenv_scalar(raw_value: str) -> tuple[str, bool]:
         match = _DOTENV_SINGLE_QUOTED.match(value)
         if match is None:
             return value, False
-        return _decode_dotenv_escapes(_DOTENV_SINGLE_ESCAPES, match.group(1)), True
+        return _decode_dotenv_escapes(
+            _DOTENV_SINGLE_ESCAPES, match.group(1), _DOTENV_SINGLE_ESCAPE_MAP
+        ), True
     if value[0] == '"':
         match = _DOTENV_DOUBLE_QUOTED.match(value)
         if match is None:
             return value, False
-        return _decode_dotenv_escapes(_DOTENV_DOUBLE_ESCAPES, match.group(1)), True
+        return _decode_dotenv_escapes(
+            _DOTENV_DOUBLE_ESCAPES, match.group(1), _DOTENV_DOUBLE_ESCAPE_MAP
+        ), True
     return re.sub(r"\s+#.*", "", value).rstrip(), True
 
 

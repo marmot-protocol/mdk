@@ -28,7 +28,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
 - Hermes Marmot doctor now applies the same Hermes enablement-seed and user-dotenv override order as the running plugin, so a process or installed `.env` home/socket/account/token wins over conflicting YAML values.
 - Hermes Marmot doctor now preserves explicit empty dotenv assignments, expands supported dotenv variable references, and inspects the adapter's configured media directories instead of installer defaults. Unsupported dotenv interpolations are reported unknown and do not send inherited or YAML credentials.
-- Hermes Marmot doctor dotenv interpolation now matches python-dotenv 1.2.2: bare `$VAR` stays literal, `${VAR}` expands in every quoting form, and references resolve from preceding file assignments then the process environment. Shared welcomer resolution again uses the first raw truthy environment value so a whitespace-only primary allowlist does not fall back to the legacy alias.
+- Hermes Marmot doctor dotenv interpolation now matches python-dotenv 1.2.2: bare `$VAR` stays literal, `${VAR}` expands in every quoting form, and references resolve from preceding file assignments then the process environment. Live welcomer resolution keeps the pre-doctor raw environment precedence so a whitespace-only primary allowlist does not fall back to the legacy alias or change gateway reconciliation.
 
 ## [0.10.1] - 2026-09-16
 

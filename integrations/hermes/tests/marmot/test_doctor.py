@@ -1445,13 +1445,19 @@ class DoctorReportTests(unittest.TestCase):
                 self.assertEqual(values, expected)
                 self.assertEqual(unsupported, leftover)
                 self.assertEqual(error, "unsupported" if leftover else None)
+                dotenv_module = None
+                dotenv_version = ""
                 try:
-                    import dotenv
-                except ImportError:
-                    dotenv = None
-                if dotenv is not None and getattr(dotenv, "__version__", "") == "1.2.2":
+                    import importlib.metadata as importlib_metadata
+
+                    import dotenv as dotenv_module
+                    dotenv_version = importlib_metadata.version("python-dotenv")
+                except Exception:
+                    dotenv_module = None
+                    dotenv_version = ""
+                if dotenv_module is not None and dotenv_version == "1.2.2":
                     with mock.patch.dict(os.environ, environ, clear=False):
-                        live = dotenv.dotenv_values(stream=io.StringIO(text))
+                        live = dotenv_module.dotenv_values(stream=io.StringIO(text))
                     for key, value in expected.items():
                         self.assertEqual(live.get(key), value)
 

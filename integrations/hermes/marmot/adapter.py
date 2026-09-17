@@ -791,7 +791,17 @@ def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) 
 
 
 def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
-    return marmot_diagnostics.resolve_welcomers(extra)
+    """Keep the pre-doctor raw environment precedence for live reconciliation.
+
+    Doctor projection must match this function; do not delegate the running
+    adapter through diagnostic helpers that may strip or rewrite values.
+    """
+
+    for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
+        if key in extra:
+            return _split_config_list(extra[key])
+    configured = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
+    return _split_config_list(configured) if configured else []
 
 
 def open_directory_without_symlinks(path: Path) -> int:
