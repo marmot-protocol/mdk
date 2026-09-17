@@ -9,6 +9,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Bounded local attachment discovery via `marmot_attachment_history_page` and
+  `marmot_attachment_history_version`, with typed page results, categories and
+  opaque cursor/version handles. Compare refresh versions with
+  `marmot_attachment_history_version_change_since`; retain an independent baseline
+  with `marmot_attachment_history_version_clone`. Release owned results with
+  `marmot_attachment_page_read_free` and `marmot_attachment_history_version_free`.
+  Reads do not require an engine or start downloads. Regenerate headers and use
+  the matching library.
+
 - `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,
   `MarmotAccountKeyPackageInventoryEntryList`,
   `marmot_account_key_package_inventory_entry_list_free`,

@@ -5,7 +5,7 @@ use crate::memory::{
     CFree, boxed, boxed_opt, free_boxed, free_guard, free_vec, owned_vec, required_str,
 };
 use crate::types::media::MarmotMediaAttachmentOutcome;
-use crate::{MarmotClient, MarmotStatus, client_ref, ffi_guard, preflight_out, preflight_out_ptr};
+use crate::{MarmotClient, MarmotStatus, check_out, client_ref, ffi_guard, preflight_out_ptr};
 use marmot_uniffi::conversions::*;
 use std::{ffi::c_char, sync::Arc};
 
@@ -196,7 +196,7 @@ pub unsafe extern "C" fn marmot_attachment_history_version_change_since(
     out: *mut u32,
 ) -> MarmotStatus {
     ffi_guard(|| {
-        try_arg!(unsafe { preflight_out(out) });
+        try_arg!(unsafe { check_out(out) });
         let Some(current) = (unsafe { current.as_ref() }) else {
             return MarmotStatus::NullPointer;
         };
@@ -369,6 +369,18 @@ mod tests {
                 MarmotStatus::Ok
             );
             assert_eq!(change, MarmotAttachmentHistoryChange::Unchanged as u32);
+            // Failure must not synthesize Unchanged (zero) into an enum output.
+            for (current, previous) in [
+                (ptr::null(), page.version.cast_const()),
+                (version.cast_const(), ptr::null()),
+            ] {
+                change = u32::MAX;
+                assert_eq!(
+                    marmot_attachment_history_version_change_since(current, previous, &mut change),
+                    MarmotStatus::NullPointer
+                );
+                assert_eq!(change, u32::MAX);
+            }
             assert_eq!(
                 marmot_attachment_history_version_change_since(
                     version,
