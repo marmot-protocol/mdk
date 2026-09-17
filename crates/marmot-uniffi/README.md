@@ -111,8 +111,7 @@ matching library: the new methods and enum are additive, but older generated
 sources cannot call them. Android device rendering remains a separate consumer
 adoption issue.
 
-Regenerate Swift/Kotlin bindings after pulling this surface. Android
-mention/QR/edit-profile migration remains
+Android mention/QR/edit-profile migration remains
 [whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
 MDK completion enables that follow-through but does not replace it.
 

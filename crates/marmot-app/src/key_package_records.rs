@@ -625,6 +625,8 @@ fn attach_local_state(
                             && entry.record.key_package_ref_hex == record.key_package_ref_hex
                     })
                     .map(|entry| entry.local_state)
+                    // Owned rows have nonempty refs preserved by the overlay,
+                    // so this lookup should always hit for production inputs.
                     .unwrap_or(AccountKeyPackageLocalState::OtherOwned)
             } else {
                 AccountKeyPackageLocalState::NotLocal

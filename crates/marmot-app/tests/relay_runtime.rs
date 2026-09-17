@@ -2660,6 +2660,30 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
 async fn local_account_key_packages_are_readable_while_startup_is_held() {
+    async fn read_while_startup_is_held(
+        runtime: &MarmotAppRuntime,
+        account_id: &str,
+        startup_barrier: &tokio::sync::Barrier,
+    ) -> Vec<marmot_app::AccountKeyPackageInventoryEntry> {
+        let mut read = tokio::task::spawn_blocking({
+            let runtime = runtime.clone();
+            let account_id = account_id.to_owned();
+            move || runtime.local_account_key_packages(&account_id)
+        });
+        let result = timeout(Duration::from_secs(2), &mut read).await;
+        if result.is_err() {
+            // A timed-out blocking task is not cancelled. Release startup
+            // before failing so runtime teardown can finish the read.
+            timeout(Duration::from_secs(5), startup_barrier.wait())
+                .await
+                .expect("release startup after local inventory timeout");
+        }
+        result
+            .expect("local inventory must not wait for startup")
+            .expect("local inventory task must not panic")
+            .unwrap()
+    }
+
     let first_dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
@@ -2698,12 +2722,7 @@ async fn local_account_key_packages_are_readable_while_startup_is_held() {
         .await
         .expect("restarted worker must reach initial sync");
 
-    let local = timeout(Duration::from_secs(2), async {
-        runtime.local_account_key_packages(&account_id)
-    })
-    .await
-    .expect("local inventory must not wait for startup")
-    .unwrap();
+    let local = read_while_startup_is_held(&runtime, &account_id, &startup_sync_barrier).await;
     let current = local
         .iter()
         .find(|entry| entry.record.key_package_ref_hex == current_ref)
@@ -2720,7 +2739,8 @@ async fn local_account_key_packages_are_readable_while_startup_is_held() {
             .is_err(),
         "refresh must remain pending while startup is held"
     );
-    let local_again = runtime.local_account_key_packages(&account_id).unwrap();
+    let local_again =
+        read_while_startup_is_held(&runtime, &account_id, &startup_sync_barrier).await;
     assert_eq!(
         local_again
             .iter()

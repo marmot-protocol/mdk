@@ -7,12 +7,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
-### Fixed
-
-- `marmot_local_account_key_packages` and `marmot_refresh_account_key_packages`
-  now project ownership and lifecycle from one consistent storage snapshot, so a
-  concurrent rotation cannot drop the newly current owned package.
-
 ### Added
 
 - `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,
@@ -20,8 +14,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_account_key_package_inventory_entry_list_free`,
   `marmot_local_account_key_packages`, and
   `marmot_refresh_account_key_packages` for local-first KeyPackage inventory
-  with typed durable provenance. Existing `MarmotAccountKeyPackage` layout is
-  unchanged. Regenerate headers and use a matching library.
+  with typed durable provenance from a consistent local storage snapshot.
+  Existing `MarmotAccountKeyPackage` layout is unchanged. Regenerate headers and
+  use a matching library.
 
 - `marmot_report_message` and `marmot_dismiss_reports`, paginated `marmot_content_reports`
   and `marmot_report_dismissals`, and the deletion-masked `marmot_reported_message` lookup.

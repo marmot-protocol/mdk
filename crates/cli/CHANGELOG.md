@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Local-first KeyPackage inventory across Rust, Swift/Kotlin and C, including
+  `localAccountKeyPackages`, `refreshAccountKeyPackages` and typed ownership via
+  `AccountKeyPackageLocalStateFfi`. Hosts can display a consistent local snapshot
+  immediately and add relay observations after refresh; retain the local result
+  if refresh fails. Regenerate bindings and headers with the matching library.
+  Android settings adoption remains a separate consumer change.
+
 ## [0.10.1] - 2026-09-16
 
 Update generated bindings, native libraries, and C headers together. Apple consumers must also stage the matching privacy resource in their Swift wrapper. Account storage advances through migration 80; back up before upgrade because downgrade is unsupported. See [0.10.1 release notes](../../docs/release/0.10.1.md).
@@ -35,12 +44,6 @@ Update generated bindings, native libraries, and C headers together. Apple consu
   compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
   not create transcript rows, move conversations or generate unread/mention activity; raw events remain available.
   Migration 76 repairs existing edited targets/previews. Regenerate native sources/headers with matching libraries.
-
-### Fixed
-
-- Local and refresh KeyPackage inventory now read durable ownership and lifecycle
-  from one consistent storage snapshot, so a concurrent rotation cannot retain a
-  previous current package while omitting the newly current owned package.
 
 ### Changed
 

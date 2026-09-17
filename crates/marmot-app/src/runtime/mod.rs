@@ -3445,12 +3445,6 @@ impl MarmotAppRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_inventory_snapshot_split_reads_for_test(&self, split: bool) {
-        self.accounts
-            .set_inventory_snapshot_split_reads_for_test(split);
-    }
-
-    #[cfg(test)]
     pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
         self.accounts.app_for_test()
     }
@@ -5571,11 +5565,6 @@ impl AccountManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_inventory_snapshot_split_reads_for_test(&self, split: bool) {
-        self.app.set_inventory_snapshot_split_reads_for_test(split);
-    }
-
-    #[cfg(test)]
     pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
         &self.app
     }
@@ -6221,22 +6210,12 @@ impl AccountManager {
         account_ref: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
-        let account = self.resolve(account_ref)?;
-        if account.can_sign() && !account.signed_out {
-            // Unlike local runtime reads, this API reports relay visibility.
-            // Wait for the managed worker's initial activation, catch-up, and
-            // open maintenance before issuing the directory query.
-            self.wait_for_account_network_startup_to_settle(&account.label)
-                .await?;
-        }
-        let owned = cgka_engine::key_package::durably_owned_key_packages(
-            &self.app.account_storage(&account.label)?,
-            cgka_traits::group::ProtocolProfile::Current,
-        )
-        .map_err(cgka_session::SessionError::from)?;
-        self.app
-            .account_key_package_records(&account.label, bootstrap_relays, owned)
-            .await
+        Ok(self
+            .refresh_account_key_packages(account_ref, bootstrap_relays)
+            .await?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
     }
 
     pub fn local_account_key_packages(
