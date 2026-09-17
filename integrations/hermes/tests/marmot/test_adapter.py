@@ -8130,7 +8130,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         dispatch = asyncio.create_task(
             adapter._dispatch_inbound_message(event, spool_message_id=message_id)
         )
-        await asyncio.wait_for(handed.wait(), timeout=1)
+        # Wait for the actual handoff; disk-backed setup is not under test.
+        await asyncio.wait_for(handed.wait(), timeout=10)
         self.assertEqual("handed", adapter._inbound_spool.get(message_id).state)
         await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
         dispatch.cancel()
@@ -8158,8 +8159,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.02)
         self.assertFalse(handling.done())
         self.assertLess(time.monotonic() - started, 0.10)
-        await asyncio.wait_for(handling, timeout=1)
-        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        # The responsiveness assertion above is complete. Allow durable work
+        # to settle without imposing a one-second filesystem deadline.
+        await asyncio.wait_for(handling, timeout=10)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=10)
         self.assertEqual(["durable"], [message.text for message in adapter.events])
         await adapter._inbound_spool_call(adapter._inbound_spool.close)
 

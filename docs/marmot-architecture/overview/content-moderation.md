@@ -63,8 +63,10 @@ and the existing deletion ID. Withdrawing evidence updates the winner and live
 projections; convergence invalidation remains a separate field.
 
 Migration 0081 adds columns defaulting to `Unknown` without replaying history or
-changing masking and deletion IDs. Normal reprojection can classify retained
-accepted evidence. See the [bindings contract](../../../crates/marmot-uniffi/README.md#deletion-provenance-and-custom-events)
+changing deletion IDs. Historical tombstones can remain `Unknown` indefinitely:
+no backfill is scheduled. A later target reprojection or group rebuild can classify
+retained accepted evidence. All timeline reads mask raw tags on deleted rows,
+including older stored tombstones. See the [bindings contract](../../../crates/marmot-uniffi/README.md#deletion-provenance-and-custom-events)
 for client fallback wording and coordinated native/binding upgrade requirements.
 
 See [implementation details](../further-context/content-moderation.md) for source

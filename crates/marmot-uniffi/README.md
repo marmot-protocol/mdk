@@ -50,7 +50,8 @@ and conversion-cache updates.
 
 Database migration 0081 adds provenance columns with an `unknown` default.
 It preserves older tombstones, deletion IDs, and cached chat presentation without scanning or
-reinterpreting history. Subsequent normal reprojection/rebuild uses available accepted evidence.
+reinterpreting history. No historical backfill is scheduled: existing tombstones can remain `Unknown` indefinitely.
+If a later operation reprojects a target or rebuilds its group, it uses available accepted evidence.
 Legacy serialized records with an absent field also default to `Unknown`. No client database
 migration or deletion index is needed. Regenerate Swift/Kotlin bindings and consume the matching
 native libraries together; C consumers must rebuild against the updated header and library.
@@ -59,7 +60,7 @@ This is a binding layout change, not an MLS/wire-format change.
 
 Custom events retain their numeric `kind` and verbatim `plaintext` content. Conversation windows
 now also carry their ordered `tags`, so clients can render app-defined event types without fetching
-raw events. Deleted custom rows expose no tags in conversation windows. MDK-owned kinds continue
+raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows. MDK-owned kinds continue
 to use prepared fields and references there. Custom-event tag changes invalidate the conversion
 cache. This does not change custom-event chat-list activity or notification policy.
 

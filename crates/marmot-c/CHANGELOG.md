@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotDeletionSource` and `deletion_source` on `MarmotTimelineMessageRecord`,
+  `MarmotTimelineReplyPreview`, and `MarmotChatListMessagePreview` distinguish
+  accepted author/admin deletions with an unknown fallback for legacy evidence.
+  Regenerate headers and use the matching library: these output record layouts
+  have changed. Custom-event conversation windows also retain undeleted tags.
+
 - `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,
   `MarmotAccountKeyPackageInventoryEntryList`,
   `marmot_account_key_package_inventory_entry_list_free`,

@@ -208,7 +208,8 @@ impl DeletionSource {
         }
     }
     // Acceptance is already established by the caller. Cross-author legacy kind-5
-    // grants stay honored, but do not establish modern author-deletion provenance.
+    // grants stay honored, but their legacy verdict does not identify a modern
+    // kind-4891 admin operation or an author retraction. Preserve Unknown.
     fn from_accepted(kind: u64, deletion_sender: &str, target_sender: &str) -> Self {
         match kind {
             MARMOT_APP_EVENT_KIND_DELETE if deletion_sender == target_sender => Self::Author,
@@ -3933,6 +3934,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 }
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
+    let deleted = row.get::<_, bool>(17)?;
     Ok(TimelineMessageRecord {
         has_reports: false,
         group_system: crate::group_system::projected_group_system(
@@ -3957,13 +3959,18 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         sender: row.get(7)?,
         plaintext: row.get(8)?,
         kind: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(10)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                10,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
+        // Mask at the read boundary, including pre-upgrade materialized rows.
+        tags: if deleted {
+            Vec::new()
+        } else {
+            tags_from_json(row.get::<_, String>(10)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?
+        },
         timeline_at: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
         reply_to_message_id_hex: row.get(13)?,
@@ -3985,7 +3992,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
                 Box::new(err),
             )
         })?,
-        deleted: row.get::<_, i64>(17)? != 0,
+        deleted,
         deleted_by_message_id_hex: row.get(18)?,
         deletion_source: DeletionSource::from_storage(&row.get::<_, String>("deletion_source")?),
         invalidation_status: row.get(19)?,

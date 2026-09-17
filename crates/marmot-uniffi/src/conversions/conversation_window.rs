@@ -603,7 +603,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         sender,
         plaintext,
         kind,
-        tags,
+        tags: _,
         timeline_at,
         received_at,
         reply_to_message_id_hex,
@@ -647,11 +647,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             invalidation_status,
         ),
         (
-            if !*deleted && !app::is_reserved_app_event_kind(*kind) {
-                tags.as_slice()
-            } else {
-                &[]
-            },
+            presented_custom_tags(row),
             if trusted { group_system.as_ref() } else { None },
         ),
     )

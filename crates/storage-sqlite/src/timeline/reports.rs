@@ -1211,6 +1211,35 @@ mod tests {
         }
     }
     #[test]
+    fn deleted_custom_tags_are_masked_on_reads_and_restored_on_withdrawal() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        let tags = vec![vec!["title".into(), "classified title".into()]];
+        record(&s, &event(1, 10, 30402, tags.clone(), "listing"));
+        record(&s, &event(2, 10, 5, vec![vec!["e".into(), id(1)]], ""));
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            let row = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert!(row.deleted && row.tags.is_empty() && row.plaintext.is_empty());
+            let page = s.message_timeline(TimelineMessageQuery::default()).unwrap();
+            assert!(
+                page.messages
+                    .iter()
+                    .find(|m| m.message_id_hex == id(1))
+                    .unwrap()
+                    .tags
+                    .is_empty()
+            );
+        }
+        s.invalidate_app_event_by_source(&id(2), "LosingBranch")
+            .unwrap();
+        let row = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+        assert!(!row.deleted);
+        assert_eq!(row.tags, tags);
+    }
+
+    #[test]
     fn admin_deletion_masks_media_reply_search_and_edit_history() {
         let s = SqliteAccountStorage::in_memory().unwrap();
         let mut message = target();
@@ -1241,6 +1270,7 @@ mod tests {
             }
             let message = s.reported_message(&id(99), &id(1)).unwrap().unwrap();
             assert!(message.deleted && message.plaintext.is_empty() && message.media.is_none());
+            assert!(message.tags.is_empty());
             let preview = s
                 .timeline_message(&id(99), &id(6))
                 .unwrap()
