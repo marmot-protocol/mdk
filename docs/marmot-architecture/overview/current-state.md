@@ -30,9 +30,10 @@ validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C adds 
 and native local access. Released-artifact adoption and device evidence remain C9 work; clients should retain host caches until validated.
 See [avatar cache storage](../further-context/avatar-cache-storage.md).
 
-C8-A adds indexed, revisioned per-group attachment-slot discovery in SQLite. This is the
-storage foundation for #1448; typed runtime/native pages and durable background attachment
-acquisition remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+C8-A/B provide indexed per-group attachment-slot discovery in SQLite and typed async
+runtime/native pages for #1448. Additions preserve cursors; destructive changes require
+replacement. Reads remain local without engine/relay readiness. Durable background
+attachment acquisition and retained-byte access remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

@@ -795,3 +795,6 @@ pub use conversation_window::*;
 
 mod avatar;
 pub use avatar::*;
+
+mod attachment_history;
+pub use attachment_history::*;

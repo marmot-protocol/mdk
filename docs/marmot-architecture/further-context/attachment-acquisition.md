@@ -10,7 +10,8 @@ status: implementation-plan
 
 Tracking: [projection plan #1742](https://github.com/marmot-protocol/mdk/issues/1742).
 Source audit: master `ebb884b8` (MDK 0.10.1). This is an implementation plan;
-only the storage discovery foundation below is implemented by this slice.
+C8-A storage discovery and C8-B runtime/native discovery are implemented;
+background acquisition and retained-byte access remain later slices.
 
 ## Problem and existing foundation
 
@@ -61,8 +62,9 @@ history refresh, repair and restart must not undo explicit removal.
 
 The storage migration backfills the derived index once from the existing materialized
 timeline. Subsequent source writes maintain it incrementally; page reads do not
-rebuild or rescan history. This migration adds no bytes or transfer jobs. C8-B is
-the immediate next planned PR after C8-A; this storage slice has no native callers.
+rebuild or rescan history. This migration adds no bytes or transfer jobs. C8-B
+exposes the index through async runtime/UniFFI methods and the equivalent blocking C ABI.
+Native APIs are available; released-artifact adoption remains C9 work.
 
 ## Discovery refresh and restart contract
 
@@ -78,13 +80,31 @@ account/group generation changes require callers to discard loaded pages and
 restart. Materialized visibility follows the canonical timeline view; parity tests
 cover blocking, invitation changes and retained history after group-list removal.
 
-## Decision before runtime/native discovery
+## Runtime/native contract and client audit
 
-Audit client Photos/Videos/Files tab requirements before C8-B. Opaque slots keep
-protocol classification in the shared app parser. Do not scan unlimited pages to
-fill a filtered tab: either expose bounded scanned pages with explicit continuation,
-or add a parser-owned classification index if the contract requires full typed
-pages. Storage must not invent a second MIME/voice-note parser.
+C8-B adds `attachment_history_page(account, group, limit, cursor)` and
+`attachment_history_version(account, group)`. SQL, account resolution and parser
+work run off the async caller thread, without engine hydration or relay readiness.
+Swift/Kotlin receive opaque process-local cursor/version objects; the C ABI mirrors
+them with explicit ownership. See [native handoff](../../../crates/marmot-uniffi/ATTACHMENT-HISTORY.md).
+
+Client source inspected on 2026-09-17 (these audited files were clean):
+
+- iOS `e05d6a05`: `SharedMediaLibraryView.swift` loads `listMedia` once;
+  `SharedMediaLibraryPresentation.swift` filters visual, audio and file categories.
+  URL links have a separate bounded timeline scan.
+- Android `3af73352`: `ui/medialibrary/MediaLibrary.kt` derives Images, Videos,
+  Voice, Files and URLs tabs from loaded media/timeline records.
+
+The contract returns at most 100 original attachment slots, with a shared-parser
+accepted/rejected outcome and MDK category (image, video, audio, file or rejected).
+Audio classification does not assert voice-note intent (#1252). Apps filter within
+loaded pages and request bounded continuation; an empty filtered page is not proof
+of exhaustion while `has_more` is true. Rejected slots consume the page limit and
+preserve their original album index. There are no filtered totals or full-category
+page guarantees, no hidden scan-until-full loop, and no additional MIME index.
+Links remain outside this attachment projection. Preserve legacy `list_media` until
+clients adopt paging and distinguish partially loaded tabs from truly empty tabs.
 
 ## Decisions before acquisition implementation
 
