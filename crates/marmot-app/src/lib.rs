@@ -41,7 +41,10 @@ pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
-use cgka_traits::storage::{DisbandTombstoneStorage, KeyPackageBundleStorage, MaintenanceStorage};
+use cgka_traits::storage::{
+    DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage, KeyPackageBundleStorage,
+    LeaveRequestStorage, MaintenanceStorage,
+};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
@@ -306,7 +309,7 @@ fn chat_pin_error_from_storage(error: storage_sqlite::ChatPinError) -> AppError 
 
 use conversions::{
     account_group_push_token_from_app, account_push_registration_from_app,
-    account_state_from_stored, app_message_record_from_stored,
+    account_state_from_stored, app_group_from_stored_group, app_message_record_from_stored,
     chat_notification_settings_from_account, group_push_token_from_account,
     normalize_relay_telemetry_settings, notification_settings_from_account,
     pending_push_registration_removal_from_account, relay_telemetry_settings_from_storage,
@@ -3422,18 +3425,19 @@ impl MarmotApp {
 
     pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
         self.ensure_account_state(label)?;
-        let mut groups = self.load_state(label)?.groups;
-        // `leave_requested_at_ms` is not part of the stored projection, so stamp
-        // it from the engine-owned leave-request table here. This is the single
-        // population point for the group record: `visible_groups`, `group`, and
-        // `subscribe_chats` all read through this method.
-        let pending = self.pending_leave_requests(label)?;
+        let storage = self.account_storage(label)?;
+        let mut groups = storage
+            .account_groups(None)?
+            .into_iter()
+            .map(app_group_from_stored_group)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Engine-owned leave and disband state can change without an app projection write.
+        let pending = storage.pending_leave_requests()?;
         if !pending.is_empty() {
             for group in &mut groups {
                 group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
             }
         }
-        let storage = self.account_storage(label)?;
         let disbanding = storage.disbanding_group_ids_hex()?;
         let requests = storage.disband_requests_by_group_hex()?;
         let disbanded = storage
@@ -3552,10 +3556,31 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
     ) -> Result<Option<AppGroupRecord>, AppError> {
-        Ok(self
-            .groups(label)?
-            .into_iter()
-            .find(|group| group.group_id_hex == group_id_hex))
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?;
+        let Some(stored) = storage.account_groups(Some(group_id_hex))?.pop() else {
+            return Ok(None);
+        };
+        let mut group = app_group_from_stored_group(stored)?;
+        // List overlays use canonical lowercase hex keys; keep the same exact matching.
+        let Ok(group_id) = hex::decode(group_id_hex) else {
+            return Ok(Some(group));
+        };
+        if hex::encode(&group_id) != group_id_hex {
+            return Ok(Some(group));
+        }
+        let group_id = GroupId::new(group_id);
+        group.leave_requested_at_ms = storage
+            .leave_request(&group_id)?
+            .map(|request| request.requested_at_ms);
+        let request = storage.disband_request(&group_id)?;
+        group.disbanding = request
+            .as_ref()
+            .is_some_and(|request| request.status == DisbandRequestStatus::Pending)
+            || storage.has_disband_candidates(&group_id)?;
+        group.disband_request = request.map(Into::into);
+        group.disbanded = storage.disband_tombstone(&group_id)?.is_some();
+        Ok(Some(group))
     }
 
     pub fn set_group_archived(

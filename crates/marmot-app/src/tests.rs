@@ -1,4 +1,5 @@
 mod draft_lifecycle;
+mod group_lookup;
 mod key_package_inventory;
 mod message_journeys;
 mod report_backfill;
