@@ -2720,10 +2720,15 @@ impl<S: StorageProvider> Engine<S> {
             // sweep consumes only retention/progress, so its opaque result
             // deliberately carries no lineage and does not scan stored history.
             Ok(Deferred(_)) | Ok(Outcome(IngestOutcome::TransportDeferred { .. })) => Ok(false),
-            Ok(Outcome(IngestOutcome::ResourceRefused {
-                resource: InboundResourceLimit::TransportDeferredCapacity,
-                ..
-            })) => Ok(false),
+            // A refusal names a local resource bound, never a verdict on the
+            // message, so NO resource may retire this row: the terminal arm
+            // below would answer `Duplicate` to every later redelivery of an id
+            // this device never opened. Defense-in-depth — this row already
+            // holds its slot, so `has_peel_deferred_capacity` charges it no row
+            // and no byte and admits it — but the rule is the refusal's, not the
+            // resource's, so the arm is written for all of them. The row keeps
+            // `PeelDeferred` and its cap slot, and the next sweep re-attempts it.
+            Ok(Outcome(IngestOutcome::ResourceRefused { .. })) => Ok(false),
             Ok(Outcome(IngestOutcome::LocalState {
                 state: LocalIngestState::Quarantined,
             })) => {
@@ -2771,7 +2776,6 @@ impl<S: StorageProvider> Engine<S> {
                 IngestOutcome::Stale { .. }
                 | IngestOutcome::Ignored { .. }
                 | IngestOutcome::LocalState { .. }
-                | IngestOutcome::ResourceRefused { .. }
                 | IngestOutcome::Rejected { .. },
             )) => {
                 // Terminal stale classifications are still successful
