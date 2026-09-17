@@ -251,6 +251,38 @@ fn zero_flake_budget_rejects_any_nonzero_flake_rate() {
 }
 
 #[test]
+fn nightly_cpu_budget_regression() {
+    let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::Nightly);
+    // Issue #1896: run 35200866880 passed every test but exhausted CPU budget.
+    // Keep roughly 20% headroom above its measured aggregate CPU time.
+    let observation = CampaignLaneObservationV1 {
+        wall_clock_seconds: 6432,
+        cpu_seconds: 14984,
+        peak_rss_bytes: 2376482816,
+        disk_bytes: 15742185891,
+        artifact_bytes: 1415613,
+        executed_cases: 654,
+        flaky_cases: 0,
+        flake_retries: 0,
+    };
+    let evaluation = config.evaluate(observation);
+    assert!(evaluation.passed, "{:?}", evaluation.violations);
+
+    let mut observation = evaluation.observation;
+    observation.cpu_seconds = config.budgets.max_cpu_seconds + 1;
+    let evaluation = config.evaluate(observation);
+    assert!(!evaluation.passed);
+    assert_eq!(
+        evaluation.violations,
+        [format!(
+            "cpu_seconds:{}>{}",
+            config.budgets.max_cpu_seconds + 1,
+            config.budgets.max_cpu_seconds
+        )]
+    );
+}
+
+#[test]
 fn budget_evaluation_reports_every_exceeded_dimension() {
     let config = CampaignLaneConfigV1::builtin(CampaignLaneV1::PullRequest);
     let evaluation = config.evaluate(CampaignLaneObservationV1 {

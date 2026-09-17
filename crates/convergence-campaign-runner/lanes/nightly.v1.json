@@ -18,7 +18,7 @@
   },
   "budgets": {
     "max_wall_clock_seconds": 7200,
-    "max_cpu_seconds": 14400,
+    "max_cpu_seconds": 18000,
     "max_peak_rss_bytes": 8589934592,
     "max_disk_bytes": 21474836480,
     "max_artifact_bytes": 5368709120,
