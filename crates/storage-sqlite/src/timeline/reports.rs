@@ -1199,14 +1199,16 @@ mod tests {
         legacy
             .record_app_event_with_source(&deletion, None, authority)
             .unwrap();
-        legacy.rebuild_message_timeline_for_group(&id(99)).unwrap();
-        assert!(
-            legacy
-                .timeline_message(&id(99), &id(1))
-                .unwrap()
-                .unwrap()
-                .deleted
-        );
+        for rebuild in [false, true] {
+            if rebuild {
+                legacy.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            let row = legacy.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert!(row.deleted);
+            assert!(row.plaintext.is_empty());
+            assert_eq!(row.deleted_by_message_id_hex, Some(id(2)));
+            assert_eq!(row.deletion_source, crate::DeletionSource::Unknown);
+        }
     }
     #[test]
     fn admin_deletion_masks_media_reply_search_and_edit_history() {

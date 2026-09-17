@@ -52,5 +52,20 @@ render unknown events or retain earlier deletion behavior. Existing honored
 legacy kind-5 tombstones remain honored locally, while newly received kind-5
 events are author-only.
 
+Message presentation exposes typed `deletion_source` on timeline/conversation rows,
+chat-list previews, reply previews, and `reported_message`. It describes the selected
+accepted deletion: author-authorized kind 5 is `Author`; authenticated kind 4891 is
+`Admin`, including self-removal. Legacy kind-5 removals of another author's content
+remain honored but are `Unknown`, as are tombstones without recoverable evidence.
+This does not infer an administrator from sender identity or present-day roles.
+The greatest `(authenticated event timestamp, event ID)` selects both provenance
+and the existing deletion ID. Withdrawing evidence updates the winner and live
+projections; convergence invalidation remains a separate field.
+
+Migration 0081 adds columns defaulting to `Unknown` without replaying history or
+changing masking and deletion IDs. Normal reprojection can classify retained
+accepted evidence. See the [bindings contract](../../../crates/marmot-uniffi/README.md#deletion-provenance-and-custom-events)
+for client fallback wording and coordinated native/binding upgrade requirements.
+
 See [implementation details](../further-context/content-moderation.md) for source
 authority recovery, persistence, and bounded migration.

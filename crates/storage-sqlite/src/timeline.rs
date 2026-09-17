@@ -207,9 +207,11 @@ impl DeletionSource {
             _ => Self::Unknown,
         }
     }
-    fn from_accepted_kind(kind: u64) -> Self {
+    // Acceptance is already established by the caller. Cross-author legacy kind-5
+    // grants stay honored, but do not establish modern author-deletion provenance.
+    fn from_accepted(kind: u64, deletion_sender: &str, target_sender: &str) -> Self {
         match kind {
-            MARMOT_APP_EVENT_KIND_DELETE => Self::Author,
+            MARMOT_APP_EVENT_KIND_DELETE if deletion_sender == target_sender => Self::Author,
             MARMOT_APP_EVENT_KIND_REMOVE => Self::Admin,
             _ => Self::Unknown,
         }
@@ -2257,7 +2259,8 @@ fn apply_message_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageR
             continue;
         }
         row.deleted = true;
-        row.deletion_source = DeletionSource::from_accepted_kind(delete.kind);
+        row.deletion_source =
+            DeletionSource::from_accepted(delete.kind, &delete.sender, &row.sender);
         row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
         row.plaintext.clear();
         row.edit = None;
@@ -3735,7 +3738,8 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
                 continue;
             }
             row.deleted = true;
-            row.deletion_source = DeletionSource::from_accepted_kind(delete.kind);
+            row.deletion_source =
+                DeletionSource::from_accepted(delete.kind, &delete.sender, &row.sender);
             row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
             row.plaintext.clear();
             row.edit = None;

@@ -2361,7 +2361,7 @@ pub(crate) fn chat_list_rows_tx(
         "WHERE row.archived = 0"
     };
     let sql = format!(
-        "{CHAT_LIST_ROW_SELECT_LIST} pin.position, row.last_message_deletion_source AS deletion_source
+        "{CHAT_LIST_ROW_SELECT_LIST} pin.position AS pinned_position
          {CHAT_LIST_ROW_JOINS}
          LEFT JOIN (
              SELECT group_id_hex, ordinal,
@@ -2400,7 +2400,7 @@ fn direct_conversation_candidate_sql() -> String {
     // Drive from the peer index, then join the matching chat-list row.
     // Durable activity order, not pin-first chat-list order.
     format!(
-        "{CHAT_LIST_ROW_SELECT_LIST} {CHAT_PIN_POSITION_SQL}, row.last_message_deletion_source AS deletion_source
+        "{CHAT_LIST_ROW_SELECT_LIST} {CHAT_PIN_POSITION_SQL} AS pinned_position
          FROM direct_conversation_members AS dcm
          JOIN chat_list_rows AS row ON row.group_id_hex = dcm.group_id_hex
          LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
@@ -2455,7 +2455,7 @@ pub(crate) fn chat_list_row_tx(
 ) -> StorageResult<Option<ChatListRow>> {
     let now_ms = unix_now_ms();
     let sql = format!(
-        "{CHAT_LIST_ROW_SELECT_LIST} {CHAT_PIN_POSITION_SQL}, row.last_message_deletion_source AS deletion_source
+        "{CHAT_LIST_ROW_SELECT_LIST} {CHAT_PIN_POSITION_SQL} AS pinned_position
          {CHAT_LIST_ROW_JOINS} {CHAT_PIN_JOIN}
          WHERE row.group_id_hex = ?1"
     );
@@ -2515,7 +2515,8 @@ macro_rules! chat_list_columns {
                 AND ", crate::group_system::authenticated_system_source_sql!("system_source"), "
                 AND system_source.plaintext = row.last_message_preview
                 AND system_source.recorded_at = row.last_message_timeline_at
-            ) ELSE 0 END AS authenticated_group_system,"
+            ) ELSE 0 END AS authenticated_group_system,
+            row.last_message_deletion_source AS deletion_source,"
         )
     };
 }
@@ -2573,7 +2574,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         row.get::<_, bool>(16)?,
     );
     let deletion_source =
-        crate::DeletionSource::from_storage(&row.get::<_, String>("deletion_source")?);
+        crate::DeletionSource::from_storage(row.get_ref("deletion_source")?.as_str()?);
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
         group_system,
         message_id_hex,
@@ -2621,7 +2622,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
     let pinned = row.get::<_, i64>(33)? != 0;
     let pinned_position = row
-        .get::<_, Option<i64>>(35)?
+        .get::<_, Option<i64>>("pinned_position")?
         .and_then(|value| u32::try_from(value).ok());
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,

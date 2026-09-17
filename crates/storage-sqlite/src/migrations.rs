@@ -3312,14 +3312,36 @@ mod content_reports_tests {
             5
         );
     }
+}
+
+#[cfg(test)]
+mod deletion_provenance_tests {
+    use super::*;
+
     #[test]
     fn deletion_provenance_migration_preserves_legacy_tombstones() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
-        conn.execute_batch("INSERT INTO message_timeline(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,deleted,deleted_by_message_id_hex)
-            VALUES('group','message','received','author','',9,'[]',1,1,'{}',1,'missing-evidence');").unwrap();
+        run(&mut conn, &MIGRATIONS[..80]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json, deleted,
+                deleted_by_message_id_hex
+            ) VALUES (
+                'group', 'message', 'received', 'author', '', 9,
+                '[]', 1, 1, '{}', 1, 'missing-evidence'
+            );",
+        )
+        .unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
-        let row: (bool,String,String,String) = conn.query_row("SELECT deleted,plaintext,deleted_by_message_id_hex,deletion_source FROM message_timeline", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        let row: (bool, String, String, String) = conn
+            .query_row(
+                "SELECT deleted, plaintext, deleted_by_message_id_hex, deletion_source
+             FROM message_timeline",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
         assert_eq!(
             row,
             (

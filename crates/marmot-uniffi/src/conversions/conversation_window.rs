@@ -360,7 +360,8 @@ pub struct ConversationWindowSnapshotFfi {
     pub has_more_before: bool,
     pub has_more_after: bool,
 }
-// Borrow raw rows so conversion never clones the full reactor/tag collections.
+// Borrow raw rows and retain only custom-event tags in the FFI presentation.
+// MDK-owned tags and full reactor collections use prepared references instead.
 fn presented_custom_tags(row: &app::TimelineMessageRecord) -> &[Vec<String>] {
     if !row.deleted && !app::is_reserved_app_event_kind(row.kind) {
         &row.tags

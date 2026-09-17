@@ -27,16 +27,20 @@ No generated Swift or Kotlin files are committed here.
 Timeline records (including conversation windows and `reportedMessage`), reply previews,
 and chat-list previews expose `deletionSource: DeletionSourceFfi`:
 
-- `Author`: the selected accepted deletion is kind 5.
+- `Author`: the selected accepted deletion is an author-authorized kind 5.
 - `Admin`: the selected accepted deletion is kind 4891, authorized by authenticated
   source-state evidence. This includes an admin removing their own message.
-- `Unknown`: no classified deletion evidence is available, including older projected tombstones.
+- `Unknown`: no classified deletion evidence is available, including older projected tombstones
+  and legacy kind-5 removals of another author's content.
 
 Consult this field only when `deleted` is true. Use the existing ordinary-deletion wording
 for `Author`, “This message was deleted by an admin.” for `Admin`, and a neutral deleted-message
 fallback for `Unknown`. Clients own localization. The message's `kind` remains its original
 inner event kind, never the deletion kind. Existing deletion IDs and content masking are retained.
 `invalidationStatus` describes convergence separately and does not imply deletion.
+
+See [deletion semantics](../../docs/marmot-architecture/overview/content-moderation.md)
+for the storage and authorization contract.
 
 When multiple accepted deletions apply, the largest `(authenticated event timestamp, event ID)`
 pair wins, matching `deletedByMessageIdHex`. Arrival order, reports, and current admin status
