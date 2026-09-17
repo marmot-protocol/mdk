@@ -5,6 +5,9 @@ use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 
+/// Maximum number of attachment slots returned by one page.
+pub const MAX_ATTACHMENT_HISTORY_PAGE: usize = 100;
+
 /// One original imeta slot, including malformed slots for the app parser to reject.
 /// No message body or complete album is loaded by this projection.
 #[derive(Clone)]
@@ -29,6 +32,19 @@ pub struct AttachmentHistoryVersion {
     group: String,
     generation: Option<Vec<u8>>,
     revision: i64,
+    additions: i64,
+}
+
+impl AttachmentHistoryVersion {
+    /// Whether previously loaded rows/boundaries must be discarded. An unequal
+    /// version with `false` here signals additions only: callers may keep paging
+    /// and choose when to refresh entries above their saved boundary.
+    pub fn requires_restart_since(&self, previous: &Self) -> bool {
+        self.store_epoch != previous.store_epoch
+            || self.group != previous.group
+            || self.generation != previous.generation
+            || self.revision != previous.revision
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -78,7 +94,10 @@ pub struct AttachmentHistoryPage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttachmentHistoryError {
-    #[error("attachment page limit must be between 1 and 100")]
+    #[error(
+        "attachment page limit must be between 1 and {}",
+        MAX_ATTACHMENT_HISTORY_PAGE
+    )]
     InvalidLimit,
     #[error("attachment cursor belongs to another account or group")]
     CursorMismatch,
@@ -120,26 +139,30 @@ fn version_tx(
             |r| r.get(0),
         )
         .storage()?;
-    let group_version: Option<(Vec<u8>, i64)> = conn
+    let group_version: Option<(Vec<u8>, i64, i64)> = conn
         .query_row_cached(
-            "SELECT generation,revision FROM attachment_history_versions WHERE group_id_hex=?1",
+            "SELECT generation,revision,additions FROM attachment_history_versions WHERE group_id_hex=?1",
             [group],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .storage()?;
-    let (generation, revision) = group_version.map_or((None, 0), |(g, r)| (Some(g), r));
+    let (generation, revision, additions) =
+        group_version.map_or((None, 0, 0), |(g, r, a)| (Some(g), r, a));
     Ok(AttachmentHistoryVersion {
         store_epoch,
         group: group.to_owned(),
         generation,
         revision,
+        additions,
     })
 }
 
 impl SqliteAccountStorage {
-    /// Cheap authoritative refresh fence, including when the last page has no
-    /// next cursor. A changed version requires replacing previously loaded rows.
+    /// Cheap authoritative change signal, including after the final page.
+    /// Compare for equality to discover changes, then use
+    /// [`AttachmentHistoryVersion::requires_restart_since`] to distinguish an
+    /// additions-only refresh from a required replacement of loaded rows.
     pub fn attachment_history_version(
         &self,
         group_id_hex: &str,
@@ -148,12 +171,17 @@ impl SqliteAccountStorage {
             .with_deferred_read(|conn| version_tx(conn, group_id_hex))
     }
 
-    /// Read at most `limit` visible delivered attachment slots (1..=100), newest
+    /// Read at most `limit` visible delivered attachment slots (1 through
+    /// [`MAX_ATTACHMENT_HISTORY_PAGE`]), newest
     /// canonical message first and original attachment index ascending within an
     /// album. Uses an indexed seek and one consistent read snapshot; no engine,
     /// network, raw-history scan or acquisition is performed.
     ///
-    /// Any relevant source/visibility change invalidates this group's cursors.
+    /// Additions change the refresh version but keep existing cursors valid.
+    /// Newer additions above a passed boundary require a separate refresh from
+    /// None; older additions below it appear on subsequent pages. Paging a changing
+    /// collection is not a fixed snapshot. Deletion, source replacement/reordering,
+    /// visibility and group-generation changes invalidate cursors and loaded rows.
     /// Restart from None and replace old pages on StaleCursor; never append a fresh
     /// first page to an old collection. Local pending/failed sends, deleted and
     /// convergence-invalidated rows are excluded. Retention follows source pruning.
@@ -163,7 +191,7 @@ impl SqliteAccountStorage {
         limit: usize,
         cursor: Option<&AttachmentHistoryCursor>,
     ) -> Result<AttachmentHistoryPage, AttachmentHistoryError> {
-        if !(1..=100).contains(&limit) {
+        if !(1..=MAX_ATTACHMENT_HISTORY_PAGE).contains(&limit) {
             return Err(AttachmentHistoryError::InvalidLimit);
         }
         self.connection.with_deferred_read(|conn| {
@@ -174,7 +202,7 @@ impl SqliteAccountStorage {
                 {
                     return Err(AttachmentHistoryError::CursorMismatch);
                 }
-                if cursor.version != version {
+                if version.requires_restart_since(&cursor.version) {
                     return Err(AttachmentHistoryError::StaleCursor);
                 }
             }
@@ -220,7 +248,16 @@ impl SqliteAccountStorage {
                         sender: r.get(9)?,
                         timeline_at: nonnegative(r, 10)?,
                         received_at: nonnegative(r, 11)?,
-                        slot: serde_json::from_str(&json).unwrap_or(serde_json::Value::Null),
+                        slot: serde_json::from_str(&json).map_err(|_| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                12,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "attachment index contains invalid JSON",
+                                )),
+                            )
+                        })?,
                     };
                     Ok((key, entry))
                 })

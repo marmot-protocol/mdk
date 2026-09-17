@@ -7,7 +7,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 CREATE TABLE attachment_history_versions (
     group_id_hex TEXT PRIMARY KEY,
     generation BLOB NOT NULL DEFAULT (randomblob(16)),
-    revision INTEGER NOT NULL DEFAULT 0
+    revision INTEGER NOT NULL DEFAULT 0,
+    additions INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE attachment_history (
     group_id_hex TEXT NOT NULL,
@@ -30,11 +31,14 @@ CREATE TABLE attachment_history (
 CREATE INDEX idx_attachment_history_page ON attachment_history(
     group_id_hex,order_class,order_primary,order_phase,order_at,message_id_hex,attachment_order
 ) WHERE visible=1;
+-- Block/unblock fan-out visits this sender, not unrelated account history.
 CREATE INDEX idx_attachment_history_sender ON attachment_history(sender);
 
 -- Only the derived slot is copied, never the whole album or message body. CASE
 -- is deliberately lazy: retention wipes may replace media_json with zero bytes.
 -- Corrupt containers become one null slot, retaining the parser's diagnostic.
+-- Visibility mirrors visible_message_timeline in 0075_user_blocks.rs.
+-- A parity regression covers all materialized block/invite transitions.
 CREATE VIEW attachment_history_source AS
 SELECT t.group_id_hex,t.message_id_hex,CAST(j.key AS INTEGER) AS attachment_index,
        t.source_message_id_hex,t.source_epoch,t.sender,t.timeline_at,t.received_at,
@@ -58,8 +62,9 @@ WHERE t.kind=9 AND t.source_message_id_hex IS NOT NULL
 
 CREATE TRIGGER attachment_history_added AFTER INSERT ON attachment_history BEGIN
     -- Even wholly hidden groups need a version row for a later unblock.
-    INSERT INTO attachment_history_versions(group_id_hex,revision) VALUES(NEW.group_id_hex,NEW.visible)
-    ON CONFLICT(group_id_hex) DO UPDATE SET revision=revision+NEW.visible;
+    -- Additions advertise a refresh without invalidating a stable older-page seek.
+    INSERT INTO attachment_history_versions(group_id_hex,additions) VALUES(NEW.group_id_hex,NEW.visible)
+    ON CONFLICT(group_id_hex) DO UPDATE SET additions=additions+NEW.visible;
 END;
 CREATE TRIGGER attachment_history_removed AFTER DELETE ON attachment_history
 WHEN OLD.visible=1 BEGIN
@@ -98,9 +103,11 @@ BEGIN
         source_epoch,sender,timeline_at,received_at,order_class,order_primary,order_phase,order_at,slot_json,visible)
     SELECT * FROM attachment_history_source WHERE group_id_hex=NEW.group_id_hex AND message_id_hex=NEW.message_id_hex;
 END;
+-- The just-inserted PK makes the sender half false, regardless of invite state.
 CREATE TRIGGER attachment_block_added AFTER INSERT ON user_blocks BEGIN
     UPDATE attachment_history SET visible=0 WHERE sender=NEW.public_key;
 END;
+-- AFTER DELETE the unique sender block is gone; only invite visibility remains.
 CREATE TRIGGER attachment_block_removed AFTER DELETE ON user_blocks BEGIN
     UPDATE attachment_history SET visible=(group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites))
     WHERE sender=OLD.public_key;
@@ -110,9 +117,11 @@ CREATE TRIGGER attachment_block_changed AFTER UPDATE OF public_key ON user_block
         AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites))
     WHERE sender IN (OLD.public_key,NEW.public_key);
 END;
+-- The inserted group PK makes the invite half false for every sender.
 CREATE TRIGGER attachment_invite_blocked AFTER INSERT ON blocked_pending_invites BEGIN
     UPDATE attachment_history SET visible=0 WHERE group_id_hex=NEW.group_id_hex;
 END;
+-- AFTER DELETE the unique invite exclusion is gone; sender blocks still apply.
 CREATE TRIGGER attachment_invite_unblocked AFTER DELETE ON blocked_pending_invites BEGIN
     UPDATE attachment_history SET visible=(sender NOT IN (SELECT public_key FROM user_blocks)) WHERE group_id_hex=OLD.group_id_hex;
 END;

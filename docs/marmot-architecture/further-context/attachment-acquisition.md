@@ -61,7 +61,22 @@ history refresh, repair and restart must not undo explicit removal.
 
 The storage migration backfills the derived index once from the existing materialized
 timeline. Subsequent source writes maintain it incrementally; page reads do not
-rebuild or rescan history. This migration adds no bytes or transfer jobs.
+rebuild or rescan history. This migration adds no bytes or transfer jobs. C8-B is
+the immediate next planned PR after C8-A; this storage slice has no native callers.
+
+## Discovery refresh and restart contract
+
+Version equality detects new attachments as well as destructive changes.
+`requires_restart_since` distinguishes additions-only refresh from a mandatory
+restart: new attachments keep existing cursors usable, including under continuous
+incoming traffic. New rows below a cursor can appear on subsequent pages; rows
+above an already passed boundary require a separate refresh. This is pagination
+over a changing collection, not a fixed snapshot.
+
+Deletion, invalidation, source replacement/reordering, visibility changes and
+account/group generation changes require callers to discard loaded pages and
+restart. Materialized visibility follows the canonical timeline view; parity tests
+cover blocking, invitation changes and retained history after group-list removal.
 
 ## Decision before runtime/native discovery
 

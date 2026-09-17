@@ -44,7 +44,7 @@ pub use account_projection::{
 };
 pub use attachment_history::{
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
-    AttachmentHistoryVersion,
+    AttachmentHistoryVersion, MAX_ATTACHMENT_HISTORY_PAGE,
 };
 pub use avatar_cache::{
     AVATAR_IDENTITY_BATCH_LIMIT, AvatarAcquisition, AvatarAcquisitionState,
