@@ -59,6 +59,20 @@ Handles are opaque, process-local and contain no database ownership. Do not pers
 or reconstruct them. On runtime reconstruction start from the head; discard handles
 at account removal/reset. All reads fail after terminal `shutdown_and_close`.
 
+
+## Swift and Kotlin handle ownership
+
+Each page returns native object handles for its version and optional next cursor.
+Kotlin hosts should explicitly `close()` handles when no longer needed and use
+`use { ... }` for short-lived standalone version probes. Keep the initial page's
+version open as the collection baseline; assigning it to another variable aliases
+the same object and does not make it safe to close through the page reference.
+Close later page versions after processing, and consumed cursors after their
+paging call completes, unless still needed by another in-flight operation. Close
+the baseline and any remaining cursor when replacing or discarding the collection.
+Swift releases these objects through ARC; drop unneeded references at the same
+lifecycle boundaries. Do not accumulate every page's handles until screen teardown.
+
 ## C ownership
 
 `marmot_attachment_history_page` returns a `MarmotAttachmentPageRead`. A successful
