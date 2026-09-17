@@ -1304,7 +1304,7 @@ class DoctorReportTests(unittest.TestCase):
 
     def test_dotenv_scalar_interpolation_and_quotes(self) -> None:
         environ = {"SYNTHETIC_TOKEN": "expanded-secret", "OTHER": "xy"}
-        values, error = diag.parse_dotenv_assignments(
+        values, error, unsupported = diag.parse_dotenv_assignments(
             "MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\n"
             "MARMOT_HOME_CHANNEL=$OTHER\n"
             "MARMOT_AGENT_SOCKET='${SYNTHETIC_TOKEN}'\n"
@@ -1314,16 +1314,18 @@ class DoctorReportTests(unittest.TestCase):
             environ=environ,
         )
         self.assertIsNone(error)
+        self.assertEqual(unsupported, frozenset())
         self.assertEqual(values["MARMOT_AGENT_AUTH_TOKEN"], "expanded-secret")
         self.assertEqual(values["MARMOT_HOME_CHANNEL"], "xy")
         self.assertEqual(values["MARMOT_AGENT_SOCKET"], "${SYNTHETIC_TOKEN}")
         self.assertEqual(values["MARMOT_ACCOUNT_ID_HEX"], "xy")
         self.assertEqual(values["MARMOT_HOME"], "$OTHER")
         self.assertEqual(values["MARMOT_INBOUND_MEDIA_DIR"], "/fallback")
-        empty, empty_error = diag.parse_dotenv_assignments(
+        empty, empty_error, empty_unsupported = diag.parse_dotenv_assignments(
             "MARMOT_AGENT_AUTH_TOKEN=\nMARMOT_AGENT_SOCKET=\"\"\n",
             environ={"MARMOT_AGENT_AUTH_TOKEN": "stale"},
         )
+        self.assertEqual(empty_unsupported, frozenset())
         self.assertIsNone(empty_error)
         self.assertEqual(empty["MARMOT_AGENT_AUTH_TOKEN"], "")
         self.assertEqual(empty["MARMOT_AGENT_SOCKET"], "")
@@ -1559,6 +1561,74 @@ class DoctorReportTests(unittest.TestCase):
                 diag.config_fingerprint(default_fields),
                 diag.config_fingerprint(configured_fields),
             )
+
+    def test_collect_unsupported_dotenv_does_not_send_stale_or_yaml_values(self) -> None:
+        yaml_home = "aa" * 16
+        yaml_account = "11" * 32
+        stale_home = "bb" * 16
+        stale_account = "22" * 32
+        with _short_tempdir("eu-") as raw:
+            root = Path(raw)
+            args = _args(root)
+            home = _private_dir(Path(args.home))
+            hermes = _private_dir(Path(args.hermes_home))
+            _private_dir(Path(args.plugin_dir))
+            _private_dir(home / "dev" / "inbound-media")
+            _private_dir(home / "dev" / "outbound-media")
+            yaml_socket = root / "y.sock"
+            _write(
+                hermes / "config.yaml",
+                "platforms:\n  marmot:\n    home_channel:\n      platform: marmot\n"
+                "      chat_id: " + yaml_home + "\n    extra:\n"
+                "      socket_path: " + str(yaml_socket) + "\n"
+                "      account_id_hex: " + yaml_account + "\n"
+                "      auth_token: yaml-inline-token\n",
+            )
+            _write(
+                hermes / ".env",
+                "MARMOT_AGENT_AUTH_TOKEN=${UNCLOSED\n"
+                "MARMOT_INBOUND_MEDIA_DIR=${UNCLOSED\n",
+            )
+            connector = _ConnectorFixture(yaml_socket, expected_token="yaml-inline-token")
+            connector.start()
+            try:
+                env = {
+                    "MARMOT_AGENT_AUTH_TOKEN": "stale-inherited-token",
+                    "MARMOT_ACCOUNT_ID_HEX": stale_account,
+                    "MARMOT_HOME_CHANNEL": stale_home,
+                }
+                with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                    diag, "bounded_run", return_value=None
+                ):
+                    report = doctor.collect(args)
+                self.assertEqual(connector.requests, [])
+                by_id = {item["id"]: item for item in report["checks"]}
+                self.assertEqual(by_id["account.selection"]["status"], "unknown")
+                self.assertEqual(by_id["account.selection"]["code"], "unsupported")
+                self.assertEqual(by_id["files.inbound_dir"]["status"], "unknown")
+                self.assertEqual(by_id["files.inbound_dir"]["code"], "unsupported")
+                self.assertEqual(by_id["files.outbound_dir"]["code"], "not_created")
+                encoded = json.dumps(report) + diag.render_human(report)
+                self.assertNotIn("stale-inherited-token", encoded)
+                self.assertNotIn("yaml-inline-token", encoded)
+                self.assertNotIn("${UNCLOSED", encoded)
+                self.assertNotIn(str(yaml_socket), encoded)
+                self.assertNotIn(stale_account, encoded)
+                self.assertNotIn(yaml_account, encoded)
+                values, error, unsupported = diag.parse_dotenv_assignments(
+                    (hermes / ".env").read_text(encoding="utf-8"),
+                    environ=env,
+                )
+                self.assertEqual(error, "unsupported")
+                self.assertIn("MARMOT_AGENT_AUTH_TOKEN", unsupported)
+                self.assertIn("MARMOT_INBOUND_MEDIA_DIR", unsupported)
+                self.assertNotIn("MARMOT_AGENT_AUTH_TOKEN", values)
+                projected = diag.project_effective_env(
+                    values, environ=env, unsupported_keys=unsupported
+                )
+                self.assertNotIn("MARMOT_AGENT_AUTH_TOKEN", projected)
+            finally:
+                connector.stop()
 
 
 class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):

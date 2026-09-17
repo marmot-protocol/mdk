@@ -52,7 +52,10 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     config, config_error = diag.parse_config_safely(config_path)
     parsed_env = diag.parse_env_safely(env_path)
     env_senders, env_allow_all, env_error = parsed_env.senders, parsed_env.allow_all, parsed_env.error
-    effective_env = diag.project_effective_env(parsed_env.values)
+    unsupported_keys = frozenset(parsed_env.unsupported_keys)
+    effective_env = diag.project_effective_env(
+        parsed_env.values, unsupported_keys=unsupported_keys
+    )
     merged = diag.merge_hermes_marmot_config(config)
     seed = diag.env_enablement_seed(
         diag.plugin_settings_from_config(config),
@@ -71,32 +74,49 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         ),
         default=False,
     )
-    home_route, home_error = diag.resolve_home_route(
-        extra,
-        home_channel=effective["home_channel"],
-        home_platform=effective["home_platform"],
-        override=args.group_id_hex,
-        env_values=effective_env,
-    )
-    account_hex, account_mode = diag.resolve_account_id(
-        extra, override=args.account_id_hex, env_values=effective_env
-    )
+    if "MARMOT_HOME_CHANNEL" in unsupported_keys:
+        home_route, home_error = None, "unsupported"
+    else:
+        home_route, home_error = diag.resolve_home_route(
+            extra,
+            home_channel=effective["home_channel"],
+            home_platform=effective["home_platform"],
+            override=args.group_id_hex,
+            env_values=effective_env,
+        )
+    if "MARMOT_ACCOUNT_ID_HEX" in unsupported_keys:
+        account_hex, account_mode = None, "unsupported"
+    else:
+        account_hex, account_mode = diag.resolve_account_id(
+            extra, override=args.account_id_hex, env_values=effective_env
+        )
     socket_path = (
         diag.resolve_socket_path(extra, fallback=installer_socket, env_values=effective_env)
         or installer_socket
     )
     welcomers = diag.resolve_welcomers(extra, env_values=effective_env)
-    auth_token, auth_error = diag.resolve_auth_token(
-        extra,
-        token=args.auth_token,
-        token_file=args.auth_token_file,
-        env_values=effective_env,
+    if {"MARMOT_AGENT_AUTH_TOKEN", "MARMOT_AGENT_AUTH_TOKEN_FILE"} & unsupported_keys:
+        auth_token, auth_error = None, "unsupported"
+    else:
+        auth_token, auth_error = diag.resolve_auth_token(
+            extra,
+            token=args.auth_token,
+            token_file=args.auth_token_file,
+            env_values=effective_env,
+        )
+    inbound_dir = (
+        None
+        if "MARMOT_INBOUND_MEDIA_DIR" in unsupported_keys
+        else diag.resolve_inbound_media_dir(
+            extra, socket_path, env_values=effective_env, fallback_home=marmot_home
+        )
     )
-    inbound_dir = diag.resolve_inbound_media_dir(
-        extra, socket_path, env_values=effective_env, fallback_home=marmot_home
-    )
-    outbound_dir = diag.resolve_outbound_media_dir(
-        extra, socket_path, env_values=effective_env, fallback_home=marmot_home
+    outbound_dir = (
+        None
+        if "MARMOT_OUTBOUND_MEDIA_DIR" in unsupported_keys
+        else diag.resolve_outbound_media_dir(
+            extra, socket_path, env_values=effective_env, fallback_home=marmot_home
+        )
     )
     fingerprint_fields = diag.nonsecret_config_fields(
         senders=senders,
@@ -105,8 +125,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         account_id_hex=account_hex,
         socket_path=str(socket_path) if socket_path else None,
         home_route=home_route,
-        inbound_media_dir=str(inbound_dir),
-        outbound_media_dir=str(outbound_dir),
+        inbound_media_dir=str(inbound_dir) if inbound_dir is not None else None,
+        outbound_media_dir=str(outbound_dir) if outbound_dir is not None else None,
     )
     fingerprint = None
     if config_error in (None, "missing"):
@@ -119,6 +139,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             socket_path,
             installer_home=marmot_home,
             env_values=effective_env,
+            unsupported_keys=unsupported_keys,
         )
     )
     checks.extend(_config_checks(config_error, env_error, senders, allow_all, home_route, home_error))
@@ -140,8 +161,22 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                 "account.selection",
                 owner="hermes_config",
                 provenance="observed",
-                status="fatal",
-                code=auth_error if auth_error in {"unreadable", "empty"} else "unauthorized",
+                status="unknown" if auth_error == "unsupported" else "fatal",
+                code=(
+                    "unsupported"
+                    if auth_error == "unsupported"
+                    else auth_error if auth_error in {"unreadable", "empty"} else "unauthorized"
+                ),
+            )
+        )
+    elif unsupported_keys & diag.DOTENV_CONNECTOR_REQUEST_KEYS:
+        checks.append(
+            diag.check(
+                "account.selection",
+                owner="hermes_config",
+                provenance="observed",
+                status="unknown",
+                code="unsupported",
             )
         )
     elif time.monotonic() < deadline:
@@ -350,7 +385,22 @@ def _file_checks(
     *,
     installer_home: Path,
     env_values: Optional[dict[str, str]] = None,
+    unsupported_keys: Optional[set[str] | frozenset[str]] = None,
 ) -> list[dict[str, Any]]:
+    unsupported = frozenset(unsupported_keys or ())
+    home_unsupported = "MARMOT_HOME" in unsupported
+    inbound_unsupported = "MARMOT_INBOUND_MEDIA_DIR" in unsupported or (
+        home_unsupported
+        and not diag.first_config_value(
+            extra, "inbound_media_dir", env="MARMOT_INBOUND_MEDIA_DIR", env_values=env_values
+        )
+    )
+    outbound_unsupported = "MARMOT_OUTBOUND_MEDIA_DIR" in unsupported or (
+        home_unsupported
+        and not diag.first_config_value(
+            extra, "outbound_media_dir", env="MARMOT_OUTBOUND_MEDIA_DIR", env_values=env_values
+        )
+    )
     effective_home = diag.resolve_marmot_home(
         extra, socket_path, env_values=env_values, fallback_home=installer_home
     )
@@ -362,12 +412,23 @@ def _file_checks(
     )
     staging = effective_home / "dev" / "media-staging"
     checks = []
-    for name, path in (
-        ("files.home", effective_home),
-        ("files.inbound_dir", inbound),
-        ("files.outbound_dir", outbound),
-        ("files.staging_dir", staging),
+    for name, path, skip in (
+        ("files.home", effective_home, home_unsupported),
+        ("files.inbound_dir", inbound, inbound_unsupported),
+        ("files.outbound_dir", outbound, outbound_unsupported),
+        ("files.staging_dir", staging, home_unsupported),
     ):
+        if skip:
+            checks.append(
+                diag.check(
+                    name,
+                    owner="hermes_config",
+                    provenance="observed",
+                    status="unknown",
+                    code="unsupported",
+                )
+            )
+            continue
         inspected = diag.inspect_path(path, expect_dir=True)
         code = inspected["code"]
         status = inspected["status"]
@@ -484,13 +545,19 @@ def _config_checks(
         )
     else:
         home_code = home_error or "missing"
+        if home_code == "unsupported":
+            home_status, home_code = "unknown", "unsupported"
+        elif home_code in {"invalid", "wrong_platform"}:
+            home_status = "degraded"
+        else:
+            home_status, home_code = "degraded", "missing"
         checks.append(
             diag.check(
                 "home.syntax",
                 owner="hermes_config",
                 provenance="observed",
-                status="degraded",
-                code=home_code if home_code in {"invalid", "wrong_platform"} else "missing",
+                status=home_status,
+                code=home_code,
             )
         )
         checks.append(
@@ -498,8 +565,8 @@ def _config_checks(
                 "home.configured_route",
                 owner="hermes_config",
                 provenance="observed",
-                status="degraded",
-                code=home_code if home_code in {"invalid", "wrong_platform"} else "missing",
+                status=home_status,
+                code=home_code,
             )
         )
     return checks

@@ -76,6 +76,22 @@ DOTENV_CONNECTOR_KEYS = frozenset(
         "MARMOT_OUTBOUND_MEDIA_DIR",
     }
 )
+DOTENV_CONNECTOR_REQUEST_KEYS = frozenset(
+    {
+        "MARMOT_HOME_CHANNEL",
+        "MARMOT_AGENT_SOCKET",
+        "MARMOT_ACCOUNT_ID_HEX",
+        "MARMOT_AGENT_AUTH_TOKEN",
+        "MARMOT_AGENT_AUTH_TOKEN_FILE",
+    }
+)
+DOTENV_MEDIA_KEYS = frozenset(
+    {
+        "MARMOT_INBOUND_MEDIA_DIR",
+        "MARMOT_OUTBOUND_MEDIA_DIR",
+        "MARMOT_HOME",
+    }
+)
 _DOTENV_INTERPOLATION = re.compile(
     r"(?P<escape>\\)?"
     r"\$(?:"
@@ -244,15 +260,20 @@ def project_effective_env(
     dotenv_values: Optional[dict[str, str]] = None,
     *,
     environ: Optional[dict[str, str]] = None,
+    unsupported_keys: Optional[set[str] | frozenset[str]] = None,
 ) -> dict[str, str]:
     """Project Hermes user-dotenv loading without mutating the process.
 
     The pinned current-candidate loader applies ``~/.hermes/.env`` with
     ``override=True``. Only connector keys are overlaid; other host or managed
-    overrides stay unmodeled.
+    overrides stay unmodeled. Unsupported interpolations are removed so a
+    stale inherited value is not treated as the dotenv assignment.
     """
 
     projected = dict(environ if environ is not None else os.environ)
+    for key in unsupported_keys or ():
+        if key in DOTENV_CONNECTOR_KEYS:
+            projected.pop(key, None)
     for key, value in (dotenv_values or {}).items():
         if key not in DOTENV_CONNECTOR_KEYS:
             continue
@@ -407,6 +428,7 @@ class ParsedHermesEnv:
     allow_all: bool = False
     error: Optional[str] = None
     values: dict[str, str] = field(default_factory=dict)
+    unsupported_keys: frozenset[str] = field(default_factory=frozenset)
 
 
 def identity_digest(value: Optional[str]) -> str:
@@ -1010,7 +1032,7 @@ def parse_dotenv_assignments(
     text: str,
     *,
     environ: Optional[dict[str, str]] = None,
-) -> tuple[dict[str, str], Optional[str]]:
+) -> tuple[dict[str, str], Optional[str], frozenset[str]]:
     raw: dict[str, tuple[str, bool]] = {}
     for line in text.splitlines():
         stripped = line.strip()
@@ -1032,42 +1054,52 @@ def parse_dotenv_assignments(
         return str(source.get(name) or "")
 
     values: dict[str, str] = {}
-    unsupported = False
+    unsupported_keys: set[str] = set()
     for key, (value, interpolate) in raw.items():
         if not interpolate:
             values[key] = value
             continue
         expanded, supported = interpolate_dotenv_value(value, lookup)
         if not supported:
-            unsupported = True
+            unsupported_keys.add(key)
             continue
         values[key] = expanded
-    return values, ("unsupported" if unsupported else None)
+    return values, ("unsupported" if unsupported_keys else None), frozenset(unsupported_keys)
 
 
 def parse_env_safely(path: Path) -> ParsedHermesEnv:
     if not path.exists():
         return ParsedHermesEnv(error="missing")
     interpolation_error: Optional[str] = None
+    unsupported_keys: frozenset[str] = frozenset()
     try:
         text = path.read_text(encoding="utf-8")
         if len(text.encode("utf-8")) > MAX_CONFIG_BYTES:
             return ParsedHermesEnv(error="oversized")
-        values, interpolation_error = parse_dotenv_assignments(text)
+        values, interpolation_error, unsupported_keys = parse_dotenv_assignments(text)
     except (OSError, UnicodeError, ValueError, TypeError):
         return ParsedHermesEnv(error="invalid")
     helper = load_configure_helper()
     if helper is None:
-        return ParsedHermesEnv(error="helper_unavailable", values=values)
+        return ParsedHermesEnv(
+            error="helper_unavailable",
+            values=values,
+            unsupported_keys=unsupported_keys,
+        )
     try:
         auth = helper.read_hermes_env_auth_from_lines(text.splitlines())
     except (OSError, UnicodeError, ValueError, TypeError):
-        return ParsedHermesEnv(error="invalid", values=values)
+        return ParsedHermesEnv(
+            error="invalid",
+            values=values,
+            unsupported_keys=unsupported_keys,
+        )
     return ParsedHermesEnv(
         senders=list(auth.allowed_users_hex),
         allow_all=bool(auth.allow_all_users),
         values=values,
         error=interpolation_error,
+        unsupported_keys=unsupported_keys,
     )
 
 
