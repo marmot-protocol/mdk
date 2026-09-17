@@ -258,6 +258,17 @@ typedef enum MarmotOnboardingDeviceDiscovery {
 } MarmotOnboardingDeviceDiscovery;
 
 /**
+ * Durable ownership classification for one inventory row.
+ */
+typedef enum MarmotAccountKeyPackageLocalState {
+  MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_NOT_LOCAL,
+  MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_CURRENT,
+  MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_PENDING_REPLACEMENT,
+  MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_RETAINED_PRIVATE_MATERIAL,
+  MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_OTHER_OWNED,
+} MarmotAccountKeyPackageLocalState;
+
+/**
  * Which relay list is missing from an incomplete account relay setup.
  */
 typedef enum MarmotMissingRelayListKind {
@@ -1404,6 +1415,23 @@ typedef struct MarmotAccountKeyPackageList {
   struct MarmotAccountKeyPackage *items;
   uintptr_t len;
 } MarmotAccountKeyPackageList;
+
+/**
+ * One KeyPackage inventory row plus its typed local provenance.
+ * The nested record is released by the list's deep-free.
+ */
+typedef struct MarmotAccountKeyPackageInventoryEntry {
+  struct MarmotAccountKeyPackage record;
+  enum MarmotAccountKeyPackageLocalState local_state;
+} MarmotAccountKeyPackageInventoryEntry;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAccountKeyPackageInventoryEntryList {
+  struct MarmotAccountKeyPackageInventoryEntry *items;
+  uintptr_t len;
+} MarmotAccountKeyPackageInventoryEntryList;
 
 /**
  * One observed relay KeyPackage event, including superseded slot members.
@@ -5249,6 +5277,39 @@ MarmotStatus marmot_account_key_packages(const struct MarmotClient *client,
                                          const char *const *bootstrap_relays,
                                          uintptr_t bootstrap_relays_len,
                                          struct MarmotAccountKeyPackageList **out);
+
+/**
+ * Local-storage KeyPackage inventory with typed durable provenance.
+ * Synchronous SQLCipher I/O on the calling thread; keep it off a UI or
+ * main thread. Free with
+ * `marmot_account_key_package_inventory_entry_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_local_account_key_packages(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               struct MarmotAccountKeyPackageInventoryEntryList **out);
+
+/**
+ * Fetch validated relay observations, then merge a fresh local snapshot.
+ * Empty bootstrap relays remain network-enabled. Free with
+ * `marmot_account_key_package_inventory_entry_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_refresh_account_key_packages(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *const *bootstrap_relays,
+                                                 uintptr_t bootstrap_relays_len,
+                                                 struct MarmotAccountKeyPackageInventoryEntryList **out);
 
 /**
  * Observed relay KeyPackage history, including superseded events. Free
@@ -9339,6 +9400,15 @@ void marmot_send_summary_free(struct MarmotSendSummary *ptr);
  * library.
  */
 void marmot_account_key_package_list_free(struct MarmotAccountKeyPackageList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_account_key_package_inventory_entry_list_free(struct MarmotAccountKeyPackageInventoryEntryList *list);
 
 /**
  * Free a list returned by this library. NULL is a no-op.

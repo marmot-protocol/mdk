@@ -11,6 +11,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Local-first KeyPackage inventory across Rust, Swift/Kotlin and C, including
+  `localAccountKeyPackages`, `refreshAccountKeyPackages` and typed ownership via
+  `AccountKeyPackageLocalStateFfi`. Hosts can display a consistent local snapshot
+  immediately and add relay observations after refresh; retain the local result
+  if refresh fails. Regenerate bindings and headers with the matching library.
+  Android settings adoption remains a separate consumer change.
+
 - Message presentation records expose typed deletion provenance (`author`, `admin`, or `unknown`),
   including conversation windows, chat-list and reply previews, moderation reads, and timeline JSON.
   Provenance comes from the selected accepted deletion, independently of the original message kind.

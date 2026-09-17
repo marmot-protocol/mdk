@@ -9,6 +9,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,
+  `MarmotAccountKeyPackageInventoryEntryList`,
+  `marmot_account_key_package_inventory_entry_list_free`,
+  `marmot_local_account_key_packages`, and
+  `marmot_refresh_account_key_packages` for local-first KeyPackage inventory
+  with typed durable provenance from a consistent local storage snapshot.
+  Existing `MarmotAccountKeyPackage` layout is unchanged. Regenerate headers and
+  use a matching library.
+
 - `marmot_report_message` and `marmot_dismiss_reports`, paginated `marmot_content_reports`
   and `marmot_report_dismissals`, and the deletion-masked `marmot_reported_message` lookup.
   Report records expose `MarmotReportReason` and individual dismissal state; timeline records

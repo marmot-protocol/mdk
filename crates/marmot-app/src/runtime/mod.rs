@@ -37,8 +37,8 @@ use crate::{
     ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
-    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountRelayListBootstrap,
-    AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
+    AccountKeyPackageInventoryEntry, AccountKeyPackageRecord, AccountKeyPackageRelayEvent,
+    AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
     AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
@@ -3410,6 +3410,45 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Local-storage KeyPackage inventory. Does not wait for network startup,
+    /// issue a worker RPC, or start a directory query. The read is synchronous
+    /// SQLCipher I/O on the caller's thread; hosts should keep it off a UI or
+    /// main thread.
+    pub fn local_account_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.accounts.local_account_key_packages(account_ref)
+    }
+
+    /// Fetch validated relay observations, then merge a fresh local snapshot.
+    ///
+    /// Empty `bootstrap_relays` remains network-enabled. On failure, callers
+    /// should keep a previously rendered local result.
+    pub async fn refresh_account_key_packages(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.accounts
+            .refresh_account_key_packages(account_ref, bootstrap_relays)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.accounts
+            .set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
+        self.accounts.app_for_test()
+    }
+
     pub async fn account_key_package_relay_events(
         &self,
         account_ref: &str,
@@ -5518,6 +5557,19 @@ impl AccountManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.app.set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
+        &self.app
+    }
+
+    #[cfg(test)]
     pub(crate) fn register_reconcile_rollback_waiter(&self, notify: std::sync::mpsc::Sender<()>) {
         self.reconcile_rollback_waiters
             .lock()
@@ -6158,22 +6210,47 @@ impl AccountManager {
         account_ref: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        Ok(self
+            .refresh_account_key_packages(account_ref, bootstrap_relays)
+            .await?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    pub fn local_account_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        let account = self.resolve(account_ref)?;
+        self.app
+            .local_account_key_package_inventory_snapshot(&account.label)
+    }
+
+    pub async fn refresh_account_key_packages(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.resolve(account_ref)?;
         if account.can_sign() && !account.signed_out {
-            // Unlike local runtime reads, this API reports relay visibility.
-            // Wait for the managed worker's initial activation, catch-up, and
-            // open maintenance before issuing the directory query.
             self.wait_for_account_network_startup_to_settle(&account.label)
                 .await?;
         }
-        let owned = cgka_engine::key_package::durably_owned_key_packages(
-            &self.app.account_storage(&account.label)?,
-            cgka_traits::group::ProtocolProfile::Current,
-        )
-        .map_err(cgka_session::SessionError::from)?;
-        self.app
-            .account_key_package_records(&account.label, bootstrap_relays, owned)
-            .await
+        let relays = self
+            .app
+            .fetch_validated_account_key_package_records(
+                &account.label,
+                bootstrap_relays,
+                "refresh_account_key_packages",
+            )
+            .await?;
+        let locals = self
+            .app
+            .local_account_key_package_inventory_snapshot(&account.label)?;
+        Ok(crate::key_package_records::merge_key_package_inventory(
+            locals, relays,
+        ))
     }
 
     pub async fn account_key_package_relay_events(

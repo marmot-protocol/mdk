@@ -506,6 +506,8 @@ pub struct MarmotApp {
     #[cfg(test)]
     legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
+    inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
+    #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
@@ -1078,6 +1080,47 @@ pub struct AccountKeyPackageRecord {
     pub relay: bool,
 }
 
+/// Durable ownership classification for one inventory row.
+///
+/// Classification comes from durable lifecycle references, never an empty
+/// event ID, timestamp, or pubkey match. `AccountKeyPackageRecord::local` is
+/// true exactly when this is not [`NotLocal`](Self::NotLocal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountKeyPackageLocalState {
+    /// No corresponding durably owned private bundle.
+    NotLocal,
+    /// Owned ref equals the durable current ref.
+    Current,
+    /// Owned ref equals the durable pending replacement ref.
+    PendingReplacement,
+    /// Owned ref occurs in durable retained material.
+    RetainedPrivateMaterial,
+    /// Genuinely owned, but not classified by the durable lifecycle
+    /// (including legacy or unclassified cases).
+    OtherOwned,
+}
+
+impl AccountKeyPackageLocalState {
+    /// True for every state that has a usable local private bundle.
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        !matches!(self, Self::NotLocal)
+    }
+}
+
+/// One KeyPackage inventory row plus its typed local provenance.
+///
+/// `record.local` and `record.relay` remain orthogonal facts.
+/// `record.relay` means a validated relay observation, never merely an
+/// authored event or a configured relay. `local_state` and `record.relay`
+/// are the authoritative display distinctions; `published_at` and
+/// `source_relays` keep their legacy semantics and are not publication proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageInventoryEntry {
+    pub record: AccountKeyPackageRecord,
+    pub local_state: AccountKeyPackageLocalState,
+}
+
 /// Observed relay history for an account's kind-30443 KeyPackage events.
 ///
 /// This is the validated, event-ID-deduplicated window returned by a single
@@ -1402,6 +1445,8 @@ impl MarmotApp {
             #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
@@ -1484,6 +1529,8 @@ impl MarmotApp {
             local_open_gates: local_open_test_gate::LocalOpenGates::default(),
             #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
@@ -4131,16 +4178,70 @@ impl MarmotApp {
         label: &str,
         owned_key_packages: Vec<KeyPackage>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
+        Ok(self
+            .project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    /// Local inventory from one consistent ownership-and-lifecycle snapshot.
+    ///
+    /// Both new inventory entrypoints use this so a concurrent rotation cannot
+    /// pair a pre-rotation owned set with a post-rotation lifecycle.
+    pub(crate) fn local_account_key_package_inventory_snapshot(
+        &self,
+        label: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        let (owned_key_packages, lifecycle) =
+            self.capture_local_key_package_ownership_and_lifecycle(label)?;
+        self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
+    }
+
+    fn capture_local_key_package_ownership_and_lifecycle(
+        &self,
+        label: &str,
+    ) -> Result<
+        (
+            Vec<KeyPackage>,
+            Option<cgka_traits::KeyPackageLifecycleState>,
+        ),
+        AppError,
+    > {
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
+            let owned = cgka_engine::key_package::durably_owned_key_packages(
+                storage,
+                cgka_traits::group::ProtocolProfile::Current,
+            )
+            .map_err(cgka_session::SessionError::from)?;
+            #[cfg(test)]
+            self.run_inventory_snapshot_between_reads_for_test();
+            let lifecycle = storage.key_package_lifecycle()?;
+            Ok((owned, lifecycle))
+        })
+    }
+
+    fn project_local_account_key_package_inventory(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+        lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.account_home().account(label)?;
         let legacy_record = read_json::<KeyPackageRecord>(self.key_package_record_path(label)).ok();
-        let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
         let source_relays = self.account_nip65_relays(label).unwrap_or_default();
-        let mut records = Vec::with_capacity(owned_key_packages.len());
+        let mut entries = Vec::with_capacity(owned_key_packages.len());
 
         for key_package in owned_key_packages {
             let metadata = key_package_metadata(&key_package)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             let key_package_ref = hex::decode(&metadata.key_package_ref_hex)?;
+            let local_state = crate::key_package_records::owned_key_package_local_state(
+                &key_package_ref,
+                lifecycle.as_ref(),
+            );
             let mut key_package_id = metadata.key_package_ref_hex.clone();
             let mut key_package_event_id = String::new();
             let mut published_at = 0;
@@ -4198,23 +4299,26 @@ impl MarmotApp {
                 }
             }
 
-            records.push(AccountKeyPackageRecord {
-                account_label: Some(account.label.clone()),
-                account_id_hex: account.account_id_hex.clone(),
-                key_package_id,
-                key_package_ref_hex: metadata.key_package_ref_hex,
-                key_package_event_id,
-                published_at,
-                key_package_bytes: key_package.bytes().len(),
-                source_relays: source_relays.clone(),
-                local: true,
-                relay: false,
+            entries.push(AccountKeyPackageInventoryEntry {
+                record: AccountKeyPackageRecord {
+                    account_label: Some(account.label.clone()),
+                    account_id_hex: account.account_id_hex.clone(),
+                    key_package_id,
+                    key_package_ref_hex: metadata.key_package_ref_hex,
+                    key_package_event_id,
+                    published_at,
+                    key_package_bytes: key_package.bytes().len(),
+                    source_relays: source_relays.clone(),
+                    local: true,
+                    relay: false,
+                },
+                local_state,
             });
         }
-        Ok(records)
+        Ok(entries)
     }
 
-    async fn fetch_validated_account_key_package_records(
+    pub(crate) async fn fetch_validated_account_key_package_records(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
@@ -5817,6 +5921,59 @@ impl MarmotApp {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<LegacyProjectionOpenHook>,
+    ) {
+        *self
+            .inventory_snapshot_between_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    #[cfg(test)]
+    fn run_inventory_snapshot_between_reads_for_test(&self) {
+        let hook = self
+            .inventory_snapshot_between_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_durably_owned_key_packages_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Vec<KeyPackage>, AppError> {
+        cgka_engine::key_package::durably_owned_key_packages(
+            &self.account_storage(label)?,
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .map_err(|error| AppError::from(cgka_session::SessionError::from(error)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_key_package_lifecycle_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        Ok(self.account_storage(label)?.key_package_lifecycle()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_local_account_key_package_inventory_for_test(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+        lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
     }
 
     fn legacy_account_projection(

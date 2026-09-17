@@ -85,6 +85,19 @@ superseded events. Free that list with
 `MarmotAccountKeyPackage` layout and `marmot_account_key_package_list_free`
 are unchanged.
 
+`marmot_local_account_key_packages` is the local-first inventory. Call it
+immediately, then independently await `marmot_refresh_account_key_packages` and
+replace the displayed snapshot. The local read is synchronous SQLCipher I/O on
+the calling thread; do not invoke it on a UI or main thread. A retained package
+stays `MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_RETAINED_PRIVATE_MATERIAL` even
+when that exact event is observed; `relay` becomes true while `local_state`
+remains retained. On refresh failure, keep the local result.
+Free either list with `marmot_account_key_package_inventory_entry_list_free`.
+The new entry embeds the existing record plus
+`MarmotAccountKeyPackageLocalState`; existing structs and frees are unchanged.
+Regenerate `marmot.h` and use a matching library. Android device rendering is
+a separate consumer adoption issue.
+
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
