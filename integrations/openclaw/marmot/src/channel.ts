@@ -57,11 +57,21 @@ function marmotSlice(cfg: OpenClawConfig): NonNullable<MarmotChannelsConfig["cha
   return (cfg as unknown as MarmotChannelsConfig).channels?.marmot ?? {};
 }
 
-/** Resolve a Marmot account for a (possibly multi-account) OpenClaw config. */
-export function resolveMarmotChannelAccount(
+/** Selected channel-account config before connection/token-file resolution. */
+export interface SelectedMarmotChannelAccount {
+  accountId: string | null;
+  config: MarmotChannelAccountConfig;
+}
+
+/**
+ * Share the existing single/multi-account selection logic without resolving
+ * sockets, tokens, or other connection material. Unknown configured accounts
+ * still fail closed.
+ */
+export function selectMarmotChannelAccountConfig(
   cfg: OpenClawConfig,
   accountId?: string | null,
-): ResolvedMarmotAccount {
+): SelectedMarmotChannelAccount {
   const slice = marmotSlice(cfg);
   // Multi-account mode: every account (including "default") lives under
   // `channels.marmot.accounts.<id>`. Single-account mode: settings live on the
@@ -72,9 +82,18 @@ export function resolveMarmotChannelAccount(
     if (!accountConfig) {
       throw new Error(`unknown Marmot account id: ${selectedId}`);
     }
-    return resolveMarmotAccount(accountConfig, selectedId);
+    return { accountId: selectedId, config: accountConfig };
   }
-  return resolveMarmotAccount(slice, accountId ?? null);
+  return { accountId: accountId ?? null, config: slice ?? {} };
+}
+
+/** Resolve a Marmot account for a (possibly multi-account) OpenClaw config. */
+export function resolveMarmotChannelAccount(
+  cfg: OpenClawConfig,
+  accountId?: string | null,
+): ResolvedMarmotAccount {
+  const selected = selectMarmotChannelAccountConfig(cfg, accountId);
+  return resolveMarmotAccount(selected.config, selected.accountId);
 }
 
 function accountSnapshot(
@@ -83,25 +102,25 @@ function accountSnapshot(
   probe?: unknown,
 ): ChannelAccountSnapshot {
   const accountId = account.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
-  const inbound = marmotInboundRuntimeSnapshot(accountId);
+  const fallback = marmotInboundRuntimeSnapshot(accountId);
+  // Prefer a supplied host runtime, including a deliberate `lastError: null`.
+  // Do not overlay the compatibility snapshot or resurrect stale errors.
+  const source = runtime ?? fallback;
   return {
-    ...runtime,
-    ...inbound,
     accountId,
     name: accountId,
     enabled: true,
     configured: true,
-    running: inbound.running === true,
-    connected: inbound.connected === true,
-    lastStartAt: inbound.lastStartAt ?? runtime?.lastStartAt ?? null,
-    lastStopAt: inbound.lastStopAt ?? runtime?.lastStopAt ?? null,
-    lastError: inbound.lastError ?? runtime?.lastError ?? null,
-    lastInboundAt: inbound.lastInboundAt ?? runtime?.lastInboundAt ?? null,
-    lastOutboundAt: inbound.lastOutboundAt ?? runtime?.lastOutboundAt ?? null,
-    reconnectAttempts: inbound.reconnectAttempts ?? runtime?.reconnectAttempts,
+    running: source.running === true,
+    connected: source.connected === true,
+    lastStartAt: source.lastStartAt ?? null,
+    lastStopAt: source.lastStopAt ?? null,
+    lastError: source.lastError ?? null,
+    lastInboundAt: source.lastInboundAt,
+    lastOutboundAt: source.lastOutboundAt,
+    reconnectAttempts: source.reconnectAttempts,
     mode: "off",
     dmPolicy: account.dmPolicy ?? "allowlist",
-    allowFrom: account.allowFrom.map(String),
     probe,
   };
 }

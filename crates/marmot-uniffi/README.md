@@ -5,10 +5,12 @@ UniFFI bindings for the Marmot app runtime.
 The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
 package that shared surface:
 
-- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` for iOS.
+- `./crates/marmot-uniffi/xcframework.sh` builds `output/MarmotKit.xcframework` plus `output/MarmotKit.swift` and
+  `output/PrivacyInfo.xcprivacy` for iOS.
 - `./crates/marmot-uniffi/xcframework-macos.sh` builds `output/macos/MarmotKit.xcframework` plus
-  `output/macos/MarmotKit.swift` for macOS on Apple Silicon (`aarch64-apple-darwin`). Its output directory is separate
-  from the iOS one so building both in one workspace cannot clobber either artifact.
+  `output/macos/MarmotKit.swift` and `output/macos/PrivacyInfo.xcprivacy` for macOS on Apple Silicon
+  (`aarch64-apple-darwin`). Its output directory is separate from the iOS one so building both in one workspace
+  cannot clobber either artifact.
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/.../marmot_uniffi.kt` plus Android
   `jniLibs` shared libraries.
 
@@ -40,6 +42,26 @@ Conversation windows continue to supply their bounded identity dictionary.
 This adds no wire format or database migration. Regenerate Swift/Kotlin bindings
 and use the matching native library; Android follow-through is tracked in
 [whitenoise-android#1581](https://github.com/marmot-protocol/whitenoise-android/issues/1581).
+
+### Reactions on group activity
+
+Use the existing reaction commands with the activity row's `messageIdHex`.
+Authenticated system rows retain that deterministic ID across reaction changes,
+replay and restart; the same timeline record exposes both `groupSystem` and
+`reactions`. Retraction uses the existing unreact command, and subscriptions
+update the target row without adding a second activity row. Do not synthesize or
+send a kind-1210 event to react to local group activity.
+
+Reaction notifications use the supported system payload's text fallback, never
+its JSON envelope. Only the stored target sender receives an alert; activity
+without an attributable actor does not invent a recipient. Deleted or invalidated
+targets and malformed or unsupported payloads expose no target preview.
+For synthesized system rows, `reactedToPreview` is an English fallback. The
+notification DTO has neither the target ID nor a structured system event, so this
+field cannot support client localization; hosts can omit it and use their generic
+localized reaction notification. Conversation rows still expose `groupSystem` for
+client-localized rendering and layout. This adds no binding fields or methods and
+requires no client-owned reaction map.
 
 ## Identity references and profile pseudonyms
 
@@ -451,6 +473,34 @@ for opening, paging, cancellation, timeout, ownership and draft migration.
 
 ## Apple privacy resources
 
-Apple exporters use resource-bearing static framework slices. See the
+Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target. See the
 [privacy audit and adoption guide](apple-privacy/README.md) for declarations,
 archive validation, host integration changes, and unresolved release questions.
+
+## Group reporting
+
+Swift/Kotlin expose `report_message`, `dismiss_reports`, `content_reports`,
+`report_dismissals`, and `reported_message`; the C ABI mirrors these operations.
+`ReportReasonFfi` supplies the NIP-56 categories. Timeline records carry
+`has_reports`. Individual report records carry reporter, target author, category,
+explanation and `dismissed`; each admin label carries its own event ID, admin,
+explanation and timestamp. No aggregate queue, count, status, revision argument,
+or winning review decision is imposed on hosts.
+
+Pages are capped at 100 and cursors are exclusive. C callers deep-free returned
+pages with `marmot_content_report_page_free` or `marmot_report_dismissal_page_free`.
+`reported_message` uses the ordinary timeline record and its free function.
+Use existing projection subscriptions to refresh client review views.
+
+## Durable avatar access
+
+Chat rows and conversation header/identity records now include `avatarAsset` metadata. For visible content, batch its
+opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`. Both
+accept at most 16 items; byte reads additionally require a 1-byte to 16-MiB aggregate budget. A `deferred` result means
+that complete image did not fit the remaining budget. Ready/stale images can render offline; decode and render on the
+host, caching decoded images by reference plus content revision. Screen subscriptions update metadata when acquisition
+completes. `clearAvatarCache` clears durable bytes and demand; later visible requests can acquire again.
+
+Use matching regenerated Swift/Kotlin and native libraries. Keep host persistent caches until migration and device
+validation are complete. See [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
+for source/account fencing, result states and lifecycle rules.

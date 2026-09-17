@@ -747,9 +747,8 @@ async fn local_inventory_reports_signed_pending_replacement() {
 async fn cache_metadata_without_owned_bundle_is_not_local() {
     let (_dir, app, account, fetcher, _relay) = inventory_fixture().await;
     write_key_package_cache(&app, &account, SLOT, "cache-only-ref", "event-cache");
-    let listing = app
-        .local_account_key_package_inventory(&account.label, Vec::new())
-        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+    let listing = runtime.local_account_key_packages(&account.label).unwrap();
     assert!(listing.is_empty());
     assert_eq!(fetcher.requests.lock().unwrap().len(), 0);
 }
@@ -864,7 +863,7 @@ async fn concurrent_refresh_uses_post_rotation_local_snapshot() {
                 .await
                 .expect("refresh must reach the held directory fetch");
             runtime.rotate_key_package(&account_id).await.unwrap();
-            release.notify_waiters();
+            release.notify_one();
         }
     );
     let refreshed = refreshed.unwrap();

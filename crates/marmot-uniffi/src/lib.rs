@@ -405,6 +405,8 @@ pub use conversions::{
 };
 pub use subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription};
 
+pub use commands::moderation::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;

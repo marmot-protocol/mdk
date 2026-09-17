@@ -10,6 +10,88 @@ use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
 
 #[tokio::test]
+async fn worker_lookup_skips_reconcile() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    let account = app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (commands, received) = mpsc::channel(1);
+    let (shutdown, stopped) = oneshot::channel();
+    manager.workers.lock().await.insert(
+        account.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: true,
+            handle: tokio::spawn(async move {
+                let _ = stopped.await;
+            }),
+            commands: commands.clone(),
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+        },
+    );
+    // A lifecycle transaction for another account must not hold up this worker.
+    let transaction = manager.worker_transactions.lock().await;
+    let found = timeout(Duration::from_millis(100), async {
+        assert!(
+            manager
+                .worker_commands("alice")
+                .await?
+                .same_channel(&commands)
+        );
+        assert!(
+            manager
+                .worker_commands_for_setup("alice")
+                .await?
+                .same_channel(&commands)
+        );
+        manager.media_worker_commands("alice").await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(found.0.same_channel(&commands));
+    drop(found);
+
+    for ready in [false, true] {
+        manager
+            .workers
+            .lock()
+            .await
+            .get_mut(&account.account_id_hex)
+            .unwrap()
+            .ready = ready;
+        manager.set_account_tearing_down(&account.account_id_hex, ready);
+        assert!(
+            timeout(Duration::from_millis(10), manager.worker_commands("alice"))
+                .await
+                .is_err()
+        );
+    }
+    manager.set_account_tearing_down(&account.account_id_hex, false);
+    drop(received);
+    assert!(
+        timeout(Duration::from_millis(10), manager.worker_commands("alice"))
+            .await
+            .is_err()
+    );
+    let worker = manager
+        .workers
+        .lock()
+        .await
+        .remove(&account.account_id_hex)
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(10), manager.worker_commands("alice"))
+            .await
+            .is_err()
+    );
+    drop(transaction);
+    worker.shutdown().await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn message_journey_early_errors() {
     let root = tempfile::tempdir().unwrap();
     let runtime = MarmotApp::with_relays(root.path(), vec![]).runtime();
@@ -571,6 +653,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         std::future::pending::<()>().await;
     });
     let worker = ManagedAccountWorker {
+        ready: true,
         media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
             crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
         )),
@@ -607,6 +690,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
 
 fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        has_reports: false,
         group_system: None,
         edit: None,
         message_id_hex: message_id_hex.to_owned(),
@@ -1714,6 +1798,7 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
     let stream_id_hex = hex::encode([0xab; 32]);
     let (message_id_hex, start, sender) = latest_agent_stream_start(
         vec![AppMessageRecord {
+            authority: None,
             message_id_hex: "11".repeat(32),
             direction: "inbound".to_owned(),
             group_id_hex: "22".repeat(32),
@@ -1777,6 +1862,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
 
 fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMessageRecord {
     AppMessageRecord {
+        authority: None,
         message_id_hex: message_id_hex.to_owned(),
         direction: "received".to_owned(),
         group_id_hex: group_id_hex.to_owned(),
@@ -2063,6 +2149,7 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
         workers.lock().await.insert(
             "replacement".to_owned(),
             ManagedAccountWorker {
+                ready: true,
                 media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
                 )),
@@ -2432,6 +2519,42 @@ async fn open_runtime_local_test_client(
     app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle())
         .await
         .expect("open local test client")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_startup_is_reaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let account = app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let starting = manager.clone();
+    let reconcile = tokio::spawn(async move { starting.reconcile().await });
+    wait_for_test_signal(reached, "account open before cancellation").await;
+    reconcile.abort();
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    let old_commands = {
+        let workers = manager.workers.lock().await;
+        let worker = workers.get(&account.account_id_hex).unwrap();
+        assert!(!worker.ready);
+        worker.commands.clone()
+    };
+
+    let retrying = manager.clone();
+    let mut lookup = tokio::spawn(async move { retrying.worker_commands("alice").await });
+    // Reaping must wait for the abandoned open to release its session guard.
+    let premature = timeout(Duration::from_millis(50), &mut lookup).await;
+    proceed.send(()).unwrap();
+    assert!(premature.is_err());
+    let commands = timeout(Duration::from_secs(10), lookup)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!commands.same_channel(&old_commands));
+    assert!(manager.workers.lock().await[&account.account_id_hex].ready);
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2971,5 +3094,206 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
         ChatListUpdateTrigger::LastMessageContentChanged,
         "invalidation can replace the selected message"
     );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn recovery_preserves_persisted_authority_after_reopen() {
+    use cgka_traits::app_event::{AppMessageAuthority, MARMOT_APP_EVENT_KIND_REVIEW};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("authority.sqlite");
+    let key = storage_sqlite::SqlCipherKey::new("authority replay test key").unwrap();
+    let evidence = [
+        None,
+        Some(AppMessageAuthority {
+            source_context: [42; 32],
+            moderation_grant: true,
+        }),
+        Some(AppMessageAuthority {
+            source_context: [43; 32],
+            moderation_grant: false,
+        }),
+        None,
+    ];
+    let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for (index, authority) in evidence.into_iter().enumerate() {
+        let event = storage_sqlite::StoredAppEvent {
+            group_id_hex: "aa".into(),
+            message_id_hex: format!("{index:064x}"),
+            source_message_id_hex: Some(format!("{:064x}", index + 100)),
+            source_epoch: Some(7),
+            direction: "received".into(),
+            sender: "ab".repeat(32),
+            plaintext: String::new(),
+            kind: MARMOT_APP_EVENT_KIND_REVIEW,
+            tags: vec![],
+            recorded_at: index as u64,
+            received_at: index as u64,
+            origin_commit_id: None,
+            moderation_grant: index == 3,
+        };
+        if index == 3 {
+            // Legacy grants alone are not reconstructed as source evidence.
+            storage.record_app_event(&event).unwrap();
+        } else {
+            storage
+                .record_app_event_with_source(&event, None, authority)
+                .unwrap();
+        }
+    }
+    storage.close().unwrap();
+    let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let rows = storage
+        .app_messages(storage_sqlite::StoredAppMessageQuery {
+            group_id_hex: Some("aa".into()),
+            kinds: None,
+            limit: Some(4),
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for (row, authority) in rows.into_iter().zip(evidence) {
+        assert_eq!(row.authority, authority);
+        assert_eq!(
+            storage
+                .app_message("aa", &row.message_id_hex)
+                .unwrap()
+                .unwrap()
+                .authority,
+            authority
+        );
+        let record = crate::conversions::app_message_record_from_stored(row);
+        let record: AppMessageRecord =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        let update =
+            received_message_update_from_record("account", "alice", record, &HashMap::new())
+                .unwrap();
+        let RuntimeMessageUpdate::Message(received) = update else {
+            panic!("expected message")
+        };
+        assert_eq!(received.message.source_epoch, 7);
+        assert_eq!(received.message.authority, authority);
+    }
+}
+
+#[tokio::test]
+async fn system_reactions_update_live_timeline_through_existing_commands() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, group_system_event_material};
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://test.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("system reactions", &[]).await.unwrap();
+    let actor = cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let change = GroupStateChange::GroupRenamed {
+        name: "renamed".into(),
+        previous_name: Some("system reactions".into()),
+    };
+    let material = group_system_event_material(&group, 0, Some(&actor), &change).unwrap();
+    let event = GroupEvent::GroupStateChanged {
+        group_id: group.clone(),
+        epoch: cgka_traits::EpochId(0),
+        actor: Some(actor),
+        change,
+        origin_commit_id: None,
+    };
+    assert_eq!(
+        client
+            .project_group_system_rows(std::slice::from_ref(&event), 1)
+            .len(),
+        1
+    );
+    // Deliberately replay the same authenticated change. The snapshot and
+    // final history assertions below must still see exactly one original row.
+    client.project_group_system_rows(&[event], 1);
+    drop(client);
+    let runtime = app.runtime();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(material.group_id_hex.clone()),
+                pagination: storage_sqlite::TimelinePagination {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let baseline = timeline.take_snapshot();
+    assert_eq!(baseline.messages.len(), 1);
+    assert_eq!(baseline.messages[0].message_id_hex, material.message_id_hex);
+    assert_eq!(
+        baseline.messages[0].kind,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+    );
+    let first = runtime
+        .react_to_message("alice", &group, &material.message_id_hex, "👍")
+        .await
+        .unwrap();
+    let duplicate = runtime
+        .react_to_message("alice", &group, &material.message_id_hex, "👍")
+        .await
+        .unwrap();
+    assert_eq!(first.message_ids, duplicate.message_ids);
+    assert_eq!(duplicate.published, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            timeline.recv().await.expect("live reaction update");
+            let page = timeline.take_snapshot();
+            assert_eq!(page.messages.len(), 1);
+            if !page.messages[0].reactions.user_reactions.is_empty() {
+                let mut row = page.messages[0].clone();
+                assert_eq!(row.reactions.user_reactions.len(), 1);
+                assert_eq!(
+                    row.reactions.user_reactions[0].target_message_id_hex,
+                    material.message_id_hex
+                );
+                row.reactions = baseline.messages[0].reactions.clone();
+                assert_eq!(row, baseline.messages[0]);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    runtime
+        .unreact_from_message("alice", &group, &material.message_id_hex)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            timeline.recv().await.expect("live reaction removal");
+            let page = timeline.take_snapshot();
+            if page.messages[0].reactions.user_reactions.is_empty() {
+                assert_eq!(page.messages, baseline.messages);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // The only transmitted application intents are kind 7 and kind 5. The
+    // kind-1210 target remains the one locally synthesized row with no source.
+    let records = app.messages("alice").unwrap();
+    let system = records
+        .iter()
+        .filter(|r| r.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)
+        .collect::<Vec<_>>();
+    assert_eq!(system.len(), 1);
+    assert_eq!(system[0].direction, "system");
+    assert!(baseline.messages[0].source_message_id_hex.is_none());
+    let mut sent_kinds = records
+        .iter()
+        .filter(|r| r.direction == "sent")
+        .map(|r| r.kind)
+        .collect::<Vec<_>>();
+    sent_kinds.sort_unstable();
+    assert_eq!(sent_kinds, [5, 7]);
     runtime.shutdown_and_close().await.unwrap();
 }

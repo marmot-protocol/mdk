@@ -39,3 +39,6 @@ mod chat_window;
 
 mod conversation_window;
 pub mod user_blocks;
+
+mod avatar;
+pub mod moderation;

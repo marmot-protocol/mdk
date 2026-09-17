@@ -201,7 +201,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let initial = window.snapshot().unwrap();
+        let mut initial = window.snapshot().unwrap();
         assert!(window.snapshot().is_none());
         assert_eq!(initial.messages.len(), 2);
         assert_eq!(
@@ -233,6 +233,22 @@ mod tests {
             .unwrap(),
             Some(vec![1, 2, 3])
         );
+        assert!(initial.header.epoch.is_none());
+        assert!(!initial.header.capabilities.can_send);
+        // Commands below test a quiet live window. Consume the independent
+        // authority replacement first, so their revision cannot race it.
+        initial = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let replacement = window.next().await.unwrap().unwrap();
+                if replacement.header.epoch.is_some() {
+                    break replacement;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(initial.header.epoch.is_some());
+        assert!(initial.header.capabilities.can_send);
         let mut wrong = initial.revision.clone();
         wrong.generation.push('x');
         assert!(matches!(

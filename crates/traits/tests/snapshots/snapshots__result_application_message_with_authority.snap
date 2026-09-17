@@ -1,0 +1,74 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: app
+---
+{
+  "ApplicationMessage": {
+    "msg": {
+      "id": [
+        187,
+        187,
+        187,
+        187
+      ],
+      "payload": [],
+      "timestamp": 0,
+      "causal_deps": [],
+      "source": "t",
+      "envelope": {
+        "GroupMessage": {
+          "transport_group_id": []
+        }
+      }
+    },
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "app_event_id": "app-event-id",
+    "source_epoch": 1,
+    "retention": {
+      "retention_seconds": 60,
+      "expires_at": 70
+    },
+    "authority": {
+      "source_context": [
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42
+      ],
+      "moderation_grant": true
+    }
+  }
+}

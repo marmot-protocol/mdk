@@ -92,7 +92,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.1"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256"
 ```
@@ -112,7 +112,7 @@ an `npub` or raw hex public key:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.1"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -126,7 +126,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.1"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes \
@@ -426,8 +426,17 @@ for any plugin or tenant that is not in the same trust boundary.
   `wn-agent` has no atomic replace, so a partial control-plane failure is
   reported, not repaired: the connector logs `welcomer allowlist revocation
   failed …` (entries still authorized) or `welcomer allowlist not reconciled …`,
-  and startup continues. A failed revocation leaves that entry authorized until
-  a later successful sync.
+  and inbound still starts. Healthy channel status means the inbound
+  subscription is acknowledged *and* a configured policy was reconciled (or
+  the allowlist is unmanaged). A failed managed sync publishes
+  `lastError: "marmot_allowlist_sync_failed"` and retries in the running
+  gateway task (1s base, exponential backoff with jitter, 30s cap) until a
+  later verified or unmanaged result. That degraded status is diagnostic only:
+  it does not fail-closed invitations or inbound dispatch. Status snapshots
+  identify the affected OpenClaw channel account and never include Marmot
+  account ids, allowlist members, token/path values, or raw exception text.
+  A failed revocation leaves that entry authorized until a later successful
+  sync.
 - **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
   disable with `profileNameOnboarding: false`): when the agent joins a group it
   asks, on its own, whether to publish a public Nostr profile (`kind:0`) name —

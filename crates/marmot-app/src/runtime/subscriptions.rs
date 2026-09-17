@@ -1985,6 +1985,7 @@ pub(crate) fn received_message_update_from_record(
     let group_id = GroupId::new(hex::decode(&record.group_id_hex).ok()?);
     let sender_display_name = display_names.get(&record.sender).cloned();
     let message = ReceivedMessage {
+        authority: record.authority,
         message_id_hex: record.message_id_hex,
         // The projection does not retain the transport (outer-event) id; the
         // canonical app-message id above is what subscribers dedupe on.

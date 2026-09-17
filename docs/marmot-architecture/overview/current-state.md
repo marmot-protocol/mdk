@@ -24,6 +24,12 @@ previews. Compact metadata is part of native conversation rows; accepted edit hi
 Migration 76 repairs existing projections. Raw edit events remain available, but edits are no longer transcript rows.
 See the [native edit contract](../../../crates/marmot-uniffi/CONVERSATION-WINDOW.md#accepted-edits-c6a).
 
+C7-A adds protected avatar-byte storage and bounded local reads in `storage-sqlite`, with source-generation
+fencing and separate narrow LRU bookkeeping. C7-B adds durable download/retry intent, selected-source maintenance,
+validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C native integration remains pending;
+existing clients should keep their image-loading paths until that handoff.
+See [avatar cache storage](../further-context/avatar-cache-storage.md).
+
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
 return a typed preparation requirement. Live screen composition is C5 M4; native bindings remain M5. See
@@ -39,8 +45,9 @@ See [shared conversation presentation](../further-context/conversation-presentat
 
 C5 M4 adds a combined Rust conversation handle: initial/live history, header and identities, read state and draft,
 with serialized paging, retained anchors, timed retries and terminal account-store teardown. Its worker capture
-combines compact live engine authority with persisted fields on the exact session connection. Frozen startup/
-recovery snapshots return a retry requirement. M5 exposes additive UniFFI/C handles with finite operation deadlines,
+combines compact live engine authority with persisted fields on the exact session connection. Initial opens
+read the durable account snapshot directly, with permissions disabled until live authority arrives. Busy/startup/
+recovery workers cannot hold local history behind relay catch-up; quiet retries upgrade the same window. M5 exposes additive UniFFI/C handles with finite operation deadlines,
 cancellation, revisioned draft operations and native parity checks; publication and adoption remain C9.
 See the [live conversation implementation plan](../further-context/conversation-live-window-plan.md).
 
@@ -362,3 +369,8 @@ Usage and diagnostics now has a shared consent receipt and independent OTLP and
 stock-Aptabase exporter paths; see [the host contract](../usage-diagnostics.md).
 Native consent UI adoption and deployed Aptabase retention verification remain
 separate rollout work.
+
+
+C7-C adds screen avatar metadata, bounded local encoded-byte batches and acquisition/cache invalidation delivery to
+resolved chat and conversation subscriptions, with matching UniFFI/C surfaces. C7-B's durable worker remains the
+network owner. Client cache migration and flagship-device evidence remain C9 follow-through; this is not a release.

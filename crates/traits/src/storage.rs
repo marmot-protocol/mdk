@@ -343,11 +343,21 @@ pub trait MessageStorage {
     /// keyed by their source message or Welcome id, and reject other events.
     /// The engine calls this on the same transaction rail that marks the source
     /// input processed, closing the crash gap between protocol ingest and app
-    /// projection.
+    /// projection. Unknown source authority additionally persists a minimal
+    /// retry request that survives output acknowledgement. Resolved authority
+    /// upgrades an otherwise identical output and retires that request atomically.
     fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()>;
 
     /// Return pending app-visible outputs in deterministic ingress order.
     fn list_pending_application_events(&self) -> StorageResult<Vec<GroupEvent>>;
+
+    /// Bounded source-authority retries. Requests survive app-output
+    /// acknowledgement without retaining decrypted report explanations.
+    fn pending_application_authority_batch(
+        &self,
+        after: Option<&MessageId>,
+        limit: usize,
+    ) -> StorageResult<Vec<crate::app_event::PendingAppMessageAuthority>>;
 
     /// Acknowledge app-visible outputs only after their app projection has
     /// committed. Unknown ids are harmless so replay remains idempotent.
@@ -396,6 +406,19 @@ pub trait MessageStorage {
     }
 
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
+
+    /// Optional content identity of one retained snapshot. Changes when the
+    /// snapshot is replaced, even under the same name. Secret-derived material:
+    /// callers must keep it in memory and never log or persist it. `None`
+    /// disables retry suppression (or indicates a snapshot pruned meanwhile).
+    fn group_snapshot_fingerprint(
+        &self,
+        _group_id: &GroupId,
+        _name: &str,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        Ok(None)
+    }
+
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
 
     /// Restore only canonical group state from a named snapshot, ignoring any

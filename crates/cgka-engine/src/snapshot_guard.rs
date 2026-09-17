@@ -53,6 +53,8 @@ pub(crate) enum RewindSite {
     /// Ingest rewinds onto a retained anchor to read the retention policy that
     /// was authenticated at a delayed message's source epoch.
     RetentionSource,
+    /// Authenticate delayed moderation policy outside any replay guard.
+    ModerationSource,
     /// Hydration processes a stored proposal to decide whether it is a
     /// deferred SelfRemove.
     HydrateSelfRemove,
@@ -68,9 +70,10 @@ pub(crate) enum RewindSite {
 }
 
 impl RewindSite {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::PastPeelContext,
         Self::RetentionSource,
+        Self::ModerationSource,
         Self::HydrateSelfRemove,
         Self::Replay,
         Self::RetainedAnchorPass,
@@ -83,6 +86,7 @@ impl RewindSite {
         match self {
             Self::PastPeelContext => "peel-restore-",
             Self::RetentionSource => "retention-restore-",
+            Self::ModerationSource => "moderation-source-restore-",
             Self::HydrateSelfRemove => "hydrate-selfremove-probe-",
             Self::Replay => "openmls-probe-",
             Self::RetainedAnchorPass => "openmls-retained-probe-",
@@ -237,6 +241,7 @@ mod tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         }
     }
 

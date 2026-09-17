@@ -7,7 +7,8 @@
 // `gateway.startAccount` task owns this runtime for its full lifetime.
 //
 // `syncMarmotAllowlist` mirrors the configured `dm.allowFrom` welcomers into
-// wn-agent's per-account allowlist so configured welcomers are accepted.
+// wn-agent's per-account allowlist so configured welcomers are accepted, and
+// returns a typed readiness result the gateway can retain and retry.
 
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
@@ -18,7 +19,7 @@ import {
   DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
   DEFAULT_INBOUND_QUEUE_MAX_TRACKED_GROUPS,
 } from "./bounded-keyed-async-queue.js";
-import { resolveMarmotChannelAccount } from "./channel.js";
+import { resolveMarmotChannelAccount, selectMarmotChannelAccountConfig } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
 import {
@@ -38,10 +39,18 @@ import {
   markMarmotInboundReady,
   markMarmotInboundReceived,
   markMarmotInboundReconnect,
+  markMarmotInboundSetupFailed,
   markMarmotInboundStarting,
   markMarmotInboundStopped,
+  marmotInboundRuntimeSnapshot,
+  type MarmotAllowlistSyncResult,
 } from "./runtime-state.js";
 import { syncAllowlist } from "./security.js";
+
+export type {
+  MarmotAllowlistSyncFailureReason,
+  MarmotAllowlistSyncResult,
+} from "./runtime-state.js";
 
 /**
  * OpenClaw stable awaits an onFlush Promise directly. 2026.7.2-beta instead
@@ -205,12 +214,17 @@ export interface StartMarmotInboundOptions {
    */
   reconnectDelayMs?: number;
   maxReconnectDelayMs?: number;
+  /**
+   * Gateway-owned recovery hook when asynchronous account/config/client setup
+   * fails before the subscription is active. Not invoked after a clean stop.
+   */
+  onSetupFailed?: () => void;
 }
 
 // OpenClaw owns one gateway task per configured channel account. Keep one
 // subscription per account even if a host accidentally starts the same task
-// twice.
-const inboundActiveAccounts = new Set<string>();
+// twice. The reservation token lets a replaced attempt release only itself.
+const inboundActiveAccounts = new Map<string, symbol>();
 
 export function resetMarmotInboundAccountsForTests(): void {
   inboundActiveAccounts.clear();
@@ -226,62 +240,108 @@ export function startMarmotInbound(
   dispatch: InboundAgentDispatcher,
   options: StartMarmotInboundOptions = {},
 ): () => void {
-  const resolved = resolveAccount(api, options.channelAccountId);
-  const inboundAccountKey =
-    options.channelAccountId?.trim() ||
-    resolved.accountId ||
-    DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
-  if (inboundActiveAccounts.has(inboundAccountKey)) {
-    api.logger.info("marmot: inbound subscription already active; ignoring duplicate start");
+  let inboundAccountKey = "";
+  let statusAccountId = "";
+  let resolved: ResolvedMarmotAccount;
+  try {
+    resolved = resolveAccount(api, options.channelAccountId);
+    inboundAccountKey =
+      options.channelAccountId?.trim() ||
+      resolved.accountId ||
+      DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+    if (inboundActiveAccounts.has(inboundAccountKey)) {
+      api.logger.info("marmot: inbound subscription already active; ignoring duplicate start");
+      return () => {};
+    }
+    statusAccountId = resolved.accountId ?? inboundAccountKey;
+    inboundActiveAccounts.set(inboundAccountKey, Symbol("marmot-inbound-attempt"));
+  } catch {
+    api.logger.warn("marmot: could not resolve an agent account for the inbound subscription");
+    const failedAccountId =
+      options.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+    markMarmotInboundSetupFailed(failedAccountId);
+    options.statusSink?.(marmotInboundRuntimeSnapshot(failedAccountId));
+    options.onSetupFailed?.();
     return () => {};
   }
-  const statusAccountId = resolved.accountId ?? inboundAccountKey;
-  inboundActiveAccounts.add(inboundAccountKey);
+  const attemptId = inboundActiveAccounts.get(inboundAccountKey)!;
+  const publishStatus = (): void => {
+    options.statusSink?.(marmotInboundRuntimeSnapshot(statusAccountId));
+  };
   markMarmotInboundStarting(statusAccountId);
-  options.statusSink?.({
-    running: true,
-    connected: false,
-    lastStartAt: Date.now(),
-    lastStopAt: null,
-    lastError: null,
-  });
+  publishStatus();
   const controller = new AbortController();
   let stopping = false;
+  let disposed = false;
   let cancelPendingDebounce = (): void => undefined;
-  const stopInbound = (): void => {
-    if (stopping) {
-      return;
+  let stopInbound: () => void = () => {};
+  const ownsReservation = (): boolean =>
+    inboundActiveAccounts.get(inboundAccountKey) === attemptId;
+  const onExternalAbort = (): void => {
+    stopInbound();
+  };
+  const dispose = (mode: "stop" | "setup-failed"): boolean => {
+    if (disposed) {
+      return false;
     }
+    disposed = true;
     stopping = true;
     cancelPendingDebounce();
-    controller.abort();
+    options.signal?.removeEventListener("abort", onExternalAbort);
+    const owned = ownsReservation();
+    if (owned) {
+      inboundActiveAccounts.delete(inboundAccountKey);
+    }
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+    if (!owned) {
+      return false;
+    }
+    if (mode === "setup-failed") {
+      markMarmotInboundSetupFailed(statusAccountId);
+    } else {
+      markMarmotInboundStopped(statusAccountId);
+    }
+    publishStatus();
+    return true;
   };
-  // Release the guard when the loop is stopped so a clean restart can re-subscribe.
+  stopInbound = (): void => {
+    dispose("stop");
+  };
+  const failSetup = (): void => {
+    const alreadyStopping = stopping;
+    dispose("setup-failed");
+    if (!alreadyStopping) {
+      options.onSetupFailed?.();
+    }
+  };
+  // Always drive the loop off the internal controller so the returned stop() is
+  // authoritative. Route external aborts through that same idempotent dispose
+  // path so a failed or replaced attempt cannot leak listeners or mutate a
+  // newer reservation.
   controller.signal.addEventListener(
     "abort",
     () => {
-      inboundActiveAccounts.delete(inboundAccountKey);
-      markMarmotInboundStopped(statusAccountId);
-      options.statusSink?.({
-        running: false,
-        connected: false,
-        lastStopAt: Date.now(),
-      });
+      dispose("stop");
     },
     { once: true },
   );
-  // Always drive the loop off the internal controller so the returned stop() is
-  // authoritative. Route external aborts through that same idempotent stop path
-  // so startup races also mark the runtime stopping before async setup resumes.
   if (options.signal) {
     if (options.signal.aborted) {
       stopInbound();
     } else {
-      options.signal.addEventListener("abort", stopInbound, { once: true });
+      options.signal.addEventListener("abort", onExternalAbort);
     }
   }
   const signal = controller.signal;
-  const client = (options.clientFactory ?? clientForAccount)(resolved);
+  let client: MarmotAgentControlClient;
+  try {
+    client = (options.clientFactory ?? clientForAccount)(resolved);
+  } catch {
+    failSetup();
+    return stopInbound;
+  }
   // One-time, opt-in public profile-name flow (default off). Runs ahead of the
   // agent turn so a consent prompt/reply isn't fed to the model.
   const onboardingStore = resolved.profileNameOnboarding
@@ -294,14 +354,10 @@ export function startMarmotInbound(
       accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
     } catch {
       api.logger.warn("marmot: could not resolve an agent account for the inbound subscription");
-      inboundActiveAccounts.delete(inboundAccountKey);
-      markMarmotInboundStopped(statusAccountId);
-      options.statusSink?.({
-        running: false,
-        connected: false,
-        lastStopAt: Date.now(),
-        lastError: "could not resolve agent account",
-      });
+      failSetup();
+      return;
+    }
+    if (stopping || !ownsReservation()) {
       return;
     }
     let readyLogged = false;
@@ -568,19 +624,16 @@ export function startMarmotInbound(
       reconnectDelayMs: options.reconnectDelayMs,
       maxReconnectDelayMs: options.maxReconnectDelayMs,
       onReady: () => {
+        if (stopping || !ownsReservation()) {
+          return;
+        }
         if (readyLogged) {
           // Clean EOF or post-error reconnect can miss a rename while the
           // socket was down; drop every fact and pending generation.
           options.clearGroupActivationCache?.();
         }
         markMarmotInboundReady(statusAccountId);
-        options.statusSink?.({
-          running: true,
-          connected: true,
-          lastStartAt: Date.now(),
-          lastStopAt: null,
-          lastError: null,
-        });
+        publishStatus();
         api.logger.info(
           readyLogged
             ? "marmot: inbound subscription re-established"
@@ -593,12 +646,12 @@ export function startMarmotInbound(
         // inbound loop keeps reading (enables cross-group concurrency). Dedupe in
         // MarmotInboundBridge.handle() already ran synchronously before this.
         markMarmotInboundReceived(statusAccountId);
-        options.statusSink?.({ lastInboundAt: Date.now() });
+        publishStatus();
         return submitInbound(message);
       },
       onAmbientEvent: (event) => {
         markMarmotInboundReceived(statusAccountId);
-        options.statusSink?.({ lastInboundAt: Date.now() });
+        publishStatus();
         api.logger.info("marmot: inbound ambient event observed");
         if (event.type === "group_state_changed") {
           options.invalidateGroupActivation?.(event.account_id_hex, event.group_id_hex);
@@ -609,7 +662,7 @@ export function startMarmotInbound(
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {
             markMarmotInboundReceived(statusAccountId);
-            options.statusSink?.({ lastInboundAt: Date.now() });
+            publishStatus();
             // Greet on join: offer to publish a public profile name (once).
             await maybeSendProfilePromptOnJoin({
               store: onboardingStore,
@@ -623,7 +676,7 @@ export function startMarmotInbound(
         : undefined,
       onResync: ({ droppedEvents }) => {
         markMarmotInboundReceived(statusAccountId);
-        options.statusSink?.({ lastInboundAt: Date.now() });
+        publishStatus();
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
         );
@@ -637,11 +690,7 @@ export function startMarmotInbound(
       onError: () => {
         options.clearGroupActivationCache?.();
         markMarmotInboundReconnect(statusAccountId);
-        options.statusSink?.({
-          running: true,
-          connected: false,
-          lastError: "inbound subscription dropped",
-        });
+        publishStatus();
         api.logger.warn("marmot: inbound subscription dropped; reconnecting");
       },
     });
@@ -657,28 +706,66 @@ export interface SyncAllowlistOptions {
   channelAccountId?: string | null;
 }
 
+function warnAllowlistFailure(api: InboundPluginApi): void {
+  api.logger.warn("marmot: failed to sync the welcomer allowlist with wn-agent");
+}
+
 /**
  * Mirror the configured `dm.allowFrom` welcomers into wn-agent's allowlist for
- * the resolved account. No-op when no allow-from is configured, so a bare
- * deployment does not wipe an allowlist managed directly on wn-agent.
+ * the resolved account. Absent or empty `allowFrom` is unmanaged: no control
+ * client, account query, list read, or mutation, so a bare deployment does not
+ * wipe an allowlist managed directly on wn-agent.
  *
- * Startup stays best-effort — a wn-agent that cannot be reconciled must not
- * block inbound dispatch — so failures surface as warnings rather than a throw.
- * A failed revocation gets its own warning: it is the one outcome that leaves
- * the account more permissive than the operator asked for.
+ * Inbound dispatch is not blocked on reconciliation. Failures return a typed
+ * result and aggregate warnings rather than throwing. A failed revocation gets
+ * its own warning: it is the one outcome that leaves the account more
+ * permissive than the operator asked for.
  */
 export async function syncMarmotAllowlist(
   api: InboundPluginApi,
   options: SyncAllowlistOptions = {},
-): Promise<void> {
+): Promise<MarmotAllowlistSyncResult> {
+  let allowFrom: Array<string | number>;
   try {
-    const resolved = resolveAccount(api, options.channelAccountId);
-    if (resolved.allowFrom.length === 0) {
-      return;
-    }
-    const client = (options.clientFactory ?? clientForAccount)(resolved);
-    const accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
-    const result = await syncAllowlist(client, accountIdHex, resolved.allowFrom);
+    const selected = selectMarmotChannelAccountConfig(
+      api.config as Parameters<typeof selectMarmotChannelAccountConfig>[0],
+      options.channelAccountId ?? null,
+    );
+    allowFrom = selected.config.dm?.allowFrom ?? [];
+  } catch {
+    warnAllowlistFailure(api);
+    return { state: "failed", reason: "config_resolution" };
+  }
+  if (allowFrom.length === 0) {
+    return { state: "unmanaged" };
+  }
+
+  let resolved: ResolvedMarmotAccount;
+  try {
+    resolved = resolveAccount(api, options.channelAccountId);
+  } catch {
+    warnAllowlistFailure(api);
+    return { state: "failed", reason: "config_resolution" };
+  }
+
+  let client: MarmotAgentControlClient;
+  try {
+    client = (options.clientFactory ?? clientForAccount)(resolved);
+  } catch {
+    warnAllowlistFailure(api);
+    return { state: "failed", reason: "control" };
+  }
+
+  let accountIdHex: string;
+  try {
+    accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
+  } catch {
+    warnAllowlistFailure(api);
+    return { state: "failed", reason: "account_resolution" };
+  }
+
+  try {
+    const result = await syncAllowlist(client, accountIdHex, allowFrom);
     if (result.failedRemovals.length > 0) {
       // Fail-open risk: those welcomers stay authorized on the shared account
       // until the next successful sync, so never let it read as a clean start.
@@ -690,14 +777,14 @@ export async function syncMarmotAllowlist(
       api.logger.info(
         `marmot: welcomer allowlist synced (added ${result.added.length}, removed ${result.removed.length})`,
       );
-      return;
+      return { state: "reconciled" };
     }
     api.logger.warn(
       `marmot: welcomer allowlist not reconciled (added ${result.added.length}, removed ${result.removed.length}, failed ${result.failedAdds.length + result.failedRemovals.length})`,
     );
+    return { state: "failed", reason: "unverified" };
   } catch {
-    // Best-effort on startup: account/config resolution or the sync itself can
-    // throw; keep it inside the guard so the voided caller can't reject.
-    api.logger.warn("marmot: failed to sync the welcomer allowlist with wn-agent");
+    warnAllowlistFailure(api);
+    return { state: "failed", reason: "control" };
   }
 }

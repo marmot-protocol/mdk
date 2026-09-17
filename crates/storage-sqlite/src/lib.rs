@@ -12,6 +12,7 @@ pub use group_system::{
 
 mod account_projection;
 mod agent_stream_sequences;
+mod avatar_cache;
 mod chat_list;
 mod chat_presentation;
 mod codec;
@@ -39,6 +40,13 @@ pub use account_projection::{
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
+};
+pub use avatar_cache::{
+    AVATAR_IDENTITY_BATCH_LIMIT, AvatarAcquisition, AvatarAcquisitionState,
+    AvatarAssetPresentation, AvatarAssetRead, AvatarAssetRef, AvatarAssetStatus, AvatarAssetTarget,
+    AvatarAvailability, AvatarCacheUsage, AvatarIdentityDemand, AvatarImage, AvatarImageFormat,
+    AvatarPublishResult, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
+    MAX_AVATAR_DIMENSION,
 };
 pub use chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
@@ -108,4 +116,8 @@ pub(crate) use codec::{
     epoch_to_i64, i64_to_u64, i64_to_usize, message_state_from_i64, message_state_to_i64,
     optional_u64_to_i64, serialize, tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds,
     unix_now_seconds_i64, usize_to_i64,
+};
+
+pub use timeline::reports::{
+    ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage,
 };

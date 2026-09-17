@@ -121,8 +121,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
-    model's own semantics plus the fork shapes that only appear when post-fork traffic on an unadopted branch is
-    unreadable
+    model's own semantics, the fork shapes that only appear when post-fork traffic on an unadopted branch is
+    unreadable, and `Group::local_copy_welcome_created_at`: the join-time clamp, and the quiet release of a deferred
+    row older than this copy's Welcome (retained and released exactly as any other, minus the
+    `TransportObjectResourceRefused` announcement) while unopenable traffic from an epoch ahead keeps its deferred
+    retry. The predicate's own margin is a `cgka-traits` unit test
 
 - **File:** `audit_log.rs`
   - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and no-op default behavior
@@ -215,6 +218,8 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
 - New `EpochState` transition → unit test in `crates/traits/src/engine_state.rs::tests` first; add an integration test
   only if the engine is involved in the transition.
 - New `StaleReason` variant → add a case to `tests/ingest.rs` and a dedicated assertion that the typed variant fires.
+  A variant a scenario can only reach under a real transport's epoch sealing belongs in
+  `tests/epoch_sealed_transport.rs` instead, because the pass-through `MockPeeler` peels everything.
 - New capability requirement type → extend `tests/capabilities.rs` and the simulator capability property so fixed
   examples and generated matrices agree.
 - New MIP-03 rule → add to `tests/mip03_guards.rs`. These tests assert at the engine boundary, not via the harness.

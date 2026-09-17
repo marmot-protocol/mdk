@@ -3570,6 +3570,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
                 disbanded: None,
                 join_epoch: EpochId(0),
                 local_copy_install_epoch: EpochId(0),
+                local_copy_welcome_created_at: None,
             })
             .unwrap();
     }
@@ -3845,6 +3846,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         "test adapter must exercise transport id replacement"
     );
     let expected_publication = PublishedApplicationMessage {
+        authority: None,
         group_id: group_id.clone(),
         app_event_id: app_event_id.clone(),
         message_id: reported_message_id,

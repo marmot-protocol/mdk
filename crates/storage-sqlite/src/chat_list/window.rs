@@ -126,11 +126,9 @@ impl SqliteAccountStorage {
                     .query_row([&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?)))
                     .storage()?;
                 if let Some(bytes) = bytes {
-                    rows.push(PresentedChatRow {
-                        row: row.clone(),
-                        presentation: crate::chat_presentation::decode_retained(&bytes, dirty)?
-                            .presentation,
-                    });
+                    let presentation = crate::chat_presentation::decode_retained(&bytes, dirty)?.presentation;
+                    let avatar_asset = crate::avatar_cache::access::target_presentation(conn, &row.group_id_hex, None, &presentation.avatar, crate::codec::unix_now_seconds())?;
+                    rows.push(PresentedChatRow { row: row.clone(), presentation, avatar_asset });
                 } else {
                     pending_presentations.push(row.group_id_hex.clone());
                 }

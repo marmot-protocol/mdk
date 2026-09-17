@@ -51,6 +51,7 @@ fn setup() -> (tempfile::TempDir, MarmotApp, ChatPresentationInput) {
 }
 fn message(group: &str, sender: &str) -> TimelineMessageRecord {
     TimelineMessageRecord {
+        has_reports: false,
         group_system: None,
         edit: None,
         message_id_hex: "01".repeat(32),

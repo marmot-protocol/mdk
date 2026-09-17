@@ -4,6 +4,7 @@
 # Outputs:
 #   <crate>/output/macos/MarmotKit.xcframework
 #   <crate>/output/macos/MarmotKit.swift   (generated Swift bindings, separate from the xcframework)
+#   <crate>/output/macos/PrivacyInfo.xcprivacy (feature-selected SDK declaration)
 #
 # Targets:
 #   aarch64-apple-darwin    (macOS, arm64)
@@ -69,7 +70,7 @@ fi
 cd "$WORKSPACE_DIR"
 
 echo "==> Cleaning previous build artifacts"
-rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift"
+rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift" "$OUT_DIR/PrivacyInfo.xcprivacy"
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
 
 echo "==> Ensuring $MACOS_TARGET is installed"
@@ -101,20 +102,19 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.mo
 # strip=none and debug=0, and package-macos-artifacts.sh publishes that profile
 # as provenance, so a post-link strip would make the manifest describe an
 # artifact that is not the one shipped.
-python3 "$TOOL_DIR/apple-framework.py" \
-  "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" "$BUILD_DIR/headers" \
-  "$BUILD_DIR/$MACOS_TARGET/marmot_uniffiFFI.framework" macos "$MACOSX_DEPLOYMENT_TARGET" \
-  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
-  -framework "$BUILD_DIR/$MACOS_TARGET/marmot_uniffiFFI.framework" \
+  -library "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" -headers "$BUILD_DIR/headers" \
   -output "$OUT_DIR/$FRAMEWORK_NAME.xcframework"
+python3 "$TOOL_DIR/apple-privacy.py" "$OUT_DIR/PrivacyInfo.xcprivacy" \
+  --privacy-dir "$CRATE_DIR/apple-privacy" --product-analytics "${PRODUCT_ANALYTICS_EXPORT:-0}"
 
 echo "==> Copying generated Swift binding to output dir"
 cp "$BUILD_DIR/swift/${LIB_BASENAME}.swift" "$OUT_DIR/${FRAMEWORK_NAME}.swift"
 
 echo ""
 echo "Done."
+echo "  SDK privacy:    $OUT_DIR/PrivacyInfo.xcprivacy"
 echo "  XCFramework:       $OUT_DIR/$FRAMEWORK_NAME.xcframework"
 echo "  Swift binding:     $OUT_DIR/$FRAMEWORK_NAME.swift"
 echo "  Deployment target: $MACOSX_DEPLOYMENT_TARGET"

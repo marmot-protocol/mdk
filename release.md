@@ -367,7 +367,7 @@ workspace release looks like:
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.1"
 
 install_verified() (
   set -eu
@@ -449,6 +449,8 @@ The release job creates these assets:
 - `marmotkit-ios-<version>.checksums.txt`
 - `marmotkit-ios-<version>.zip`
 - `marmotkit-ios-<version>.zip.sha256`
+- `PrivacyInfo-ios-<version>.xcprivacy` (SDK privacy resource for the Swift wrapper)
+- `PrivacyInfo-ios-<version>.xcprivacy.sha256`
 - `MarmotKitFFI-macos-<version>.xcframework.zip` (macOS, Apple Silicon)
 - `MarmotKitFFI-macos-<version>.xcframework.zip.sha256`
 - `MarmotKitFFI-macos-<version>.xcframework.zip.swiftpm-checksum`
@@ -456,6 +458,8 @@ The release job creates these assets:
 - `marmotkit-macos-<version>.checksums.txt`
 - `marmotkit-macos-<version>.zip`
 - `marmotkit-macos-<version>.zip.sha256`
+- `PrivacyInfo-macos-<version>.xcprivacy` (SDK privacy resource for the Swift wrapper)
+- `PrivacyInfo-macos-<version>.xcprivacy.sha256`
 - `MarmotKit-<version>.swift` (shared by iOS and macOS)
 - `marmotkit-android-<version>.zip`
 - `marmotkit-android-<version>.zip.sha256`
@@ -469,17 +473,25 @@ Snapshot assets use `snapshot-<full-sha>` in place of `<version>` and are publis
 for SwiftPM. Android snapshots publish `marmotkit-android-snapshot-<full-sha>.zip` and its sibling `.sha256` under the
 same release tag. See `crates/marmot-uniffi/DISTRIBUTION.md` for exact URLs and consumer examples.
 
-The iOS zip contains:
+The `marmotkit-ios-<version>.zip` contains:
 
 - `MarmotKit.xcframework`
 - `MarmotKit.swift`
+- `PrivacyInfo.xcprivacy`
 - `manifest.json`
 
-The macOS zip contains:
+The `marmotkit-macos-<version>.zip` contains:
 
 - `MarmotKit.xcframework`
 - `MarmotKit.swift`
+- `PrivacyInfo.xcprivacy`
 - `manifest.json`
+
+Apple binary-target ZIPs now contain raw static-library slices. Publish the matching privacy asset and its checksum
+with each platform's assets; platform manifests use `distribution: static-library-and-privacy-v1`. No additional complete
+Swift package ZIP is published. Consumers must update their wrapper's privacy resource declaration as well as the
+binary and Swift inputs. Merely changing the binary URL loses SDK privacy delivery. See the
+[consumer migration guide](crates/marmot-uniffi/DISTRIBUTION.md#apple-privacy-migration).
 
 The Android zip contains:
 
@@ -505,11 +517,14 @@ App repos should pin an exact formal MarmotKit tag or SHA-addressed snapshot, ve
 the generated source and native libraries into ignored build inputs or another repository-approved generated-artifact
 location. Never mix generated source and native libraries from different release identifiers.
 
-iOS expects the staged equivalent of:
+Apple SwiftPM consumers can retain the remote binary target and stage the matching generated Swift and privacy file
+in its existing wrapper target. Rename the privacy asset to `PrivacyInfo.xcprivacy`, declare
+`resources: [.copy("PrivacyInfo.xcprivacy")]`, and assign the wrapper product to every consuming app/extension.
+The two staged sources are:
 
 ```text
-Vendored/MarmotKit/MarmotKit.xcframework
-Vendored/MarmotKit/Sources/MarmotKit/MarmotKit.swift
+Sources/MarmotKit/MarmotKit.swift
+Sources/MarmotKit/PrivacyInfo.xcprivacy
 ```
 
 Android expects the staged equivalent of:
@@ -584,7 +599,8 @@ name reusable.
 
 - The workspace is not published to crates.io.
 - The whole-workspace release is tag- and source-archive-based.
-- MarmotKit does not publish a Swift package manifest or Maven package. Its binary-target ZIP is SwiftPM-compatible.
+- MarmotKit publishes SwiftPM binary-target ZIPs and separate Swift/privacy assets, but no remote version-resolved
+  Swift wrapper package repository or Maven package. Hosts must synchronize the matching inputs and own resource wiring.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
 - The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the
   MarmotKit binding release.

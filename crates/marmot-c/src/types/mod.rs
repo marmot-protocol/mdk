@@ -35,3 +35,6 @@ pub mod chat_window;
 
 pub mod conversation_window;
 pub mod user_blocks;
+
+pub mod avatar;
+pub mod moderation;

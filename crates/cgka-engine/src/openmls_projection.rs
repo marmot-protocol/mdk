@@ -320,6 +320,7 @@ pub enum OpenMlsReplayObservation {
         sender: Vec<u8>,
         payload: Vec<u8>,
         retention: AppMessageRetentionDecision,
+        authority: Option<cgka_traits::app_event::AppMessageAuthority>,
         decrypted_payload_ref: String,
     },
     OwnApplicationSent {
@@ -4226,6 +4227,20 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         source_epoch,
                         sender: sender.as_slice().to_vec(),
                         payload: payload.clone(),
+                        authority: if cgka_traits::reporting::requires_source_authority(
+                            app_event.kind,
+                        ) && source_epoch == mls_group.epoch().as_u64()
+                        {
+                            Some(
+                                crate::app_payload::source_authority(&mls_group, sender)
+                                    .map_err(|e| OpenMlsProjectionError::Replay(e.to_string()))?,
+                            )
+                        } else {
+                            // Do not nest a source-policy rewind inside a replay
+                            // guard. Durable control-only recovery authenticates
+                            // historical evidence on the maintenance rail.
+                            None
+                        },
                         retention: AppMessageRetentionDecision::new(
                             app_event.created_at,
                             retention_seconds,
@@ -4715,6 +4730,7 @@ mod checkpoint_prefix_tests {
                 disbanded: None,
                 join_epoch: EpochId(0),
                 local_copy_install_epoch: EpochId(0),
+                local_copy_welcome_created_at: None,
             })
             .unwrap();
         storage

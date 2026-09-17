@@ -3,6 +3,16 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        for state in [AvatarAvailabilityFfi.missing, .ready, .stale, .invalidated] {
+            for acquisition in [AvatarAcquisitionStateFfi.idle, .queued, .fetching, .retryScheduled, .blocked] {
+                let asset = AvatarAssetFfi(target: "opaque-target", reference: "opaque-reference", availability: state, acquisition: acquisition, contentRevision: 7, byteCount: 4)
+                let copy = try FfiConverterTypeAvatarAssetFfi.lift(FfiConverterTypeAvatarAssetFfi.lower(asset))
+                precondition(copy == asset)
+            }
+            let image = AvatarBytesFfi(reference: "opaque-reference", availability: state, contentRevision: 7, byteCount: 4, deferred: false, bytes: Data([1,2,3,4]), mediaType: "image/png", width: 1, height: 1)
+            let copy = try FfiConverterTypeAvatarBytesFfi.lift(FfiConverterTypeAvatarBytesFfi.lower(image))
+            precondition(copy == image)
+        }
         for provenance in [GroupSystemEventProvenanceFfi.authenticatedGroupState, .memberAuthored] {
             let event = GroupSystemEventFfi(provenance: provenance, actorDisplayName: "Actor", subjectDisplayName: "Subject",
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
@@ -36,6 +46,14 @@ struct ChatProjectionsSmoke {
             accounts: states.map { AccountAttentionEntryFfi(accountIdHex: "account", state: $0) })
         let copy = try FfiConverterTypeAccountAttentionSnapshotFfi.lift(FfiConverterTypeAccountAttentionSnapshotFfi.lower(value))
         precondition(copy == value)
+        let report = ContentReportFfi(reportIdHex: "report", messageIdHex: "message", messageAuthor: "author", reporter: "member",
+            reason: .other, explanation: "explanation", reportedAt: 42, dismissed: true)
+        let reports = ContentReportPageFfi(reports: [report], nextCursor: nil)
+        let reportsCopy = try FfiConverterTypeContentReportPageFfi.lift(FfiConverterTypeContentReportPageFfi.lower(reports))
+        precondition(reportsCopy == reports)
+        let labels = ReportDismissalPageFfi(labels: [ReportDismissalFfi(eventIdHex: "label", admin: "admin", explanation: "reviewed", createdAt: 43)], nextCursor: "cursor")
+        let labelsCopy = try FfiConverterTypeReportDismissalPageFfi.lift(FfiConverterTypeReportDismissalPageFfi.lower(labels))
+        precondition(labelsCopy == labels)
         let edit = TimelineEditSummaryFfi(editCount: 3, latestEditMessageIdHex: "edit", editedAt: 17)
         let editCopy = try FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit))
         precondition(editCopy == edit)
@@ -119,9 +137,23 @@ func compileBlockCommands(_ marmot: Marmot, account: String, user: String) async
     _ = await sub.next()
 }
 
+func compileModerationCommands(_ marmot: Marmot, account: String, group: String) async throws {
+    _ = try await marmot.reportMessage(accountRef: account, groupIdHex: group, messageId: "message", reason: .spam, explanation: "")
+    _ = try await marmot.dismissReports(accountRef: account, groupIdHex: group, reportIds: ["report"], explanation: "reviewed")
+    _ = try marmot.contentReports(accountRef: account, groupIdHex: group, messageId: "message", after: nil, limit: 50)
+    _ = try marmot.reportedMessage(accountRef: account, groupIdHex: group, messageId: "message")
+    _ = try marmot.reportDismissals(accountRef: account, groupIdHex: group, reportId: "report", after: nil, limit: 50)
+}
+
 func compileEditHistory(_ marmot: Marmot, account: String, group: String, target: String) throws {
     let page = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: nil, beforeMessageIdHex: nil, limit: 50)
     if let oldest = page.versions.first {
         _ = try marmot.messageEditHistory(accountRef: account, groupIdHex: group, targetMessageIdHex: target, beforeEditedAt: oldest.editedAt, beforeMessageIdHex: oldest.messageIdHex, limit: 50)
     }
+}
+
+func compileAvatarCommands(_ marmot: Marmot, account: String, asset: AvatarAssetFfi) async throws {
+    let requested = try await marmot.requestAvatarAssets(accountRef: account, targets: [asset.target])
+    _ = try await marmot.readAvatarAssets(accountRef: account, references: requested.compactMap(\.reference), maxBytes: 1024 * 1024)
+    try await marmot.clearAvatarCache(accountRef: account)
 }

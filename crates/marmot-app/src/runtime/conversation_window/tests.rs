@@ -47,9 +47,14 @@ impl Fixture {
                 tokio::select! {
                     _ = &mut stop => return,
                     command = rx.recv() => match command {
-                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, respond }) => {
+                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, observer, respond }) => {
                             n.fetch_add(1, Ordering::SeqCst);
+                            client.register_conversation_capture(observer);
                             let mode = m.load(Ordering::SeqCst);
+                            if mode == 5 {
+                                reached.notify_one();
+                                tokio::select! { _ = resume.notified() => {}, _ = &mut stop => return }
+                            }
                             let result = match mode {
                                 1 => Err(ConversationWindowError::NotReady),
                                 2 => Err(StorageError::Busy("test contention".into()).into()),
@@ -71,6 +76,7 @@ impl Fixture {
         runtime.accounts.workers.lock().await.insert(
             account.account_id_hex.clone(),
             ManagedAccountWorker {
+                ready: true,
                 handle,
                 commands,
                 media_admission: Arc::new(Semaphore::new(1)),
@@ -157,7 +163,7 @@ impl Fixture {
         target: ConversationOpenTarget,
         limit: usize,
     ) -> RuntimeConversationWindowSubscription {
-        timeout(
+        let mut subscription = timeout(
             Duration::from_secs(10),
             self.runtime.open_conversation_window(
                 "alice",
@@ -167,7 +173,13 @@ impl Fixture {
         )
         .await
         .unwrap()
-        .unwrap()
+        .unwrap();
+        // Existing tests exercise the live-authority contract; dedicated cold
+        // tests assert the immediately returned local-only initial snapshot.
+        while subscription.snapshot.presentation.header.epoch.is_none() {
+            subscription.snapshot = next(&mut subscription).await;
+        }
+        subscription
     }
     async fn close(self) {
         self.runtime.shutdown_and_close().await.unwrap();
@@ -202,7 +214,18 @@ async fn open_combines_first_unread_draft_identity_and_permissions_without_marki
         .mark_timeline_message_read(&f.account, &f.group_hex(), &id(3), &|_, _| false)
         .unwrap();
     f.draft("unsent");
-    let sub = f.open(ConversationOpenTarget::Automatic, 5).await;
+    let mut sub = f
+        .runtime
+        .open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Automatic,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         sub.snapshot.anchor,
         ConversationOpenAnchorOutcome::FirstUnread { .. }
@@ -211,7 +234,7 @@ async fn open_combines_first_unread_draft_identity_and_permissions_without_marki
     assert_eq!(sub.snapshot.anchors[index].message_id_hex(), id(4));
     assert_eq!(sub.snapshot.read_state.unread_count, 8);
     assert_eq!(sub.snapshot.draft.draft.as_ref().unwrap().content, "unsent");
-    assert!(sub.snapshot.presentation.header.capabilities.is_self_admin);
+    assert!(!sub.snapshot.presentation.header.capabilities.is_self_admin);
     assert!(
         sub.snapshot
             .presentation
@@ -219,6 +242,10 @@ async fn open_combines_first_unread_draft_identity_and_permissions_without_marki
             .contains_key(&"bb".repeat(32))
     );
     assert_eq!(sub.snapshot.page.page().messages.len(), 5);
+    while sub.snapshot.presentation.header.epoch.is_none() {
+        sub.snapshot = next(&mut sub).await;
+    }
+    assert!(sub.snapshot.presentation.header.capabilities.is_self_admin);
     let handle = sub.window_handle();
     let page = handle
         .page(&sub.snapshot.revision, ConversationPageDirection::Older, 3)
@@ -302,7 +329,14 @@ async fn mutations_during_initial_capture_are_reconciled_after_delivery() {
     let (sub, ()) = tokio::join!(open, mutate);
     let mut sub = sub.unwrap();
     assert!(sub.snapshot.draft.draft.is_none());
-    let updated = next(&mut sub).await;
+    // A coherent live-authority upgrade captured before the mutation may
+    // arrive first. It must not consume invalidations queued during capture.
+    let updated = loop {
+        let update = next(&mut sub).await;
+        if update.draft.draft.is_some() {
+            break update;
+        }
+    };
     assert_eq!(
         updated.draft.draft.as_ref().unwrap().content,
         "arrived during capture"
@@ -330,13 +364,15 @@ async fn quiet_busy_retries_keep_cancelled_command_position() {
         .unwrap();
     caller.abort();
     let _ = caller.await;
-    f.mode.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await; // exceed the display budget
+    f.mode.store(0, Ordering::SeqCst);
     f.release.notify_one();
     let jumped = next(&mut sub).await;
     assert_eq!(
         jumped.anchors[anchor_index(jumped.anchor).unwrap()].message_id_hex(),
         id(4)
     );
+    f.mode.store(2, Ordering::SeqCst);
     f.draft("retry me");
     assert!(matches!(
         timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
@@ -356,16 +392,16 @@ async fn quiet_busy_retries_keep_cancelled_command_position() {
 async fn transient_command_failure_keeps_target_until_quiet_retry() {
     let f = Fixture::new(20).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
-    f.mode.store(1, Ordering::SeqCst);
+    f.mode.store(2, Ordering::SeqCst);
     assert!(matches!(
         sub.window_handle()
             .jump_to_message(&sub.snapshot.revision, &id(3))
             .await,
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     assert!(matches!(
         sub.recv().await,
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     f.mode.store(0, Ordering::SeqCst);
     let recovered = next(&mut sub).await;
@@ -597,12 +633,12 @@ async fn eviction_and_lost_reset_are_terminal_even_if_same_store_can_reopen() {
 async fn closed_session_storage_terminates_retry_and_missing_jump_recovers_original_viewport() {
     let f = Fixture::new(20).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
-    f.mode.store(1, Ordering::SeqCst);
+    f.mode.store(2, Ordering::SeqCst);
     assert!(matches!(
         sub.window_handle()
             .jump_to_message(&sub.snapshot.revision, &id(3))
             .await,
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     assert!(sub.recv().await.is_err());
     f.store
@@ -768,11 +804,11 @@ async fn saturated_history_paging_continues_after_reporting_the_new_visible_anch
 async fn terminal_task_failure_after_transient_failure_is_reported_and_stops_retrying() {
     let f = Fixture::new(3).await;
     let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
-    f.mode.store(1, Ordering::SeqCst);
+    f.mode.store(2, Ordering::SeqCst);
     f.signal();
     assert!(matches!(
         timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
-        Err(ConversationWindowError::NotReady)
+        Err(ConversationWindowError::App(_))
     ));
     f.mode.store(4, Ordering::SeqCst);
     assert!(
@@ -835,6 +871,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
                 group_id: f.group.clone(),
                 query: Default::default(),
                 store_epoch: f.store.chat_presentation_version().unwrap().store_epoch,
+                observer: None,
                 respond,
             })
             .unwrap();
@@ -919,5 +956,603 @@ async fn conversation_viewer_reaction_updates_after_add_and_remove() {
         vec![peer]
     );
     drop(sub);
+    f.close().await;
+}
+
+// The window must render retained local rows even when a live capture cannot
+// run. This is the public first-open boundary, not just a SQL paging test.
+#[tokio::test]
+async fn cold_open_returns_stored_history_while_authority_is_not_ready() {
+    let f = Fixture::new(200).await;
+    f.store
+        .refresh_chat_list_row(&f.account, &f.group_hex(), &|_, _| false)
+        .unwrap();
+    f.mode.store(1, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let result = timeout(
+        Duration::from_millis(500),
+        f.runtime.open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 50,
+            },
+        ),
+    )
+    .await;
+    eprintln!(
+        "cold local open: history=200 elapsed_ms={} completed={}",
+        started.elapsed().as_millis(),
+        result.is_ok()
+    );
+    let mut sub = result
+        .expect("stored messages must not wait for engine/relay readiness")
+        .unwrap();
+    assert_eq!(sub.snapshot.page.page().messages.len(), 50);
+    assert_eq!(ids(&sub.snapshot).last(), Some(&id(199)));
+    assert!(!sub.snapshot.presentation.header.capabilities.can_send);
+    assert!(sub.snapshot.presentation.header.epoch.is_none());
+    // Wait for the first authority attempt to settle into quiet retry, then
+    // ensure local draft invalidation is not held behind that one-second timer.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.draft("local update during catch-up");
+    let local = timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        local.draft.draft.as_ref().unwrap().content,
+        "local update during catch-up"
+    );
+    assert!(local.presentation.header.epoch.is_none());
+    f.mode.store(0, Ordering::SeqCst);
+    let ready = next(&mut sub).await;
+    assert!(ready.presentation.header.capabilities.can_send);
+    assert!(ready.presentation.header.epoch.is_some());
+    assert_eq!(ids(&ready), ids(&sub.snapshot));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn cold_capture_does_not_force_group_hydration() {
+    let f = Fixture::new(200).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let plane = f.runtime.shared_services().relay_plane().clone();
+    let mut client = f
+        .app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.runtime.session().unhydrated_group_ids(),
+        vec![f.group.clone()]
+    );
+    let result = capture_conversation(
+        &mut client,
+        &f.group,
+        Default::default(),
+        &f.store.chat_presentation_version().unwrap().store_epoch,
+    );
+    assert!(matches!(result, Err(ConversationWindowError::NotReady)));
+    assert_eq!(
+        client.runtime.session().unhydrated_group_ids(),
+        vec![f.group.clone()]
+    );
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
+    let f = Fixture::new(20).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let observer = Arc::new(SendCapture::new(
+        f.group.clone(),
+        f.store.chat_presentation_version().unwrap().store_epoch,
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    assert_eq!(client.conversation_captures.len(), 1);
+    client.publish_conversation_captures(&f.group);
+    let captured = observer.take().unwrap();
+    assert!(captured.authority.is_some());
+    assert_eq!(captured.account.page.page().messages.len(), 5);
+
+    let other_group = client.create_group("unrelated window", &[]).await.unwrap();
+    f.store
+        .refresh_chat_list_row(&f.account, &hex::encode(other_group.as_slice()), &|_, _| {
+            false
+        })
+        .unwrap();
+    let other = Arc::new(SendCapture::new(
+        other_group.clone(),
+        f.store.chat_presentation_version().unwrap().store_epoch,
+        query.clone(),
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&other)));
+    client.publish_conversation_captures(&f.group);
+    assert!(
+        other.take().is_none(),
+        "sending must not recapture unrelated groups"
+    );
+    client.publish_conversation_captures(&other_group);
+    assert!(
+        other.take().is_some(),
+        "the unrelated window is a valid registered capture"
+    );
+    drop(other);
+
+    // A viewport change invalidates the previous capture, including a change
+    // that fails to resolve. It must not fall back to the previous viewport.
+    client.publish_conversation_captures(&f.group);
+    let mut missing = query.clone();
+    missing.opening.target = ConversationOpenTarget::Message("ff".repeat(32));
+    observer.set_query(&missing);
+    assert!(observer.take().is_none());
+    client.publish_conversation_captures(&f.group);
+    assert!(observer.take().is_none());
+    observer.set_query(&query);
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    client.publish_conversation_captures(&f.group);
+    let captured = observer.take().unwrap();
+    assert_eq!(
+        captured.account.presentation_input.self_membership,
+        crate::SelfMembership::Removed
+    );
+    assert!(captured.authority.is_some());
+    client.publish_conversation_captures(&f.group);
+    client.register_conversation_capture(Some(Arc::downgrade(&observer)));
+    assert!(
+        observer.take().is_none(),
+        "normal reads supersede earlier checkpoints"
+    );
+    let weak = Arc::downgrade(&observer);
+    drop(observer);
+    client.publish_conversation_captures(&f.group);
+    assert!(weak.upgrade().is_none());
+    assert!(client.conversation_captures.is_empty());
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh_read() {
+    let f = Fixture::new(5).await;
+    let initial = f.open(ConversationOpenTarget::Latest, 5).await.snapshot;
+    let worker = f.runtime.accounts.workers.lock().await[&f.account]
+        .commands
+        .clone();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 5,
+        },
+        before_anchor: None,
+    };
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let (respond, response) = oneshot::channel();
+    worker
+        .send(AccountWorkerCommand::CaptureConversation {
+            group_id: f.group.clone(),
+            query: query.clone(),
+            store_epoch: epoch.clone(),
+            observer: None,
+            respond,
+        })
+        .await
+        .unwrap();
+    let checkpoint = response.await.unwrap().unwrap();
+    let capture = Arc::new(SendCapture::new(
+        f.group.clone(),
+        epoch.clone(),
+        query.clone(),
+    ));
+    capture.state.lock().unwrap().pending = Some(checkpoint);
+    let reader = Reader {
+        app: f.app.clone(),
+        label: "alice".into(),
+        account_id: f.account.clone(),
+        group: f.group.clone(),
+        store_epoch: epoch,
+        worker: watch::channel(Some(Ok(worker))).1,
+        send_capture: capture,
+    };
+    let sources = Sources {
+        avatars: f.app.presentation_signals.avatars.subscribe(),
+        events: f.runtime.events.subscribe(),
+        profiles: f.app.presentation_signals.profile_updates.subscribe(),
+        presentation: f.app.presentation_signals.updates.subscribe(),
+        drafts: f.app.presentation_signals.drafts.subscribe(),
+        stopping: f.runtime.shared.lifecycle().subscribe_shutdown(),
+    };
+    let resets = f.app.presentation_signals.account_resets.subscribe();
+    // Deliberately enqueue this between the checkpoint and run's first drain.
+    // No subsequent invalidation or send completion will rescue a stale read.
+    f.draft("written after checkpoint");
+    let (commands, command_rx) = mpsc::channel(8);
+    let (updates, mut changes) = watch::channel(Ok(initial.clone()));
+    let actor = tokio::spawn(run(
+        reader, query, initial, sources, resets, command_rx, updates,
+    ));
+    let updated = timeout(Duration::from_secs(3), async {
+        loop {
+            changes.changed().await.unwrap();
+            let snapshot = changes.borrow_and_update().clone().unwrap();
+            if snapshot
+                .draft
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.content == "written after checkpoint")
+            {
+                return snapshot;
+            }
+        }
+    })
+    .await;
+    drop(commands);
+    drop(changes);
+    actor.await.unwrap();
+    f.close().await;
+    assert!(
+        updated.is_ok(),
+        "a checkpoint must not swallow a later draft invalidation"
+    );
+}
+
+#[tokio::test]
+async fn busy_live_window_keeps_complete_snapshot_until_coherent_membership_update() {
+    let f = Fixture::new(8).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    assert!(sub.snapshot.presentation.header.capabilities.can_send);
+    f.mode.store(5, Ordering::SeqCst);
+    let handle = sub.window_handle();
+    let revision = sub.snapshot.revision.clone();
+    let mut read = tokio::spawn(async move { handle.return_to_latest(&revision).await });
+    timeout(Duration::from_secs(5), f.captured.notified())
+        .await
+        .unwrap();
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
+    );
+    // A delayed live capture must not publish either downgraded permissions
+    // or fresh membership combined with the old live authority.
+    assert!(
+        timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err()
+    );
+    f.mode.store(0, Ordering::SeqCst);
+    f.release.notify_one();
+    let updated = timeout(Duration::from_millis(500), read)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(updated.presentation.header.epoch.is_some());
+    assert!(!updated.presentation.header.capabilities.can_send);
+    assert_eq!(
+        updated.presentation.header.capabilities.participation,
+        crate::conversation_presentation::ConversationParticipation::Removed
+    );
+    let streamed = next(&mut sub).await;
+    assert_eq!(streamed.revision.sequence, updated.revision.sequence);
+    assert!(!streamed.presentation.header.capabilities.can_send);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn busy_live_window_does_not_disable_composer() {
+    let f = Fixture::new(8).await;
+    let mut sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    f.mode.store(1, Ordering::SeqCst);
+    f.draft("changed while sync is busy");
+    assert!(
+        timeout(Duration::from_millis(150), sub.recv())
+            .await
+            .is_err()
+    );
+    assert!(sub.snapshot.presentation.header.capabilities.can_send);
+    f.mode.store(2, Ordering::SeqCst);
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(3), sub.recv()).await.unwrap(),
+            Err(ConversationWindowError::App(_))
+        ),
+        "quiet NotReady must not hide a later storage failure"
+    );
+    f.mode.store(0, Ordering::SeqCst);
+    let updated = next(&mut sub).await;
+    assert!(updated.presentation.header.capabilities.can_send);
+    assert!(updated.presentation.header.epoch.is_some());
+    assert_eq!(
+        updated.draft.draft.as_ref().unwrap().content,
+        "changed while sync is busy"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn transient_worker_acquisition_failure_retries_without_closing_local_window() {
+    let f = Fixture::new(8).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    f.runtime
+        .accounts
+        .set_account_tearing_down(&f.account, true);
+    let mut sub = f
+        .runtime
+        .open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
+    // Reconcile deliberately cannot start this account yet. That temporary
+    // missing-worker result must not become a terminal stream error.
+    assert!(
+        timeout(Duration::from_millis(150), sub.recv())
+            .await
+            .is_err()
+    );
+    f.draft("still usable locally");
+    let local = next(&mut sub).await;
+    assert!(local.presentation.header.epoch.is_none());
+    assert_eq!(
+        local.draft.draft.as_ref().unwrap().content,
+        "still usable locally"
+    );
+    f.runtime
+        .accounts
+        .set_account_tearing_down(&f.account, false);
+    let live = next(&mut sub).await;
+    assert!(live.presentation.header.epoch.is_some());
+    assert!(live.presentation.header.capabilities.can_send);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
+    let f = Fixture::new(8).await;
+    // A missing requested worker forces reconciliation of the stale worker.
+    f.runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap()
+        .shutdown()
+        .await;
+    let (commands, _rx) = mpsc::channel(8);
+    let (shutdown, stopping) = oneshot::channel();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let entered_task = entered.clone();
+    let release_task = release.clone();
+    let handle = tokio::spawn(async move {
+        let _ = stopping.await;
+        entered_task.notify_one();
+        release_task.notified().await;
+    });
+    f.runtime.accounts.workers.lock().await.insert(
+        "stale account".into(),
+        ManagedAccountWorker {
+            ready: true,
+            handle,
+            commands,
+            shutdown,
+            media_admission: Arc::new(Semaphore::new(1)),
+        },
+    );
+    let mut sub = f
+        .runtime
+        .open_conversation_window(
+            "alice",
+            &f.group,
+            ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    // Reconcile is awaiting stale-worker teardown inside worker_transactions.
+    // Local invalidations must stay usable while that lifecycle work progresses.
+    f.draft("local during worker teardown");
+    let local = timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(local.presentation.header.epoch.is_none());
+    assert_eq!(
+        local.draft.draft.as_ref().unwrap().content,
+        "local during worker teardown"
+    );
+    drop(sub);
+    let runtime = f.runtime.clone();
+    let mut closing = tokio::spawn(async move { runtime.shutdown_and_close().await });
+    assert!(
+        timeout(Duration::from_millis(150), &mut closing)
+            .await
+            .is_err(),
+        "shutdown must still own the stale worker until its teardown finishes"
+    );
+    release.notify_one();
+    timeout(Duration::from_secs(10), closing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn live_window_waits_for_queue_capacity_without_a_display_retry_delay() {
+    let f = Fixture::new(8).await;
+    let sub = f.open(ConversationOpenTarget::Latest, 5).await;
+    let sender = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .get(&f.account)
+        .unwrap()
+        .commands
+        .clone();
+    let permits = sender.reserve_many(8).await.unwrap();
+    let handle = sub.window_handle();
+    let revision = sub.snapshot.revision.clone();
+    let mut read = tokio::spawn(async move { handle.return_to_latest(&revision).await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut read)
+            .await
+            .is_err(),
+        "an established window must retain its queued capture beyond the display budget"
+    );
+    f.add(8);
+    f.draft("stored while command queue was full");
+    drop(permits);
+    let updated = timeout(Duration::from_millis(500), read)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(updated.presentation.header.capabilities.can_send);
+    assert!(updated.presentation.header.epoch.is_some());
+    assert_eq!(ids(&updated).last(), Some(&id(8)));
+    assert_eq!(
+        updated.draft.draft.as_ref().unwrap().content,
+        "stored while command queue was full"
+    );
+
+    // Waiting for capacity is still interrupted by window closure, even if
+    // an outstanding command clone keeps its own channel alive.
+    let permits = sender.reserve_many(8).await.unwrap();
+    let handle = sub.window_handle();
+    let mut closing_read =
+        tokio::spawn(async move { handle.return_to_latest(&updated.revision).await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut closing_read)
+            .await
+            .is_err()
+    );
+    drop(sub);
+    assert!(matches!(
+        timeout(Duration::from_millis(500), closing_read)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ConversationWindowError::Closed)
+    ));
+    drop(permits);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn avatar_identity_sidecar_tracks_local_bytes_without_new_timeline_activity() {
+    let f = Fixture::new(2).await;
+    let member = "bb".repeat(32);
+    let mut record = f.app.empty_directory_record(&member);
+    record.profile = Some(crate::UserProfileMetadata {
+        picture: Some("https://example.com/avatar.png".into()),
+        created_at: 42,
+        ..Default::default()
+    });
+    f.app.save_directory_entry(&record).unwrap();
+    let mut sub = f.open(ConversationOpenTarget::Latest, 2).await;
+    let asset = sub.snapshot.presentation.identities[&member]
+        .avatar_asset
+        .clone()
+        .unwrap();
+    assert!(asset.reference.is_none());
+    let requested = f
+        .runtime
+        .request_avatar_assets("alice", vec![asset.target])
+        .await
+        .unwrap();
+    let reference = requested[0].reference.clone().unwrap();
+    let image =
+        storage_sqlite::AvatarImage::new(vec![1; 8], storage_sqlite::AvatarImageFormat::Png, 1, 1)
+            .unwrap();
+    f.store.publish_avatar(&reference, 0, &image, None).unwrap();
+    for _ in 0..100 {
+        let _ = f.app.presentation_signals.avatars.send("alice".into());
+    }
+    let update = next(&mut sub).await;
+    assert_eq!(
+        update.presentation.identities[&member]
+            .avatar_asset
+            .as_ref()
+            .unwrap()
+            .status
+            .availability,
+        storage_sqlite::AvatarAvailability::Ready
+    );
+    assert_eq!(update.page.page(), sub.snapshot.page.page());
+    let bytes = f
+        .runtime
+        .read_avatar_assets("alice", vec![reference.clone()], 8)
+        .await
+        .unwrap();
+    assert_eq!(bytes[0].result.image, Some(image));
+    f.runtime.clear_avatar_cache("alice").await.unwrap();
+    let removed = next(&mut sub).await;
+    assert!(
+        removed.presentation.identities[&member]
+            .avatar_asset
+            .as_ref()
+            .unwrap()
+            .reference
+            .is_none()
+    );
     f.close().await;
 }

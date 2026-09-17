@@ -1,8 +1,8 @@
-//! One worker capture and one actor per conversation. Account-owned fields share
-//! a read boundary; directory enrichment is a separate consistency domain.
+//! Local-first bounded windows with optional coherent live-authority capture.
+//! Account-owned fields share a read boundary; directory enrichment is separate.
 use super::account_worker::AccountWorkerCommand;
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
-use super::{MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
+use super::{AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::conversation_presentation::{
     ConversationAuthority, ConversationHeaderState, ConversationPresentationError,
@@ -12,7 +12,10 @@ use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use cgka_engine::group_authority::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 use storage_sqlite::{ConversationAccountSnapshot, ConversationOpenError, ConversationWindowQuery};
 pub use storage_sqlite::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenQuery,
@@ -21,6 +24,9 @@ pub use storage_sqlite::{
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+// Before first authority, a busy worker may enrich the local window later.
+// Bound that display wait, not the lifetime of an established window command.
+const AUTHORITY_WAIT: Duration = Duration::from_millis(50);
 const DRAIN_LIMIT: usize = 1024;
 pub const CONVERSATION_WINDOW_MAX_ROWS: usize = 200;
 
@@ -151,7 +157,98 @@ impl ConversationWindowSnapshot {
 
 pub(crate) struct CapturedConversation {
     account: ConversationAccountSnapshot,
-    authority: GroupAuthoritySnapshot,
+    authority: Option<GroupAuthoritySnapshot>,
+}
+
+// A worker-owned send can yield a coherent read before awaiting transport. Each
+// open window retains at most one such capture, and only for its current query.
+// The worker holds weak references so closing a window releases its rows.
+pub(crate) struct SendCapture {
+    group: GroupId,
+    epoch: Vec<u8>,
+    state: Mutex<SendCaptureState>,
+    changed: watch::Sender<()>,
+}
+struct SendCaptureState {
+    query: ConversationWindowQuery,
+    generation: u64,
+    pending: Option<CapturedConversation>,
+}
+impl SendCapture {
+    fn new(group: GroupId, epoch: Vec<u8>, query: ConversationWindowQuery) -> Self {
+        Self {
+            group,
+            epoch,
+            state: Mutex::new(SendCaptureState {
+                query,
+                generation: 0,
+                pending: None,
+            }),
+            changed: watch::channel(()).0,
+        }
+    }
+    fn set_query(&self, query: &ConversationWindowQuery) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.query != *query {
+            state.query = query.clone();
+            state.generation += 1;
+            state.pending = None;
+        }
+    }
+    fn take(&self) -> Option<CapturedConversation> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .take()
+    }
+}
+impl AppClient {
+    pub(crate) fn register_conversation_capture(&mut self, observer: Option<Weak<SendCapture>>) {
+        self.conversation_captures
+            .retain(|capture| capture.strong_count() > 0);
+        if let Some(observer) = observer
+            && let Some(capture) = observer.upgrade()
+        {
+            // A normal worker read supersedes earlier send checkpoints.
+            capture.take();
+            if !self
+                .conversation_captures
+                .iter()
+                .any(|old| old.ptr_eq(&observer))
+            {
+                self.conversation_captures.push(observer);
+            }
+        }
+    }
+    pub(crate) fn publish_conversation_captures(&mut self, group: &GroupId) {
+        self.conversation_captures
+            .retain(|capture| capture.strong_count() > 0);
+        let observers: Vec<_> = self
+            .conversation_captures
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|observer| observer.group == *group)
+            .collect();
+        for observer in observers {
+            let (query, generation) = {
+                let state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+                (state.query.clone(), state.generation)
+            };
+            // Use the same live engine/account read boundary as a normal window
+            // capture. Never combine frozen permissions with newer account rows.
+            // Best effort: the normal read path still owns capture errors.
+            if let Ok(captured) =
+                capture_conversation(self, &observer.group, query, &observer.epoch)
+            {
+                let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.generation == generation {
+                    state.pending = Some(captured);
+                    observer.changed.send_replace(());
+                }
+            }
+        }
+    }
 }
 /// Only called with the live client. Frozen startup/recovery snapshots return
 /// NotReady at their dispatch sites instead of entering this path.
@@ -161,7 +258,6 @@ pub(super) fn capture_conversation(
     query: ConversationWindowQuery,
     epoch: &[u8],
 ) -> Result<CapturedConversation, ConversationWindowError> {
-    client.runtime.session_mut().ensure_group_hydrated(group)?;
     let group_hex = hex::encode(group.as_slice());
     let capture = || {
         client
@@ -185,10 +281,25 @@ pub(super) fn capture_conversation(
                 {
                     account.presentation_input.self_membership = crate::SelfMembership::Removed;
                 }
-                Ok(CapturedConversation { account, authority })
+                Ok(CapturedConversation {
+                    account,
+                    authority: Some(authority),
+                })
             })
     };
     match capture() {
+        Err(ConversationWindowError::App(error))
+            if matches!(
+                error.as_ref(),
+                AppError::Session(cgka_session::SessionError::Engine(
+                    cgka_traits::EngineError::GroupNotHydrated(_)
+                ))
+            ) =>
+        {
+            // Background hydration owns recovery; no projection repair or
+            // full-history work is needed merely because authority is cold.
+            Err(ConversationWindowError::NotReady)
+        }
         Err(ConversationWindowError::NotReady) => {
             // Readiness belongs to the existing keyed projection owner. Repair
             // outside the read boundary, only when missing/dirty; never mark read.
@@ -316,31 +427,190 @@ struct Command {
     action: Action,
     reply: oneshot::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 }
+type WorkerConnection =
+    watch::Receiver<Option<Result<mpsc::Sender<AccountWorkerCommand>, ConversationWindowError>>>;
+
+// This future is joined with the window actor, not polled under its display
+// timeout. Every admitted reconcile runs to completion, even if the window
+// closes, so worker teardown cannot be abandoned inside worker_transactions.
+async fn acquire_worker(
+    accounts: AccountManager,
+    label: String,
+    account_id: String,
+    ready: watch::Sender<
+        Option<Result<mpsc::Sender<AccountWorkerCommand>, ConversationWindowError>>,
+    >,
+) {
+    while !ready.is_closed() {
+        let result = async {
+            let account = accounts.resolve(&label)?;
+            if account.account_id_hex != account_id {
+                return Err(
+                    AppError::from(marmot_account::AccountHomeError::AccountIdMismatch).into(),
+                );
+            }
+            if account.signed_out {
+                return Err(ConversationWindowError::Closed);
+            }
+            accounts.worker_commands(&label).await.map_err(Into::into)
+        }
+        .await;
+        let finished = result.is_ok() || result.as_ref().is_err_and(|error| error.terminal());
+        if ready.send(Some(result)).is_err() || finished {
+            return;
+        }
+        // A missing worker during account restart is transient. Retry only
+        // after the previous acquisition finished; closing cancels this wait.
+        tokio::select! {
+            _ = ready.closed() => return,
+            _ = tokio::time::sleep(RETRY_DELAY) => {},
+        }
+    }
+}
+
 struct Reader {
     app: MarmotApp,
     label: String,
     account_id: String,
     group: GroupId,
     store_epoch: Vec<u8>,
-    worker: mpsc::Sender<AccountWorkerCommand>,
+    worker: WorkerConnection,
+    send_capture: Arc<SendCapture>,
 }
 impl Reader {
+    async fn capture_live(
+        &mut self,
+        query: &ConversationWindowQuery,
+        allow_checkpoint: bool,
+    ) -> Result<(CapturedConversation, bool), ConversationWindowError> {
+        let worker = match self.worker.borrow().as_ref() {
+            Some(Ok(worker)) => worker.clone(),
+            Some(Err(error)) if error.terminal() => return Err(error.clone()),
+            _ => return Err(ConversationWindowError::NotReady),
+        };
+        if worker.is_closed() {
+            return Err(ConversationWindowError::Closed);
+        }
+        self.send_capture.set_query(query);
+        let mut changed = self.send_capture.changed.subscribe();
+        if allow_checkpoint && let Some(captured) = self.send_capture.take() {
+            return Ok((captured, true));
+        }
+        let (respond, rx) = oneshot::channel();
+        let capture = async {
+            worker
+                .send(AccountWorkerCommand::CaptureConversation {
+                    group_id: self.group.clone(),
+                    query: query.clone(),
+                    store_epoch: self.store_epoch.clone(),
+                    observer: Some(Arc::downgrade(&self.send_capture)),
+                    respond,
+                })
+                .await
+                .map_err(|_| ConversationWindowError::Closed)?;
+            rx.await.map_err(|_| ConversationWindowError::Closed)?
+        };
+        tokio::pin!(capture);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut capture => return result.map(|captured| (captured, false)),
+                _ = changed.changed(), if allow_checkpoint => {
+                    if worker.is_closed() { return Err(ConversationWindowError::Closed); }
+                    if let Some(captured) = self.send_capture.take() { return Ok((captured, true)); }
+                }
+            }
+        }
+    }
+
     async fn read(
+        &mut self,
+        query: &ConversationWindowQuery,
+        revision: ConversationWindowRevision,
+        allow_local: bool,
+        allow_checkpoint: bool,
+    ) -> Result<(ConversationWindowSnapshot, bool), ConversationWindowError> {
+        if !allow_local {
+            // Established windows require a coherent live capture, including
+            // checkpoints supplied by an in-flight send. The actor still
+            // cancels on close/reset/shutdown; never downgrade to a local read.
+            let (captured, checkpoint) = self.capture_live(query, allow_checkpoint).await?;
+            return self
+                .present(captured, revision)
+                .await
+                .map(|snapshot| (snapshot, checkpoint));
+        }
+        match tokio::time::timeout(AUTHORITY_WAIT, self.capture_live(query, allow_checkpoint)).await
+        {
+            Ok(Ok((captured, checkpoint))) => self
+                .present(captured, revision)
+                .await
+                .map(|snapshot| (snapshot, checkpoint)),
+            Ok(Err(ConversationWindowError::NotReady)) | Err(_) => self
+                .read_local(query, revision)
+                .await
+                .map(|snapshot| (snapshot, false)),
+            Ok(Err(error)) => Err(error),
+        }
+    }
+
+    async fn read_local(
         &self,
         query: &ConversationWindowQuery,
         revision: ConversationWindowRevision,
     ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
-        let (respond, rx) = oneshot::channel();
-        self.worker
-            .send(AccountWorkerCommand::CaptureConversation {
-                group_id: self.group.clone(),
-                query: query.clone(),
-                store_epoch: self.store_epoch.clone(),
-                respond,
-            })
-            .await
-            .map_err(|_| ConversationWindowError::Closed)?;
-        let captured = rx.await.map_err(|_| ConversationWindowError::Closed)??;
+        let app = self.app.clone();
+        let label = self.label.clone();
+        let group = hex::encode(self.group.as_slice());
+        let local = self.account_id.clone();
+        let query = query.clone();
+        let epoch = self.store_epoch.clone();
+        let expected_epoch = epoch.clone();
+        let captured = blocking_app_task(move || {
+            if app.account_home().account(&label)?.account_id_hex != local {
+                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+            }
+            let store = app.account_storage(&label)?;
+            if store.chat_presentation_version()?.store_epoch != expected_epoch {
+                return Ok(Err(ConversationOpenError::Storage(StorageError::Closed(
+                    "conversation store replaced".into(),
+                ))));
+            }
+            let read = || store.conversation_account_snapshot(&group, query.clone());
+            let account = match read() {
+                Err(ConversationOpenError::ReadStateNotReady) => {
+                    // Reuse the keyed durable projection owner. Never hydrate
+                    // MLS or mark read merely to render retained local content.
+                    store.refresh_chat_list_row(
+                        &local,
+                        &group,
+                        &MarmotApp::chat_list_mention_classifier(&local),
+                    )?;
+                    read()
+                }
+                result => result,
+            };
+            Ok(account)
+        })
+        .await??;
+        if captured.page.store_epoch() != epoch {
+            return Err(ConversationWindowError::Closed);
+        }
+        self.present(
+            CapturedConversation {
+                account: captured,
+                authority: None,
+            },
+            revision,
+        )
+        .await
+    }
+
+    async fn present(
+        &self,
+        captured: CapturedConversation,
+        revision: ConversationWindowRevision,
+    ) -> Result<ConversationWindowSnapshot, ConversationWindowError> {
         let app = self.app.clone();
         let label = self.label.clone();
         let account_id = self.account_id.clone();
@@ -349,24 +619,51 @@ impl Reader {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
             let account = captured.account;
-            let authority = captured.authority;
-            let facts = authority.facts;
-            let state = ConversationHeaderState {
-                archived: account.archived,
-                epoch: Some(facts.epoch.0),
-                authority: ConversationAuthority {
-                    is_member: facts.is_member,
-                    self_membership: account.presentation_input.self_membership,
-                    is_admin: facts.is_admin,
-                    admin_count: facts.admin_count,
-                    pending_confirmation: account.pending_confirmation,
-                    leave_request_pending: account.leave_request_pending,
-                    lifecycle: authority.lifecycle.into(),
-                    unrecoverable: facts.unrecoverable,
-                    disbanding: authority.disbanding,
-                    disbanding_enabled: facts.disbanding_enabled,
-                    has_disbanding_blockers: facts.has_disbanding_blockers,
-                },
+            let state = if let Some(authority) = captured.authority {
+                let facts = authority.facts;
+                ConversationHeaderState {
+                    archived: account.archived,
+                    epoch: Some(facts.epoch.0),
+                    authority: ConversationAuthority {
+                        is_member: facts.is_member,
+                        self_membership: account.presentation_input.self_membership,
+                        is_admin: facts.is_admin,
+                        admin_count: facts.admin_count,
+                        pending_confirmation: account.pending_confirmation,
+                        leave_request_pending: account.leave_request_pending,
+                        lifecycle: authority.lifecycle.into(),
+                        unrecoverable: facts.unrecoverable,
+                        disbanding: authority.disbanding,
+                        disbanding_enabled: facts.disbanding_enabled,
+                        has_disbanding_blockers: facts.has_disbanding_blockers,
+                    },
+                }
+            } else {
+                // Membership is a durable display fact, not engine authority.
+                // epoch=None explicitly denotes local-only capture; the shared
+                // presenter suppresses every live permission in this state.
+                ConversationHeaderState {
+                    archived: account.archived,
+                    epoch: None,
+                    authority: ConversationAuthority {
+                        is_member: account.presentation_input.self_membership
+                            == crate::SelfMembership::Member,
+                        self_membership: account.presentation_input.self_membership,
+                        is_admin: false,
+                        admin_count: 0,
+                        pending_confirmation: account.pending_confirmation,
+                        leave_request_pending: account.leave_request_pending,
+                        lifecycle: if account.disbanded {
+                            crate::AppGroupLifecycleState::Disbanded
+                        } else {
+                            crate::AppGroupLifecycleState::Recovering
+                        },
+                        unrecoverable: false,
+                        disbanding: false,
+                        disbanding_enabled: false,
+                        has_disbanding_blockers: false,
+                    },
+                }
             };
             let presentation = app.conversation_window_presentation(
                 &label,
@@ -404,8 +701,21 @@ impl MarmotAppRuntime {
             return Err(ConversationWindowError::InvalidLimit);
         }
         let account = self.accounts.resolve(account_ref)?;
+        self.accounts.require_onboarding_complete_for(&account)?;
+        if !account.can_sign() {
+            return Err(
+                AppError::from(marmot_account::AccountHomeError::SecretNotFound(
+                    account.account_id_hex,
+                ))
+                .into(),
+            );
+        }
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()).into());
+        }
         let app = &self.accounts.app;
         let mut sources = Sources {
+            avatars: app.presentation_signals.avatars.subscribe(),
             events: self.events.subscribe(),
             profiles: app.presentation_signals.profile_updates.subscribe(),
             presentation: app.presentation_signals.updates.subscribe(),
@@ -431,8 +741,13 @@ impl MarmotAppRuntime {
                     .store_epoch)
             })
             .await?;
-            let worker = self.accounts.worker_commands(account_ref).await?;
+            let (ready, worker) = watch::channel(None);
             let reader = Reader {
+                send_capture: Arc::new(SendCapture::new(
+                    group.clone(),
+                    epoch.clone(),
+                    position.clone(),
+                )),
                 app: self.accounts.app.clone(),
                 label: account.label.clone(),
                 account_id: account.account_id_hex,
@@ -441,13 +756,13 @@ impl MarmotAppRuntime {
                 worker,
             };
             loop {
-                match reader.read(&position, revision.clone()).await {
+                match reader.read_local(&position, revision.clone()).await {
                     Err(ConversationWindowError::NotReady) => tokio::time::sleep(RETRY_DELAY).await,
-                    result => return result.map(|snapshot| (reader, snapshot)),
+                    result => return result.map(|snapshot| (reader, snapshot, ready)),
                 }
             }
         };
-        let (reader, snapshot) = tokio::select! {
+        let (reader, snapshot, ready) = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return Err(ConversationWindowError::Closed),
             _ = wait_for_account_reset(&mut resets, &account.label) => return Err(ConversationWindowError::Closed),
@@ -456,15 +771,24 @@ impl MarmotAppRuntime {
         let position = retain_anchor(position, &snapshot);
         let (updates, rx) = watch::channel(Ok(snapshot.clone()));
         let (commands, command_rx) = mpsc::channel(8);
-        tokio::spawn(run(
-            reader,
-            position,
-            snapshot.clone(),
-            sources,
-            resets,
-            command_rx,
-            updates,
-        ));
+        let snapshot_for_actor = snapshot.clone();
+        let accounts = self.accounts.clone();
+        let label = reader.label.clone();
+        let account_id = reader.account_id.clone();
+        tokio::spawn(async move {
+            tokio::join!(
+                acquire_worker(accounts, label, account_id, ready),
+                run(
+                    reader,
+                    position,
+                    snapshot_for_actor,
+                    sources,
+                    resets,
+                    command_rx,
+                    updates
+                ),
+            );
+        });
         Ok(RuntimeConversationWindowSubscription {
             snapshot,
             handle: ConversationWindowHandle { commands },
@@ -562,6 +886,7 @@ fn command_position(
     Ok(next)
 }
 struct Sources {
+    avatars: broadcast::Receiver<String>,
     events: broadcast::Receiver<MarmotAppEvent>,
     profiles: broadcast::Receiver<String>,
     presentation: broadcast::Receiver<PresentationInvalidation>,
@@ -570,6 +895,9 @@ struct Sources {
 }
 impl Sources {
     fn drain(&mut self) {
+        for _ in 0..self.avatars.len().min(DRAIN_LIMIT) {
+            let _ = self.avatars.try_recv();
+        }
         for _ in 0..self.events.len().min(DRAIN_LIMIT) {
             let _ = self.events.try_recv();
         }
@@ -587,6 +915,7 @@ impl Sources {
         let group_hex = hex::encode(reader.group.as_slice());
         loop {
             tokio::select! {
+                event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 event = self.events.recv() => match event {
                     Ok(event) if projection_update_from_event(&event).is_some_and(|u|u.account_id_hex == reader.account_id && u.update.group_id_hex == group_hex)
                         || chat_list_event_route(&event).is_some_and(|(account,group)| account == reader.account_id && group == &reader.group) => return,
@@ -609,7 +938,7 @@ impl Sources {
     }
 }
 async fn run(
-    reader: Reader,
+    mut reader: Reader,
     mut position: ConversationWindowQuery,
     mut current: ConversationWindowSnapshot,
     mut sources: Sources,
@@ -617,8 +946,14 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     updates: watch::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 ) {
-    let mut dirty = false;
+    let mut worker_updates = reader.worker.clone();
+    let mut send_updates = reader.send_capture.changed.subscribe();
+    reader.send_capture.set_query(&position);
+    let mut worker_updates_open = true;
+    let mut dirty = true; // enrich the initial local snapshot without delaying it
+    let mut authority_pending = false;
     let mut failed = false;
+    let mut retry_delayed = false;
     let mut last_good_position = position.clone();
     loop {
         let mut stopping = sources.stopping.clone();
@@ -628,7 +963,13 @@ async fn run(
             _ = wait_for_account_reset(&mut resets, &reader.label) => return,
             _ = updates.closed() => return,
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
-            _ = tokio::time::sleep(if failed { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty => None,
+            _ = send_updates.changed() => { dirty = true; continue; },
+            result = worker_updates.changed(), if worker_updates_open => {
+                if result.is_err() { worker_updates_open = false; }
+                else { dirty = true; }
+                continue;
+            },
+            _ = tokio::time::sleep(if retry_delayed || (authority_pending && !dirty) { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty || authority_pending => None,
             _ = sources.invalidated(&reader, &current), if !dirty => { dirty = true; continue; },
         };
         let next = match command
@@ -645,15 +986,16 @@ async fn run(
             }
         };
         sources.drain(); // only the queued prefix; mutations during capture remain queued
+        let reset_label = reader.label.clone();
         let result = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut sources.stopping) => return,
-            _ = wait_for_account_reset(&mut resets, &reader.label) => return,
+            _ = wait_for_account_reset(&mut resets, &reset_label) => return,
             _ = updates.closed() => return,
-            result = reader.read(&next, current.revision.clone()) => result,
+            result = reader.read(&next, current.revision.clone(), current.presentation.header.epoch.is_none(), command.is_none()) => result,
         };
         match result {
-            Ok(mut replacement) => {
+            Ok((mut replacement, checkpoint)) => {
                 let changed = command.is_some() || !replacement.same_content(&current);
                 if changed {
                     replacement.revision.sequence = current
@@ -663,6 +1005,7 @@ async fn run(
                         .expect("window sequence exhausted");
                 }
                 position = retain_anchor(next, &replacement);
+                reader.send_capture.set_query(&position);
                 last_good_position = position.clone();
                 current = replacement;
                 if changed || failed {
@@ -671,13 +1014,24 @@ async fn run(
                 if let Some(command) = command {
                     let _ = command.reply.send(Ok(current.clone()));
                 }
-                dirty = false;
+                authority_pending = current.presentation.header.epoch.is_none();
+                // A checkpoint predates sources.drain(), so it may not include
+                // invalidations discarded there. Follow it with a fresh capture
+                // even when no further event or send completion arrives. This
+                // conservative extra read is self-limiting: sends publish only
+                // finitely many checkpoints, each before a transport wait.
+                dirty = checkpoint;
                 failed = false;
+                retry_delayed = false;
             }
             Err(error) => {
                 let terminal = error.terminal();
+                let waiting = matches!(error, ConversationWindowError::NotReady);
                 let query_error = matches!(error, ConversationWindowError::Query(_));
-                if terminal || (!failed && !query_error) || (query_error && command.is_none()) {
+                if terminal
+                    || (!waiting && !failed && !query_error)
+                    || (query_error && command.is_none())
+                {
                     let _ = updates.send_replace(Err(error.clone()));
                 }
                 if let Some(command) = command {
@@ -689,6 +1043,7 @@ async fn run(
                     position = last_good_position.clone();
                     dirty = true;
                     failed = true;
+                    retry_delayed = true;
                 }
                 if terminal {
                     return;
@@ -697,7 +1052,10 @@ async fn run(
                     // Preserve accepted viewport commands through a quiet failure.
                     position = next;
                     dirty = true;
-                    failed = true;
+                    // Quiet NotReady retries must not suppress a later real
+                    // storage error that the receiver has not yet seen.
+                    failed |= !waiting;
+                    retry_delayed = true;
                 }
             }
         }

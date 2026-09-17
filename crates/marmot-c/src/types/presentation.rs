@@ -1,4 +1,5 @@
 //! Additive selected-presentation mirrors. Existing chat-row layouts remain stable.
+use super::avatar::MarmotAvatarAsset;
 use super::chat_list::{MarmotChatListAvatar, MarmotChatListRow};
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, owned_c_string};
@@ -111,6 +112,7 @@ c_mirror! { MarmotPresentationVersion from PresentationVersionFfi {
 c_mirror! { MarmotPresentedChatRow from PresentedChatRowFfi, free marmot_presented_chat_row_free {
     rec row: MarmotChatListRow,
     rec presentation: MarmotConversationPresentation,
+    opt_rec avatar_asset: MarmotAvatarAsset,
 } }
 c_mirror! { MarmotPresentedChatListSnapshot from PresentedChatListSnapshotFfi, free marmot_presented_chat_list_snapshot_free {
     vec rows/rows_len: MarmotPresentedChatRow,
@@ -181,7 +183,18 @@ mod tests {
                 subscription_generation: "generation".into(),
                 sequence: 3,
                 snapshot: PresentedChatListSnapshotFfi {
-                    rows: vec![PresentedChatRowFfi { row, presentation }],
+                    rows: vec![PresentedChatRowFfi {
+                        row,
+                        presentation,
+                        avatar_asset: Some(AvatarAssetFfi {
+                            target: "target".into(),
+                            reference: Some("ref".into()),
+                            availability: AvatarAvailabilityFfi::Ready,
+                            acquisition: Some(AvatarAcquisitionStateFfi::Idle),
+                            content_revision: 1,
+                            byte_count: 4,
+                        }),
+                    }],
                     presentation_version: PresentationVersionFfi {
                         account_store_epoch: vec![1; 16],
                         revision: 2,

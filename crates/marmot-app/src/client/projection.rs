@@ -4,9 +4,7 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
 };
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
-};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::GroupStorage;
 use cgka_traits::{GroupId, TransportGroupSubscription};
@@ -83,19 +81,23 @@ impl AppClient {
         sender: &str,
         event: &MarmotInnerEvent,
         source_message_id_hex: Option<String>,
-        source_state: Option<(u64, crate::AppMessageRetentionDecision)>,
+        source_state: Option<(
+            u64,
+            crate::AppMessageRetentionDecision,
+            Option<cgka_traits::app_event::AppMessageAuthority>,
+        )>,
         advance_read_marker: bool,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let (source_epoch, retention) = source_state
-            .map(|(epoch, retention)| (Some(epoch), Some(retention)))
-            .unwrap_or((None, None));
+        let (source_epoch, retention, authority) = source_state
+            .map(|(epoch, retention, authority)| (Some(epoch), Some(retention), authority))
+            .unwrap_or((None, None, None));
         // Stamped on the sender's own store too, so a moderation delete of
         // another member's message survives local reprojection instead of
         // resurrecting the target.
-        let moderation_grant = event.kind == MARMOT_APP_EVENT_KIND_DELETE
-            && self.delete_moderation_grant(group_id, sender);
+        let moderation_grant = authority.is_some_and(|a| a.moderation_grant);
         let message_projection = AppMessageProjection {
+            authority,
             message_id_hex: event.id.clone(),
             source_message_id_hex,
             direction: "sent".to_owned(),
@@ -112,10 +114,7 @@ impl AppClient {
             origin_commit_id: None,
             moderation_grant,
         };
-        // The reconciling post-publish projection (advance_read_marker) runs
-        // after group sync, so its recomputed moderation grant supersedes the
-        // optimistic pre-send one; the pre-send projection keeps the default
-        // freeze so a later no-op re-record can't downgrade it.
+        // Publication carries the engine-stamped source authority.
         let update = if advance_read_marker {
             self.app
                 .record_account_app_event_refreshing_moderation_grant(
@@ -143,18 +142,8 @@ impl AppClient {
         Ok(update)
     }
 
-    /// Fail-closed: a group or admin-policy lookup failure yields no grant, so
-    /// the delete degrades to self-retraction semantics.
-    ///
-    /// Accepted trade-off: the grant is evaluated against the admin set this
-    /// device sees now (current signed group state), not the admin set as of
-    /// the delete's epoch, and it is then frozen at first record. Two devices
-    /// that first observe the same delete at different points in their own sync
-    /// — one already past an admin-adding commit, the other not, or one while
-    /// the group is quarantined — can therefore disagree permanently on whether
-    /// it is honored, a milder echo of the cross-device divergence #873
-    /// addresses. This is the deliberate fail-closed / frozen posture; an
-    /// epoch-anchored admin evaluation is future work.
+    /// Send-time preflight only. The engine stamps final authorization at
+    /// encryption, and receivers consume that authenticated source-state proof.
     pub(crate) fn delete_moderation_grant(&self, group_id: &GroupId, sender_hex: &str) -> bool {
         let Ok(group) = self.runtime.group_record(group_id) else {
             return false;
@@ -700,6 +689,7 @@ impl AppClient {
                 Some(source_message_id_hex.as_str()),
                 published.source_epoch.0,
                 published.retention,
+                published.authority,
             );
             match finalized {
                 Ok(Some(update)) => updates.push(update),
@@ -1119,6 +1109,7 @@ fn build_group_system_projection(
     let material = group_system_event_material(group_id, epoch, actor, change)?;
 
     Ok(AppMessageProjection {
+        authority: None,
         message_id_hex: material.message_id_hex,
         // Synthesized rows carry no source: several rows can come from one
         // commit, which would collide on the partial unique source index, and
@@ -1260,5 +1251,22 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::UserBlocked => "read_marker_failed:user_blocked",
         AppError::BlockListUnavailable => "read_marker_failed:block_list_unavailable",
         AppError::BlockPublicationUncertain => "read_marker_failed:block_publication_uncertain",
+    }
+}
+
+impl super::AppClient {
+    pub(crate) fn backfill_content_reports(&mut self) -> Result<(), crate::AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        // A failed chat-list conversion must roll back the backfill cursor and
+        // all projections. Queue the complete batch only after it commits.
+        let updates = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .backfill_content_reports(100)?
+                .into_iter()
+                .map(|update| self.app.app_projection_update(&self.state.label, update))
+                .collect::<Result<Vec<_>, crate::AppError>>()
+        })?;
+        self.pending_projection_updates.extend(updates);
+        Ok(())
     }
 }

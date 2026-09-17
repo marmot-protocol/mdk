@@ -22,10 +22,18 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_refresh_account_key_packages` for local-first KeyPackage inventory
   with typed durable provenance. Existing `MarmotAccountKeyPackage` layout is
   unchanged. Regenerate headers and use a matching library.
+
+- `marmot_report_message` and `marmot_dismiss_reports`, paginated `marmot_content_reports`
+  and `marmot_report_dismissals`, and the deletion-masked `marmot_reported_message` lookup.
+  Report records expose `MarmotReportReason` and individual dismissal state; timeline records
+  gain `has_reports`. Use existing projection subscriptions to refresh report views.
+  Regenerate headers with the matching library for the changed output layouts.
+
 - Typed group-system chat previews and explicit `MarmotGroupSystemEventProvenance`
   on timeline and preview events. Authenticated actor/subject IDs remain distinct;
   chat previews include locally prepared names, while clients localize wording.
   Regenerate headers and use the matching library: both output record layouts changed.
+
 - Accepted-edit presentation: `MarmotTimelineMessageRecord.edit` carries a nullable
   `MarmotTimelineEditSummary`; `marmot_message_edit_history` returns a
   `MarmotTimelineEditHistoryPage`, released with
@@ -33,6 +41,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `LastMessageContentChanged`. The timeline record layout has changed: regenerate
   headers and use the matching library. Raw edit events remain accessible while
   transcript rows expose effective content on the original message.
+
 - `MarmotConversationReaction.viewer_reacted` identifies the viewing account's
   active reaction independently of the bounded reactor preview. Regenerate headers
   and use the matching library: the output record layout has changed.

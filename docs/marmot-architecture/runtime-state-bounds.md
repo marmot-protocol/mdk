@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-15
+updated: 2026-09-16
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -29,6 +29,29 @@ Tracking issue: marmot-protocol/mdk#381.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `Engine::canonical_replays`, `Engine::peel_replays` | At most one continuation of each kind per pending group. Each owns one input graph; frontier and completed paths are bounded by the existing cumulative replay-probe budget, with path depth limited by the retained graph. Peel output remains capped at eight contexts. This is an input-relative bound, not a fixed account-wide byte cap. | Removed on completion/error, relevant state or policy invalidation, hydration/repair/removal, or engine drop. Exact source identity and replay-state content fingerprint (or strict MLS mutation generation on other tracking backends) are checked before reuse; a new canonical pass discards the old cursor. No transaction, snapshot guard, or durable scratch row survives a slice. |
+
+### `cgka-engine` moderation authority recovery (`src/app_payload.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `Engine::authority_recovery_attempts`, `Engine::authority_recovery_seen` | At most one entry per durable unresolved moderation control encountered in the current or previous cursor pass; input-relative to retained source records, never ordinary chat history. Each maintenance call visits at most 32 requests. Fingerprints identify one named snapshot rather than the whole live group. | Resolved entries are removed immediately; each completed cursor pass removes entries whose requests disappeared. Source-byte pruning and group deletion remove durable requests atomically. Engine drop clears both caches; restart may retry once against unchanged evidence. No secret-derived fingerprint is logged or persisted. |
+
+### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
+
+These are input-relative durable bounds, not fixed account-wide row or byte caps. Moderation evidence must remain
+stable under delayed delivery and convergence; ordinary chat expiry must not create a moderation history ledger.
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `content_reports` | One metadata row per retained valid report event; no target summaries or logical-report grouping. | Recomputed for affected targets; event expiry/invalidation and group deletion remove rows. Target expiry does not erase reports. |
+| `content_pruned_controls` and retained control `app_events` | One marker and minimal structural record per retained kind-5 or kind-4891 deletion. | Expiry removes unrelated tags while preserving references, verdicts and source provenance. Group deletion reclaims evidence. Reports and labels use ordinary retention. |
+| `content_expired_targets` | At most one marker per erased target with retained deletion evidence. Ordinary expired chats and reports create no marker. | Retained until group deletion so late target/edit delivery cannot restore deleted content. Repeated delivery reuses the marker. |
+| `content_report_backfill` | One cursor row per account database. | Advances through the captured pre-migration prefix in batches of at most 100 events; completion retains only that progress row. |
+
+Explicit secure erasure intentionally retains these minimal moderation identifiers and branch-provenance records;
+it does not promise to erase every trace of a moderation decision. Message bodies, report/review explanations and media remain subject to
+secure erasure. The moderation replay fence applies only to targets with this retained evidence. Ordinary message
+re-delivery and expiry continue through the existing ingress deduplication and retention lifecycle.
 
 ### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
 
@@ -84,6 +107,10 @@ Tracking issue: marmot-protocol/mdk#381.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
+| Avatar acquisition | At most 2,048 jobs, each descriptor at most 16 KiB; at most four HTTP/results across foreground media and avatar work, with one permit kept free by background admission | Job rows cascade with asset eviction/removal. Selected source changes replace demand atomically. Interrupted work resumes after worker reconstruction; retry deadlines persist and 16 consecutive transient failures slow to one daily probe. Worker exit cancels active I/O. |
+| Native avatar batches | 16 targets/references; at most 16 MiB returned encoded bytes per call | Per-call ownership; budget-deferred images are not copied. Screen updates carry only metadata. |
+| Avatar identity demand | 2,048 explicit registrations; 64 inspected per batch after directory version changes | Eviction removes registration; group deletion/account cache clear removes demand. Placeholder registrations remain eligible for later profile updates. No historical-roster crawl. |
+| Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)

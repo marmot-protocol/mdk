@@ -53,6 +53,12 @@ Selected composer reads and revision-checked mutations share the existing encryp
 tracks legacy writes too; queued/fanout acceptance clears only its submitted revision atomically. See the
 [draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
 
+## Avatar storage
+
+The [local avatar storage contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md) covers account-encrypted bytes, generation-scoped
+references, atomic publication, offline local reads, bounded eviction and C7-B durable acquisition intent.
+Selected presentation and source demand commit together; native screen integration remains C7-C.
+
 ## Migrations
 
 Account/session schema changes go through Rust migrations. The runner and ordered registry live in

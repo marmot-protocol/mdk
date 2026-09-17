@@ -1951,6 +1951,7 @@ impl<S: StorageProvider> Engine<S> {
                 sender,
                 payload,
                 retention,
+                authority,
                 ..
             } = observation
             else {
@@ -1975,6 +1976,7 @@ impl<S: StorageProvider> Engine<S> {
                 sender: MemberId::new(sender.clone()),
                 payload: payload.clone(),
                 retention: Some(*retention),
+                authority: *authority,
             });
         }
         Ok(events)

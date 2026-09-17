@@ -190,6 +190,7 @@ fn insert_marmot_group_without_openmls_state(
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
         })
         .expect("insert marmot group record without openmls state");
 }
@@ -479,6 +480,14 @@ impl MessageStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<Vec<cgka_traits::engine::GroupEvent>> {
         self.inner.list_pending_application_events()
     }
+    fn pending_application_authority_batch(
+        &self,
+        after: Option<&MessageId>,
+        limit: usize,
+    ) -> StorageResult<Vec<cgka_traits::app_event::PendingAppMessageAuthority>> {
+        self.inner.pending_application_authority_batch(after, limit)
+    }
+
     fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
         self.inner.delete_pending_application_events(ids)
     }

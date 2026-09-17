@@ -932,6 +932,25 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
+        let authority = if cgka_traits::reporting::requires_source_authority(app_event.kind) {
+            Some(crate::app_payload::source_authority(
+                &mls_group,
+                self.identity.self_id(),
+            )?)
+        } else {
+            None
+        };
+        if matches!(
+            app_event.kind,
+            cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REVIEW
+                | cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REMOVE
+        ) && !authority.is_some_and(|a| a.moderation_grant)
+        {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::InvalidAppMessagePayload(
+                "group admin authority required".into(),
+            ));
+        }
         let own_application_stamp = OwnApplicationConvergenceStamp {
             sender: self.identity.self_id().clone(),
             source_epoch_authenticator: hex::encode(mls_group.epoch_authenticator().as_slice()),
@@ -986,6 +1005,7 @@ impl<S: StorageProvider> Engine<S> {
             app_event_id: app_event.id,
             source_epoch,
             retention,
+            authority,
         })
     }
 }

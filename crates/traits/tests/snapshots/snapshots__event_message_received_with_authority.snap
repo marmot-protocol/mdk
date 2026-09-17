@@ -1,0 +1,69 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::MessageReceived\n{\n    authority:\n    Some(cgka_traits::app_event::AppMessageAuthority\n    { source_context: [43; 32], moderation_grant: false, }), group_id: gid(),\n    message_id: mid(), epoch: EpochId(7), sender: mem_id(), payload:\n    b\"hi\".to_vec(), retention: None,\n}"
+---
+{
+  "MessageReceived": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "message_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "sender": [
+      97,
+      108,
+      105,
+      99,
+      101
+    ],
+    "epoch": 7,
+    "payload": [
+      104,
+      105
+    ],
+    "authority": {
+      "source_context": [
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43,
+        43
+      ],
+      "moderation_grant": false
+    }
+  }
+}

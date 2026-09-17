@@ -9,7 +9,27 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-16
+
+Update generated bindings, native libraries, and C headers together. Apple consumers must also stage the matching privacy resource in their Swift wrapper. Account storage advances through migration 80; back up before upgrade because downgrade is unsupported. See [0.10.1 release notes](../../docs/release/0.10.1.md).
+
+### Fixed
+
+- OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
+  managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
+  no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch. Failed
+  inbound setup attempts dispose their abort listeners and reservations before retry, so a replaced
+  generation cannot be stopped by a late account lookup from the previous attempt.
+
 ### Added
+
+- Durable, account-scoped avatar assets and validated local asset access across native chat lists and conversation windows in Rust, Swift/Kotlin and C.
+- Authenticated group-system previews with prepared actor and subject identities.
+
+- Encrypted group reports (1984), shared dismissal labels (1985), and admin removal (4891),
+  with paginated report and dismissal-label records, a deletion-masked reported-message lookup,
+  and `has_reports` on timeline rows in Rust, Swift/Kotlin and C. Migration 79 adds the indexed
+  projections; regenerate bindings and headers with the matching library.
 
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and
   compact edit metadata, with a separate paged accepted-edit history API in Rust, Swift/Kotlin and C. Edits do
@@ -21,6 +41,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Local and refresh KeyPackage inventory now read durable ownership and lifecycle
   from one consistent storage snapshot, so a concurrent rotation cannot retain a
   previous current package while omitting the newly current owned package.
+
+### Changed
+
+- `messages delete` / `delete_message` use kind 5 for author deletion and kind 4891 for
+  an eligible admin removing any chat, including their own. A non-author non-admin now receives an error.
+  Admins can also remove a peer's messages in unnamed two-member conversations.
+  Cross-author admin removal is limited to whole kind-9 messages; agent-stream starts, activity,
+  operations, system events, and custom-kind rows are no longer admin-removal targets.
+  Older peers may retain 4891-removed content; upgraded peers reject newly received cross-author
+  admin kind-5 requests. Previously honored legacy tombstones remain. Upgrade all participants
+  for consistent moderation.
 
 ## [0.10.0] - 2026-09-16
 

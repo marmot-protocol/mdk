@@ -305,6 +305,7 @@ fn received_message(
     tags: Vec<Vec<String>>,
 ) -> ReceivedMessage {
     ReceivedMessage {
+        authority: None,
         message_id_hex: "33".repeat(32),
         source_message_id_hex: "44".repeat(32),
         sender: "bb".repeat(32),
@@ -4597,6 +4598,7 @@ fn received_chat_record(
     text: &str,
 ) -> AppMessageRecord {
     AppMessageRecord {
+        authority: None,
         message_id_hex: message_id_hex.to_owned(),
         direction: "received".to_owned(),
         group_id_hex: group_id_hex.to_owned(),

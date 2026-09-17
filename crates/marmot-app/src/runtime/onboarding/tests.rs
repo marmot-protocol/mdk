@@ -2388,6 +2388,7 @@ fn controlled_reap_worker() -> (
     });
     (
         ManagedAccountWorker {
+            ready: true,
             media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::runtime::MEDIA_COMMAND_QUEUE_LIMIT,
             )),

@@ -188,6 +188,7 @@ impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
+    pub has_reports: bool,
     pub message_id_hex: String,
     /// Delivery marker for own (`direction == "sent"`) messages. An own send
     /// commits and projects locally *before* it publishes, so a message that
@@ -254,6 +255,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
         Self {
+            has_reports: value.has_reports,
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
             source_epoch: value.source_epoch,
@@ -648,6 +650,7 @@ mod tests {
         reply_preview: Option<TimelineReplyPreview>,
     ) -> TimelineMessageRecord {
         TimelineMessageRecord {
+            has_reports: false,
             group_system: None,
             edit: None,
             message_id_hex: "msg".to_owned(),
@@ -672,6 +675,61 @@ mod tests {
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         }
+    }
+
+    #[test]
+    fn system_reactions_native_row_keeps_identity_and_summary() {
+        let actor = cgka_traits::MemberId::new(vec![0x22; 32]);
+        let material = cgka_traits::app_event::group_system_event_material(
+            &cgka_traits::GroupId::new(vec![0x11; 16]),
+            3,
+            Some(&actor),
+            &cgka_traits::engine::GroupStateChange::AdminAdded {
+                member: actor.clone(),
+            },
+        )
+        .unwrap();
+        let mut row = record_with_media(Some(3), None, None);
+        row.message_id_hex = material.message_id_hex.clone();
+        row.direction = "system".into();
+        row.sender = material.sender.clone();
+        row.kind = 1210;
+        row.plaintext = material.content;
+        row.tags = material.tags;
+        row.group_id_hex = material.group_id_hex;
+        let mut system = marmot_app::group_system_event_from_message(1210, &row.plaintext).unwrap();
+        // Storage/runtime tests establish this provenance; this test pins its
+        // conversion alongside reactions without changing the binding layout.
+        system.provenance = marmot_app::GroupSystemEventProvenance::AuthenticatedGroupState;
+        row.group_system = Some(system);
+        row.reactions
+            .by_emoji
+            .insert("👍".into(), vec!["66".repeat(32)]);
+        row.reactions.user_reactions.push(TimelineUserReaction {
+            reaction_message_id_hex: "44".repeat(32),
+            target_message_id_hex: material.message_id_hex.clone(),
+            sender: "66".repeat(32),
+            emoji: "👍".into(),
+            reacted_at: 20,
+        });
+        let native = TimelineMessageRecordFfi::from(row);
+        assert_eq!(native.message_id_hex, material.message_id_hex);
+        let activity = native.group_system.unwrap();
+        assert_eq!(
+            activity.provenance,
+            GroupSystemEventProvenanceFfi::AuthenticatedGroupState
+        );
+        assert_eq!(
+            activity.actor_account_id_hex.as_deref(),
+            Some(material.sender.as_str())
+        );
+        assert_eq!(native.reactions.by_emoji.len(), 1);
+        assert_eq!(native.reactions.by_emoji[0].count, 1);
+        assert_eq!(native.reactions.by_emoji[0].emoji, "👍");
+        assert_eq!(
+            native.reactions.user_reactions[0].target_message_id_hex,
+            material.message_id_hex
+        );
     }
 
     #[test]

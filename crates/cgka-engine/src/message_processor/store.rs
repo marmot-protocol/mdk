@@ -863,13 +863,30 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
+        // The application reads `TransportObjectResourceRefused` as evidence
+        // that this device is missing history it was served, and arms a
+        // full-history backfill from it. Traffic older than this copy's Welcome
+        // is the one shape where that is knowably wasted work: the copy's own
+        // epochs begin at the commit that minted its Welcome, so a re-fetch can
+        // only bring back more of what it already cannot open. The release
+        // itself is unchanged — only the announcement is dropped, which is why
+        // a timestamp is allowed to decide it at all. It is a compose-time
+        // value for application messages and this seam cannot tell those from
+        // commits, so being wrong here must stay free, and here it is: the row
+        // is released either way, and the id stays eligible for redelivery.
+        let predates_this_copy = self.released_row_predates_local_copy(record);
         self.storage.release_message_for_replay(record)?;
+        let release_reason = if predates_this_copy {
+            crate::message_disposition::MessageDisposition::PredatesLocalCopy.tag()
+        } else {
+            disposition.tag()
+        };
         tracing::info!(
             target: "cgka_engine::message_processor",
             method = "release_deferred_peel_row",
             retry_count,
             residence_ms,
-            release_reason = disposition.tag(),
+            release_reason,
             "deferred transport row released for replay"
         );
         self.audit_group(
@@ -877,19 +894,41 @@ impl<S: StorageProvider> Engine<S> {
             crate::audit_helpers::deferred_peel_resource_refused_event(
                 hex::encode(record.id.as_slice()),
                 Some(record.epoch),
-                disposition.tag(),
+                release_reason,
                 retry_count,
                 residence_ms,
             ),
         );
-        self.events_buf
-            .push_back(GroupEvent::TransportObjectResourceRefused {
-                group_id: record.group_id.clone(),
-                message_id: record.id.clone(),
-                resource,
-            });
+        if !predates_this_copy {
+            self.events_buf
+                .push_back(GroupEvent::TransportObjectResourceRefused {
+                    group_id: record.group_id.clone(),
+                    message_id: record.id.clone(),
+                    resource,
+                });
+        }
         self.note_peel_deferred_row_retired(record);
         Ok(())
+    }
+
+    /// Whether a released deferred row's envelope predates the Welcome that
+    /// installed this local copy.
+    ///
+    /// The timestamp lives in the stored `RawTransport` payload, so this decodes
+    /// the row the same way `make_room_in_the_removed_ring` does. The cost is
+    /// one decode per released row, paid only on the release path — which is
+    /// rate-limited by the residence and retry budgets it implements — and next
+    /// to the storage write it accompanies it is free. Best-effort in both
+    /// directions: an unreadable record or payload, or a copy that knows no
+    /// Welcome time, answers `false` and keeps today's announcement.
+    fn released_row_predates_local_copy(&self, record: &MessageRecord) -> bool {
+        let Ok(group) = self.storage.get_group(&record.group_id) else {
+            return false;
+        };
+        StoredMessagePayload::decode(&record.payload)
+            .ok()
+            .and_then(|payload| payload.as_raw_transport().map(|msg| msg.timestamp))
+            .is_some_and(|timestamp| group.transport_message_predates_local_copy(timestamp))
     }
 
     /// Retire this group's whole `PeelDeferred` backlog because the local copy
@@ -1177,6 +1216,7 @@ mod tests {
                 disbanded: None,
                 join_epoch: EpochId(0),
                 local_copy_install_epoch: EpochId(0),
+                local_copy_welcome_created_at: None,
             })
             .unwrap();
         (storage, engine, group_id)

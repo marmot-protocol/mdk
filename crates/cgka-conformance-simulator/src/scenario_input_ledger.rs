@@ -484,6 +484,7 @@ fn stale_reason(reason: &StaleReason) -> &'static str {
         StaleReason::UnknownGroup => "unknown_group",
         StaleReason::OwnEcho => "own_echo",
         StaleReason::PreMembership => "pre_membership",
+        StaleReason::PredatesLocalCopy => "predates_local_copy",
         StaleReason::BeyondAnchor => "beyond_anchor",
         StaleReason::BeyondRollbackHorizon => "beyond_rollback_horizon",
         StaleReason::BeyondAppRetention => "beyond_app_retention",

@@ -12,6 +12,7 @@ use cgka_traits::message::{
 use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
 const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
@@ -535,6 +536,46 @@ impl MessageStorage for SqliteAccountStorage {
         let record = serialize(event)?;
         let write = || {
             let conn = self.lock()?;
+            if let GroupEvent::MessageReceived {
+                group_id,
+                message_id,
+                epoch,
+                sender,
+                payload,
+                authority,
+                retention,
+            } = event
+            {
+                if authority.is_none()
+                    && cgka_traits::MarmotAppEvent::decode(payload).is_ok_and(|event| {
+                        cgka_traits::reporting::requires_source_authority(event.kind)
+                    })
+                {
+                    let request = cgka_traits::app_event::PendingAppMessageAuthority {
+                        group_id: group_id.clone(),
+                        message_id: message_id.clone(),
+                        epoch: *epoch,
+                        sender: sender.clone(),
+                        payload_digest: Sha256::digest(payload).into(),
+                        retention: *retention,
+                    };
+                    conn.execute_cached(
+                        "INSERT OR IGNORE INTO pending_application_authority VALUES(?1,?2,?3)",
+                        params![
+                            message_id.as_slice(),
+                            group_id.as_slice(),
+                            serialize(&request)?
+                        ],
+                    )
+                    .storage()?;
+                } else {
+                    conn.execute_cached(
+                        "DELETE FROM pending_application_authority WHERE message_id=?1",
+                        params![message_id.as_slice()],
+                    )
+                    .storage()?;
+                }
+            }
             let inserted = conn
                 .execute_cached(
                     "INSERT INTO pending_application_events (
@@ -558,6 +599,14 @@ impl MessageStorage for SqliteAccountStorage {
                     .storage()?;
                 return match existing {
                     Some(existing) if existing == record => Ok(()),
+                    Some(existing) if pending_authority_upgrade(&existing, event)? => {
+                        conn.execute_cached(
+                            "UPDATE pending_application_events SET record=?2 WHERE message_id=?1",
+                            params![message_id.as_slice(), record],
+                        )
+                        .storage()?;
+                        Ok(())
+                    }
                     Some(_) => Err(StorageError::Backend(
                         "pending application event id reused with different content".to_owned(),
                     )),
@@ -569,7 +618,7 @@ impl MessageStorage for SqliteAccountStorage {
         if self.connection.is_current_thread_transaction_owner() {
             write()
         } else {
-            retry_on_busy(write)
+            retry_on_busy(|| self.connection.with_transaction(write))
         }
     }
 
@@ -588,6 +637,24 @@ impl MessageStorage for SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         rows.iter().map(|event| deserialize(event)).collect()
+    }
+
+    fn pending_application_authority_batch(
+        &self,
+        after: Option<&MessageId>,
+        limit: usize,
+    ) -> StorageResult<Vec<cgka_traits::app_event::PendingAppMessageAuthority>> {
+        let conn = self.lock()?;
+        let mut stmt=conn.prepare_cached("SELECT record FROM pending_application_authority WHERE (?1 IS NULL OR message_id>?1) ORDER BY message_id LIMIT ?2").storage()?;
+        let rows = stmt
+            .query_map(
+                params![after.map(MessageId::as_slice), limit.min(100) as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.iter().map(|r| deserialize(r)).collect()
     }
 
     fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()> {
@@ -707,6 +774,21 @@ impl MessageStorage for SqliteAccountStorage {
 
     fn create_group_state_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::create_state_scoped(self, group_id, name)
+    }
+
+    fn group_snapshot_fingerprint(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        let conn = self.lock()?;
+        conn.query_row_cached(
+            "SELECT snapshot FROM cgka_group_snapshots WHERE group_id = ?1 AND name = ?2",
+            params![group_id.as_slice(), name],
+            |row| Ok(Sha256::digest(row.get_ref(0)?.as_blob()?).into()),
+        )
+        .optional()
+        .storage()
     }
 
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
@@ -991,6 +1073,12 @@ fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> Sto
 /// the same connection/transaction so neither row can outlive the other.
 fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
     conn.execute_cached(
+        "DELETE FROM pending_application_authority WHERE message_id = ?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+
+    conn.execute_cached(
         "DELETE FROM pending_application_events WHERE message_id = ?1",
         params![id.as_slice()],
     )
@@ -1027,6 +1115,31 @@ fn put_processed_transport_id_on_connection(
         ));
     }
     Ok(())
+}
+
+fn pending_authority_upgrade(existing: &[u8], incoming: &GroupEvent) -> StorageResult<bool> {
+    let mut existing: GroupEvent = deserialize(existing)?;
+    if let (
+        GroupEvent::MessageReceived {
+            authority: old,
+            retention: old_retention,
+            ..
+        },
+        GroupEvent::MessageReceived {
+            authority: Some(new),
+            retention: new_retention,
+            ..
+        },
+    ) = (&mut existing, incoming)
+        && old.is_none()
+    {
+        *old = Some(*new);
+        if old_retention.is_none() {
+            *old_retention = *new_retention;
+        }
+        return Ok(&existing == incoming);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1500,6 +1613,7 @@ mod tests {
 
     fn application_event(message_id: cgka_traits::MessageId) -> GroupEvent {
         GroupEvent::MessageReceived {
+            authority: None,
             group_id: gid(1),
             message_id,
             sender: MemberId::new(vec![7; 32]),
@@ -2063,6 +2177,117 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::Created,
             "message state must roll back with the aborted outer transaction",
+        );
+    }
+
+    #[test]
+    fn pending_authority_is_control_only_and_pruned_with_source_bytes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        for (index, kind) in [9, 7, 1009, 5, 1984, 1985, 4891].into_iter().enumerate() {
+            let message = sample_message(mid(index as u8 + 1), gid(1), 0);
+            store.put_message(&message).unwrap();
+            let mut event = application_event(message.id);
+            if let GroupEvent::MessageReceived { payload, .. } = &mut event {
+                *payload =
+                    cgka_traits::MarmotAppEvent::new("07".repeat(32), 1, kind, vec![], "payload")
+                        .encode()
+                        .unwrap();
+            }
+            store.put_pending_application_event(&event).unwrap();
+        }
+        let requests = store
+            .pending_application_authority_batch(None, 100)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.message_id.clone())
+                .collect::<Vec<_>>(),
+            vec![mid(6), mid(7)]
+        );
+        // Acknowledging the app output must not discard unresolved evidence.
+        let ids = requests
+            .iter()
+            .map(|r| r.message_id.clone())
+            .collect::<Vec<_>>();
+        store.delete_pending_application_events(&ids).unwrap();
+        assert_eq!(
+            store
+                .pending_application_authority_batch(None, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            storage.delete_message(&ids[0])?;
+            Err(StorageError::Backend("rollback source pruning".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .pending_application_authority_batch(None, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        for id in &ids {
+            store.delete_message(id).unwrap();
+        }
+        assert!(
+            store
+                .pending_application_authority_batch(None, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn named_snapshot_fingerprint_tracks_replacement_not_live_message_traffic() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 0);
+        store.put_group(&group).unwrap();
+        assert_eq!(
+            store
+                .group_snapshot_fingerprint(&group.id, "source")
+                .unwrap(),
+            None
+        );
+        store
+            .create_group_state_snapshot(&group.id, "source")
+            .unwrap();
+        let before = store
+            .group_snapshot_fingerprint(&group.id, "source")
+            .unwrap();
+        assert!(before.is_some());
+        store
+            .put_message(&sample_message(mid(1), gid(1), 0))
+            .unwrap();
+        assert_eq!(
+            before,
+            store
+                .group_snapshot_fingerprint(&group.id, "source")
+                .unwrap()
+        );
+        let mut group = group;
+        group.name = "new policy".into();
+        store.put_group(&group).unwrap();
+        store
+            .create_group_state_snapshot(&group.id, "source")
+            .unwrap();
+        assert_ne!(
+            before,
+            store
+                .group_snapshot_fingerprint(&group.id, "source")
+                .unwrap()
+        );
+        store.release_group_snapshot(&group.id, "source").unwrap();
+        assert_eq!(
+            store
+                .group_snapshot_fingerprint(&group.id, "source")
+                .unwrap(),
+            None
         );
     }
 

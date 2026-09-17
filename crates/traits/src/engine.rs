@@ -287,6 +287,8 @@ pub enum SendResult {
         source_epoch: EpochId,
         /// Retention decision resolved from that same encryption state.
         retention: AppMessageRetentionDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<crate::app_event::AppMessageAuthority>,
     },
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
@@ -559,6 +561,8 @@ pub enum GroupEvent {
         /// is not recoverable; callers must not substitute the live policy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retention: Option<AppMessageRetentionDecision>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<crate::app_event::AppMessageAuthority>,
     },
     AppMessageInvalidated {
         group_id: GroupId,

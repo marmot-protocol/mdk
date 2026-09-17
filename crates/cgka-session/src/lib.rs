@@ -258,6 +258,7 @@ pub enum PublishWork {
         app_event_id: String,
         source_epoch: EpochId,
         retention: cgka_traits::app_event::AppMessageRetentionDecision,
+        authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     },
     Proposal {
         msg: TransportMessage,
@@ -1244,6 +1245,12 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    /// Bounded local policy recovery, driven by account maintenance.
+    pub fn recover_pending_application_authority(&mut self) -> SessionResult<()> {
+        self.engine.recover_pending_application_authority()?;
+        Ok(())
+    }
+
     pub fn drain(&mut self) -> SessionEffects {
         tracing::trace!(
             target: TRACE_TARGET,
@@ -1426,6 +1433,7 @@ impl AccountDeviceSession {
                     app_event_id,
                     source_epoch,
                     retention,
+                    authority,
                 } => {
                     let queued_intent = self
                         .engine
@@ -1441,6 +1449,7 @@ impl AccountDeviceSession {
                         app_event_id,
                         source_epoch,
                         retention,
+                        authority,
                     });
                 }
                 SendResult::Proposal { msg } => {

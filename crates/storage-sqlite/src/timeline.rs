@@ -1,3 +1,7 @@
+pub mod reports;
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
+};
 mod capture;
 pub use capture::ConversationAccountSnapshot;
 mod edits;
@@ -148,15 +152,10 @@ pub struct StoredAppEvent {
     /// can produce many rows. Enables `invalidate_app_events_by_origin_commit`
     /// when that commit loses a fork. `None` for all other event kinds.
     pub origin_commit_id: Option<String>,
-    /// True only for a delete whose authenticated sender held group-admin
-    /// moderation authority in a non-direct group when the delete was
-    /// recorded. On the default [`record_app_event`] path a conflicting row's
-    /// value is frozen, so reprojection and relay echoes arriving after an
-    /// admin-set change can never flip an honored tombstone. The local
-    /// sender's post-publish reconciling projection uses
-    /// [`record_app_event_refreshing_moderation_grant`] instead, so the grant
-    /// recomputed after group sync supersedes the optimistic pre-send one.
-    /// `false` for every other event.
+    /// Legacy persisted admin verdict. New runtime writes derive this from
+    /// authenticated source-state evidence for admin deletions and dismissal labels
+    /// decisions. A resolved verdict is stable across later admin changes;
+    /// convergence invalidation can still withdraw the action's effects.
     pub moderation_grant: bool,
 }
 
@@ -184,6 +183,8 @@ pub struct TimelineMessageQuery {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
+    #[serde(default)]
+    pub has_reports: bool,
     #[serde(default)]
     pub group_system: Option<crate::GroupSystemEventProjection>,
     pub message_id_hex: String,
@@ -448,7 +449,7 @@ impl SqliteAccountStorage {
         // Default path freezes an existing row's moderation_grant on conflict
         // (see the upsert below): a re-received or relay-echoed delete must not
         // have its honored verdict recomputed against later admin state.
-        self.record_app_event_inner(event, false, None)
+        self.record_app_event_inner(event, false, None, None)
     }
 
     /// Record an app event together with the normalized retention decision
@@ -458,26 +459,28 @@ impl SqliteAccountStorage {
         event: &StoredAppEvent,
         retention: Option<AppMessageRetentionDecision>,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, false, retention)
+        self.record_app_event_inner(event, false, retention, None)
     }
 
     /// Like [`record_app_event`], but a conflicting row's `moderation_grant` is
-    /// replaced with this event's value instead of frozen. Used only by the
-    /// local sender's post-publish reconciling projection, where the grant
-    /// recomputed after group sync supersedes the optimistic pre-send one.
+    /// replaced with this event's value instead of frozen. Retained for callers
+    /// using the legacy optimistic-grant reconciliation API. Source-aware
+    /// callers should use [`Self::record_app_event_with_source`] instead.
     pub fn record_app_event_refreshing_moderation_grant(
         &self,
         event: &StoredAppEvent,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, true, None)
+        self.record_app_event_inner(event, true, None, None)
     }
 
+    /// Legacy grant reconciliation with retention; see
+    /// [`Self::record_app_event_refreshing_moderation_grant`].
     pub fn record_app_event_refreshing_moderation_grant_with_retention(
         &self,
         event: &StoredAppEvent,
         retention: Option<AppMessageRetentionDecision>,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, true, retention)
+        self.record_app_event_inner(event, true, retention, None)
     }
 
     /// Finalize an optimistic local row from the exact MLS state that encrypted
@@ -595,9 +598,28 @@ impl SqliteAccountStorage {
         event: &StoredAppEvent,
         refresh_moderation_grant: bool,
         retention: Option<AppMessageRetentionDecision>,
+        authority: Option<Option<cgka_traits::app_event::AppMessageAuthority>>,
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            // Only erased targets with retained moderation evidence have a
+            // replay fence here; ordinary dedup and expiry belong to ingress.
+            let expired_target = match event.kind {
+                MARMOT_APP_EVENT_KIND_CHAT => Some(event.message_id_hex.as_str()),
+                MARMOT_APP_EVENT_KIND_EDIT => tag_value(&event.tags, "e"),
+                _ => None,
+            };
+            let is_expired = match expired_target {
+                Some(target) => reports::target_expired(&conn, &event.group_id_hex, target)?,
+                None => false,
+            };
+            if is_expired {
+                return Ok(TimelineProjectionUpdate {
+                    group_id_hex: event.group_id_hex.clone(),
+                    messages: Vec::new(),
+                    changes: Vec::new(),
+                });
+            }
             let new_affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
             // Upserting an existing app_event may change its kind/tags, so the
             // incremental path must reproject both the old projection dependents
@@ -637,9 +659,17 @@ impl SqliteAccountStorage {
                     source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
-                    plaintext = excluded.plaintext,
+                    plaintext = CASE WHEN EXISTS (
+                        SELECT 1 FROM content_pruned_controls p
+                        WHERE p.group_id_hex = app_events.group_id_hex
+                          AND p.message_id_hex = app_events.message_id_hex
+                    ) THEN app_events.plaintext ELSE excluded.plaintext END,
                     kind = excluded.kind,
-                    tags_json = excluded.tags_json,
+                    tags_json = CASE WHEN EXISTS (
+                        SELECT 1 FROM content_pruned_controls p
+                        WHERE p.group_id_hex = app_events.group_id_hex
+                          AND p.message_id_hex = app_events.message_id_hex
+                    ) THEN app_events.tags_json ELSE excluded.tags_json END,
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
@@ -678,7 +708,7 @@ impl SqliteAccountStorage {
                     u64_to_i64(event.recorded_at)?,
                     u64_to_i64(event.received_at)?,
                     &event.origin_commit_id,
-                    event.moderation_grant,
+                    event.moderation_grant && (authority.is_none() || event.kind != MARMOT_APP_EVENT_KIND_DELETE),
                     retention
                         .map(|decision| u64_to_i64(decision.retention_seconds))
                         .transpose()?,
@@ -690,6 +720,32 @@ impl SqliteAccountStorage {
                 ],
             )
             .storage()?;
+            if let Some(authority) = authority {
+                if let Some(authority) = authority {
+                    conn.execute_cached(
+                        "UPDATE app_events SET
+                            authority_state = 2,
+                            authority_context = ?3,
+                            moderation_grant = CASE
+                                WHEN kind = 5 AND authority_state = 0 THEN moderation_grant
+                                WHEN kind IN (1985, 4891) THEN ?4
+                                ELSE 0
+                            END
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND authority_state != 2",
+                        params![
+                            event.group_id_hex, event.message_id_hex,
+                            authority.source_context.as_slice(), authority.moderation_grant,
+                        ],
+                    ).storage()?;
+                } else if existing_event.is_none() {
+                    conn.execute_cached(
+                        "UPDATE app_events SET authority_state = 1, moderation_grant = 0
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                        params![event.group_id_hex, event.message_id_hex],
+                    ).storage()?;
+                }
+            }
+            reports::rescrub_control(&conn, &event.group_id_hex, &event.message_id_hex)?;
             replace_encrypted_media_secret_references_tx(&conn, event)?;
             upsert_message_modifier_edges_tx(&conn, event)?;
             for message_id in &affected_message_ids {
@@ -1511,6 +1567,11 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     group_id_hex: &str,
 ) -> StorageResult<()> {
     let events = app_events_for_rebuild_tx(tx, group_id_hex)?;
+    let chat_ids: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == MARMOT_APP_EVENT_KIND_CHAT)
+        .map(|event| event.message_id_hex.clone())
+        .collect();
     let (rows, stream_starts) = project_group_events(events);
     tx.execute_cached(
         "DELETE FROM message_timeline WHERE group_id_hex = ?1",
@@ -1524,6 +1585,9 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     .storage()?;
     for row in rows {
         upsert_message_timeline_row_tx(tx, &row)?;
+    }
+    for message_id in chat_ids {
+        reports::refresh(tx, group_id_hex, &message_id)?;
     }
     for start in stream_starts {
         upsert_agent_stream_start_tx(tx, &start)?;
@@ -1623,6 +1687,23 @@ fn secure_prune_selected_app_events_tx(
         )?);
     }
 
+    let roots = pruned_message_ids.clone();
+    for root in &roots {
+        for dependent in
+            app_events_targeting_message_tx(tx, group_id_hex, MARMOT_APP_EVENT_KIND_EDIT, root)?
+        {
+            pruned_message_ids.insert(dependent.message_id_hex);
+        }
+    }
+    // Retain deletion evidence so delayed targets and edits remain hidden.
+    // Reports and dismissal explanations expire independently of their targets.
+    let pruned_controls =
+        reports::retain_pruned_controls(tx, group_id_hex, &mut pruned_message_ids)?;
+    for event in &pruned_events {
+        if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+            reports::retain_expired_target(tx, group_id_hex, &event.message_id_hex)?;
+        }
+    }
     retain_pruned_chat_activity_tx(tx, group_id_hex, &pruned_message_ids)?;
     scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     // `message_timeline.plaintext` is indexed for search; overwriting it
@@ -1655,7 +1736,7 @@ fn secure_prune_selected_app_events_tx(
     )?;
 
     Ok(SecurePruneAppEventsResult {
-        pruned_messages: pruned,
+        pruned_messages: pruned.saturating_add(pruned_controls),
         pruned_media_epoch_secrets,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
         erasure_pending: false,
@@ -1905,10 +1986,12 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
             params![group_id_hex, message_id_hex],
         )
         .storage()?;
+        reports::refresh(tx, group_id_hex, message_id_hex)?;
         return Ok(());
     };
 
     upsert_message_timeline_row_tx(tx, &row)?;
+    reports::refresh(tx, group_id_hex, message_id_hex)?;
     if let Some(stream_start) = stream_start {
         upsert_agent_stream_start_tx(tx, &stream_start)?;
     }
@@ -1972,7 +2055,10 @@ fn project_single_message_timeline_tx(
         // app-defined custom kinds — projects a generic row.
         MARMOT_APP_EVENT_KIND_REACTION
         | MARMOT_APP_EVENT_KIND_DELETE
-        | MARMOT_APP_EVENT_KIND_EDIT => return Ok(None),
+        | MARMOT_APP_EVENT_KIND_EDIT
+        | MARMOT_APP_EVENT_KIND_REPORT
+        | MARMOT_APP_EVENT_KIND_REVIEW
+        | MARMOT_APP_EVENT_KIND_REMOVE => return Ok(None),
         _ => timeline_row_from_custom_event(&event),
     };
 
@@ -1998,7 +2084,12 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
     .storage()?;
     if !matches!(
         event.kind,
-        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE | MARMOT_APP_EVENT_KIND_EDIT
+        MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_DELETE
+            | MARMOT_APP_EVENT_KIND_EDIT
+            | MARMOT_APP_EVENT_KIND_REPORT
+            | MARMOT_APP_EVENT_KIND_REVIEW
+            | MARMOT_APP_EVENT_KIND_REMOVE
     ) {
         return Ok(());
     }
@@ -2065,17 +2156,64 @@ fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> Storag
         .map(|(emoji, senders)| (emoji, senders.into_iter().collect()))
         .collect();
 
-    let deletes = app_events_targeting_message_tx(
+    apply_message_removals_tx(tx, row)
+}
+
+fn apply_message_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
+    let target = if row.kind == MARMOT_APP_EVENT_KIND_EDIT {
+        tag_value(&row.tags, "e").unwrap_or(&row.message_id_hex)
+    } else {
+        &row.message_id_hex
+    };
+    let mut deletes = app_events_targeting_message_tx(
         tx,
         &row.group_id_hex,
         MARMOT_APP_EVENT_KIND_DELETE,
-        &row.message_id_hex,
+        target,
     )?;
+    if matches!(
+        row.kind,
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_EDIT
+    ) {
+        // This check needs only the kind. Keep rebuilds tolerant of corrupt
+        // source tag JSON, like raw_event_from_row; do not decode target tags.
+        let root_is_chat: bool = tx.query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2 AND kind=?3)",
+            params![row.group_id_hex, target, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
+            |r| r.get(0),
+        ).storage()?;
+        if root_is_chat {
+            deletes.extend(
+                app_events_targeting_message_tx(
+                    tx,
+                    &row.group_id_hex,
+                    MARMOT_APP_EVENT_KIND_REMOVE,
+                    target,
+                )?
+                .into_iter()
+                .filter(|decision| {
+                    decision.moderation_grant
+                        && cgka_traits::reporting::parse_removal(
+                            &decision.tags,
+                            &decision.plaintext,
+                        )
+                        .as_deref()
+                            == Some(target)
+                }),
+            );
+        }
+    }
+    deletes.sort_by(|a, b| {
+        (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
+    });
     for delete in deletes {
-        // Self-retraction, or an admin moderation delete whose grant was
-        // authenticated and frozen at ingest (never granted in direct
-        // conversations). Anything else is a forged cross-sender delete.
-        if row.sender != delete.sender && !delete.moderation_grant {
+        // Kind 5 is author-only for new events. An already-persisted legacy
+        // verdict may retain its tombstone, but source admin status cannot
+        // grant a new kind-5 cross-author deletion.
+        if delete.kind == MARMOT_APP_EVENT_KIND_DELETE
+            && row.sender != delete.sender
+            && !delete.moderation_grant
+        {
             continue;
         }
         row.deleted = true;
@@ -2707,6 +2845,16 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
         | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
             ids.insert(message_id_hex.to_owned());
             reply_preview_targets.insert(message_id_hex.to_owned());
+            if kind == MARMOT_APP_EVENT_KIND_CHAT {
+                for edit in app_events_targeting_message_tx(
+                    tx,
+                    group_id_hex,
+                    MARMOT_APP_EVENT_KIND_EDIT,
+                    message_id_hex,
+                )? {
+                    ids.insert(edit.message_id_hex);
+                }
+            }
         }
         MARMOT_APP_EVENT_KIND_EDIT => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
@@ -2715,9 +2863,29 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
         MARMOT_APP_EVENT_KIND_REACTION => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
-        MARMOT_APP_EVENT_KIND_DELETE => {
+        MARMOT_APP_EVENT_KIND_REPORT => {
+            ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+        }
+        MARMOT_APP_EVENT_KIND_REVIEW => {
+            for report in tag_values(tags, EVENT_REF_TAG) {
+                if let Some((kind, tags)) = app_event_projection_parts_tx(tx, group_id_hex, report)?
+                    && kind == MARMOT_APP_EVENT_KIND_REPORT
+                {
+                    ids.extend(tag_values(&tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+                }
+            }
+        }
+        MARMOT_APP_EVENT_KIND_DELETE | MARMOT_APP_EVENT_KIND_REMOVE => {
             for target in tag_values(tags, EVENT_REF_TAG) {
                 ids.insert(target.to_owned());
+                for edit in app_events_targeting_message_tx(
+                    tx,
+                    group_id_hex,
+                    MARMOT_APP_EVENT_KIND_EDIT,
+                    target,
+                )? {
+                    ids.insert(edit.message_id_hex);
+                }
                 reply_preview_targets.insert(target.to_owned());
                 if let Some((kind, modifier_target)) =
                     modifier_target_message_id_tx(tx, group_id_hex, target)?
@@ -2781,6 +2949,12 @@ fn timeline_trigger_for_recorded_event_row(
     new_affected_message_ids: &BTreeSet<String>,
     row: &TimelineMessageRecord,
 ) -> TimelineUpdateTrigger {
+    if matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_REPORT | MARMOT_APP_EVENT_KIND_REVIEW
+    ) {
+        return TimelineUpdateTrigger::MessageEditedOrReprojected;
+    }
     if !new_affected_message_ids.contains(&row.message_id_hex)
         && let Some((previous_kind, previous_tags)) = previous_event
     {
@@ -2875,12 +3049,16 @@ fn timeline_trigger_for_invalidation_row(
                 | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                 | MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_REMOVE
                 | MARMOT_APP_EVENT_KIND_EDIT
         )
     {
         return TimelineUpdateTrigger::ReplyPreviewChanged;
     }
     match kind {
+        MARMOT_APP_EVENT_KIND_REPORT
+        | MARMOT_APP_EVENT_KIND_REVIEW
+        | MARMOT_APP_EVENT_KIND_REMOVE => TimelineUpdateTrigger::MessageEditedOrReprojected,
         MARMOT_APP_EVENT_KIND_REACTION => TimelineUpdateTrigger::ReactionRemoved,
         MARMOT_APP_EVENT_KIND_DELETE => {
             if event_targets
@@ -2919,12 +3097,14 @@ fn timeline_trigger_for_event_row(
                 | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                 | MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_REMOVE
                 | MARMOT_APP_EVENT_KIND_EDIT
         )
     {
         return TimelineUpdateTrigger::ReplyPreviewChanged;
     }
     match kind {
+        MARMOT_APP_EVENT_KIND_REMOVE if row.deleted => TimelineUpdateTrigger::MessageDeleted,
         MARMOT_APP_EVENT_KIND_CHAT => {
             if tag_value(tags, STREAM_TAG).is_some() && tag_value(tags, STREAM_START_TAG).is_some()
             {
@@ -3412,11 +3592,15 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             // mutate canonical content, so they are skipped entirely.
             MARMOT_APP_EVENT_KIND_REACTION if !event.invalidated => reactions.push(event.clone()),
             MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
+            MARMOT_APP_EVENT_KIND_REMOVE if !event.invalidated => deletes.push(event.clone()),
             // Modifier kinds never get a row of their own. Every other kind —
             // including app-defined custom kinds — projects a generic row.
             MARMOT_APP_EVENT_KIND_REACTION
             | MARMOT_APP_EVENT_KIND_DELETE
-            | MARMOT_APP_EVENT_KIND_EDIT => {}
+            | MARMOT_APP_EVENT_KIND_EDIT
+            | MARMOT_APP_EVENT_KIND_REPORT
+            | MARMOT_APP_EVENT_KIND_REVIEW
+            | MARMOT_APP_EVENT_KIND_REMOVE => {}
             _ => {
                 let mut row = timeline_row_from_custom_event(event);
                 if event.invalidated {
@@ -3435,6 +3619,9 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
         .collect::<HashMap<_, _>>();
     let mut deleted_reaction_ids = HashSet::new();
     for delete in &deletes {
+        if delete.kind != MARMOT_APP_EVENT_KIND_DELETE {
+            continue;
+        }
         for target in tag_values(&delete.tags, EVENT_REF_TAG) {
             if let Some(target_event) = events_by_id.get(target)
                 && target_event.kind == MARMOT_APP_EVENT_KIND_REACTION
@@ -3483,12 +3670,24 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             .collect();
     }
 
+    deletes.sort_by(|a, b| {
+        (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
+    });
     for delete in deletes {
         for target in tag_values(&delete.tags, EVENT_REF_TAG) {
             let Some(row) = timeline.get_mut(target) else {
                 continue;
             };
-            if row.sender != delete.sender && !delete.moderation_grant {
+            if delete.kind == MARMOT_APP_EVENT_KIND_REMOVE {
+                if row.kind != MARMOT_APP_EVENT_KIND_CHAT
+                    || !delete.moderation_grant
+                    || cgka_traits::reporting::parse_removal(&delete.tags, &delete.plaintext)
+                        .as_deref()
+                        != Some(target)
+                {
+                    continue;
+                }
+            } else if row.sender != delete.sender && !delete.moderation_grant {
                 continue;
             }
             row.deleted = true;
@@ -3683,6 +3882,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     Ok(TimelineMessageRecord {
+        has_reports: false,
         group_system: crate::group_system::projected_group_system(
             row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
             &row.get::<_, String>(8)?,
@@ -3754,6 +3954,7 @@ fn hydrate_timeline_presentation(
     conn: &Connection,
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
+    reports::hydrate(conn, messages)?;
     filter_blocked_reactions(conn, messages)?;
     let targets = messages
         .iter()
