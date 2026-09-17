@@ -1277,11 +1277,6 @@ impl Drop for AppAccountSessionGuard {
     }
 }
 
-struct LocalAccountNames {
-    directory: UserDirectoryLocalAccount,
-    label: String,
-}
-
 impl MarmotApp {
     /// Dev/test convenience constructor — see [`MarmotApp::with_relays`]. Not a
     /// production entry point; hidden from the public API docs.
@@ -4823,24 +4818,6 @@ impl MarmotApp {
         self.display_names_for_account_ids(&account_ids)
     }
 
-    fn local_accounts_by_id(&self) -> Result<HashMap<String, LocalAccountNames>, AppError> {
-        let mut local = HashMap::new();
-        for account in self.account_home().accounts()? {
-            // Preserve first-record directory links and last-label display fallback for aliases.
-            local
-                .entry(account.account_id_hex)
-                .and_modify(|names: &mut LocalAccountNames| names.label = account.label.clone())
-                .or_insert_with(|| LocalAccountNames {
-                    directory: UserDirectoryLocalAccount {
-                        label: account.label.clone(),
-                        local_signing: account.local_signing,
-                    },
-                    label: account.label,
-                });
-        }
-        Ok(local)
-    }
-
     fn display_names_for_account_ids(
         &self,
         account_id_hexes: &[String],
@@ -4891,6 +4868,7 @@ impl MarmotApp {
     /// back to a local account's label. Split out so callers that already hold
     /// the entry (e.g. notification building, #639) don't re-query
     /// `directory_entry_for_account_id`.
+    /// Preserve its first-alias fallback; batched name reads historically use the last alias.
     pub(crate) fn display_name_from_directory_entry(
         &self,
         account_id_hex: &str,

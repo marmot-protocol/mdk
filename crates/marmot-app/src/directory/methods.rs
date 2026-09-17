@@ -22,7 +22,7 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::records::{
-    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList,
+    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
     MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
     cached_identity_projection, follow_list_from_record, latest_follow_list_from_records,
@@ -51,6 +51,26 @@ use crate::{
 };
 
 impl MarmotApp {
+    pub(crate) fn local_accounts_by_id(
+        &self,
+    ) -> Result<HashMap<String, LocalAccountNames>, AppError> {
+        let mut local = HashMap::new();
+        for account in self.account_home().accounts()? {
+            // Preserve first-record directory links and last-label display fallback for aliases.
+            local
+                .entry(account.account_id_hex)
+                .and_modify(|names: &mut LocalAccountNames| names.label = account.label.clone())
+                .or_insert_with(|| LocalAccountNames {
+                    directory: UserDirectoryLocalAccount {
+                        label: account.label.clone(),
+                        local_signing: account.local_signing,
+                    },
+                    label: account.label,
+                });
+        }
+        Ok(local)
+    }
+
     pub fn warm_directory_storage(&self) -> Result<(), AppError> {
         let _span = tracing::debug_span!(
             target: "marmot_app::directory",
@@ -1225,7 +1245,7 @@ impl MarmotApp {
         account_id_hex: &str,
         caches: &[DirectoryCache],
         shared_storage: &SqliteSharedStorage,
-        local_accounts: &HashMap<String, crate::LocalAccountNames>,
+        local_accounts: &HashMap<String, LocalAccountNames>,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let cached_entry = Self::directory_entry_from_caches(caches, account_id_hex)?
             .map(|entry| Self::hydrate_directory_record(entry, local_accounts))
@@ -1758,7 +1778,7 @@ impl MarmotApp {
 
     fn hydrate_directory_record(
         mut entry: UserDirectoryRecord,
-        local_accounts: &HashMap<String, crate::LocalAccountNames>,
+        local_accounts: &HashMap<String, LocalAccountNames>,
     ) -> Result<UserDirectoryRecord, AppError> {
         entry.account_id_hex = parse_account_id_hex(&entry.account_id_hex)?;
         entry.npub = npub_for_account_id(&entry.account_id_hex)?;
@@ -1842,6 +1862,13 @@ mod tests {
         );
         assert_eq!(local.label, home.accounts().unwrap().last().unwrap().label);
         assert_ne!(local.directory.label, local.label);
+        // Notification's existing single-entry reader keeps the first alias.
+        assert_eq!(
+            app.display_name_from_directory_entry(&alice.account_id_hex, None)
+                .unwrap()
+                .as_deref(),
+            Some(local.directory.label.as_str())
+        );
         let entry = app.empty_directory_record(&alice.account_id_hex);
         for label in ["alice", "z-alias"] {
             fs_private::write_private(&home.account_dir(label).join("account.json"), b"broken")
