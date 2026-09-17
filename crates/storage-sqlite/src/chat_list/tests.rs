@@ -4885,3 +4885,58 @@ fn authenticated_system_preview_without_commit_attribution_keeps_subject() {
         Some(&system)
     );
 }
+
+#[test]
+fn deletion_provenance_changes_refresh_chat_preview() {
+    let store = setup_store();
+    let target = "01".repeat(32);
+    store
+        .record_app_event(&chat(&target, REMOTE, 1, "body"))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let mut deletion = reaction("author-delete", REMOTE, &target, 2);
+    deletion.kind = 5;
+    store.record_app_event(&deletion).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap()
+            .deletion_source,
+        crate::DeletionSource::Author
+    );
+    deletion.message_id_hex = "admin-delete".into();
+    deletion.source_message_id_hex = Some("source-admin-delete".into());
+    deletion.kind = 4891;
+    deletion.recorded_at = 3;
+    deletion.plaintext = r#"{"v":1,"action":"remove"}"#.into();
+    store
+        .record_app_event_with_source(
+            &deletion,
+            None,
+            Some(cgka_traits::app_event::AppMessageAuthority {
+                source_context: [42; 32],
+                moderation_grant: true,
+            }),
+        )
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let preview = store
+        .chat_list_row(GROUP)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .unwrap();
+    assert!(preview.deleted);
+    assert!(preview.plaintext.is_empty());
+    assert_eq!(preview.deletion_source, crate::DeletionSource::Admin);
+}

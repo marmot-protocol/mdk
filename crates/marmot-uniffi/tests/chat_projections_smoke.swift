@@ -18,10 +18,17 @@ struct ChatProjectionsSmoke {
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
                 name: nil, oldName: nil, oldRetentionSeconds: nil, newRetentionSeconds: nil)
             let preview = ChatListMessagePreviewFfi(groupSystem: event, messageIdHex: "selected", sender: "actor", senderDisplayName: nil,
-                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false,
+                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false, deletionSource: .unknown,
                 attachmentKind: nil, attachmentCount: 0, deliveryState: .notApplicable)
             let copy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
             precondition(copy == preview && copy.groupSystem?.provenance == provenance)
+        }
+        for source in [DeletionSourceFfi.author, .admin, .unknown] {
+            let preview = TimelineReplyPreviewFfi(messageIdHex: "deleted", sender: "author", plaintext: "",
+                contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 9,
+                mediaJson: nil, media: [], agentTextStreamJson: nil, deleted: true, deletionSource: source, invalidationStatus: nil)
+            let copy = try FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
+            precondition(copy == preview && copy.deletionSource == source)
         }
         let blocks = BlockListSnapshotFfi(revision: UInt64.max, users: [BlockedUserFfi(publicKey: "key", isPrivate: true, createdAtMs: 123)])
         let blockCopy = try FfiConverterTypeBlockListSnapshotFfi.lift(FfiConverterTypeBlockListSnapshotFfi.lower(blocks))

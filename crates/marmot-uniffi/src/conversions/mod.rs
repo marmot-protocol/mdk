@@ -520,6 +520,7 @@ mod tests {
                 media: None,
                 agent_text_stream: None,
                 deleted: false,
+                deletion_source: Default::default(),
                 invalidation_status: Some("LosingBranch".to_owned()),
             }),
             media: Some(serde_json::json!({
@@ -539,6 +540,7 @@ mod tests {
                 }],
             },
             deleted: true,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
             invalidation_status: None,
         };
@@ -647,6 +649,7 @@ mod tests {
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         };
@@ -696,6 +699,7 @@ mod tests {
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         };

@@ -3,12 +3,13 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    GroupSystemEventFfi, GroupSystemEventProvenanceFfi, RuntimeProjectionUpdateFfi,
-    TimelineEditHistoryPageFfi, TimelineEditSummaryFfi, TimelineEditVersionFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
-    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
-    TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
-    TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
+    DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi,
+    RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi, TimelineEditSummaryFfi,
+    TimelineEditVersionFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
+    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
+    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
+    TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
+    TimelineUserReactionFfi,
 };
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
@@ -59,6 +60,15 @@ impl MarmotTimelineMessageQuery {
     }
 }
 
+c_enum! {
+    /// Accepted deletion origin; meaningful only for deleted rows.
+    MarmotDeletionSource from DeletionSourceFfi {
+        Unknown,
+        Author,
+        Admin,
+    }
+}
+
 c_mirror! {
     /// Preview of the message a timeline row replies to.
     MarmotTimelineReplyPreview from TimelineReplyPreviewFfi {
@@ -73,6 +83,7 @@ c_mirror! {
         vec media/media_len: MarmotMediaAttachmentOutcome,
         opt_str agent_text_stream_json,
         copy deleted: bool,
+        copy deletion_source: MarmotDeletionSource,
         /// Convergence invalidation reason for the previewed message.
         /// Nullable.
         opt_str invalidation_status,
@@ -182,6 +193,7 @@ c_mirror! {
         rec reactions: MarmotTimelineReactionSummary,
         opt_rec edit: MarmotTimelineEditSummary,
         copy deleted: bool,
+        copy deletion_source: MarmotDeletionSource,
         opt_str deleted_by_message_id_hex,
         /// Convergence invalidation reason (e.g. `LosingBranch`); NULL
         /// for delivered messages.

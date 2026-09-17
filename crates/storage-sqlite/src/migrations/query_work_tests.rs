@@ -503,7 +503,12 @@ fn retention_indexes_upgrade() {
                 .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
                 .unwrap();
             let columns = (0..stmt.column_count())
-                .filter(|&i| stmt.column_name(i).unwrap() != "edit_json")
+                .filter(|&i| {
+                    !matches!(
+                        stmt.column_name(i).unwrap(),
+                        "edit_json" | "deletion_source"
+                    )
+                })
                 .collect::<Vec<_>>();
             rows.extend(
                 stmt.query_map([], |row| {

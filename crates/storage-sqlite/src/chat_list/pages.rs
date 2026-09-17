@@ -350,7 +350,7 @@ fn page_rows_sql() -> String {
     // batching alone would still scan unrelated engine records without indexed joins.
     // json_each supplies at most 200 keys (100 for standalone pages); row order is restored from navigation below.
     format!(
-        "{} row.list_pin_position,
+        "{} row.list_pin_position, row.last_message_deletion_source AS deletion_source,
             leave_request.record AS page_leave_record,
             disband_request.record AS page_disband_record,
             EXISTS(SELECT 1 FROM cgka_disband_candidates

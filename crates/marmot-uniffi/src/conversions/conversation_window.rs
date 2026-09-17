@@ -340,7 +340,7 @@ impl From<app::SelectedMessageDraft> for SelectedMessageDraftFfi {
     }
 }
 /// Timeline content plus bounded display references. Use references.reactions for UI;
-/// the compatibility timeline's raw tags/reactions are deliberately empty here.
+/// custom-event tags are preserved; typed rows use structured fields and reactions use references.
 #[derive(Clone, uniffi::Record)]
 pub struct ConversationMessageFfi {
     pub timeline: TimelineMessageRecordFfi,
@@ -361,6 +361,14 @@ pub struct ConversationWindowSnapshotFfi {
     pub has_more_after: bool,
 }
 // Borrow raw rows so conversion never clones the full reactor/tag collections.
+fn presented_custom_tags(row: &app::TimelineMessageRecord) -> &[Vec<String>] {
+    if !row.deleted && !app::is_reserved_app_event_kind(row.kind) {
+        &row.tags
+    } else {
+        &[]
+    }
+}
+
 fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
     presented_timeline_with_tokens(
         row,
@@ -388,7 +396,7 @@ fn presented_timeline_with_tokens(
         plaintext: row.plaintext.clone(),
         content_tokens,
         kind: row.kind,
-        tags: vec![],
+        tags: super::common::message_tags_ffi(presented_custom_tags(row).to_vec()),
         timeline_at: row.timeline_at,
         received_at: row.received_at,
         reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
@@ -406,6 +414,7 @@ fn presented_timeline_with_tokens(
             user_reactions: vec![],
         },
         deleted: row.deleted,
+        deletion_source: row.deletion_source.into(),
         deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
         invalidation_status: row.invalidation_status.clone(),
     }
@@ -530,7 +539,7 @@ impl ConversationConversionCache {
             sender: row.sender.clone(),
             plaintext: row.plaintext.clone(),
             kind: row.kind,
-            tags: vec![],
+            tags: presented_custom_tags(row).to_vec(),
             timeline_at: row.timeline_at,
             received_at: row.received_at,
             reply_to_message_id_hex: row.reply_to_message_id_hex.clone(),
@@ -546,6 +555,7 @@ impl ConversationConversionCache {
             edit: row.edit.clone(),
             has_reports: row.has_reports,
             deleted: row.deleted,
+            deletion_source: row.deletion_source,
             deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
             invalidation_status: row.invalidation_status.clone(),
         };
@@ -592,7 +602,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         sender,
         plaintext,
         kind,
-        tags: _,
+        tags,
         timeline_at,
         received_at,
         reply_to_message_id_hex,
@@ -605,6 +615,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         has_reports,
         deleted,
         deleted_by_message_id_hex,
+        deletion_source,
         invalidation_status,
     } = row;
     (
@@ -631,9 +642,17 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             has_reports,
             deleted,
             deleted_by_message_id_hex,
+            deletion_source,
             invalidation_status,
         ),
-        if trusted { group_system.as_ref() } else { None },
+        (
+            if !*deleted && !app::is_reserved_app_event_kind(*kind) {
+                tags.as_slice()
+            } else {
+                &[]
+            },
+            if trusted { group_system.as_ref() } else { None },
+        ),
     )
 }
 
@@ -791,6 +810,7 @@ mod tests {
             agent_text_stream: None,
             reactions: app::TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         };

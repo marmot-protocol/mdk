@@ -13,12 +13,18 @@ fun main() {
     for (provenance in GroupSystemEventProvenanceFfi.entries) {
         val event = GroupSystemEventFfi(provenance, "Actor", "Subject", "member_added", "Member added", "actor", "subject", null, null, null, null)
         val preview = ChatListMessagePreviewFfi(event, "selected", "actor", null, "raw", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
-            1210u, 50u, false, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
+            1210u, 50u, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
         val copy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
         // Kotlin ByteArray equality is referential; compare the nested bytes by content.
         check(copy.contentTokens.blankLinesBefore.contentEquals(preview.contentTokens.blankLinesBefore))
         check(copy.contentTokens.blocks == preview.contentTokens.blocks && copy.contentTokens.truncated == preview.contentTokens.truncated)
         check(copy.copy(contentTokens = preview.contentTokens) == preview && copy.groupSystem?.provenance == provenance)
+    }
+    for (source in DeletionSourceFfi.entries) {
+        val preview = TimelineReplyPreviewFfi("deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
+            9u, null, emptyList(), null, true, source, null)
+        val copy = FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
+        check(copy.deletionSource == source && copy.deleted && copy.plaintext.isEmpty())
     }
     val edit = TimelineEditSummaryFfi(3u, "edit", 17u)
     check(FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit)) == edit)

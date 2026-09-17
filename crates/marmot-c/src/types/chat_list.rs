@@ -9,7 +9,7 @@ use marmot_uniffi::conversions::{
 
 use super::group::{MarmotDisbandRequest, MarmotGroupLifecycleState, MarmotSelfMembership};
 use super::markdown::MarmotMarkdownDocument;
-use super::timeline::MarmotGroupSystemEvent;
+use super::timeline::{MarmotDeletionSource, MarmotGroupSystemEvent};
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, free_vec, owned_c_string, owned_vec};
 
@@ -116,6 +116,7 @@ c_mirror! {
         copy kind: u64,
         copy timeline_at: u64,
         copy deleted: bool,
+        copy deletion_source: MarmotDeletionSource,
         opt_copy has_attachment_kind/attachment_kind: MarmotChatListAttachmentKind,
         copy attachment_count: u32,
         copy delivery_state: MarmotChatListMessageDeliveryState,
@@ -295,6 +296,7 @@ mod tests {
             kind: 1210,
             timeline_at: 50,
             deleted: false,
+            deletion_source: Default::default(),
             attachment_kind: None,
             attachment_count: 0,
             delivery_state: ChatListMessageDeliveryStateFfi::NotApplicable,

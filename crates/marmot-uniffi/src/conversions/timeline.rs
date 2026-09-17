@@ -13,6 +13,24 @@ use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
 use super::media::{MediaAttachmentOutcomeFfi, timeline_media_outcomes_ffi};
 use crate::markdown::MarkdownDocumentFfi;
 
+/// Accepted deletion origin; consult only when `deleted` is true.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
+pub enum DeletionSourceFfi {
+    #[default]
+    Unknown,
+    Author,
+    Admin,
+}
+impl From<marmot_app::DeletionSource> for DeletionSourceFfi {
+    fn from(value: marmot_app::DeletionSource) -> Self {
+        match value {
+            marmot_app::DeletionSource::Unknown => Self::Unknown,
+            marmot_app::DeletionSource::Author => Self::Author,
+            marmot_app::DeletionSource::Admin => Self::Admin,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineReactionEmojiFfi {
     pub emoji: String,
@@ -100,6 +118,7 @@ pub struct TimelineReplyPreviewFfi {
     pub media: Vec<MediaAttachmentOutcomeFfi>,
     pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
+    pub deletion_source: DeletionSourceFfi,
     /// Convergence invalidation reason for the previewed message. The content
     /// fields are intentionally preserved so the application controls display.
     pub invalidation_status: Option<String>,
@@ -119,6 +138,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             deleted: value.deleted,
+            deletion_source: value.deletion_source.into(),
             invalidation_status: value.invalidation_status,
         }
     }
@@ -241,6 +261,7 @@ pub struct TimelineMessageRecordFfi {
     pub reactions: TimelineReactionSummaryFfi,
     pub edit: Option<TimelineEditSummaryFfi>,
     pub deleted: bool,
+    pub deletion_source: DeletionSourceFfi,
     pub deleted_by_message_id_hex: Option<String>,
     /// Set when convergence invalidated this message (it landed on a losing
     /// branch). The message is kept as a "did not reach the group" tombstone
@@ -279,6 +300,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             reactions: value.reactions.into(),
             edit: value.edit.map(Into::into),
             deleted: value.deleted,
+            deletion_source: value.deletion_source.into(),
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
             invalidation_status: value.invalidation_status,
         }
@@ -672,6 +694,7 @@ mod tests {
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         }
@@ -843,6 +866,7 @@ mod tests {
             media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
             agent_text_stream: None,
             deleted: false,
+            deletion_source: Default::default(),
             invalidation_status: Some("LosingBranch".to_owned()),
         };
         let record: TimelineMessageRecordFfi =

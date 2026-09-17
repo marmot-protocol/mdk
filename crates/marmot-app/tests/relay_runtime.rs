@@ -14546,10 +14546,38 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
         assert_eq!(labels.labels[0].event_id_hex, dismissal.message_ids[0]);
         assert_eq!(labels.labels[0].explanation, "reviewed");
     }
+    let ordinary = bob.send(&group, b"ordinary author deletion").await.unwrap();
+    bob.delete_message(&group, &ordinary.message_ids[0])
+        .await
+        .unwrap();
+    alice.sync().await.unwrap();
+    for account in ["alice", "bob"] {
+        let row = runtime
+            .timeline_message(account, &group_hex, &ordinary.message_ids[0])
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted && row.plaintext.is_empty());
+        assert_eq!(row.deletion_source, marmot_app::DeletionSource::Author);
+    }
     // Admin removal is independent of reports and also applies to their own chat.
     let unreported = bob.send(&group, b"unreported").await.unwrap();
     alice.sync().await.unwrap();
     let own = alice.send(&group, b"admin message").await.unwrap();
+    bob.sync().await.unwrap();
+    assert!(
+        bob.delete_message(&group, &own.message_ids[0])
+            .await
+            .is_err()
+    );
+    alice.sync().await.unwrap();
+    for account in ["alice", "bob"] {
+        let row = runtime
+            .timeline_message(account, &group_hex, &own.message_ids[0])
+            .unwrap()
+            .unwrap();
+        assert!(!row.deleted);
+        assert_eq!(row.deletion_source, marmot_app::DeletionSource::Unknown);
+    }
     for id in [target, &unreported.message_ids[0], &own.message_ids[0]] {
         let removed = alice.delete_message(&group, id).await.unwrap();
         assert_eq!(
@@ -14568,6 +14596,7 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
                 .unwrap()
                 .unwrap();
             assert!(message.deleted && message.plaintext.is_empty());
+            assert_eq!(message.deletion_source, marmot_app::DeletionSource::Admin);
         }
         let reports = runtime
             .content_reports(account, &group, Some(target), None, 10)

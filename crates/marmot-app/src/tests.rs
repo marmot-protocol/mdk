@@ -10786,6 +10786,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         timeline_at: 1,
         deleted: false,
+        deletion_source: Default::default(),
         attachment_kind: None,
         attachment_count: 0,
         delivery_state: ChatListMessageDeliveryState::NotApplicable,

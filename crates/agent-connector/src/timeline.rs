@@ -265,6 +265,7 @@ mod tests {
                 }],
             },
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         }

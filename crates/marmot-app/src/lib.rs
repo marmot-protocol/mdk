@@ -248,7 +248,7 @@ pub use relay_telemetry_export::{
 };
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, ExistingDirectConversation,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
     MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
     TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
