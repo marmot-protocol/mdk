@@ -3424,6 +3424,7 @@ impl MarmotApp {
     }
 
     pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        // Keep overlays aligned with group(); keyed_group_matches_list checks parity.
         self.ensure_account_state(label)?;
         let storage = self.account_storage(label)?;
         let mut groups = storage
@@ -3556,13 +3557,15 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
     ) -> Result<Option<AppGroupRecord>, AppError> {
+        // Keep overlays aligned with groups(); keyed_group_matches_list checks parity.
         self.ensure_account_state(label)?;
         let storage = self.account_storage(label)?;
         let Some(stored) = storage.account_groups(Some(group_id_hex))?.pop() else {
             return Ok(None);
         };
         let mut group = app_group_from_stored_group(stored)?;
-        // List overlays use canonical lowercase hex keys; keep the same exact matching.
+        // Defend parity for noncanonical persisted ids: list overlays only match
+        // lowercase hex keys, even when the projection row itself matches exactly.
         let Ok(group_id) = hex::decode(group_id_hex) else {
             return Ok(Some(group));
         };
