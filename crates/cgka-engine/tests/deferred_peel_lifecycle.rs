@@ -2142,7 +2142,6 @@ async fn carol_deferring_in_two_live_groups() -> (
 async fn assert_group_b_owns_the_whole_account_budget(
     restarted: &mut Engine<SqliteAccountStorage>,
     template_b: TransportMessage,
-    bytes_b: usize,
     why: &str,
 ) {
     let second_b = TransportMessage {
@@ -2200,7 +2199,6 @@ async fn unrecoverable_group_does_not_charge_the_account_byte_budget() {
     assert_group_b_owns_the_whole_account_budget(
         &mut restarted,
         template_b,
-        bytes_b,
         "a halted group's parked rows must not spend the account byte budget a live group needs",
     )
     .await;
@@ -2251,7 +2249,6 @@ async fn quarantined_group_does_not_charge_the_account_byte_budget() {
     assert_group_b_owns_the_whole_account_budget(
         &mut restarted,
         template_b,
-        bytes_b,
         "a quarantined group's parked rows must not spend the account byte budget a live \
          group needs",
     )
@@ -2317,7 +2314,6 @@ async fn rows_retained_for_a_blocked_group_do_not_accrue_account_bytes() {
     assert_group_b_owns_the_whole_account_budget(
         &mut restarted,
         template_b,
-        bytes_b,
         "rows retained for a blocked group must not accrue against the account budget",
     )
     .await;
