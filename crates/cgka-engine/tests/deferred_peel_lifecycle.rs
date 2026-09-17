@@ -1921,6 +1921,143 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
     ));
 }
 
+/// Stage a local publish, which halts carol's ingest: while it is unresolved
+/// every inbound group message is retained as a raw `Retryable` row for the
+/// replay the publish outcome runs — the same shape a re-join's replay sees.
+async fn stage_publish_halting_ingest(
+    carol: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+) -> cgka_traits::engine_state::PendingStateRef {
+    evolution(
+        carol
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .expect("self-update stages"),
+    )
+    .1
+}
+
+/// Count this group's stored rows in `state`.
+#[cfg(feature = "test-policy-overrides")]
+fn rows_in_state(storage: &SqliteAccountStorage, group_id: &GroupId, state: MessageState) -> usize {
+    storage
+        .list_messages(group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.state == state)
+        .count()
+}
+
+/// A replayed row the group has no room to park is refused for lack of room —
+/// a local resource bound, not a verdict on the message. Such a row must stay
+/// retained and redeliverable: retiring it `Processed` would answer `Duplicate`
+/// to every later redelivery of an id this device never opened, permanently.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn replay_keeps_a_row_refused_for_lack_of_room_redeliverable() {
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+
+    let mut buffered = Vec::new();
+    for index in 0..3 {
+        buffered.push(send_app(&mut alice, &group_id, &format!("ahead-{index}")).await);
+    }
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    for msg in &buffered {
+        assert!(
+            matches!(
+                carol.ingest(msg.clone()).await.unwrap(),
+                IngestOutcome::Buffered { .. }
+            ),
+            "a staged publish halts ingest, so inbound traffic is buffered"
+        );
+        assert_eq!(
+            carol_storage.get_message(&msg.id).unwrap().state,
+            MessageState::Retryable
+        );
+    }
+
+    // Room for exactly one deferred row, so the replay parks one and is refused
+    // for the rest.
+    carol.set_deferred_peel_limits_for_tests(1, usize::MAX, usize::MAX);
+    carol.publish_failed(pending).await.unwrap();
+
+    assert_eq!(
+        rows_in_state(&carol_storage, &group_id, MessageState::PeelDeferred),
+        1,
+        "the cap admits exactly one row"
+    );
+    let refused: Vec<_> = buffered
+        .iter()
+        .filter(|msg| carol_storage.get_message(&msg.id).unwrap().state == MessageState::Retryable)
+        .cloned()
+        .collect();
+    assert_eq!(
+        refused.len(),
+        2,
+        "every row the cap refused stays awaiting retry, not retired"
+    );
+    for msg in refused {
+        assert!(
+            matches!(
+                carol.ingest(msg).await.unwrap(),
+                IngestOutcome::Buffered { .. }
+            ),
+            "a refusal for lack of room must not poison same-id redelivery"
+        );
+    }
+
+    // Once the group has room, a later replay parks what the refusal retained.
+    carol.set_deferred_peel_limits_for_tests(
+        MAX_PEEL_DEFERRED_ROWS_PER_GROUP,
+        usize::MAX,
+        usize::MAX,
+    );
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    carol.publish_failed(pending).await.unwrap();
+    assert_eq!(
+        rows_in_state(&carol_storage, &group_id, MessageState::PeelDeferred),
+        buffered.len(),
+        "with room restored every retained row parks for the deferred-peel sweep"
+    );
+}
+
+/// The other half of the same rule: a replayed row that really does earn a
+/// verdict is still retired. A commit that applies leaves its raw wrapper
+/// `Processed`, and redelivery of that id is a duplicate.
+#[tokio::test]
+async fn replay_still_retires_a_row_that_applies() {
+    let (_alice, mut carol, carol_storage, _peeler, group_id, commit2, _commit3) =
+        carol_behind_two_epochs().await;
+
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    assert!(matches!(
+        carol.ingest(commit2.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&commit2.id).unwrap().state,
+        MessageState::Retryable
+    );
+
+    carol.publish_failed(pending).await.unwrap();
+
+    assert_eq!(
+        carol_storage.get_message(&commit2.id).unwrap().state,
+        MessageState::Processed,
+        "a replayed commit that applies retires its raw wrapper"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(matches!(
+        carol.ingest(commit2).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        }
+    ));
+}
+
 /// If account accounting was initialized by group A, a later deferral in
 /// group B is charged incrementally. Group B's first sweep must reconcile that
 /// contribution rather than adding the same durable bytes again.

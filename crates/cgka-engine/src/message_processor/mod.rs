@@ -3585,11 +3585,11 @@ impl<S: StorageProvider> Engine<S> {
                     // Leave it and stop: the record is terminal from here, so
                     // every row behind this one gets the same refusal.
                     //
-                    // Never relabel it `Processed`: that is an OpenMLS graph
-                    // input state (`OPENMLS_GRAPH_INPUT_STATES`), so a
-                    // never-applied commit would score as canonical evidence, and
-                    // it is outside `unresolved_commit_state`, so the re-join
-                    // sweep would not clean it up. Retained is also the useful
+                    // Never relabel it `Processed`: `recorded_message_outcome`
+                    // answers `Duplicate` for every terminal state, so retiring a
+                    // row nothing ever opened makes its id permanently
+                    // undeliverable — redelivery is the only way these bytes
+                    // arrive again. Retained is also the useful
                     // state: a commit published after our removal is the "raced
                     // ahead of the re-add Welcome" case, and this replay runs
                     // again from `do_join_welcome`. Nothing spins on it meanwhile
@@ -3598,6 +3598,26 @@ impl<S: StorageProvider> Engine<S> {
                     // and a `PeelDeferred` row's cap slot was already returned
                     // when the removal retired the deferred backlog.
                     break;
+                }
+                Ok(IngestOutcome::ResourceRefused { .. }) => {
+                    // Refused for lack of room, not on the message's merits: the
+                    // group's deferred-peel cap had no slot for this row right
+                    // now. Leave it exactly as ingest found it — still awaiting
+                    // retry, still the redelivery source — and release nothing:
+                    // a refused row was never admitted, so it holds no cap slot
+                    // to give back.
+                    //
+                    // Never relabel it `Processed`, for the same reason as the
+                    // `Removed` arm above: `recorded_message_outcome` answers
+                    // `Duplicate` for every terminal state, so a row retired here
+                    // would be dead for this device forever — the one thing
+                    // `IngestOutcome::ResourceRefused` promises a local resource
+                    // bound must never do.
+                    //
+                    // Continue rather than stop: the cap bounds only rows that
+                    // need parking, so a later row may still peel and apply. This
+                    // replay runs again on every publish cycle, so the retry cost
+                    // stays bounded by the rows still retained.
                 }
                 Ok(_) => {
                     // Terminal reclassification of the raw wrapper: the content-
