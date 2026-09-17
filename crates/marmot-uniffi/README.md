@@ -48,7 +48,7 @@ play no part. Invalidated deletion evidence is withdrawn; projections update to 
 winner (or restore the undeleted state). Provenance-only changes participate in live projection
 and conversion-cache updates.
 
-Database migration 0081 adds provenance columns with an `unknown` default.
+Database migration 0082 adds provenance columns with an `unknown` default.
 It preserves older tombstones, deletion IDs, and cached chat presentation without scanning or
 reinterpreting history. No historical backfill is scheduled: existing tombstones can remain `Unknown` indefinitely.
 If a later operation reprojects a target or rebuilds its group, it uses available accepted evidence.

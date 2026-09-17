@@ -1,6 +1,6 @@
 # marmot-c
 
-Stable C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
+C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
 any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
 
 ## What you get
@@ -17,6 +17,21 @@ Build the bundle locally:
 
 Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip with the same
 contents.
+
+## Binary compatibility
+
+Build clients against the header shipped with the exact native library they load.
+Output records have concrete C layouts; this API has no tail-extension or
+cross-release layout-compatibility guarantee. Do not swap in a new library under
+an application compiled against older record layouts.
+
+The next release adds `deletion_source` to `MarmotTimelineMessageRecord`,
+`MarmotTimelineReplyPreview`, and `MarmotChatListMessagePreview`. This changes
+field offsets and record sizes and requires rebuilding C consumers with the
+updated header. It is not a binary-compatible replacement for the previous
+release. The release operation must assign a new workspace/release version and
+publish the header and native libraries together; unreleased feature commits
+retain the current workspace version.
 
 ## Using the ABI
 

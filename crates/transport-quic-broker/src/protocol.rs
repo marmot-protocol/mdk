@@ -75,6 +75,12 @@ pub(crate) const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
 /// have between records (e.g. a quiet tool call), unlike the handshake
 /// deadline.
 pub(crate) const RECORD_QUIET_GAP_DEADLINE: Duration = Duration::from_secs(120);
+/// Per-record bound for broker-to-subscriber backlog and live writes.
+/// Reuses the conservative record-I/O quiet-gap so a flow-controlled send
+/// cannot pin a subscriber handler; it does not bound quiet waits for the
+/// next record or total subscription age. Transport keepalives do not
+/// extend this deadline.
+pub(crate) const SUBSCRIBER_WRITE_DEADLINE: Duration = RECORD_QUIET_GAP_DEADLINE;
 pub(crate) const FINISHED_ROOM_TTL: Duration = Duration::from_secs(60);
 // Stale unfinished rooms are a defense-in-depth cleanup path for task
 // cancellation, so keep the same retention window as finished backlog rooms.

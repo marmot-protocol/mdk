@@ -16,6 +16,12 @@ final MLS app-message payload remains authoritative.
   envelope on a unidirectional stream.
 - Rooms are keyed by `stream_id + start_event_id` (raw bytes in the control envelope).
 - Subscriber queues are bounded and live-only.
+- Each backlog or live record write to a subscriber is bounded by the 120-second application quiet-gap deadline. A
+  stalled, flow-controlled write resets that subscriber stream and unsubscribes it so its handler and per-connection
+  stream permit can be reused. Transport keepalives do not extend this deadline; they only keep the QUIC connection
+  alive. Quiet gaps while waiting for the next record are unaffected, and a healthy connection stays up after one
+  subscriber is evicted. Connection admission and the connection permit of a still-open multiplexed connection are
+  unchanged.
 - Replay backlog is gated by `--replay-ttl-secs` (default `0`: no retained replay, matching the first-profile
   `replay_ttl_secs` default; hard cap 300s). With a nonzero replay window, backlog entries are timestamped on append
   and purged once they age out; finished rooms keep their remaining backlog for at most 60 seconds.

@@ -62,7 +62,7 @@ The greatest `(authenticated event timestamp, event ID)` selects both provenance
 and the existing deletion ID. Withdrawing evidence updates the winner and live
 projections; convergence invalidation remains a separate field.
 
-Migration 0081 adds columns defaulting to `Unknown` without replaying history or
+Migration 0082 adds columns defaulting to `Unknown` without replaying history or
 changing deletion IDs. Historical tombstones can remain `Unknown` indefinitely:
 no backfill is scheduled. A later target reprojection or group rebuild can classify
 retained accepted evidence. All timeline reads mask raw tags on deleted rows,

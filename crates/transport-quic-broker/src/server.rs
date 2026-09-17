@@ -13,7 +13,7 @@ use tokio::time::timeout;
 use crate::config::QuicBrokerConfig;
 use crate::error::QuicBrokerError;
 use crate::handlers::{BrokerStreamPolicy, PublishForwardLimits, handle_connection};
-use crate::protocol::MAX_BROKER_REPLAY_TTL;
+use crate::protocol::{MAX_BROKER_REPLAY_TTL, SUBSCRIBER_WRITE_DEADLINE};
 use crate::state::BrokerState;
 use crate::tls::{broker_transport_config, configure_server};
 
@@ -83,6 +83,7 @@ impl QuicBrokerServer {
             policy: BrokerStreamPolicy {
                 max_streams_per_connection: config.max_streams_per_connection,
                 read_timeout: config.read_timeout,
+                write_timeout: SUBSCRIBER_WRITE_DEADLINE,
                 publish_limits: PublishForwardLimits {
                     max_records: config.publish_max_records,
                     max_frame_bytes: config.publish_max_frame_bytes,

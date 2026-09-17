@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-16
+updated: 2026-09-17
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -26,9 +26,13 @@ See the [native edit contract](../../../crates/marmot-uniffi/CONVERSATION-WINDOW
 
 C7-A adds protected avatar-byte storage and bounded local reads in `storage-sqlite`, with source-generation
 fencing and separate narrow LRU bookkeeping. C7-B adds durable download/retry intent, selected-source maintenance,
-validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C native integration remains pending;
-existing clients should keep their image-loading paths until that handoff.
+validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C adds screen-selected opaque targets
+and native local access. Released-artifact adoption and device evidence remain C9 work; clients should retain host caches until validated.
 See [avatar cache storage](../further-context/avatar-cache-storage.md).
+
+C8-A adds indexed, revisioned per-group attachment-slot discovery in SQLite. This is the
+storage foundation for #1448; typed runtime/native pages and durable background attachment
+acquisition remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

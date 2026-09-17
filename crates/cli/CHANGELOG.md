@@ -71,6 +71,10 @@ This minor release establishes a new compatibility cohort. Update generated Swif
 
 ### Changed
 
+- The QUIC preview broker now bounds each subscriber backlog or live record write to the 120-second application
+  quiet-gap deadline. A stalled write resets and unsubscribes that subscriber so its stream permit can be reused;
+  transport keepalives do not extend the deadline, quiet waits for the next record stay unbounded, and the
+  connection permit of a still-open multiplexed connection is unchanged.
 - Forensic audit-log uploads now resolve, validate, and pin a fresh client for each attempt, with redirects and
   system proxies disabled. Private, retired, or redirected collector endpoints fail closed instead of following
   `Location` or dialing an unchecked address. Local loopback testing and the existing 60-second upload deadline remain.
