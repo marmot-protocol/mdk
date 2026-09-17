@@ -29,9 +29,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   Provenance comes from the selected accepted deletion, independently of the original message kind.
 - Conversation-window bindings preserve custom-event tags for client-defined renderers.
 
-Update generated Swift/Kotlin bindings, native libraries, and C headers together. Storage migration 81
-preserves existing tombstones with unknown provenance until normal reprojection can classify accepted
-history. See the [binding contract](../marmot-uniffi/README.md#deletion-provenance-and-custom-events).
+Update generated Swift/Kotlin bindings, native libraries, and C headers together. Storage migration 82
+adds provenance columns defaulting to unknown and preserves existing tombstones and deletion IDs.
+No historical backfill is scheduled; older tombstones can remain unknown indefinitely.
+See the [binding contract](../marmot-uniffi/README.md#deletion-provenance-and-custom-events).
 
 ## [0.10.1] - 2026-09-16
 

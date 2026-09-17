@@ -363,6 +363,7 @@ pub struct ConversationWindowSnapshotFfi {
 // Borrow raw rows and retain only custom-event tags in the FFI presentation.
 // MDK-owned tags and full reactor collections use prepared references instead.
 fn presented_custom_tags(row: &app::TimelineMessageRecord) -> &[Vec<String>] {
+    // Defence in depth for in-memory records that did not cross the storage read boundary.
     if !row.deleted && !app::is_reserved_app_event_kind(row.kind) {
         &row.tags
     } else {

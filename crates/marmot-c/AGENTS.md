@@ -64,7 +64,8 @@ across the boundary. That deserves its own focused design + tests rather than a 
 - Keep this crate in lockstep with `marmot-uniffi` surface changes. Document ABI layout changes in `CHANGELOG.md`
   and require matching headers/libraries. Workspace version bumps belong to an explicit user-directed release
   operation, as required by the root `AGENTS.md`; do not bump versions during feature or review-feedback work.
-  `just c-parity-gate` enforces the command half of that lockstep, for `impl Marmot` and for the subscription handles. Two things stay silent: new *fields* on an existing
+- `just c-parity-gate` enforces command parity for `impl Marmot` and the subscription handles.
+  Two things stay silent: new *fields* on an existing
   record (`c_mirror!` ignores what its spec does not name), and a new subscription method whose name another handle
   already mirrors (handle methods are matched by name, not per type). Re-read the record when upstream touches it.
 

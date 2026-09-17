@@ -24,7 +24,9 @@ NIP-09, and a dismissal cannot undo a deletion. Admin deletion intentionally use
 one moderation operation for all whole-chat targets, regardless of authorship.
 This includes self-deletion: older peers may keep that content visible, and a
 demotion before encryption rejects the operation rather than changing it to an
-author retraction.
+author retraction. Admin removal currently applies only to chat messages (kind 9),
+including their edits; it does not remove custom-kind events. Authors can retract
+their own custom events with kind 5.
 
 Timeline records expose `has_reports`. Existing timeline and projection events
 carry updates; there is no dedicated shared review queue, pending count, or
