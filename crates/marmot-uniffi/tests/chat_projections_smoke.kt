@@ -141,3 +141,14 @@ suspend fun compileAvatarCommands(marmot: Marmot, account: String, asset: Avatar
     marmot.readAvatarAssets(account, requested.mapNotNull { it.reference }, 1024uL * 1024uL)
     marmot.clearAvatarCache(account)
 }
+
+suspend fun compileAttachmentCommands(marmot: Marmot, account: String, group: String) {
+    val result = marmot.attachmentHistoryPage(account, group, 50u, null)
+    if (result is AttachmentPageReadFfi.Page) {
+        val page = result.page
+        marmot.attachmentHistoryVersion(account, group).use { current ->
+            current.changeSince(page.version)
+        }
+        if (page.hasMore) marmot.attachmentHistoryPage(account, group, 50u, page.nextCursor)
+    }
+}

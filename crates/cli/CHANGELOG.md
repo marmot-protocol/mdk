@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Bounded local attachment-history pages across Rust, Swift/Kotlin and C, with media
+  categories, opaque cursors and change versions for authoritative removal/refresh.
+  Migration 81 indexes canonical attachment slots; browsing no longer requires a
+  full-history scan or live engine. This does not enable background downloads.
+  Regenerate native bindings and C headers with the matching library.
+
 - Local-first KeyPackage inventory across Rust, Swift/Kotlin and C, including
   `localAccountKeyPackages`, `refreshAccountKeyPackages` and typed ownership via
   `AccountKeyPackageLocalStateFfi`. Hosts can display a consistent local snapshot

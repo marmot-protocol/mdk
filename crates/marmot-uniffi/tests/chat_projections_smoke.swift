@@ -164,3 +164,14 @@ func compileAvatarCommands(_ marmot: Marmot, account: String, asset: AvatarAsset
     _ = try await marmot.readAvatarAssets(accountRef: account, references: requested.compactMap(\.reference), maxBytes: 1024 * 1024)
     try await marmot.clearAvatarCache(accountRef: account)
 }
+
+func compileAttachmentCommands(_ marmot: Marmot, account: String, group: String) async throws {
+    let result = try await marmot.attachmentHistoryPage(accountRef: account, groupIdHex: group, limit: 50, cursor: nil)
+    if case let .page(page) = result {
+        let current = try await marmot.attachmentHistoryVersion(accountRef: account, groupIdHex: group)
+        _ = current.changeSince(previous: page.version)
+        if page.hasMore {
+            _ = try await marmot.attachmentHistoryPage(accountRef: account, groupIdHex: group, limit: 50, cursor: page.nextCursor)
+        }
+    }
+}

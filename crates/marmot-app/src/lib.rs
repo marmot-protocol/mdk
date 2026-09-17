@@ -6866,3 +6866,8 @@ pub use storage_sqlite::{
     AvatarAssetTarget, AvatarAvailability,
 };
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
+
+pub use runtime::{
+    AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
+    AttachmentPage, AttachmentPageRead, MAX_ATTACHMENT_HISTORY_PAGE,
+};

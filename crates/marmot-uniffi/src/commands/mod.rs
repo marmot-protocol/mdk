@@ -42,3 +42,5 @@ pub mod user_blocks;
 
 mod avatar;
 pub mod moderation;
+
+mod attachment_history;

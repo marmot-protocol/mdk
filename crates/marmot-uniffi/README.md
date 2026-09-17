@@ -545,3 +545,9 @@ completes. `clearAvatarCache` clears durable bytes and demand; later visible req
 Use matching regenerated Swift/Kotlin and native libraries. Keep host persistent caches until migration and device
 validation are complete. See [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
 for source/account fencing, result states and lifecycle rules.
+
+## Bounded attachment history
+
+Use the asynchronous attachment history page/version methods for canonical media-library
+discovery. See [the C8-B native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
+removal and cursor ownership. `list_media` remains a compatibility API.
