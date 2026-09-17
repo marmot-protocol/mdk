@@ -4818,64 +4818,6 @@ impl MarmotApp {
         self.display_names_for_account_ids(&account_ids)
     }
 
-    fn display_names_for_account_ids(
-        &self,
-        account_id_hexes: &[String],
-    ) -> Result<HashMap<String, String>, AppError> {
-        let mut account_ids = account_id_hexes
-            .iter()
-            .map(|account_id| parse_account_id_hex(account_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        account_ids.sort();
-        account_ids.dedup();
-        if account_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let caches = self.directory_caches()?;
-        let shared_storage = self.shared_storage()?;
-        let local_accounts = self.local_accounts_by_id()?;
-        let mut profiles = HashMap::<String, Option<UserProfileMetadata>>::new();
-        let mut missing = account_ids.clone();
-        for cache in caches {
-            profiles.extend(cache.profiles_for_ids(&missing)?);
-            // The first cache row wins even when it contains no profile.
-            missing.retain(|id| !profiles.contains_key(id));
-            if missing.is_empty() {
-                break;
-            }
-        }
-        for record in shared_storage.directory_profiles_for_ids(&account_ids)? {
-            let Some(json) = record.profile_json else {
-                continue;
-            };
-            let candidate: UserProfileMetadata = serde_json::from_str(&json)?;
-            let profile = profiles.entry(record.account_id_hex).or_default();
-            // Match select_newer_directory_entry: account-cache ties win.
-            if profile
-                .as_ref()
-                .is_none_or(|current| candidate.created_at > current.created_at)
-            {
-                *profile = Some(candidate);
-            }
-        }
-        let mut names = HashMap::new();
-
-        for account_id in account_ids {
-            if let Some(name) =
-                display_name_for_profile(profiles.get(&account_id).and_then(Option::as_ref))
-            {
-                names.insert(account_id, name);
-                continue;
-            }
-            if let Some(name) = local_accounts.get(&account_id) {
-                names.insert(account_id, name.label.clone());
-            }
-        }
-
-        Ok(names)
-    }
-
     fn display_name_for_account_id(
         &self,
         account_id_hex: &str,

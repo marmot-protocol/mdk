@@ -25,10 +25,11 @@ use crate::directory::records::{
     CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
     MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    cached_identity_projection, follow_list_from_record, latest_follow_list_from_records,
-    latest_fresh_profiles_from_records, profile_content_json, profile_from_record,
-    public_directory_user_record, select_newer_directory_entry, source_relays_from_record,
-    upsert_newer_directory_entry, user_directory_record_from_public, user_record_match,
+    cached_identity_projection, display_name_for_profile, follow_list_from_record,
+    latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_content_json,
+    profile_from_record, public_directory_user_record, select_newer_directory_entry,
+    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
+    user_record_match,
 };
 use crate::directory::{
     DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
@@ -51,6 +52,66 @@ use crate::{
 };
 
 impl MarmotApp {
+    /// Resolve batched profile names with first-cache precedence, then local labels.
+    /// Shared profiles replace cached profiles only when strictly newer.
+    pub(crate) fn display_names_for_account_ids(
+        &self,
+        account_id_hexes: &[String],
+    ) -> Result<HashMap<String, String>, AppError> {
+        let mut account_ids = account_id_hexes
+            .iter()
+            .map(|account_id| parse_account_id_hex(account_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        account_ids.sort();
+        account_ids.dedup();
+        if account_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let caches = self.directory_caches()?;
+        let shared_storage = self.shared_storage()?;
+        let local_accounts = self.local_accounts_by_id()?;
+        let mut profiles = HashMap::<String, Option<UserProfileMetadata>>::new();
+        let mut missing = account_ids.clone();
+        for cache in caches {
+            profiles.extend(cache.profiles_for_ids(&missing)?);
+            // The first cache row wins even when it contains no profile.
+            missing.retain(|id| !profiles.contains_key(id));
+            if missing.is_empty() {
+                break;
+            }
+        }
+        for record in shared_storage.directory_profiles_for_ids(&account_ids)? {
+            let Some(json) = record.profile_json else {
+                continue;
+            };
+            let candidate: UserProfileMetadata = serde_json::from_str(&json)?;
+            let profile = profiles.entry(record.account_id_hex).or_default();
+            // Match select_newer_directory_entry: account-cache ties win.
+            if profile
+                .as_ref()
+                .is_none_or(|current| candidate.created_at > current.created_at)
+            {
+                *profile = Some(candidate);
+            }
+        }
+        let mut names = HashMap::new();
+
+        for account_id in account_ids {
+            if let Some(name) =
+                display_name_for_profile(profiles.get(&account_id).and_then(Option::as_ref))
+            {
+                names.insert(account_id, name);
+                continue;
+            }
+            if let Some(name) = local_accounts.get(&account_id) {
+                names.insert(account_id, name.label.clone());
+            }
+        }
+
+        Ok(names)
+    }
+
     pub(crate) fn local_accounts_by_id(
         &self,
     ) -> Result<HashMap<String, LocalAccountNames>, AppError> {
