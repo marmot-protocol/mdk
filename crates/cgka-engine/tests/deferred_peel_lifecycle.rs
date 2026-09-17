@@ -2035,10 +2035,22 @@ fn restart_carol_with_account_budget(
     storage: SqliteAccountStorage,
     account_byte_limit: usize,
 ) -> Engine<SqliteAccountStorage> {
+    let mut restarted = restart_carol_unhydrated(storage, account_byte_limit);
+    restarted.hydrate_all_stored_groups().unwrap();
+    restarted
+}
+
+/// [`restart_carol_with_account_budget`] without the hydration call, for tests
+/// that need the production ordering where per-group hydration runs in the
+/// background while inbound ingest is already flowing (`defer_group_hydration`).
+#[cfg(feature = "test-policy-overrides")]
+fn restart_carol_unhydrated(
+    storage: SqliteAccountStorage,
+    account_byte_limit: usize,
+) -> Engine<SqliteAccountStorage> {
     let clock = ManualConvergenceClock::new(2_000, 20_000);
     let (mut restarted, _, _) =
         build_counting_client_with_storage_and_clock(b"carol", storage, clock);
-    restarted.hydrate_all_stored_groups().unwrap();
     restarted.set_deferred_peel_limits_for_tests(512, usize::MAX, account_byte_limit);
     restarted
 }
@@ -2337,6 +2349,204 @@ async fn rows_retained_for_a_blocked_group_do_not_accrue_account_bytes() {
         "rows retained for a blocked group must not accrue against the account budget",
     )
     .await;
+}
+
+/// Mint a copy of a wrap template under a fresh id of fixed width. The encoded
+/// `PeelDeferred` payload carries the message id, so only same-width ids cost
+/// the same number of bytes — which is what lets these budgets be expressed as
+/// a row count.
+#[cfg(feature = "test-policy-overrides")]
+fn row_with_id(template: &TransportMessage, tag: &str) -> TransportMessage {
+    let id = format!("{tag:-<18}").into_bytes();
+    assert_eq!(
+        id.len(),
+        18,
+        "row tag {tag} does not fit the fixture's id width"
+    );
+    TransportMessage {
+        id: MessageId::new(id),
+        ..template.clone()
+    }
+}
+
+/// Undo [`quarantine_group_on_next_open`] so `retry_hydrate_quarantined_group`
+/// can actually recover the group: the quarantine reason is the stored record,
+/// so restoring the record is the repair.
+#[cfg(feature = "test-policy-overrides")]
+fn repair_quarantined_group(storage: &SqliteAccountStorage, group_id: &GroupId) {
+    let mut repaired = storage.get_group(group_id).unwrap();
+    repaired.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&repaired).unwrap();
+}
+
+/// The account reconstruction is one-shot per incarnation and runs lazily on
+/// the first capacity-sensitive ingest, but a hydration quarantine is only
+/// established inside per-group hydration. Under `defer_group_hydration` that
+/// hydration is not guaranteed to have run first, so a group about to be
+/// quarantined can be charged by the reconstruction — and without an explicit
+/// adjustment nothing ever takes the charge back, for the whole session.
+///
+/// Unlike every other test here, this one reopens WITHOUT hydrating, so the
+/// reconstruction genuinely observes group A as live.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn quarantine_established_after_reconstruction_releases_its_account_bytes() {
+    let (carol, storage, group_a, _template_a, bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    quarantine_group_on_next_open(&storage, &group_a);
+
+    let account_byte_limit = bytes_b.saturating_mul(3);
+    assert!(
+        bytes_a > 0 && bytes_a <= bytes_b,
+        "group A must hold real bytes, and fewer than a group-B row, for the budget \
+         arithmetic below to isolate the charge"
+    );
+    let mut restarted = restart_carol_unhydrated(storage.clone(), account_byte_limit);
+
+    // Reconstruction runs here, with group A not yet hydrated and therefore not
+    // yet quarantined: its bytes are charged.
+    let second_b = row_with_id(&template_b, "defhyd-b-2");
+    assert!(matches!(
+        restarted.ingest(second_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        storage.get_message(&second_b.id).unwrap().payload.len(),
+        bytes_b,
+        "every group-B row must cost the same, or the budget arithmetic below is wrong"
+    );
+
+    // Now hydration catches up and quarantines group A.
+    restarted.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        restarted.quarantined_groups(),
+        vec![(
+            group_a,
+            GroupHydrationQuarantineReason::MemberValidationFailed
+        )],
+        "group A must be the one and only quarantined group"
+    );
+
+    let third_b = row_with_id(&template_b, "defhyd-b-3");
+    assert!(
+        matches!(
+            restarted.ingest(third_b).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "quarantining a group must release the account bytes the reconstruction \
+         charged it, whatever order hydration and ingest ran in"
+    );
+
+    let overflow_b = row_with_id(&template_b, "defhyd-b-4");
+    assert!(
+        matches!(
+            restarted.ingest(overflow_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "the account budget is still enforced past that point"
+    );
+}
+
+/// The inverse: lifting a quarantine puts the group's retained rows back in the
+/// account total, because the sweep can reach them again. Without this the
+/// account would read low until the next open, and the repaired group's own
+/// drain would decrement bytes that were never added.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn lifting_a_quarantine_restores_its_account_bytes() {
+    let (carol, storage, group_a, _template_a, bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    quarantine_group_on_next_open(&storage, &group_a);
+    let mut restarted =
+        restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(3));
+    assert!(bytes_a > 0);
+
+    // Force the (lazy) reconstruction to run while group A is still
+    // quarantined, so its bytes are genuinely absent from the total the repair
+    // below has to restore. Without this the test would pass on the
+    // reconstruction alone.
+    let second_b = row_with_id(&template_b, "qlift-b-2");
+    assert!(matches!(
+        restarted.ingest(second_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        storage.get_message(&second_b.id).unwrap().payload.len(),
+        bytes_b,
+        "every group-B row must cost the same, or the budget arithmetic below is wrong"
+    );
+
+    repair_quarantined_group(&storage, &group_a);
+    assert!(
+        restarted.retry_hydrate_quarantined_group(&group_a).unwrap(),
+        "restoring the stored record must let the retry recover the group"
+    );
+
+    // Group A is sweepable again, so its rows are charged again and group B can
+    // no longer spend the rest of the budget.
+    let third_b = row_with_id(&template_b, "qlift-b-3");
+    assert!(
+        matches!(
+            restarted.ingest(third_b).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "a repaired group's rows must charge the account budget again"
+    );
+}
+
+/// Admission has to agree with the definition too. A blocked group's rows never
+/// enter the account total, so measuring its new inbound against that total
+/// lets live groups' backlog decide whether a parked group may retain anything
+/// — the account-wide refusal this PR removed, reintroduced from the admission
+/// side. Its per-group cap is its only bound.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn blocked_group_is_admitted_while_live_groups_fill_the_account_budget() {
+    let (carol, storage, group_a, template_a, _bytes_a, _group_b, template_b, bytes_b) =
+        carol_deferring_in_two_live_groups().await;
+    drop(carol);
+
+    quarantine_group_on_next_open(&storage, &group_a);
+    let mut restarted =
+        restart_carol_with_account_budget(storage.clone(), bytes_b.saturating_mul(2));
+
+    // Live group B spends the account budget down to nothing.
+    assert_group_b_owns_the_whole_account_budget(
+        &mut restarted,
+        template_b,
+        "a quarantined group's parked rows must not spend the account byte budget",
+    )
+    .await;
+
+    // New traffic for the blocked group, with the account budget now full.
+    let second_a = row_with_id(&template_a, "admit-a-2");
+    let outcome = restarted.ingest(second_a.clone()).await.unwrap();
+    assert!(
+        !matches!(
+            outcome,
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "a blocked group must not be refused against an account total it does not \
+         contribute to, got {outcome:?}"
+    );
+    assert_eq!(
+        storage.get_message(&second_a.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the row must be parked for post-repair replay"
+    );
 }
 
 /// The bound the two exclusions above must not weaken: a group the sweep CAN

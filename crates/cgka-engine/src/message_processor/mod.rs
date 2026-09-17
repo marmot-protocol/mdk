@@ -387,35 +387,30 @@ pub(crate) struct DeferredPeelAccountState {
     /// spend the whole account budget and refuse inbound traffic for every
     /// healthy group on the device.
     ///
-    /// Both writers skip such a group, and must keep agreeing:
-    /// [`Engine::ensure_peel_deferred_usage_initialized`] reconstructs the sum
-    /// at open, and [`Engine::note_peel_deferred_row_persisted`] adds each new
-    /// row after that — ingest keeps retaining rows for a quarantined group,
-    /// so an ungated add would walk the total back up one row at a time. A
-    /// blocked group still keeps full per-group state, because the per-group
-    /// cap remains its only bound and a verified repair replays its rows.
+    /// Four sites share that rule and must keep agreeing:
+    /// [`Engine::ensure_peel_deferred_usage_initialized`] reconstructs the sum,
+    /// [`Engine::note_peel_deferred_row_persisted`] adds each later row,
+    /// [`Engine::has_peel_deferred_capacity`] measures admission against it,
+    /// and `Engine::enter_hydration_quarantine` / `leave_hydration_quarantine`
+    /// move a group's bytes out and back as quarantine is established or
+    /// lifted. The reconstruction is lazy and a quarantine is established
+    /// during per-group hydration, so those two orders must agree.
     ///
     /// The bound this relaxes: on-disk `PeelDeferred` bytes may exceed the
     /// account cap by at most one per-group cap per un-sweepable group, since
     /// an un-sweepable group cannot grow past its own per-group cap.
     ///
-    /// Membership of the sum is decided by the predicate at the moment of each
-    /// write, so the two mid-session transitions are approximate until the next
-    /// reconstruction, in opposite and equally bounded directions:
+    /// One approximation remains. `Unrecoverable` transitions are raw record
+    /// writes with no such hook, so a group halted mid-session keeps the charge
+    /// it already had, and a group halted before the reconstruction that later
+    /// repairs drains rows it was never charged for. Both are bounded by that
+    /// group's per-group cap and end at the next open, which recomputes the
+    /// total — as does `Engine::forget_group_local`.
     ///
-    /// - a group that becomes blocked mid-session keeps the charge it already
-    ///   had, until the next open;
-    /// - a group blocked at reconstruction time that later heals drains rows it
-    ///   was never charged for, leaving the total low by at most one per-group
-    ///   cap per such group, until the next open.
-    ///
-    /// Note the asymmetry is keyed on the group's state at reconstruction time,
-    /// not at retire time. A sweep that enters a `Stable` group and halts it
-    /// part-way through then retires rows the reconstruction *did* charge, and
-    /// decrementing those is correct — do not gate the retire on the predicate.
-    ///
-    /// `Engine::forget_group_local` and the next open both restore an exact
-    /// total.
+    /// Membership is keyed on the group's state when each write happens, never
+    /// at retire time: a sweep that enters a `Stable` group and halts it
+    /// part-way through must still decrement the rows the reconstruction
+    /// charged, so the retire path is deliberately ungated.
     bytes: usize,
     counted: bool,
 }
@@ -1897,11 +1892,19 @@ impl<S: StorageProvider> Engine<S> {
     /// resolve on their own, so their rows really are awaiting a sweep.
     ///
     /// Deliberately reads only the in-memory state the sweep itself reads, so
-    /// the prediction and the refusal cannot disagree. Session open restores a
-    /// durable halt into the epoch map before any ingest can reach the account
-    /// budget (`Engine::hydrate_stable_groups_from_storage`);
-    /// [`Self::sync_unrecoverable_halt_from_record`] is the syncing form for
-    /// the paths that run without session-open hydration.
+    /// the prediction and the refusal cannot disagree. The two legs reach that
+    /// state differently, and only the halt is settled before ingest:
+    ///
+    /// - a durable `Unrecoverable` halt is restored into the epoch map by the
+    ///   session-open cheap pass (`Engine::hydrate_stable_groups_from_storage`),
+    ///   with [`Self::sync_unrecoverable_halt_from_record`] as the syncing form
+    ///   for paths that run without it;
+    /// - a hydration quarantine is established only inside per-group hydration,
+    ///   which under `defer_group_hydration` can run after the account
+    ///   reconstruction. `Engine::enter_hydration_quarantine` moves the group's
+    ///   bytes out of the account total at that moment (and
+    ///   `leave_hydration_quarantine` back in), so the ordering cannot change
+    ///   the total.
     pub(crate) fn deferred_peel_sweep_is_blocked(&self, group_id: &GroupId) -> bool {
         self.quarantined_reason(group_id).is_some() || self.epoch_manager.is_unrecoverable(group_id)
     }
@@ -3027,6 +3030,35 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Stop counting one group's retained rows toward the account total because
+    /// it just stopped being sweepable, and its inverse. Together these keep a
+    /// quarantine transition exact in both directions without a second copy of
+    /// the membership rule: the amount moved is always the per-group state the
+    /// reconstruction would have used.
+    ///
+    /// Both no-op before the reconstruction has run — an uncounted total is
+    /// rebuilt from the predicate anyway — and for a group with no retained
+    /// rows.
+    pub(crate) fn discharge_deferred_peel_account_for_group(&mut self, group_id: &GroupId) {
+        let bytes = self.charged_deferred_peel_bytes(group_id);
+        self.deferred_peel_account.bytes = self.deferred_peel_account.bytes.saturating_sub(bytes);
+    }
+
+    /// Inverse of [`Self::discharge_deferred_peel_account_for_group`].
+    pub(crate) fn recharge_deferred_peel_account_for_group(&mut self, group_id: &GroupId) {
+        let bytes = self.charged_deferred_peel_bytes(group_id);
+        self.deferred_peel_account.bytes = self.deferred_peel_account.bytes.saturating_add(bytes);
+    }
+
+    fn charged_deferred_peel_bytes(&self, group_id: &GroupId) -> usize {
+        if !self.deferred_peel_account.counted {
+            return 0;
+        }
+        self.deferred_peel
+            .get(group_id)
+            .map_or(0, |state| state.deferred_bytes)
+    }
+
     /// Refresh one group's cached usage from a durable row enumeration. This
     /// also reconciles the account total when it has already been initialized.
     fn refresh_peel_deferred_group_usage(
@@ -3070,6 +3102,13 @@ impl<S: StorageProvider> Engine<S> {
         let incoming_rows = usize::from(previous_payload_bytes.is_none());
         let additional_bytes =
             incoming_payload_bytes.saturating_sub(previous_payload_bytes.unwrap_or_default());
+        // Read before the `deferred_peel` borrow below. A blocked group's rows
+        // never enter the account total, so measuring its inbound against that
+        // total would let live groups' backlog decide whether a parked group
+        // may retain anything — the account-wide refusal this rule removes,
+        // arriving from the admission side instead. Its per-group cap, checked
+        // below, is its bound.
+        let charges_account = !self.deferred_peel_sweep_is_blocked(group_id);
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
         let group_has_capacity = state.has_capacity(
             incoming_rows,
@@ -3078,6 +3117,7 @@ impl<S: StorageProvider> Engine<S> {
             self.deferred_peel_group_byte_limit,
         );
         let account_has_capacity = additional_bytes == 0
+            || !charges_account
             || self
                 .deferred_peel_account
                 .bytes

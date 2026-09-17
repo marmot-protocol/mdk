@@ -2483,6 +2483,42 @@ impl<S: StorageProvider> Engine<S> {
         Ok(false)
     }
 
+    /// Record a hydration quarantine and keep the deferred-peel account total
+    /// consistent with its definition: a quarantined group's retained rows stop
+    /// awaiting a sweep, so they stop counting (see
+    /// `message_processor::DeferredPeelAccountState`). The account
+    /// reconstruction runs lazily on the first capacity-sensitive ingest and a
+    /// quarantine is only established inside per-group hydration, which may run
+    /// after it, so this transition is what keeps the two orders equivalent.
+    ///
+    /// Idempotent: re-recording the reason for an already-quarantined group
+    /// moves nothing.
+    fn enter_hydration_quarantine(
+        &mut self,
+        group_id: &GroupId,
+        reason: GroupHydrationQuarantineReason,
+    ) {
+        if self
+            .quarantined_groups
+            .insert(group_id.clone(), reason)
+            .is_none()
+        {
+            self.discharge_deferred_peel_account_for_group(group_id);
+        }
+    }
+
+    /// Inverse of [`Self::enter_hydration_quarantine`]: the sweep can reach this
+    /// group's retained rows again, so they count again. Returns whether the
+    /// group was quarantined. `forget_group_local` deliberately does not use
+    /// this — it drops the group's rows outright and resets the whole total.
+    pub(crate) fn leave_hydration_quarantine(&mut self, group_id: &GroupId) -> bool {
+        if self.quarantined_groups.remove(group_id).is_none() {
+            return false;
+        }
+        self.recharge_deferred_peel_account_for_group(group_id);
+        true
+    }
+
     fn quarantine_stored_group_on_hydrate(
         &mut self,
         group_id: &GroupId,
@@ -2506,7 +2542,7 @@ impl<S: StorageProvider> Engine<S> {
         // otherwise keep it listed in `live_group_ids` while every accessor
         // rejects it (mdk#1161).
         self.epoch_manager.clear_group_state(group_id);
-        self.quarantined_groups.insert(group_id.clone(), reason);
+        self.enter_hydration_quarantine(group_id, reason);
         self.events_buf
             .push_back(GroupEvent::GroupHydrationQuarantined {
                 group_id: group_id.clone(),
@@ -2667,7 +2703,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         match self.hydrate_one_stored_group(group_id) {
             Ok(recovered_epoch) => {
-                self.quarantined_groups.remove(group_id);
+                self.leave_hydration_quarantine(group_id);
                 let reason_tag = "recovered";
                 let group_digest = hydration_quarantine_group_digest(group_id);
                 tracing::info!(
@@ -2704,7 +2740,7 @@ impl<S: StorageProvider> Engine<S> {
                     reason = reason_tag,
                     "retry did not recover the quarantined stored group"
                 );
-                self.quarantined_groups.insert(group_id.clone(), reason);
+                self.enter_hydration_quarantine(group_id, reason);
                 Ok(false)
             }
         }
