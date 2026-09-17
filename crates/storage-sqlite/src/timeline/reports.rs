@@ -82,45 +82,33 @@ pub(super) fn hydrate(
 ) -> StorageResult<()> {
     // Batch indexed probes, scoped to the exact group, message and author.
     // EXISTS stops at the first report, even when a target has many reports.
-    let mut reported = HashSet::new();
-    for chunk in messages.chunks(SQLITE_BIND_PARAMETER_CHUNK / 3) {
-        let values = vec!["(?, ?, ?)"; chunk.len()].join(",");
+    for chunk in messages.chunks_mut(SQLITE_BIND_PARAMETER_CHUNK / 4) {
+        let values = vec!["(?, ?, ?, ?)"; chunk.len()].join(",");
         let sql = format!(
-            "WITH report_targets(group_id_hex, message_id_hex, message_author) AS (VALUES {values})
-             SELECT t.group_id_hex, t.message_id_hex, t.message_author FROM report_targets t
-             WHERE EXISTS (SELECT 1 FROM content_reports c
+            "WITH report_targets(row_index, group_id_hex, message_id_hex, message_author) AS (VALUES {values})
+             SELECT t.row_index, EXISTS (SELECT 1 FROM content_reports c
                WHERE c.group_id_hex=t.group_id_hex AND c.message_id_hex=t.message_id_hex
-                 AND c.message_author=t.message_author)"
+                 AND c.message_author=t.message_author) FROM report_targets t"
         );
         let mut statement = conn.prepare_cached(&sql).storage()?;
         let rows = statement
             .query_map(
-                params_from_iter(chunk.iter().flat_map(|m| {
+                params_from_iter(chunk.iter().enumerate().flat_map(|(index, m)| {
+                    use rusqlite::types::ToSqlOutput;
                     [
-                        m.group_id_hex.as_str(),
-                        m.message_id_hex.as_str(),
-                        m.sender.as_str(),
+                        ToSqlOutput::from(index as i64),
+                        ToSqlOutput::from(m.group_id_hex.as_str()),
+                        ToSqlOutput::from(m.message_id_hex.as_str()),
+                        ToSqlOutput::from(m.sender.as_str()),
                     ]
                 })),
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
             )
             .storage()?;
         for row in rows {
-            reported.insert(row.storage()?);
+            let (index, has_reports) = row.storage()?;
+            chunk[index as usize].has_reports = has_reports;
         }
-    }
-    for message in messages {
-        message.has_reports = reported.contains(&(
-            message.group_id_hex.clone(),
-            message.message_id_hex.clone(),
-            message.sender.clone(),
-        ));
     }
     Ok(())
 }
@@ -920,7 +908,7 @@ mod tests {
         record(&s, &report(2));
         record(&s, &report(3));
         let template = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
-        let count = 2 * (SQLITE_BIND_PARAMETER_CHUNK / 3) + 1;
+        let count = 2 * (SQLITE_BIND_PARAMETER_CHUNK / 4) + 1;
         let mut messages = (0..count)
             .map(|n| {
                 let mut m = template.clone();

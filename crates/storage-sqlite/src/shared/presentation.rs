@@ -2,7 +2,7 @@
 use super::{SharedSqliteResultExt, SqliteSharedStorage};
 use crate::{CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationVersion, u64_to_i64};
 use cgka_traits::storage::StorageResult;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
 #[derive(Clone)]
 pub struct DirectoryPresentation {
@@ -34,33 +34,26 @@ impl SqliteSharedStorage {
         version(&conn)
     }
     pub fn directory_presentation(&self, member: &str) -> StorageResult<DirectoryPresentation> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let mut source = version(&tx)?;
-        source.revision = tx
-            .query_row(
-                "SELECT revision FROM directory_presentation_changes WHERE member_id_hex=?1",
-                [member],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()
-            .storage()?
-            .unwrap_or(0) as u64;
-        let profile_json = tx
-            .query_row(
-                "SELECT profile_json FROM directory_users WHERE account_id_hex=?1",
-                [member],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .storage()?
-            .flatten();
-        tx.commit().storage()?;
-        Ok(DirectoryPresentation {
-            member_id_hex: member.to_owned(),
-            profile_json,
-            version: source,
+        let conn = self.lock()?;
+        conn.prepare_cached(
+            "SELECT m.store_epoch, COALESCE(c.revision, 0), u.profile_json
+             FROM directory_presentation_meta m
+             LEFT JOIN directory_presentation_changes c ON c.member_id_hex=?1
+             LEFT JOIN directory_users u ON u.account_id_hex=?1
+             WHERE m.id=1",
+        )
+        .storage()?
+        .query_row([member], |r| {
+            Ok(DirectoryPresentation {
+                member_id_hex: member.to_owned(),
+                profile_json: r.get(2)?,
+                version: ChatPresentationVersion {
+                    store_epoch: r.get(0)?,
+                    revision: r.get::<_, i64>(1)? as u64,
+                },
+            })
         })
+        .storage()
     }
     pub fn directory_presentation_changes(
         &self,
@@ -102,6 +95,49 @@ impl SqliteSharedStorage {
 #[cfg(test)]
 mod tests {
     use crate::SqliteSharedStorage;
+    #[test]
+    fn missing_profile_keeps_epoch() {
+        let store = SqliteSharedStorage::in_memory().unwrap();
+        store
+            .put_public_directory_user(&record("other", "Other"))
+            .unwrap();
+        let missing = store.directory_presentation("missing").unwrap();
+        assert_eq!(missing.member_id_hex, "missing");
+        assert!(missing.profile_json.is_none());
+        assert_eq!(missing.version.revision, 0);
+        assert_eq!(
+            missing.version.store_epoch,
+            store.directory_presentation_version().unwrap().store_epoch
+        );
+    }
+
+    #[test]
+    fn profile_read_is_one_statement() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::cell::Cell;
+        thread_local! { static QUERIES: Cell<usize> = const { Cell::new(0) }; }
+        fn trace(event: TraceEvent<'_>) {
+            if matches!(event, TraceEvent::Stmt(..)) {
+                QUERIES.with(|count| count.set(count.get() + 1));
+            }
+        }
+        let store = SqliteSharedStorage::in_memory().unwrap();
+        store
+            .put_public_directory_user(&record("aa", "Alice"))
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace));
+        QUERIES.with(|count| count.set(0));
+        let profile = store.directory_presentation("aa").unwrap();
+        store
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+        assert_eq!(profile.profile_json, record("aa", "Alice").profile_json);
+        assert_eq!(QUERIES.with(Cell::get), 1);
+    }
     #[test]
     fn accepted_profile_changes_have_a_durable_revision_domain() {
         let store = SqliteSharedStorage::in_memory().unwrap();

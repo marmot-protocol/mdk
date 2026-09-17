@@ -234,7 +234,7 @@ fn oversized_reply_preview_target_sets_are_chunked() {
         .collect();
 
     let previews = load_reply_previews(&store.lock().unwrap(), targets).unwrap();
-    assert_eq!(previews.len(), 2);
+    assert_eq!(previews[&group_id].len(), 2);
 }
 
 #[test]

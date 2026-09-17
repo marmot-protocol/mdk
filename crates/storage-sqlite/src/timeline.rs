@@ -1082,7 +1082,7 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT group_id_hex, message_id_hex, kind, tags_json
                          FROM app_events
                          WHERE origin_commit_id = ?1
@@ -1204,7 +1204,7 @@ impl SqliteAccountStorage {
         let deferred = crate::codec::message_state_to_i64(MessageState::ConvergenceDeferred);
         let collect =
             |sql: &str, binds: Vec<rusqlite::types::Value>| -> StorageResult<Vec<String>> {
-                let mut stmt = conn.prepare(sql).storage()?;
+                let mut stmt = conn.prepare_cached(sql).storage()?;
                 let rows = stmt
                     .query_map(params_from_iter(binds), |row| row.get(0))
                     .storage()?
@@ -3976,7 +3976,8 @@ fn hydrate_timeline_presentation(
             continue;
         };
         message.reply_preview = previews
-            .get(&(message.group_id_hex.clone(), target.clone()))
+            .get(&message.group_id_hex)
+            .and_then(|group| group.get(target))
             .cloned();
     }
     Ok(())
@@ -4019,7 +4020,7 @@ fn filter_blocked_reactions(
 fn load_reply_previews(
     conn: &Connection,
     targets: HashSet<(String, String)>,
-) -> StorageResult<HashMap<(String, String), TimelineReplyPreview>> {
+) -> StorageResult<HashMap<String, HashMap<String, TimelineReplyPreview>>> {
     let mut targets_by_group = BTreeMap::<String, Vec<String>>::new();
     for (group_id_hex, message_id_hex) in targets {
         targets_by_group
@@ -4028,8 +4029,9 @@ fn load_reply_previews(
             .push(message_id_hex);
     }
 
-    let mut previews = HashMap::new();
+    let mut previews = HashMap::<String, HashMap<String, TimelineReplyPreview>>::new();
     for (group_id_hex, mut message_ids) in targets_by_group {
+        let group_previews = previews.entry(group_id_hex.clone()).or_default();
         message_ids.sort();
         message_ids.dedup();
         for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
@@ -4046,16 +4048,13 @@ fn load_reply_previews(
             params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
             params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
             let mut stmt = conn.prepare_cached(&sql).storage()?;
-            let group_previews = stmt
+            let rows = stmt
                 .query_map(params_from_iter(params.iter()), reply_preview_from_row)
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
-            for preview in group_previews {
-                previews.insert(
-                    (group_id_hex.clone(), preview.message_id_hex.clone()),
-                    preview,
-                );
+            for preview in rows {
+                group_previews.insert(preview.message_id_hex.clone(), preview);
             }
         }
     }
