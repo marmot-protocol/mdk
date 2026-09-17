@@ -12,7 +12,12 @@ pub use group_system::{
 
 mod account_projection;
 mod agent_stream_sequences;
+mod attachment_history;
 mod avatar_cache;
+pub use attachment_history::{
+    AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
+    AttachmentHistoryVersion,
+};
 mod chat_list;
 mod chat_presentation;
 mod codec;
