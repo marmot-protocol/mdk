@@ -10,14 +10,16 @@ status: implementation-plan
 
 Tracking: [projection plan #1742](https://github.com/marmot-protocol/mdk/issues/1742).
 Source audit: master `ebb884b8` (MDK 0.10.1). This is an implementation plan;
-C8-A storage discovery and C8-B runtime/native discovery are implemented;
-background acquisition and retained-byte access remain later slices.
+C8-A storage discovery and C8-B runtime/native discovery are implemented. C8-C1
+adds the durable storage foundation below; worker acquisition and native retained-byte
+access remain later slices.
 
 ## Problem and existing foundation
 
 Opening a conversation should find already acquired attachment bytes locally.
 Today MDK retains decryption secrets and can explicitly download an attachment,
-but does not own a durable background attachment queue or retained byte store.
+and C8-C1 now supplies durable jobs and protected byte storage. The runtime does
+not yet feed or execute those jobs automatically.
 A timeline window covers only a bounded part of a conversation. The synchronous
 `list_media` compatibility API instead scans raw app events, potentially without
 a limit, and does not provide authoritative removal or pagination semantics.
@@ -106,17 +108,55 @@ page guarantees, no hidden scan-until-full loop, and no additional MIME index.
 Links remain outside this attachment projection. Preserve legacy `list_media` until
 clients adopt paging and distinguish partially loaded tabs from truly empty tabs.
 
-## Decisions before acquisition implementation
+## C8-C1: durable storage foundation
 
-- Specify per-file/aggregate admission and disk-pressure behavior without silently
-  evicting successfully acquired retained bytes; pausing new acquisition is the
-  proposed default, not yet an implemented policy.
+Migration 82 adds source-bound demand, leases, retry deadlines and protected bytes
+inside each account's SQLCipher database. It creates no transfer jobs on upgrade.
+The caller supplies a shared-parser-validated slot and digest; admission compares
+that exact source against the current index. Unknown source epochs, pending
+invitations, hidden and expired sources are not admitted. No engine or network is
+needed to inspect job state or read retained bytes.
+
+A claimed attempt has a private store/attempt fence. Publication rechecks the
+current source, invitation acceptance, expiry and unexpired lease, then verifies
+the plaintext digest and atomically commits the bytes and ready state. The future
+worker must still authenticate/decrypt the entire body using the existing media
+pipeline before publication. Interrupted leases become due again after reopen;
+ordinary repeated demand cannot reset retry deadlines or replace ready bytes.
+
+Bytes have no LRU. Publication enforces a caller-supplied account payload-byte
+budget and a 512 MiB storage ceiling per object; the existing stricter transport
+ciphertext cap remains in force. Capacity refusal preserves existing objects and
+requires the caller to pause/retry. Filesystem free-space and WAL overhead admission
+belong to worker integration. Local storage reads return at most 1 MiB and recheck
+source visibility/expiry. Stored job status alone is not authorization to read.
+Due/expiry maintenance pages contain at most 64 entries and use dedicated indexes.
+
+Jobs and removal tombstones belong to raw source events. Deletion/expiry and
+source invalidation erase retained bytes; matching timeline repair preserves them.
+Explicit local removal cancels the job and survives restart, repair and later
+source revalidation. Only explicit download-again clears that suppression while
+the source remains retained. Already acquired left-group history remains readable.
+Separate copies per slot avoid cross-message erasure ambiguity in this first slice.
+Account-store generation reset invalidates all handles and clears retained state.
+
+This is a storage API, not automatic download, partial/range-resume support, transfer
+progress or a native binding. Next connect accepted canonical demand to the existing
+bounded media worker, including shutdown cancellation, retry pacing and maintenance;
+then expose native availability, local bytes and explicit removal/download-again.
+[#1437](https://github.com/marmot-protocol/mdk/issues/1437) remains open across those slices.
+
+## Decisions before worker integration
+
+- Choose the runtime payload-byte budget and filesystem headroom policy. Storage
+  already refuses over-budget publication without eviction; the worker must stop
+  admitting work under pressure rather than repeatedly downloading rejected bytes.
 - Define durable partial-download/range-resume support, retry scheduling and
   protected partial-file cleanup. Current whole-body verification does not make
   partially downloaded plaintext safe to expose.
-- Define shared-reference erasure, cancellation/publication races, account teardown
-  and explicit remove/download-again APIs. Retention deadlines must be rechecked
-  before publication; discovery follows authoritative source pruning.
+- Wire source/account teardown and cancellation into the worker, and expose the
+  existing storage removal/download-again operations through native APIs. Test
+  runtime publication races on top of the storage source/lease/expiry fences.
 
 ## Issue audit and exclusions
 

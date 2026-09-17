@@ -172,6 +172,8 @@ mod migration_0079_content_reports;
 mod migration_0080_avatar_target_lookup;
 #[path = "migrations/0081_attachment_history.rs"]
 mod migration_0081_attachment_history;
+#[path = "migrations/0082_attachment_acquisition.rs"]
+mod migration_0082_attachment_acquisition;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -584,6 +586,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 81,
         name: "0081_attachment_history",
         apply: migration_0081_attachment_history::apply,
+    },
+    Migration {
+        version: 82,
+        name: "0082_attachment_acquisition",
+        apply: migration_0082_attachment_acquisition::apply,
     },
 ];
 

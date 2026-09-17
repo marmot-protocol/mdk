@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Attachment retention storage foundation (migration 82): durable leased download
+  jobs, restart-safe retries, protected local bytes and explicit-removal suppression
+  that survives timeline repair. Capacity refusal preserves existing attachments.
+  Background acquisition and native local-byte APIs are not enabled by this slice.
+
 - Bounded local attachment-history pages across Rust, Swift/Kotlin and C, with media
   categories, opaque cursors and change versions for authoritative removal/refresh.
   Migration 81 indexes canonical attachment slots; browsing no longer requires a

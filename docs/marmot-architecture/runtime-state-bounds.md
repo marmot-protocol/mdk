@@ -113,6 +113,17 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
 
+### `storage-sqlite` attachment acquisition (`src/attachment_acquisition.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Durable jobs | One per requested retained message slot; source descriptor at most 16 KiB; due/expiry scans at most 64 rows | Raw-source deletion cascades. Canonical source replacement/invalidation reconciles transactionally; matching timeline repair preserves work. Expired leases are reclaimable with a new attempt token; stale completion cannot publish. No in-memory history-sized queue. |
+| Retained attachment bytes | At most 512 MiB per object; caller-supplied account payload-byte budget checked atomically at publication; local reads at most 1 MiB | No LRU eviction. Budget refusal commits no bytes. Source deletion/expiry, explicit removal and store-generation reset release objects. Separate copies per message slot give independent erasure. A future runtime must reserve filesystem/WAL overhead and pace expiry maintenance. |
+| Removal suppression | One tombstone per explicitly removed source slot, owned by the raw app event rather than a rebuildable timeline row | Survives reopen, repair and source revalidation; cleared only by explicit download-again, raw-source deletion or store-generation reset. |
+
+These are attachment-storage bounds, not convergence-input or engine-recovery policy.
+The current slice does not schedule transfers or persist partial downloads.
+
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 
 | Structure | Bound | Reclamation |

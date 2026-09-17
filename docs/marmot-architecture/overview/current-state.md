@@ -32,8 +32,9 @@ See [avatar cache storage](../further-context/avatar-cache-storage.md).
 
 C8-A/B provide indexed per-group attachment-slot discovery in SQLite and typed async
 runtime/native pages for #1448. Additions preserve cursors; destructive changes require
-replacement. Reads remain local without engine/relay readiness. Durable background
-attachment acquisition and retained-byte access remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+replacement. Reads remain local without engine/relay readiness. C8-C1 adds storage-only
+durable demand/attempt fencing, protected retained bytes and removal suppression in migration 82.
+Background download scheduling and native retained-byte access remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

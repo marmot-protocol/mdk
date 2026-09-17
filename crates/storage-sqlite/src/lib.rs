@@ -12,6 +12,7 @@ pub use group_system::{
 
 mod account_projection;
 mod agent_stream_sequences;
+mod attachment_acquisition;
 mod attachment_history;
 mod avatar_cache;
 mod chat_list;
@@ -41,6 +42,11 @@ pub use account_projection::{
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
+};
+pub use attachment_acquisition::{
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, AttachmentAcquisitionState,
+    AttachmentAcquisitionStatus, AttachmentAssetRef, AttachmentDemand, AttachmentPublishResult,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
 };
 pub use attachment_history::{
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
