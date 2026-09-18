@@ -146,7 +146,7 @@ impl MemberKeyPackagePrewarmCache {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemberResolutionPurpose {
+pub(crate) enum MemberResolutionPurpose {
     Commit,
     CommitFresh,
     Prewarm,
@@ -233,18 +233,10 @@ impl MarmotApp {
         &self,
         member_refs: Vec<String>,
         requirements: &cgka_engine::key_package::KeyPackageRequirements,
-        fresh_reinvite: bool,
+        purpose: MemberResolutionPurpose,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
-        self.resolve_member_key_packages_for_purpose(
-            member_refs,
-            if fresh_reinvite {
-                MemberResolutionPurpose::CommitFresh
-            } else {
-                MemberResolutionPurpose::Commit
-            },
-            Some(requirements),
-        )
-        .await
+        self.resolve_member_key_packages_for_purpose(member_refs, purpose, Some(requirements))
+            .await
     }
 
     /// Prewarm group composition without reserving or consuming any package.
@@ -888,7 +880,8 @@ impl MarmotApp {
                 });
                 match selected {
                     Ok(mut fetched)
-                        if !multiple_authors
+                        if purpose == MemberResolutionPurpose::Prewarm
+                            || !multiple_authors
                             || account_records.iter().any(|record| {
                                 record.event.id == fetched.key_package_event_id
                                     && key_package_client_priority(&record.event) == 2
@@ -899,6 +892,9 @@ impl MarmotApp {
                     }
                     // Bounded multi-author results can hide an older preferred
                     // slot even when they contain a valid lower-priority one.
+                    // Relays may cap below our requested limit, so even a
+                    // short batch does not prove completeness. Prewarm only
+                    // needs existence, while commits seek the preferred slot.
                     // Keep observed slot replacements when combining the refetch.
                     _ => {
                         fallback.push(index);
@@ -949,13 +945,22 @@ impl MarmotApp {
                             KEY_PACKAGE_EVENTS_PER_AUTHOR,
                         );
                         let result = async {
-                            let mut records = app
+                            let (mut records, refetch_error) = match app
                                 .relay_plane
                                 .fetch_directory_events(endpoints, vec![query])
                                 .await
-                                .map_err(|error| {
-                                    AppError::RelayDirectory(format!("fetch key packages: {error}"))
-                                })?;
+                            {
+                                Ok(records) => (records, None),
+                                Err(error) => (
+                                    Vec::new(),
+                                    Some(AppError::RelayDirectory(format!(
+                                        "fetch key packages: {error}"
+                                    ))),
+                                ),
+                            };
+                            // This supplementary lookup must not discard a
+                            // valid package observed in this call's batch.
+                            // Never load a previously cached package here.
                             records.extend(observed_records);
                             let mut fetched = preferred_fresh_key_package_from_records(
                                 &target.account_id_hex,
@@ -965,7 +970,9 @@ impl MarmotApp {
                             )?
                             .value
                             .ok_or_else(|| {
-                                AppError::MissingKeyPackage(target.account_id_hex.clone())
+                                refetch_error.unwrap_or_else(|| {
+                                    AppError::MissingKeyPackage(target.account_id_hex.clone())
+                                })
                             })?;
                             fetched.relay_lists = target.relay_lists;
                             Ok::<_, AppError>(fetched)

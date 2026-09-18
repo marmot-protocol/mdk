@@ -9420,9 +9420,13 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .session()
             .invite_key_package_requirements(&group)
             .unwrap();
-        app.resolve_compatible_member_key_packages(members.clone(), &requirements, true)
-            .await
-            .unwrap();
+        app.resolve_compatible_member_key_packages(
+            members.clone(),
+            &requirements,
+            crate::directory::MemberResolutionPurpose::CommitFresh,
+        )
+        .await
+        .unwrap();
         for member in &members {
             assert!(
                 app.directory_entry_for_account_id(member)
@@ -9442,7 +9446,11 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         }
         fetcher.requests.lock().unwrap().clear();
         let error = app
-            .resolve_compatible_member_key_packages(members.clone(), &requirements, true)
+            .resolve_compatible_member_key_packages(
+                members.clone(),
+                &requirements,
+                crate::directory::MemberResolutionPurpose::CommitFresh,
+            )
             .await
             .err()
             .expect("future-only discovery must fail closed");
@@ -9487,8 +9495,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        11,
-        "three batches plus one preference refetch per untagged member"
+        3,
+        "prewarm needs discovery, outbox and package batches, without preference refetches"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9528,8 +9536,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        20,
-        "create reuses discovery routes but repeats the package batch and eight preference refetches"
+        12,
+        "create reuses discovery routes but adds a package batch and eight preference refetches"
     );
 }
 
@@ -9587,8 +9595,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        4,
-        "discovery covers the outbox; package lookup adds a batch and two preference refetches"
+        2,
+        "discovery covers the outbox; prewarm adds only the package batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
@@ -9601,8 +9609,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        7,
-        "create repeats the package batch and two preference refetches, without relay discovery"
+        5,
+        "create adds the package batch and two preference refetches, without relay discovery"
     );
 }
 
@@ -9667,8 +9675,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        6,
-        "both relay-list hops retry each member, and untagged package winners need preference refetches"
+        4,
+        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
     );
 }
 

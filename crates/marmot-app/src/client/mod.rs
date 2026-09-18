@@ -1603,7 +1603,7 @@ impl AppClient {
                     .map(|member_ref| (*member_ref).to_owned())
                     .collect(),
                 &requirements,
-                false,
+                crate::directory::MemberResolutionPurpose::Commit,
             )
             .await;
         let key_package_elapsed = key_package_started_at.elapsed();
@@ -2228,7 +2228,7 @@ impl AppClient {
                     .map(|member| (*member).to_owned())
                     .collect(),
                 &requirements,
-                false,
+                crate::directory::MemberResolutionPurpose::Commit,
             )
             .await
             .map(|resolved| resolved.key_packages);

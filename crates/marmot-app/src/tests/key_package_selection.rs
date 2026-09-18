@@ -254,6 +254,125 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
 }
 
 #[tokio::test]
+async fn failed_preference_refetch_preserves_only_usable_current_batch_packages() {
+    for batch_case in ["valid", "absent", "malformed", "incompatible"] {
+        let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        app.account_home().create_account("inviter").unwrap();
+        let mut inviter = client_on_app_relay_plane(&app, "inviter").await;
+        let group = inviter.create_group("refetch failures", &[]).await.unwrap();
+        let requirements = inviter
+            .runtime
+            .session()
+            .invite_key_package_requirements(&group)
+            .unwrap();
+        let refs = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        // Ready prewarm reuses the batched existence answer, even for untagged
+        // packages; it must not trigger per-author preference queries.
+        app.prewarm_group_member_key_packages(&refs).await.unwrap();
+        assert!(!fetcher.requests.lock().unwrap().iter().any(|request| {
+            request
+                .queries
+                .iter()
+                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
+        }));
+        let account = &accounts[0];
+        let expected = fetcher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == account.account_id_hex
+            })
+            .unwrap()
+            .id
+            .clone();
+        if batch_case == "incompatible" {
+            let package = fresh_key_package_with_components(
+                &app,
+                account,
+                false,
+                app.supported_app_component_ids()
+                    .into_iter()
+                    .filter(|id| *id != GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID)
+                    .collect(),
+            )
+            .await;
+            let replacement = candidate(account, package, "limited", None, unix_now_seconds());
+            let mut events = fetcher.events.lock().unwrap();
+            events.retain(|event| {
+                event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != account.account_id_hex
+            });
+            events.push(replacement);
+        } else if batch_case != "valid" {
+            let mut events = fetcher.events.lock().unwrap();
+            if batch_case == "absent" {
+                events.retain(|event| {
+                    event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != account.account_id_hex
+                });
+            } else {
+                events
+                    .iter_mut()
+                    .find(|event| {
+                        event.kind == KIND_MARMOT_KEY_PACKAGE
+                            && event.pubkey == account.account_id_hex
+                    })
+                    .unwrap()
+                    .content = "not base64".into();
+            }
+        }
+        *fetcher.failing_single_author.lock().unwrap() = Some(account.account_id_hex.clone());
+        fetcher.requests.lock().unwrap().clear();
+        let result = app
+            .resolve_compatible_member_key_packages(
+                refs.iter().map(|member| (*member).to_owned()).collect(),
+                &requirements,
+                crate::directory::MemberResolutionPurpose::Commit,
+            )
+            .await;
+        assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+            request.queries.iter().any(|query| {
+                query.kind == KIND_MARMOT_KEY_PACKAGE
+                    && query.authors == vec![account.account_id_hex.clone()]
+            })
+        }));
+        if batch_case == "valid" {
+            let resolved = result.unwrap();
+            assert_eq!(resolved.key_packages.len(), 2);
+            assert_eq!(
+                hex::encode(
+                    resolved.key_packages[0]
+                        .source
+                        .as_ref()
+                        .unwrap()
+                        .event_id
+                        .as_slice()
+                ),
+                expected
+            );
+        } else {
+            let error = result
+                .err()
+                .expect("unusable batch material must not become a fallback");
+            match batch_case {
+                "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
+                "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
+                "incompatible" => assert!(matches!(
+                    error,
+                    AppError::Session(cgka_session::SessionError::Engine(
+                        cgka_traits::EngineError::MissingRequiredCapabilities { .. }
+                    ))
+                )),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
@@ -362,7 +481,7 @@ async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite()
         .resolve_compatible_member_key_packages(
             vec![bob.account_id_hex.clone()],
             &requirements,
-            true,
+            crate::directory::MemberResolutionPurpose::CommitFresh,
         )
         .await
         .unwrap();

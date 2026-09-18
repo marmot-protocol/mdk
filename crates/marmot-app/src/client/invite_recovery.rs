@@ -291,7 +291,11 @@ impl AppClient {
                     };
                     match self
                         .app
-                        .resolve_compatible_member_key_packages(members, &requirements, true)
+                        .resolve_compatible_member_key_packages(
+                            members,
+                            &requirements,
+                            crate::directory::MemberResolutionPurpose::CommitFresh,
+                        )
                         .await
                     {
                         Ok(resolved) => resolved.key_packages,
