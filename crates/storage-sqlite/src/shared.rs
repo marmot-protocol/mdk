@@ -15,7 +15,7 @@ use crate::{
     bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64, unix_now_ms, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
 
 const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 
@@ -332,6 +332,39 @@ impl SqliteSharedStorage {
             .collect()
     }
 
+    /// Read only requested profiles, without follow, relay-list, or key-package rows.
+    pub fn directory_profiles_for_ids(
+        &self,
+        account_ids: &[String],
+    ) -> StorageResult<Vec<PublicDirectoryProfileRecord>> {
+        let conn = self.lock()?;
+        let mut profiles = Vec::new();
+        for ids in account_ids.chunks(crate::SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn
+                .prepare_cached(&format!(
+                    "SELECT account_id_hex, npub, profile_json FROM directory_users
+                 WHERE account_id_hex IN ({placeholders})"
+                ))
+                .storage()?;
+            let rows = statement
+                .query_map(params_from_iter(ids), |row| {
+                    Ok(PublicDirectoryProfileRecord {
+                        account_id_hex: row.get(0)?,
+                        npub: row.get(1)?,
+                        profile_json: row.get(2)?,
+                    })
+                })
+                .storage()?;
+            for row in rows {
+                profiles.push(row.storage()?);
+            }
+        }
+        Ok(profiles)
+    }
+
     fn public_directory_users_capped(
         &self,
         max: usize,
@@ -586,6 +619,58 @@ fn optional_i64_to_u64(value: Option<i64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_batch_is_scoped() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        thread_local! {
+            static SELECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
+             INSERT INTO directory_users(account_id_hex,npub,profile_json,relay_lists_json)
+             SELECT printf('%064x',x),'npub',NULL,'broken' FROM n;",
+            )
+            .unwrap();
+        let ids = (1..=1000)
+            .map(|id| format!("{id:064x}"))
+            .collect::<Vec<_>>();
+        storage.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event| {
+                if let TraceEvent::Stmt(_, sql) = event
+                    && sql.starts_with("SELECT")
+                {
+                    SELECTS.set(SELECTS.get() + 1);
+                }
+            }),
+        );
+        for id in &ids {
+            assert!(storage.public_directory_user(id).unwrap().is_some());
+        }
+        assert_eq!(SELECTS.replace(0), 2000);
+        assert!(storage.directory_profiles_for_ids(&[]).unwrap().is_empty());
+        assert_eq!(
+            storage.directory_profiles_for_ids(&ids).unwrap().len(),
+            ids.len()
+        );
+        assert_eq!(SELECTS.replace(0), 2);
+        storage
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+        let selected = storage.directory_profiles_for_ids(&ids[10..12]).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .all(|row| ids[10..12].contains(&row.account_id_hex))
+        );
+    }
 
     #[test]
     fn shared_storage_is_plaintext_public_directory_only() {

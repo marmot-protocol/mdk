@@ -110,7 +110,7 @@ clients adopt paging and distinguish partially loaded tabs from truly empty tabs
 
 ## C8-C1: durable storage foundation
 
-Migration 82 adds source-bound demand, leases, retry deadlines and protected bytes
+Migration 83 adds source-bound demand, leases, retry deadlines and protected bytes
 inside each account's SQLCipher database. It creates no transfer jobs on upgrade.
 The caller supplies a shared-parser-validated slot and its exact plaintext digest;
 a mismatched digest is a caller bug to fix by re-parsing, not a download failure to

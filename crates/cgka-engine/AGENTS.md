@@ -475,7 +475,9 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   queries, the safe-export family, `own_leaf_index`) calls `ensure_group_live` first and returns `UnknownGroup`; `do_send` and
   `converge_and_drain_queued_outbound_intents` refuse to run; `ingest_group_message` retains inbound input as
   `PeelDeferred` and classifies it `Stale { reason: Quarantined }`; `converge_stored_openmls_messages` reports a
-  `Blocked` run without touching state; `retry_deferred_peels` skips the group. When you add a new accessor or data
+  `Blocked` run without touching state; `retry_deferred_peels` skips the group, and because no sweep can ever
+  drain them, those retained rows (like a group halted `Unrecoverable`) are bounded by the per-group deferred-peel
+  caps alone and never charge the account-wide byte budget. When you add a new accessor or data
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.
@@ -587,6 +589,13 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   select and cannot reach `set_stable` with one. Both halves are pinned by
   `tests/publish_lifecycle.rs::a_publication_is_never_staged_while_a_convergence_input_is_unresolved` and
   `::an_inbound_commit_under_a_held_publication_is_retained_not_converged`.
+- **A refusal for lack of room is never a verdict.** `IngestOutcome::ResourceRefused` has one mint site
+  (`peel_deferred_capacity_refused`) and means the group's deferred-peel cap had no slot for an unopenable row right now.
+  Every seam that meets it leaves the row exactly as it was — live ingest keeps the id redeliverable, `replay_buffered_messages`
+  leaves the `Retryable` row and continues, the sweep leaves the `PeelDeferred` row — and none stamps `Processed`: a terminal
+  state makes `recorded_message_outcome` answer `Duplicate` forever, so a never-applied message would be dead for this
+  device. (Convergence graph seeding is not the hazard; it skips raw-transport payloads.) Pinned by
+  `tests/deferred_peel_lifecycle.rs::replay_keeps_a_row_refused_for_lack_of_room_redeliverable`.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
   do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
   `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so

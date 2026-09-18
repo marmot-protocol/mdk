@@ -44,6 +44,11 @@ pub struct UserDirectoryLocalAccount {
     pub local_signing: bool,
 }
 
+pub(crate) struct LocalAccountNames {
+    pub(super) directory: UserDirectoryLocalAccount,
+    pub(crate) label: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserProfileMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]

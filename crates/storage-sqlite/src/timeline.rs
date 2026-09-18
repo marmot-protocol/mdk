@@ -181,6 +181,44 @@ pub struct TimelineMessageQuery {
     pub pagination: TimelinePagination,
 }
 
+/// Origin of the accepted deletion selected by MDK. Meaningful only when `deleted`.
+/// Unknown includes legacy tombstones whose accepted evidence is unavailable.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionSource {
+    #[default]
+    Unknown,
+    Author,
+    Admin,
+}
+
+impl DeletionSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Author => "author",
+            Self::Admin => "admin",
+        }
+    }
+    pub(crate) fn from_storage(value: &str) -> Self {
+        match value {
+            "author" => Self::Author,
+            "admin" => Self::Admin,
+            _ => Self::Unknown,
+        }
+    }
+    // Acceptance is already established by the caller. Cross-author legacy kind-5
+    // grants stay honored, but their legacy verdict does not identify a modern
+    // kind-4891 admin operation or an author retraction. Preserve Unknown.
+    fn from_accepted(kind: u64, deletion_sender: &str, target_sender: &str) -> Self {
+        match kind {
+            MARMOT_APP_EVENT_KIND_DELETE if deletion_sender == target_sender => Self::Author,
+            MARMOT_APP_EVENT_KIND_REMOVE => Self::Admin,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
     #[serde(default)]
@@ -216,6 +254,8 @@ pub struct TimelineMessageRecord {
     #[serde(default)]
     pub edit: Option<TimelineEditSummary>,
     pub deleted: bool,
+    #[serde(default)]
+    pub deletion_source: DeletionSource,
     pub deleted_by_message_id_hex: Option<String>,
     /// Set when convergence invalidated this message (e.g. it landed on a losing
     /// branch). The message is kept in the timeline as a "did not reach the group"
@@ -252,6 +292,8 @@ pub struct TimelineReplyPreview {
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub deleted: bool,
+    #[serde(default)]
+    pub deletion_source: DeletionSource,
     /// Set when convergence invalidated the previewed message. Content remains
     /// available so the application can choose whether to show or hide it.
     pub invalidation_status: Option<String>,
@@ -404,6 +446,7 @@ struct TimelineRow {
     reactions: TimelineReactionSummary,
     edit: Option<TimelineEditSummary>,
     deleted: bool,
+    deletion_source: DeletionSource,
     deleted_by_message_id_hex: Option<String>,
     invalidation_status: Option<String>,
 }
@@ -1509,7 +1552,7 @@ impl SqliteAccountStorage {
                         timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                        timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
                  FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
@@ -2223,6 +2266,8 @@ fn apply_message_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageR
             continue;
         }
         row.deleted = true;
+        row.deletion_source =
+            DeletionSource::from_accepted(delete.kind, &delete.sender, &row.sender);
         row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
         row.plaintext.clear();
         row.edit = None;
@@ -2347,9 +2392,9 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
             plaintext, kind, tags_json, timeline_at, received_at,
             reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-            deleted, deleted_by_message_id_hex, invalidation_status, edit_json
+            deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
             source_message_id_hex = excluded.source_message_id_hex,
             source_epoch = excluded.source_epoch,
@@ -2367,7 +2412,8 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             deleted = excluded.deleted,
             deleted_by_message_id_hex = excluded.deleted_by_message_id_hex,
             invalidation_status = excluded.invalidation_status,
-            edit_json = excluded.edit_json",
+            edit_json = excluded.edit_json,
+            deletion_source = excluded.deletion_source",
         params![
             &row.group_id_hex,
             &row.message_id_hex,
@@ -2388,6 +2434,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             &row.deleted_by_message_id_hex,
             &row.invalidation_status,
             row.edit.as_ref().map(serde_json::to_string).transpose().map_err(|e| StorageError::Serialization(e.to_string()))?,
+            row.deletion_source.as_str(),
         ],
     )
     .storage()?;
@@ -2685,6 +2732,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
                      reactions_json = zeroblob(length(reactions_json)),
                      edit_json = NULL,
                      deleted_by_message_id_hex = NULL,
+                     deletion_source = 'unknown',
                      invalidation_status = NULL
                  WHERE group_id_hex = ?
                    AND message_id_hex IN ({placeholders})"
@@ -3233,7 +3281,7 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
@@ -3494,7 +3542,7 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
@@ -3697,6 +3745,8 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
                 continue;
             }
             row.deleted = true;
+            row.deletion_source =
+                DeletionSource::from_accepted(delete.kind, &delete.sender, &row.sender);
             row.deleted_by_message_id_hex = Some(delete.message_id_hex.clone());
             row.plaintext.clear();
             row.edit = None;
@@ -3741,6 +3791,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         reactions: TimelineReactionSummary::default(),
         edit: None,
         deleted: false,
+        deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
     }
@@ -3765,6 +3816,7 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         reactions: TimelineReactionSummary::default(),
         edit: None,
         deleted: false,
+        deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
     }
@@ -3800,6 +3852,7 @@ fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
         reactions: TimelineReactionSummary::default(),
         edit: None,
         deleted: false,
+        deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
     }
@@ -3887,6 +3940,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
 }
 
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
+    let deleted = row.get::<_, bool>(17)?;
     Ok(TimelineMessageRecord {
         has_reports: false,
         group_system: crate::group_system::projected_group_system(
@@ -3911,13 +3965,18 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         sender: row.get(7)?,
         plaintext: row.get(8)?,
         kind: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(10)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                10,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
+        // Mask at the read boundary, including pre-upgrade materialized rows.
+        tags: if deleted {
+            Vec::new()
+        } else {
+            tags_from_json(row.get::<_, String>(10)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?
+        },
         timeline_at: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
         reply_to_message_id_hex: row.get(13)?,
@@ -3939,8 +3998,9 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
                 Box::new(err),
             )
         })?,
-        deleted: row.get::<_, i64>(17)? != 0,
+        deleted,
         deleted_by_message_id_hex: row.get(18)?,
+        deletion_source: DeletionSource::from_storage(&row.get::<_, String>("deletion_source")?),
         invalidation_status: row.get(19)?,
         edit: row
             .get::<_, Option<String>>(20)?
@@ -4044,7 +4104,7 @@ fn load_reply_previews(
                 .join(", ");
             let sql = format!(
                 "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch,
-                        invalidation_status
+                        invalidation_status, deletion_source
                  FROM visible_message_timeline
                  WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
@@ -4089,6 +4149,7 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
             .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
         invalidation_status: row.get(8)?,
+        deletion_source: DeletionSource::from_storage(&row.get::<_, String>(9)?),
     })
 }
 

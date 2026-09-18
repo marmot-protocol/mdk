@@ -24,7 +24,9 @@ NIP-09, and a dismissal cannot undo a deletion. Admin deletion intentionally use
 one moderation operation for all whole-chat targets, regardless of authorship.
 This includes self-deletion: older peers may keep that content visible, and a
 demotion before encryption rejects the operation rather than changing it to an
-author retraction.
+author retraction. Admin removal currently applies only to chat messages (kind 9),
+including their edits; it does not remove custom-kind events. Authors can retract
+their own custom events with kind 5.
 
 Timeline records expose `has_reports`. Existing timeline and projection events
 carry updates; there is no dedicated shared review queue, pending count, or
@@ -51,6 +53,23 @@ Compatible clients are needed for consistent enforcement. Older clients may
 render unknown events or retain earlier deletion behavior. Existing honored
 legacy kind-5 tombstones remain honored locally, while newly received kind-5
 events are author-only.
+
+Message presentation exposes typed `deletion_source` on timeline/conversation rows,
+chat-list previews, reply previews, and `reported_message`. It describes the selected
+accepted deletion: author-authorized kind 5 is `Author`; authenticated kind 4891 is
+`Admin`, including self-removal. Legacy kind-5 removals of another author's content
+remain honored but are `Unknown`, as are tombstones without recoverable evidence.
+This does not infer an administrator from sender identity or present-day roles.
+The greatest `(authenticated event timestamp, event ID)` selects both provenance
+and the existing deletion ID. Withdrawing evidence updates the winner and live
+projections; convergence invalidation remains a separate field.
+
+Migration 0082 adds columns defaulting to `Unknown` without replaying history or
+changing deletion IDs. Historical tombstones can remain `Unknown` indefinitely:
+no backfill is scheduled. A later target reprojection or group rebuild can classify
+retained accepted evidence. All timeline reads mask raw tags on deleted rows,
+including older stored tombstones. See the [bindings contract](../../../crates/marmot-uniffi/README.md#deletion-provenance-and-custom-events)
+for client fallback wording and coordinated native/binding upgrade requirements.
 
 See [implementation details](../further-context/content-moderation.md) for source
 authority recovery, persistence, and bounded migration.

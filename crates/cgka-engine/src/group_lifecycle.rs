@@ -1670,7 +1670,7 @@ impl<S: StorageProvider> Engine<S> {
         // the now-live group (and so an unrepairable group can always be
         // recovered by re-invite). The buffered-message replay below picks up
         // any input retained while quarantined.
-        if self.quarantined_groups.remove(&group_id).is_some() {
+        if self.leave_hydration_quarantine(&group_id) {
             let recovered_epoch = EpochId(mls_group.epoch().as_u64());
             tracing::info!(
                 target: "cgka_engine::hydrate",

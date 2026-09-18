@@ -1,4 +1,5 @@
 mod draft_lifecycle;
+mod group_lookup;
 mod key_package_inventory;
 mod message_journeys;
 mod report_backfill;
@@ -10797,6 +10798,75 @@ fn repeated_display_name_lookup_reuses_directory_cache_handle() {
 }
 
 #[test]
+fn batch_names_preserve_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let caches = app.directory_caches().unwrap();
+    let shared = app.shared_storage().unwrap();
+    let ids = (11..=16).map(|id| format!("{id:064x}")).collect::<Vec<_>>();
+    for id in &ids[..4] {
+        caches[0]
+            .put(&test_directory_record(id, "first", 2))
+            .unwrap();
+        caches[1]
+            .put(&test_directory_record(id, "second", 5))
+            .unwrap();
+    }
+    for (id, timestamp) in [(&ids[0], 1), (&ids[1], 2), (&ids[3], 3), (&ids[5], 1)] {
+        shared
+            .put_public_directory_user(
+                &public_directory_user_record(&test_directory_record(id, "shared", timestamp))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let mut empty = test_directory_record(&ids[2], "unused", 0);
+    empty.profile = None;
+    caches[0].put(&empty).unwrap();
+    caches[1]
+        .put(&test_directory_record(&ids[4], "second", 5))
+        .unwrap();
+
+    let mut requested = ids.clone();
+    requested.extend([
+        alice.account_id_hex.clone(),
+        ids[0].to_uppercase(),
+        format!("{:064x}", 100),
+    ]);
+    let expected = HashMap::from([
+        (ids[0].clone(), "first".to_owned()),
+        (ids[1].clone(), "first".to_owned()),
+        (ids[3].clone(), "shared".to_owned()),
+        (ids[4].clone(), "second".to_owned()),
+        (ids[5].clone(), "shared".to_owned()),
+        (alice.account_id_hex.clone(), "alice".to_owned()),
+    ]);
+    assert_eq!(
+        app.display_names_for_account_ids(&requested).unwrap(),
+        expected
+    );
+    assert!(app.display_names_for_account_ids(&[]).unwrap().is_empty());
+    assert!(
+        app.display_names_for_account_ids(&["invalid".into()])
+            .is_err()
+    );
+
+    // Every read sees new writes; no process-level invalidation is needed.
+    shared
+        .put_public_directory_user(
+            &public_directory_user_record(&test_directory_record(&ids[1], "updated", 6)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        app.display_names_for_account_ids(&requested).unwrap()[&ids[1]],
+        "updated"
+    );
+}
+
+#[test]
 fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -10831,6 +10901,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         timeline_at: 1,
         deleted: false,
+        deletion_source: Default::default(),
         attachment_kind: None,
         attachment_count: 0,
         delivery_state: ChatListMessageDeliveryState::NotApplicable,

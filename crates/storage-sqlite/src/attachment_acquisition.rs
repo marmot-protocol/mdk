@@ -112,7 +112,7 @@ pub(crate) fn reconcile_attachment_acquisition_tx(
     group: &str,
     message: Option<&str>,
 ) -> StorageResult<()> {
-    // Historical migrations invoke timeline rebuild before migration 82 exists.
+    // Historical migrations invoke timeline rebuild before migration 83 exists.
     let present: bool = conn
         .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master

@@ -36,6 +36,7 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
         agent_text_stream: None,
         reactions: marmot_app::TimelineReactionSummary::default(),
         deleted: false,
+        deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
     }

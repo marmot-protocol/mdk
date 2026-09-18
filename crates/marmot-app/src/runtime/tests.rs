@@ -707,6 +707,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         timeline_at,
         received_at: timeline_at,
         deleted: false,
+        deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
         reply_to_message_id_hex: None,
@@ -1738,6 +1739,7 @@ fn chat_list_fingerprint_preserves_serialized_deduplication_semantics() {
         kind: 9,
         timeline_at: 1,
         deleted: false,
+        deletion_source: Default::default(),
         attachment_kind: None,
         attachment_count: 0,
         delivery_state: crate::ChatListMessageDeliveryState::NotApplicable,
@@ -3296,4 +3298,50 @@ async fn system_reactions_update_live_timeline_through_existing_commands() {
     sent_kinds.sort_unstable();
     assert_eq!(sent_kinds, [5, 7]);
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut row = chat_list_test_row("group", "title");
+    row.last_message = Some(crate::ChatListMessagePreview {
+        group_system: None,
+        message_id_hex: "message".into(),
+        sender: "author".into(),
+        sender_display_name: None,
+        plaintext: String::new(),
+        kind: 9,
+        timeline_at: 1,
+        deleted: true,
+        deletion_source: crate::DeletionSource::Author,
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state: crate::ChatListMessageDeliveryState::NotApplicable,
+        media_json: None,
+    });
+    let mut fingerprints =
+        HashMap::from([(row.group_id_hex.clone(), chat_list_row_fingerprint(&row))]);
+    row.last_message.as_mut().unwrap().deletion_source = crate::DeletionSource::Admin;
+    assert!(
+        reconcile_chat_list_snapshot(
+            &tx,
+            &mut fingerprints,
+            ChatListUpdateTrigger::SnapshotRefresh,
+            vec![row.clone()]
+        )
+        .await
+    );
+    assert!(
+        matches!(rx.recv().await, Some(RuntimeChatListUpdate::Row { row, .. }) if row.last_message.as_ref().unwrap().deletion_source == crate::DeletionSource::Admin)
+    );
+    assert!(
+        reconcile_chat_list_snapshot(
+            &tx,
+            &mut fingerprints,
+            ChatListUpdateTrigger::SnapshotRefresh,
+            vec![row]
+        )
+        .await
+    );
+    assert!(rx.try_recv().is_err());
 }

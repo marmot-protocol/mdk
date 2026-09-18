@@ -6,27 +6,30 @@
 //! in-memory directory-record hydration. The stateless record types and helpers
 //! these build on live in [`crate::directory::records`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 use cgka_traits::TransportEndpoint;
 use marmot_account::AccountSummary;
 use nostr_sdk::prelude::PublicKey;
-use storage_sqlite::{PublicDirectoryUserRecord, SqliteSharedStorage};
+#[cfg(test)]
+use storage_sqlite::PublicDirectoryUserRecord;
+use storage_sqlite::SqliteSharedStorage;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::records::{
-    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList,
+    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
     MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    cached_identity_projection, follow_list_from_record, latest_follow_list_from_records,
-    latest_fresh_profiles_from_records, profile_content_json, profile_from_record,
-    public_directory_user_record, select_newer_directory_entry, source_relays_from_record,
-    upsert_newer_directory_entry, user_directory_record_from_public, user_record_match,
+    cached_identity_projection, display_name_for_profile, follow_list_from_record,
+    latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_content_json,
+    profile_from_record, public_directory_user_record, select_newer_directory_entry,
+    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
+    user_record_match,
 };
 use crate::directory::{
     DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
@@ -49,6 +52,86 @@ use crate::{
 };
 
 impl MarmotApp {
+    /// Resolve batched profile names with first-cache precedence, then local labels.
+    /// Shared profiles replace cached profiles only when strictly newer.
+    pub(crate) fn display_names_for_account_ids(
+        &self,
+        account_id_hexes: &[String],
+    ) -> Result<HashMap<String, String>, AppError> {
+        let mut account_ids = account_id_hexes
+            .iter()
+            .map(|account_id| parse_account_id_hex(account_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        account_ids.sort();
+        account_ids.dedup();
+        if account_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let caches = self.directory_caches()?;
+        let shared_storage = self.shared_storage()?;
+        let local_accounts = self.local_accounts_by_id()?;
+        let mut profiles = HashMap::<String, Option<UserProfileMetadata>>::new();
+        let mut missing = account_ids.clone();
+        for cache in caches {
+            profiles.extend(cache.profiles_for_ids(&missing)?);
+            // The first cache row wins even when it contains no profile.
+            missing.retain(|id| !profiles.contains_key(id));
+            if missing.is_empty() {
+                break;
+            }
+        }
+        for record in shared_storage.directory_profiles_for_ids(&account_ids)? {
+            let Some(json) = record.profile_json else {
+                continue;
+            };
+            let candidate: UserProfileMetadata = serde_json::from_str(&json)?;
+            let profile = profiles.entry(record.account_id_hex).or_default();
+            // Match select_newer_directory_entry: account-cache ties win.
+            if profile
+                .as_ref()
+                .is_none_or(|current| candidate.created_at > current.created_at)
+            {
+                *profile = Some(candidate);
+            }
+        }
+        let mut names = HashMap::new();
+
+        for account_id in account_ids {
+            if let Some(name) =
+                display_name_for_profile(profiles.get(&account_id).and_then(Option::as_ref))
+            {
+                names.insert(account_id, name);
+                continue;
+            }
+            if let Some(name) = local_accounts.get(&account_id) {
+                names.insert(account_id, name.label.clone());
+            }
+        }
+
+        Ok(names)
+    }
+
+    pub(crate) fn local_accounts_by_id(
+        &self,
+    ) -> Result<HashMap<String, LocalAccountNames>, AppError> {
+        let mut local = HashMap::new();
+        for account in self.account_home().accounts()? {
+            // Preserve first-record directory links and last-label display fallback for aliases.
+            local
+                .entry(account.account_id_hex)
+                .and_modify(|names: &mut LocalAccountNames| names.label = account.label.clone())
+                .or_insert_with(|| LocalAccountNames {
+                    directory: UserDirectoryLocalAccount {
+                        label: account.label.clone(),
+                        local_signing: account.local_signing,
+                    },
+                    label: account.label,
+                });
+        }
+        Ok(local)
+    }
+
     pub fn warm_directory_storage(&self) -> Result<(), AppError> {
         let _span = tracing::debug_span!(
             target: "marmot_app::directory",
@@ -577,7 +660,13 @@ impl MarmotApp {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
-        self.directory_entry_for_account_id_with_handles(&account_id_hex, &caches, &shared_storage)
+        let local_accounts = self.local_accounts_by_id()?;
+        self.directory_entry_for_account_id_with_handles(
+            &account_id_hex,
+            &caches,
+            &shared_storage,
+            &local_accounts,
+        )
     }
 
     /// Bounded local cached-identity page for many account IDs.
@@ -601,7 +690,7 @@ impl MarmotApp {
 
         let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
-        let local_labels = self.local_account_labels_by_id()?;
+        let local_accounts = self.local_accounts_by_id()?;
         let mut projections = Vec::with_capacity(account_id_hexes.len());
 
         for requested_id in account_id_hexes {
@@ -619,9 +708,12 @@ impl MarmotApp {
                     &account_id_hex,
                     &caches,
                     &shared_storage,
+                    &local_accounts,
                 )?
                 .and_then(|entry| entry.profile);
-            let local_label = local_labels.get(&account_id_hex).cloned();
+            let local_label = local_accounts
+                .get(&account_id_hex)
+                .map(|account| account.label.clone());
             projections.push(cached_identity_projection(
                 requested_id.clone(),
                 Some(account_id_hex),
@@ -1112,17 +1204,21 @@ impl MarmotApp {
     }
 
     pub(crate) fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
+        let local_accounts = self.local_accounts_by_id()?;
         let mut entries_by_id = BTreeMap::new();
         for cache in self.directory_caches()? {
             for entry in cache.entries()? {
                 upsert_newer_directory_entry(
                     &mut entries_by_id,
-                    self.hydrate_directory_record(entry)?,
+                    Self::hydrate_directory_record(entry, &local_accounts)?,
                 );
             }
         }
         for record in self.shared_storage()?.public_directory_users()? {
-            let entry = self.hydrate_public_directory_record(record)?;
+            let entry = Self::hydrate_directory_record(
+                user_directory_record_from_public(record)?,
+                &local_accounts,
+            )?;
             upsert_newer_directory_entry(&mut entries_by_id, entry);
         }
         Ok(entries_by_id.into_values().collect())
@@ -1210,13 +1306,19 @@ impl MarmotApp {
         account_id_hex: &str,
         caches: &[DirectoryCache],
         shared_storage: &SqliteSharedStorage,
+        local_accounts: &HashMap<String, LocalAccountNames>,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let cached_entry = Self::directory_entry_from_caches(caches, account_id_hex)?
-            .map(|entry| self.hydrate_directory_record(entry))
+            .map(|entry| Self::hydrate_directory_record(entry, local_accounts))
             .transpose()?;
         let shared_entry = shared_storage
             .public_directory_user(account_id_hex)?
-            .map(|record| self.hydrate_public_directory_record(record))
+            .map(|record| {
+                Self::hydrate_directory_record(
+                    user_directory_record_from_public(record)?,
+                    local_accounts,
+                )
+            })
             .transpose()?;
         Ok(select_newer_directory_entry(cached_entry, shared_entry))
     }
@@ -1479,12 +1581,18 @@ impl MarmotApp {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
-        let proposed_entry = self.hydrate_directory_record(entry.clone())?;
+        let local_accounts = self.local_accounts_by_id()?;
+        let proposed_entry = Self::hydrate_directory_record(entry.clone(), &local_accounts)?;
         let shared_storage = self.shared_storage()?;
         let shared_record = shared_storage.public_directory_user(&proposed_entry.account_id_hex)?;
         let shared_entry = shared_record
             .clone()
-            .map(|record| self.hydrate_public_directory_record(record))
+            .map(|record| {
+                Self::hydrate_directory_record(
+                    user_directory_record_from_public(record)?,
+                    &local_accounts,
+                )
+            })
             .transpose()?;
         let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
             .expect("proposed directory entry should be present");
@@ -1495,7 +1603,7 @@ impl MarmotApp {
         for cache in &caches {
             let cached_entry = cache
                 .entry(&entry.account_id_hex)?
-                .map(|record| self.hydrate_directory_record(record))
+                .map(|record| Self::hydrate_directory_record(record, &local_accounts))
                 .transpose()?;
             if cached_entry.as_ref() != Some(&entry) {
                 caches_match = false;
@@ -1647,9 +1755,10 @@ impl MarmotApp {
             return Ok(());
         };
 
+        let local_accounts = self.local_accounts_by_id()?;
         let entries = entries
             .into_iter()
-            .map(|entry| self.hydrate_directory_record(entry))
+            .map(|entry| Self::hydrate_directory_record(entry, &local_accounts))
             .collect::<Result<Vec<_>, _>>()?;
         let shared_storage = self.shared_storage()?;
         for entry in &entries {
@@ -1729,23 +1838,29 @@ impl MarmotApp {
     }
 
     fn hydrate_directory_record(
-        &self,
         mut entry: UserDirectoryRecord,
+        local_accounts: &HashMap<String, LocalAccountNames>,
     ) -> Result<UserDirectoryRecord, AppError> {
         entry.account_id_hex = parse_account_id_hex(&entry.account_id_hex)?;
         entry.npub = npub_for_account_id(&entry.account_id_hex)?;
-        entry.local_account = self.local_account_for_id(&entry.account_id_hex);
+        entry.local_account = local_accounts
+            .get(&entry.account_id_hex)
+            .map(|names| names.directory.clone());
         entry.follows = normalize_account_ids(entry.follows)?;
         entry.follow_source_relays.sort();
         entry.follow_source_relays.dedup();
         Ok(entry)
     }
 
+    #[cfg(test)]
     pub(crate) fn hydrate_public_directory_record(
         &self,
         record: PublicDirectoryUserRecord,
     ) -> Result<UserDirectoryRecord, AppError> {
-        self.hydrate_directory_record(user_directory_record_from_public(record)?)
+        Self::hydrate_directory_record(
+            user_directory_record_from_public(record)?,
+            &self.local_accounts_by_id()?,
+        )
     }
 
     fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
@@ -1777,5 +1892,61 @@ pub(crate) fn cached_or_unknown_follow_list(
             .iter()
             .map(|endpoint| endpoint.0.clone())
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydration_uses_one_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relays(root.path(), vec![]);
+        let home = app.account_home();
+        let alice = home.create_account("alice").unwrap();
+        // Legacy homes can retain two labels for one identity.
+        let mut alias = alice.clone();
+        alias.label = "z-alias".into();
+        let alias_dir = home.account_dir(&alias.label);
+        fs_private::create_dir_all_private(&alias_dir).unwrap();
+        fs_private::write_private(
+            &alias_dir.join("account.json"),
+            &serde_json::to_vec(&alias).unwrap(),
+        )
+        .unwrap();
+        let local_accounts = app.local_accounts_by_id().unwrap();
+        let local = &local_accounts[&alice.account_id_hex];
+        assert_eq!(
+            local.directory,
+            app.local_account_for_id(&alice.account_id_hex).unwrap()
+        );
+        assert_eq!(local.label, home.accounts().unwrap().last().unwrap().label);
+        assert_ne!(local.directory.label, local.label);
+        // Notification's existing single-entry reader keeps the first alias.
+        assert_eq!(
+            app.display_name_from_directory_entry(&alice.account_id_hex, None)
+                .unwrap()
+                .as_deref(),
+            Some(local.directory.label.as_str())
+        );
+        let entry = app.empty_directory_record(&alice.account_id_hex);
+        for label in ["alice", "z-alias"] {
+            fs_private::write_private(&home.account_dir(label).join("account.json"), b"broken")
+                .unwrap();
+        }
+        for index in 0..1000 {
+            let mut row = entry.clone();
+            if index != 0 {
+                row.account_id_hex = format!("{index:064x}");
+            }
+            let hydrated = MarmotApp::hydrate_directory_record(row, &local_accounts).unwrap();
+            if index == 0 {
+                assert_eq!(hydrated.local_account.unwrap(), local.directory);
+            } else {
+                assert!(hydrated.local_account.is_none());
+            }
+        }
+        assert!(app.local_accounts_by_id().unwrap().is_empty());
     }
 }

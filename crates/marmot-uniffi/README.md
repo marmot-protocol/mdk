@@ -22,6 +22,48 @@ same UniFFI surface, and releases publish it once.
 bindings to handle the new tag; older generated sources cannot render it.
 No generated Swift or Kotlin files are committed here.
 
+## Deletion provenance and custom events
+
+Timeline records (including conversation windows and `reportedMessage`), reply previews,
+and chat-list previews expose `deletionSource: DeletionSourceFfi`:
+
+- `Author`: the selected accepted deletion is an author-authorized kind 5.
+- `Admin`: the selected accepted deletion is kind 4891, authorized by authenticated
+  source-state evidence. This includes an admin removing their own message.
+- `Unknown`: no classified deletion evidence is available, including older projected tombstones
+  and legacy kind-5 removals of another author's content.
+
+Consult this field only when `deleted` is true. Use the existing ordinary-deletion wording
+for `Author`, “This message was deleted by an admin.” for `Admin`, and a neutral deleted-message
+fallback for `Unknown`. Clients own localization. The message's `kind` remains its original
+inner event kind, never the deletion kind. Existing deletion IDs and content masking are retained.
+`invalidationStatus` describes convergence separately and does not imply deletion.
+
+See [deletion semantics](../../docs/marmot-architecture/overview/content-moderation.md)
+for the storage and authorization contract.
+
+When multiple accepted deletions apply, the largest `(authenticated event timestamp, event ID)`
+pair wins, matching `deletedByMessageIdHex`. Arrival order, reports, and current admin status
+play no part. Invalidated deletion evidence is withdrawn; projections update to the remaining
+winner (or restore the undeleted state). Provenance-only changes participate in live projection
+and conversion-cache updates.
+
+Database migration 0082 adds provenance columns with an `unknown` default.
+It preserves older tombstones, deletion IDs, and cached chat presentation without scanning or
+reinterpreting history. No historical backfill is scheduled: existing tombstones can remain `Unknown` indefinitely.
+If a later operation reprojects a target or rebuilds its group, it uses available accepted evidence.
+Legacy serialized records with an absent field also default to `Unknown`. No client database
+migration or deletion index is needed. Regenerate Swift/Kotlin bindings and consume the matching
+native libraries together; C consumers must rebuild against the updated header and library.
+Older MDK binaries reject the upgraded database schema; do not roll back only the library.
+This is a binding layout change, not an MLS/wire-format change.
+
+Custom events retain their numeric `kind` and verbatim `plaintext` content. Conversation windows
+now also carry their ordered `tags`, so clients can render app-defined event types without fetching
+raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows. MDK-owned kinds continue
+to use prepared fields and references there. Custom-event tag changes invalidate the conversion
+cache. This does not change custom-event chat-list activity or notification policy.
+
 ## Group-system previews
 
 `ChatListMessagePreviewFfi.groupSystem` and timeline `groupSystem` now carry

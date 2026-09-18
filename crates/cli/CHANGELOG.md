@@ -11,7 +11,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
-- Attachment retention storage foundation (migration 82): durable leased download
+- Attachment retention storage foundation (migration 83): durable leased download
   jobs, restart-safe retries, protected local bytes and explicit-removal suppression
   that survives timeline repair. Capacity refusal preserves existing attachments.
   Background acquisition and native local-byte APIs are not enabled by this slice.
@@ -28,6 +28,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   immediately and add relay observations after refresh; retain the local result
   if refresh fails. Regenerate bindings and headers with the matching library.
   Android settings adoption remains a separate consumer change.
+
+- Message presentation records expose typed deletion provenance (`author`, `admin`, or `unknown`),
+  including conversation windows, chat-list and reply previews, moderation reads, and timeline JSON.
+  Provenance comes from the selected accepted deletion, independently of the original message kind.
+- Conversation-window bindings preserve custom-event tags for client-defined renderers.
+
+Update generated Swift/Kotlin bindings, native libraries, and C headers together. Storage migration 82
+adds provenance columns defaulting to unknown and preserves existing tombstones and deletion IDs.
+No historical backfill is scheduled; older tombstones can remain unknown indefinitely.
+See the [binding contract](../marmot-uniffi/README.md#deletion-provenance-and-custom-events).
 
 ## [0.10.1] - 2026-09-16
 

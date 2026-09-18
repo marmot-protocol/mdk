@@ -701,6 +701,101 @@ mod tests {
         s.content_reports(&id(99), None, None, 100).unwrap()
     }
     #[test]
+    fn deletion_provenance_survives_reload_and_rebuild_and_updates_dependents() {
+        use crate::{DeletionSource, SqlCipherKey};
+        for admin_is_author in [false, true] {
+            for reverse in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("provenance.db");
+                let key = SqlCipherKey::new("07".repeat(32)).unwrap();
+                let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                let author = if admin_is_author { 20 } else { 10 };
+                record(&s, &event(1, author, 9, vec![], "original"));
+                let mut complaint = report(5);
+                complaint.tags[1][1] = id(author);
+                record(&s, &complaint);
+                record(&s, &event(2, 11, 9, vec![vec!["e".into(), id(1)]], "reply"));
+                let mut author_delete = event(3, author, 5, vec![vec!["e".into(), id(1)]], "");
+                let mut admin_delete = removal(4, 1);
+                // Same authenticated timestamp: event id resolves the tie, not arrival order.
+                author_delete.recorded_at = 10;
+                admin_delete.recorded_at = 10;
+                if reverse {
+                    record(&s, &admin_delete);
+                    record(&s, &author_delete);
+                } else {
+                    record(&s, &author_delete);
+                    assert_eq!(
+                        s.timeline_message(&id(99), &id(1))
+                            .unwrap()
+                            .unwrap()
+                            .deletion_source,
+                        DeletionSource::Author
+                    );
+                    let update = s
+                        .record_app_event_with_source(&admin_delete, None, Some(authority(true)))
+                        .unwrap();
+                    assert!(
+                        update.messages.iter().any(|m| m.message_id_hex == id(1)
+                            && m.deletion_source == DeletionSource::Admin)
+                    );
+                    assert!(update.messages.iter().any(|m| {
+                        m.message_id_hex == id(2)
+                            && m.reply_preview
+                                .as_ref()
+                                .is_some_and(|p| p.deletion_source == DeletionSource::Admin)
+                    }));
+                }
+                drop(s);
+                let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                for rebuild in [false, true] {
+                    if rebuild {
+                        s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                    }
+                    let row = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+                    assert!(row.deleted);
+                    assert!(row.plaintext.is_empty());
+                    assert_eq!(row.kind, 9);
+                    assert_eq!(row.deletion_source, DeletionSource::Admin);
+                    assert_eq!(row.deleted_by_message_id_hex, Some(id(4)));
+                    assert_eq!(
+                        s.reported_message(&id(99), &id(1))
+                            .unwrap()
+                            .unwrap()
+                            .deletion_source,
+                        row.deletion_source
+                    );
+                    let reply = s
+                        .timeline_message(&id(99), &id(2))
+                        .unwrap()
+                        .unwrap()
+                        .reply_preview
+                        .unwrap();
+                    assert_eq!(reply.deletion_source, row.deletion_source);
+                    assert!(reply.plaintext.is_empty());
+                }
+                s.invalidate_app_event_by_source(&id(4), "LosingBranch")
+                    .unwrap();
+                assert_eq!(
+                    s.timeline_message(&id(99), &id(1))
+                        .unwrap()
+                        .unwrap()
+                        .deletion_source,
+                    DeletionSource::Author
+                );
+                s.invalidate_app_event_by_source(&id(3), "LosingBranch")
+                    .unwrap();
+                s.invalidate_app_event_by_source(&id(1), "LosingBranch")
+                    .unwrap();
+                let row = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+                assert!(!row.deleted);
+                assert_eq!(row.deletion_source, DeletionSource::Unknown);
+                assert_eq!(row.invalidation_status.as_deref(), Some("LosingBranch"));
+            }
+        }
+    }
+
+    #[test]
     fn report_and_label_dependencies_can_arrive_in_any_order() {
         let events = [target(), report(2), dismiss(3, &[2])];
         for order in [
@@ -825,6 +920,14 @@ mod tests {
                     }
                     let m = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
                     assert_eq!(m.deleted, deleted);
+                    assert_eq!(
+                        m.deletion_source,
+                        if deleted {
+                            crate::DeletionSource::Admin
+                        } else {
+                            crate::DeletionSource::Unknown
+                        }
+                    );
                     assert_eq!(m.plaintext, if deleted { "" } else { "original" });
                 }
             };
@@ -1096,15 +1199,46 @@ mod tests {
         legacy
             .record_app_event_with_source(&deletion, None, authority)
             .unwrap();
-        legacy.rebuild_message_timeline_for_group(&id(99)).unwrap();
-        assert!(
-            legacy
-                .timeline_message(&id(99), &id(1))
-                .unwrap()
-                .unwrap()
-                .deleted
-        );
+        for rebuild in [false, true] {
+            if rebuild {
+                legacy.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            let row = legacy.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert!(row.deleted);
+            assert!(row.plaintext.is_empty());
+            assert_eq!(row.deleted_by_message_id_hex, Some(id(2)));
+            assert_eq!(row.deletion_source, crate::DeletionSource::Unknown);
+        }
     }
+    #[test]
+    fn deleted_custom_tags_are_masked_on_reads_and_restored_on_withdrawal() {
+        let s = SqliteAccountStorage::in_memory().unwrap();
+        let tags = vec![vec!["title".into(), "classified title".into()]];
+        record(&s, &event(1, 10, 30402, tags.clone(), "listing"));
+        record(&s, &event(2, 10, 5, vec![vec!["e".into(), id(1)]], ""));
+        for rebuild in [false, true] {
+            if rebuild {
+                s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+            }
+            let row = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+            assert!(row.deleted && row.tags.is_empty() && row.plaintext.is_empty());
+            let page = s.message_timeline(TimelineMessageQuery::default()).unwrap();
+            assert!(
+                page.messages
+                    .iter()
+                    .find(|m| m.message_id_hex == id(1))
+                    .unwrap()
+                    .tags
+                    .is_empty()
+            );
+        }
+        s.invalidate_app_event_by_source(&id(2), "LosingBranch")
+            .unwrap();
+        let row = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+        assert!(!row.deleted);
+        assert_eq!(row.tags, tags);
+    }
+
     #[test]
     fn admin_deletion_masks_media_reply_search_and_edit_history() {
         let s = SqliteAccountStorage::in_memory().unwrap();
@@ -1136,6 +1270,7 @@ mod tests {
             }
             let message = s.reported_message(&id(99), &id(1)).unwrap().unwrap();
             assert!(message.deleted && message.plaintext.is_empty() && message.media.is_none());
+            assert!(message.tags.is_empty());
             let preview = s
                 .timeline_message(&id(99), &id(6))
                 .unwrap()

@@ -106,7 +106,7 @@ pub use timeline::{
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
-    ConversationWindowQuery, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
+    ConversationWindowQuery, DeletionSource, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
     SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
     TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
     TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,

@@ -1758,10 +1758,16 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             make_event(group_b, "02" * 32, "fast group B"),
         ]
 
+        started_a = asyncio.Event()
+        finished_a = asyncio.Event()
+        finished_b = asyncio.Event()
+
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None):
                 for event in events:
                     yield wire_event(event)
+                    if event["group_id_hex"] == group_a:
+                        await started_a.wait()
                 # Keep the subscription open after yielding so the consume loop parks on the
                 # next event instead of draining the queue (which would serialize the turns).
                 await asyncio.sleep(3600)
@@ -1783,18 +1789,19 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             chat_id = event.source.chat_id
             if chat_id == group_a:
                 # Group A's turn is "slow/hung": it blocks until the test releases it.
+                started_a.set()
                 await release_a.wait()
             completed.append(chat_id)
+            (finished_a if chat_id == group_a else finished_b).set()
 
         adapter.handle_message = handle_message
 
         loop_task = asyncio.ensure_future(adapter._consume_inbound_once())
         try:
-            # Group B should complete while group A is still blocked: no head-of-line blocking.
-            for _ in range(200):
-                if group_b in completed:
-                    break
-                await asyncio.sleep(0.01)
+            # Establish A's blocked turn before testing B's independent progress.
+            # Storage/executor startup is not part of the concurrency assertion.
+            await asyncio.wait_for(started_a.wait(), timeout=10)
+            await asyncio.wait_for(finished_b.wait(), timeout=10)
             self.assertIn(
                 group_b,
                 completed,
@@ -1808,16 +1815,14 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             # Releasing group A lets its turn finish too — nothing was dropped.
             release_a.set()
-            for _ in range(200):
-                if group_a in completed:
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(finished_a.wait(), timeout=10)
             self.assertIn(group_a, completed, "group A turn must complete once released")
         finally:
+            release_a.set()
             loop_task.cancel()
             with suppress(asyncio.CancelledError):
                 await loop_task
-            await adapter._inbound_queue.cancel_all()
+            await adapter.disconnect()
 
     async def test_same_group_turns_dispatch_in_fifo_order(self):
         # Per-group ordering must be preserved: two messages for the SAME group run strictly
@@ -8125,7 +8130,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         dispatch = asyncio.create_task(
             adapter._dispatch_inbound_message(event, spool_message_id=message_id)
         )
-        await asyncio.wait_for(handed.wait(), timeout=1)
+        # Wait for the actual handoff; disk-backed setup is not under test.
+        await asyncio.wait_for(handed.wait(), timeout=10)
         self.assertEqual("handed", adapter._inbound_spool.get(message_id).state)
         await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
         dispatch.cancel()
@@ -8153,8 +8159,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.02)
         self.assertFalse(handling.done())
         self.assertLess(time.monotonic() - started, 0.10)
-        await asyncio.wait_for(handling, timeout=1)
-        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        # The responsiveness assertion above is complete. Allow durable work
+        # to settle without imposing a one-second filesystem deadline.
+        await asyncio.wait_for(handling, timeout=10)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=10)
         self.assertEqual(["durable"], [message.text for message in adapter.events])
         await adapter._inbound_spool_call(adapter._inbound_spool.close)
 

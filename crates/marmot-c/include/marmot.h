@@ -493,6 +493,15 @@ typedef enum MarmotMarkdownAlignment {
 } MarmotMarkdownAlignment;
 
 /**
+ * Accepted deletion origin; meaningful only for deleted rows.
+ */
+typedef enum MarmotDeletionSource {
+  MARMOT_DELETION_SOURCE_UNKNOWN,
+  MARMOT_DELETION_SOURCE_AUTHOR,
+  MARMOT_DELETION_SOURCE_ADMIN,
+} MarmotDeletionSource;
+
+/**
  * Kind of the last message's attachments.
  */
 typedef enum MarmotChatListAttachmentKind {
@@ -2447,6 +2456,7 @@ typedef struct MarmotChatListMessagePreview {
   uint64_t kind;
   uint64_t timeline_at;
   bool deleted;
+  enum MarmotDeletionSource deletion_source;
   bool has_attachment_kind;
   /**
    *Only meaningful when the matching `has_` flag is set.
@@ -3386,6 +3396,7 @@ typedef struct MarmotTimelineReplyPreview {
   uintptr_t media_len;
   char *agent_text_stream_json;
   bool deleted;
+  enum MarmotDeletionSource deletion_source;
   /**
    * Convergence invalidation reason for the previewed message.
    * Nullable.
@@ -3509,6 +3520,7 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotTimelineReactionSummary reactions;
   struct MarmotTimelineEditSummary *edit;
   bool deleted;
+  enum MarmotDeletionSource deletion_source;
   char *deleted_by_message_id_hex;
   /**
    * Convergence invalidation reason (e.g. `LosingBranch`); NULL

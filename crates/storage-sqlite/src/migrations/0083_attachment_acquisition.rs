@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn attachment_acquisition_upgrade_preserves_discovery_and_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..81]).unwrap();
+        run(&mut conn, &MIGRATIONS[..82]).unwrap();
         conn.execute_batch(r#"
             INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,
                 direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json)
