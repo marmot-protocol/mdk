@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay
+  policy, cursor persistence, client label and optional host secret storage.
+  Zero-initialized options preserve the existing defaults. Use matching headers
+  and libraries; existing constructor signatures remain available.
+
 - `marmot_client_new_with_client_name` configures an optional public KeyPackage
   client tag, with cursor policy and optional host secret store. Existing
   constructors remain untagged. Use the matching header and library.

@@ -21,7 +21,7 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
-    fresh_relay_list_status_from_records, key_package_client_priority, merge_relay_list_status,
+    fresh_relay_list_status_from_records, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -860,16 +860,19 @@ impl MarmotApp {
                 continue;
             };
             let multiple_authors = indices.len() > 1;
+            let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
+            for record in records {
+                records_by_author
+                    .entry(record.event.pubkey.clone())
+                    .or_default()
+                    .push(record);
+            }
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
-                let account_records = records
-                    .iter()
-                    .filter(|record| record.event.pubkey == *account_id)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let account_records = records_by_author.remove(account_id).unwrap_or_default();
                 let selected = preferred_fresh_key_package_from_records(
                     account_id,
-                    account_records.clone(),
+                    &account_records,
                     self.directory_freshness(),
                     requirements,
                 )
@@ -879,14 +882,12 @@ impl MarmotApp {
                         .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))
                 });
                 match selected {
-                    Ok(mut fetched)
+                    Ok(selected)
                         if purpose == MemberResolutionPurpose::Prewarm
                             || !multiple_authors
-                            || account_records.iter().any(|record| {
-                                record.event.id == fetched.key_package_event_id
-                                    && key_package_client_priority(&record.event) == 2
-                            }) =>
+                            || selected.priority == 2 =>
                     {
+                        let mut fetched = selected.fetched;
                         fetched.relay_lists = targets[index].relay_lists.clone();
                         outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
                     }
@@ -968,7 +969,7 @@ impl MarmotApp {
                             records.extend(observed_records);
                             let mut fetched = preferred_fresh_key_package_from_records(
                                 &target.account_id_hex,
-                                records,
+                                &records,
                                 app.directory_freshness(),
                                 requirements,
                             )?
@@ -977,7 +978,8 @@ impl MarmotApp {
                                 refetch_error.unwrap_or_else(|| {
                                     AppError::MissingKeyPackage(target.account_id_hex.clone())
                                 })
-                            })?;
+                            })?
+                            .fetched;
                             fetched.relay_lists = target.relay_lists;
                             Ok::<_, AppError>(fetched)
                         }

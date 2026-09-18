@@ -164,16 +164,32 @@ pub(crate) fn latest_fresh_key_package_from_records(
     records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
 ) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
-    preferred_fresh_key_package_from_records(account_id_hex, records, freshness, None)
+    let selection =
+        preferred_fresh_key_package_from_records(account_id_hex, &records, freshness, None)?;
+    Ok(DirectorySelection {
+        value: selection.value.map(|selected| selected.fetched),
+        rejected_future: selection.rejected_future,
+    })
+}
+
+pub(crate) struct PreferredKeyPackage {
+    pub(crate) fetched: FetchedKeyPackage,
+    pub(crate) priority: u8,
 }
 
 pub(crate) fn preferred_fresh_key_package_from_records(
     account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
+    records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
-    sort_directory_records(&mut records);
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    let mut records = records.iter().collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
     let mut rejected_future = false;
     let mut newest_error = None;
     let mut selected = None;
@@ -183,7 +199,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
         }
-        if !freshness.accepts(&record) {
+        if !freshness.accepts(record) {
             rejected_future = true;
             continue;
         }
@@ -196,7 +212,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             continue;
         }
         let priority = key_package_client_priority(&record.event);
-        let fetched = match key_package_from_record(record) {
+        let fetched = match key_package_from_borrowed_record(record) {
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
                 fetched
             }
@@ -213,7 +229,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             continue;
         }
         if selected.is_none() || priority > selected_priority {
-            selected = Some(fetched);
+            selected = Some(PreferredKeyPackage { fetched, priority });
             selected_priority = priority;
             // Newest-first order already breaks ties; nothing can outrank this.
             if selected_priority == 2 {
@@ -345,8 +361,14 @@ pub(crate) fn fresh_or_cached_key_package(
 pub(crate) fn key_package_from_record(
     record: RelayEventRecord,
 ) -> Result<FetchedKeyPackage, AppError> {
-    let event = record.event;
-    require_key_package_tag(&event, "mls_protocol_version", |value| value == "1.0")?;
+    key_package_from_borrowed_record(&record)
+}
+
+fn key_package_from_borrowed_record(
+    record: &RelayEventRecord,
+) -> Result<FetchedKeyPackage, AppError> {
+    let event = &record.event;
+    require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
         .tag_value("d")
         .filter(|value| !value.is_empty())
@@ -377,21 +399,21 @@ pub(crate) fn key_package_from_record(
     .with_protocol_profile(ProtocolProfile::Current);
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
-    require_key_package_tag(&event, "mls_ciphersuite", |value| {
+    require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "mls_extensions",
         metadata.mls_extensions.iter().copied(),
     )?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "mls_proposals",
         metadata.mls_proposals.iter().copied(),
     )?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "app_components",
         metadata
             .app_components
@@ -415,16 +437,16 @@ pub(crate) fn key_package_from_record(
         &mut source_relays,
         record
             .endpoints
-            .into_iter()
-            .map(|endpoint| endpoint.0)
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
             .collect::<Vec<_>>(),
     );
     Ok(FetchedKeyPackage {
-        account_id_hex: event.pubkey,
+        account_id_hex: event.pubkey.clone(),
         key_package,
         key_package_id,
         key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id,
+        key_package_event_id: event.id.clone(),
         created_at: event.created_at,
         source_relays,
         relay_lists: AccountRelayListStatus::empty(),

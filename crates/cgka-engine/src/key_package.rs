@@ -5,8 +5,6 @@
 //! validated for OpenMLS lifetime validity and accepted lifetime range;
 //! refresh scheduling is handled above the engine.
 
-use std::sync::LazyLock;
-
 use crate::capabilities::leaf_capabilities;
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
@@ -24,12 +22,27 @@ use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use tls_codec::{Deserialize as _, Serialize as _};
 
-// Validation and hashing do not consume randomness. Reuse the backend instead
-// of seeding a new RNG for each discovery candidate.
-// This instance is process-wide across accounts. Keep its uses limited to
-// validation and hashing; operations that draw randomness must use the engine's
-// own provider instead.
-static VALIDATION_CRYPTO: LazyLock<RustCrypto> = LazyLock::new(RustCrypto::default);
+// The backend is private even to this parent module: callers can only validate
+// or hash, and cannot obtain the process-wide RNG-bearing provider.
+mod validation_crypto {
+    use super::*;
+    use std::sync::LazyLock;
+
+    static CRYPTO: LazyLock<RustCrypto> = LazyLock::new(RustCrypto::default);
+
+    pub(super) fn validate(
+        kp: openmls::prelude::KeyPackageIn,
+    ) -> Result<MlsKeyPackage, EngineError> {
+        validate_key_package(kp, &*CRYPTO)
+    }
+
+    pub(super) fn hash_ref(
+        kp: &MlsKeyPackage,
+    ) -> Result<openmls::prelude::KeyPackageRef, EngineError> {
+        kp.hash_ref(&*CRYPTO)
+            .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackageMetadata {
@@ -59,8 +72,6 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
     storage: &S,
     protocol_profile: ProtocolProfile,
 ) -> Result<Vec<KeyPackage>, EngineError> {
-    let crypto = &*VALIDATION_CRYPTO;
-    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
     let mut owned = Vec::new();
     let mut seen_references = std::collections::BTreeSet::new();
     let mut skipped = 0_usize;
@@ -69,12 +80,12 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
             skipped += 1;
             continue;
         };
-        let Ok(reference) = bundle.key_package().hash_ref(provider.crypto()) else {
+        let Ok(reference) = validation_crypto::hash_ref(bundle.key_package()) else {
             skipped += 1;
             continue;
         };
         let Ok(Some(persisted_bundle)) = OpenMlsStorageProvider::key_package::<_, KeyPackageBundle>(
-            provider.storage(),
+            storage.mls_storage(),
             &reference,
         ) else {
             skipped += 1;
@@ -124,8 +135,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
             ));
         }
     };
-    let crypto = &*VALIDATION_CRYPTO;
-    let key_package = validate_key_package(kp_in, crypto)?;
+    let key_package = validation_crypto::validate(kp_in)?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // Validate the account-identity proof against the KeyPackage's OWN
     // ciphersuite, matching `parse_key_package` (mdk#747). `DEFAULT_CIPHERSUITE`
@@ -139,9 +149,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     ensure_key_package_profile(kp, protocol_profile)?;
     let capabilities =
         crate::capabilities::advertised_capabilities_of_leaf(key_package.leaf_node());
-    let key_package_ref = key_package
-        .hash_ref(crypto)
-        .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
+    let key_package_ref = validation_crypto::hash_ref(&key_package)?;
     Ok(KeyPackageMetadata {
         key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
         credential_identity_hex: hex::encode(member_id.as_slice()),
@@ -169,8 +177,7 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
             ));
         }
     };
-    let crypto = &*VALIDATION_CRYPTO;
-    let key_package = validate_key_package(kp_in, crypto)?;
+    let key_package = validation_crypto::validate(kp_in)?;
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // See `key_package_metadata`: validate against the KeyPackage's own
     // ciphersuite, not `DEFAULT_CIPHERSUITE` (mdk#747).
@@ -448,7 +455,7 @@ fn parse_invitation_key_package(kp: &KeyPackage) -> Result<MlsKeyPackage, Engine
         }
     };
 
-    let key_package = validate_key_package(kp_in, &*VALIDATION_CRYPTO)?;
+    let key_package = validation_crypto::validate(kp_in)?;
     // foundation/key-packages.md: reject a KeyPackage whose credential
     // identity is not a valid Marmot account identity. This single gate
     // covers both the create-group and invite invitee paths.

@@ -588,6 +588,27 @@ the actual group's requirements. Device-aware delivery in
 [MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
 replacement for this temporary client ranking.
 
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, and
+`secretStore` in `Marmot.newWithConfiguration`. Each field is optional in generated
+Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
+an omitted label stays untagged and omitted storage uses the platform keychain.
+Existing constructors keep their signatures and delegate to this same configuration
+path. Use the options constructor when combining a label with a custom relay policy.
+C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
+struct; zero initialization selects the same defaults. Use the matching header
+and library for that struct's layout.
+
+```swift
+let options = MarmotOptions(clientName: "whitenoise")
+let marmot = try Marmot.newWithConfiguration(
+    rootPath: rootPath, relayUrls: relayUrls, options: options
+)
+```
+
+Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
+and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
+./crates/marmot-uniffi/options-smoke.sh kotlin`.
+
 Host applications opt into public tagging at construction. Existing constructors
 remain untagged. Swift hosts can use:
 

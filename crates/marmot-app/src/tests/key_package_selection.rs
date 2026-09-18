@@ -49,19 +49,20 @@ async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency(
     let select = |events: Vec<NostrTransportEvent>| {
         preferred_fresh_key_package_from_records(
             &account.account_id_hex,
-            events
+            &events
                 .into_iter()
                 .map(|event| RelayEventRecord {
                     event,
                     endpoints: vec![],
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             app.directory_freshness(),
             None,
         )
         .unwrap()
         .value
         .unwrap()
+        .fetched
         .key_package_event_id
     };
     assert_eq!(select(vec![amethyst.clone()]), amethyst.id);
@@ -149,13 +150,13 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
     let select = |events: Vec<NostrTransportEvent>| {
         preferred_fresh_key_package_from_records(
             &account.account_id_hex,
-            events
+            &events
                 .into_iter()
                 .map(|event| RelayEventRecord {
                     event,
                     endpoints: vec![],
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             app.directory_freshness(),
             None,
         )
@@ -168,6 +169,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
                 .unwrap()
                 .value
                 .unwrap()
+                .fetched
                 .key_package_event_id,
             fallback.id,
         );
@@ -181,6 +183,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
                 .unwrap()
                 .value
                 .unwrap()
+                .fetched
                 .key_package_event_id,
             old.id,
         );

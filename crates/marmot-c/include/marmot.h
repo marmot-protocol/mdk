@@ -1159,6 +1159,30 @@ typedef struct MarmotSecretStore {
 } MarmotSecretStore;
 
 /**
+ * Borrowed construction options. Zero initialization selects public-only
+ * endpoints, an advancing cursor, no client label, and the platform keychain.
+ * Use this struct only with the matching header/library version.
+ */
+typedef struct MarmotClientOptions {
+  /**
+   * A MarmotRelayPolicy discriminant.
+   */
+  uint32_t relay_policy;
+  /**
+   * A MarmotCursorPersistence discriminant.
+   */
+  uint32_t cursor_persistence;
+  /**
+   * Optional UTF-8 label; NULL or blank omits the public tag.
+   */
+  const char *client_name;
+  /**
+   * Optional callback store; NULL selects the platform keychain.
+   */
+  const struct MarmotSecretStore *store;
+} MarmotClientOptions;
+
+/**
  * One storage locator for an encrypted attachment.
  */
 typedef struct MarmotMediaLocator {
@@ -4971,6 +4995,22 @@ MarmotStatus marmot_client_new_with_client_name(const char *root_path,
                                                 uint32_t cursor_persistence,
                                                 const struct MarmotSecretStore *store,
                                                 struct MarmotClient **out_client);
+
+/**
+ * Create a client with combined relay, cursor, label and secret-storage options.
+ * NULL options uses defaults. Store ownership transfers only on success, with
+ * the same callback lifetime contract as marmot_client_new_with_secret_store.
+ *
+ * # Safety
+ * Same root, relay and output pointer contracts as marmot_client_new.
+ * Non-NULL options must point to a readable MarmotClientOptions for this call;
+ * its label and store pointers obey marmot_client_new_with_client_name's contract.
+ */
+MarmotStatus marmot_client_new_with_configuration(const char *root_path,
+                                                  const char *const *relay_urls,
+                                                  uintptr_t relay_urls_len,
+                                                  const struct MarmotClientOptions *options,
+                                                  struct MarmotClient **out_client);
 
 /**
  * Start the runtime (reconcile accounts, start workers, subscribe
