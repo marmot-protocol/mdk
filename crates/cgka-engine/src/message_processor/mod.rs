@@ -51,6 +51,15 @@ pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 
+// Retained commits supply fork context even when their state cannot gate sends.
+const GATE_CLASSIFIER_STATES: [MessageState; 5] = [
+    MessageState::Sent,
+    MessageState::Created,
+    MessageState::Retryable,
+    MessageState::ConvergenceDeferred,
+    MessageState::Processed,
+];
+
 /// Retry budget for a `PeelDeferred` row (mdk#339). Each unit is one
 /// actual re-peel attempt under a *changed* peel context (the fingerprint
 /// gate skips unchanged contexts entirely), so a legitimate future-epoch
@@ -1615,7 +1624,11 @@ impl<S: StorageProvider> Engine<S> {
         )? {
             return Ok(false);
         }
-        let records = self.storage.list_messages(group_id, EpochId(anchor))?;
+        let records = self.storage.list_messages_in_states(
+            group_id,
+            &GATE_CLASSIFIER_STATES,
+            EpochId(anchor),
+        )?;
         Ok(self.any_gating_convergence_input(anchor, ceiling, &records))
     }
 
@@ -1694,14 +1707,8 @@ impl<S: StorageProvider> Engine<S> {
             if record.epoch.0 < anchor {
                 continue;
             }
-            if !matches!(
-                record.state,
-                MessageState::Sent
-                    | MessageState::Created
-                    | MessageState::Retryable
-                    | MessageState::ConvergenceDeferred
-                    | MessageState::Processed
-            ) {
+            // Hydration also calls this classifier with an unfiltered list.
+            if !GATE_CLASSIFIER_STATES.contains(&record.state) {
                 continue;
             }
             // Fail OPEN, not closed (mdk#736): a row we cannot decode, is not an

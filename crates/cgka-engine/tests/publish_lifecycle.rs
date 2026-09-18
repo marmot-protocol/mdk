@@ -339,6 +339,95 @@ async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() 
 }
 
 #[tokio::test]
+async fn send_gate_filters_stored_rows() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let message_rows = Arc::new(AtomicUsize::new(0));
+    let mut alice = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        message_rows: message_rows.clone(),
+        fault: ProcessedFault::default(),
+        lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: ProcessedFault::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"alice"))
+    .account_identity_proof_signer(proof_signer(b"alice"))
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "send gate".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+    let SendResult::GroupEvolution { msg, pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected self-update commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let mut record = storage.get_message(&msg.id).unwrap();
+    for existing in storage.list_messages(&group_id, EpochId(0)).unwrap() {
+        storage.delete_message(&existing.id).unwrap();
+    }
+    let states = [
+        MessageState::Sent,
+        MessageState::Created,
+        MessageState::Retryable,
+        MessageState::ConvergenceDeferred,
+        MessageState::Processed,
+    ];
+    for (index, state) in states.into_iter().enumerate() {
+        record.id = MessageId::new(format!("gate-{index}").into_bytes());
+        record.state = state;
+        storage.put_message(&record).unwrap();
+    }
+    // Processed rows remain necessary fork context; unrelated states do not.
+    for index in 0..1_000 {
+        for state in [
+            MessageState::Processed,
+            MessageState::Failed,
+            MessageState::EpochInvalidated,
+            MessageState::PeelDeferred,
+        ] {
+            record.id = MessageId::new(format!("history-{state:?}-{index}").into_bytes());
+            record.state = state;
+            storage.put_message(&record).unwrap();
+        }
+    }
+    assert_eq!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap().len(),
+        4_005
+    );
+    message_rows.store(0, Ordering::SeqCst);
+    assert!(alice.has_pending_convergence_inputs(&group_id).unwrap());
+    assert_eq!(message_rows.load(Ordering::SeqCst), 1_005);
+
+    for index in [1, 2] {
+        storage
+            .delete_message(&MessageId::new(format!("gate-{index}").into_bytes()))
+            .unwrap();
+    }
+    message_rows.store(0, Ordering::SeqCst);
+    assert!(!alice.has_pending_convergence_inputs(&group_id).unwrap());
+    assert_eq!(message_rows.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn current_group_creation_persists_automatic_maintenance_enrollment() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut alice = EngineBuilder::new(storage.clone())
@@ -990,6 +1079,7 @@ impl ProcessedFault {
 /// confirm-path `Processed` write. Every other call delegates unchanged.
 struct FaultStorage {
     inner: SqliteAccountStorage,
+    message_rows: Arc<AtomicUsize>,
     fault: ProcessedFault,
     lifecycle_fault: ProcessedFault,
     disband_request_fault: ProcessedFault,
@@ -1035,7 +1125,30 @@ impl MessageStorage for FaultStorage {
         group_id: &GroupId,
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>> {
-        self.inner.list_messages(group_id, at_or_after_epoch)
+        let records = self.inner.list_messages(group_id, at_or_after_epoch)?;
+        self.message_rows.fetch_add(records.len(), Ordering::SeqCst);
+        Ok(records)
+    }
+    fn has_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<bool> {
+        self.inner
+            .has_messages_in_states(group_id, states, at_or_after_epoch)
+    }
+    fn list_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        let records = self
+            .inner
+            .list_messages_in_states(group_id, states, at_or_after_epoch)?;
+        self.message_rows.fetch_add(records.len(), Ordering::SeqCst);
+        Ok(records)
     }
     fn put_pending_application_event(
         &self,
@@ -1526,6 +1639,7 @@ fn build_fault_engine(
     let inner = SqliteAccountStorage::in_memory().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage {
+        message_rows: Arc::default(),
         inner,
         fault,
         lifecycle_fault: ProcessedFault::default(),
@@ -1548,6 +1662,7 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
     let handle = inner.clone();
     let disband_request_fault = ProcessedFault::default();
     let mut alice = EngineBuilder::new(FaultStorage {
+        message_rows: Arc::default(),
         inner,
         fault: ProcessedFault::default(),
         lifecycle_fault: ProcessedFault::default(),
@@ -1636,6 +1751,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     let handle = inner.clone();
     let lifecycle_fault = ProcessedFault::default();
     let mut engine = EngineBuilder::new(FaultStorage {
+        message_rows: Arc::default(),
         inner,
         fault: ProcessedFault::default(),
         lifecycle_fault: lifecycle_fault.clone(),
@@ -2172,6 +2288,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
         let inner = SqliteAccountStorage::in_memory().unwrap();
         let queued_intent_list_fault = ProcessedFault::default();
         let mut alice = EngineBuilder::new(FaultStorage {
+            message_rows: Arc::default(),
             inner,
             fault: ProcessedFault::default(),
             lifecycle_fault: ProcessedFault::default(),
@@ -2241,6 +2358,7 @@ async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
     let queued_intent_list_fault = ProcessedFault::default();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut alice = EngineBuilder::new(FaultStorage {
+        message_rows: Arc::default(),
         inner,
         fault: ProcessedFault::default(),
         lifecycle_fault: ProcessedFault::default(),
