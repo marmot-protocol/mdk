@@ -56,6 +56,7 @@ fn resume_context(
     reference: &crate::MediaAttachmentReference,
 ) -> AttachmentResume {
     AttachmentResume {
+        automatic: true,
         updates: None,
         storage: store.clone(),
         job: job.clone(),
@@ -1131,7 +1132,7 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
         } else {
             store.cancel_attachment_acquisition(&asset).unwrap();
         }
-        shared.attachment_updates.send_modify(|_| {});
+        shared.attachment_cancellations.send_modify(|_| {});
         let done = tokio::time::timeout(Duration::from_secs(3), completions.recv())
             .await
             .unwrap()

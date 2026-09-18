@@ -170,6 +170,11 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
 
 #[tokio::test]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
+    download_without_engine_and_retain(false).await;
+    download_without_engine_and_retain(true).await;
+}
+
+async fn download_without_engine_and_retain(explicit: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
@@ -268,6 +273,23 @@ async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_
         admission.is_waiting(),
         "eligible job must queue for global capacity"
     );
+    if explicit {
+        let now = crate::unix_now_seconds();
+        let asset = storage
+            .attachment_transfer_candidates(now, 1, true)
+            .unwrap()
+            .remove(0);
+        storage.explicitly_retry_attachment(&asset, now).unwrap();
+        let mut policy =
+            super::super::super::attachment_controls::default_policy(&client.app.config);
+        policy.automatic = false;
+        // Enough quota for the default admission reservation, but not the
+        // explicit 512 MiB ceiling. A tiny explicit file must still finish.
+        policy.retained_bytes = policy.transfer_limit;
+        storage
+            .set_attachment_download_policy(&policy, now)
+            .unwrap();
+    }
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
     assert_eq!(shared.attachment_transfer.available_permits(), 0);
@@ -534,7 +556,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
 mod resume;
 
 #[tokio::test]
-async fn attachment_worker_budget_pause_does_not_consume_attempts() {
+async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     let (_dir, mut client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
     admit_demands(&store, now, false).unwrap();
@@ -545,7 +567,8 @@ async fn attachment_worker_budget_pause_does_not_consume_attempts() {
         .attachment_acquisition
         .as_mut()
         .unwrap()
-        .retained_bytes_per_account = 1;
+        .minimum_free_disk_bytes =
+        i64::MAX as u64 - 4 * crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
     let (http, _rx) = context();
     let shared = RuntimeSharedServices::default();
     let mut admission = Admission::default();
@@ -558,5 +581,14 @@ async fn attachment_worker_budget_pause_does_not_consume_attempts() {
         .unwrap();
     assert_eq!(status.attempts, 0);
     assert!(status.due.unwrap() > now);
+    let progress = store
+        .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        progress.state,
+        storage_sqlite::AttachmentTransferState::RetryScheduled
+    );
+    assert_eq!(progress.retry_at, status.due);
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
 }

@@ -171,15 +171,18 @@ Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::defa
 | Policy | Default |
 | --- | --- |
 | Retained plaintext per account | 2 GiB, no eviction |
-| Free disk reserve | 256 MiB, plus four maximum-size objects for SQLite/WAL overhead |
+| Free disk reserve | 256 MiB, plus four admission-sized objects for SQLite/WAL overhead |
 | Automatic ciphertext ceiling | 64 MiB, enforced during streaming, including chunked bodies |
 | Concurrent automatic transfers | One across accounts in a runtime |
 
 `MarmotAppConfig::attachment_acquisition` defaults to `Some(default_policy)`. Rust callers may
 supply `None` to disable the fallback. Durable per-account policy overrides that fallback;
 native hosts can read and set it without starting the runtime. Frozen/NSE runtimes skip acquisition. Explicit
-foreground downloads retain their 512 MiB ciphertext cap. Admission reserves a full
-maximum-size object against quota, so a final smaller remainder can stay unused.
+downloads retain their 512 MiB ciphertext cap. Admission reserves the configured automatic
+transfer limit (64 MiB by default) against quota, including explicit queued requests whose
+references have no declared size. This avoids requiring 512 MiB of unused quota for tiny
+explicit files. Checkpoint and publication checks enforce actual quota and disk use as files
+grow; a final remainder below the admission reservation can still stay unused.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 
@@ -188,7 +191,10 @@ policy/secrets defer one candidate for 15 seconds before claiming it; no transfe
 is consumed and due siblings keep their deadlines. Integrity/decryption failures,
 publication digest mismatches and over-limit responses require explicit retry;
 locator failover still runs, and a remaining transient candidate keeps the attempt retryable.
-Three-minute leases cover a two-minute acquisition transfer deadline and publication margin.
+Automatic transfers use three-minute leases around a two-minute transfer deadline.
+Explicit queued transfers retain the 15-minute media deadline with a 20-minute lease.
+A running automatic attempt promoted to explicit keeps its current deadline; subsequent
+attempts use the explicit policy.
 A 30-second body-idle deadline releases stalled transfers; explicit legacy downloads retain their existing deadline.
 Worker exit cancels active HTTP and releases permits. Before scheduling any transfer,
 a new exclusive account worker reclaims abandoned fetching attempts in batches of 64;
@@ -312,14 +318,21 @@ preserves explicit requests and cached bytes. Re-enabling never clears cancellat
 Native snapshot and subscription targets are bounded to 64 original slots. Replacement snapshots
 are coalesced to at most four per second; they include states, a transfer generation, received/known
 total ciphertext bytes, optional retry time and an opaque job reference. Verification phases precede
-Ready; only verified plaintext is exposed by local byte reads. A new HTTP body explicitly advances
-the generation before resetting counters. Metadata write failures cannot mask integrity failures.
+Ready; only verified plaintext is exposed by local byte reads. Claim advances the generation
+and clears counters before HTTP starts; a later body restart or locator fallback advances it
+again. The first body belongs to the claimed generation. Metadata write failures cannot mask
+integrity failures. Progress notifications do not wake the cancellation monitor; a separate
+control signal interrupts it immediately, with a one-second fallback for cross-writer changes.
+Visible subscriptions also refresh once per second for expiry and cross-writer updates.
 
 Explicit requests precede automatic work, and recent incoming sources precede older backfill.
 The global one-transfer permit uses FIFO account admission. Transfer/idle deadlines prevent a
 stalled server retaining that slot indefinitely. Raising the automatic cap readmits size-policy
 failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy
-values are rejected before mutation, and invalid Rust policy is rejected at runtime start.
+values, including a quota smaller than the admission reservation, are rejected before mutation,
+and invalid Rust policy is rejected at runtime start. Disk reserves may intentionally exceed
+current free space; resource pressure is exposed as RetryScheduled with a retry time, without
+spending a transfer attempt or evicting existing bytes.
 
 Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
 not establish mobile throughput or background execution entitlement. See the native usage guide.

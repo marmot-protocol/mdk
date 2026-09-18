@@ -10,7 +10,7 @@ pub struct AttachmentDownloadPolicy {
 }
 impl AttachmentDownloadPolicy {
     pub fn validate(&self) -> StorageResult<()> {
-        if self.retained_bytes == 0
+        if self.retained_bytes < self.transfer_limit
             || self.retained_bytes > i64::MAX as u64
             || self.disk_reserve
                 > (i64::MAX as u64).saturating_sub(4 * MAX_RETAINED_ATTACHMENT_BYTES as u64)
@@ -43,7 +43,7 @@ pub enum AttachmentTransferState {
 pub struct AttachmentTransferStatus {
     pub reference: Option<AttachmentAssetRef>,
     pub state: AttachmentTransferState,
-    /// Changes whenever a new HTTP body starts (including locator fallback).
+    /// Changes on claim and later HTTP-body restarts (including locator fallback).
     pub attempt: u64,
     pub received: u64,
     pub total: Option<u64>,
@@ -248,7 +248,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !partial::valid_attempt(&conn,job,now)? {return Ok(false);}
-            Ok(conn.execute("UPDATE attachment_acquisition SET progress_epoch=progress_epoch+?2,progress_received=?3,progress_total=?4,progress_phase=?5
+            Ok(conn.execute("UPDATE attachment_acquisition SET progress_epoch=progress_epoch+CASE WHEN ?2 AND progress_phase<>0 THEN 1 ELSE 0 END,progress_received=?3,progress_total=?4,progress_phase=?5
                 WHERE token=?1 AND (?2 OR progress_received<=?3)",params![job.reference.token,restart,u64_to_i64(received)?,total.map(u64_to_i64).transpose()?,phase]).storage()?==1)
         })
     }
@@ -273,15 +273,33 @@ impl SqliteAccountStorage {
             let removed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",params![group,message,index],|r|r.get(0)).storage()?;
             let status=conn.query_row(&format!("SELECT token,state,cancelled,explicit_request,size_blocked_max,progress_epoch,progress_received,progress_total,progress_phase,due
                 FROM attachment_acquisition q WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND {SOURCE_MATCH}"),params![group,message,source,index],|r| {
-                let state=r.get::<_,u8>(1)?;
-                let cancelled=r.get::<_,bool>(2)?;
-                let explicit=r.get::<_,bool>(3)?;
-                let size_blocked=r.get::<_,Option<i64>>(4)?.is_some();
-                let phase=r.get::<_,u8>(8)?;
-                let state=if state==3 {AttachmentTransferState::Ready} else if cancelled {AttachmentTransferState::Cancelled}
-                    else if size_blocked {AttachmentTransferState::PolicyBlocked} else if state==4 {AttachmentTransferState::Failed} else if !automatic && !explicit {AttachmentTransferState::Paused}
-                    else {match state {0=>AttachmentTransferState::Queued,1=>match phase {2=>AttachmentTransferState::VerifyingCiphertext,3=>AttachmentTransferState::Decrypting,4=>AttachmentTransferState::VerifyingPlaintext,_=>AttachmentTransferState::Downloading},2=>AttachmentTransferState::RetryScheduled,5=>AttachmentTransferState::Paused,_=>AttachmentTransferState::Failed}};
-                Ok((r.get::<_,Vec<u8>>(0)?,state,nonnegative(r,5)?,nonnegative(r,6)?,r.get::<_,Option<i64>>(7)?.map(|v|v as u64),r.get::<_,Option<i64>>(9)?.map(|v|v as u64)))
+                let stored_state = r.get::<_,u8>(1)?;
+                let cancelled = r.get::<_,bool>(2)?;
+                let explicit = r.get::<_,bool>(3)?;
+                let size_blocked = r.get::<_,Option<i64>>(4)?.is_some();
+                let phase = r.get::<_,u8>(8)?;
+                let state = match stored_state {
+                    3 => AttachmentTransferState::Ready,
+                    _ if cancelled => AttachmentTransferState::Cancelled,
+                    _ if size_blocked => AttachmentTransferState::PolicyBlocked,
+                    4 => AttachmentTransferState::Failed,
+                    _ if !automatic && !explicit => AttachmentTransferState::Paused,
+                    0 => AttachmentTransferState::Queued,
+                    1 => match phase {
+                        2 => AttachmentTransferState::VerifyingCiphertext,
+                        3 => AttachmentTransferState::Decrypting,
+                        4 => AttachmentTransferState::VerifyingPlaintext,
+                        _ => AttachmentTransferState::Downloading,
+                    },
+                    2 => AttachmentTransferState::RetryScheduled,
+                    5 => AttachmentTransferState::Paused,
+                    _ => AttachmentTransferState::Failed,
+                };
+                Ok((
+                    r.get::<_,Vec<u8>>(0)?, state, nonnegative(r,5)?, nonnegative(r,6)?,
+                    r.get::<_,Option<i64>>(7)?.map(|v|v as u64),
+                    r.get::<_,Option<i64>>(9)?.map(|v|v as u64),
+                ))
             }).optional().storage()?;
             Ok(Some(match status {
                 Some((token,state,attempt,received,total,retry_at))=>AttachmentTransferStatus {reference:Some(AttachmentAssetRef{store_epoch:epoch(&conn)?,token}),state,attempt,received,total,retry_at:if state==AttachmentTransferState::RetryScheduled {retry_at}else{None}},

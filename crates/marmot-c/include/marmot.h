@@ -780,6 +780,23 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_LAST_MESSAGE_CONTENT_CHANGED,
 } MarmotChatListUpdateTrigger;
 
+typedef enum MarmotAttachmentTransferState {
+  MARMOT_ATTACHMENT_TRANSFER_STATE_UNAVAILABLE,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_NOT_REQUESTED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_QUEUED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_DOWNLOADING,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_CIPHERTEXT,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_DECRYPTING,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_PLAINTEXT,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_READY,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_SCHEDULED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_FAILED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_CANCELLED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_PAUSED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_REMOVED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
+} MarmotAttachmentTransferState;
+
 typedef enum MarmotChatListView {
   MARMOT_CHAT_LIST_VIEW_CHATS,
   MARMOT_CHAT_LIST_VIEW_UNREAD,
@@ -812,23 +829,6 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_NEXT,
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
-
-typedef enum MarmotAttachmentTransferState {
-  MARMOT_ATTACHMENT_TRANSFER_STATE_UNAVAILABLE,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_NOT_REQUESTED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_QUEUED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_DOWNLOADING,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_CIPHERTEXT,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_DECRYPTING,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_PLAINTEXT,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_READY,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_SCHEDULED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_FAILED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_CANCELLED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_PAUSED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_REMOVED,
-  MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
-} MarmotAttachmentTransferState;
 
 typedef enum MarmotAttachmentControl {
   MARMOT_ATTACHMENT_CONTROL_CANCEL,
@@ -4715,6 +4715,28 @@ typedef struct MarmotBlockListSnapshot {
  */
 typedef void (*MarmotBlockListCallback)(const struct MarmotBlockListSnapshot *item, void *user_data);
 
+typedef struct MarmotAttachmentTransferStatus {
+  char *reference;
+  enum MarmotAttachmentTransferState state;
+  uint64_t attempt;
+  uint64_t received;
+  bool has_total;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t total;
+  bool has_retry_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retry_at;
+} MarmotAttachmentTransferStatus;
+
+typedef struct MarmotAttachmentTransferSnapshot {
+  struct MarmotAttachmentTransferStatus *items;
+  uintptr_t items_len;
+} MarmotAttachmentTransferSnapshot;
+
 typedef enum MarmotChatListAnchorOutcome_Tag {
   MARMOT_CHAT_LIST_ANCHOR_OUTCOME_TOP,
   MARMOT_CHAT_LIST_ANCHOR_OUTCOME_RETAINED,
@@ -4951,28 +4973,6 @@ typedef struct MarmotConversationWindowSnapshot {
   bool has_more_before;
   bool has_more_after;
 } MarmotConversationWindowSnapshot;
-
-typedef struct MarmotAttachmentTransferStatus {
-  char *reference;
-  enum MarmotAttachmentTransferState state;
-  uint64_t attempt;
-  uint64_t received;
-  bool has_total;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t total;
-  bool has_retry_at;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t retry_at;
-} MarmotAttachmentTransferStatus;
-
-typedef struct MarmotAttachmentTransferSnapshot {
-  struct MarmotAttachmentTransferStatus *items;
-  uintptr_t items_len;
-} MarmotAttachmentTransferSnapshot;
 
 typedef struct MarmotAttachmentDownloadPolicy {
   bool automatic;
@@ -9415,6 +9415,42 @@ MarmotStatus marmot_block_list_subscription_snapshot(const struct MarmotBlockLis
                                                      struct MarmotBlockListSnapshot **out);
 
 /**
+ * Open a bounded progress stream. First next returns the initial snapshot.
+ * # Safety
+ * Inputs must be live, targets NULL only with zero length, out writable.
+ */
+MarmotStatus marmot_subscribe_attachment_transfers(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const char *group_id_hex,
+                                                   const struct MarmotAttachmentLocalTarget *targets,
+                                                   uintptr_t targets_len,
+                                                   struct MarmotAttachmentTransferSubscription **out);
+
+/**
+ * Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely.
+ * Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free.
+ * # Safety
+ * Sub must be live and out writable. Use one receiver per handle.
+ */
+MarmotStatus marmot_attachment_transfer_subscription_next(const struct MarmotAttachmentTransferSubscription *sub,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotAttachmentTransferSnapshot **out);
+
+/**
+ * Close observation and wake receivers. Does not cancel downloads.
+ * # Safety
+ * Sub must remain live throughout the call.
+ */
+MarmotStatus marmot_attachment_transfer_subscription_cancel(const struct MarmotAttachmentTransferSubscription *sub);
+
+/**
+ * NULL-safe free. Already returned snapshots remain separately owned.
+ * # Safety
+ * Sub must be NULL or library-owned with no active calls.
+ */
+void marmot_attachment_transfer_subscription_free(struct MarmotAttachmentTransferSubscription *sub);
+
+/**
  * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
  * # Safety
  * sub must be live and out writable.
@@ -9686,42 +9722,6 @@ MarmotStatus marmot_send_message_draft(const struct MarmotClient *client,
                                        const struct MarmotMediaAttachmentReference *attachments,
                                        uintptr_t attachments_len,
                                        struct MarmotSendSummary **out);
-
-/**
- * Open a bounded progress stream. First next returns the initial snapshot.
- * # Safety
- * Inputs must be live, targets NULL only with zero length, out writable.
- */
-MarmotStatus marmot_subscribe_attachment_transfers(const struct MarmotClient *client,
-                                                   const char *account_ref,
-                                                   const char *group_id_hex,
-                                                   const struct MarmotAttachmentLocalTarget *targets,
-                                                   uintptr_t targets_len,
-                                                   struct MarmotAttachmentTransferSubscription **out);
-
-/**
- * Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely.
- * Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free.
- * # Safety
- * Sub must be live and out writable. Use one receiver per handle.
- */
-MarmotStatus marmot_attachment_transfer_subscription_next(const struct MarmotAttachmentTransferSubscription *sub,
-                                                          uint32_t timeout_ms,
-                                                          struct MarmotAttachmentTransferSnapshot **out);
-
-/**
- * Close observation and wake receivers. Does not cancel downloads.
- * # Safety
- * Sub must remain live throughout the call.
- */
-MarmotStatus marmot_attachment_transfer_subscription_cancel(const struct MarmotAttachmentTransferSubscription *sub);
-
-/**
- * NULL-safe free. Already returned snapshots remain separately owned.
- * # Safety
- * Sub must be NULL or library-owned with no active calls.
- */
-void marmot_attachment_transfer_subscription_free(struct MarmotAttachmentTransferSubscription *sub);
 
 /**
  * Free a value of this type returned by this library. NULL

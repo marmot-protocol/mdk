@@ -7,6 +7,7 @@ use storage_sqlite::{AttachmentAcquisition, AttachmentPublishResult, SqliteAccou
 const DEMAND_BATCH: usize = 32;
 // Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
 const LEASE_SECONDS: u64 = 3 * 60;
+const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -167,16 +168,25 @@ pub(super) fn schedule(
         return Ok(more);
     };
     for candidate in candidates {
-        let max = if storage.attachment_request_is_explicit(&candidate)? {
+        let explicit = storage.attachment_request_is_explicit(&candidate)?;
+        let max = if explicit {
             crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
         } else {
             policy.transfer_limit
         };
-        if !capacity(&policy, max, free) {
+        // References do not declare a trustworthy size. Reserve the configured
+        // automatic-sized object even for explicit work, then enforce actual
+        // checkpoint/publication capacity as the transfer grows.
+        let reservation = policy.transfer_limit;
+        if !capacity(&policy, reservation, free) {
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
             continue;
         }
-        if !storage.attachment_acquisition_fits_budget(&candidate, max, policy.retained_bytes)? {
+        if !storage.attachment_acquisition_fits_budget(
+            &candidate,
+            reservation,
+            policy.retained_bytes,
+        )? {
             // Defer without spending an attempt. This also lets reserved prefixes
             // beyond the bounded candidate page reach the worker under pressure.
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
@@ -225,7 +235,11 @@ pub(super) fn schedule(
         let Some(job) = storage.claim_attachment_acquisition(
             &candidate,
             now,
-            now.saturating_add(LEASE_SECONDS),
+            now.saturating_add(if explicit {
+                EXPLICIT_LEASE_SECONDS
+            } else {
+                LEASE_SECONDS
+            }),
         )?
         else {
             continue;
@@ -238,12 +252,13 @@ pub(super) fn schedule(
             budget: byte_budget,
             directory: client.app.account_dir(&client.state.label),
             disk_reserve: policy.disk_reserve,
+            automatic: !explicit,
             updates: Some(shared.attachment_updates.clone()),
         };
         let cancel = cancelled(
             storage.clone(),
             job.clone(),
-            shared.attachment_updates.subscribe(),
+            shared.attachment_cancellations.subscribe(),
         );
         let updates = shared.attachment_updates.clone();
         updates.send_modify(|_| {});

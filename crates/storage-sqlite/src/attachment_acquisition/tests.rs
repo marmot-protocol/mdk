@@ -1713,3 +1713,60 @@ fn attachment_promoted_explicit_transfer_retries_with_full_limit_after_old_cap()
         AttachmentTransferState::Queued
     );
 }
+
+#[test]
+fn attachment_retry_claim_resets_progress_before_any_response_body() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "retry-progress");
+    let asset = request(&store, "retry-progress");
+    let old = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .update_attachment_progress(&old, 13, 1, 8, Some(12), true)
+        .unwrap();
+    let previous = transfer(&store, "retry-progress", true);
+    store.fail_attachment_acquisition(&old, Some(14)).unwrap();
+    let current = store
+        .claim_attachment_acquisition(&asset, 14, 100)
+        .unwrap()
+        .unwrap();
+    let claimed = transfer(&store, "retry-progress", true);
+    assert_eq!(claimed.state, AttachmentTransferState::Downloading);
+    assert!(
+        claimed.attempt > previous.attempt,
+        "claim must identify the new attempt before HTTP starts"
+    );
+    assert_eq!((claimed.received, claimed.total), (0, None));
+    store
+        .update_attachment_progress(&current, 15, 1, 8, Some(12), true)
+        .unwrap();
+    let resumed = transfer(&store, "retry-progress", true);
+    assert_eq!(
+        resumed.attempt, claimed.attempt,
+        "first body belongs to the claimed generation"
+    );
+    assert_eq!(resumed.received, 8);
+    store
+        .update_attachment_progress(&current, 16, 1, 0, None, true)
+        .unwrap();
+    assert!(
+        transfer(&store, "retry-progress", true).attempt > resumed.attempt,
+        "locator fallback explicitly resets generation"
+    );
+}
+
+#[test]
+fn attachment_policy_rejects_quota_smaller_than_admission_without_mutating() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let original = policy(true, 64);
+    store.set_attachment_download_policy(&original, 12).unwrap();
+    let mut invalid = original.clone();
+    invalid.retained_bytes = 63;
+    assert!(store.set_attachment_download_policy(&invalid, 13).is_err());
+    assert_eq!(
+        store.attachment_download_policy(&original).unwrap(),
+        original
+    );
+}

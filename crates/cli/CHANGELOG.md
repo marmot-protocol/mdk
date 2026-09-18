@@ -17,29 +17,35 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Attachment acquisition now defaults on for accepted conversations, with durable
+  per-account policy and native cancel, retry, remove, and download-again controls.
+  Bounded Swift/Kotlin and C snapshots/subscriptions report progress and verification
+  phases. Disabling automatic work preserves explicit downloads and retained files;
+  cancellation survives restart. Admission remains bounded by quota, disk reserve,
+  and one transfer across accounts. Regenerate bindings before client adoption.
+
 - Native attachment availability and bounded local reads let hosts reuse verified
   MDK-retained media without network requests or engine readiness. Source/account
   checks apply to each read; no partial ciphertext is exposed. Swift/Kotlin and C
-  APIs are additive; progress/controls and default acquisition enablement follow.
+  APIs are additive; the controls below share the same durable acquisition store.
 
-- Opt-in attachment acquisition resumes interrupted downloads from protected ciphertext
+- Attachment acquisition resumes interrupted downloads from protected ciphertext
   checkpoints when a server supplies a strong ETag and valid HTTP Range responses.
   Account/source/attempt fences and combined storage budgets protect checkpoint reuse;
   incompatible responses restart safely and full authentication precedes publication.
-  Native progress controls and default enablement remain follow-up work.
 
-- Opt-in Rust attachment acquisition for accepted conversations, including retained
+- Rust attachment acquisition for accepted conversations, including retained
   history, without opening a chat screen. Durable discovery and retry state survive
   restart; verified bytes remain in SQLCipher until source deletion/expiry or explicit
   removal. Defaults: 2 GiB per account, 256 MiB free disk reserve plus write overhead,
   one transfer across accounts and a 64 MiB automatic transfer cap. Rust configuration
-  enables/tunes acquisition; native constructors stay off until removal
-  and policy controls land. Explicit downloads keep their existing limit.
+  tunes acquisition; native hosts can override policy per account. Explicit downloads
+  keep their existing limit.
 
 - Attachment retention storage foundation (migration 83): durable leased download
   jobs, restart-safe retries, protected local bytes and explicit-removal suppression
   that survives timeline repair. Capacity refusal preserves existing attachments.
-  Acquisition remains opt-in; native progress and controls follow.
+  Native progress and controls use this same store.
 
 - Bounded local attachment-history pages across Rust, Swift/Kotlin and C, with media
   categories, opaque cursors and change versions for authoritative removal/refresh.

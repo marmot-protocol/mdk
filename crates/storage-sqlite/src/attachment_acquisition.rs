@@ -492,6 +492,7 @@ impl SqliteAccountStorage {
             }
             conn.execute(
                 "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,
+                    progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
                     attempts=min(attempts+1,2147483647) WHERE token=?1",
                 params![reference.token, deadline],
             )

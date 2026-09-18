@@ -16,6 +16,7 @@ pub(crate) struct AttachmentResume {
     pub budget: u64,
     pub directory: PathBuf,
     pub disk_reserve: u64,
+    pub automatic: bool,
     pub updates: Option<tokio::sync::watch::Sender<()>>,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {

@@ -120,7 +120,9 @@ impl BlossomHttpTransport {
         mut self,
         resume: Arc<super::attachment_resume::AttachmentResume>,
     ) -> Self {
-        self.transfer_timeout = self.transfer_timeout.min(Duration::from_secs(120));
+        if resume.automatic {
+            self.transfer_timeout = self.transfer_timeout.min(Duration::from_secs(120));
+        }
         self.resume = Some(resume);
         self
     }

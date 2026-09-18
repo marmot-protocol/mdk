@@ -61,6 +61,7 @@ impl MarmotAppRuntime {
     }
     fn wake_attachment_work(&self) {
         self.shared.attachment_updates.send_modify(|_| {});
+        self.shared.attachment_cancellations.send_modify(|_| {});
         self.accounts.app.presentation_signals.wake();
     }
     /// Opaque job references come from transfer snapshots (including non-ready jobs).

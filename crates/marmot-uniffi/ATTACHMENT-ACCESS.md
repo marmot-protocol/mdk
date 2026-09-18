@@ -82,7 +82,7 @@ consume an update. Close/error/runtime shutdown ends observation. No transfer is
 Use state to distinguish unavailable source, not requested, queued, paused, downloading,
 verification, retry scheduled, failed, policy blocked, cancelled, removed and ready. `received`
 and optional `total` count ciphertext bytes, including a compatible resumed prefix. Never merge
-counters across `attempt` generations: a fresh body or locator fallback can restart at zero.
+counters across `attempt` generations: claim resets counters before HTTP starts, and later body restarts or locator fallback reset them again.
 Ready alone means complete cryptographic verification and local publication. Continue using
 local-asset lookup/ranged reads to obtain plaintext; always revalidate availability.
 
@@ -98,7 +98,11 @@ network readiness; acquisition needs an active, non-frozen account runtime.
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
 policy. Automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
-Explicit queued downloads use the existing 512 MiB hard limit and respect disk/quota admission.
+Explicit queued downloads use the existing 512 MiB hard limit and 15-minute transfer deadline.
+Initial disk/quota admission reserves the automatic cap (64 MiB by default), then checkpoint
+and publication checks enforce actual capacity. Automatic transfers have a two-minute deadline.
+Policy requires retained quota at least equal to the automatic cap. Resource pressure appears
+as `RetryScheduled` with a retry time; an intentionally high disk reserve can pause work.
 Disable stops active automatic work and pauses automatic queues; explicit work and cached files
 remain. Re-enable preserves individual cancellations/removals. No automatic retained-byte eviction.
 Raising the cap readmits size-policy failures, never cryptographic failures. The legacy
