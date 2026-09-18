@@ -575,14 +575,14 @@ impl SqliteAccountStorage {
                 .storage()?;
             let partial_used: u64 = conn
                 .query_row(
-                    "SELECT byte_count FROM attachment_partial_usage WHERE id=1",
+                    "SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1",
                     [],
                     |r| nonnegative(r, 0),
                 )
                 .storage()?;
             let own_partial: u64 = conn
                 .query_row(
-                    "SELECT coalesce((SELECT received FROM attachment_partial WHERE token=?1),0)",
+                    "SELECT coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",
                     [&job.reference.token],
                     |r| nonnegative(r, 0),
                 )

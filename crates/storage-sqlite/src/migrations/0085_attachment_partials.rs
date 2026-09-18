@@ -23,9 +23,19 @@ CREATE TABLE attachment_partial_chunk (
 );
 CREATE TABLE attachment_partial_usage (
  id INTEGER PRIMARY KEY CHECK(id=1),
- byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count>=0)
+ byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count>=0),
+ reserved_bytes INTEGER NOT NULL DEFAULT 0 CHECK(reserved_bytes>=0)
 );
 INSERT INTO attachment_partial_usage(id) VALUES(1);
+CREATE TRIGGER attachment_partial_reserved_added AFTER INSERT ON attachment_partial BEGIN
+ UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes+NEW.total WHERE id=1;
+END;
+CREATE TRIGGER attachment_partial_reserved_removed AFTER DELETE ON attachment_partial BEGIN
+ UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes-OLD.total WHERE id=1;
+END;
+CREATE TRIGGER attachment_partial_reserved_updated AFTER UPDATE OF total ON attachment_partial BEGIN
+ UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes-OLD.total+NEW.total WHERE id=1;
+END;
 CREATE TRIGGER attachment_partial_bytes_added AFTER INSERT ON attachment_partial_chunk BEGIN
  UPDATE attachment_partial_usage SET byte_count=byte_count+length(NEW.bytes) WHERE id=1;
 END;

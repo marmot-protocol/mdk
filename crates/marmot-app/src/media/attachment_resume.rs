@@ -31,18 +31,18 @@ impl AttachmentResume {
         max: u64,
     ) -> Result<Option<AttachmentPartial>, AttachmentDownloadFailure> {
         let this = self.clone();
-        let part = tokio::task::spawn_blocking(move || {
-            this.storage
-                .load_attachment_partial(&this.job, crate::unix_now_seconds(), max)
+        let locator_digest = Sha256::digest(url.as_str().as_bytes()).into();
+        tokio::task::spawn_blocking(move || {
+            this.storage.load_attachment_partial(
+                &this.job,
+                crate::unix_now_seconds(),
+                max,
+                Some((&this.ciphertext_digest, &locator_digest)),
+            )
         })
         .await
         .map_err(|_| retry("partial checkpoint task failed"))?
-        .map_err(|_| retry("partial checkpoint read failed"))?;
-        Ok(part.filter(|p| {
-            p.identity.ciphertext_digest == self.ciphertext_digest
-                && p.identity.locator_digest
-                    == <[u8; 32]>::from(Sha256::digest(url.as_str().as_bytes()))
-        }))
+        .map_err(|_| retry("partial checkpoint read failed"))
     }
     pub(crate) async fn clear(&self) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
@@ -145,13 +145,14 @@ pub(super) async fn read_body(
         .get(reqwest::header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes() != b"identity")
     {
-        context.clear().await?;
+        let _ = context.clear().await;
         return Err(stop("encoded response cannot be resumed"));
     }
     let (mut bytes, identity) = if let Some(part) = prefix {
         (part.bytes, Some(part.identity))
     } else {
-        context.clear().await?;
+        // A replacement checkpoint atomically replaces the old locator's prefix.
+        // Preserve it if this fallback fails before saving any useful bytes.
         let identity = strong_etag(response.headers())
             .zip(response.content_length())
             .filter(|(_, n)| *n > 0 && *n <= max)
@@ -168,7 +169,7 @@ pub(super) async fn read_body(
         .map(|i| i.total)
         .or_else(|| response.content_length());
     if expected_total.is_some_and(|n| n > max) {
-        context.clear().await?;
+        let _ = context.clear().await;
         return Err(stop("download exceeds size limit"));
     }
     let mut saved = bytes.len();
@@ -198,7 +199,7 @@ pub(super) async fn read_body(
         first = false;
         let size = bytes.len().saturating_add(chunk.len()) as u64;
         if size > max || expected_total.is_some_and(|n| size > n) {
-            context.clear().await?;
+            let _ = context.clear().await;
             return Err(stop("download exceeds response size bound"));
         }
         bytes.extend_from_slice(&chunk);
@@ -212,12 +213,14 @@ pub(super) async fn read_body(
             }
         }
     }
-    if let Some(identity) = &identity {
-        checkpoint_tail(context, identity, &bytes, &mut saved).await?;
-    }
     if expected_total.is_some_and(|n| bytes.len() as u64 != n) {
+        if let Some(identity) = &identity {
+            checkpoint_tail(context, identity, &bytes, &mut saved).await?;
+        }
         return Err(retry("incomplete media body"));
     }
+    // Complete bodies go straight to verification/publication. Do not write a
+    // final tiny checkpoint only to delete it on success.
     Ok(bytes)
 }
 async fn checkpoint_tail(

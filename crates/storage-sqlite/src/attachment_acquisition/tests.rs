@@ -935,7 +935,7 @@ fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
     assert!(!store.clear_attachment_partial(&old, 13).unwrap());
     assert_eq!(
         store
-            .load_attachment_partial(&job, 13, 10)
+            .load_attachment_partial(&job, 13, 10, None)
             .unwrap()
             .unwrap()
             .bytes,
@@ -948,7 +948,7 @@ fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
     );
     assert_eq!(
         store
-            .load_attachment_partial(&job, 13, 10)
+            .load_attachment_partial(&job, 13, 10, None)
             .unwrap()
             .unwrap()
             .bytes,
@@ -997,7 +997,7 @@ fn attachment_partial_quota_rollback_corruption_and_terminal_cleanup() {
     );
     assert_eq!(
         store
-            .load_attachment_partial(&job, 12, 10)
+            .load_attachment_partial(&job, 12, 10, None)
             .unwrap()
             .unwrap()
             .bytes,
@@ -1006,7 +1006,7 @@ fn attachment_partial_quota_rollback_corruption_and_terminal_cleanup() {
     store.lock().unwrap().execute_batch("DROP TRIGGER refuse_checkpoint; UPDATE attachment_partial_chunk SET bytes=x'010203040506';").unwrap();
     assert!(
         store
-            .load_attachment_partial(&job, 12, 10)
+            .load_attachment_partial(&job, 12, 10, None)
             .unwrap()
             .is_none()
     );
@@ -1049,7 +1049,7 @@ fn attachment_partial_publication_accounts_other_partials_and_releases_own() {
     );
     assert_eq!(
         store
-            .complete_attachment_acquisition(&job, BODY, 12, BODY.len() as u64 + 6)
+            .complete_attachment_acquisition(&job, BODY, 12, BODY.len() as u64 + 10)
             .unwrap(),
         AttachmentPublishResult::Published
     );
@@ -1091,9 +1091,110 @@ fn attachment_partial_expiry_is_bounded_and_shrinking_limit_discards() {
         .unwrap();
     assert!(
         store
-            .load_attachment_partial(&job, 12, 9)
+            .load_attachment_partial(&job, 12, 9, None)
             .unwrap()
             .is_none()
     );
     assert_eq!(partial_usage(&store), 0);
+}
+
+#[test]
+fn attachment_partial_reservation_prevents_pressure_deadlock() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for name in ["a", "b", "new"] {
+        seed(&store, name);
+    }
+    let a = request(&store, "a");
+    let b = request(&store, "b");
+    let new = request(&store, "new");
+    let ja = store
+        .claim_attachment_acquisition(&a, 12, 100)
+        .unwrap()
+        .unwrap();
+    let jb = store
+        .claim_attachment_acquisition(&b, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    for job in [&ja, &jb] {
+        assert!(
+            store
+                .checkpoint_attachment_partial(job, &identity, 0, b"abc", 12, 20)
+                .unwrap()
+        );
+    }
+    assert_eq!(partial_usage(&store), 6);
+    assert!(
+        !store
+            .attachment_acquisition_fits_budget(&new, 20, 20)
+            .unwrap()
+    );
+    // A full reservation can resume even when the account budget is saturated,
+    // including when its size is smaller than the policy's maximum transfer.
+    assert!(
+        store
+            .attachment_acquisition_fits_budget(&a, 20, 20)
+            .unwrap()
+    );
+    assert!(
+        store
+            .checkpoint_attachment_partial(&ja, &identity, 3, b"defghij", 12, 20)
+            .unwrap()
+    );
+    // Deletion releases the reservation as well as the actual chunk bytes.
+    store.remove_local_attachment(GROUP, "a", 0).unwrap();
+    assert!(
+        store
+            .attachment_acquisition_fits_budget(&new, 10, 20)
+            .unwrap()
+    );
+    store.remove_local_attachment(GROUP, "b", 0).unwrap();
+    assert!(
+        store
+            .attachment_acquisition_fits_budget(&new, 20, 20)
+            .unwrap()
+    );
+}
+
+#[test]
+fn attachment_partial_locator_mismatch_does_not_read_or_discard_chunks() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, b"abc", 12, 100)
+            .unwrap()
+    );
+    sql(
+        &store,
+        "UPDATE attachment_partial_chunk SET digest=zeroblob(32);",
+    );
+    assert!(
+        store
+            .load_attachment_partial(&job, 12, 10, Some((&[1; 32], &[3; 32])))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        partial_usage(&store),
+        3,
+        "mismatched locator must not scan even corrupt chunks"
+    );
+    assert!(
+        store
+            .load_attachment_partial(&job, 12, 10, Some((&[1; 32], &[2; 32])))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        partial_usage(&store),
+        0,
+        "matching locator verifies and discards corruption"
+    );
 }

@@ -907,7 +907,12 @@ where
                     .as_ref()
                     .is_some_and(|part| super::attachment_resume::valid_range(&response, part))
             {
-                context.clear().await?;
+                if partial.is_some() && !restarted_range {
+                    context.clear().await?;
+                    restarted_range = true;
+                    continue;
+                }
+                let _ = context.clear().await;
                 return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                     "invalid partial response".into(),
                 )));
@@ -916,7 +921,7 @@ where
                 if status != reqwest::StatusCode::OK
                     && status != reqwest::StatusCode::PARTIAL_CONTENT
                 {
-                    context.clear().await?;
+                    let _ = context.clear().await;
                     return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                         "unexpected media response".into(),
                     )));
@@ -936,7 +941,7 @@ where
                 )
                 .await;
                 if matches!(result, Err(AttachmentDownloadFailure::Stop(_))) {
-                    context.clear().await?;
+                    let _ = context.clear().await;
                 }
                 return result;
             }

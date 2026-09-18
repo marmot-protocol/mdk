@@ -7,24 +7,13 @@ fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
     assert_eq!(p.minimum_free_disk_bytes, 256 * 1024 * 1024);
     assert_eq!(p.maximum_transfer_bytes, 64 * 1024 * 1024);
     let free = p.minimum_free_disk_bytes + 4 * p.maximum_transfer_bytes;
-    assert!(capacity(&p, 0, free));
-    assert!(!capacity(&p, 0, free - 1));
-    assert!(capacity(
-        &p,
-        p.retained_bytes_per_account - p.maximum_transfer_bytes,
-        free
-    ));
-    assert!(!capacity(
-        &p,
-        p.retained_bytes_per_account - p.maximum_transfer_bytes + 1,
-        free
-    ));
+    assert!(capacity(&p, free));
+    assert!(!capacity(&p, free - 1));
     assert!(!capacity(
         &crate::AttachmentAcquisitionPolicy {
             maximum_transfer_bytes: u64::MAX,
             ..p
         },
-        0,
         u64::MAX
     ));
 }
@@ -549,3 +538,31 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_off
 }
 
 mod resume;
+
+#[tokio::test]
+async fn attachment_worker_budget_pause_does_not_consume_attempts() {
+    let (_dir, mut client, store, _reference) = offline_fixture().await;
+    let now = crate::unix_now_seconds();
+    admit_demands(&store, now, false).unwrap();
+    let asset = store.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    client
+        .app
+        .config
+        .attachment_acquisition
+        .as_mut()
+        .unwrap()
+        .retained_bytes_per_account = 0;
+    let (http, _rx) = context();
+    let shared = RuntimeSharedServices::default();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let status = store
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.attempts, 0);
+    assert!(status.due.unwrap() > now);
+    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+}

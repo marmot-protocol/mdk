@@ -1233,7 +1233,7 @@ async fn fetch_encrypted_media_blob_classified(
                     return Ok(bytes);
                 }
                 if let Some(resume) = &transport.resume {
-                    resume.clear().await?;
+                    let _ = resume.clear().await;
                 }
                 terminal_failure = true;
                 record_candidate_failure(

@@ -53,11 +53,15 @@ fn resume_context(
     store: &SqliteAccountStorage,
     job: &AttachmentAcquisition,
     dir: &std::path::Path,
+    reference: &crate::MediaAttachmentReference,
 ) -> AttachmentResume {
     AttachmentResume {
         storage: store.clone(),
         job: job.clone(),
-        ciphertext_digest: [0; 32],
+        ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap(),
         budget: 128 * 1024 * 1024,
         directory: dir.into(),
         disk_reserve: 0,
@@ -163,13 +167,13 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
         .unwrap();
     assert!(matches!(
         prepared
-            .run_classified(resume_context(&store, &old, dir.path()))
+            .run_classified(resume_context(&store, &old, dir.path(), &reference))
             .await,
         Err(AttachmentDownloadFailure::Retry(_))
     ));
     assert_eq!(
         store
-            .load_attachment_partial(&old, crate::unix_now_seconds(), 64 * 1024 * 1024)
+            .load_attachment_partial(&old, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .unwrap()
             .bytes
@@ -190,13 +194,13 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
-            reference,
+            reference.clone(),
             64 * 1024 * 1024,
         )
         .unwrap()
         .unwrap();
     let result = prepared
-        .run_classified(resume_context(&store, &job, dir.path()))
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
         .await
         .unwrap();
     assert_eq!(result.plaintext, plaintext);
@@ -207,7 +211,7 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
     );
     assert!(
         store
-            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024)
+            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .is_none()
     );
@@ -222,6 +226,7 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
         "changed",
         "unsatisfiable",
         "malformed",
+        "unknown_total",
         "oversized",
         "corrupt",
         "weak",
@@ -240,9 +245,23 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
                 "ignored" => {
                     respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &cipher, total).await
                 }
-                "changed" | "weak" | "unsatisfiable" => {
+                "changed" | "weak" | "unsatisfiable" | "unknown_total" | "malformed" => {
                     if case == "unsatisfiable" {
                         respond(&mut socket, "416 Range Not Satisfiable", "", &[], 0).await;
+                    } else if case == "unknown_total" || case == "malformed" {
+                        let range = if case == "unknown_total" {
+                            format!("bytes 8-{}/*", total - 1)
+                        } else {
+                            format!("bytes 7-{}/{}", total - 1, total)
+                        };
+                        respond(
+                            &mut socket,
+                            "206 Partial Content",
+                            &format!("ETag: \"v1\"\r\nContent-Range: {range}\r\n"),
+                            &cipher[8..],
+                            total - 8,
+                        )
+                        .await;
                     } else {
                         let tag = if case == "weak" { "W/\"v1\"" } else { "\"v2\"" };
                         respond(
@@ -334,7 +353,7 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
         let prepared = client
             .prepare_background_attachment_download(
                 &GroupId::new(vec![0xab; 16]),
-                reference,
+                reference.clone(),
                 if case == "chunked_oversized" {
                     128
                 } else {
@@ -344,10 +363,9 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
             .unwrap()
             .unwrap();
         let result = prepared
-            .run_classified(resume_context(&store, &job, dir.path()))
+            .run_classified(resume_context(&store, &job, dir.path(), &reference))
             .await;
         if [
-            "malformed",
             "oversized",
             "corrupt",
             "chunked_oversized",
@@ -362,7 +380,12 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
             );
             assert!(
                 store
-                    .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024)
+                    .load_attachment_partial(
+                        &job,
+                        crate::unix_now_seconds(),
+                        64 * 1024 * 1024,
+                        None
+                    )
                     .unwrap()
                     .is_none()
             );
@@ -400,16 +423,17 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
-            reference,
+            reference.clone(),
             64 * 1024 * 1024,
         )
         .unwrap()
         .unwrap();
-    let task = tokio::spawn(prepared.run_classified(resume_context(&store, &job, dir.path())));
+    let task =
+        tokio::spawn(prepared.run_classified(resume_context(&store, &job, dir.path(), &reference)));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if store
-                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024)
+                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
                 .unwrap()
                 .is_some_and(|p| p.bytes.len() == ATTACHMENT_CHECKPOINT_BYTES)
             {
@@ -425,7 +449,7 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
     let next = claim(&store);
     assert_eq!(
         store
-            .load_attachment_partial(&next, crate::unix_now_seconds(), 64 * 1024 * 1024)
+            .load_attachment_partial(&next, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .unwrap()
             .bytes
@@ -458,20 +482,20 @@ async fn attachment_resume_without_strong_validator_uses_full_download() {
         let prepared = client
             .prepare_background_attachment_download(
                 &GroupId::new(vec![0xab; 16]),
-                reference,
+                reference.clone(),
                 64 * 1024 * 1024,
             )
             .unwrap()
             .unwrap();
         assert!(
             prepared
-                .run_classified(resume_context(&store, &job, dir.path()))
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
                 .await
                 .is_err()
         );
         assert!(
             store
-                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024)
+                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
                 .unwrap()
                 .is_none()
         );
@@ -524,13 +548,13 @@ async fn attachment_resume_failover_does_not_mix_locator_validators() {
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
-            reference,
+            reference.clone(),
             64 * 1024 * 1024,
         )
         .unwrap()
         .unwrap();
     let result = prepared
-        .run_classified(resume_context(&store, &job, dir.path()))
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
         .await
         .unwrap();
     assert_eq!(
@@ -539,4 +563,223 @@ async fn attachment_resume_failover_does_not_mix_locator_validators() {
     );
     first_server.await.unwrap();
     second_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
+    let (first, mut reference, cipher) =
+        listener_fixture(b"preserve useful progress on the original locator").await;
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}.bin",
+            second.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    });
+    let total = cipher.len();
+    let prefix = cipher[..8].to_vec();
+    let a = tokio::spawn(async move {
+        let (mut socket, _) = first.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+        respond(&mut socket, "404 Not Found", "", &[], 0).await;
+        drop(socket);
+        let (mut socket, _) = first.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+        respond(
+            &mut socket,
+            "206 Partial Content",
+            &format!(
+                "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                total - 1,
+                total
+            ),
+            &cipher[8..],
+            total - 8,
+        )
+        .await;
+    });
+    let b = tokio::spawn(async move {
+        let (mut socket, _) = second.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+        respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &[], total).await;
+        // Interrupted before a replacement checkpoint exists.
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = resume_context(&store, &job, dir.path(), &reference);
+    assert!(
+        store
+            .checkpoint_attachment_partial(
+                &job,
+                &AttachmentPartialIdentity {
+                    ciphertext_digest: context.ciphertext_digest,
+                    locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+                    etag: "\"v1\"".into(),
+                    total: total as u64,
+                },
+                0,
+                &prefix,
+                crate::unix_now_seconds(),
+                10000
+            )
+            .unwrap()
+    );
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prepared.run_classified(context).await,
+        Err(AttachmentDownloadFailure::Retry(_))
+    ));
+    store.close().unwrap();
+    drop(client);
+    drop(store);
+    let (client, store) = client_at(dir.path(), &reference, false).await;
+    let job = claim(&store);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.plaintext,
+        b"preserve useful progress on the original locator"
+    );
+    a.await.unwrap();
+    b.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resume_cleanup_error_preserves_terminal_integrity_failure() {
+    let (listener, reference, mut cipher) =
+        listener_fixture(b"must remain a terminal hash failure").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let closing = store.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        closing.close().unwrap();
+        cipher[0] ^= 1;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"v1\"\r\n",
+            &cipher,
+            cipher.len(),
+        )
+        .await;
+    });
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prepared
+            .run_classified(resume_context(&store, &job, dir.path(), &reference))
+            .await,
+        Err(AttachmentDownloadFailure::Stop(_))
+    ));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
+    let (listener, reference, cipher) = listener_fixture(b"small complete attachment").await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"v1\"\r\n",
+            &cipher,
+            cipher.len(),
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.disk_reserve = u64::MAX; // Any unnecessary checkpoint would refuse.
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await.unwrap();
+    assert_eq!(result.plaintext, b"small complete attachment");
+    assert!(
+        store
+            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .is_none()
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints() {
+    let (_dir, mut client, store, reference) = offline_fixture().await;
+    let job = claim(&store);
+    let earlier = crate::unix_now_seconds() - 86401;
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: 10,
+    };
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, b"abc", earlier, 100)
+            .unwrap()
+    );
+    assert!(
+        store
+            .load_attachment_partial(&job, earlier, 10, None)
+            .unwrap()
+            .is_some()
+    );
+    client.app.config.attachment_acquisition = None;
+    let (http, _rx) = context();
+    schedule(
+        &client,
+        &RuntimeSharedServices::default(),
+        &http,
+        &mut Admission::default(),
+    )
+    .unwrap();
+    assert!(
+        store
+            .load_attachment_partial(&job, earlier, 10, None)
+            .unwrap()
+            .is_none()
+    );
 }

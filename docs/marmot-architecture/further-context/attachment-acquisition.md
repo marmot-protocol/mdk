@@ -211,7 +211,7 @@ The legacy download API continues returning transient bytes until clients adopt 
 Migration 85 stores ciphertext chunks and bounded validator metadata in the same SQLCipher
 account store. It creates no transfers on upgrade. Checkpoints append at an exact offset,
 in chunks of at most 1 MiB; every append rechecks the store/attempt, retained source,
-acceptance, expiry and combined retained-plus-partial payload budget. Filesystem reserve
+acceptance, expiry and combined retained-plus-reserved payload budget. Filesystem reserve
 is checked off the account worker before each checkpoint. No plaintext partial is stored
 or exposed. A cancelled transfer may lose its last uncommitted chunk; completed checkpoints
 survive process death and the existing startup attempt reclamation.
@@ -220,9 +220,10 @@ The representation is bound to the admitted source, ciphertext digest, exact URL
 strong ETag and known total length. Raw URLs are not duplicated in partial metadata.
 Resume sends `Range` and `If-Range` through the existing address-pinned, redirect-vetted
 HTTP path, with identity encoding. A `206` must describe the exact remaining suffix and
-same strong validator/total. A `200` replaces the prefix. Changed/missing validators on a
-`206`, or a `416`, discard the incompatible prefix and retry once from zero. Malformed
-ranges, unsupported content encoding and over-limit bodies fail closed. Servers without
+same strong validator/total. A `200` starts a replacement body; the old checkpoint survives
+until a replacement checkpoint or final publication. Changed/missing validators, unusable
+ranges (including unknown totals), or a `416` discard the incompatible prefix and retry
+once from zero. Repeated invalid ranges, unsupported encoding and over-limit bodies fail closed. Servers without
 a strong ETag or known length still support complete downloads without durable checkpoints.
 Validator comparison follows [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-range);
 Last-Modified-only resume is deliberately not implemented.
@@ -233,13 +234,15 @@ checkpoint contents. The normal complete ciphertext hash, AEAD authentication an
 hash checks remain mandatory before publication. Resume still assembles a bounded full body
 for the existing crypto pipeline; it does not add streaming plaintext decryption.
 
-Partial ciphertext counts against the same configured account payload budget as retained
-plaintext. Atomic publication replaces its own partial accounting while preserving other
-jobs' allocations. No retained-byte eviction is introduced. Success, terminal/parked state,
+The first checkpoint reserves the complete declared ciphertext size against the same account
+budget as retained plaintext. Worker admission, append and publication share this accounting;
+existing prefixes can finish when reservations fill the budget. New demand pauses without
+spending transfer attempts. Atomic publication replaces its own reservation while preserving
+other jobs' allocations. Complete small responses skip the final checkpoint write. No retained-byte eviction is introduced. Success, terminal/parked state,
 source removal/invalidation, explicit removal and store reset delete partials transactionally.
 Expired message jobs cascade to their partials. Abandoned checkpoints expire 24 hours after
-last progress, reclaimed in indexed batches of 64 by active acquisition maintenance;
-disabling acquisition does not run this maintenance or erase already acquired bytes.
+last progress, reclaimed in indexed batches of 64 by non-frozen worker maintenance, including
+when acquisition is disabled. Disabling acquisition does not erase already acquired bytes.
 This temporary checkpoint lifetime does not change the agreed retained-media lifetime.
 
 Tests cover interrupted HTTP plus encrypted reopen and verified publication, task cancellation,
