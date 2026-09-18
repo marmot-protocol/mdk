@@ -1220,7 +1220,8 @@ async fn fetch_encrypted_media_blob_classified(
         )
         .await;
         match fetched {
-            Ok(bytes) => {
+            Ok(blob) => {
+                let bytes = blob.bytes;
                 let verify_started = Instant::now();
                 let matches = encrypted_media_hash_matches(&bytes, &expected_hash);
                 record_media_download_phase(
@@ -1233,7 +1234,7 @@ async fn fetch_encrypted_media_blob_classified(
                     return Ok(bytes);
                 }
                 if let Some(resume) = &transport.resume {
-                    let _ = resume.clear().await;
+                    let _ = resume.clear(Some(&blob.response_url)).await;
                 }
                 terminal_failure = true;
                 record_candidate_failure(

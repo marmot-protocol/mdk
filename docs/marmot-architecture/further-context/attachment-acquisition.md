@@ -229,8 +229,10 @@ Validator comparison follows [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.h
 Last-Modified-only resume is deliberately not implemented.
 
 Each locator has its own validator scope; failover never combines a prefix from a different
-URL even when its ETag string matches. Chunks carry local SHA-256 checksums to detect damaged
-checkpoint contents. The normal complete ciphertext hash, AEAD authentication and plaintext
+URL even when its ETag string matches. Candidate failure cleanup is fenced by ciphertext
+and final response URL (including redirects), so a bad alternative server cannot erase an
+unused prefix from another locator. Retryable redirect failures preserve valid checkpoints.
+Chunks carry local SHA-256 checksums to detect damaged checkpoint contents. The normal complete ciphertext hash, AEAD authentication and plaintext
 hash checks remain mandatory before publication. Resume still assembles a bounded full body
 for the existing crypto pipeline; it does not add streaming plaintext decryption.
 

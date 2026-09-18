@@ -177,10 +177,13 @@ pub(super) fn schedule(
                 continue;
             }
         };
-        let ciphertext_digest = hex::decode(&reference.ciphertext_sha256)
+        let Some(ciphertext_digest) = hex::decode(&reference.ciphertext_sha256)
             .ok()
             .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| AppError::InvalidEncryptedMedia("invalid ciphertext digest".into()))?;
+        else {
+            storage.finish_attachment_preparation(&candidate, now, None)?;
+            continue;
+        };
         let prepared = match client.prepare_background_attachment_download(
             &group,
             reference,

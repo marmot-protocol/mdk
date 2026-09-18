@@ -197,7 +197,7 @@ impl EncryptedMediaDownloadHttp {
             result,
             Err(crate::media::AttachmentDownloadFailure::Stop(_))
         ) {
-            let _ = resume.clear().await;
+            let _ = resume.clear(None).await;
         }
         result
     }

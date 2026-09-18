@@ -531,7 +531,15 @@ pub(super) async fn fetch_blossom_blob_bounded(
 ) -> Result<Vec<u8>, AppError> {
     fetch_blossom_blob_bounded_classified(url, transport, telemetry, deadline, max_bytes)
         .await
+        .map(|blob| blob.bytes)
         .map_err(AttachmentDownloadFailure::into_error)
+}
+
+/// Final validated locator is kept with the bytes so a hash failure only
+/// invalidates that locator's checkpoint, including after redirects.
+pub(super) struct FetchedBlob {
+    pub bytes: Vec<u8>,
+    pub response_url: Url,
 }
 
 pub(super) async fn fetch_blossom_blob_classified_until(
@@ -539,7 +547,7 @@ pub(super) async fn fetch_blossom_blob_classified_until(
     transport: &BlossomHttpTransport,
     telemetry: Option<&AppPerformanceTelemetry>,
     deadline: tokio::time::Instant,
-) -> Result<Vec<u8>, AttachmentDownloadFailure> {
+) -> Result<FetchedBlob, AttachmentDownloadFailure> {
     fetch_blossom_blob_bounded_classified(
         url,
         transport,
@@ -556,7 +564,7 @@ pub(super) async fn fetch_blossom_blob_bounded_classified(
     telemetry: Option<&AppPerformanceTelemetry>,
     deadline: tokio::time::Instant,
     max_bytes: u64,
-) -> Result<Vec<u8>, AttachmentDownloadFailure> {
+) -> Result<FetchedBlob, AttachmentDownloadFailure> {
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, transport.allow_loopback_http)
@@ -724,6 +732,7 @@ where
         redirect_target,
     )
     .await
+    .map(|blob| blob.bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -736,7 +745,7 @@ async fn fetch_http_resumable<C, CFut, R>(
     resume: Option<&Arc<super::attachment_resume::AttachmentResume>>,
     mut client_for_url: C,
     mut redirect_target: R,
-) -> Result<Vec<u8>, AttachmentDownloadFailure>
+) -> Result<FetchedBlob, AttachmentDownloadFailure>
 where
     C: FnMut(Url) -> CFut,
     CFut: std::future::Future<Output = Result<reqwest::Client, AppError>>,
@@ -783,12 +792,6 @@ where
                     host_setup_started,
                     false,
                 );
-                if redirects > 0
-                    && matches!(error, AppError::UnsafeMediaFetch(_))
-                    && let Some(context) = resume
-                {
-                    context.clear().await?;
-                }
                 return Err(match error {
                     AppError::UnsafeMediaFetch(detail) if redirects > 0 => {
                         AppError::BlobStore(format!(
@@ -826,7 +829,10 @@ where
         if let Some(part) = &partial
             && part.bytes.len() as u64 == part.identity.total
         {
-            return Ok(partial.expect("checked").bytes);
+            return Ok(FetchedBlob {
+                bytes: partial.expect("checked").bytes,
+                response_url: current,
+            });
         }
         let mut request = client.get(current.clone()).timeout(remaining);
         if resume.is_some() {
@@ -898,7 +904,7 @@ where
                     || (status == reqwest::StatusCode::PARTIAL_CONTENT && changed))
                 && !restarted_range
             {
-                context.clear().await?;
+                context.clear(Some(&current)).await?;
                 restarted_range = true;
                 continue;
             }
@@ -908,11 +914,11 @@ where
                     .is_some_and(|part| super::attachment_resume::valid_range(&response, part))
             {
                 if partial.is_some() && !restarted_range {
-                    context.clear().await?;
+                    context.clear(Some(&current)).await?;
                     restarted_range = true;
                     continue;
                 }
-                let _ = context.clear().await;
+                let _ = context.clear(Some(&current)).await;
                 return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                     "invalid partial response".into(),
                 )));
@@ -921,7 +927,7 @@ where
                 if status != reqwest::StatusCode::OK
                     && status != reqwest::StatusCode::PARTIAL_CONTENT
                 {
-                    let _ = context.clear().await;
+                    let _ = context.clear(Some(&current)).await;
                     return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                         "unexpected media response".into(),
                     )));
@@ -941,9 +947,12 @@ where
                 )
                 .await;
                 if matches!(result, Err(AttachmentDownloadFailure::Stop(_))) {
-                    let _ = context.clear().await;
+                    let _ = context.clear(Some(&current)).await;
                 }
-                return result;
+                return result.map(|bytes| FetchedBlob {
+                    bytes,
+                    response_url: current,
+                });
             }
         }
         if status.is_success() {
@@ -956,7 +965,11 @@ where
                 Some(first_byte_deadline),
                 telemetry,
             )
-            .await;
+            .await
+            .map(|bytes| FetchedBlob {
+                bytes,
+                response_url: current,
+            });
         }
         if !status.is_redirection() {
             return Err(
@@ -978,15 +991,8 @@ where
             })?
             .to_str()
             .map_err(|_| AppError::BlobStore("redirect Location header is invalid".into()))?;
-        current = match redirect_target(&current, location) {
-            Ok(next) => next,
-            Err(err) => {
-                if let Some(context) = resume {
-                    context.clear().await?;
-                }
-                return Err(err.into());
-            }
-        };
+        // A retryable redirect failure does not invalidate the saved representation.
+        current = redirect_target(&current, location)?;
         redirects += 1;
     }
 }

@@ -378,7 +378,7 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
                     || (case == "unsafe_redirect" && result.is_err()),
                 "{case}"
             );
-            assert!(
+            assert_eq!(
                 store
                     .load_attachment_partial(
                         &job,
@@ -387,7 +387,9 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
                         None
                     )
                     .unwrap()
-                    .is_none()
+                    .is_none(),
+                case != "unsafe_redirect",
+                "retryable redirect failure preserves its valid prefix"
             );
         } else {
             assert_eq!(
@@ -567,101 +569,149 @@ async fn attachment_resume_failover_does_not_mix_locator_validators() {
 
 #[tokio::test]
 async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
-    let (first, mut reference, cipher) =
-        listener_fixture(b"preserve useful progress on the original locator").await;
-    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    reference.locators.push(crate::MediaLocator {
-        kind: "blossom-v1".into(),
-        value: format!(
-            "http://{}/{}.bin",
-            second.local_addr().unwrap(),
-            reference.ciphertext_sha256
-        ),
-    });
-    let total = cipher.len();
-    let prefix = cipher[..8].to_vec();
-    let a = tokio::spawn(async move {
-        let (mut socket, _) = first.accept().await.unwrap();
-        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
-        respond(&mut socket, "404 Not Found", "", &[], 0).await;
-        drop(socket);
-        let (mut socket, _) = first.accept().await.unwrap();
-        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
-        respond(
-            &mut socket,
-            "206 Partial Content",
-            &format!(
-                "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
-                total - 1,
-                total
+    for case in [
+        "interrupted",
+        "hash_miss",
+        "oversize",
+        "encoded",
+        "unsafe_redirect",
+    ] {
+        let (first, mut reference, cipher) =
+            listener_fixture(b"preserve useful progress on the original locator").await;
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        reference.locators.push(crate::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!(
+                "http://{}/{}.bin",
+                second.local_addr().unwrap(),
+                reference.ciphertext_sha256
             ),
-            &cipher[8..],
-            total - 8,
-        )
-        .await;
-    });
-    let b = tokio::spawn(async move {
-        let (mut socket, _) = second.accept().await.unwrap();
-        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
-        respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &[], total).await;
-        // Interrupted before a replacement checkpoint exists.
-    });
-    let dir = tempfile::tempdir().unwrap();
-    let (client, store) = client_at(dir.path(), &reference, true).await;
-    let job = claim(&store);
-    let context = resume_context(&store, &job, dir.path(), &reference);
-    assert!(
-        store
-            .checkpoint_attachment_partial(
-                &job,
-                &AttachmentPartialIdentity {
-                    ciphertext_digest: context.ciphertext_digest,
-                    locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
-                    etag: "\"v1\"".into(),
-                    total: total as u64,
-                },
-                0,
-                &prefix,
-                crate::unix_now_seconds(),
-                10000
+        });
+        let total = cipher.len();
+        let prefix = cipher[..8].to_vec();
+        let fallback_cipher = cipher.clone();
+        let a = tokio::spawn(async move {
+            let (mut socket, _) = first.accept().await.unwrap();
+            assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+            respond(&mut socket, "404 Not Found", "", &[], 0).await;
+            drop(socket);
+            let (mut socket, _) = first.accept().await.unwrap();
+            assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+            respond(
+                &mut socket,
+                "206 Partial Content",
+                &format!(
+                    "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                    total - 1,
+                    total
+                ),
+                &cipher[8..],
+                total - 8,
+            )
+            .await;
+        });
+        let b = tokio::spawn(async move {
+            let (mut socket, _) = second.accept().await.unwrap();
+            assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+            match case {
+                "interrupted" => {
+                    respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &[], total).await
+                }
+                "hash_miss" => {
+                    let mut wrong = fallback_cipher;
+                    wrong[0] ^= 1;
+                    respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &wrong, total).await;
+                }
+                "oversize" => respond(&mut socket, "200 OK", "", &[], 70 * 1024 * 1024).await,
+                "encoded" => {
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        "Content-Encoding: gzip\r\n",
+                        &[],
+                        total,
+                    )
+                    .await
+                }
+                "unsafe_redirect" => {
+                    respond(
+                        &mut socket,
+                        "302 Found",
+                        "Location: http://169.254.169.254/private\r\n",
+                        &[],
+                        0,
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (client, store) = client_at(dir.path(), &reference, true).await;
+        let job = claim(&store);
+        let context = resume_context(&store, &job, dir.path(), &reference);
+        assert!(
+            store
+                .checkpoint_attachment_partial(
+                    &job,
+                    &AttachmentPartialIdentity {
+                        ciphertext_digest: context.ciphertext_digest,
+                        locator_digest: Sha256::digest(reference.locators[0].value.as_bytes())
+                            .into(),
+                        etag: "\"v1\"".into(),
+                        total: total as u64,
+                    },
+                    0,
+                    &prefix,
+                    crate::unix_now_seconds(),
+                    10000
+                )
+                .unwrap()
+        );
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
             )
             .unwrap()
-    );
-    let prepared = client
-        .prepare_background_attachment_download(
-            &GroupId::new(vec![0xab; 16]),
-            reference.clone(),
-            64 * 1024 * 1024,
-        )
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        prepared.run_classified(context).await,
-        Err(AttachmentDownloadFailure::Retry(_))
-    ));
-    store.close().unwrap();
-    drop(client);
-    drop(store);
-    let (client, store) = client_at(dir.path(), &reference, false).await;
-    let job = claim(&store);
-    let prepared = client
-        .prepare_background_attachment_download(
-            &GroupId::new(vec![0xab; 16]),
-            reference.clone(),
-            64 * 1024 * 1024,
-        )
-        .unwrap()
-        .unwrap();
-    let result = prepared
-        .run_classified(resume_context(&store, &job, dir.path(), &reference))
-        .await
-        .unwrap();
-    assert_eq!(
-        result.plaintext,
-        b"preserve useful progress on the original locator"
-    );
-    a.await.unwrap();
-    b.await.unwrap();
+            .unwrap();
+        assert!(matches!(
+            prepared.run_classified(context).await,
+            Err(AttachmentDownloadFailure::Retry(_))
+        ));
+        assert_eq!(
+            store
+                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+                .unwrap()
+                .map(|p| p.bytes),
+            Some(prefix),
+            "failed fallback must preserve A: {case}"
+        );
+        store.close().unwrap();
+        drop(client);
+        drop(store);
+        let (client, store) = client_at(dir.path(), &reference, false).await;
+        let job = claim(&store);
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        let result = prepared
+            .run_classified(resume_context(&store, &job, dir.path(), &reference))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.plaintext,
+            b"preserve useful progress on the original locator"
+        );
+        a.await.unwrap();
+        b.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -782,4 +832,88 @@ async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn attachment_resume_hash_failure_clears_redirected_replacement() {
+    let body = vec![17; ATTACHMENT_CHECKPOINT_BYTES * 2];
+    let (first, mut reference, mut cipher) = listener_fixture(&body).await;
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}.bin",
+            second.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    });
+    let total = cipher.len();
+    let prefix = cipher[..8].to_vec();
+    let a = tokio::spawn(async move {
+        let (mut socket, _) = first.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+        respond(&mut socket, "404 Not Found", "", &[], 0).await;
+    });
+    let b = tokio::spawn(async move {
+        let (mut socket, _) = second.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+        respond(
+            &mut socket,
+            "302 Found",
+            "Location: /redirected.bin\r\n",
+            &[],
+            0,
+        )
+        .await;
+        drop(socket);
+        let (mut socket, _) = second.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        assert!(request.starts_with("get /redirected.bin "));
+        assert!(!request.contains("\r\nrange:"));
+        cipher[0] ^= 1;
+        respond(&mut socket, "200 OK", "ETag: \"v2\"\r\n", &cipher, total).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = resume_context(&store, &job, dir.path(), &reference);
+    assert!(
+        store
+            .checkpoint_attachment_partial(
+                &job,
+                &AttachmentPartialIdentity {
+                    ciphertext_digest: context.ciphertext_digest,
+                    locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+                    etag: "\"v1\"".into(),
+                    total: total as u64,
+                },
+                0,
+                &prefix,
+                crate::unix_now_seconds(),
+                128 * 1024 * 1024
+            )
+            .unwrap()
+    );
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference,
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prepared.run_classified(context).await,
+        Err(AttachmentDownloadFailure::Retry(_))
+    ));
+    // B's large replacement was checkpointed at its final URL. Hash failure
+    // must discard that representation even though the candidate URL differs.
+    assert!(
+        store
+            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .is_none()
+    );
+    a.await.unwrap();
+    b.await.unwrap();
 }

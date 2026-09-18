@@ -3,7 +3,8 @@ use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
-    tx.execute_batch(r#"
+    tx.execute_batch(
+        r#"
 CREATE TABLE attachment_partial (
  token BLOB PRIMARY KEY NOT NULL REFERENCES attachment_acquisition(token) ON DELETE CASCADE,
  ciphertext_digest BLOB NOT NULL CHECK(length(ciphertext_digest)=32),
@@ -23,7 +24,6 @@ CREATE TABLE attachment_partial_chunk (
 );
 CREATE TABLE attachment_partial_usage (
  id INTEGER PRIMARY KEY CHECK(id=1),
- byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count>=0),
  reserved_bytes INTEGER NOT NULL DEFAULT 0 CHECK(reserved_bytes>=0)
 );
 INSERT INTO attachment_partial_usage(id) VALUES(1);
@@ -33,23 +33,13 @@ END;
 CREATE TRIGGER attachment_partial_reserved_removed AFTER DELETE ON attachment_partial BEGIN
  UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes-OLD.total WHERE id=1;
 END;
-CREATE TRIGGER attachment_partial_reserved_updated AFTER UPDATE OF total ON attachment_partial BEGIN
- UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes-OLD.total+NEW.total WHERE id=1;
-END;
-CREATE TRIGGER attachment_partial_bytes_added AFTER INSERT ON attachment_partial_chunk BEGIN
- UPDATE attachment_partial_usage SET byte_count=byte_count+length(NEW.bytes) WHERE id=1;
-END;
-CREATE TRIGGER attachment_partial_bytes_removed AFTER DELETE ON attachment_partial_chunk BEGIN
- UPDATE attachment_partial_usage SET byte_count=byte_count-length(OLD.bytes) WHERE id=1;
-END;
-CREATE TRIGGER attachment_partial_bytes_updated AFTER UPDATE OF bytes ON attachment_partial_chunk BEGIN
- UPDATE attachment_partial_usage SET byte_count=byte_count-length(OLD.bytes)+length(NEW.bytes) WHERE id=1;
-END;
 CREATE TRIGGER attachment_partial_terminal AFTER UPDATE OF state ON attachment_acquisition
 WHEN NEW.state IN (3,4,5) BEGIN
  DELETE FROM attachment_partial WHERE token=NEW.token;
 END;
-"#).storage()
+"#,
+    )
+    .storage()
 }
 
 #[cfg(test)]
@@ -81,9 +71,12 @@ mod tests {
             0
         );
         assert_eq!(
-            conn.query_row("SELECT byte_count FROM attachment_partial_usage", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
+            conn.query_row(
+                "SELECT reserved_bytes FROM attachment_partial_usage",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             0
         );
     }

@@ -891,7 +891,7 @@ fn partial_usage(store: &SqliteAccountStorage) -> u64 {
         .lock()
         .unwrap()
         .query_row(
-            "SELECT byte_count FROM attachment_partial_usage WHERE id=1",
+            "SELECT coalesce(sum(length(bytes)),0) FROM attachment_partial_chunk",
             [],
             |r| nonnegative(r, 0),
         )
@@ -932,7 +932,7 @@ fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
             .checkpoint_attachment_partial(&old, &identity, 3, b"old", 13, 100)
             .unwrap()
     );
-    assert!(!store.clear_attachment_partial(&old, 13).unwrap());
+    assert!(!store.clear_attachment_partial(&old, 13, None).unwrap());
     assert_eq!(
         store
             .load_attachment_partial(&job, 13, 10, None)
@@ -1196,5 +1196,52 @@ fn attachment_partial_locator_mismatch_does_not_read_or_discard_chunks() {
         partial_usage(&store),
         0,
         "matching locator verifies and discards corruption"
+    );
+}
+
+#[test]
+fn attachment_partial_cleanup_is_locator_ciphertext_and_attempt_scoped() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    let old = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&old, &identity, 0, b"abc", 12, 100)
+            .unwrap()
+    );
+    for pair in [([1; 32], [3; 32]), ([4; 32], [2; 32])] {
+        assert!(
+            !store
+                .clear_attachment_partial(&old, 12, Some((&pair.0, &pair.1)))
+                .unwrap()
+        );
+        assert_eq!(partial_usage(&store), 3);
+    }
+    store.resume_attachment_acquisitions(13, 64).unwrap();
+    let current = store
+        .claim_attachment_acquisition(&asset, 13, 100)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .clear_attachment_partial(&old, 13, Some((&[1; 32], &[2; 32])))
+            .unwrap()
+    );
+    assert_eq!(partial_usage(&store), 3);
+    assert!(
+        store
+            .clear_attachment_partial(&current, 13, Some((&[1; 32], &[2; 32])))
+            .unwrap()
+    );
+    assert_eq!(partial_usage(&store), 0);
+    assert!(
+        store
+            .attachment_acquisition_fits_budget(&asset, 100, 100)
+            .unwrap()
     );
 }

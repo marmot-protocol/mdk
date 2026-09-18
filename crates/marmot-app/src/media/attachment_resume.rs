@@ -44,11 +44,23 @@ impl AttachmentResume {
         .map_err(|_| retry("partial checkpoint task failed"))?
         .map_err(|_| retry("partial checkpoint read failed"))
     }
-    pub(crate) async fn clear(&self) -> Result<(), AttachmentDownloadFailure> {
+    pub(crate) async fn clear(
+        &self,
+        url: Option<&url::Url>,
+    ) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
+        let identity = url.map(|url| {
+            (
+                self.ciphertext_digest,
+                <[u8; 32]>::from(Sha256::digest(url.as_str().as_bytes())),
+            )
+        });
         tokio::task::spawn_blocking(move || {
-            this.storage
-                .clear_attachment_partial(&this.job, crate::unix_now_seconds())
+            this.storage.clear_attachment_partial(
+                &this.job,
+                crate::unix_now_seconds(),
+                identity.as_ref().map(|(c, l)| (c, l)),
+            )
         })
         .await
         .map_err(|_| retry("partial checkpoint task failed"))?
@@ -145,7 +157,6 @@ pub(super) async fn read_body(
         .get(reqwest::header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes() != b"identity")
     {
-        let _ = context.clear().await;
         return Err(stop("encoded response cannot be resumed"));
     }
     let (mut bytes, identity) = if let Some(part) = prefix {
@@ -169,7 +180,6 @@ pub(super) async fn read_body(
         .map(|i| i.total)
         .or_else(|| response.content_length());
     if expected_total.is_some_and(|n| n > max) {
-        let _ = context.clear().await;
         return Err(stop("download exceeds size limit"));
     }
     let mut saved = bytes.len();
@@ -199,7 +209,6 @@ pub(super) async fn read_body(
         first = false;
         let size = bytes.len().saturating_add(chunk.len()) as u64;
         if size > max || expected_total.is_some_and(|n| size > n) {
-            let _ = context.clear().await;
             return Err(stop("download exceeds response size bound"));
         }
         bytes.extend_from_slice(&chunk);

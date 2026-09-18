@@ -275,23 +275,37 @@ impl SqliteAccountStorage {
     }
 
     /// Clear only this live attempt's checkpoint; stale/cancelled work cannot
-    /// erase a newer attempt's progress.
+    /// erase a newer attempt's progress. Candidate failures must supply the
+    /// expected ciphertext/locator identity; None is for whole-job cleanup.
     pub fn clear_attachment_partial(
         &self,
         job: &AttachmentAcquisition,
         now: u64,
+        expected: Option<(&[u8; 32], &[u8; 32])>,
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !valid_attempt(&conn, job, now)? {
                 return Ok(false);
             }
-            conn.execute(
-                "DELETE FROM attachment_partial WHERE token=?1",
-                [&job.reference.token],
-            )
+            let removed = if let Some((ciphertext, locator)) = expected {
+                conn.execute(
+                    "DELETE FROM attachment_partial WHERE token=?1
+                     AND ciphertext_digest=?2 AND locator_digest=?3",
+                    params![
+                        job.reference.token,
+                        ciphertext.as_slice(),
+                        locator.as_slice()
+                    ],
+                )
+            } else {
+                conn.execute(
+                    "DELETE FROM attachment_partial WHERE token=?1",
+                    [&job.reference.token],
+                )
+            }
             .storage()?;
-            Ok(true)
+            Ok(removed > 0)
         })
     }
 
