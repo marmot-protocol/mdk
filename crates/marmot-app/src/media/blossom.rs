@@ -540,6 +540,8 @@ pub(super) async fn fetch_blossom_blob_bounded(
 pub(super) struct FetchedBlob {
     pub bytes: Vec<u8>,
     pub response_url: Url,
+    /// The body contains saved checkpoint bytes and may need one clean retry.
+    pub resumed: bool,
 }
 
 pub(super) async fn fetch_blossom_blob_classified_until(
@@ -832,6 +834,7 @@ where
             return Ok(FetchedBlob {
                 bytes: partial.expect("checked").bytes,
                 response_url: current,
+                resumed: true,
             });
         }
         let mut request = client.get(current.clone()).timeout(remaining);
@@ -937,6 +940,7 @@ where
                 } else {
                     None
                 };
+                let resumed = prefix.is_some();
                 let result = super::attachment_resume::read_body(
                     response,
                     &current,
@@ -952,6 +956,7 @@ where
                 return result.map(|bytes| FetchedBlob {
                     bytes,
                     response_url: current,
+                    resumed,
                 });
             }
         }
@@ -969,6 +974,7 @@ where
             .map(|bytes| FetchedBlob {
                 bytes,
                 response_url: current,
+                resumed: false,
             });
         }
         if !status.is_redirection() {

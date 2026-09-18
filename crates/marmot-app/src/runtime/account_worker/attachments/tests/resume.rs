@@ -375,7 +375,9 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
         {
             assert!(
                 matches!(result, Err(AttachmentDownloadFailure::Stop(_)))
-                    || (case == "unsafe_redirect" && result.is_err()),
+                    || (case == "unsafe_redirect" && result.is_err())
+                    || (case == "corrupt"
+                        && matches!(result, Err(AttachmentDownloadFailure::Retry(_)))),
                 "{case}"
             );
             assert_eq!(
@@ -916,4 +918,147 @@ async fn attachment_resume_hash_failure_clears_redirected_replacement() {
     );
     a.await.unwrap();
     b.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
+    for complete_prefix in [false, true] {
+        for fresh_is_valid in [false, true] {
+            let plaintext = b"authenticate a clean download after a bad resume";
+            let (listener, reference, cipher) = listener_fixture(plaintext).await;
+            let total = cipher.len();
+            let saved = if complete_prefix {
+                let mut saved = cipher.clone();
+                saved[0] ^= 1;
+                saved
+            } else {
+                cipher[..8].to_vec()
+            };
+            let server = tokio::spawn(async move {
+                if !complete_prefix {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+                    let mut rest = cipher[8..].to_vec();
+                    rest[0] ^= 1;
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!(
+                            "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                            total - 1,
+                            total
+                        ),
+                        &rest,
+                        rest.len(),
+                    )
+                    .await;
+                }
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = headers(&mut socket).await;
+                assert!(!request.contains("\r\nrange:"));
+                assert!(!request.contains("\r\nif-range:"));
+                let mut body = cipher;
+                if !fresh_is_valid {
+                    body[0] ^= 1;
+                }
+                respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &body, total).await;
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let (client, store) = client_at(dir.path(), &reference, true).await;
+            let job = claim(&store);
+            let identity = AttachmentPartialIdentity {
+                ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+                etag: "\"v1\"".into(),
+                total: total as u64,
+            };
+            assert!(
+                store
+                    .checkpoint_attachment_partial(
+                        &job,
+                        &identity,
+                        0,
+                        &saved,
+                        crate::unix_now_seconds(),
+                        10000,
+                    )
+                    .unwrap()
+            );
+            let prepared = client
+                .prepare_background_attachment_download(
+                    &GroupId::new(vec![0xab; 16]),
+                    reference.clone(),
+                    64 * 1024 * 1024,
+                )
+                .unwrap()
+                .unwrap();
+            let result = prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await;
+            assert!(matches!(result, Err(AttachmentDownloadFailure::Retry(_))));
+            assert!(
+                store
+                    .load_attachment_partial(
+                        &job,
+                        crate::unix_now_seconds(),
+                        64 * 1024 * 1024,
+                        None,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+            let status = store
+                .attachment_acquisition_status(&job.reference)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                status.state,
+                storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+            );
+            assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+            store.close().unwrap();
+            drop(client);
+            drop(store);
+            let (client, store) = client_at(dir.path(), &reference, false).await;
+            let now = status.due.unwrap();
+            let job = store
+                .claim_attachment_acquisition(&job.reference, now, now + 1200)
+                .unwrap()
+                .unwrap();
+            let prepared = client
+                .prepare_background_attachment_download(
+                    &GroupId::new(vec![0xab; 16]),
+                    reference.clone(),
+                    64 * 1024 * 1024,
+                )
+                .unwrap()
+                .unwrap();
+            let result = prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await;
+            if fresh_is_valid {
+                assert_eq!(result.as_ref().unwrap().plaintext, plaintext);
+            } else {
+                assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+            }
+            complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+            assert_eq!(
+                store
+                    .attachment_acquisition_status(&job.reference)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                if fresh_is_valid {
+                    storage_sqlite::AttachmentAcquisitionState::Ready
+                } else {
+                    storage_sqlite::AttachmentAcquisitionState::Blocked
+                }
+            );
+            server.await.unwrap();
+        }
+    }
 }

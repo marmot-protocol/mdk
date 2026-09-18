@@ -1236,7 +1236,14 @@ async fn fetch_encrypted_media_blob_classified(
                 if let Some(resume) = &transport.resume {
                     let _ = resume.clear(Some(&blob.response_url)).await;
                 }
-                terminal_failure = true;
+                if blob.resumed {
+                    // Range headers alone cannot prove the server supplied the
+                    // correct suffix. Discard the checkpoint and let the durable
+                    // retry fetch from zero; a fresh hash miss stays terminal.
+                    retryable_failure = true;
+                } else {
+                    terminal_failure = true;
+                }
                 record_candidate_failure(
                     &mut last_error,
                     AppError::MediaDownloadFailed(

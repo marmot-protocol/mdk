@@ -233,7 +233,11 @@ URL even when its ETag string matches. Candidate failure cleanup is fenced by ci
 and final response URL (including redirects), so a bad alternative server cannot erase an
 unused prefix from another locator. Retryable redirect failures preserve valid checkpoints.
 Chunks carry local SHA-256 checksums to detect damaged checkpoint contents. The normal complete ciphertext hash, AEAD authentication and plaintext
-hash checks remain mandatory before publication. Resume still assembles a bounded full body
+hash checks remain mandatory before publication. A ciphertext hash miss on a body containing
+saved checkpoint bytes discards that checkpoint and schedules a clean download on the durable
+retry path. A fresh full-download hash miss remains terminal. The regression
+`attachment_resume_hash_miss_retries_from_zero_after_reopen` covers both outcomes across
+store reopen, including a fully saved checkpoint. Resume still assembles a bounded full body
 for the existing crypto pipeline; it does not add streaming plaintext decryption.
 
 The first checkpoint reserves the complete declared ciphertext size against the same account
