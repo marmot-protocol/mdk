@@ -24,6 +24,17 @@ Tracking issue: marmot-protocol/mdk#381.
 
 ## Inventory
 
+### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Runtime operation aggregates | One entry per closed `RuntimePerformanceOperation`, fixed histogram buckets and scalar counters; no account/group/message keys | Runtime telemetry drop reclaims aggregates; snapshots include untouched operations as zeroes |
+| Active-operation age slots | At most `TRACKED_STARTS` (64) monotonic starts per operation | RAII completion or cancellation releases a slot; excess starts still increment exact active/outcome counts and appear in `untracked_in_flight` |
+
+Age tracking never drops or delays application work. When slots overflow, the oldest tracked
+age is a lower bound; `untracked_in_flight` exposes that limitation. Each observation owns
+only telemetry, a closed operation and timing metadata, never a client or storage handle.
+
 ### `cgka-engine` candidate reconstruction (`src/openmls_projection/resumable.rs`)
 
 | Structure | Bound | Reclamation |

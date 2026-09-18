@@ -796,3 +796,69 @@ fn message_journey_metric_export() {
     assert_eq!(legacy.outbound_message_queue_wait.attempts, 0);
     assert_eq!(legacy.host_inbound_message_visible.attempts, 0);
 }
+
+#[test]
+fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels() {
+    use crate::app_telemetry::{
+        AppPerformanceTelemetry, RuntimePerformanceOperation as Op, runtime::Outcome,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    let exporter = MarmotRelayPlane::full_history()
+        .telemetry_exporter(
+            RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                .with_runtime_config(runtime_config()),
+            crate::product_analytics::test_permit(),
+        )
+        .unwrap();
+    let batch = || {
+        build_export_batch_with_app_performance(
+            &RelayTelemetryRollup::default(),
+            &RelayLabelResolution::default(),
+            Some(&telemetry.snapshot()),
+        )
+    };
+    exporter.since_baseline(batch());
+    let observation = telemetry.observe(Op::ConversationOpen);
+    let (active, _) = exporter.since_baseline(batch());
+    let points: Vec<_> = active
+        .points
+        .iter()
+        .filter(|p| p.name.starts_with("app_runtime_"))
+        .collect();
+    assert_eq!(points.len(), Op::ALL.len() * 11);
+    assert!(
+        points
+            .iter()
+            .all(|p| p.relay.is_none() && p.failure.is_none())
+    );
+    let metric = |batch: &RelayTelemetryExportBatch, name| {
+        batch
+            .points
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap()
+            .value
+            .clone()
+    };
+    assert_eq!(
+        metric(&active, "app_runtime_conversation_open_started"),
+        ExportMetricValue::Counter(1)
+    );
+    assert_eq!(
+        metric(&active, "app_runtime_conversation_open_in_flight"),
+        ExportMetricValue::Gauge(1.0)
+    );
+    observation.finish(Outcome::Success);
+    let (finished, _) = exporter.since_baseline(batch());
+    assert_eq!(
+        metric(&finished, "app_runtime_conversation_open_completed"),
+        ExportMetricValue::Counter(1)
+    );
+    assert_eq!(
+        metric(&finished, "app_runtime_conversation_open_in_flight"),
+        ExportMetricValue::Gauge(0.0)
+    );
+    assert!(
+        matches!(metric(&finished, "app_runtime_conversation_open_duration_ms"), ExportMetricValue::Histogram(h) if h.bucket_counts.iter().sum::<u64>() + h.overflow_count == 1)
+    );
+}

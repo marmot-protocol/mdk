@@ -329,6 +329,7 @@ pub(crate) struct GroupRouteRefresh {
 
 pub struct AppClient {
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
+    pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,

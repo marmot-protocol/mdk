@@ -2,6 +2,7 @@
 //! [`AccountWorkerCommand`] to the per-account worker and awaits its oneshot
 //! reply.
 
+use crate::RuntimePerformanceOperation as RuntimeOp;
 use zeroize::Zeroizing;
 
 use std::collections::BTreeSet;
@@ -89,7 +90,13 @@ impl AccountManager {
         command: mpsc::Sender<AccountWorkerCommand>,
         method: &'static str,
     ) {
-        if let Err(error) = self.catch_up_account_commands(vec![command]).await {
+        let observation = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::CatchUpAfterMutation);
+        let result = self.catch_up_account_commands(vec![command]).await;
+        observation.finish_app(&result);
+        if let Err(error) = result {
             tracing::warn!(
                 target: "marmot_app::runtime",
                 method = method,
@@ -1334,18 +1341,39 @@ impl AccountManager {
         revision: crate::MessageDraftRevision,
         attachments: Vec<MediaAttachmentReference>,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::SendMessageDraft {
-                group_id: group_id.clone(),
-                revision,
-                attachments,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let telemetry = self.shared.app_performance_telemetry();
+        let caller = telemetry.observe(RuntimeOp::DraftSendCaller);
+        let enqueued_at = Instant::now();
+        let result = async {
+            let acquire = telemetry.observe(RuntimeOp::SendWorkerAcquire);
+            let command = self.worker_commands(account_ref).await;
+            acquire.finish_app(&command);
+            let command = command?;
+            let (respond, response) = oneshot::channel();
+            let admission = telemetry.observe(RuntimeOp::SendAdmission);
+            let admitted = command
+                .send(AccountWorkerCommand::SendMessageDraft {
+                    enqueued_at,
+                    queued: Some(telemetry.observe(RuntimeOp::SendQueue)),
+                    group_id: group_id.clone(),
+                    revision,
+                    attachments,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed);
+            admission.finish_app(&admitted);
+            admitted?;
+            account_worker_response(response).await
+        }
+        .await;
+        caller.finish_app(&result);
+        telemetry.record(
+            AppPerformanceOperation::OutboundMessageResponse,
+            enqueued_at.elapsed(),
+            result.is_ok(),
+        );
+        let summary = result?;
         self.schedule_audit_log_tracker_update("send_message_draft");
         Ok(summary)
     }
@@ -1356,22 +1384,32 @@ impl AccountManager {
         group_id: &GroupId,
         payload: Vec<u8>,
     ) -> Result<SendSummary, AppError> {
+        let telemetry = self.shared.app_performance_telemetry();
+        let caller = telemetry.observe(RuntimeOp::DirectSendCaller);
         let enqueued_at = Instant::now();
         let result = async {
-            let command = self.worker_commands(account_ref).await?;
+            let acquire = telemetry.observe(RuntimeOp::SendWorkerAcquire);
+            let command = self.worker_commands(account_ref).await;
+            acquire.finish_app(&command);
+            let command = command?;
             let (respond, response) = oneshot::channel();
-            command
+            let admission = telemetry.observe(RuntimeOp::SendAdmission);
+            let admitted = command
                 .send(AccountWorkerCommand::SendMessage {
                     enqueued_at,
+                    queued: Some(telemetry.observe(RuntimeOp::SendQueue)),
                     group_id: group_id.clone(),
                     payload,
                     respond,
                 })
                 .await
-                .map_err(|_| AppError::TransportClosed)?;
+                .map_err(|_| AppError::TransportClosed);
+            admission.finish_app(&admitted);
+            admitted?;
             account_worker_response(response).await
         }
         .await;
+        caller.finish_app(&result);
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::OutboundMessageResponse,
             enqueued_at.elapsed(),

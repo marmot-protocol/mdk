@@ -1679,6 +1679,45 @@ fn append_app_performance_points(
         metric_names::APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES,
         metric_names::APP_HOST_FOREGROUND_LOCAL_READY_FAILURES,
     );
+    for operation in &app_performance.runtime_operations {
+        let names = operation.operation.metric_names();
+        for (name, value) in names[..7].iter().zip([
+            operation.started,
+            operation.completed,
+            operation.successes,
+            operation.failures,
+            operation.cancelled,
+            operation.timeouts,
+            operation.not_ready,
+        ]) {
+            points.push(ExportMetricPoint {
+                name,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(value),
+            });
+        }
+        points.push(ExportMetricPoint {
+            name: names[7],
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
+                &operation.duration_ms,
+            )),
+        });
+        for (name, value) in names[8..].iter().zip([
+            operation.in_flight,
+            operation.oldest_tracked_in_flight_ms,
+            operation.untracked_in_flight,
+        ]) {
+            points.push(ExportMetricPoint {
+                name,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(value as f64),
+            });
+        }
+    }
     // Process-wide SQLCipher probe counters (mdk#1439): runs are keyed opens
     // paying the passphrase KDF, skips are KDF derivations avoided via cached
     // verdicts. Population-level only, no labels.

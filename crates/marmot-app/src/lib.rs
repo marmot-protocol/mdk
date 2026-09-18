@@ -169,8 +169,9 @@ pub use agent_streams::{
 };
 pub use app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    HostPerformanceOperation, HostPerformanceOutcome, SyncErrorClass, SyncFailureClassification,
-    SyncFailureCount, SyncFailureStage,
+    HostPerformanceOperation, HostPerformanceOutcome, RuntimePerformanceOperation,
+    RuntimePerformanceSnapshot, SyncErrorClass, SyncFailureClassification, SyncFailureCount,
+    SyncFailureStage,
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
@@ -1706,6 +1707,7 @@ impl MarmotApp {
         let _ = open.runtime.take_maintenance_activity();
         let mut client = AppClient {
             conversation_captures: Vec::new(),
+            runtime_telemetry: None,
             send_telemetry: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),

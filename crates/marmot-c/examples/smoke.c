@@ -183,6 +183,27 @@ int main(int argc, char **argv) {
     }
     ok("client constructed");
 
+    st = marmot_record_host_performance(client,
+        MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,
+        MARMOT_HOST_PERFORMANCE_OUTCOME_CANCELLED);
+    check(st == MARMOT_STATUS_OK, "conversation host timing accepted");
+    MarmotAppPerformanceSnapshot *performance = NULL;
+    st = marmot_app_performance_snapshot(client, &performance);
+    check(st == MARMOT_STATUS_OK && performance != NULL, "runtime performance snapshot");
+    bool found_timing = false;
+    if (performance != NULL) {
+        for (uintptr_t i = 0; i < performance->runtime_operations_len; i++) {
+            const MarmotRuntimePerformanceSnapshot *timing = &performance->runtime_operations[i];
+            if (strcmp(timing->operation, "host_conversation_composer_ready") == 0) {
+                found_timing = timing->started == 1 && timing->completed == 1 &&
+                    timing->cancelled == 1 && timing->in_flight == 0 &&
+                    timing->duration_ms.sum_ms == 125 && timing->duration_ms.buckets_len > 0;
+            }
+        }
+    }
+    check(found_timing, "runtime timing array, outcome and histogram cross C ABI");
+    marmot_app_performance_snapshot_free(performance);
+
     bool stopping = true;
     st = marmot_client_is_stopping(client, &stopping);
     check(st == MARMOT_STATUS_OK && !stopping, "client not stopping");

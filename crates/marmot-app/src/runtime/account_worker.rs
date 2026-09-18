@@ -3,6 +3,8 @@
 
 mod attachments;
 
+use crate::RuntimePerformanceOperation as RuntimeOp;
+use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -159,6 +161,7 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
     },
     CaptureConversation {
+        queued: Option<Observation>,
         group_id: GroupId,
         query: storage_sqlite::ConversationWindowQuery,
         store_epoch: Vec<u8>,
@@ -311,12 +314,15 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendMessageDraft {
+        enqueued_at: Instant,
+        queued: Option<Observation>,
         group_id: GroupId,
         revision: crate::MessageDraftRevision,
         attachments: Vec<MediaAttachmentReference>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendMessage {
+        queued: Option<Observation>,
         enqueued_at: Instant,
         group_id: GroupId,
         payload: Vec<u8>,
@@ -525,6 +531,30 @@ impl Drop for WelcomeRecoveryTask {
     }
 }
 
+fn install_storage_telemetry(client: &AppClient, telemetry: &crate::AppPerformanceTelemetry) {
+    if let Ok(storage) = client.app.account_storage(&client.state.label) {
+        let telemetry = telemetry.clone();
+        storage.set_timing_observer(Some(Arc::new(move |operation, duration, success| {
+            let operation = match operation {
+                storage_sqlite::SqliteTimingOperation::ConnectionWait => {
+                    RuntimeOp::StorageConnectionWait
+                }
+                storage_sqlite::SqliteTimingOperation::Transaction => RuntimeOp::StorageTransaction,
+                storage_sqlite::SqliteTimingOperation::WriteBegin => RuntimeOp::StorageWriteBegin,
+            };
+            telemetry.record_runtime(
+                operation,
+                duration,
+                if success {
+                    TelemetryOutcome::Success
+                } else {
+                    TelemetryOutcome::Failure
+                },
+            );
+        })));
+    }
+}
+
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
@@ -558,7 +588,10 @@ async fn run_app_runtime_account_worker(
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut open_client =
         std::pin::pin!(app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(),));
-    let mut client = match tokio::select! {
+    let startup = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::AccountStartup);
+    let opened = tokio::select! {
         _ = &mut shutdown => {
             release_startup_client_if_opened(open_client.as_mut()).await;
             if let Some(ready) = ready.take() {
@@ -578,7 +611,9 @@ async fn run_app_runtime_account_worker(
             return;
         }
         result = open_client.as_mut() => result,
-    } {
+    };
+    startup.finish_app(&opened);
+    let mut client = match opened {
         Ok(client) => client,
         Err(err) => {
             let message = account_error_message("runtime startup failed", &err);
@@ -594,6 +629,8 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
+    install_storage_telemetry(&client, &shared.app_performance_telemetry());
+    client.runtime_telemetry = Some(shared.app_performance_telemetry());
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
         scheduled_convergence_test_delay(&app),
@@ -803,8 +840,9 @@ async fn run_app_runtime_account_worker(
                                 ))),
                             }
                         }
-                        Some(AccountWorkerCommand::CaptureConversation { respond, .. }) => {
+                        Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
                             // Frozen startup facts cannot be composed with newer account rows.
+                            if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                             let _ = respond.send(Err(ConversationWindowError::NotReady));
                         }
                         Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
@@ -1232,6 +1270,8 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = scheduled_convergence.timer.as_mut() => {
+                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
+
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 // Recovery owns the live client, but member/roster reads can
@@ -1336,6 +1376,8 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                 ))
                 .await;
+
+                phase.finish(TelemetryOutcome::Success);
             }
             received = client.receive_next_delivery() => {
                 // Only the transport wait participates in `select!`. Once a
@@ -1344,6 +1386,7 @@ async fn run_app_runtime_account_worker(
                 // commands remain queued until that durable sequence lands.
                 let delivery_started = matches!(&received, Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(_)))
                     .then(Instant::now);
+                let receive_observation = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReceive);
                 let (result, overflow_recovery_incomplete) = match received {
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                         (client.ingest_received_delivery(*delivery).await, false)
@@ -1385,6 +1428,7 @@ async fn run_app_runtime_account_worker(
                         false,
                     );
                 }
+                receive_observation.finish_app(&result);
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
@@ -1463,6 +1507,7 @@ async fn run_app_runtime_account_worker(
                         // prolonged transport outage.
                         drop(client);
                         client = loop {
+                            let reconnect_wait = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReconnectWait);
                             let retry_started_at = Instant::now();
                             let mut retry_delay =
                                 std::pin::pin!(sleep(reconnect_backoff.next_delay()));
@@ -1491,10 +1536,14 @@ async fn run_app_runtime_account_worker(
                                                         | AccountWorkerCommand::ConnectivityRestored { .. }) => {
                                                             pending.push_back(command);
                                                         }
-                                                        AccountWorkerCommand::CaptureConversation { respond, .. } => {
+                                                        AccountWorkerCommand::CaptureConversation { respond, queued, .. } => {
+                                                            if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                                                             let _ = respond.send(Err(ConversationWindowError::NotReady));
                                                         }
-                                                        command => drop(command),
+                                                        command => {
+                                                            shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            drop(command);
+                                                        },
                                                     }
                                                 }
                                                 tracing::debug!(
@@ -1510,7 +1559,8 @@ async fn run_app_runtime_account_worker(
                                                 );
                                                 break;
                                             }
-                                            Some(AccountWorkerCommand::CaptureConversation { respond, .. }) => {
+                                            Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
+                                                if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                                                 let _ = respond.send(Err(ConversationWindowError::NotReady));
                                             }
                                             // There is deliberately no engine
@@ -1520,18 +1570,27 @@ async fn run_app_runtime_account_worker(
                                             // dropping their response sender
                                             // instead of letting the queue fill
                                             // until host-side timeouts fire.
-                                            Some(command) => drop(command),
+                                            Some(command) => {
+                                                shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                drop(command);
+                                            },
                                             None => return,
                                         }
                                     }
                                 }
                             }
-                            match tokio::select! {
+                            reconnect_wait.finish(TelemetryOutcome::Success);
+                            let reopen = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReopen);
+                            let reopened_result = tokio::select! {
                                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
                                 _ = &mut shutdown => return,
                                 result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
-                            } {
+                            };
+                            reopen.finish_app(&reopened_result);
+                            match reopened_result {
                                 Ok(mut reopened) => {
+                                    install_storage_telemetry(&reopened, &shared.app_performance_telemetry());
+                                    reopened.runtime_telemetry = Some(shared.app_performance_telemetry());
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
                                     // eagerly here — the steady-state loop
@@ -1680,6 +1739,8 @@ async fn run_app_runtime_account_worker(
                 };
             }
             _ = maintenance_tick.tick() => {
+                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
+
                 attachment_due = true;
                 presentation_due = true;
                 avatar_due = true;
@@ -1850,6 +1911,8 @@ async fn run_app_runtime_account_worker(
                         );
                     }
                 }
+
+                phase.finish(TelemetryOutcome::Success);
             }
         }
     }
@@ -1877,7 +1940,12 @@ async fn handle_account_worker_catch_up(
     pending: &mut VecDeque<AccountWorkerCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
-    let read_snapshot = match client.group_read_snapshot() {
+    let telemetry = context.shared.app_performance_telemetry();
+    let catch_up_observation = telemetry.observe(RuntimeOp::WorkerCatchUp);
+    let snapshot_observation = telemetry.observe(RuntimeOp::WorkerSnapshot);
+    let snapshot_result = client.group_read_snapshot();
+    snapshot_observation.finish_app(&snapshot_result);
+    let read_snapshot = match snapshot_result {
         Ok(snapshot) => Some(snapshot),
         Err(err) => {
             let message = account_error_message("runtime catch-up snapshot failed", &err);
@@ -1935,7 +2003,12 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(snapshot.member_ids_page(&group_ids));
                 }
-                AccountWorkerCommand::CaptureConversation { respond, .. } => {
+                AccountWorkerCommand::CaptureConversation {
+                    respond, queued, ..
+                } => {
+                    if let Some(queued) = queued {
+                        queued.finish(TelemetryOutcome::NotReady);
+                    }
                     let _ = respond.send(Err(ConversationWindowError::NotReady));
                 }
                 AccountWorkerCommand::GroupMlsState { group_id, respond }
@@ -1986,6 +2059,11 @@ async fn handle_account_worker_catch_up(
                     let _ = respond.send(true);
                 }
                 AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
+                    telemetry.record_runtime(
+                        RuntimeOp::CatchUpCoalesced,
+                        Duration::ZERO,
+                        TelemetryOutcome::Success,
+                    );
                     catch_up_responders.push(respond);
                 }
                 command => deferred.push_back(command),
@@ -2064,6 +2142,11 @@ async fn handle_account_worker_catch_up(
                 .map(AccountCatchUpFailure::classification),
         );
     let retry_after_response = result.is_ok();
+    catch_up_observation.finish(if result.is_ok() {
+        TelemetryOutcome::Success
+    } else {
+        TelemetryOutcome::Failure
+    });
     for respond in catch_up_responders {
         let _ = respond.send(result.clone());
     }
@@ -2226,6 +2309,9 @@ async fn run_startup_hydration_pipeline(
         finish_deferred_hydration_reconciliation(client);
         return StartupHydrationOutcome::Completed;
     }
+    let hydration_observation = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::WorkerHydration);
     let pipeline_started = Instant::now();
     // Chat-list recency order from the durable projection: the groups the
     // user sees first hydrate first. The session appends any stored group
@@ -2330,6 +2416,11 @@ async fn run_startup_hydration_pipeline(
         }
         tokio::task::yield_now().await;
     }
+    hydration_observation.finish(if pipeline_ok {
+        TelemetryOutcome::Success
+    } else {
+        TelemetryOutcome::Failure
+    });
     shared.app_performance_telemetry().record(
         AppPerformanceOperation::AccountGroupHydration,
         pipeline_started.elapsed(),
@@ -2426,15 +2517,31 @@ async fn handle_startup_hydration_command(
             let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
         }
         AccountWorkerCommand::CaptureConversation {
+            queued,
             group_id,
             query,
             store_epoch,
             observer,
             respond,
         } => {
+            if let Some(queued) = queued {
+                queued.finish(if respond.is_closed() {
+                    TelemetryOutcome::Cancelled
+                } else {
+                    TelemetryOutcome::Success
+                });
+            }
             if !respond.is_closed() {
                 client.register_conversation_capture(observer);
-                let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+                let capture = client
+                    .runtime_telemetry
+                    .as_ref()
+                    .map(|t| t.observe(RuntimeOp::ConversationCapture));
+                let result = capture_conversation(client, &group_id, query, &store_epoch);
+                if let Some(capture) = capture {
+                    capture.finish(super::conversation_window::telemetry_outcome(&result));
+                }
+                let _ = respond.send(result);
             }
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
@@ -2924,7 +3031,12 @@ where
                     .expect("snapshot availability checked above");
                 let _ = respond.send(snapshot.member_ids_page(&group_ids));
             }
-            AccountWorkerCommand::CaptureConversation { respond, .. } => {
+            AccountWorkerCommand::CaptureConversation {
+                respond, queued, ..
+            } => {
+                if let Some(queued) = queued {
+                    queued.finish(TelemetryOutcome::NotReady);
+                }
                 let _ = respond.send(Err(ConversationWindowError::NotReady));
             }
             AccountWorkerCommand::GroupMlsState { group_id, respond }
@@ -3446,15 +3558,31 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::CaptureConversation {
+            queued,
             group_id,
             query,
             store_epoch,
             observer,
             respond,
         } => Box::pin(async move {
+            if let Some(queued) = queued {
+                queued.finish(if respond.is_closed() {
+                    TelemetryOutcome::Cancelled
+                } else {
+                    TelemetryOutcome::Success
+                });
+            }
             if !respond.is_closed() {
                 client.register_conversation_capture(observer);
-                let _ = respond.send(capture_conversation(client, &group_id, query, &store_epoch));
+                let capture = client
+                    .runtime_telemetry
+                    .as_ref()
+                    .map(|t| t.observe(RuntimeOp::ConversationCapture));
+                let result = capture_conversation(client, &group_id, query, &store_epoch);
+                if let Some(capture) = capture {
+                    capture.finish(super::conversation_window::telemetry_outcome(&result));
+                }
+                let _ = respond.send(result);
             }
             true
         }),
@@ -4035,17 +4163,40 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::SendMessageDraft {
+            enqueued_at,
+            queued,
             group_id,
             revision,
             attachments,
             respond,
         } => Box::pin(async move {
+            if let Some(queued) = queued {
+                queued.finish(TelemetryOutcome::Success);
+            }
+            let telemetry = shared.app_performance_telemetry();
+            let execution = telemetry.observe(RuntimeOp::SendExecution);
+            let send_started_at = Instant::now();
+            telemetry.record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                enqueued_at.elapsed(),
+                true,
+            );
+            let mut first_projection = true;
+            client.send_telemetry = Some(telemetry.clone());
             let result = client
                 .send_message_draft_with_local_projection(
                     &group_id,
                     revision,
                     attachments,
                     |update| {
+                        if first_projection {
+                            telemetry.record(
+                                AppPerformanceOperation::OutboundMessageLocalProjection,
+                                enqueued_at.elapsed(),
+                                true,
+                            );
+                            first_projection = false;
+                        }
                         publish_app_runtime_projection_update(
                             events,
                             account_id_hex,
@@ -4055,15 +4206,29 @@ fn account_worker_command_future<'a>(
                     },
                 )
                 .await;
+            client.send_telemetry = None;
+            execution.finish_app(&result);
+            telemetry.record(
+                AppPerformanceOperation::OutboundMessageSend,
+                send_started_at.elapsed(),
+                result.is_ok(),
+            );
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
         AccountWorkerCommand::SendMessage {
             enqueued_at,
+            queued,
             group_id,
             payload,
             respond,
         } => Box::pin(async move {
+            if let Some(queued) = queued {
+                queued.finish(TelemetryOutcome::Success);
+            }
+            let execution = shared
+                .app_performance_telemetry()
+                .observe(RuntimeOp::SendExecution);
             let send_started_at = Instant::now();
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageQueueWait,
@@ -4091,6 +4256,7 @@ fn account_worker_command_future<'a>(
                 })
                 .await;
             client.send_telemetry = None;
+            execution.finish_app(&result);
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),
@@ -5562,6 +5728,7 @@ mod tests {
             let (respond, response) = oneshot::channel();
             commands
                 .try_send(AccountWorkerCommand::CaptureConversation {
+                    queued: None,
                     group_id: GroupId::new(vec![1; 16]),
                     query: Default::default(),
                     store_epoch: vec![],

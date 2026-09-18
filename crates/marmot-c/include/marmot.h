@@ -962,6 +962,8 @@ typedef enum MarmotHostPerformanceOperation {
   MARMOT_HOST_PERFORMANCE_OPERATION_FOREGROUND_LOCAL_READY,
   MARMOT_HOST_PERFORMANCE_OPERATION_OUTBOUND_MESSAGE_VISIBLE,
   MARMOT_HOST_PERFORMANCE_OPERATION_INBOUND_MESSAGE_VISIBLE,
+  MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_LOCAL_VISIBLE,
+  MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY,
 } MarmotHostPerformanceOperation;
 
 /**
@@ -970,6 +972,9 @@ typedef enum MarmotHostPerformanceOperation {
 typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_SUCCESS,
   MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_CANCELLED,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_TIMEOUT,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_UNAVAILABLE,
 } MarmotHostPerformanceOutcome;
 
 /**
@@ -3798,6 +3803,24 @@ typedef struct MarmotAppPerformanceOperationSnapshot {
 } MarmotAppPerformanceOperationSnapshot;
 
 /**
+ * Bounded runtime timings and unfinished operation counts.
+ */
+typedef struct MarmotRuntimePerformanceSnapshot {
+  char *operation;
+  uint64_t started;
+  uint64_t completed;
+  uint64_t successes;
+  uint64_t failures;
+  uint64_t cancelled;
+  uint64_t timeouts;
+  uint64_t not_ready;
+  uint64_t in_flight;
+  uint64_t oldest_tracked_in_flight_ms;
+  uint64_t untracked_in_flight;
+  struct MarmotDurationHistogramSnapshot duration_ms;
+} MarmotRuntimePerformanceSnapshot;
+
+/**
  * Process-wide performance counters. Free with
  * `marmot_app_performance_snapshot_free`.
  */
@@ -3895,6 +3918,8 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot media_download_plaintext_verify;
   struct MarmotAppPerformanceOperationSnapshot host_splash_ready;
   struct MarmotAppPerformanceOperationSnapshot host_foreground_local_ready;
+  struct MarmotRuntimePerformanceSnapshot *runtime_operations;
+  uintptr_t runtime_operations_len;
 } MarmotAppPerformanceSnapshot;
 
 typedef struct MarmotUsageDiagnosticsSettings {

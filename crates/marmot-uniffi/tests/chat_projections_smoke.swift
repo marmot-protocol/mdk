@@ -14,6 +14,16 @@ struct ChatProjectionsSmoke {
             let copy = try FfiConverterTypeAttachmentLocalBytesFfi.lift(FfiConverterTypeAttachmentLocalBytesFfi.lower(chunk))
             precondition(copy == chunk)
         }
+        let timing = RuntimePerformanceSnapshotFfi(operation: "conversation_open", started: 5,
+            completed: 4, successes: 1, failures: 1, cancelled: 1, timeouts: 1, notReady: 0,
+            inFlight: 1, oldestTrackedInFlightMs: 800, untrackedInFlight: 0,
+            durationMs: DurationHistogramSnapshotFfi(buckets: [DurationHistogramBucketFfi(upperBoundMs: 100, count: 4)], overflowCount: 0, sumMs: 400))
+        let timingCopy = try FfiConverterTypeRuntimePerformanceSnapshotFfi.lift(FfiConverterTypeRuntimePerformanceSnapshotFfi.lower(timing))
+        precondition(timingCopy == timing)
+        for outcome in [HostPerformanceOutcomeFfi.success, .failure, .cancelled, .timeout, .unavailable] {
+            let outcomeCopy = try FfiConverterTypeHostPerformanceOutcomeFfi.lift(FfiConverterTypeHostPerformanceOutcomeFfi.lower(outcome))
+            precondition(outcomeCopy == outcome)
+        }
         for state in [AvatarAvailabilityFfi.missing, .ready, .stale, .invalidated] {
             for acquisition in [AvatarAcquisitionStateFfi.idle, .queued, .fetching, .retryScheduled, .blocked] {
                 let asset = AvatarAssetFfi(target: "opaque-target", reference: "opaque-reference", availability: state, acquisition: acquisition, contentRevision: 7, byteCount: 4)

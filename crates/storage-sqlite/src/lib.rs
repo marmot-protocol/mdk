@@ -79,7 +79,8 @@ pub use chat_presentation::{
 pub use connection::SqliteStorage;
 pub use connection::{
     CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
-    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
+    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
+    SqliteTimingOperation, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
     MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,

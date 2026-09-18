@@ -25,6 +25,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_attachment_local_bytes_free`. Additive API; regenerate headers and use
   the matching library. Automatic acquisition remains opt-in.
 
+- Runtime performance snapshots with bounded operation names, terminal outcomes,
+  duration histograms and unfinished-work gauges. Host timing enums add conversation
+  local-visible/composer-ready milestones and cancelled/timeout/unavailable outcomes.
+  `MarmotAppPerformanceSnapshot` gains an owned runtime-operation array; its existing
+  free function releases the array and nested records. Use matching regenerated
+  headers and libraries because the output record layout changed.
+
 - `MarmotDeletionSource` and `deletion_source` on `MarmotTimelineMessageRecord`,
   `MarmotTimelineReplyPreview`, and `MarmotChatListMessagePreview` distinguish
   accepted author/admin deletions with an unknown fallback for legacy evidence.

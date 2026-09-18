@@ -3725,7 +3725,20 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
         },
     };
 
-    let ingested = runtime.ingest_delivery(delivery).await.unwrap();
+    let mut phases = Vec::new();
+    let ingested = runtime
+        .ingest_delivery_with_observer(delivery, |phase, _elapsed, success| {
+            phases.push((phase, success));
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        phases,
+        vec![
+            (marmot_account::AccountIngestPhase::Engine, true),
+            (marmot_account::AccountIngestPhase::EffectPublication, true),
+        ]
+    );
     assert_eq!(ingested.effects.pending_convergence, vec![group_id.clone()]);
     assert!(
         ingested.effects.pending.is_empty(),

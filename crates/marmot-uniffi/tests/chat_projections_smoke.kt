@@ -10,6 +10,12 @@ fun main() {
         val copy = FfiConverterTypeAttachmentLocalBytesFfi.lift(FfiConverterTypeAttachmentLocalBytesFfi.lower(chunk))
         check(copy.available == chunk.available && copy.bytes.contentEquals(chunk.bytes))
     }
+    val timing = RuntimePerformanceSnapshotFfi("conversation_open", 5u, 4u, 1u, 1u, 1u, 1u, 0u,
+        1u, 800u, 0u, DurationHistogramSnapshotFfi(listOf(DurationHistogramBucketFfi(100u, 4u)), 0u, 400u))
+    check(FfiConverterTypeRuntimePerformanceSnapshotFfi.lift(FfiConverterTypeRuntimePerformanceSnapshotFfi.lower(timing)) == timing)
+    for (outcome in HostPerformanceOutcomeFfi.entries) {
+        check(FfiConverterTypeHostPerformanceOutcomeFfi.lift(FfiConverterTypeHostPerformanceOutcomeFfi.lower(outcome)) == outcome)
+    }
     for (state in AvatarAvailabilityFfi.entries) {
         for (acquisition in AvatarAcquisitionStateFfi.entries) {
             val asset = AvatarAssetFfi("opaque-target", "opaque-reference", state, acquisition, 7u, 4u)
