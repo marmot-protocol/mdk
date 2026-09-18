@@ -541,8 +541,9 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   `ConvergenceDeferred`, and the row carries no deferral reason (the only stored epoch authenticator,
   `OwnApplicationConvergenceStamp`, belongs to locally authored rows the drain already skips). It withholds both, which
   is harmless only because the drain is not the deliverer of a matured row: a pass re-seeds every
-  `ConvergenceDeferred` application above the retained anchor and delivers it, and it runs before
-  `advance_convergence_inputs` reaches the drain arm. If a pass ever stops dominating the drain there, the gate must
+  `ConvergenceDeferred` application above the retained anchor and re-evaluates its disposition — one that decrypts on
+  the selected canonical branch is delivered, one that decrypts only on a still-eligible losing branch is re-deferred
+  `NonSelectedEligibleBranch` — and it runs before `advance_convergence_inputs` reaches the drain arm. If a pass ever stops dominating the drain there, the gate must
   distinguish the two reasons by outcome — a matured application decrypts against canonical state, a branch message
   does not — rather than by state.
   Terminalization is owed to a later pass and the horizon arms (`BeyondAnchor`, `BeyondAppRetention`) — nothing runs on

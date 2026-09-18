@@ -6722,8 +6722,11 @@ async fn a_commit_awaiting_adjudication_is_adjudicated_before_the_application_dr
 /// the row and withholds both. What keeps that harmless is that the drain is not
 /// the deliverer of a matured row: a convergence pass re-seeds every
 /// `ConvergenceDeferred` application above the retained anchor
-/// (`seed_stored_openmls_graph_inputs`) and delivers it, and any pass reaching
-/// this state runs before `advance_convergence_inputs` can reach the drain arm.
+/// (`seed_stored_openmls_graph_inputs`) and re-evaluates its disposition —
+/// delivered if it decrypts on the selected canonical branch, re-deferred
+/// `NonSelectedEligibleBranch` if only on a still-eligible losing branch — and
+/// any pass reaching this state runs before `advance_convergence_inputs` can
+/// reach the drain arm.
 /// Forcing the gate shut (`if false`) leaves this test green, which is the
 /// evidence; forcing it open is what the revival test catches. Keep this test:
 /// it is the assertion that would fail if the pass ever stopped dominating the
