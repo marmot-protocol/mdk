@@ -100,6 +100,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| SQLCipher database-open lock registry (`src/sqlcipher/open_lock.rs`) | One weak entry per concurrently requested database, bounded by peak simultaneous opens. | Each lookup sweeps expired weak entries. Only openers and waiters retain strong references; cached handles do not retain locks. Parent-canonical paths remain stable before/after file creation. |
 | `SQLCIPHER_V2_VERDICTS` probe-verdict cache | 256 entries (`SQLCIPHER_V2_VERDICT_CACHE_CAPACITY`) | Entries are keyed by canonical database path + salt and record only an observed "opens under the v2 key" verdict (mdk#1439). Removed when the database file set is deleted via `remove_sqlite_file_set`; replaced in place when the salt rotates; oldest-first eviction at the cap. Eviction or loss of an entry only ever causes one extra recovery probe, never a wrong-key assumption. The companion `SQLCIPHER_MIGRATION_PROBE_RUNS`/`SKIPS` counters are monotonic process-lifetime aggregates by design (telemetry gauges, not tracked state). |
 
 ### `marmot-app` client (`src/client/`)

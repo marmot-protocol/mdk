@@ -1011,7 +1011,11 @@ impl AccountManager {
                 .app
                 .account_home()
                 .account_setup_state(account_ref)?
-                .is_some_and(|s| s.kind == AccountSetupKind::InteractiveIdentity)
+                .is_some_and(|s| {
+                    s.kind == AccountSetupKind::InteractiveIdentity
+                        || (s.kind == AccountSetupKind::GeneratedIdentity
+                            && s.phase == AccountSetupPhase::LocalStateCreated)
+                })
         {
             return Ok(false);
         }

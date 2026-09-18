@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-08-23
+updated: 2026-09-18
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -42,6 +42,24 @@ mdk#357, mdk#367, mdk#396).
 restrictive-by-construction posture with an on-disk mode test) instead of re-deriving umask/chmod/PRAGMA ordering.
 `crates/marmot-account/src/io.rs` (`write_file_atomically` with `FileMode::Private`) is a compliant-equivalent
 implementation that predates the shared crate.
+
+## Initializing encrypted account databases
+
+Concurrent first opens of one database serialize salt selection, legacy rekey,
+schema migration and cache publication. Waiters recheck the cache after taking
+that database's lock; unrelated databases can still open in parallel. Production
+root leases exclude other processes. Lock order is storage lifecycle admission,
+then the per-database initialization lock, then cache publication; terminal close
+waits for admitted opens before draining caches.
+
+Salts and external-signing storage secrets are published from unique 0600 staging
+files only after their contents are synced. Atomic hard-link publication refuses
+to replace existing key material and exposes no partially written destination.
+Generated accounts remain unavailable to attention readers and managed workers
+until the setup journal reaches `LocalReady`. A failed pre-readiness resume keeps
+its account files and keys while healthy accounts start. Neither journal state
+nor file size proves an unreadable encrypted database empty; no automatic deletion
+or salt replacement is a recovery operation.
 
 ## Releasing artifacts before host suspension
 

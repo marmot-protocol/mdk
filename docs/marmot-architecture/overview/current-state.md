@@ -126,6 +126,13 @@ with raw-byte deletion; app recovery retires both inventory and duplicate
 receipts before readmission. See [released transport receipts](../storage-format-v2.md#released-transport-receipts).
 The production retention and retry limits remain unchanged.
 
+Same-database first opens now serialize SQLCipher key selection, schema migration
+and handle publication; salts cannot be overwritten by competing initializers.
+Generated identities remain unavailable to background attention and managed workers
+until local readiness. Failed pre-readiness setup preserves its files and keys
+without preventing healthy accounts from starting; it does not automatically erase
+or repair an unreadable database. See [local artifact safety](local-artifact-safety.md#initializing-encrypted-account-databases).
+
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
 It requires single-device acknowledgment before KeyPackage publication and offers

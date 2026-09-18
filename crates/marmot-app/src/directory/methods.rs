@@ -1681,19 +1681,30 @@ impl MarmotApp {
         )
         .entered();
         let path = self.directory_cache_path(&account.label);
+        let lock = crate::sqlcipher::database_open_lock(&path);
+        let database = lock.lock();
+        if let Some(cache) = self
+            .directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account.label)
+            .cloned()
+        {
+            return Ok(cache);
+        }
         let key = if account.local_signing {
             let keys = self.account_home().load_signing_keys(&account.label)?;
-            self.sqlcipher_key(
+            self.sqlcipher_key_locked(
                 &account.label,
                 &keys,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::DirectoryCache,
             )?
         } else {
             self.external_sqlcipher_key(
                 &account.label,
                 &account.account_id_hex,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::DirectoryCache,
             )?
         };

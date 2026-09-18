@@ -5001,6 +5001,7 @@ impl MarmotAppRuntime {
                     .app
                     .account_home()
                     .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
+                self.accounts.app.presentation_signals.catalog_changed();
                 Ok(bytes)
             } else {
                 let lifecycle = self
