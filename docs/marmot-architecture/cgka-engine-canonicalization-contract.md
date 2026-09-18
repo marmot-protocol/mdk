@@ -310,8 +310,11 @@ Rules:
 - Accepted app messages MUST become application-visible `GroupEvent::MessageReceived` outputs after the selected
   canonical commit path has been applied.
 - An app message that decrypts against multiple candidate states is accepted only if one matching state is on the
-  selected branch. If no matching state is selected, it is invalidated.
-- An app message that decrypts only against a losing branch is invalidated.
+  selected branch. If no matching state is selected, it is deferred or invalidated by the rule below.
+- An app message that decrypts only against non-selected branches is deferred (`NonSelectedEligibleBranch`) while any
+  of those branches is still eligible, exactly as that branch's commits and proposals are. A later pass holding deeper
+  evidence can adopt the branch, and the deferred app message is then accepted and delivered with it. It is invalidated
+  (`LosingBranch`) only once no branch it decrypts on can be reconsidered.
 - An app message older than the MLS past-epoch decryption limit is expired.
 - Duplicate app messages MUST be reported as `AlreadySeen`.
 - A future-epoch app message without a reachable commit in the frozen batch is deferred for a later pass; it is not
@@ -513,11 +516,12 @@ The conformance suite should cover:
 - child commit with missing parent explicitly deferred while the completed frozen pass settles,
 - proposal consumed by canonical commit,
 - proposal not consumed by a canonical commit explicitly deferred while still viable,
-- proposal and commit on a non-selected eligible branch deferred rather than terminally dropped,
+- proposal, commit, and app message on a non-selected eligible branch deferred rather than terminally dropped, and the
+  app message delivered with its branch when a later pass adopts it,
 - deferred input reconsidered when later selection-relevant evidence opens a pass, without immediately reopening an
   unchanged completed pass,
 - future-epoch app message without its advancing commit deferred and later delivered after that commit arrives,
-- app message on losing branch invalidated with payload reference when known,
+- app message on a losing branch that can no longer be reconsidered invalidated with payload reference when known,
 - end-to-end peeler ingest emits selected branch epoch/member `GroupEvent` output across multiple clients
   (`convergence-e2e-group-events/v1`),
 - generated `convergence-e2e-delivery/v1` variants preserve that epoch/member output under duplicated, delayed, and

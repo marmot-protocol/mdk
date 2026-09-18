@@ -518,6 +518,32 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   for every deferral. The app side must mirror the asymmetry: its tombstone is terminal by default (#1608), and only the
   explicitly evidenced `GroupStateRevalidated` path clears a `SupersededByBranchSelection` row. Withdrawals under every
   other reason stay terminal on both sides.
+- **An application moves with the branch it rode.** A never-delivered application that decrypts only on non-selected
+  branches is parked `ConvergenceDeferred` under `NonSelectedEligibleBranch` while any of those branches is still
+  eligible — `handle_app_message`'s losing arm mirrors `classify_losing_materialized_candidate_commits`. Graph seeding
+  re-admits a parked application, so the same later pass that revives the commits accepts and delivers it: applications
+  need no revival emitter of their own. Parking also keeps the branch's witness weight in the candidate graph, which is
+  what makes selection independent of local arrival order (the same reason a `Processed` application is re-admitted as
+  `already_delivered`). A parked application is announced to nobody: withdrawing a payload the application was never
+  shown retracts nothing, exactly as a never-applied parked commit emits no `CommitRolledBack`. Terminal
+  `AppMessageInvalidationReason::LosingBranch` is therefore reserved for the two cases that really are final — an
+  application no branch it decrypts on can be reconsidered any more, and an already-delivered application a reorg takes
+  back (mdk#965), whose app-layer tombstone has no revival path. The background drain honours the same park: while the
+  group still holds a parked commit — a rival branch — `pending_canonical_applications` reports no parked application as
+  drainable work, so the drain can neither hand a parked row the terminal `UndecryptableInCanonicalState` verdict the
+  pass withheld nor rearm the scheduler on it. "Parked", not "pending", is the right question on both sides: a commit
+  that still owes a verdict gates unconditionally (`ConvergenceInputContext::gates_outbound`, `CommitEdge => true`) and
+  so keeps the drain arm unreachable, while widening the gate to any pending commit would let one forged
+  beyond-ceiling row hold every parked application back. The gate's other half is a coupling to keep in step:
+  `handle_app_message`'s park arm fires on exactly the materialized/eligible/non-selected branches for which
+  `handle_commit` answers `NonSelectedEligibleBranch`, so a parked application always has a parked commit beside it.
+  Terminalization is owed to a later pass and the horizon arms (`BeyondAnchor`, `BeyondAppRetention`) — nothing runs on
+  its own, because a parked row opens no pass (`ConvergenceDeferred` is in neither `PASS_OPENING_STATES` nor
+  `OUTBOUND_GATING_STATES`, `convergence_input.rs`), so a fork frozen with no further input keeps its parked rows until
+  some other input opens the next pass. Pinned by
+  `tests/distributed_convergence.rs::a_reorg_delivers_the_application_that_rode_the_revived_branch`,
+  `::a_parked_application_whose_branch_never_wins_is_terminalized_undelivered`, and
+  `::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`.
 - **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `MissingCandidateParent` is the other commit deferral and
   it does not mean "branch selection put this commit on the losing side": `handle_commit` also reaches it when the pass
   selected NO branch at all, which is the case that actually occurs in practice. Withdrawing there would tombstone a

@@ -149,8 +149,9 @@ a group has applied a canonical branch while `Settled`, a later canonicalization
 arrived *after* that settle, with a `fork_epoch` at or above the retained anchor (i.e. within `max_rewind_commits`) —
 selects a *different* canonical branch that diverges at or below the previously-applied tip. This is the engine's
 fork-resolution path (distributed convergence; `GroupEvent::CommitRolledBack` +
-`GroupEvent::GroupStateInvalidated` mark the superseded commit); losing-branch app messages are re-dispositioned
-`InvalidatedAppMessageReason::LosingBranch`.
+`GroupEvent::GroupStateInvalidated` mark the superseded commit). An app message the reorg had already delivered is
+re-dispositioned `InvalidatedAppMessageReason::LosingBranch`; one that was never delivered is parked
+`ConvergenceDeferred` with its branch's commits, so the reorg after the next one can deliver it.
 
 A normal forward advance — where the selected branch extends the previously-applied one — is **not** a reorg. The engine
 does not distinguish these today; both surface as `EpochChanged`. So the metric requires a small addition: a per-group

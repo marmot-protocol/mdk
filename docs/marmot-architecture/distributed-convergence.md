@@ -213,7 +213,7 @@ flowchart TD
     D --> E["Apply bounded quorum boost"]
     E --> F["Compare effective depth, quorum, witness score, priority, committer, digest"]
     F --> G["Materialize selected branch"]
-    F --> H["Mark losing-branch messages invalidated"]
+    F --> H["Park non-selected eligible branches; invalidate what cannot be revisited"]
 ```
 
 This lets a broadly used live branch beat a private branch that is only a few commits longer. It does not let app
@@ -352,7 +352,13 @@ Initial lemmas:
 11. **Anchor failure dispositions:** missing retained anchors report `MissingRetainedAnchor` without applying, while
     commits older than the retained anchor are invalidated with `BeyondAnchor` and are never selected or applied.
 12. **Canonical app output:** accepted app messages become application-visible only after their canonical branch is
-    applied; losing-branch app messages produce an invalidation disposition and are never delivered as normal output.
+    applied; an app message on a non-selected branch is never delivered as normal output. While that branch is still
+    eligible the implementation parks the app message (`NonSelectedEligibleBranch`) alongside its commits and
+    proposals, so a later pass adopting the branch delivers it; the invalidation disposition is reserved for an app
+    message no branch it decrypts on can reconsider, and for one a reorg takes back after delivery. The v0 Tamarin
+    model still encodes the older unconditional withdrawal in `Invalidate_Losing_Branch_App`; aligning it with rule 14's
+    eligible/ineligible split — and with it the `commit_application_app_output_executable` and
+    `delivery_order_robustness_executable` reachability lemmas — is tracked as a follow-up.
 13. **Welcome/commit handoff:** a welcome-derived join lands the recipient at the post-commit epoch; the matching commit
     arriving afterward is `AlreadyAtEpoch` and does not trigger convergence selection or fork recovery. A stale
     same-source commit is fork-shaped only when the local client previously committed from that source epoch.
