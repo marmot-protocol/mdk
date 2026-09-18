@@ -2561,6 +2561,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
+        | AppError::GroupCreateIncludesCreator
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)

@@ -427,6 +427,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
         AgentControlResponse::InvitePolicy { .. } => "invite_policy",
+        AgentControlResponse::GroupCreated { .. } => "group_created",
         AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {

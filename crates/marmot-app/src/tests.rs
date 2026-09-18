@@ -401,13 +401,12 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
         let group_id = client
             .create_group_with_initial_source_and_optional_telemetry(
                 "crash-window group",
-                String::new(),
                 &[],
+                AppCreateGroupOptions::default(),
                 Some(crate::client::InitialGroupImageSource::Prepared {
                     upload_id: "injected-missing-consume-row".to_owned(),
                     component_data,
                 }),
-                0,
                 Some(&telemetry),
             )
             .await
@@ -8922,6 +8921,83 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         .await
         .unwrap_err();
     assert!(matches!(member_error, AppError::RelayDirectory(_)));
+}
+
+#[tokio::test]
+async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_packages() {
+    let (directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let member = &accounts[0];
+    app.account_home().create_account("creator").unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    for reference in [
+        npub_for_account_id_lossy(&member.account_id_hex),
+        member.account_id_hex.clone(),
+        member.label.clone(),
+    ] {
+        let group = runtime
+            .create_group_with_options(
+                "creator",
+                "Resolution regression",
+                &[reference],
+                AppCreateGroupOptions::default(),
+            )
+            .await
+            .unwrap();
+        let roster = runtime.group_members("creator", &group).await.unwrap();
+        assert_eq!(roster.len(), 2);
+        assert!(
+            roster
+                .iter()
+                .any(|entry| entry.member_id_hex == member.account_id_hex)
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+    drop(directory);
+}
+
+#[tokio::test]
+async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
+    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let creator = &accounts[0];
+    let runtime = MarmotAppRuntime::new(app.clone());
+    for reference in [
+        creator.label.clone(),
+        creator.account_id_hex.clone(),
+        npub_for_account_id_lossy(&creator.account_id_hex),
+    ] {
+        let result = runtime
+            .create_group_with_options(
+                &creator.label,
+                "Self invite",
+                &[reference],
+                AppCreateGroupOptions::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::GroupCreateIncludesCreator)),
+            "{result:?}"
+        );
+        assert!(app.groups(&creator.label).unwrap().is_empty());
+    }
+    // Empty rosters remain valid: the creator is included implicitly by MLS.
+    let group = runtime
+        .create_group_with_options(
+            &creator.label,
+            "Solo",
+            &[],
+            AppCreateGroupOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .group_members(&creator.label, &group)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test]
@@ -22192,4 +22268,38 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
         client.has_pending_epoch_backfill(),
         "undecryptable traffic from this copy's own era is still a stall signal",
     );
+}
+
+#[test]
+fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec!["wss://relay.example.com".into()],
+        MarmotAppConfig::default(),
+    );
+    assert_eq!(
+        app.new_nostr_routing(None).unwrap().relays,
+        vec!["wss://relay.example.com"]
+    );
+    assert_eq!(
+        app.new_nostr_routing(Some(vec!["wss://other.example.com".into()]))
+            .unwrap()
+            .relays,
+        vec!["wss://other.example.com"]
+    );
+    for relays in [
+        vec![],
+        vec!["ws://127.0.0.1:1234".into()],
+        vec!["wss://192.168.1.1".into()],
+        crate::relay_plane::retired_relay_hosts()
+            .into_iter()
+            .map(|host| format!("wss://{host}"))
+            .collect(),
+    ] {
+        assert!(matches!(
+            app.new_nostr_routing(Some(relays)),
+            Err(AppError::InvalidNostrRouting(_))
+        ));
+    }
 }

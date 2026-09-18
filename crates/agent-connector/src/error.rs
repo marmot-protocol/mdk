@@ -26,6 +26,8 @@ pub enum ConnectorError {
     UnsafeControlPlaneConfig(&'static str),
     #[error("agent stream error: {0}")]
     Stream(String),
+    #[error("invalid group create request: {0}")]
+    InvalidGroupCreate(&'static str),
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
     #[error("connector operation timed out: {0}")]
@@ -66,6 +68,7 @@ impl ConnectorError {
             Self::Unauthorized => "unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
+            Self::InvalidGroupCreate(_) => "invalid_group_create",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
@@ -95,6 +98,7 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamSendFailed(_)) => {
                 "stream durable send failed; retry the same finish request"
             }
+            Self::InvalidGroupCreate(_) => "invalid group create request",
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {
