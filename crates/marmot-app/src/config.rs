@@ -71,7 +71,8 @@ impl Default for AttachmentAcquisitionPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
-    /// None disables automatic attachment acquisition. Frozen runtimes always disable it.
+    /// Opt-in until native retained-byte access/removal lands in C8-D.
+    /// None (the default) disables acquisition; frozen runtimes always disable it.
     pub attachment_acquisition: Option<AttachmentAcquisitionPolicy>,
     /// Disable exporters for short-lived command processes. Frozen cursors always disable them.
     pub usage_diagnostics_silent: bool,
@@ -248,7 +249,7 @@ pub struct MarmotServiceEndpoints {
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
-            attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
+            attachment_acquisition: None,
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),

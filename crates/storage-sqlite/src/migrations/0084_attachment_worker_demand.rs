@@ -4,6 +4,7 @@ use rusqlite::Transaction;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(r#"
+CREATE INDEX attachment_acquisition_active ON attachment_acquisition(state,token) WHERE state=1;
 CREATE TABLE attachment_worker_demand (
     group_id_hex TEXT NOT NULL,
     message_id_hex TEXT NOT NULL,

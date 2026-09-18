@@ -795,3 +795,74 @@ fn attachment_worker_pending_demand_survives_encrypted_reopen() {
     }
     assert_eq!(store.attachment_worker_demands(32).unwrap().len(), 3);
 }
+
+#[test]
+fn attachment_startup_reclaims_only_abandoned_attempts_in_bounded_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resume.sqlite");
+    let key = SqlCipherKey::new("resume-test").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for name in ["active", "retry", "ready", "blocked"] {
+        seed(&store, name);
+    }
+    let active = request(&store, "active");
+    let old = store
+        .claim_attachment_acquisition(&active, 12, 1200)
+        .unwrap()
+        .unwrap();
+    let retry = request(&store, "retry");
+    let job = store
+        .claim_attachment_acquisition(&retry, 12, 1200)
+        .unwrap()
+        .unwrap();
+    store.fail_attachment_acquisition(&job, Some(100)).unwrap();
+    let ready = request(&store, "ready");
+    publish(&store, &ready);
+    let blocked = request(&store, "blocked");
+    let job = store
+        .claim_attachment_acquisition(&blocked, 12, 1200)
+        .unwrap()
+        .unwrap();
+    store.fail_attachment_acquisition(&job, None).unwrap();
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(store.resume_attachment_acquisitions(13, 1).unwrap(), 1);
+    assert_eq!(store.resume_attachment_acquisitions(13, 1).unwrap(), 0);
+    assert_eq!(
+        store.due_attachment_acquisitions(13, 64).unwrap(),
+        vec![active.clone()]
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&old, BODY, 13, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Superseded
+    );
+    let new = store
+        .claim_attachment_acquisition(&active, 13, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&new, BODY, 13, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&retry)
+            .unwrap()
+            .unwrap()
+            .due,
+        Some(100)
+    );
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&blocked)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(read(&store, &ready), BODY);
+}

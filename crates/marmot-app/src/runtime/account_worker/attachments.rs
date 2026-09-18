@@ -19,6 +19,7 @@ type PermitWait = std::pin::Pin<
 /// across worker select turns preserves Tokio semaphore FIFO fairness.
 #[derive(Default)]
 pub(super) struct Admission {
+    resumed: bool,
     waiting: Option<PermitWait>,
     permit: Option<OwnedSemaphorePermit>,
 }
@@ -108,6 +109,12 @@ pub(super) fn schedule(
     }
     let storage = client.app.account_storage(&client.state.label)?;
     let now = crate::unix_now_seconds();
+    if !admission.resumed {
+        if storage.resume_attachment_acquisitions(now, 64)? == 64 {
+            return Ok(true);
+        }
+        admission.resumed = true;
+    }
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
     let more = admit_demands(
         &storage,
@@ -140,26 +147,21 @@ pub(super) fn schedule(
         return Ok(more);
     };
     for candidate in candidates {
-        let Some(job) = storage.claim_attachment_acquisition(
-            &candidate,
-            now,
-            now.saturating_add(LEASE_SECONDS),
-        )?
-        else {
+        let Some(source) = storage.prepare_attachment_acquisition(&candidate, now)? else {
             continue;
         };
         let Some(reference) = reference(
-            &job.slot,
-            job.source_epoch,
+            &source.slot,
+            source.source_epoch,
             client.app.config.allow_loopback_blob_endpoints,
         ) else {
-            storage.fail_attachment_acquisition(&job, None)?;
+            storage.finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
-        let group = match hex::decode(&job.group_id_hex) {
+        let group = match hex::decode(&source.group_id_hex) {
             Ok(bytes) => GroupId::new(bytes),
             Err(_) => {
-                storage.fail_attachment_acquisition(&job, None)?;
+                storage.finish_attachment_preparation(&candidate, now, None)?;
                 continue;
             }
         };
@@ -169,12 +171,26 @@ pub(super) fn schedule(
             policy.maximum_transfer_bytes,
         ) {
             Ok(Some(prepared)) => prepared,
-            // Sync warms retained epoch secrets independently. Never hydrate the
-            // engine or scan retained history just to start a background transfer.
+            // Local readiness is not a failed transfer. Defer only this candidate
+            // for one maintenance tick, preserving siblings and their attempts.
             Ok(None) | Err(_) => {
-                storage.fail_attachment_acquisition(&job, Some(retry_at(&storage, &job, now)))?;
-                continue;
+                storage.finish_attachment_preparation(
+                    &candidate,
+                    now,
+                    Some(now.saturating_add(15)),
+                )?;
+                return Ok(more);
             }
+        };
+        // A source change replaces the asset token. Claim rechecks the same
+        // token/source after preparation, so stale prepared material cannot run.
+        let Some(job) = storage.claim_attachment_acquisition(
+            &candidate,
+            now,
+            now.saturating_add(LEASE_SECONDS),
+        )?
+        else {
+            continue;
         };
         let byte_budget = policy.retained_bytes_per_account;
         spawn_media_http(
@@ -207,6 +223,10 @@ pub(super) fn complete(
     match result {
         Ok(result) => {
             let plaintext = zeroize::Zeroizing::new(result.plaintext);
+            if job.verify_plaintext(&plaintext).is_err() {
+                storage.fail_attachment_acquisition(job, None)?;
+                return Ok(());
+            }
             // Other writers may consume disk while HTTP is in flight. Recheck
             // before starting a full-object SQLite write, without evicting data.
             let reserve = client

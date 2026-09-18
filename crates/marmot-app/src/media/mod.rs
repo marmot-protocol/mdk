@@ -974,7 +974,8 @@ pub(crate) async fn download_encrypted_media_classified(
     reference
         .validate(transport.allow_loopback_http)
         .map_err(|e| AttachmentDownloadFailure::Stop(e.into()))?;
-    let version = EncryptedMediaVersion::parse(&reference.version)?;
+    let version = EncryptedMediaVersion::parse(&reference.version)
+        .map_err(AttachmentDownloadFailure::Stop)?;
     let encrypted = fetch_encrypted_media_blob_classified(
         &reference,
         fallback_endpoints,
@@ -983,12 +984,15 @@ pub(crate) async fn download_encrypted_media_classified(
         telemetry,
     )
     .await?;
-    let plaintext_hash = media_hash_from_reference(&reference)?;
+    let plaintext_hash =
+        media_hash_from_reference(&reference).map_err(AttachmentDownloadFailure::Stop)?;
     let media_type = match version {
-        EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)?,
-        EncryptedMediaVersion::V2 => canonical_media_type_v2(&reference.media_type)?,
+        EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)
+            .map_err(AttachmentDownloadFailure::Stop)?,
+        EncryptedMediaVersion::V2 => canonical_media_type_v2(&reference.media_type)
+            .map_err(AttachmentDownloadFailure::Stop)?,
     };
-    let nonce = media_nonce_from_reference(&reference)?;
+    let nonce = media_nonce_from_reference(&reference).map_err(AttachmentDownloadFailure::Stop)?;
     let file_key = derive_media_file_key(
         media_secret,
         version,

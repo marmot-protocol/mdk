@@ -155,6 +155,27 @@ pub struct AttachmentWorkerDemand {
     generation: Vec<u8>,
 }
 
+/// Source material for local preparation. This is not a lease or permission to
+/// fetch; claim must still succeed for this exact asset before network work.
+pub struct AttachmentAcquisitionSource {
+    pub group_id_hex: String,
+    pub source_epoch: u64,
+    pub slot: serde_json::Value,
+}
+
+impl AttachmentAcquisition {
+    /// Deterministic publication validation, distinct from transient DB errors.
+    pub fn verify_plaintext(&self, plaintext: &[u8]) -> StorageResult<()> {
+        if plaintext.len() > MAX_RETAINED_ATTACHMENT_BYTES {
+            return Err(invalid("retained attachment exceeds storage bound"));
+        }
+        if Sha256::digest(plaintext).as_slice() != self.digest {
+            return Err(invalid("attachment plaintext digest mismatch"));
+        }
+        Ok(())
+    }
+}
+
 impl SqliteAccountStorage {
     /// Read source changes without a history scan. Oversized descriptors are
     /// represented as null so the shared parser rejects them without allocation.
@@ -361,6 +382,72 @@ impl SqliteAccountStorage {
             .collect())
     }
 
+    /// Reclaim abandoned attempts once, under the new account worker's exclusive
+    /// ownership, before it starts any transfers. Bounded and attempt-fenced;
+    /// scheduled retries, terminal failures and ready bytes are unchanged.
+    pub fn resume_attachment_acquisitions(&self, now: u64, limit: usize) -> StorageResult<usize> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment resume limit"));
+        }
+        self.lock()?.execute("UPDATE attachment_acquisition SET state=0,due=?1,attempt=NULL
+            WHERE token IN (SELECT token FROM attachment_acquisition WHERE state=1 ORDER BY token LIMIT ?2)",
+            params![u64_to_i64(now)?,limit as i64]).storage()
+    }
+
+    /// Select a due source without incrementing attempts. Ineligible sources are
+    /// parked just as at claim time, so stale rows cannot obstruct the due page.
+    pub fn prepare_attachment_acquisition(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<Option<AttachmentAcquisitionSource>> {
+        let now = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? { return Ok(None); }
+            let row = conn.query_row(&format!("SELECT group_id_hex,source_epoch,slot_json
+                FROM attachment_acquisition q WHERE token=?1 AND due<=?2 AND {SOURCE_MATCH} AND {ACCEPTED}
+                AND (expires_at IS NULL OR expires_at>?2)"), params![reference.token,now], |r|
+                Ok((r.get::<_,String>(0)?,nonnegative(r,1)?,r.get::<_,String>(2)?))).optional().storage()?;
+            let Some((group_id_hex,source_epoch,slot)) = row else {
+                conn.execute("UPDATE attachment_acquisition SET state=5,due=NULL,attempt=NULL
+                    WHERE token=?1 AND due<=?2",params![reference.token,now]).storage()?;
+                return Ok(None);
+            };
+            Ok(Some(AttachmentAcquisitionSource { group_id_hex,source_epoch,
+                slot: serde_json::from_str(&slot).map_err(|_| invalid("invalid stored attachment slot"))? }))
+        })
+    }
+
+    /// Defer readiness checks without recording a transfer attempt, or block a
+    /// structurally invalid source. Never replace an active lease or newer job.
+    pub fn finish_attachment_preparation(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        retry_at: Option<u64>,
+    ) -> StorageResult<()> {
+        let due = retry_at.map(u64_to_i64).transpose()?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=?3,due=?4
+                WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                params![
+                    reference.token,
+                    u64_to_i64(now)?,
+                    if due.is_some() { 2 } else { 4 },
+                    due
+                ],
+            )
+            .storage()?;
+            Ok(())
+        })
+    }
+
     /// Lease deadlines are chosen by the runtime transfer policy. Expired leases
     /// can be reclaimed after process death; the new attempt fences late results.
     pub fn claim_attachment_acquisition(
@@ -456,12 +543,7 @@ impl SqliteAccountStorage {
         now: u64,
         byte_budget: u64,
     ) -> StorageResult<AttachmentPublishResult> {
-        if plaintext.len() > MAX_RETAINED_ATTACHMENT_BYTES {
-            return Err(invalid("retained attachment exceeds storage bound"));
-        }
-        if Sha256::digest(plaintext).as_slice() != job.digest {
-            return Err(invalid("attachment plaintext digest mismatch"));
-        }
+        job.verify_plaintext(plaintext)?;
         let now = u64_to_i64(now)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;

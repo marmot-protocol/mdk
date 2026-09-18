@@ -19,7 +19,8 @@ partial/range resume (C8-C3) and native retained-byte access (C8-D) remain later
 Opening a conversation should find already acquired attachment bytes locally.
 Today MDK retains decryption secrets and can explicitly download an attachment,
 and C8-C1 supplies durable jobs and protected byte storage. C8-C2 feeds and executes
-those jobs automatically in active, non-frozen account workers.
+those jobs automatically in explicitly enabled, non-frozen account workers.
+Acquisition defaults off until native local access and removal are available (C8-D).
 A timeline window covers only a bounded part of a conversation. The synchronous
 `list_media` compatibility API instead scans raw app events, potentially without
 a limit, and does not provide authoritative removal or pagination semantics.
@@ -165,7 +166,7 @@ Preparation reads projected group policy and retained source-epoch secrets; it n
 hydrates MLS state. Missing secrets wait for sync's existing secret-warming path.
 Invitation acceptance and canonical visibility are checked again at claim/publication.
 
-Starting Rust-configurable defaults (`MarmotAppConfig::attachment_acquisition`):
+Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::default()`):
 
 | Policy | Default |
 | --- | --- |
@@ -174,22 +175,35 @@ Starting Rust-configurable defaults (`MarmotAppConfig::attachment_acquisition`):
 | Automatic ciphertext ceiling | 64 MiB, enforced during streaming, including chunked bodies |
 | Concurrent automatic transfers | One across accounts in a runtime |
 
-`None` disables automatic acquisition. Frozen/NSE runtimes also skip it. Explicit
+`MarmotAppConfig::attachment_acquisition` defaults to `None`. Rust callers may opt in
+with `Some(policy)`; native constructors remain off until C8-D supplies access, removal
+and policy controls. Frozen/NSE runtimes also skip acquisition. Explicit
 foreground downloads retain their 512 MiB ciphertext cap. Admission reserves a full
 maximum-size object against quota, so a final smaller remainder can stay unused.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 
-Network and temporarily unavailable policy/secret failures back off durably from 15 seconds
-to one hour. Integrity/decryption failures and over-limit responses require explicit retry;
+Network failures back off durably from 15 seconds to one hour. Unavailable local
+policy/secrets defer one candidate for 15 seconds before claiming it; no transfer attempt
+is consumed and due siblings keep their deadlines. Integrity/decryption failures,
+publication digest mismatches and over-limit responses require explicit retry;
 locator failover still runs, and a remaining transient candidate keeps the attempt retryable.
 Twenty-minute leases cover the shared fifteen-minute transfer deadline and publication margin.
-Worker exit cancels active HTTP and releases permits; expired leases recover interrupted work.
+Worker exit cancels active HTTP and releases permits. Before scheduling any transfer,
+a new exclusive account worker reclaims abandoned fetching attempts in batches of 64;
+old completions remain fenced, and existing retry deadlines/ready bytes are unchanged.
+Expired leases remain a fallback for interruption recovery.
 Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; no automatic LRU applies.
 
 C8-C2 retries complete bodies. It does **not** persist partial ciphertext or implement byte-offset
 resume. C8-C3 will add protected partials, Range/validator semantics and cleanup. C8-D will
 expose native availability/local bytes/progress and explicit remove/download-again operations.
+Before enabling acquisition by default, complete C8-D access/removal/policy controls,
+and validate shorter background transfer/idle deadlines, recent-message priority over
+backfill, size-limit re-admission when policy increases, and explicit invalid-policy
+validation. The current opt-in worker shares the 15-minute media deadline, admits durable
+demand in queue order, blocks over-limit responses until explicit retry, and pauses
+for invalid zero/over-ceiling transfer limits. These are tracked enablement gates.
 The legacy download API continues returning transient bytes until clients adopt that contract.
 [#1437](https://github.com/marmot-protocol/mdk/issues/1437) stays open across those slices.
 

@@ -117,6 +117,60 @@ fn seed(
         })
         .unwrap();
 }
+fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRecord {
+    let mut projection = crate::conversions::app_group_from_stored_group(group(false)).unwrap();
+    projection.encrypted_media = crate::AppGroupEncryptedMediaComponent {
+        component_id: crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        component: "marmot.encrypted-media.v2".into(),
+        required: true,
+        media_format: "encrypted-media-v2".into(),
+        allowed_locator_kinds: vec!["blossom-v1".into()],
+        default_blob_endpoints: vec![crate::AppBlobEndpoint {
+            locator_kind: "blossom-v1".into(),
+            base_url: reference.locators[0]
+                .value
+                .rsplit_once('/')
+                .unwrap()
+                .0
+                .into(),
+        }],
+        data_hex: String::new(),
+    };
+    projection
+}
+
+async fn offline_fixture() -> (
+    tempfile::TempDir,
+    AppClient,
+    SqliteAccountStorage,
+    crate::MediaAttachmentReference,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+            ..Default::default()
+        },
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let (mut reference, _) =
+        crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://media.example/{}", reference.ciphertext_sha256),
+    }];
+    seed(&storage, &reference, false);
+    client.state.groups.push(projection(&reference));
+    (dir, client, storage, reference)
+}
+
 fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (
@@ -169,6 +223,7 @@ async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_
         dir.path(),
         "wss://relay.example",
         MarmotAppConfig {
+            attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
             allow_loopback_blob_endpoints: true,
             ..Default::default()
         },
@@ -177,24 +232,7 @@ async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_
     let mut client = app.client("alice").await.unwrap();
     let storage = app.account_storage("alice").unwrap();
     seed(&storage, &reference, true);
-    let mut projection = crate::conversions::app_group_from_stored_group(group(false)).unwrap();
-    projection.encrypted_media = crate::AppGroupEncryptedMediaComponent {
-        component_id: crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-        component: "marmot.encrypted-media.v2".into(),
-        required: true,
-        media_format: "encrypted-media-v2".into(),
-        allowed_locator_kinds: vec!["blossom-v1".into()],
-        default_blob_endpoints: vec![crate::AppBlobEndpoint {
-            locator_kind: "blossom-v1".into(),
-            base_url: reference.locators[0]
-                .value
-                .rsplit_once('/')
-                .unwrap()
-                .0
-                .into(),
-        }],
-        data_hex: String::new(),
-    };
+    let projection = projection(&reference);
     client.state.groups.push(projection);
     storage
         .remember_encrypted_media_epoch_secret(
@@ -331,4 +369,181 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
     );
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
     assert_eq!(permits.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    let entry = storage
+        .attachment_history_page(GROUP, 100, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    for n in 1..20 {
+        storage
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: GROUP.into(),
+                message_id_hex: format!("{n:064x}"),
+                source_message_id_hex: Some(format!("{:064x}", n + 1000)),
+                source_epoch: Some(3),
+                direction: "received".into(),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![serde_json::from_value(entry.slot.clone()).unwrap()],
+                recorded_at: 10,
+                received_at: 10,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+    }
+    assert!(
+        client
+            .prepare_background_attachment_download(&GroupId::new(vec![0xab; 16]), reference, 1024)
+            .unwrap()
+            .is_none()
+    );
+    let now = crate::unix_now_seconds();
+    while admit_demands(&storage, now, false).unwrap() {}
+    let jobs = storage.due_attachment_acquisitions(now, 32).unwrap();
+    assert_eq!(jobs.len(), 20);
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    assert_eq!(
+        storage.due_attachment_acquisitions(now, 32).unwrap().len(),
+        19
+    );
+    for job in jobs {
+        assert_eq!(
+            storage
+                .attachment_acquisition_status(&job)
+                .unwrap()
+                .unwrap()
+                .attempts,
+            0
+        );
+    }
+    assert!(completions.try_recv().is_err());
+    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() {
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let now = crate::unix_now_seconds();
+    admit_demands(&storage, now, false).unwrap();
+    let asset = storage
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
+    let old = storage
+        .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
+        .unwrap()
+        .unwrap();
+    assert!(
+        storage
+            .due_attachment_acquisitions(now, 1)
+            .unwrap()
+            .is_empty()
+    );
+    let (http, _completions) = context();
+    let shared = RuntimeSharedServices::default();
+    let mut restarted = Admission::default();
+    schedule(&client, &shared, &http, &mut restarted).unwrap();
+    let now = crate::unix_now_seconds();
+    assert_eq!(
+        storage.due_attachment_acquisitions(now, 1).unwrap(),
+        vec![asset.clone()]
+    );
+    complete(
+        &client,
+        &old,
+        Ok(MediaDownloadResult {
+            plaintext: b"retained worker bytes".to_vec(),
+            size_bytes: 21,
+            file_name: "fixture.bin".into(),
+            media_type: "application/octet-stream".into(),
+        }),
+        10000,
+    )
+    .unwrap();
+    assert!(
+        storage
+            .read_retained_attachment(&asset, now, 0, 100)
+            .unwrap()
+            .is_none()
+    );
+    let next = storage
+        .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
+        .unwrap()
+        .unwrap();
+    storage
+        .remove_local_attachment(GROUP, &"11".repeat(32), 0)
+        .unwrap();
+    complete(
+        &client,
+        &next,
+        Ok(MediaDownloadResult {
+            plaintext: b"retained worker bytes".to_vec(),
+            size_bytes: 21,
+            file_name: "fixture.bin".into(),
+            media_type: "application/octet-stream".into(),
+        }),
+        10000,
+    )
+    .unwrap();
+    assert!(
+        storage
+            .read_retained_attachment(&asset, now, 0, 100)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_off() {
+    assert!(MarmotAppConfig::default().attachment_acquisition.is_none());
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let now = crate::unix_now_seconds();
+    let entry = storage
+        .attachment_history_page(GROUP, 100, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    let storage_sqlite::AttachmentDemand::Requested(asset) = storage
+        .request_attachment_acquisition(GROUP, &entry, [0; 32], now)
+        .unwrap()
+    else {
+        panic!("demand");
+    };
+    let job = storage
+        .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
+        .unwrap()
+        .unwrap();
+    complete(
+        &client,
+        &job,
+        Ok(MediaDownloadResult {
+            plaintext: b"retained worker bytes".to_vec(),
+            size_bytes: 21,
+            file_name: "fixture.bin".into(),
+            media_type: "application/octet-stream".into(),
+        }),
+        10000,
+    )
+    .unwrap();
+    let status = storage
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert!(status.due.is_none());
 }
