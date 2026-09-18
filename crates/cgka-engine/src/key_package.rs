@@ -210,9 +210,9 @@ impl<S: StorageProvider> Engine<S> {
         let record = self.storage.get_group(group_id)?;
         self.with_mls_group(group_id, |group| {
             let mut required = record.required_capabilities.clone();
-            merge_requirements(
+            crate::capability_manager::merge_capabilities(
                 &mut required,
-                crate::capability_manager::required_role_capabilities_from_group(group),
+                &crate::capability_manager::required_role_capabilities_from_group(group),
             );
             Ok(KeyPackageRequirements {
                 profile: record.protocol_profile,
@@ -244,9 +244,9 @@ impl<S: StorageProvider> Engine<S> {
         for component in &request.app_components {
             required.app_components.insert(component.component_id);
         }
-        merge_requirements(
+        crate::capability_manager::merge_capabilities(
             &mut required,
-            crate::capability_manager::required_role_capabilities_from_request_components(
+            &crate::capability_manager::required_role_capabilities_from_request_components(
                 &request.app_components,
             ),
         );
@@ -255,17 +255,6 @@ impl<S: StorageProvider> Engine<S> {
             ciphersuite: self.ciphersuite,
             required,
         })
-    }
-}
-
-fn merge_requirements(
-    target: &mut cgka_traits::capabilities::GroupCapabilities,
-    other: cgka_traits::capabilities::GroupCapabilities,
-) {
-    target.extensions.extend(other.extensions);
-    target.proposals.extend(other.proposals);
-    for id in other.app_components.ids {
-        target.app_components.insert(id);
     }
 }
 

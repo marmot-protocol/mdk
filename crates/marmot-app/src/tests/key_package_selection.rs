@@ -118,6 +118,76 @@ async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency(
 }
 
 #[tokio::test]
+async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let package = fresh_key_package_for_account(&app, account, false).await;
+    let now = unix_now_seconds();
+    let old = candidate(
+        account,
+        package.clone(),
+        "white",
+        Some("whitenoise"),
+        now - 10,
+    );
+    let fallback = candidate(
+        account,
+        package.clone(),
+        "amethyst",
+        Some("amethyst"),
+        now - 20,
+    );
+    let replacement = candidate(account, package, "white", Some("whitenoise"), now);
+    let mut bad_content = replacement.clone();
+    bad_content.content = "not base64".into();
+    let mut bad_metadata = replacement;
+    bad_metadata
+        .tags
+        .iter_mut()
+        .find(|tag| tag[0] == "i")
+        .unwrap()[1] = "incorrect-reference".into();
+    let select = |events: Vec<NostrTransportEvent>| {
+        preferred_fresh_key_package_from_records(
+            &account.account_id_hex,
+            events
+                .into_iter()
+                .map(|event| RelayEventRecord {
+                    event,
+                    endpoints: vec![],
+                })
+                .collect(),
+            app.directory_freshness(),
+            None,
+        )
+    };
+    for malformed in [bad_content, bad_metadata] {
+        // An independent slot remains usable, but the superseded White Noise
+        // package must never be resurrected when its replacement is invalid.
+        assert_eq!(
+            select(vec![old.clone(), malformed.clone(), fallback.clone()])
+                .unwrap()
+                .value
+                .unwrap()
+                .key_package_event_id,
+            fallback.id,
+        );
+        assert!(select(vec![old.clone(), malformed.clone()]).is_err());
+        // Freshness is checked before replacement: future events cannot hide
+        // the current publication.
+        let mut future = malformed;
+        future.created_at = u64::MAX;
+        assert_eq!(
+            select(vec![old.clone(), future])
+                .unwrap()
+                .value
+                .unwrap()
+                .key_package_event_id,
+            old.id,
+        );
+    }
+}
+
+#[tokio::test]
 async fn client_preference_is_used_in_batch_and_single_author_fallback() {
     for reject_batch in [false, true] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;

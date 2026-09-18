@@ -9771,7 +9771,7 @@ async fn member_key_package_resolution_ignores_older_malformed_publication() {
 }
 
 #[tokio::test]
-async fn member_key_package_resolution_falls_back_from_newest_malformed_publication() {
+async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_replacement() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
     {
@@ -9788,13 +9788,12 @@ async fn member_key_package_resolution_falls_back_from_newest_malformed_publicat
         events.push(newer_malformed);
     }
 
-    let summary = app
+    let error = app
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
-        .expect("an invalid newest publication must not hide an older valid KeyPackage");
+        .expect_err("a malformed replacement must suppress the superseded KeyPackage in its slot");
 
-    assert_eq!(summary.unique_members, 1);
-    assert_eq!(summary.network_resolved_members, 1);
+    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
 }
 
 #[tokio::test]

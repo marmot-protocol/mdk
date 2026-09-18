@@ -179,6 +179,14 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             rejected_future = true;
             continue;
         }
+        // A fresh publication supersedes its slot even when its payload or
+        // metadata is invalid. Falling back within that slot can invite a
+        // package whose private material has already been retired.
+        if let Some(slot) = record.event.tag_value("d").filter(|slot| !slot.is_empty())
+            && !slots.insert(slot.to_owned())
+        {
+            continue;
+        }
         let priority = key_package_client_priority(&record.event);
         let fetched = match key_package_from_record(record) {
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
@@ -190,11 +198,6 @@ pub(crate) fn preferred_fresh_key_package_from_records(
                 continue;
             }
         };
-        // Replacement is per slot, before client ranking. Never resurrect a
-        // superseded package just because its old label/capabilities rank better.
-        if !slots.insert(fetched.key_package_id.clone()) {
-            continue;
-        }
         if let Some(requirements) = requirements
             && let Err(error) = requirements.validate(&fetched.key_package)
         {

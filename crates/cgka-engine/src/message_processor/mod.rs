@@ -17,7 +17,6 @@ mod send;
 mod store;
 
 pub(crate) use ingest::avatar_component_snapshot;
-pub(crate) use send::merge_capabilities;
 pub(crate) use store::fail_deferred_peel_rows_in_terminal_group;
 #[cfg(feature = "test-conformance-snapshot")]
 pub(crate) use store::normalized_deferred_peel_lifecycle;

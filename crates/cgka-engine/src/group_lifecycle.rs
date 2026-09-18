@@ -1298,7 +1298,7 @@ impl<S: StorageProvider> Engine<S> {
             // apply, including required agent-stream roles.
             let mut group_required =
                 crate::capability_manager::required_capabilities_from_group(&mls_group);
-            crate::message_processor::merge_capabilities(
+            crate::capability_manager::merge_capabilities(
                 &mut group_required,
                 &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
             );

@@ -352,3 +352,18 @@ impl<S: StorageProvider> Engine<S> {
         Ok(upgradeable)
     }
 }
+
+/// Fold every capability in `extra` into `required` (set union). Used to add the
+/// agent-stream `required_member_roles` role capabilities to a group's required
+/// capability set before the per-KeyPackage invite check and the join-time
+/// self-check (#177).
+pub(crate) fn merge_capabilities(
+    required: &mut cgka_traits::capabilities::GroupCapabilities,
+    extra: &cgka_traits::capabilities::GroupCapabilities,
+) {
+    required.proposals.extend(extra.proposals.iter().copied());
+    required.extensions.extend(extra.extensions.iter().copied());
+    for id in &extra.app_components.ids {
+        required.app_components.insert(*id);
+    }
+}
