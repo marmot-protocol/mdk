@@ -34,7 +34,7 @@ pub mod types;
 
 pub use status::MarmotStatus;
 
-use memory::{owned_c_string, required_str, str_array};
+use memory::{optional_str, owned_c_string, required_str, str_array};
 use secret_store::{CSecretStore, MarmotSecretStore};
 use status::set_last_error;
 use types::notification::MarmotCursorPersistence;
@@ -352,13 +352,9 @@ pub unsafe extern "C" fn marmot_client_new_with_client_name(
             Ok(value) => value,
             Err(status) => return status,
         };
-        let name = if client_name.is_null() {
-            None
-        } else {
-            match unsafe { required_str(client_name) } {
-                Ok(name) => Some(name),
-                Err(status) => return status,
-            }
+        let name = match unsafe { optional_str(client_name) } {
+            Ok(name) => name,
+            Err(status) => return status,
         };
         let store = if store.is_null() {
             None

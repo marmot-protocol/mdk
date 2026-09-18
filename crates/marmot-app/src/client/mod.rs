@@ -1581,17 +1581,18 @@ impl AppClient {
                     .to_app_component_data()?,
             );
         }
+        let mut request = CreateGroupRequest {
+            name: name.to_owned(),
+            description,
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components,
+            initial_admins: Vec::new(),
+        };
         let requirements = self
             .runtime
             .session()
-            .create_key_package_requirements(&CreateGroupRequest {
-                name: name.to_owned(),
-                description: description.clone(),
-                members: Vec::new(),
-                required_features: Vec::new(),
-                app_components: app_components.clone(),
-                initial_admins: Vec::new(),
-            })
+            .create_key_package_requirements(&request)
             .map_err(cgka_session::SessionError::from)?;
         let key_package_started_at = Instant::now();
         let key_packages = self
@@ -1624,7 +1625,7 @@ impl AppClient {
         let members = resolved.key_packages;
         self.refresh_routing()?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
-        require_initial_group_component_support(&constructable, &app_components)?;
+        require_initial_group_component_support(&constructable, &request.app_components)?;
         let uploads_inline_image =
             matches!(&initial_image, Some(InitialGroupImageSource::Inline(_)));
         let prepared_upload_id = match &initial_image {
@@ -1704,7 +1705,8 @@ impl AppClient {
             );
         }
         let optional_app_components = optional_app_components?;
-        let mut touched_components = app_components
+        let mut touched_components = request
+            .app_components
             .iter()
             .map(|component| component.component_id)
             .collect::<Vec<_>>();
@@ -1714,7 +1716,7 @@ impl AppClient {
                 .map(|component| component.component_id),
         );
         let mut changed_fields = vec!["name", "members"];
-        if !description.is_empty() {
+        if !request.description.is_empty() {
             changed_fields.push("description");
         }
         if disappearing_message_secs != 0 {
@@ -1730,18 +1732,12 @@ impl AppClient {
             Some(members.len() as u64),
         );
 
+        request.members = members;
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
             .prepare_create_group_with_optional_app_components_and_audit_context(
-                CreateGroupRequest {
-                    name: name.to_owned(),
-                    description,
-                    members,
-                    required_features: Vec::new(),
-                    app_components,
-                    initial_admins: Vec::new(),
-                },
+                request,
                 optional_app_components,
                 audit_context.clone(),
             )

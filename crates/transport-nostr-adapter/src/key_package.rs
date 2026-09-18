@@ -10,6 +10,8 @@ use crate::{NostrPublishOutcome, NostrRelayClient};
 
 pub const KIND_MARMOT_KEY_PACKAGE: u64 = 30_443;
 
+pub const CLIENT_TAG: &str = "client";
+
 const D_TAG: &str = "d";
 const IDENTITY_TAG: &str = "i";
 const MLS_PROTOCOL_VERSION_TAG: &str = "mls_protocol_version";
@@ -95,7 +97,7 @@ impl NostrKeyPackagePublication {
         ];
 
         if let Some(name) = &self.client_name {
-            tags.push(vec!["client".into(), name.clone()]);
+            tags.push(vec![CLIENT_TAG.into(), name.clone()]);
         }
 
         Ok(NostrTransportEvent::new_unsigned_at(

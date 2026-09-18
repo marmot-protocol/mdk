@@ -130,11 +130,13 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
 
 /// Temporary interoperability policy. Keep separate from cryptographic admission so
 /// multi-device selection can replace this preference without changing validity.
+/// Labels are self-asserted and do not authenticate an application; they only
+/// rank candidates after admission checks and never relax cryptographic gates.
 fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
-    let mut tags = event
-        .tags
-        .iter()
-        .filter(|tag| tag.first().is_some_and(|name| name == "client"));
+    let mut tags = event.tags.iter().filter(|tag| {
+        tag.first()
+            .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
+    });
     let Some(tag) = tags.next() else {
         return 1;
     };

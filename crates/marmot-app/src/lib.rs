@@ -6602,7 +6602,9 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
         // A retry belongs to its durable signed artifact, not the current host config.
-        nostr_publication.client_name = event.tag_value("client").map(str::to_owned);
+        nostr_publication.client_name = event
+            .tag_value(transport_nostr_adapter::CLIENT_TAG)
+            .map(str::to_owned);
         if event.id != hex::encode(artifact.id.as_slice())
             || event.created_at != artifact.created_at.0
         {

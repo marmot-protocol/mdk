@@ -5,6 +5,8 @@
 //! validated for OpenMLS lifetime validity and accepted lifetime range;
 //! refresh scheduling is handled above the engine.
 
+use std::sync::LazyLock;
+
 use crate::capabilities::leaf_capabilities;
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
@@ -21,6 +23,10 @@ use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use tls_codec::{Deserialize as _, Serialize as _};
+
+// Validation and hashing do not consume randomness. Reuse the backend instead
+// of seeding a new RNG for each discovery candidate.
+static VALIDATION_CRYPTO: LazyLock<RustCrypto> = LazyLock::new(RustCrypto::default);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackageMetadata {
@@ -50,8 +56,8 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
     storage: &S,
     protocol_profile: ProtocolProfile,
 ) -> Result<Vec<KeyPackage>, EngineError> {
-    let crypto = RustCrypto::default();
-    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let crypto = &*VALIDATION_CRYPTO;
+    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
     let mut owned = Vec::new();
     let mut seen_references = std::collections::BTreeSet::new();
     let mut skipped = 0_usize;
@@ -115,8 +121,8 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
             ));
         }
     };
-    let crypto = RustCrypto::default();
-    let key_package = validate_key_package(kp_in, &crypto)?;
+    let crypto = &*VALIDATION_CRYPTO;
+    let key_package = validate_key_package(kp_in, crypto)?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // Validate the account-identity proof against the KeyPackage's OWN
     // ciphersuite, matching `parse_key_package` (mdk#747). `DEFAULT_CIPHERSUITE`
@@ -131,7 +137,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     let capabilities =
         crate::capabilities::advertised_capabilities_of_leaf(key_package.leaf_node());
     let key_package_ref = key_package
-        .hash_ref(&crypto)
+        .hash_ref(crypto)
         .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
     Ok(KeyPackageMetadata {
         key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
@@ -160,8 +166,8 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
             ));
         }
     };
-    let crypto = RustCrypto::default();
-    let key_package = validate_key_package(kp_in, &crypto)?;
+    let crypto = &*VALIDATION_CRYPTO;
+    let key_package = validate_key_package(kp_in, crypto)?;
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // See `key_package_metadata`: validate against the KeyPackage's own
     // ciphersuite, not `DEFAULT_CIPHERSUITE` (mdk#747).
@@ -183,6 +189,8 @@ pub struct KeyPackageRequirements {
 }
 
 impl KeyPackageRequirements {
+    /// Validate identity, lifetime, profile, ciphersuite, and required capabilities.
+    /// Client labels never participate in this admission check.
     pub fn validate(&self, package: &KeyPackage) -> Result<(), EngineError> {
         let parsed = parse_invitation_key_package(package)?;
         if package.protocol_profile != self.profile || parsed.ciphersuite() != self.ciphersuite {
@@ -227,33 +235,59 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         request: &cgka_traits::engine::CreateGroupRequest,
     ) -> Result<KeyPackageRequirements, EngineError> {
+        let CreationKeyPackageCapabilities {
+            mut required,
+            mandatory_components,
+            required_roles,
+        } = self.creation_key_package_capabilities(request)?;
+        for id in mandatory_components.ids {
+            required.app_components.insert(id);
+        }
+        crate::capability_manager::merge_capabilities(&mut required, &required_roles);
+        Ok(KeyPackageRequirements {
+            profile: self.new_protocol_profile,
+            ciphersuite: self.ciphersuite,
+            required,
+        })
+    }
+}
+
+/// Shared creation requirements. Role advertisements are checked per member,
+/// separately from the capabilities persisted in the group's MLS context.
+pub(crate) struct CreationKeyPackageCapabilities {
+    pub required: cgka_traits::capabilities::GroupCapabilities,
+    pub mandatory_components: cgka_traits::app_components::AppComponentSet,
+    pub required_roles: cgka_traits::capabilities::GroupCapabilities,
+}
+
+impl<S: StorageProvider> Engine<S> {
+    pub(crate) fn creation_key_package_capabilities(
+        &self,
+        request: &cgka_traits::engine::CreateGroupRequest,
+    ) -> Result<CreationKeyPackageCapabilities, EngineError> {
         let (mut required, _) = crate::capabilities::required_capabilities_extension_for_features(
             &self.registry,
             &[],
             &request.required_features,
             self.new_protocol_profile,
         )?;
-        for id in cgka_traits::app_components::default_group_components() {
-            required.app_components.insert(id);
-        }
-        if self.new_protocol_profile == ProtocolProfile::Current {
-            required
-                .app_components
-                .insert(cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
-        }
         for component in &request.app_components {
             required.app_components.insert(component.component_id);
         }
-        crate::capability_manager::merge_capabilities(
-            &mut required,
-            &crate::capability_manager::required_role_capabilities_from_request_components(
-                &request.app_components,
-            ),
+        let mut mandatory_components = cgka_traits::app_components::AppComponentSet::from(
+            cgka_traits::app_components::default_group_components(),
         );
-        Ok(KeyPackageRequirements {
-            profile: self.new_protocol_profile,
-            ciphersuite: self.ciphersuite,
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            mandatory_components
+                .insert(cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        }
+        Ok(CreationKeyPackageCapabilities {
             required,
+            mandatory_components,
+            required_roles:
+                crate::capability_manager::required_role_capabilities_from_request_components(
+                    &request.app_components,
+                ),
         })
     }
 }
@@ -411,7 +445,7 @@ fn parse_invitation_key_package(kp: &KeyPackage) -> Result<MlsKeyPackage, Engine
         }
     };
 
-    let key_package = validate_key_package(kp_in, &RustCrypto::default())?;
+    let key_package = validate_key_package(kp_in, &*VALIDATION_CRYPTO)?;
     // foundation/key-packages.md: reject a KeyPackage whose credential
     // identity is not a valid Marmot account identity. This single gate
     // covers both the create-group and invite invitee paths.

@@ -9393,7 +9393,18 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .iter()
             .map(|account| account.account_id_hex.clone())
             .collect::<Vec<_>>();
-        app.resolve_fresh_reinvite_key_packages(&members)
+        app.account_home().create_account("reinviter").unwrap();
+        let mut inviter = client_on_app_relay_plane(&app, "reinviter").await;
+        let group = inviter
+            .create_group("reinvite discovery", &[])
+            .await
+            .unwrap();
+        let requirements = inviter
+            .runtime
+            .session()
+            .invite_key_package_requirements(&group)
+            .unwrap();
+        app.resolve_compatible_member_key_packages(members.clone(), &requirements, true)
             .await
             .unwrap();
         for member in &members {
@@ -9415,9 +9426,10 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         }
         fetcher.requests.lock().unwrap().clear();
         let error = app
-            .resolve_fresh_reinvite_key_packages(&members)
+            .resolve_compatible_member_key_packages(members.clone(), &requirements, true)
             .await
-            .unwrap_err();
+            .err()
+            .expect("future-only discovery must fail closed");
         assert!(matches!(error, AppError::MissingKeyPackage(id) if id == members[0]));
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {

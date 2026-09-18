@@ -561,6 +561,16 @@ Only valid packages compatible with the proposed/existing group qualify. Within 
 tier, the existing recency order applies. Amethyst remains selectable when no
 higher-priority compatible package is available. A replacement in a publication
 slot supersedes the old package before ranking; one package per account is selected.
+This temporary selection policy applies to all hosts of this runtime; only the
+publication label is host-configurable. Compatibility alone cannot identify a
+client that publishes usable packages but does not process Welcomes.
+
+Slot supersession also applies to directory lookup and composition prewarm. A
+malformed current publication never revives an older package in the same slot.
+If no usable slot remains, prewarm reports failure while retaining successfully
+discovered routes for other members. Its success must not imply readiness based
+on superseded material. Bounded batch results are not exhaustive, so rejected
+candidates still permit a per-account fallback fetch.
 
 Host applications opt into public tagging at construction. Existing constructors
 remain untagged. Swift hosts can use:

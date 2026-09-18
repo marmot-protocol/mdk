@@ -281,6 +281,30 @@ async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite()
         .unwrap();
     assert_eq!(alice.members(&group).unwrap().len(), 2);
     let empty = alice.create_group("compatible invite", &[]).await.unwrap();
+    let requirements = alice
+        .runtime
+        .session()
+        .invite_key_package_requirements(&empty)
+        .unwrap();
+    let reinvite = app
+        .resolve_compatible_member_key_packages(
+            vec![bob.account_id_hex.clone()],
+            &requirements,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hex::encode(
+            reinvite.key_packages[0]
+                .source
+                .as_ref()
+                .unwrap()
+                .event_id
+                .as_slice()
+        ),
+        fallback.id
+    );
     alice
         .invite_members(&empty, &[bob.account_id_hex.as_str()])
         .await

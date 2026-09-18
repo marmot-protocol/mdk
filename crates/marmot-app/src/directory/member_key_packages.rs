@@ -247,23 +247,6 @@ impl MarmotApp {
         .await
     }
 
-    /// A superseded invite must not reuse the directory/prewarm package that
-    /// its first Welcome consumed. Fetch through the existing safe discovery path.
-    #[cfg(test)]
-    pub(crate) async fn resolve_fresh_reinvite_key_packages(
-        &self,
-        members: &[String],
-    ) -> Result<Vec<KeyPackage>, AppError> {
-        Ok(self
-            .resolve_member_key_packages_for_purpose(
-                members.to_vec(),
-                MemberResolutionPurpose::CommitFresh,
-                None,
-            )
-            .await?
-            .key_packages)
-    }
-
     /// Prewarm group composition without reserving or consuming any package.
     /// Success reports relay/metadata readiness only; final Create/Invite
     /// re-fetches packages and enforces the engine's membership policy.
@@ -271,6 +254,8 @@ impl MarmotApp {
     /// The roster must also resolve a safe Marmot inbox route for every member;
     /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
     /// discovered routes remain cached even when another member fails readiness.
+    /// A malformed current slot publication suppresses older packages here too;
+    /// return an error rather than report readiness from superseded material.
     /// Every call fetches packages for a fresh readiness signal; hosts should
     /// debounce composition changes. A later create call can reuse discovery routes,
     /// but fetches KeyPackages again because prewarmed material may have been
@@ -904,6 +889,9 @@ impl MarmotApp {
                         fetched.relay_lists = targets[index].relay_lists.clone();
                         outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
                     }
+                    // A bounded multi-author result can omit a compatible
+                    // candidate. Re-fetch per author even when the batch only
+                    // contained incompatible packages; it is not exhaustive.
                     Err(_) => fallback.push(index),
                 }
             }
