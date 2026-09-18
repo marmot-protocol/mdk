@@ -746,8 +746,6 @@ impl MarmotAppRuntime {
     ) -> Result<RuntimeConversationWindowSubscription, ConversationWindowError> {
         let telemetry = self.shared.app_performance_telemetry();
         measured(&telemetry, RuntimeOp::ConversationOpen, async {
-            let authority_ready = telemetry.observe(RuntimeOp::ConversationAuthorityReady);
-            let send_ready = telemetry.observe(RuntimeOp::ConversationSendReady);
             self.shared.lifecycle().ensure_running()?;
             if !(1..=CONVERSATION_WINDOW_MAX_ROWS).contains(&query.limit) {
                 return Err(ConversationWindowError::InvalidLimit);
@@ -765,6 +763,8 @@ impl MarmotAppRuntime {
             if account.signed_out {
                 return Err(AppError::RelayDirectory("account is signed out".into()).into());
             }
+            let authority_ready = telemetry.observe(RuntimeOp::ConversationAuthorityReady);
+            let send_ready = telemetry.observe(RuntimeOp::ConversationSendReady);
             let app = &self.accounts.app;
             let mut sources = Sources {
                 avatars: app.presentation_signals.avatars.subscribe(),

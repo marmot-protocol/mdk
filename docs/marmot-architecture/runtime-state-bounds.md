@@ -28,7 +28,7 @@ Tracking issue: marmot-protocol/mdk#381.
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| Runtime operation aggregates | One entry per closed `RuntimePerformanceOperation`, fixed histogram buckets and scalar counters; no account/group/message keys | Runtime telemetry drop reclaims aggregates; snapshots include untouched operations as zeroes |
+| Runtime operation aggregates | One fixed array entry per closed `RuntimePerformanceOperation`, with atomic completed-only counters/buckets and a separate mutex for live observations; no account/group/message keys | Runtime telemetry drop reclaims aggregates; snapshots include untouched operations as zeroes |
 | Active-operation age slots | At most `TRACKED_STARTS` (64) monotonic starts per operation | RAII completion or cancellation releases a slot; excess starts still increment exact active/outcome counts and appear in `untracked_in_flight` |
 
 Age tracking never drops or delays application work. When slots overflow, the oldest tracked

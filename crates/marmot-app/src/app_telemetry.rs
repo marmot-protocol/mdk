@@ -1042,48 +1042,44 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         outcome: HostPerformanceOutcome,
     ) {
-        let runtime_operation = match operation {
-            HostPerformanceOperation::ConversationLocalVisible => {
-                Some(RuntimePerformanceOperation::HostConversationLocalVisible)
-            }
-            HostPerformanceOperation::ConversationComposerReady => {
-                Some(RuntimePerformanceOperation::HostConversationComposerReady)
-            }
-            _ => None,
+        let runtime_outcome = match outcome {
+            HostPerformanceOutcome::Success => runtime::Outcome::Success,
+            HostPerformanceOutcome::Failure => runtime::Outcome::Failure,
+            HostPerformanceOutcome::Cancelled => runtime::Outcome::Cancelled,
+            HostPerformanceOutcome::Timeout => runtime::Outcome::Timeout,
+            HostPerformanceOutcome::Unavailable => runtime::Outcome::NotReady,
         };
-        if let Some(operation) = runtime_operation {
-            self.record_runtime(
-                operation,
+        let success = matches!(outcome, HostPerformanceOutcome::Success);
+        match operation {
+            HostPerformanceOperation::ConversationLocalVisible => self.record_runtime(
+                RuntimePerformanceOperation::HostConversationLocalVisible,
                 duration,
-                match outcome {
-                    HostPerformanceOutcome::Success => runtime::Outcome::Success,
-                    HostPerformanceOutcome::Failure => runtime::Outcome::Failure,
-                    HostPerformanceOutcome::Cancelled => runtime::Outcome::Cancelled,
-                    HostPerformanceOutcome::Timeout => runtime::Outcome::Timeout,
-                    HostPerformanceOutcome::Unavailable => runtime::Outcome::NotReady,
-                },
-            );
-            return;
+                runtime_outcome,
+            ),
+            HostPerformanceOperation::ConversationComposerReady => self.record_runtime(
+                RuntimePerformanceOperation::HostConversationComposerReady,
+                duration,
+                runtime_outcome,
+            ),
+            HostPerformanceOperation::OutboundMessageVisible => self.record(
+                AppPerformanceOperation::HostOutboundMessageVisible,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::InboundMessageVisible => self.record(
+                AppPerformanceOperation::HostInboundMessageVisible,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::SplashReady => {
+                self.record(AppPerformanceOperation::HostSplashReady, duration, success)
+            }
+            HostPerformanceOperation::ForegroundLocalReady => self.record(
+                AppPerformanceOperation::HostForegroundLocalReady,
+                duration,
+                success,
+            ),
         }
-        let operation = match operation {
-            HostPerformanceOperation::ConversationLocalVisible
-            | HostPerformanceOperation::ConversationComposerReady => unreachable!("handled above"),
-            HostPerformanceOperation::OutboundMessageVisible => {
-                AppPerformanceOperation::HostOutboundMessageVisible
-            }
-            HostPerformanceOperation::InboundMessageVisible => {
-                AppPerformanceOperation::HostInboundMessageVisible
-            }
-            HostPerformanceOperation::SplashReady => AppPerformanceOperation::HostSplashReady,
-            HostPerformanceOperation::ForegroundLocalReady => {
-                AppPerformanceOperation::HostForegroundLocalReady
-            }
-        };
-        self.record(
-            operation,
-            duration,
-            matches!(outcome, HostPerformanceOutcome::Success),
-        );
     }
 
     /// Return cumulative process-wide aggregates suitable for the opt-in

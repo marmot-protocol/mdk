@@ -6,6 +6,42 @@ use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 
+#[tokio::test]
+async fn rejected_open_does_not_start_readiness_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let result = runtime
+        .open_conversation_window(
+            "unknown",
+            &GroupId::new(vec![1; 16]),
+            ConversationOpenQuery {
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(ConversationWindowError::InvalidLimit)));
+    let snapshot = runtime.shared.app_performance_telemetry().snapshot();
+    for operation in [
+        RuntimeOp::ConversationAuthorityReady,
+        RuntimeOp::ConversationSendReady,
+    ] {
+        let sample = snapshot
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == operation)
+            .unwrap();
+        assert_eq!(sample.started, 0);
+        assert_eq!(sample.cancelled, 0);
+    }
+    let open = snapshot
+        .runtime_operations
+        .iter()
+        .find(|s| s.operation == RuntimeOp::ConversationOpen)
+        .unwrap();
+    assert_eq!((open.started, open.failures), (1, 1));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     app: MarmotApp,

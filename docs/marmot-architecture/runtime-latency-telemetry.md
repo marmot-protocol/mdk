@@ -44,6 +44,12 @@ start and completion are recorded together, so their live gauges remain zero. Th
 runtime observations show unfinished work. Export uses the existing consent-period baseline;
 fixed runtime series exist from its first snapshot so the first later observation is retained.
 
+Completed-only recording uses per-operation atomic counters and histogram buckets, without the
+live-observation mutex. Snapshot fields are sampled independently: a concurrent completion can
+straddle the outcome and histogram reads, so those totals can differ temporarily. No samples are
+lost; quiescent snapshots agree. Live observations use a separate mutex per closed operation.
+Storage without an installed observer skips timing clock reads and the observer mutex entirely.
+
 ## Boundaries
 
 Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do not sum them**.
@@ -57,7 +63,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `conversation_capture_queue` | Capture channel admission through worker dispatch/rejection/drop; a timed-out caller can leave a cancelled request queued until dispatch |
 | `conversation_capture` | Worker-side authority/account capture; excludes response transport and presentation |
 | `conversation_presentation` | Preparation of header, messages, identities and draft for a snapshot, including blocking-task scheduling |
-| `conversation_authority_ready` | Window-open entry to the first prepared snapshot carrying live authority; stays active across retries |
+| `conversation_authority_ready` | After open admission checks to the first prepared snapshot carrying live authority; stays active across retries; rejected opens do not start this wait |
 | `conversation_send_ready` | Same start, successful when the first authoritative snapshot permits sending; finishes not-ready if that authority disables sending (membership/lifecycle), rather than reporting an indefinitely stuck open |
 | `draft_send_caller`, `direct_send_caller` | Account-manager send entry through worker response, including acquisition and queueing |
 | `send_worker_acquire` | Send's worker lookup/reconciliation |
@@ -70,7 +76,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `worker_hydration` | Nonempty startup hydration pipeline, including command service between slices |
 | `worker_catch_up` | Worker catch-up including the preceding frozen read snapshot and coalescing |
 | `worker_snapshot` | Frozen group read snapshot immediately before catch-up |
-| `worker_convergence`, `worker_maintenance` | Selected convergence/periodic maintenance branch; success means branch completed, not that every internally handled sub-operation succeeded |
+| `worker_convergence`, `worker_maintenance` | Selected convergence/periodic maintenance work after no-work/shutdown skip checks; success means branch completed, not that every internally handled sub-operation succeeded |
 | `worker_receive` | Received delivery/overflow handling through ingest result; excludes waiting for network input and subsequent worker postprocessing |
 | `worker_reconnect_wait` | Reconnect backoff, including commands served/rejected during that wait |
 | `ingest` | Account ingest and resulting effect publication; excludes subsequent app projection work |

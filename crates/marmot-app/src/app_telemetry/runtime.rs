@@ -3,6 +3,7 @@
 //! Observations own no runtime resources and never change scheduling. Dropping
 //! one records cancellation, including cancellation before a queued command runs.
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Only age tracking is capped; all starts, outcomes and active counts remain exact.
 const TRACKED_STARTS: usize = 64;
@@ -159,20 +160,95 @@ fn millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
-#[derive(Clone, Debug, Default)]
+// Completed-only hot paths do not need live-start tracking or a mutex. Each
+// closed operation owns its counters; no lock serializes unrelated operations.
+#[derive(Debug, Default)]
+struct CompletedState {
+    outcomes: [AtomicU64; 5],
+    buckets: [AtomicU64; APP_DURATION_BUCKET_BOUNDS_MS.len()],
+    overflow: AtomicU64,
+    sum_ms: AtomicU64,
+}
+impl CompletedState {
+    fn record(&self, outcome: Outcome, duration: Duration) {
+        let duration_ms = millis(duration);
+        let bucket = APP_DURATION_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|bound| duration_ms <= *bound)
+            .map_or(&self.overflow, |index| &self.buckets[index]);
+        bucket.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .sum_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sum| {
+                Some(sum.saturating_add(duration_ms))
+            });
+        let index = match outcome {
+            Outcome::Success => 0,
+            Outcome::Failure => 1,
+            Outcome::Cancelled => 2,
+            Outcome::Timeout => 3,
+            Outcome::NotReady => 4,
+        };
+        self.outcomes[index].fetch_add(1, Ordering::Relaxed);
+    }
+    fn add_to(&self, snapshot: &mut RuntimePerformanceSnapshot) {
+        let [successes, failures, cancelled, timeouts, not_ready] = self
+            .outcomes
+            .each_ref()
+            .map(|count| count.load(Ordering::Relaxed));
+        let completed = successes + failures + cancelled + timeouts + not_ready;
+        snapshot.started += completed;
+        snapshot.completed += completed;
+        snapshot.successes += successes;
+        snapshot.failures += failures;
+        snapshot.cancelled += cancelled;
+        snapshot.timeouts += timeouts;
+        snapshot.not_ready += not_ready;
+        for (bucket, count) in snapshot.duration_ms.buckets.iter_mut().zip(&self.buckets) {
+            bucket.count += count.load(Ordering::Relaxed);
+        }
+        snapshot.duration_ms.overflow_count += self.overflow.load(Ordering::Relaxed);
+        snapshot.duration_ms.sum_ms = snapshot
+            .duration_ms
+            .sum_ms
+            .saturating_add(self.sum_ms.load(Ordering::Relaxed));
+    }
+}
+
+#[derive(Debug, Default)]
+struct OperationTelemetry {
+    observed: Mutex<OperationState>,
+    recorded: CompletedState,
+}
+#[derive(Clone, Debug)]
 pub(crate) struct RuntimeTelemetry(
-    Arc<Mutex<BTreeMap<RuntimePerformanceOperation, OperationState>>>,
+    Arc<[OperationTelemetry; RuntimePerformanceOperation::ALL.len()]>,
 );
+impl Default for RuntimeTelemetry {
+    fn default() -> Self {
+        Self(Arc::new(std::array::from_fn(|_| {
+            OperationTelemetry::default()
+        })))
+    }
+}
 impl RuntimeTelemetry {
+    fn operation(&self, operation: RuntimePerformanceOperation) -> &OperationTelemetry {
+        &self.0[operation as usize]
+    }
     pub(super) fn snapshot(&self) -> Vec<RuntimePerformanceSnapshot> {
-        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         RuntimePerformanceOperation::ALL
             .iter()
             .map(|op| {
-                state
-                    .get(op)
-                    .unwrap_or(&OperationState::default())
-                    .snapshot(*op)
+                let state = self.operation(*op);
+                let mut snapshot = state
+                    .observed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot(*op);
+                // Atomic completed-only fields are independently sampled. Counts
+                // are never lost, but a concurrent record may straddle a snapshot.
+                state.recorded.add_to(&mut snapshot);
+                snapshot
             })
             .collect()
     }
@@ -210,10 +286,12 @@ impl Observation {
         if self.finished {
             return;
         }
-        let mut states = self.telemetry.0.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states
-            .get_mut(&self.operation)
-            .expect("observation registered");
+        let mut state = self
+            .telemetry
+            .operation(self.operation)
+            .observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         state.active -= 1;
         if let Some(slot) = self.slot {
             state.starts[slot] = None;
@@ -241,8 +319,12 @@ impl AppPerformanceTelemetry {
     }
     pub(crate) fn observe(&self, operation: RuntimePerformanceOperation) -> Observation {
         let started = Instant::now();
-        let mut states = self.runtime.0.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states.entry(operation).or_default();
+        let mut state = self
+            .runtime
+            .operation(operation)
+            .observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         state.started += 1;
         state.active += 1;
         let slot = if let Some(index) = state.starts.iter().position(Option::is_none) {
@@ -268,16 +350,83 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         outcome: Outcome,
     ) {
-        let mut states = self.runtime.0.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states.entry(operation).or_default();
-        state.started += 1;
-        state.finish(outcome, duration);
+        self.runtime
+            .operation(operation)
+            .recorded
+            .record(outcome, duration);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_recording_does_not_wait_for_live_observations() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let operation = RuntimePerformanceOperation::StorageConnectionWait;
+        let guard = telemetry
+            .runtime
+            .operation(operation)
+            .observed
+            .lock()
+            .unwrap();
+        let copy = telemetry.clone();
+        let (done, received) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            copy.record_runtime(operation, Duration::from_millis(2), Outcome::Success);
+            done.send(()).unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        recorder.join().unwrap();
+        result.expect("completed storage recording must not wait for the live-observation lock");
+    }
+
+    #[test]
+    fn concurrent_completed_recording_preserves_all_counts_and_durations() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let operation = RuntimePerformanceOperation::StorageConnectionWait;
+        std::thread::scope(|scope| {
+            for outcome in [
+                Outcome::Success,
+                Outcome::Failure,
+                Outcome::Cancelled,
+                Outcome::Timeout,
+                Outcome::NotReady,
+            ] {
+                let telemetry = &telemetry;
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        telemetry.record_runtime(operation, Duration::from_millis(2), outcome);
+                    }
+                });
+            }
+        });
+        let snapshot = telemetry
+            .runtime
+            .snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.operation == operation)
+            .unwrap();
+        assert_eq!(
+            (snapshot.started, snapshot.completed, snapshot.in_flight),
+            (5_000, 5_000, 0)
+        );
+        assert_eq!(
+            [
+                snapshot.successes,
+                snapshot.failures,
+                snapshot.cancelled,
+                snapshot.timeouts,
+                snapshot.not_ready
+            ],
+            [1_000; 5]
+        );
+        assert_eq!(snapshot.duration_ms.buckets[1].count, 5_000);
+        assert_eq!(snapshot.duration_ms.sum_ms, 10_000);
+        assert_eq!(snapshot.duration_ms.overflow_count, 0);
+    }
+
     fn sample(t: &AppPerformanceTelemetry) -> RuntimePerformanceSnapshot {
         t.runtime
             .snapshot()

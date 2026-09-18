@@ -1270,10 +1270,9 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = scheduled_convergence.timer.as_mut() => {
-                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
-
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence);
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
                 // Mutations retain worker FIFO order; reads use the snapshot.
@@ -1739,8 +1738,6 @@ async fn run_app_runtime_account_worker(
                 };
             }
             _ = maintenance_tick.tick() => {
-                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
-
                 attachment_due = true;
                 presentation_due = true;
                 avatar_due = true;
@@ -1754,6 +1751,7 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
+                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(
                         target: "marmot_app::account_worker",
