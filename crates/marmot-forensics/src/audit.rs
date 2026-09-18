@@ -1357,11 +1357,13 @@ struct JsonlInner {
     next_segment_index: Option<u32>,
     /// Most recently explicitly recorded `AuditEventKind::SourceContext`.
     /// Retained even when the best-effort write fails so a later successful
-    /// destructive rotation can replay it. Not inferred from
-    /// `AuditEventContext.source`. Survives destructive swaps; size-based
-    /// segment rolls do not replay it.
+    /// rotation can repeat it. Not inferred from
+    /// `AuditEventContext.source`. Survives destructive swaps.
     retained_source_context: Option<AuditSourceContext>,
-    /// Test seam: fail the next `write_record` after capturing any source
+    /// Serialized segment prefix and successfully written offset. Resume partial
+    /// writes before admitting ordinary rows; never reserialize an emitted prefix.
+    pending_segment_source: Option<(Vec<u8>, usize)>,
+    /// Test seam: fail the next row or segment-prefix write after capturing source
     /// context, so retention can be proven independently of a durable write.
     #[cfg(test)]
     fail_next_write: bool,
@@ -1413,6 +1415,7 @@ impl JsonlRecorder {
                 writer_path: path.clone(),
                 next_segment_index: None,
                 retained_source_context: None,
+                pending_segment_source: None,
                 #[cfg(test)]
                 fail_next_write: false,
             }),
@@ -1444,7 +1447,7 @@ impl JsonlRecorder {
 }
 
 /// The `recorder_started` boundary row recorded by [`JsonlRecorder::open`] and
-/// after each rotation. The recorder session id lives on the enclosing
+/// after each destructive rotation. The recorder session id lives on the enclosing
 /// [`AuditEvent::recorder_session_id`], so the kind only names the recorder.
 fn recorder_started_kind() -> AuditEventKind {
     AuditEventKind::RecorderStarted {
@@ -1505,6 +1508,13 @@ impl ForensicRecorder for JsonlRecorder {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Retain updates even if a pending prefix prevents this best-effort row.
+        if let AuditEventKind::SourceContext { source } = &record.kind {
+            inner.retained_source_context = Some(source.clone());
+        }
+        if !Self::finish_segment_source(&mut inner) {
+            return;
+        }
         if Self::write_record(&mut inner, record) {
             self.try_roll_segment(&mut inner, Instant::now());
         }
@@ -1552,24 +1562,7 @@ impl JsonlRecorder {
             inner.health.write_failures = inner.health.write_failures.saturating_add(1);
             return false;
         }
-        let seq = inner.seq;
-        inner.seq = seq.wrapping_add(1);
-        let kind = record.kind;
-        let context = stamp_system_human_action(record.context, &kind);
-        let event = AuditEvent {
-            schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
-            seq,
-            wall_time_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            recorder_session_id: Some(inner.recorder_session_id.clone()),
-            account_ref: inner.account_ref.clone(),
-            engine_id: inner.engine_id.clone(),
-            group_ref: record.group_ref,
-            context,
-            kind,
-        };
+        let event = Self::event(inner, record);
         if let Ok(line) = serde_json::to_string(&event) {
             if writeln!(inner.writer, "{line}").is_err() {
                 inner.health.write_failures = inner.health.write_failures.saturating_add(1);
@@ -1588,6 +1581,65 @@ impl JsonlRecorder {
                 inner.health.serialization_failures.saturating_add(1);
             return false;
         }
+        true
+    }
+
+    fn event(inner: &mut JsonlInner, record: AuditRecord) -> AuditEvent {
+        let seq = inner.seq;
+        inner.seq = seq.wrapping_add(1);
+        let kind = record.kind;
+        let context = stamp_system_human_action(record.context, &kind);
+        AuditEvent {
+            schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
+            seq,
+            wall_time_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            recorder_session_id: Some(inner.recorder_session_id.clone()),
+            account_ref: inner.account_ref.clone(),
+            engine_id: inner.engine_id.clone(),
+            group_ref: record.group_ref,
+            context,
+            kind,
+        }
+    }
+
+    /// Fresh segment writers have no buffered ordinary data. Write directly to
+    /// their file so a short write can resume at the exact byte offset, including
+    /// after a flush failure, without duplicating a row or corrupting JSONL.
+    fn finish_segment_source(inner: &mut JsonlInner) -> bool {
+        let Some((bytes, offset)) = inner.pending_segment_source.as_mut() else {
+            return true;
+        };
+        #[cfg(test)]
+        if std::mem::take(&mut inner.fail_next_write) {
+            inner.health.write_failures = inner.health.write_failures.saturating_add(1);
+            return false;
+        }
+        debug_assert!(inner.writer.buffer().is_empty());
+        while *offset < bytes.len() {
+            match inner.writer.get_mut().write(&bytes[*offset..]) {
+                Ok(0) => {
+                    inner.health.write_failures = inner.health.write_failures.saturating_add(1);
+                    return false;
+                }
+                Ok(written) => {
+                    *offset += written;
+                    inner.active_bytes = inner.active_bytes.saturating_add(written as u64);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    inner.health.write_failures = inner.health.write_failures.saturating_add(1);
+                    return false;
+                }
+            }
+        }
+        if inner.writer.get_mut().flush().is_err() {
+            inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+            return false;
+        }
+        inner.pending_segment_source = None;
         true
     }
 
@@ -1656,6 +1708,7 @@ impl JsonlRecorder {
         inner.recorder_session_id = generate_recorder_session_id();
         inner.health = AuditRecorderHealthSnapshot::default();
         inner.active_bytes = 0;
+        inner.pending_segment_source = None;
         inner.segment_retry_after = None;
         inner.writer_path = self.path.clone();
         Ok(())
@@ -1666,9 +1719,9 @@ impl JsonlRecorder {
     /// hold the inner lock.
     ///
     /// Nothing is deleted or truncated: the rename hands the *same inode* — and
-    /// therefore every recorded byte — to the segment name, and the concatenation
-    /// of the segments and the active file is byte-identical to the single file
-    /// this recorder would otherwise have written. Retention and disk bounding
+    /// therefore every recorded byte — to the segment name. Only the latest
+    /// source context is repeated, with a fresh sequence, in the new file.
+    /// Ordinary events are never replayed. Retention and disk bounding
     /// of the sealed segments are deliberately out of scope here; they belong to
     /// mdk#1014.
     ///
@@ -1685,6 +1738,11 @@ impl JsonlRecorder {
     /// segment is renamed back so the still-open writer fd and the active path
     /// agree again.
     fn roll_into_segment(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
+        if !Self::finish_segment_source(inner) {
+            return Err(std::io::Error::other(
+                "audit segment source write incomplete",
+            ));
+        }
         // A failed flush must not seal a segment or discard buffered bytes.
         inner.writer.flush().inspect_err(|_| {
             inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
@@ -1698,6 +1756,23 @@ impl JsonlRecorder {
                 inner.active_bytes = 0;
                 inner.next_segment_index = Some(index.saturating_add(1));
                 inner.writer_path = self.path.clone();
+                if let Some(source) = inner.retained_source_context.clone() {
+                    let event = Self::event(
+                        inner,
+                        AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                    );
+                    // AuditSourceContext contains only serializable string options.
+                    let mut bytes = serde_json::to_vec(&event).map_err(|err| {
+                        inner.health.serialization_failures =
+                            inner.health.serialization_failures.saturating_add(1);
+                        std::io::Error::other(err)
+                    })?;
+                    bytes.push(b'\n');
+                    inner.pending_segment_source = Some((bytes, 0));
+                    // Do not call record(): it relocks and could recursively roll
+                    // when metadata itself meets the size threshold.
+                    Self::finish_segment_source(inner);
+                }
                 Ok(())
             }
             Err(err) => {

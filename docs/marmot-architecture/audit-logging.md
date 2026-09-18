@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-15
+updated: 2026-09-18
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -1043,8 +1043,11 @@ The recorder seals the active file into an immutable segment once it reaches `AU
 continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
 still enumerated by `audit_log_files()` and sort ahead of the active file.
 
-- Rotation is a rename, so nothing is deleted or truncated, and the concatenation of a session's segments plus its
-  active file is byte-identical to the single file the recorder would otherwise have written.
+- Rotation is a rename: existing event bytes and identities are preserved without deletion or truncation.
+  Each fresh segment starts with the latest known `source_context`, assigned a fresh sequence number. Ordinary
+  events are never replayed. Without an explicitly recorded source context, no metadata is invented.
+  Prefix writes resume after failure before ordinary rows are admitted; health counters track failures.
+  Writing the prefix cannot recursively trigger rollover, even if the metadata reaches the size threshold.
 - `seq`, the recorder session id, and the health counters carry across a segment boundary, and no `recorder_started`
   row is written: a roll is not a new recorder session, and the upload endpoint's content-keyed line dedupe never
   re-mints a line just because it moved to a new file name.
@@ -1052,8 +1055,8 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
   the 64 MiB request ceiling — is rolled aside on the first open, so a session always starts on an uploadable file.
 - A failed roll is compensated and retried later, not absorbed: the rename is the only step that moves data, so a failed
   reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
-  attempting rolls until something proves the directory writable again — a fresh open, or a `rotate()` — so a transient
-  `ENOSPC`/`EMFILE` costs a delayed roll, not a session with rotation disabled.
+  attempting rolls for a 30-second backoff before retrying, so transient `ENOSPC`/`EMFILE` errors cost a delayed roll,
+  not a session with rotation disabled.
 - Retention, deletion, and disk bounding of sealed segments are out of scope here; they belong to mdk#1014.
 
 ### Explicit upload
@@ -1175,12 +1178,26 @@ for `device_label`; C hosts use `marmot_set_audit_log_tracker_config_v4` for har
 The producer member reference is derived internally; hosts do not supply it. Destructive live rotation
 (`JsonlRecorder::rotate`, including app delete of the active file) emits `recorder_started` and then the most
 recently recorded `source_context` into the fresh file. Size-based segment rolls stay one continuous session and
-do not replay lifecycle or source rows, so an isolated segment may lack the mapping. Current recording and upload
+repeat the latest source row before ordinary events, without replaying lifecycle rows. Current recording and upload
 are v4-only; historical v2/v3 source rows remain valid under their original schemas and do not carry this field.
-A valid uploaded segment may therefore lack source metadata; analyzers may associate it with validated source rows
+Older segments, or recorders that never received source context, may still lack source metadata; analyzers may associate it with validated source rows
 for the same producer/session or leave identity unknown. Joining `local_member_ref` to a later
 `group_state_changed.subject_member_ref` is a diagnostic correlation, not a membership interval or
 removed-versus-stale classification. External consumers must adopt the optional field before using that join.
+
+Goggles validates with strict `additionalProperties: false`: adding even an optional field to an existing v4
+variant is a consumer compatibility change. The `local_member_ref` addition caused whole-upload rejection until
+Goggles synchronized its schema. Coordinate future field/kind changes with consumer schema releases and validate
+representative producer JSONL against the consumer schema before distributing clients. This segmentation fix adds
+no fields or schema version; source metadata stays in the validated JSONL body, never upload headers or user-assigned
+account/device names. Goggles can correlate retained metadata by engine/account/recorder-session identity, but cannot
+recover startup evidence that was never uploaded or has expired.
+
+Adoption requires rebuilt MDK native artifacts: a MarmotKit release for iOS/macOS (Swift/XCFramework) and Android
+(Kotlin/native libraries), followed by White Noise client releases using those artifacts. C ABI consumers need a
+rebuilt Marmot C release; CLI/daemon and wn-agent distributions embedding this recorder need rebuilt binaries.
+No binding API change or version bump is part of this fix. Existing uploaded or local historical segments are not rewritten.
+
 
 Compiled/default endpoint source:
 
