@@ -325,6 +325,68 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
     })
 }
 
+/// Open with an optional public client name for newly prepared KeyPackages.
+/// NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+/// their original tags. NULL `store` selects the platform keychain.
+/// Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
+///
+/// # Safety
+/// Same pointer contracts as `marmot_client_new_with_secret_store`, except
+/// `store` may be NULL. `client_name` must be NULL or a valid UTF-8 C string.
+/// `cursor_persistence` must be a `MarmotCursorPersistence` discriminant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_client_name(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    client_name: *const c_char,
+    cursor_persistence: u32,
+    store: *const MarmotSecretStore,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
+        let cursor = match MarmotCursorPersistence::from_c(cursor_persistence) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let name = if client_name.is_null() {
+            None
+        } else {
+            match unsafe { required_str(client_name) } {
+                Ok(name) => Some(name),
+                Err(status) => return status,
+            }
+        };
+        let store = if store.is_null() {
+            None
+        } else {
+            match unsafe { CSecretStore::from_c(store) } {
+                Ok(store) => Some(Arc::new(store)),
+                Err(status) => return status,
+            }
+        };
+        let status = unsafe {
+            open_client(root_path, relay_urls, relay_urls_len, out_client, {
+                let store = store
+                    .as_ref()
+                    .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
+                move |root, relays| {
+                    Marmot::new_with_client_name(root, relays, name, cursor.into(), store)
+                }
+            })
+        };
+        if status == MarmotStatus::Ok
+            && let Some(store) = store
+        {
+            store.arm();
+        }
+        status
+    })
+}
+
 /// Shared body of the client constructors: read the borrowed arguments,
 /// build the embedded runtime, run `construct` inside it, and hand the
 /// handle out.

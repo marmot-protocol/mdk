@@ -1,6 +1,7 @@
 mod draft_lifecycle;
 mod group_lookup;
 mod key_package_inventory;
+mod key_package_selection;
 mod message_journeys;
 mod report_backfill;
 mod user_blocks;
@@ -8335,6 +8336,15 @@ async fn fresh_key_package_for_account(
     account: &AccountSummary,
     legacy: bool,
 ) -> KeyPackage {
+    fresh_key_package_with_components(app, account, legacy, app.supported_app_component_ids()).await
+}
+
+async fn fresh_key_package_with_components(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    legacy: bool,
+    components: Vec<u16>,
+) -> KeyPackage {
     let signer = app.account_signer_for_summary(account).unwrap();
     let session_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let keys = app
@@ -8358,7 +8368,7 @@ async fn fresh_key_package_for_account(
     )
     .account_identity_proof_signer(signer.as_proof_signer())
     .feature_registry(app_feature_registry())
-    .supported_app_components(app.supported_app_component_ids());
+    .supported_app_components(components);
     if legacy {
         config = config.legacy_compatibility_profile();
     }
@@ -8523,6 +8533,7 @@ fn member_resolution_key_package_event(
 ) -> NostrTransportEvent {
     let metadata = cgka_engine::key_package::key_package_metadata(&key_package).unwrap();
     transport_nostr_adapter::NostrKeyPackagePublication {
+        client_name: None,
         account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
         key_package,
         key_package_slot_id: format!("{}-slot", account.label),

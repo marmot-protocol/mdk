@@ -188,3 +188,22 @@ fn a_null_store_is_rejected_before_the_client_is_built() {
     assert_eq!(status, MarmotStatus::NullPointer);
     assert!(client.is_null(), "out-pointer must be cleared at entry");
 }
+
+#[test]
+fn client_name_constructor_validates_arguments_without_taking_store_ownership() {
+    let mut client: *mut MarmotClient = std::ptr::dangling_mut();
+    let name = CString::new("whitenoise").unwrap();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_client_name(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            name.as_ptr(),
+            u32::MAX,
+            std::ptr::null(),
+            &raw mut client,
+        )
+    };
+    assert_eq!(status, MarmotStatus::InvalidArgument);
+    assert!(client.is_null());
+}

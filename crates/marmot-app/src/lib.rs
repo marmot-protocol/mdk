@@ -6505,6 +6505,14 @@ impl AppKeyPackagePublisher {
             ));
         }
         Ok(NostrKeyPackagePublication {
+            client_name: self
+                .app
+                .config
+                .key_package_client_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
             key_package_slot_id: publication.slot_id.clone(),
@@ -6590,9 +6598,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         publication: &KeyPackagePublication,
         artifact: &cgka_traits::SignedPublicationArtifact,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
-        let nostr_publication = self.nostr_publication(publication)?;
+        let mut nostr_publication = self.nostr_publication(publication)?;
         let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        // A retry belongs to its durable signed artifact, not the current host config.
+        nostr_publication.client_name = event.tag_value("client").map(str::to_owned);
         if event.id != hex::encode(artifact.id.as_slice())
             || event.created_at != artifact.created_at.0
         {

@@ -1561,34 +1561,6 @@ impl AppClient {
         {
             return Err(AppError::UserBlocked);
         }
-        let key_package_started_at = Instant::now();
-        let key_packages = self
-            .app
-            .resolve_member_key_packages_with_stats(
-                member_refs
-                    .iter()
-                    .map(|member_ref| (*member_ref).to_owned())
-                    .collect(),
-            )
-            .await;
-        let key_package_elapsed = key_package_started_at.elapsed();
-        record_app_performance(
-            telemetry,
-            AppPerformanceOperation::GroupCreateKeyPackageLookup,
-            key_package_elapsed,
-            key_packages.is_ok(),
-        );
-        let resolved = key_packages?;
-        if resolved.stats.unique_members > 0 {
-            record_app_performance(
-                telemetry,
-                AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
-                key_package_elapsed,
-                true,
-            );
-        }
-        let members = resolved.key_packages;
-        self.refresh_routing()?;
         let nostr_routing = self.app.new_nostr_routing()?;
         let nostr_routing_bytes =
             encode_nostr_routing_v1(&nostr_routing).map_err(AppError::InvalidNostrRouting)?;
@@ -1609,6 +1581,48 @@ impl AppClient {
                     .to_app_component_data()?,
             );
         }
+        let requirements = self
+            .runtime
+            .session()
+            .create_key_package_requirements(&CreateGroupRequest {
+                name: name.to_owned(),
+                description: description.clone(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: app_components.clone(),
+                initial_admins: Vec::new(),
+            })
+            .map_err(cgka_session::SessionError::from)?;
+        let key_package_started_at = Instant::now();
+        let key_packages = self
+            .app
+            .resolve_compatible_member_key_packages(
+                member_refs
+                    .iter()
+                    .map(|member_ref| (*member_ref).to_owned())
+                    .collect(),
+                &requirements,
+                false,
+            )
+            .await;
+        let key_package_elapsed = key_package_started_at.elapsed();
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupCreateKeyPackageLookup,
+            key_package_elapsed,
+            key_packages.is_ok(),
+        );
+        let resolved = key_packages?;
+        if resolved.stats.unique_members > 0 {
+            record_app_performance(
+                telemetry,
+                AppPerformanceOperation::GroupCreateKeyPackageNetworkResolution,
+                key_package_elapsed,
+                true,
+            );
+        }
+        let members = resolved.key_packages;
+        self.refresh_routing()?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &app_components)?;
         let uploads_inline_image =
@@ -2205,7 +2219,23 @@ impl AppClient {
         self.ensure_group(group_id)?;
 
         let key_package_started_at = Instant::now();
-        let key_packages = self.app.resolve_member_key_packages(member_refs).await;
+        let requirements = self
+            .runtime
+            .session()
+            .invite_key_package_requirements(group_id)
+            .map_err(cgka_session::SessionError::from)?;
+        let key_packages = self
+            .app
+            .resolve_compatible_member_key_packages(
+                member_refs
+                    .iter()
+                    .map(|member| (*member).to_owned())
+                    .collect(),
+                &requirements,
+                false,
+            )
+            .await
+            .map(|resolved| resolved.key_packages);
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,

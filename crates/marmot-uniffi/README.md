@@ -551,3 +551,36 @@ for source/account fencing, result states and lifecycle rules.
 Use the asynchronous attachment history page/version methods for canonical media-library
 discovery. See [the C8-B native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
 removal and cursor ownership. `list_media` remains a compatibility API.
+
+## KeyPackage client preference and publication label
+
+Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
+then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by
+substring). These are advisory labels, never proof of a particular application.
+Only valid packages compatible with the proposed/existing group qualify. Within a
+tier, the existing recency order applies. Amethyst remains selectable when no
+higher-priority compatible package is available. A replacement in a publication
+slot supersedes the old package before ranking; one package per account is selected.
+
+Host applications opt into public tagging at construction. Existing constructors
+remain untagged. Swift hosts can use:
+
+```swift
+let marmot = try Marmot.newWithClientName(
+    rootPath: rootPath,
+    relayUrls: relayUrls,
+    clientName: "whitenoise",
+    cursorPersistence: .advance,
+    secretStore: nil
+)
+```
+
+Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
+`marmot_client_new_with_client_name`. Rust hosts set
+`MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
+Supply the name on every host runtime construction, including background and
+notification-extension entry points (which retain their frozen cursor policy).
+Absent or whitespace-only names omit the tag. New initial publications and normal
+rotations carry the configured label. Existing events are not republished, and
+already-signed pending publications retry with their original tags even if the
+configuration changes. No workspace/binding version bump is part of this change.

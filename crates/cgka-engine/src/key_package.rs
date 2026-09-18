@@ -173,6 +173,102 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
     Ok(key_package.last_resort())
 }
 
+/// Read-only admission snapshot used to filter discovery candidates before ranking.
+/// Sending still revalidates against canonical group state.
+#[derive(Clone, Debug)]
+pub struct KeyPackageRequirements {
+    profile: ProtocolProfile,
+    ciphersuite: openmls_traits::types::Ciphersuite,
+    required: cgka_traits::capabilities::GroupCapabilities,
+}
+
+impl KeyPackageRequirements {
+    pub fn validate(&self, package: &KeyPackage) -> Result<(), EngineError> {
+        let parsed = parse_invitation_key_package(package)?;
+        if package.protocol_profile != self.profile || parsed.ciphersuite() != self.ciphersuite {
+            return Err(EngineError::Other(
+                "KeyPackage does not match target group profile or ciphersuite".into(),
+            ));
+        }
+        let had = crate::capabilities::capabilities_of_key_package(&parsed);
+        if !self.required.missing_from(&had).is_empty() {
+            return Err(EngineError::MissingRequiredCapabilities {
+                required: Box::new(self.required.clone()),
+                had: Box::new(had),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<S: StorageProvider> Engine<S> {
+    /// Snapshot required capabilities, including component-owned member roles.
+    pub fn invite_key_package_requirements(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<KeyPackageRequirements, EngineError> {
+        let record = self.storage.get_group(group_id)?;
+        self.with_mls_group(group_id, |group| {
+            let mut required = record.required_capabilities.clone();
+            merge_requirements(
+                &mut required,
+                crate::capability_manager::required_role_capabilities_from_group(group),
+            );
+            Ok(KeyPackageRequirements {
+                profile: record.protocol_profile,
+                ciphersuite: group.ciphersuite(),
+                required,
+            })
+        })
+    }
+
+    /// Admission requirements for a proposed group, before any MLS state is created.
+    pub fn create_key_package_requirements(
+        &self,
+        request: &cgka_traits::engine::CreateGroupRequest,
+    ) -> Result<KeyPackageRequirements, EngineError> {
+        let (mut required, _) = crate::capabilities::required_capabilities_extension_for_features(
+            &self.registry,
+            &[],
+            &request.required_features,
+            self.new_protocol_profile,
+        )?;
+        for id in cgka_traits::app_components::default_group_components() {
+            required.app_components.insert(id);
+        }
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            required
+                .app_components
+                .insert(cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        }
+        for component in &request.app_components {
+            required.app_components.insert(component.component_id);
+        }
+        merge_requirements(
+            &mut required,
+            crate::capability_manager::required_role_capabilities_from_request_components(
+                &request.app_components,
+            ),
+        );
+        Ok(KeyPackageRequirements {
+            profile: self.new_protocol_profile,
+            ciphersuite: self.ciphersuite,
+            required,
+        })
+    }
+}
+
+fn merge_requirements(
+    target: &mut cgka_traits::capabilities::GroupCapabilities,
+    other: cgka_traits::capabilities::GroupCapabilities,
+) {
+    target.extensions.extend(other.extensions);
+    target.proposals.extend(other.proposals);
+    for id in other.app_components.ids {
+        target.app_components.insert(id);
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     /// Permanently retire every locally persisted KeyPackage bundle that is not
     /// usable by the current protocol profile.
@@ -309,32 +405,35 @@ impl<S: StorageProvider> Engine<S> {
     /// [`MlsKeyPackage`], running the MLS 1.0 validation pass. Used by
     /// `create_group` and `invite`.
     pub(crate) fn parse_key_package(&self, kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
-        let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
-            .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
-
-        let kp_in = match msg.extract() {
-            MlsMessageBodyIn::KeyPackage(k) => k,
-            _ => {
-                return Err(EngineError::Serialize(
-                    "MLS message did not carry a KeyPackage".into(),
-                ));
-            }
-        };
-
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let key_package = validate_key_package(kp_in, provider.crypto())?;
-        // foundation/key-packages.md: reject a KeyPackage whose credential
-        // identity is not a valid Marmot account identity. This single gate
-        // covers both the create-group and invite invitee paths.
-        let member = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
-        let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
-            key_package.leaf_node(),
-            key_package.ciphersuite(),
-        )?;
-        ensure_key_package_profile(kp, protocol_profile)?;
-        validate_invitee_capabilities(&key_package, member)?;
-        Ok(key_package)
+        parse_invitation_key_package(kp)
     }
+}
+
+fn parse_invitation_key_package(kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
+    let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
+        .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
+
+    let kp_in = match msg.extract() {
+        MlsMessageBodyIn::KeyPackage(k) => k,
+        _ => {
+            return Err(EngineError::Serialize(
+                "MLS message did not carry a KeyPackage".into(),
+            ));
+        }
+    };
+
+    let key_package = validate_key_package(kp_in, &RustCrypto::default())?;
+    // foundation/key-packages.md: reject a KeyPackage whose credential
+    // identity is not a valid Marmot account identity. This single gate
+    // covers both the create-group and invite invitee paths.
+    let member = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+    let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
+        key_package.leaf_node(),
+        key_package.ciphersuite(),
+    )?;
+    ensure_key_package_profile(kp, protocol_profile)?;
+    validate_invitee_capabilities(&key_package, member)?;
+    Ok(key_package)
 }
 
 /// Enforce the RFC 9420 section 7.2 advertisement rule before using a

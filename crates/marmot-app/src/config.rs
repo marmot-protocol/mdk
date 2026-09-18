@@ -71,6 +71,9 @@ impl Default for AttachmentAcquisitionPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
+    /// Optional public client label for newly prepared KeyPackage events.
+    /// None leaves publications untagged; signed retries retain their original tags.
+    pub key_package_client_name: Option<String>,
     /// Opt-in until native retained-byte access/removal lands in C8-D.
     /// None (the default) disables acquisition; frozen runtimes always disable it.
     pub attachment_acquisition: Option<AttachmentAcquisitionPolicy>,
@@ -249,6 +252,7 @@ pub struct MarmotServiceEndpoints {
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
+            key_package_client_name: None,
             attachment_acquisition: None,
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
@@ -280,6 +284,11 @@ impl Default for MarmotAppConfig {
 }
 
 impl MarmotAppConfig {
+    pub fn with_key_package_client_name(mut self, name: Option<String>) -> Self {
+        self.key_package_client_name = name;
+        self
+    }
+
     pub fn with_directory_max_future_skew(mut self, skew: Duration) -> Self {
         self.directory_max_future_skew = skew;
         self

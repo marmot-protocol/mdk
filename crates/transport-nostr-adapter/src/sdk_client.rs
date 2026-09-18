@@ -2608,6 +2608,7 @@ mod tests {
         let client = Client::builder().signer(keys.clone()).build();
         let sdk = NostrSdkRelayClient::new(client);
         let dto = NostrKeyPackagePublication {
+            client_name: None,
             account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
             key_package: KeyPackage::new(vec![1, 2, 3, 4]),
             key_package_slot_id: "slot-1".into(),
@@ -2954,6 +2955,7 @@ mod tests {
         let client = Client::builder().signer(keys.clone()).build();
         let sdk = NostrSdkRelayClient::new(client);
         let dto = NostrKeyPackagePublication {
+            client_name: None,
             account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
             key_package: KeyPackage::new(vec![1, 2, 3, 4]),
             key_package_slot_id: "slot-1".into(),

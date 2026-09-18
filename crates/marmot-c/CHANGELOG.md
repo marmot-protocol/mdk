@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_client_new_with_client_name` configures an optional public KeyPackage
+  client tag, with cursor policy and optional host secret store. Existing
+  constructors remain untagged. Use the matching header and library.
+
 - `MarmotDeletionSource` and `deletion_source` on `MarmotTimelineMessageRecord`,
   `MarmotTimelineReplyPreview`, and `MarmotChatListMessagePreview` distinguish
   accepted author/admin deletions with an unknown fallback for legacy evidence.

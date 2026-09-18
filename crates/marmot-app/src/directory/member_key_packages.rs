@@ -21,8 +21,8 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
-    fresh_relay_list_status_from_records, latest_fresh_key_package_from_records,
-    merge_relay_list_status,
+    fresh_relay_list_status_from_records, merge_relay_list_status,
+    preferred_fresh_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
@@ -229,8 +229,27 @@ impl MarmotApp {
             .key_packages)
     }
 
+    pub(crate) async fn resolve_compatible_member_key_packages(
+        &self,
+        member_refs: Vec<String>,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+        fresh_reinvite: bool,
+    ) -> Result<ResolvedMemberKeyPackages, AppError> {
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            if fresh_reinvite {
+                MemberResolutionPurpose::CommitFresh
+            } else {
+                MemberResolutionPurpose::Commit
+            },
+            Some(requirements),
+        )
+        .await
+    }
+
     /// A superseded invite must not reuse the directory/prewarm package that
     /// its first Welcome consumed. Fetch through the existing safe discovery path.
+    #[cfg(test)]
     pub(crate) async fn resolve_fresh_reinvite_key_packages(
         &self,
         members: &[String],
@@ -239,6 +258,7 @@ impl MarmotApp {
             .resolve_member_key_packages_for_purpose(
                 members.to_vec(),
                 MemberResolutionPurpose::CommitFresh,
+                None,
             )
             .await?
             .key_packages)
@@ -263,23 +283,32 @@ impl MarmotApp {
             .iter()
             .map(|member_ref| (*member_ref).to_owned())
             .collect::<Vec<_>>();
-        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Prewarm)
-            .await
-            .map(|resolved| resolved.stats.into())
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Prewarm,
+            None,
+        )
+        .await
+        .map(|resolved| resolved.stats.into())
     }
 
     pub(crate) async fn resolve_member_key_packages_with_stats(
         &self,
         member_refs: Vec<String>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
-        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Commit)
-            .await
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Commit,
+            None,
+        )
+        .await
     }
 
     async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
@@ -288,7 +317,7 @@ impl MarmotApp {
         );
         let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose),
+            self.resolve_member_key_packages_inner(&member_refs, purpose, requirements),
         )
         .await
         {
@@ -312,6 +341,7 @@ impl MarmotApp {
         &self,
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let directory_observation = self
             .product_analytics
@@ -407,6 +437,7 @@ impl MarmotApp {
             &key_package_unresolved,
             &mut outcomes,
             purpose,
+            requirements,
         )
         .await;
 
@@ -772,6 +803,7 @@ impl MarmotApp {
         unresolved: &[usize],
         outcomes: &mut [Option<Result<KeyPackage, AppError>>],
         purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -856,10 +888,11 @@ impl MarmotApp {
                     .filter(|record| record.event.pubkey == *account_id)
                     .cloned()
                     .collect::<Vec<_>>();
-                let selected = latest_fresh_key_package_from_records(
+                let selected = preferred_fresh_key_package_from_records(
                     account_id,
                     account_records,
                     self.directory_freshness(),
+                    requirements,
                 )
                 .and_then(|selection| {
                     selection
@@ -918,10 +951,11 @@ impl MarmotApp {
                             .map_err(|error| {
                                 AppError::RelayDirectory(format!("fetch key packages: {error}"))
                             })?;
-                        let mut fetched = latest_fresh_key_package_from_records(
+                        let mut fetched = preferred_fresh_key_package_from_records(
                             &target.account_id_hex,
                             records,
                             app.directory_freshness(),
+                            requirements,
                         )?
                         .value
                         .ok_or_else(|| {

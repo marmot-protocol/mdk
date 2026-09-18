@@ -37,6 +37,7 @@ fn key_package_event(
 ) -> NostrTransportEvent {
     let metadata = key_package_metadata(&key_package).unwrap();
     transport_nostr_adapter::NostrKeyPackagePublication {
+        client_name: None,
         account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
         key_package,
         key_package_slot_id: slot_id.to_owned(),

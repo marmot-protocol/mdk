@@ -278,8 +278,17 @@ impl AppClient {
                 if members.is_empty() || group.as_ref().is_none_or(|group| group.is_terminal()) {
                     vec![]
                 } else {
-                    match self.app.resolve_fresh_reinvite_key_packages(&members).await {
-                        Ok(packages) => packages,
+                    let requirements = self
+                        .runtime
+                        .session()
+                        .invite_key_package_requirements(&record.group_id)
+                        .map_err(cgka_session::SessionError::from)?;
+                    match self
+                        .app
+                        .resolve_compatible_member_key_packages(members, &requirements, true)
+                        .await
+                    {
+                        Ok(resolved) => resolved.key_packages,
                         Err(_) => break,
                     }
                 };

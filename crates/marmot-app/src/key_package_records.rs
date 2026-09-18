@@ -128,54 +128,93 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
         .collect()
 }
 
-fn latest_key_package_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-) -> Result<FetchedKeyPackage, AppError> {
-    sort_directory_records(&mut records);
-    let mut newest_error = None;
-    for record in records.into_iter().rev() {
-        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            continue;
-        }
-        match key_package_from_record(record) {
-            Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
-                return Ok(fetched);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                newest_error.get_or_insert(error);
-            }
-        }
+/// Temporary interoperability policy. Keep separate from cryptographic admission so
+/// multi-device selection can replace this preference without changing validity.
+fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
+    let mut tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|name| name == "client"));
+    let Some(tag) = tags.next() else {
+        return 1;
+    };
+    if tags.next().is_some() || tag.len() < 2 {
+        return 1;
     }
-    Err(newest_error.unwrap_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned())))
+    let name = tag[1].trim();
+    if name.eq_ignore_ascii_case("whitenoise") {
+        2
+    } else if name.eq_ignore_ascii_case("amethyst") {
+        0
+    } else {
+        1
+    }
 }
 
 pub(crate) fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
+    records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
 ) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+    preferred_fresh_key_package_from_records(account_id_hex, records, freshness, None)
+}
+
+pub(crate) fn preferred_fresh_key_package_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+    sort_directory_records(&mut records);
     let mut rejected_future = false;
-    records.retain(|record| {
+    let mut newest_error = None;
+    let mut selected = None;
+    let mut selected_priority = 0;
+    let mut slots = BTreeSet::new();
+    for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            return true;
+            continue;
         }
-        let accepted = freshness.accepts(record);
-        rejected_future |= !accepted;
-        accepted
-    });
-    match latest_key_package_from_records(account_id_hex, records) {
-        Ok(value) => Ok(DirectorySelection {
-            value: Some(value),
-            rejected_future,
-        }),
-        Err(AppError::MissingKeyPackage(_)) => Ok(DirectorySelection {
-            value: None,
-            rejected_future,
-        }),
-        Err(err) => Err(err),
+        if !freshness.accepts(&record) {
+            rejected_future = true;
+            continue;
+        }
+        let priority = key_package_client_priority(&record.event);
+        let fetched = match key_package_from_record(record) {
+            Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
+                fetched
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                newest_error.get_or_insert(error);
+                continue;
+            }
+        };
+        // Replacement is per slot, before client ranking. Never resurrect a
+        // superseded package just because its old label/capabilities rank better.
+        if !slots.insert(fetched.key_package_id.clone()) {
+            continue;
+        }
+        if let Some(requirements) = requirements
+            && let Err(error) = requirements.validate(&fetched.key_package)
+        {
+            newest_error.get_or_insert(AppError::from(cgka_session::SessionError::from(error)));
+            continue;
+        }
+        if selected.is_none() || priority > selected_priority {
+            selected = Some(fetched);
+            selected_priority = priority;
+        }
     }
+    if selected.is_none()
+        && let Some(error) = newest_error
+    {
+        return Err(error);
+    }
+    Ok(DirectorySelection {
+        value: selected,
+        rejected_future,
+    })
 }
 
 fn cached_key_package_from_entry(

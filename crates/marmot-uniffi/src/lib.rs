@@ -285,6 +285,27 @@ impl Marmot {
         )
     }
 
+    /// Open with an optional public client label for new KeyPackage publications.
+    /// Existing constructors remain untagged. Whitespace-only labels are omitted.
+    /// Hosts must supply this on every foreground/background runtime construction.
+    #[uniffi::constructor]
+    pub fn new_with_client_name(
+        root_path: String,
+        relay_urls: Vec<String>,
+        client_name: Option<String>,
+        cursor_persistence: CursorPersistenceFfi,
+        secret_store: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        Self::open(
+            root_path,
+            relay_urls,
+            MarmotAppConfig::default()
+                .with_cursor_persistence(cursor_persistence.into())
+                .with_key_package_client_name(client_name),
+            secret_store.map(|store| Arc::new(secret_store::ForeignSecretStore::new(store)) as _),
+        )
+    }
+
     /// Bring the runtime to local readiness.
     ///
     /// On success, persisted account state is seeded and worker-routed local

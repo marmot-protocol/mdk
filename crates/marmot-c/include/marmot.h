@@ -4954,6 +4954,25 @@ MarmotStatus marmot_client_new_with_secret_store(const char *root_path,
                                                  struct MarmotClient **out_client);
 
 /**
+ * Open with an optional public client name for newly prepared KeyPackages.
+ * NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+ * their original tags. NULL `store` selects the platform keychain.
+ * Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
+ *
+ * # Safety
+ * Same pointer contracts as `marmot_client_new_with_secret_store`, except
+ * `store` may be NULL. `client_name` must be NULL or a valid UTF-8 C string.
+ * `cursor_persistence` must be a `MarmotCursorPersistence` discriminant.
+ */
+MarmotStatus marmot_client_new_with_client_name(const char *root_path,
+                                                const char *const *relay_urls,
+                                                uintptr_t relay_urls_len,
+                                                const char *client_name,
+                                                uint32_t cursor_persistence,
+                                                const struct MarmotSecretStore *store,
+                                                struct MarmotClient **out_client);
+
+/**
  * Start the runtime (reconcile accounts, start workers, subscribe
  * transport). Must be called before subscribing.
  *
