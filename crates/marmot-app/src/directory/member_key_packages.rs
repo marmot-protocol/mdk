@@ -895,6 +895,10 @@ impl MarmotApp {
                     // Relays may cap below our requested limit, so even a
                     // short batch does not prove completeness. Prewarm only
                     // needs existence, while commits seek the preferred slot.
+                    // A priority-2 winner already has the best tier in a
+                    // newest-first prefix. This is a bounded preference search,
+                    // not proof of relay completeness: neither path can detect
+                    // a newer publication omitted from a non-prefix response.
                     // Keep observed slot replacements when combining the refetch.
                     _ => {
                         fallback.push(index);

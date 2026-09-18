@@ -565,7 +565,8 @@ This temporary selection policy applies to all hosts of this runtime; only the
 publication label is host-configurable. Compatibility alone cannot identify a
 client that publishes usable packages but does not process Welcomes.
 
-Slot supersession also applies to directory lookup and composition prewarm. A
+Client ranking and slot supersession also apply to directory lookup (including
+`wn-cli key-package`) and composition prewarm, without target-group requirements. A
 malformed current publication never revives an older package in the same slot.
 If no usable slot remains, prewarm reports failure while retaining successfully
 discovered routes for other members. Its success must not imply readiness based
@@ -574,6 +575,10 @@ candidates still permit a per-account fallback fetch. A lower-priority batch
 winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
 batch limit, even if it returned fewer records than requested: relays may impose
 lower caps. Already observed replacements remain authoritative during the refetch.
+This adds a per-author request for each lower-priority batch winner. A White Noise
+winner already has the highest tier in a newest-first prefix, so it skips that
+request. Both paths remain bounded discovery: neither guarantees completeness
+when a relay omits newer events instead of returning a newest-first prefix.
 If that supplementary fetch fails, a still-valid, compatible package from the
 current batch remains usable; previously cached packages are never substituted.
 Prewarm skips preference-only refetches because it only checks existence.

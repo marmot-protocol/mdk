@@ -26,6 +26,9 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 // Validation and hashing do not consume randomness. Reuse the backend instead
 // of seeding a new RNG for each discovery candidate.
+// This instance is process-wide across accounts. Keep its uses limited to
+// validation and hashing; operations that draw randomness must use the engine's
+// own provider instead.
 static VALIDATION_CRYPTO: LazyLock<RustCrypto> = LazyLock::new(RustCrypto::default);
 
 #[derive(Clone, Debug, PartialEq, Eq)]

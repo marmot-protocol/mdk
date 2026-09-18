@@ -155,6 +155,10 @@ pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
     }
 }
 
+/// Directory reads deliberately share the client ranking and slot-supersession
+/// policy used by invitation discovery, but have no target-group requirements.
+/// A malformed current slot never revives an older publication; if no usable
+/// slot remains, the lookup returns the validation error.
 pub(crate) fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
     records: Vec<RelayEventRecord>,
