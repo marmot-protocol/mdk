@@ -613,19 +613,33 @@ fn canonical_dispositions_are_order_invariant(case: CanonicalDispositionCase) {
         "only selected-branch app messages are accepted",
     );
 
-    let invalidated_losing_apps: BTreeSet<String> = observed
-        .invalidated_app_messages
+    // The losing branch forks inside the rewind horizon, so it stays adoptable
+    // and its applications are parked alongside its commits and proposals —
+    // never withdrawn, and never delivered.
+    let deferred_losing_apps: BTreeSet<String> = observed
+        .deferred_messages
         .iter()
-        .filter(|message| message.reason == InvalidatedAppMessageReason::LosingBranch)
+        .filter(|message| {
+            message.kind == MessageKind::AppMessage
+                && message.reason == DeferredMessageReason::NonSelectedEligibleBranch
+        })
         .map(|message| message.message_id.clone())
         .collect();
     let expected_losing_apps: BTreeSet<String> = (0..case.losing_apps)
         .map(|i| format!("losing-app-{i}"))
         .collect();
     prop_assert(
-        invalidated_losing_apps,
+        deferred_losing_apps,
         expected_losing_apps,
-        "losing-branch app messages are invalidated",
+        "eligible losing-branch app messages are deferred",
+    );
+    prop_assert(
+        observed
+            .invalidated_app_messages
+            .iter()
+            .any(|message| message.reason == InvalidatedAppMessageReason::LosingBranch),
+        false,
+        "no application is withdrawn while its branch is still adoptable",
     );
 
     let accepted_proposals: BTreeSet<String> =

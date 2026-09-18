@@ -334,8 +334,11 @@ fn duplicate_commit_proposal_and_app_message_return_already_seen() {
     );
 }
 
+/// The losing branch is inside the rewind horizon, so a later pass holding
+/// deeper evidence can still adopt it. The application that rode it is parked
+/// with that branch's commits rather than withdrawn.
 #[test]
-fn losing_branch_app_message_is_invalidated_with_payload_ref() {
+fn app_message_on_a_losing_but_eligible_branch_is_parked_for_revival() {
     let result = canonicalize(input(
         vec![app_message(
             "losing-app",
@@ -346,6 +349,39 @@ fn losing_branch_app_message_is_invalidated_with_payload_ref() {
         )],
         vec![branch("live", 1, 3, 0x00), branch("losing", 1, 2, 0xff)],
     ));
+
+    assert_eq!(result.selected_branch_id.as_deref(), Some("live"));
+    assert_eq!(result.invalidated_app_messages, vec![]);
+    assert_eq!(
+        result.deferred_messages,
+        vec![DeferredMessage {
+            message_id: "losing-app".into(),
+            kind: MessageKind::AppMessage,
+            reason: DeferredMessageReason::NonSelectedEligibleBranch,
+        }]
+    );
+}
+
+/// The branch forks below the retained anchor, so nothing can revisit it. The
+/// withdrawal is final and carries the stored payload reference the app layer
+/// needs to tombstone the row.
+#[test]
+fn losing_branch_app_message_is_invalidated_with_payload_ref() {
+    let result = canonicalize(CanonicalizationInput {
+        // The anchor has moved past both forks, so the rival branch can no
+        // longer be materialized from retained state.
+        state: state(3, 2),
+        ..input(
+            vec![app_message(
+                "losing-app",
+                "mallory",
+                2,
+                &["losing"],
+                Some("stored-payload"),
+            )],
+            vec![branch("live", 1, 3, 0x00), branch("losing", 1, 2, 0xff)],
+        )
+    });
 
     assert_eq!(result.selected_branch_id.as_deref(), Some("live"));
     assert_eq!(

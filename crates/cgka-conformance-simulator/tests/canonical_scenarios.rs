@@ -23,7 +23,7 @@ use cgka_engine::ManualConvergenceClock;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::MessageState;
@@ -3123,15 +3123,16 @@ async fn scenario_report_records_convergence_e2e_group_events() {
     assert!(report.invariant_failures.is_empty());
     assert_real_peeler_convergence_trace(report.observed_trace.as_ref().expect("trace"));
     assert!(matches!(report.epoch_change_observations.len(), 2 | 4));
-    // Each observer retracts bob's losing-branch payload exactly once; the
-    // report must attribute both retractions.
+    // Bob's losing branch is still adoptable, so each observer parks his payload
+    // rather than retracting one it never delivered. The report must attribute
+    // no withdrawal at all.
     assert_eq!(
         report
             .app_invalidation_observations
             .iter()
             .map(|invalidation| (invalidation.client.as_str(), invalidation.reason.as_str()))
             .collect::<Vec<_>>(),
-        vec![("carol", "losing_branch"), ("frank", "losing_branch")],
+        Vec::new(),
         "{:#?}",
         report.app_invalidation_observations
     );
@@ -3298,14 +3299,33 @@ fn assert_canonical_scenario_input_ledger(
         losing.delivered, 0,
         "{client} must not project losing-branch application output: {ledger:#?}"
     );
+    // A losing-branch payload has exactly two legitimate fates: a
+    // `losing_branch` withdrawal when no branch it decrypts on can be revisited
+    // any more, or no verdict at all while convergence keeps it parked for a
+    // branch a later pass can still adopt. Anything else — expired, rejected,
+    // stale, ignored — means the harness lost the message for the wrong reason.
+    // (Parking itself is not distinguishable here: the ledger resolves the raw
+    // transport alias first, and that wrapper is retired as soon as the peeled
+    // copy enters convergence. The app-visible half is pinned by
+    // `assert_canonical_application_event`, the parked state itself by
+    // `cgka-engine`'s `a_reorg_delivers_the_application_that_rode_the_revived_branch`.)
     assert!(
         losing
             .invalidated
             .iter()
-            .any(|reason| reason == "losing_branch")
-            || (losing.transport_deferred > 0 && losing.pending),
-        "{client} must classify losing output as invalidated or visibly transport-pending: \
-         {ledger:#?}"
+            .all(|reason| reason == "losing_branch"),
+        "{client} may only withdraw losing output for losing-branch selection: {ledger:#?}"
+    );
+    assert!(
+        !matches!(
+            losing.disposition,
+            ScenarioInputDisposition::Expired
+                | ScenarioInputDisposition::Rejected
+                | ScenarioInputDisposition::Stale
+                | ScenarioInputDisposition::Ignored
+                | ScenarioInputDisposition::ResourceRefused
+        ),
+        "{client} must not lose the losing-branch payload to an unrelated verdict: {ledger:#?}"
     );
 }
 
@@ -3330,13 +3350,14 @@ fn assert_tick_reached_convergence(
 
 /// Pins this client's application timeline across branch selection: exactly the
 /// selected branch's payload reaches the application, it is never taken back,
-/// and the rival branch's payload is retracted explicitly.
+/// and the rival branch's payload is neither delivered nor retracted.
 ///
 /// Branch-relative peel makes the rival branch's traffic decryptable under that
-/// branch's own state, so the losing payload is now decrypted and adjudicated
-/// instead of sitting undecryptable. That turns "no invalidation ever" into a
-/// live obligation: convergence owes the application a `LosingBranch`
-/// retraction for it.
+/// branch's own state, so the losing payload is decrypted and adjudicated
+/// instead of sitting undecryptable — and because that branch is still inside
+/// the rewind horizon, the adjudication is a park, not a withdrawal. A
+/// retraction here would announce the loss of a payload the application was
+/// never shown, and would strand it if the fork later healed the other way.
 fn assert_canonical_application_event(
     client: &str,
     events: Vec<GroupEvent>,
@@ -3360,9 +3381,7 @@ fn assert_canonical_application_event(
     let retractions: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            GroupEvent::AppMessageInvalidated {
-                message_id, reason, ..
-            } => Some((message_id, *reason)),
+            GroupEvent::AppMessageInvalidated { message_id, .. } => Some(message_id),
             _ => None,
         })
         .collect();
@@ -3388,22 +3407,18 @@ fn assert_canonical_application_event(
     // legitimately delivers the rival branch first trips this by design.
     for (message_id, _) in &delivered {
         assert!(
-            !retractions
-                .iter()
-                .any(|(retracted, _)| retracted == message_id),
+            !retractions.iter().any(|retracted| retracted == message_id),
             "{client} retracted a payload it had already delivered: {events:?}"
         );
     }
+    // The rival branch forks inside the rewind horizon, so convergence parks
+    // its payload for a later pass instead of retracting a payload this client
+    // was never shown. Any retraction that does appear may only be a
+    // losing-branch one.
     assert_eq!(
         retractions.len(),
-        1,
-        "{client} should retract the losing branch payload exactly once: {events:?}"
-    );
-    assert!(
-        retractions
-            .iter()
-            .all(|(_, reason)| matches!(reason, AppMessageInvalidationReason::LosingBranch)),
-        "{client} should retract only for losing-branch selection: {events:?}"
+        0,
+        "{client} must not retract a payload it never delivered: {events:?}"
     );
     assert!(
         events.iter().any(|event| {
@@ -3479,18 +3494,12 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
             .map(String::as_str)
             .collect();
         assert_eq!(net_added, vec!["david", "grace"], "{observation:?}");
-        // Bob's payload decrypts under his own branch state, so it must be
-        // retracted rather than silently dropped.
-        let invalidation_reasons: Vec<&str> = observation
-            .app_invalidations
-            .iter()
-            .map(|invalidation| invalidation.reason.as_str())
-            .collect();
-        assert_eq!(
-            invalidation_reasons,
-            vec!["losing_branch"],
-            "{observation:?}"
-        );
+        // The rival branch forks inside the rewind horizon, so it stays
+        // adoptable and its payload is parked with its commits. Retracting a
+        // payload this client was never shown would announce a withdrawal of
+        // nothing, and would strand the payload if the fork later heals the
+        // other way.
+        assert_eq!(observation.app_invalidations, vec![], "{observation:?}");
     }
 }
 
