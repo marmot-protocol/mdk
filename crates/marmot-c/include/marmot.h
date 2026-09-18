@@ -813,6 +813,23 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
 
+typedef enum MarmotAttachmentTransferState {
+  MARMOT_ATTACHMENT_TRANSFER_STATE_UNAVAILABLE,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_NOT_REQUESTED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_QUEUED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_DOWNLOADING,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_CIPHERTEXT,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_DECRYPTING,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_PLAINTEXT,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_READY,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_SCHEDULED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_FAILED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_CANCELLED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_PAUSED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_REMOVED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
+} MarmotAttachmentTransferState;
+
 typedef enum MarmotAttachmentHistoryChange {
   MARMOT_ATTACHMENT_HISTORY_CHANGE_UNCHANGED,
   MARMOT_ATTACHMENT_HISTORY_CHANGE_ADDITIONS,
@@ -994,6 +1011,11 @@ typedef struct MarmotAgentStreamSubscription MarmotAgentStreamSubscription;
 typedef struct MarmotAttachmentHistoryCursor MarmotAttachmentHistoryCursor;
 
 typedef struct MarmotAttachmentHistoryVersion MarmotAttachmentHistoryVersion;
+
+/**
+ * Close/free before freeing its client. Never free during an active call.
+ */
+typedef struct MarmotAttachmentTransferSubscription MarmotAttachmentTransferSubscription;
 
 /**
  * Account-private block list changes.
@@ -4923,6 +4945,45 @@ typedef struct MarmotConversationWindowSnapshot {
   bool has_more_before;
   bool has_more_after;
 } MarmotConversationWindowSnapshot;
+
+typedef struct MarmotAttachmentTransferStatus {
+  char *reference;
+  enum MarmotAttachmentTransferState state;
+  uint64_t attempt;
+  uint64_t received;
+  bool has_total;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t total;
+  bool has_retry_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retry_at;
+} MarmotAttachmentTransferStatus;
+
+typedef struct MarmotAttachmentTransferSnapshot {
+  struct MarmotAttachmentTransferStatus *items;
+  uintptr_t items_len;
+} MarmotAttachmentTransferSnapshot;
+
+typedef struct MarmotAttachmentDownloadPolicy {
+  bool automatic;
+  uint64_t retained_bytes;
+  uint64_t disk_reserve;
+  uint64_t transfer_limit;
+} MarmotAttachmentDownloadPolicy;
+
+/**
+ * Borrowed policy input. Nonzero automatic enables acquisition.
+ */
+typedef struct MarmotAttachmentDownloadPolicyInput {
+  uint8_t automatic;
+  uint64_t retained_bytes;
+  uint64_t disk_reserve;
+  uint64_t transfer_limit;
+} MarmotAttachmentDownloadPolicyInput;
 
 #ifdef __cplusplus
 extern "C" {
@@ -9621,6 +9682,42 @@ MarmotStatus marmot_send_message_draft(const struct MarmotClient *client,
                                        struct MarmotSendSummary **out);
 
 /**
+ * Open a bounded progress stream. First next returns the initial snapshot.
+ * # Safety
+ * Inputs must be live, targets NULL only with zero length, out writable.
+ */
+MarmotStatus marmot_subscribe_attachment_transfers(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const char *group_id_hex,
+                                                   const struct MarmotAttachmentLocalTarget *targets,
+                                                   uintptr_t targets_len,
+                                                   struct MarmotAttachmentTransferSubscription **out);
+
+/**
+ * Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely.
+ * Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free.
+ * # Safety
+ * Sub must be live and out writable. Use one receiver per handle.
+ */
+MarmotStatus marmot_attachment_transfer_subscription_next(const struct MarmotAttachmentTransferSubscription *sub,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotAttachmentTransferSnapshot **out);
+
+/**
+ * Close observation and wake receivers. Does not cancel downloads.
+ * # Safety
+ * Sub must remain live throughout the call.
+ */
+MarmotStatus marmot_attachment_transfer_subscription_cancel(const struct MarmotAttachmentTransferSubscription *sub);
+
+/**
+ * NULL-safe free. Already returned snapshots remain separately owned.
+ * # Safety
+ * Sub must be NULL or library-owned with no active calls.
+ */
+void marmot_attachment_transfer_subscription_free(struct MarmotAttachmentTransferSubscription *sub);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -10636,6 +10733,78 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_download_policy_free(struct MarmotAttachmentDownloadPolicy *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_transfer_snapshot_free(struct MarmotAttachmentTransferSnapshot *ptr);
+
+/**
+ * Read the effective durable policy.
+ * # Safety
+ * Client and strings must be live, out writable. Free the returned record.
+ */
+MarmotStatus marmot_attachment_download_policy(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               struct MarmotAttachmentDownloadPolicy **out);
+
+/**
+ * Persist policy. Disable pauses automatic work but preserves explicit transfers and cached bytes.
+ * # Safety
+ * Client, strings and policy must be live throughout this call. Inputs are borrowed.
+ */
+MarmotStatus marmot_set_attachment_download_policy(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const struct MarmotAttachmentDownloadPolicyInput *policy);
+
+/**
+ * Apply a MarmotAttachmentControl discriminant to an opaque reference.
+ * # Safety
+ * Client/strings must be live and out writable. No inputs are retained.
+ */
+MarmotStatus marmot_control_attachment(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *reference,
+                                       uint32_t control,
+                                       bool *out);
+
+/**
+ * Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable.
+ * # Safety
+ * Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
+ */
+MarmotStatus marmot_download_attachment_again(const struct MarmotClient *client,
+                                              const char *account_ref,
+                                              const char *group_id_hex,
+                                              const struct MarmotAttachmentLocalTarget *target,
+                                              char **out);
+
+/**
+ * Read up to 64 progress entries in input order. No network demand is created.
+ * # Safety
+ * Inputs must be live; targets may be NULL only for zero length; out writable.
+ */
+MarmotStatus marmot_attachment_transfer_snapshot(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *group_id_hex,
+                                                 const struct MarmotAttachmentLocalTarget *targets,
+                                                 uintptr_t targets_len,
+                                                 struct MarmotAttachmentTransferSnapshot **out);
 
 #ifdef __cplusplus
 }  // extern "C"

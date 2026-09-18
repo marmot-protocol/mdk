@@ -1,6 +1,9 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val transfer = AttachmentTransferStatusFfi("job", AttachmentTransferStateFfi.VERIFYING_PLAINTEXT, ULong.MAX_VALUE, 17uL, null, 42uL)
+    val transferFrame = AttachmentTransferSnapshotFfi(listOf(transfer))
+    check(FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame)) == transferFrame)
     val localTarget = AttachmentLocalTargetFfi("message", "source", UInt.MAX_VALUE)
     check(FfiConverterTypeAttachmentLocalTargetFfi.lift(FfiConverterTypeAttachmentLocalTargetFfi.lower(localTarget)) == localTarget)
     for (asset in listOf(AttachmentLocalAssetFfi(null, 0uL), AttachmentLocalAssetFfi("opaque", ULong.MAX_VALUE))) {
@@ -169,5 +172,21 @@ suspend fun compileLocalAttachmentCommands(marmot: Marmot, account: String, grou
     assets.firstOrNull()?.reference?.let { reference ->
         val chunk = marmot.readAttachmentAsset(account, reference, 0uL, 65536u)
         if (chunk.available) check(chunk.bytes.size <= 65536)
+    }
+}
+
+suspend fun compileAttachmentControls(marmot: Marmot, account: String, group: String, target: AttachmentLocalTargetFfi) {
+    val policy = marmot.attachmentDownloadPolicy(account)
+    marmot.setAttachmentDownloadPolicy(account, policy.copy(automatic = false))
+    val snapshot = marmot.attachmentTransferSnapshot(account, group, listOf(target))
+    snapshot.items.firstOrNull()?.reference?.let { reference ->
+        marmot.controlAttachment(account, reference, AttachmentControlFfi.CANCEL)
+        marmot.controlAttachment(account, reference, AttachmentControlFfi.RETRY)
+        marmot.controlAttachment(account, reference, AttachmentControlFfi.REMOVE)
+    }
+    marmot.downloadAttachmentAgain(account, group, target)
+    marmot.subscribeAttachmentTransfers(account, group, listOf(target)).use { stream ->
+        stream.next()
+        stream.cancel()
     }
 }

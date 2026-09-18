@@ -5,8 +5,8 @@ use crate::media::AttachmentDownloadFailure;
 use storage_sqlite::{AttachmentAcquisition, AttachmentPublishResult, SqliteAccountStorage};
 
 const DEMAND_BATCH: usize = 32;
-// Shared HTTP has a 15 minute whole-transfer deadline. Leave publication margin.
-const LEASE_SECONDS: u64 = 20 * 60;
+// Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
+const LEASE_SECONDS: u64 = 3 * 60;
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -70,11 +70,32 @@ fn admit_demands(
     Ok(more)
 }
 
-fn capacity(policy: &crate::AttachmentAcquisitionPolicy, free: u64) -> bool {
-    let max = policy.maximum_transfer_bytes;
-    max > 0 && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
-        // Conservative full-object reservation for SQLite pages, journal and WAL.
-        && free >= policy.minimum_free_disk_bytes.saturating_add(max.saturating_mul(4))
+fn capacity(policy: &storage_sqlite::AttachmentDownloadPolicy, max: u64, free: u64) -> bool {
+    max > 0
+        && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
+        && free >= policy.disk_reserve.saturating_add(max.saturating_mul(4))
+}
+
+async fn cancelled(
+    storage: SqliteAccountStorage,
+    job: AttachmentAcquisition,
+    mut updates: watch::Receiver<()>,
+) {
+    loop {
+        let store = storage.clone();
+        let current = job.clone();
+        let active = tokio::task::spawn_blocking(move || {
+            store.attachment_transfer_is_active(&current, crate::unix_now_seconds())
+        })
+        .await;
+        if !matches!(active, Ok(Ok(true))) {
+            return;
+        }
+        tokio::select! {
+            _ = updates.changed()=>{},
+            _ = tokio::time::sleep(Duration::from_secs(1))=>{},
+        }
+    }
 }
 
 fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u64) -> u64 {
@@ -106,10 +127,9 @@ pub(super) fn schedule(
     let now = crate::unix_now_seconds();
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
     let partials = storage.prune_attachment_partials(now, 64)?;
-    let Some(policy) = &client.app.config.attachment_acquisition else {
-        admission.waiting = None;
-        return Ok(partials == 64);
-    };
+    let policy = storage.attachment_download_policy(
+        &super::super::attachment_controls::default_policy(&client.app.config),
+    )?;
     if !admission.resumed {
         if storage.resume_attachment_acquisitions(now, 64)? == 64 {
             return Ok(true);
@@ -117,11 +137,13 @@ pub(super) fn schedule(
         admission.resumed = true;
     }
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
-    let more = admit_demands(
-        &storage,
-        now,
-        client.app.config.allow_loopback_blob_endpoints,
-    )? || expired == 64
+    let more = (policy.automatic
+        && admit_demands(
+            &storage,
+            now,
+            client.app.config.allow_loopback_blob_endpoints,
+        )?)
+        || expired == 64
         || partials == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
     // Admission never evicts an acquired asset and never increments attempts while paused.
@@ -130,11 +152,7 @@ pub(super) fn schedule(
         return Ok(more);
     }
     let free = fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
-    if !capacity(policy, free) {
-        admission.waiting = None;
-        return Ok(more);
-    }
-    let candidates = storage.due_attachment_acquisitions(now, 32)?;
+    let candidates = storage.attachment_transfer_candidates(now, 32, policy.automatic)?;
     if candidates.is_empty() {
         admission.waiting = None;
         return Ok(more);
@@ -149,11 +167,16 @@ pub(super) fn schedule(
         return Ok(more);
     };
     for candidate in candidates {
-        if !storage.attachment_acquisition_fits_budget(
-            &candidate,
-            policy.maximum_transfer_bytes,
-            policy.retained_bytes_per_account,
-        )? {
+        let max = if storage.attachment_request_is_explicit(&candidate)? {
+            crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
+        } else {
+            policy.transfer_limit
+        };
+        if !capacity(&policy, max, free) {
+            storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
+            continue;
+        }
+        if !storage.attachment_acquisition_fits_budget(&candidate, max, policy.retained_bytes)? {
             // Defer without spending an attempt. This also lets reserved prefixes
             // beyond the bounded candidate page reach the worker under pressure.
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
@@ -184,11 +207,7 @@ pub(super) fn schedule(
             storage.finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
-        let prepared = match client.prepare_background_attachment_download(
-            &group,
-            reference,
-            policy.maximum_transfer_bytes,
-        ) {
+        let prepared = match client.prepare_background_attachment_download(&group, reference, max) {
             Ok(Some(prepared)) => prepared,
             // Local readiness is not a failed transfer. Defer only this candidate
             // for one maintenance tick, preserving siblings and their attempts.
@@ -211,20 +230,33 @@ pub(super) fn schedule(
         else {
             continue;
         };
-        let byte_budget = policy.retained_bytes_per_account;
+        let byte_budget = policy.retained_bytes;
         let resume = crate::media::attachment_resume::AttachmentResume {
             storage: storage.clone(),
             job: job.clone(),
             ciphertext_digest,
             budget: byte_budget,
             directory: client.app.account_dir(&client.state.label),
-            disk_reserve: policy.minimum_free_disk_bytes,
+            disk_reserve: policy.disk_reserve,
+            updates: Some(shared.attachment_updates.clone()),
         };
+        let cancel = cancelled(
+            storage.clone(),
+            job.clone(),
+            shared.attachment_updates.subscribe(),
+        );
+        let updates = shared.attachment_updates.clone();
+        updates.send_modify(|_| {});
         spawn_media_http(
             http,
             permit,
             async move {
-                let result = prepared.run_classified(resume).await;
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel => Err(AttachmentDownloadFailure::Retry(AppError::BlobStore("attachment transfer cancelled".into()))),
+                    result = prepared.run_classified(resume) => result,
+                };
+                updates.send_modify(|_| {});
                 MediaHttpCompletion::Attachment {
                     job,
                     result,
@@ -256,12 +288,11 @@ pub(super) fn complete(
             }
             // Other writers may consume disk while HTTP is in flight. Recheck
             // before starting a full-object SQLite write, without evicting data.
-            let reserve = client
-                .app
-                .config
-                .attachment_acquisition
-                .as_ref()
-                .map_or(u64::MAX, |p| p.minimum_free_disk_bytes);
+            let policy = storage.attachment_download_policy(
+                &super::super::attachment_controls::default_policy(&client.app.config),
+            )?;
+            let reserve = policy.disk_reserve;
+            let byte_budget = byte_budget.min(policy.retained_bytes);
             let free =
                 fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
             if free < reserve.saturating_add((plaintext.len() as u64).saturating_mul(4)) {
@@ -277,6 +308,9 @@ pub(super) fn complete(
         }
         Err(AttachmentDownloadFailure::Retry(_)) => {
             storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+        }
+        Err(AttachmentDownloadFailure::SizeLimit(_, limit)) => {
+            storage.block_attachment_size_policy(job, limit, now)?;
         }
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;

@@ -18,7 +18,11 @@ pub struct AttachmentPartial {
     pub bytes: Vec<u8>,
 }
 
-fn valid_attempt(conn: &Connection, job: &AttachmentAcquisition, now: u64) -> StorageResult<bool> {
+pub(super) fn valid_attempt(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: u64,
+) -> StorageResult<bool> {
     if !matches_store(conn, &job.reference)? {
         return Ok(false);
     }

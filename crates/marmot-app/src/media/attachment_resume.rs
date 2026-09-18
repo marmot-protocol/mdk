@@ -16,6 +16,7 @@ pub(crate) struct AttachmentResume {
     pub budget: u64,
     pub directory: PathBuf,
     pub disk_reserve: u64,
+    pub updates: Option<tokio::sync::watch::Sender<()>>,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Retry(AppError::BlobStore(message.into()))
@@ -25,6 +26,52 @@ fn stop(message: &str) -> AttachmentDownloadFailure {
 }
 
 impl AttachmentResume {
+    pub(crate) async fn progress(
+        &self,
+        received: u64,
+        total: Option<u64>,
+        restart: bool,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        let this = self.clone();
+        let updated = tokio::task::spawn_blocking(move || {
+            this.storage.update_attachment_progress(
+                &this.job,
+                crate::unix_now_seconds(),
+                1,
+                received,
+                total,
+                restart,
+            )
+        })
+        .await;
+        // Observation failures must not mask a cryptographic terminal outcome.
+        // The worker cancellation monitor and publication gate still fence bytes.
+        if matches!(updated, Ok(Ok(false))) {
+            return Err(retry("transfer no longer admitted"));
+        }
+        if let Some(updates) = &self.updates {
+            updates.send_modify(|_| {});
+        }
+        Ok(())
+    }
+    pub(crate) async fn phase(&self, phase: u8) -> Result<(), AttachmentDownloadFailure> {
+        let this = self.clone();
+        let updated = tokio::task::spawn_blocking(move || {
+            this.storage
+                .update_attachment_phase(&this.job, crate::unix_now_seconds(), phase)
+        })
+        .await;
+        // Observation failures must not mask a cryptographic terminal outcome.
+        // The worker cancellation monitor and publication gate still fence bytes.
+        if matches!(updated, Ok(Ok(false))) {
+            return Err(retry("transfer no longer admitted"));
+        }
+        if let Some(updates) = &self.updates {
+            updates.send_modify(|_| {});
+        }
+        Ok(())
+    }
+
     pub(super) async fn load(
         &self,
         url: &url::Url,
@@ -180,8 +227,15 @@ pub(super) async fn read_body(
         .map(|i| i.total)
         .or_else(|| response.content_length());
     if expected_total.is_some_and(|n| n > max) {
-        return Err(stop("download exceeds size limit"));
+        return Err(AttachmentDownloadFailure::SizeLimit(
+            AppError::BlobStore("download exceeds size limit".into()),
+            max as u64,
+        ));
     }
+    context
+        .progress(bytes.len() as u64, expected_total, true)
+        .await?;
+    let mut reported = tokio::time::Instant::now();
     let mut saved = bytes.len();
     let mut first = true;
     loop {
@@ -191,10 +245,10 @@ pub(super) async fn read_body(
                 .map_err(|_| retry("request timed out"))?
                 .map_err(|_| retry("body transfer failed"))
         } else {
-            response
-                .chunk()
+            tokio::time::timeout(std::time::Duration::from_secs(30), response.chunk())
                 .await
-                .map_err(|_| retry("body transfer failed"))
+                .map_err(|_| retry("body idle timeout"))
+                .and_then(|r| r.map_err(|_| retry("body transfer failed")))
         };
         let chunk = match next {
             Ok(Some(chunk)) => chunk,
@@ -208,10 +262,22 @@ pub(super) async fn read_body(
         };
         first = false;
         let size = bytes.len().saturating_add(chunk.len()) as u64;
-        if size > max || expected_total.is_some_and(|n| size > n) {
+        if size > max {
+            return Err(AttachmentDownloadFailure::SizeLimit(
+                AppError::BlobStore("download exceeds size limit".into()),
+                max as u64,
+            ));
+        }
+        if expected_total.is_some_and(|n| size > n) {
             return Err(stop("download exceeds response size bound"));
         }
         bytes.extend_from_slice(&chunk);
+        if reported.elapsed() >= std::time::Duration::from_millis(250) {
+            context
+                .progress(bytes.len() as u64, expected_total, false)
+                .await?;
+            reported = tokio::time::Instant::now();
+        }
         if let Some(identity) = &identity {
             while bytes.len() - saved >= ATTACHMENT_CHECKPOINT_BYTES {
                 let end = saved + ATTACHMENT_CHECKPOINT_BYTES;
@@ -230,6 +296,9 @@ pub(super) async fn read_body(
     }
     // Complete bodies go straight to verification/publication. Do not write a
     // final tiny checkpoint only to delete it on success.
+    context
+        .progress(bytes.len() as u64, expected_total, false)
+        .await?;
     Ok(bytes)
 }
 async fn checkpoint_tail(

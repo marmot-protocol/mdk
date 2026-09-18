@@ -46,3 +46,6 @@ pub mod moderation;
 mod attachment_history;
 
 mod attachment_access;
+
+mod attachment_controls;
+pub use attachment_controls::AttachmentTransferSubscription;

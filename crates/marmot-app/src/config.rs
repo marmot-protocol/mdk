@@ -74,8 +74,9 @@ pub struct MarmotAppConfig {
     /// Optional public client label for newly prepared KeyPackage events.
     /// None leaves publications untagged; signed retries retain their original tags.
     pub key_package_client_name: Option<String>,
-    /// Opt-in until native retained-byte access/removal lands in C8-D.
-    /// None (the default) disables acquisition; frozen runtimes always disable it.
+    /// Automatic acquisition defaults on with bounded resource limits.
+    /// None disables automatic acquisition; frozen runtimes always disable it.
+    /// Per-account native policy overrides are durable.
     pub attachment_acquisition: Option<AttachmentAcquisitionPolicy>,
     /// Disable exporters for short-lived command processes. Frozen cursors always disable them.
     pub usage_diagnostics_silent: bool,
@@ -253,7 +254,7 @@ impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
             key_package_client_name: None,
-            attachment_acquisition: None,
+            attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),

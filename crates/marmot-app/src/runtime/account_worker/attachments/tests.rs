@@ -2,20 +2,14 @@ use super::*;
 
 #[test]
 fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
-    let p = crate::AttachmentAcquisitionPolicy::default();
-    assert_eq!(p.retained_bytes_per_account, 2 * 1024 * 1024 * 1024);
-    assert_eq!(p.minimum_free_disk_bytes, 256 * 1024 * 1024);
-    assert_eq!(p.maximum_transfer_bytes, 64 * 1024 * 1024);
-    let free = p.minimum_free_disk_bytes + 4 * p.maximum_transfer_bytes;
-    assert!(capacity(&p, free));
-    assert!(!capacity(&p, free - 1));
-    assert!(!capacity(
-        &crate::AttachmentAcquisitionPolicy {
-            maximum_transfer_bytes: u64::MAX,
-            ..p
-        },
-        u64::MAX
-    ));
+    let p = super::super::super::attachment_controls::default_policy(&MarmotAppConfig::default());
+    assert_eq!(p.retained_bytes, 2 * 1024 * 1024 * 1024);
+    assert_eq!(p.disk_reserve, 256 * 1024 * 1024);
+    assert_eq!(p.transfer_limit, 64 * 1024 * 1024);
+    let free = p.disk_reserve + 4 * p.transfer_limit;
+    assert!(capacity(&p, p.transfer_limit, free));
+    assert!(!capacity(&p, p.transfer_limit, free - 1));
+    assert!(!capacity(&p, u64::MAX, u64::MAX));
 }
 
 use crate::tests::ScriptedPushRelayClient;
@@ -495,8 +489,8 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
 }
 
 #[tokio::test]
-async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_off() {
-    assert!(MarmotAppConfig::default().attachment_acquisition.is_none());
+async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on() {
+    assert!(MarmotAppConfig::default().attachment_acquisition.is_some());
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();
     let entry = storage
@@ -551,7 +545,7 @@ async fn attachment_worker_budget_pause_does_not_consume_attempts() {
         .attachment_acquisition
         .as_mut()
         .unwrap()
-        .retained_bytes_per_account = 0;
+        .retained_bytes_per_account = 1;
     let (http, _rx) = context();
     let shared = RuntimeSharedServices::default();
     let mut admission = Admission::default();

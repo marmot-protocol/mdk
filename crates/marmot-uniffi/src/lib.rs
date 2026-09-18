@@ -576,3 +576,5 @@ mod tests {
         );
     }
 }
+
+pub use commands::AttachmentTransferSubscription;

@@ -3,6 +3,10 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        let transfer = AttachmentTransferStatusFfi(reference: "job", state: .verifyingPlaintext, attempt: UInt64.max, received: 17, total: nil, retryAt: 42)
+        let transferFrame = AttachmentTransferSnapshotFfi(items: [transfer])
+        let transferCopy = try FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame))
+        precondition(transferCopy == transferFrame)
         let localTarget = AttachmentLocalTargetFfi(messageIdHex: "message", sourceMessageIdHex: "source", attachmentIndex: UInt32.max)
         let localTargetCopy = try FfiConverterTypeAttachmentLocalTargetFfi.lift(FfiConverterTypeAttachmentLocalTargetFfi.lower(localTarget))
         precondition(localTargetCopy == localTarget)
@@ -195,4 +199,20 @@ func compileLocalAttachmentCommands(_ marmot: Marmot, account: String, group: St
         let chunk = try await marmot.readAttachmentAsset(accountRef: account, reference: reference, offset: 0, limit: 65536)
         if chunk.available { _ = chunk.bytes }
     }
+}
+
+func compileAttachmentControls(_ marmot: Marmot, account: String, group: String, target: AttachmentLocalTargetFfi) async throws {
+    var policy = try await marmot.attachmentDownloadPolicy(accountRef: account)
+    policy.automatic = false
+    try await marmot.setAttachmentDownloadPolicy(accountRef: account, policy: policy)
+    let snapshot = try await marmot.attachmentTransferSnapshot(accountRef: account, groupIdHex: group, targets: [target])
+    if let reference = snapshot.items.first?.reference {
+        _ = try await marmot.controlAttachment(accountRef: account, reference: reference, control: .cancel)
+        _ = try await marmot.controlAttachment(accountRef: account, reference: reference, control: .retry)
+        _ = try await marmot.controlAttachment(accountRef: account, reference: reference, control: .remove)
+    }
+    _ = try await marmot.downloadAttachmentAgain(accountRef: account, groupIdHex: group, target: target)
+    let stream = try await marmot.subscribeAttachmentTransfers(accountRef: account, groupIdHex: group, targets: [target])
+    _ = try await stream.next()
+    stream.cancel()
 }

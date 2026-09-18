@@ -18,12 +18,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   client tag, with cursor policy and optional host secret store. Existing
   constructors remain untagged. Use the matching header and library.
 
+- Attachment transfer snapshot/subscription, durable cancel/retry/remove/download-again,
+  and per-account download policy APIs. The subscription uses blocking next, cancel and free;
+  results have a dedicated deep-free. Automatic acquisition now defaults on with the approved
+  bounded policy. Regenerate the header and use its matching library.
+
 - `marmot_attachment_local_assets` resolves up to 64 source slots to opaque local
   references without fetching or registering demand. `marmot_read_attachment_asset`
   returns verified plaintext ranges of at most 1 MiB, with unavailable distinct from
   empty EOF. Free results with `marmot_attachment_local_asset_list_free` and
   `marmot_attachment_local_bytes_free`. Additive API; regenerate headers and use
-  the matching library. Automatic acquisition remains opt-in.
+  the matching library. Acquisition policy is controlled through the additive C8-D2 APIs.
 
 - `MarmotDeletionSource` and `deletion_source` on `MarmotTimelineMessageRecord`,
   `MarmotTimelineReplyPreview`, and `MarmotChatListMessagePreview` distinguish

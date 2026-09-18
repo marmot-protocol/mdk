@@ -134,3 +134,7 @@ pub(crate) use codec::{
 pub use timeline::reports::{
     ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage,
 };
+
+pub use attachment_acquisition::{
+    AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
+};

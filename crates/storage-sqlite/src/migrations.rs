@@ -178,6 +178,8 @@ mod migration_0083_attachment_acquisition;
 mod migration_0084_attachment_worker_demand;
 #[path = "migrations/0085_attachment_partials.rs"]
 mod migration_0085_attachment_partials;
+#[path = "migrations/0086_attachment_controls.rs"]
+mod migration_0086_attachment_controls;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -613,6 +615,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 85,
         name: "0085_attachment_partials",
         apply: migration_0085_attachment_partials::apply,
+    },
+    Migration {
+        version: 86,
+        name: "0086_attachment_controls",
+        apply: migration_0086_attachment_controls::apply,
     },
 ];
 

@@ -70,3 +70,40 @@ or filesystem paths cross the ABI.
 
 Progress subscriptions and cancellation/retry/remove/download-again/policy controls
 remain C8-D2. C9 owns released-artifact integration and real-device measurements.
+
+## Transfer progress and controls (C8-D2)
+
+`attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded
+original-slot targets as local access. `next()` returns an initial snapshot then complete
+replacements in target order (maximum four per second). `cancel()` stops observation only;
+drop/destroy the subscription when its screen leaves. Recreate it when the visible target set
+changes. C provides blocking `next` with a timeout; call off the UI thread. A timeout does not
+consume an update. Close/error/runtime shutdown ends observation. No transfer is requested by lookup.
+
+Use state to distinguish unavailable source, not requested, queued, paused, downloading,
+verification, retry scheduled, failed, policy blocked, cancelled, removed and ready. `received`
+and optional `total` count ciphertext bytes, including a compatible resumed prefix. Never merge
+counters across `attempt` generations: a fresh body or locator fallback can restart at zero.
+Ready alone means complete cryptographic verification and local publication. Continue using
+local-asset lookup/ranged reads to obtain plaintext; always revalidate availability.
+
+The opaque reference in a transfer entry supports `controlAttachment` with Cancel, Retry or
+Remove. Cancel survives restart, retains valid partial ciphertext for its existing 24-hour expiry,
+and does nothing to already-ready bytes. Retry is explicit and can run with automatic work disabled.
+Remove discards local bytes and suppresses reacquisition. `downloadAttachmentAgain` accepts an
+exact current source slot, clears suppression/cancellation and queues explicit work atomically.
+Obsolete references return false; obsolete/unavailable slots return no reference. Pending invites
+cannot download attachments before acceptance. These commands persist intent without waiting for
+network readiness; acquisition needs an active, non-frozen account runtime.
+
+`attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
+policy. Automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
+SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
+Explicit queued downloads use the existing 512 MiB hard limit and respect disk/quota admission.
+Disable stops active automatic work and pauses automatic queues; explicit work and cached files
+remain. Re-enable preserves individual cancellations/removals. No automatic retained-byte eviction.
+Raising the cap readmits size-policy failures, never cryptographic failures. The legacy
+`downloadMedia` API remains compatible and returns transient complete bytes.
+
+Regenerate Swift/Kotlin bindings and C headers with the matching library. Release/client adoption,
+large-file chunk overhead and device measurements remain C9 work; retain host caches until validated.

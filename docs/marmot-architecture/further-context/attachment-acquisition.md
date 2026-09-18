@@ -20,7 +20,7 @@ Opening a conversation should find already acquired attachment bytes locally.
 Today MDK retains decryption secrets and can explicitly download an attachment,
 and C8-C1 supplies durable jobs and protected byte storage. C8-C2 feeds and executes
 those jobs automatically in explicitly enabled, non-frozen account workers.
-Acquisition defaults off until native local access and removal are available (C8-D).
+C8-D2 enables acquisition by default with native local access, durable controls and policy.
 A timeline window covers only a bounded part of a conversation. The synchronous
 `list_media` compatibility API instead scans raw app events, potentially without
 a limit, and does not provide authoritative removal or pagination semantics.
@@ -175,9 +175,9 @@ Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::defa
 | Automatic ciphertext ceiling | 64 MiB, enforced during streaming, including chunked bodies |
 | Concurrent automatic transfers | One across accounts in a runtime |
 
-`MarmotAppConfig::attachment_acquisition` defaults to `None`. Rust callers may opt in
-with `Some(policy)`; native constructors remain off until C8-D supplies access, removal
-and policy controls. Frozen/NSE runtimes also skip acquisition. Explicit
+`MarmotAppConfig::attachment_acquisition` defaults to `Some(default_policy)`. Rust callers may
+supply `None` to disable the fallback. Durable per-account policy overrides that fallback;
+native hosts can read and set it without starting the runtime. Frozen/NSE runtimes skip acquisition. Explicit
 foreground downloads retain their 512 MiB ciphertext cap. Admission reserves a full
 maximum-size object against quota, so a final smaller remainder can stay unused.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
@@ -188,7 +188,8 @@ policy/secrets defer one candidate for 15 seconds before claiming it; no transfe
 is consumed and due siblings keep their deadlines. Integrity/decryption failures,
 publication digest mismatches and over-limit responses require explicit retry;
 locator failover still runs, and a remaining transient candidate keeps the attempt retryable.
-Twenty-minute leases cover the shared fifteen-minute transfer deadline and publication margin.
+Three-minute leases cover a two-minute acquisition transfer deadline and publication margin.
+A 30-second body-idle deadline releases stalled transfers; explicit legacy downloads retain their existing deadline.
 Worker exit cancels active HTTP and releases permits. Before scheduling any transfer,
 a new exclusive account worker reclaims abandoned fetching attempts in batches of 64;
 old completions remain fenced, and existing retry deadlines/ready bytes are unchanged.
@@ -196,13 +197,9 @@ Expired leases remain a fallback for interruption recovery.
 Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; no automatic LRU applies.
 
 C8-C2 introduced complete-body retries. C8-C3 below preserves compatible partial transfers.
-C8-D1 exposes native availability/local bytes; C8-D2 will add progress and explicit remove/download-again operations.
-Before enabling acquisition by default, complete C8-D access/removal/policy controls,
-and validate shorter background transfer/idle deadlines, recent-message priority over
-backfill, size-limit re-admission when policy increases, and explicit invalid-policy
-validation. The current opt-in worker shares the 15-minute media deadline, admits durable
-demand in queue order, blocks over-limit responses until explicit retry, and pauses
-for invalid zero/over-ceiling transfer limits. These are tracked enablement gates.
+C8-D1 exposes native availability/local bytes; C8-D2 exposes progress and explicit controls.
+Automatic acquisition now defaults on. Native removal/policy controls, shorter transfer/idle deadlines,
+recent-message priority, size-limit re-admission and policy validation are implemented and covered by regressions.
 The legacy download API continues returning transient bytes until clients adopt that contract.
 [#1437](https://github.com/marmot-protocol/mdk/issues/1437) stays open across those slices.
 
@@ -254,7 +251,7 @@ This temporary checkpoint lifetime does not change the agreed retained-media lif
 Tests cover interrupted HTTP plus encrypted reopen and verified publication, task cancellation,
 Range ignored, changed/weak validators, malformed ranges, ciphertext corruption, over-limit
 responses, locator failover, bounded quota/rollback, chunk corruption and lifecycle fences.
-C8-D1 local-byte access is described below; progress, controls and default enablement remain outstanding.
+C8-D1 local-byte access is described below; C8-D2 adds the control and progress contract.
 
 ## Issue audit and exclusions
 
@@ -302,5 +299,27 @@ See [native usage and lifetime contract](../../../crates/marmot-uniffi/ATTACHMEN
 offline reconstruction, cross-account handles, retained-left history and local removal.
 `attachment_local_metadata_is_read_only_and_follows_byte_visibility` covers no-demand
 lookup, exact source selection and immediate retention expiry before maintenance.
-Progress, cancellation, retry/remove/download-again and policy controls remain C8-D2;
-automatic acquisition stays disabled by default.
+## C8-D2: progress, controls and default acquisition
+
+Migration 86 extends the existing acquisition rows with durable cancellation, explicit-request
+intent, size-policy failure reasons and progress generations. It adds a per-account policy override;
+there is no second download queue. Cancellation invalidates the attempt immediately, survives restart,
+and retains valid partial ciphertext under its existing 24-hour expiry. It never erases ready bytes.
+Remove deletes local bytes and suppresses automatic reacquisition until an explicit download-again.
+
+Disabling automatic work invalidates active automatic leases, pauses queued automatic demand and
+preserves explicit requests and cached bytes. Re-enabling never clears cancellation/removal.
+Native snapshot and subscription targets are bounded to 64 original slots. Replacement snapshots
+are coalesced to at most four per second; they include states, a transfer generation, received/known
+total ciphertext bytes, optional retry time and an opaque job reference. Verification phases precede
+Ready; only verified plaintext is exposed by local byte reads. A new HTTP body explicitly advances
+the generation before resetting counters. Metadata write failures cannot mask integrity failures.
+
+Explicit requests precede automatic work, and recent incoming sources precede older backfill.
+The global one-transfer permit uses FIFO account admission. Transfer/idle deadlines prevent a
+stalled server retaining that slot indefinitely. Raising the automatic cap readmits size-policy
+failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy
+values are rejected before mutation, and invalid Rust policy is rejected at runtime start.
+
+Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
+not establish mobile throughput or background execution entitlement. See the native usage guide.

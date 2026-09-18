@@ -56,6 +56,7 @@ fn resume_context(
     reference: &crate::MediaAttachmentReference,
 ) -> AttachmentResume {
     AttachmentResume {
+        updates: None,
         storage: store.clone(),
         job: job.clone(),
         ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
@@ -374,8 +375,11 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
         .contains(&case)
         {
             assert!(
-                matches!(result, Err(AttachmentDownloadFailure::Stop(_)))
-                    || (case == "unsafe_redirect" && result.is_err())
+                matches!(
+                    result,
+                    Err(AttachmentDownloadFailure::Stop(_)
+                        | AttachmentDownloadFailure::SizeLimit(_, _))
+                ) || (case == "unsafe_redirect" && result.is_err())
                     || (case == "corrupt"
                         && matches!(result, Err(AttachmentDownloadFailure::Retry(_)))),
                 "{case}"
@@ -1061,4 +1065,150 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
             server.await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn attachment_controls_interrupt_http_and_release_capacity_without_publishing() {
+    for disable in [false, true] {
+        let (listener, reference, cipher) =
+            listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
+        let (sent, started) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            respond(
+                &mut socket,
+                "200 OK",
+                "ETag: \"stable\"\r\n",
+                &cipher[..ATTACHMENT_CHECKPOINT_BYTES],
+                cipher.len(),
+            )
+            .await;
+            sent.send(()).unwrap();
+            let mut byte = [0];
+            let _ = socket.read(&mut byte).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, store) = client_at(dir.path(), &reference, true).await;
+        let shared = RuntimeSharedServices::default();
+        let (http, mut completions) = context();
+        let mut admission = Admission::default();
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        admission.ready().await;
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        started.await.unwrap();
+        let entry = store
+            .attachment_history_page(GROUP, 1, None)
+            .unwrap()
+            .entries
+            .remove(0);
+        let asset = store
+            .attachment_transfer_status(
+                GROUP,
+                &entry.message_id_hex,
+                &entry.source_message_id_hex,
+                0,
+                crate::unix_now_seconds(),
+                true,
+            )
+            .unwrap()
+            .unwrap()
+            .reference
+            .unwrap();
+        if disable {
+            let mut policy =
+                super::super::super::super::attachment_controls::default_policy(&client.app.config);
+            policy.automatic = false;
+            store
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+                .unwrap();
+        } else {
+            store.cancel_attachment_acquisition(&asset).unwrap();
+        }
+        shared.attachment_updates.send_modify(|_| {});
+        let done = tokio::time::timeout(Duration::from_secs(3), completions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        complete_media_http(&mut client, done, &shared, &http).await;
+        assert_eq!(shared.attachment_transfer.available_permits(), 1);
+        assert!(
+            store
+                .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .attachment_transfer_status(
+                    GROUP,
+                    &entry.message_id_hex,
+                    &entry.source_message_id_hex,
+                    0,
+                    crate::unix_now_seconds(),
+                    !disable
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+            if disable {
+                storage_sqlite::AttachmentTransferState::Paused
+            } else {
+                storage_sqlite::AttachmentTransferState::Cancelled
+            }
+        );
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
+    let (listener, reference, cipher) =
+        listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"stable\"\r\n",
+            &cipher[..ATTACHMENT_CHECKPOINT_BYTES],
+            cipher.len(),
+        )
+        .await;
+        let mut byte = [0];
+        let _ = socket.read(&mut byte).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, store) = client_at(dir.path(), &reference, true).await;
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(40), completions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let asset = match &done.completion {
+        MediaHttpCompletion::Attachment { job, result, .. } => {
+            assert!(matches!(result, Err(AttachmentDownloadFailure::Retry(_))));
+            job.reference.clone()
+        }
+        _ => panic!("attachment completion"),
+    };
+    complete_media_http(&mut client, done, &shared, &http).await;
+    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+    );
+    server.abort();
+    let _ = server.await;
 }

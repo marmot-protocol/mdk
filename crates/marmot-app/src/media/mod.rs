@@ -925,6 +925,7 @@ pub(crate) async fn download_encrypted_media(
 pub(crate) enum AttachmentDownloadFailure {
     Retry(AppError),
     Stop(AppError),
+    SizeLimit(AppError, u64),
 }
 impl From<AppError> for AttachmentDownloadFailure {
     fn from(error: AppError) -> Self {
@@ -934,7 +935,7 @@ impl From<AppError> for AttachmentDownloadFailure {
 impl AttachmentDownloadFailure {
     pub(crate) fn into_error(self) -> AppError {
         match self {
-            Self::Retry(error) | Self::Stop(error) => error,
+            Self::Retry(error) | Self::Stop(error) | Self::SizeLimit(error, _) => error,
         }
     }
 }
@@ -1003,6 +1004,9 @@ pub(crate) async fn download_encrypted_media_classified(
     )
     .map_err(|e| AttachmentDownloadFailure::Stop(media_download_failure(e)))?;
     let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
+    if let Some(resume) = &transport.resume {
+        resume.phase(3).await?;
+    }
     let decrypt_started = Instant::now();
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key).map_err(|_| {
         record_media_download_phase(
@@ -1036,6 +1040,9 @@ pub(crate) async fn download_encrypted_media_classified(
         decrypt_started,
         true,
     );
+    if let Some(resume) = &transport.resume {
+        resume.phase(4).await?;
+    }
     let plaintext_verify_started = Instant::now();
     let actual_plaintext_hash: [u8; 32] = Sha256::digest(&plaintext).into();
     if actual_plaintext_hash != plaintext_hash {
@@ -1159,6 +1166,7 @@ async fn fetch_encrypted_media_blob_classified(
     }
     let mut last_error = None;
     let mut retryable_failure = false;
+    let mut size_failure = None;
     let mut terminal_failure = false;
     let expected_hash = reference.ciphertext_sha256.to_ascii_lowercase();
     let candidate_count = candidates.len();
@@ -1222,6 +1230,9 @@ async fn fetch_encrypted_media_blob_classified(
         match fetched {
             Ok(blob) => {
                 let bytes = blob.bytes;
+                if let Some(resume) = &transport.resume {
+                    resume.phase(2).await?;
+                }
                 let verify_started = Instant::now();
                 let matches = encrypted_media_hash_matches(&bytes, &expected_hash);
                 record_media_download_phase(
@@ -1253,6 +1264,7 @@ async fn fetch_encrypted_media_blob_classified(
             }
             Err(err) => {
                 match &err {
+                    AttachmentDownloadFailure::SizeLimit(_, limit) => size_failure = Some(*limit),
                     AttachmentDownloadFailure::Stop(_) => terminal_failure = true,
                     AttachmentDownloadFailure::Retry(AppError::UnsafeMediaFetch(_)) => {}
                     AttachmentDownloadFailure::Retry(_) => retryable_failure = true,
@@ -1266,6 +1278,8 @@ async fn fetch_encrypted_media_blob_classified(
         last_error.unwrap_or_else(|| AppError::MediaDownloadFailed("download failed".into()));
     if terminal_failure && !retryable_failure {
         Err(AttachmentDownloadFailure::Stop(error))
+    } else if let Some(limit) = size_failure.filter(|_| !terminal_failure && !retryable_failure) {
+        Err(AttachmentDownloadFailure::SizeLimit(error, limit))
     } else {
         Err(AttachmentDownloadFailure::Retry(error))
     }

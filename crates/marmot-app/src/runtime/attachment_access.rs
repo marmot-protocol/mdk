@@ -33,24 +33,7 @@ impl MarmotAppRuntime {
         group: &GroupId,
         mut targets: Vec<AttachmentLocalTarget>,
     ) -> Result<Vec<Option<RetainedAttachmentAsset>>, AppError> {
-        if targets.len() > MAX_ATTACHMENT_ASSET_LOOKUPS {
-            return Err(AppError::InvalidEncryptedMedia(
-                "too many attachment asset lookups".into(),
-            ));
-        }
-        for target in &mut targets {
-            for id in [
-                &mut target.message_id_hex,
-                &mut target.source_message_id_hex,
-            ] {
-                if id.len() != 64 || !id.bytes().all(|v| v.is_ascii_hexdigit()) {
-                    return Err(AppError::InvalidEncryptedMedia(
-                        "invalid attachment source id".into(),
-                    ));
-                }
-                id.make_ascii_lowercase();
-            }
-        }
+        validate_targets(&mut targets)?;
         let group = hex::encode(group.as_slice());
         self.attachment_read(account_ref, move |storage, _| {
             targets
@@ -98,3 +81,26 @@ impl MarmotAppRuntime {
 }
 #[cfg(test)]
 mod tests;
+
+pub(super) fn validate_targets(targets: &mut [AttachmentLocalTarget]) -> Result<(), AppError> {
+    if targets.len() > MAX_ATTACHMENT_ASSET_LOOKUPS {
+        return Err(AppError::InvalidEncryptedMedia(
+            "too many attachment asset lookups".into(),
+        ));
+    }
+    for target in targets {
+        for id in [
+            &mut target.message_id_hex,
+            &mut target.source_message_id_hex,
+        ] {
+            if id.len() != 64 || !id.bytes().all(|v| v.is_ascii_hexdigit()) {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "invalid attachment source id".into(),
+                ));
+            }
+            id.make_ascii_lowercase();
+        }
+    }
+
+    Ok(())
+}

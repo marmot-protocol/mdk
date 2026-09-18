@@ -312,3 +312,54 @@ async fn attachment_local_access_rejects_unbounded_inputs_without_starting_worke
     assert!(runtime.accounts.workers.lock().await.is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn attachment_progress_stream_observes_removal_without_network_or_erasing_ready_on_cancel() {
+    use crate::{AttachmentControl, AttachmentTransferState};
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed(&store, b"retained");
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let stream = runtime
+        .subscribe_attachment_transfers("alice", &group, vec![target()])
+        .await
+        .unwrap();
+    let first = stream.next().await.unwrap().unwrap().remove(0).unwrap();
+    assert_eq!(first.state, AttachmentTransferState::Ready);
+    let reference = first.reference.unwrap();
+    assert!(
+        !runtime
+            .control_attachment("alice", reference.clone(), AttachmentControl::Cancel)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .control_attachment("alice", reference.clone(), AttachmentControl::Remove)
+            .await
+            .unwrap()
+    );
+    let update = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(update.state, AttachmentTransferState::Removed);
+    assert!(
+        runtime
+            .read_attachment_asset("alice", reference, 0, 100)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    stream.close();
+    assert!(stream.next().await.unwrap().is_none());
+    runtime.shutdown_and_close().await.unwrap();
+}

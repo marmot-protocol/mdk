@@ -81,6 +81,11 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+mod attachment_controls;
+pub use attachment_controls::{
+    AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
+    RuntimeAttachmentTransferSubscription,
+};
 mod attachment_access;
 mod attachment_history;
 pub use attachment_access::{
@@ -267,6 +272,7 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     attachment_transfer: Arc<tokio::sync::Semaphore>,
+    attachment_updates: watch::Sender<()>,
     product_analytics: crate::ProductAnalytics,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
@@ -355,6 +361,7 @@ impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_updates: watch::channel(()).0,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             app_performance_telemetry: AppPerformanceTelemetry::default(),
             product_analytics: crate::ProductAnalytics::default(),
@@ -398,6 +405,7 @@ impl RuntimeSharedServices {
         );
         Self {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_updates: watch::channel(()).0,
             relay_plane: app.relay_plane.clone(),
             app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(
                 app.product_analytics.clone(),
@@ -1392,6 +1400,11 @@ impl MarmotAppRuntime {
     /// catch-up continue asynchronously after this method returns.
     pub async fn start(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
+        attachment_controls::default_policy(&self.accounts.app.config)
+            .validate()
+            .map_err(|_| {
+                AppError::InvalidEncryptedMedia("invalid attachment download policy".into())
+            })?;
         *self
             .shared
             .diagnostics_executor

@@ -2726,6 +2726,7 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
+            shared.attachment_updates.send_modify(|_| {});
             drop(background_permit);
         }
         MediaHttpCompletion::Avatar { job, result } => {
