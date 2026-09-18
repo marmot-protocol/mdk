@@ -2087,7 +2087,7 @@ async fn consumed_last_resort_private_material_survives_pending_replacement_then
     assert!(matches!(
         rejected.outcome,
         cgka_traits::IngestOutcome::Ignored {
-            category: cgka_traits::ingest::InputRejectionCategory::InvalidEncoding
+            category: cgka_traits::ingest::InputRejectionCategory::MissingWelcomeKeyPackage
         }
     ));
 }
