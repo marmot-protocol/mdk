@@ -21,7 +21,9 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         conn.query_row(
             &format!(
-                "SELECT q.token,length(b.bytes) FROM attachment_acquisition q
+                "SELECT q.token,length(b.bytes),
+                        (SELECT store_epoch FROM chat_presentation_meta WHERE id=1)
+                 FROM attachment_acquisition q
                  JOIN retained_attachment_bytes b USING(token)
                  WHERE q.group_id_hex=?1 AND q.message_id_hex=?2
                    AND q.source_message_id_hex=?3 AND q.attachment_index=?4
@@ -29,20 +31,18 @@ impl SqliteAccountStorage {
                    AND (q.expires_at IS NULL OR q.expires_at>?5)"
             ),
             params![group, message, source, index, u64_to_i64(now)?],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, nonnegative(r, 1)?)),
+            |r| {
+                Ok(RetainedAttachmentAsset {
+                    reference: AttachmentAssetRef {
+                        store_epoch: r.get(2)?,
+                        token: r.get(0)?,
+                    },
+                    byte_count: nonnegative(r, 1)?,
+                })
+            },
         )
         .optional()
-        .storage()?
-        .map(|(token, byte_count)| {
-            Ok(RetainedAttachmentAsset {
-                reference: AttachmentAssetRef {
-                    store_epoch: epoch(&conn)?,
-                    token,
-                },
-                byte_count,
-            })
-        })
-        .transpose()
+        .storage()
     }
 }
 

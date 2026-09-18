@@ -36,7 +36,9 @@ metadata after runtime reconstruction. Each read validates account/store identit
 current source visibility/expiry. Deletion, explicit removal and source replacement can
 invalidate a reference between chunks. Leaving a group preserves retained history access.
 Calls after shutdown fail rather than reopening databases. Hosts own decoding, layout,
-plaintext buffer/export lifetime and removal of any downstream copies.
+plaintext buffer/export lifetime and removal of any downstream copies. Only the transient
+Rust storage-read buffer is zeroized; MDK does not wipe plaintext copies delivered through
+native bindings, including buffers released by the C free function.
 
 ```swift
 let targets = [AttachmentLocalTargetFfi(

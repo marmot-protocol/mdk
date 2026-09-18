@@ -83,7 +83,10 @@ pub use conversation_window::{
 };
 mod attachment_access;
 mod attachment_history;
-pub use attachment_access::*;
+pub use attachment_access::{
+    AttachmentAssetRef, AttachmentLocalTarget, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+};
 mod avatar;
 pub use attachment_history::{
     AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
