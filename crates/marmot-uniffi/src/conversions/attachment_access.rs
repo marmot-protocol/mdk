@@ -53,15 +53,6 @@ impl From<Option<zeroize::Zeroizing<Vec<u8>>>> for AttachmentLocalBytesFfi {
         }
     }
 }
-macro_rules! redacted_debug {
-    ($($t:ty),+ $(,)?) => { $(impl std::fmt::Debug for $t {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct(stringify!($t)).finish_non_exhaustive()
-        }
-    })+ };
-}
-redacted_debug!(
-    AttachmentLocalTargetFfi,
-    AttachmentLocalAssetFfi,
-    AttachmentLocalBytesFfi
-);
+redact!(AttachmentLocalTargetFfi);
+redact!(AttachmentLocalAssetFfi);
+redact!(AttachmentLocalBytesFfi);

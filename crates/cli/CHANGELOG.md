@@ -33,14 +33,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   restart; verified bytes remain in SQLCipher until source deletion/expiry or explicit
   removal. Defaults: 2 GiB per account, 256 MiB free disk reserve plus write overhead,
   one transfer across accounts and a 64 MiB automatic transfer cap. Rust configuration
-  enables/tunes acquisition; native constructors stay off until local access/removal
+  enables/tunes acquisition; native constructors stay off until removal
   and policy controls land. Explicit downloads keep their existing limit.
-  Native retained-byte access remains a follow-up slice.
 
 - Attachment retention storage foundation (migration 83): durable leased download
   jobs, restart-safe retries, protected local bytes and explicit-removal suppression
   that survives timeline repair. Capacity refusal preserves existing attachments.
-  Background acquisition and native local-byte APIs are not enabled by this slice.
+  Acquisition remains opt-in; native progress and controls follow.
 
 - Bounded local attachment-history pages across Rust, Swift/Kotlin and C, with media
   categories, opaque cursors and change versions for authoritative removal/refresh.

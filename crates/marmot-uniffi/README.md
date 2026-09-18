@@ -551,3 +551,11 @@ for source/account fencing, result states and lifecycle rules.
 Use the asynchronous attachment history page/version methods for canonical media-library
 discovery. See [the C8-B native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
 removal and cursor ownership. `list_media` remains a compatibility API.
+
+## Local attachment access
+
+Use `attachmentLocalAssets` to locate verified retained bytes for visible source
+slots, then `readAttachmentAsset` for bounded local chunks without network work.
+See [the C8-D1 native handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
+source revalidation, host buffer ownership and integration guidance. Acquisition
+remains off by default; native progress and controls are the next slice.

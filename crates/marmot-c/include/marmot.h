@@ -5087,20 +5087,6 @@ MarmotStatus marmot_attachment_local_assets(const struct MarmotClient *client,
                                             struct MarmotAttachmentLocalAssetList **out);
 
 /**
- * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
- * Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
- * available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
- * # Safety
- * Client and NUL-terminated strings must be live; out must be writable. Borrowed inputs.
- */
-MarmotStatus marmot_read_attachment_asset(const struct MarmotClient *client,
-                                          const char *account_ref,
-                                          const char *reference,
-                                          uint64_t offset,
-                                          uint32_t limit,
-                                          struct MarmotAttachmentLocalBytes **out);
-
-/**
  * Deep-free a page result and its cursor/version. NULL is a no-op.
  * # Safety
  * Value must be NULL or an owned result, not freed or borrowed by an active call.
@@ -5154,6 +5140,25 @@ MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client
 MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
                                                             const struct MarmotAttachmentHistoryVersion *previous,
                                                             uint32_t *out);
+
+/**
+ * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
+ * Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
+ * available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
+ * Free the result with `marmot_attachment_local_bytes_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_read_attachment_asset(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *reference,
+                                          uint64_t offset,
+                                          uint32_t limit,
+                                          struct MarmotAttachmentLocalBytes **out);
 
 /**
  * Register up to 16 visible avatar targets without awaiting HTTP.

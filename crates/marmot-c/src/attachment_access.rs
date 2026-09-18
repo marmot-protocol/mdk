@@ -48,13 +48,15 @@ pub unsafe extern "C" fn marmot_attachment_local_assets(
 ) -> MarmotStatus {
     ffi_guard(|| {
         try_arg!(unsafe { preflight_out_ptr(out) });
-        if targets_len > 64 {
+        if targets_len > marmot_uniffi::MAX_ATTACHMENT_ASSET_LOOKUPS {
+            crate::status::set_last_error("too many attachment asset lookups");
             return MarmotStatus::InvalidArgument;
         }
         let targets = if targets_len == 0 {
             &[]
         } else {
             if targets.is_null() {
+                crate::status::set_last_error("attachment targets were NULL with nonzero length");
                 return MarmotStatus::NullPointer;
             }
             unsafe { std::slice::from_raw_parts(targets, targets_len) }
@@ -80,41 +82,10 @@ pub unsafe extern "C" fn marmot_attachment_local_assets(
         }
     })
 }
-/// Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
-/// Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
-/// available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
-/// # Safety
-/// Client and NUL-terminated strings must be live; out must be writable. Borrowed inputs.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_read_attachment_asset(
-    client: *const MarmotClient,
-    account_ref: *const c_char,
-    reference: *const c_char,
-    offset: u64,
-    limit: u32,
-    out: *mut *mut MarmotAttachmentLocalBytes,
-) -> MarmotStatus {
-    ffi_guard(|| {
-        try_arg!(unsafe { preflight_out_ptr(out) });
-        let client = try_arg!(unsafe { client_ref(client) });
-        let account = try_arg!(unsafe { required_str(account_ref) });
-        let reference = try_arg!(unsafe { required_str(reference) });
-        unsafe {
-            deliver(
-                client.block_on(
-                    client
-                        .marmot
-                        .read_attachment_asset(account, reference, offset, limit),
-                ),
-                out,
-            )
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::marmot_read_attachment_asset;
     use crate::memory::{audit, boxed};
     use std::ptr;
     #[test]
@@ -123,6 +94,7 @@ mod tests {
         #[cfg(feature = "alloc-audit")]
         let before = audit::live_allocations();
         unsafe {
+            crate::status::set_last_error("earlier unrelated failure");
             let mut out = ptr::dangling_mut();
             assert_eq!(
                 marmot_attachment_local_assets(
@@ -137,6 +109,11 @@ mod tests {
             );
             assert!(out.is_null());
             assert_eq!(
+                crate::status::take_last_error().as_deref(),
+                Some("too many attachment asset lookups")
+            );
+            crate::status::set_last_error("earlier unrelated failure");
+            assert_eq!(
                 marmot_attachment_local_assets(
                     ptr::null(),
                     ptr::null(),
@@ -148,6 +125,10 @@ mod tests {
                 MarmotStatus::NullPointer
             );
             assert!(out.is_null());
+            assert_eq!(
+                crate::status::take_last_error().as_deref(),
+                Some("attachment targets were NULL with nonzero length")
+            );
             assert_eq!(
                 marmot_read_attachment_asset(
                     ptr::null(),

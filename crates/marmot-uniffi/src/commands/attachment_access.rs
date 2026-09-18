@@ -15,6 +15,8 @@ impl Marmot {
         group_id_hex: String,
         targets: Vec<AttachmentLocalTargetFfi>,
     ) -> Result<Vec<AttachmentLocalAssetFfi>, MarmotKitError> {
+        // Reject before allocating the converted target vector; the runtime also
+        // enforces this bound for callers that bypass the native adapter.
         if targets.len() > MAX_ATTACHMENT_ASSET_LOOKUPS {
             return Err(AppError::InvalidEncryptedMedia(
                 "too many attachment asset lookups".into(),
