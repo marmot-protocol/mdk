@@ -2173,7 +2173,7 @@ fn segment_prefix_uses_latest_context_and_preserves_sealed_bytes_and_identity() 
 }
 
 #[test]
-fn segment_prefix_write_failure_retries_before_ordinary_events() {
+fn segment_source_write_failure_preserves_recording_and_latest_context() {
     let dir = TempDir::new().unwrap();
     let path = default_jsonl_path(dir.path(), "engine-abc");
     let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
@@ -2188,42 +2188,51 @@ fn segment_prefix_write_failure_retries_before_ordinary_events() {
     {
         let mut inner = recorder.inner.lock().unwrap();
         assert!(recorder.roll_into_segment(&mut inner).is_err());
-        assert!(inner.pending_segment_source.is_none());
         assert_eq!(fs::read(&path).unwrap(), before);
         inner.fail_next_write = true;
         recorder.roll_into_segment(&mut inner).unwrap();
-        assert!(inner.pending_segment_source.is_some());
     }
     assert_eq!(recorder.health_snapshot().write_failures, 1);
     assert!(fs::read(&path).unwrap().is_empty());
-    // Another failed prefix attempt must not admit the ordinary event.
-    recorder.fail_next_write();
     record_numbered_rows(&recorder, 1);
-    assert!(fs::read(&path).unwrap().is_empty());
-    // Model a short successful write before a later error. The retry must
-    // resume exact bytes, including the original timestamp and sequence.
-    let expected = {
-        let mut inner = recorder.inner.lock().unwrap();
-        let bytes = inner.pending_segment_source.as_ref().unwrap().0.clone();
-        inner.writer.get_mut().write_all(&bytes[..17]).unwrap();
-        inner.pending_segment_source.as_mut().unwrap().1 = 17;
-        inner.active_bytes = 17;
-        bytes
-    };
-    record_numbered_rows(&recorder, 1);
-    let after = fs::read(&path).unwrap();
-    assert!(after.starts_with(&expected));
+    assert_eq!(
+        recorded_events(&path).len(),
+        1,
+        "failed metadata must not suppress ordinary events"
+    );
+    let latest = sample_source("dddddddddddddddddddddddddddddddd");
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: latest.clone(),
+        },
+    ));
     let rows = recorded_events(&path);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].seq, 2);
-    assert_eq!(rows[1].seq, 3);
-    assert_eq!(recorder.health_snapshot().write_failures, 2);
+    assert_eq!(rows[1].seq, rows[0].seq + 1);
+    assert_eq!(
+        rows[1].kind,
+        AuditEventKind::SourceContext {
+            source: latest.clone()
+        }
+    );
+    recorder
+        .roll_into_segment(&mut recorder.inner.lock().unwrap())
+        .unwrap();
+    let prefix = recorded_events(&path);
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(
+        prefix[0].kind,
+        AuditEventKind::SourceContext { source: latest }
+    );
+    assert_eq!(prefix[0].seq, rows[1].seq + 1);
+    assert_eq!(recorder.health_snapshot().write_failures, 1);
     assert_eq!(fs::read(&segment_paths(&path)[0]).unwrap(), before);
     assert_jsonl_matches_v4_schema(&path);
 }
 
 #[test]
-fn oversized_source_prefix_does_not_recursively_roll() {
+fn oversized_source_prefix_neither_recursively_rolls_nor_amplifies_each_event() {
     let dir = TempDir::new().unwrap();
     let path = default_jsonl_path(dir.path(), "engine-abc");
     let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
@@ -2238,8 +2247,19 @@ fn oversized_source_prefix_does_not_recursively_roll() {
     ));
     assert_eq!(segment_paths(&path).len(), 1);
     assert_eq!(recorded_events(&path).len(), 1);
-    record_numbered_rows(&recorder, 1);
-    assert_eq!(segment_paths(&path).len(), 2);
+    record_numbered_rows(&recorder, 100);
+    assert_eq!(
+        segment_paths(&path).len(),
+        1,
+        "metadata alone must not exhaust the next segment budget"
+    );
+    assert_eq!(recorded_events(&path).len(), 101);
+    record_until_segment_rolls(&recorder, &path, 1);
+    assert_eq!(
+        segment_paths(&path).len(),
+        2,
+        "ordinary bytes must still trigger rotation"
+    );
     assert_eq!(recorded_events(&path).len(), 1);
 }
 

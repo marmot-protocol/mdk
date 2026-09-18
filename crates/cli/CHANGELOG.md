@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Size-rotated v4 audit logs repeat the latest source context (app version, platform, hardware model, and device
+  identifier) so standalone segments retain metadata. Engine/account/session identities and existing event bytes
+  are preserved. Requires rebuilt native libraries and client releases; historical logs are not rewritten.
+
 ### Added
 
 - Attachment retention storage foundation (migration 83): durable leased download

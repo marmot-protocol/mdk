@@ -1039,15 +1039,17 @@ Files are sorted by app account label, then file name.
 
 ### Segment rotation
 
-The recorder seals the active file into an immutable segment once it reaches `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
+The recorder seals the active file into an immutable segment once new event bytes, excluding the repeated source
+prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
 continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
 still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 - Rotation is a rename: existing event bytes and identities are preserved without deletion or truncation.
   Each fresh segment starts with the latest known `source_context`, assigned a fresh sequence number. Ordinary
   events are never replayed. Without an explicitly recorded source context, no metadata is invented.
-  Prefix writes resume after failure before ordinary rows are admitted; health counters track failures.
-  Writing the prefix cannot recursively trigger rollover, even if the metadata reaches the size threshold.
+  Prefix writes use the same best-effort path and health counters as ordinary rows; a failed metadata write does
+  not suppress later events. Writing the prefix cannot recursively trigger rollover. Repeated prefix bytes are
+  excluded from the next segment's 1 MiB event budget, avoiding a roll per event when metadata itself is oversized.
 - `seq`, the recorder session id, and the health counters carry across a segment boundary, and no `recorder_started`
   row is written: a roll is not a new recorder session, and the upload endpoint's content-keyed line dedupe never
   re-mints a line just because it moved to a new file name.
@@ -1193,12 +1195,6 @@ no fields or schema version; source metadata stays in the validated JSONL body, 
 account/device names. Goggles can correlate retained metadata by engine/account/recorder-session identity, but cannot
 recover startup evidence that was never uploaded or has expired.
 
-Adoption requires rebuilt MDK native artifacts: a MarmotKit release for iOS/macOS (Swift/XCFramework) and Android
-(Kotlin/native libraries), followed by White Noise client releases using those artifacts. C ABI consumers need a
-rebuilt Marmot C release; CLI/daemon and wn-agent distributions embedding this recorder need rebuilt binaries.
-No binding API change or version bump is part of this fix. Existing uploaded or local historical segments are not rewritten.
-
-
 Compiled/default endpoint source:
 
 - `MarmotServiceEndpoints.audit_log_tracker_endpoint`;
@@ -1239,7 +1235,7 @@ it, plus whether that was an accepted upload, a file above the request ceiling, 
 - A file whose current size and mtime match its entry is never re-read or re-posted. Sealed segments never change, so
   one `2xx` is a durable acknowledgment of their whole content.
 - The active file changes on every append and therefore re-transfers in full on each trigger. That residual is accepted
-  by design and is bounded by the segment threshold; a byte-offset acknowledgment protocol was considered and rejected.
+  by design and is bounded by the segment threshold plus the repeated source prefix and final row; a byte-offset acknowledgment protocol was considered and rejected.
 - Identity is metadata, not a content hash, because the point of the checkpoint is to avoid reading the file. Audit
   files only grow, so every mismatch — including the racy ones where the file grew between enumeration and upload —
   falls back to re-uploading, which the endpoint short-circuits on `file_sha256` without parsing a line.
