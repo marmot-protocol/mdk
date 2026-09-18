@@ -59,7 +59,7 @@ const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
 const FULL_HISTORY_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct FullHistoryRepairControl<'a> {
-    started: Instant,
+    started: tokio::time::Instant,
     timeout: Duration,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
@@ -4118,7 +4118,7 @@ impl AppClient {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         self.repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: FULL_HISTORY_REPAIR_TIMEOUT,
             cancelled,
         })
