@@ -261,6 +261,7 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    attachment_transfer: Arc<tokio::sync::Semaphore>,
     product_analytics: crate::ProductAnalytics,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
@@ -348,6 +349,7 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             app_performance_telemetry: AppPerformanceTelemetry::default(),
             product_analytics: crate::ProductAnalytics::default(),
@@ -390,6 +392,7 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             relay_plane: app.relay_plane.clone(),
             app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(
                 app.product_analytics.clone(),

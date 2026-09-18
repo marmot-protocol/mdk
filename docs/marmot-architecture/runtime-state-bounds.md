@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-16
+updated: 2026-09-18
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -118,11 +118,18 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | Durable jobs | One per requested retained message slot; source descriptor at most 16 KiB; due/expiry scans at most 64 rows | Raw-source deletion cascades. Canonical source replacement/invalidation reconciles transactionally; matching timeline repair preserves work. Expired leases are reclaimable with a new attempt token; stale completion cannot publish. Eligible demand resumes policy-parked work; explicit-retry failures remain blocked. Worker policy changes must re-admit affected sources. No in-memory history-sized queue. |
-| Retained attachment bytes | At most 512 MiB per object; caller-supplied account payload-byte budget checked atomically at publication; local reads at most 1 MiB; publication retains a full plaintext buffer plus SQLite binding cost | No LRU eviction. Budget refusal commits no bytes. Source deletion/expiry, explicit removal and store-generation reset release objects. Separate copies per message slot give independent erasure. A future runtime must reserve filesystem/WAL overhead and pace expiry maintenance. |
+| Retained attachment bytes | At most 512 MiB per object; caller-supplied account payload-byte budget checked atomically at publication; local reads at most 1 MiB; publication retains a full plaintext buffer plus SQLite binding cost | No LRU eviction. Budget refusal commits no bytes. Source deletion/expiry, explicit removal and store-generation reset release objects. Separate copies per message slot give independent erasure. Worker admission reserves filesystem/WAL overhead and prunes up to 64 expired jobs per turn. |
 | Removal suppression | One tombstone per explicitly removed source slot, owned by the raw app event rather than a rebuildable timeline row | Survives reopen, repair and source revalidation; cleared only by explicit download-again, raw-source deletion or store-generation reset. |
 
 These are attachment-storage bounds, not convergence-input or engine-recovery policy.
-The current slice does not schedule transfers or persist partial downloads.
+C8-C2 schedules complete-body transfers; partial downloads remain C8-C3.
+
+| Worker structure | Bound | Reclamation |
+| --- | --- | --- |
+| Durable parser demand | One metadata row per eligible retained slot; 32 descriptors per turn, each at most 16 KiB | Generation-fenced acknowledgement after parse/admission; source deletion cascades; rebuild/acceptance regenerates affected demand. No repeated startup history scan. |
+| Global automatic transfer permit | One per runtime across all accounts, including completed plaintext awaiting publication | Released on completion or worker exit. FIFO waiter future per active account prevents an account with a large backlog monopolizing capacity. |
+| Background transfer body | Default 64 MiB ciphertext, configurable up to the existing 512 MiB ceiling; full-buffer crypto/publication plus SQLite copies | Cancellation discards interrupted whole bodies; durable leases/retries recover work. No persistent partials in C8-C2. |
+| Resource admission | Default 2 GiB retained payload per account; 256 MiB disk reserve plus four maximum-size objects for SQLite/WAL | Pause on insufficient/unknown space without eviction or incrementing attempts. Existing 15-second maintenance tick revisits admission; errors use durable 15-second to one-hour backoff. |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 

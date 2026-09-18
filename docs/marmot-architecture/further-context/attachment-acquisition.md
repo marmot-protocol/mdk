@@ -1,7 +1,7 @@
 ---
 title: "Attachment discovery and acquisition"
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-18
 tags: [marmot, attachments, projections]
 status: implementation-plan
 ---
@@ -11,15 +11,15 @@ status: implementation-plan
 Tracking: [projection plan #1742](https://github.com/marmot-protocol/mdk/issues/1742).
 Source audit: master `ebb884b8` (MDK 0.10.1). This is an implementation plan;
 C8-A storage discovery and C8-B runtime/native discovery are implemented. C8-C1
-adds the durable storage foundation below; worker acquisition and native retained-byte
-access remain later slices.
+adds the durable storage foundation below. C8-C2 connects automatic worker acquisition;
+partial/range resume (C8-C3) and native retained-byte access (C8-D) remain later slices.
 
 ## Problem and existing foundation
 
 Opening a conversation should find already acquired attachment bytes locally.
 Today MDK retains decryption secrets and can explicitly download an attachment,
-and C8-C1 now supplies durable jobs and protected byte storage. The runtime does
-not yet feed or execute those jobs automatically.
+and C8-C1 supplies durable jobs and protected byte storage. C8-C2 feeds and executes
+those jobs automatically in active, non-frozen account workers.
 A timeline window covers only a bounded part of a conversation. The synchronous
 `list_media` compatibility API instead scans raw app events, potentially without
 a limit, and does not provide authoritative removal or pagination semantics.
@@ -121,8 +121,8 @@ needed to inspect job state or read retained bytes.
 
 A claimed attempt has a private store/attempt fence. Publication rechecks the
 current source, invitation acceptance, expiry and unexpired lease, then verifies
-the plaintext digest and atomically commits the bytes and ready state. The future
-worker must still authenticate/decrypt the entire body using the existing media
+the plaintext digest and atomically commits the bytes and ready state. The
+worker authenticates/decrypts the entire body using the existing media
 pipeline before publication. Interrupted leases become due again after reopen;
 ordinary repeated demand cannot reset retry deadlines or replace ready bytes.
 Claim-time policy ineligibility parks work separately from an explicit-retry
@@ -148,23 +148,50 @@ the source remains retained. Already acquired left-group history remains readabl
 Separate copies per slot avoid cross-message erasure ambiguity in this first slice.
 Account-store generation reset invalidates all handles and clears retained state.
 
-This is a storage API, not automatic download, partial/range-resume support, transfer
-progress or a native binding. Next connect accepted canonical demand to the existing
-bounded media worker, including shutdown cancellation, retry pacing and maintenance;
-then expose native availability, local bytes and explicit removal/download-again.
-[#1437](https://github.com/marmot-protocol/mdk/issues/1437) remains open across those slices.
+## C8-C2: automatic worker acquisition
 
-## Decisions before worker integration
+Migration 84 queues retained eligible attachment slots once at upgrade. Source changes,
+acceptance, unblocking, repair and group recreation enqueue changed slots transactionally.
+The worker consumes at most 32 descriptors per turn, uses the shared strict parser for
+both the reference and plaintext digest, and acknowledges each queue generation only
+after admission or rejection. Repeated account saves do not rescan/requeue history.
+Explicit-removal suppression, ready bytes, backoff and terminal failures survive rediscovery.
 
-- Choose the runtime payload-byte budget and filesystem headroom policy. Storage
-  already refuses over-budget publication without eviction; the worker must stop
-  admitting work under pressure rather than repeatedly downloading rejected bytes.
-- Define durable partial-download/range-resume support, retry scheduling and
-  protected partial-file cleanup. Current whole-body verification does not make
-  partially downloaded plaintext safe to expose.
-- Wire source/account teardown and cancellation into the worker, and expose the
-  existing storage removal/download-again operations through native APIs. Test
-  runtime publication races on top of the storage source/lease/expiry fences.
+Automatic work uses the existing cancellable media executor. A FIFO semaphore permits
+one automatic transfer across all accounts in a runtime; each account has at most one
+pending permit request. A permit remains held through queued plaintext publication.
+At least one of the four per-account media slots is reserved for foreground work.
+Preparation reads projected group policy and retained source-epoch secrets; it never
+hydrates MLS state. Missing secrets wait for sync's existing secret-warming path.
+Invitation acceptance and canonical visibility are checked again at claim/publication.
+
+Starting Rust-configurable defaults (`MarmotAppConfig::attachment_acquisition`):
+
+| Policy | Default |
+| --- | --- |
+| Retained plaintext per account | 2 GiB, no eviction |
+| Free disk reserve | 256 MiB, plus four maximum-size objects for SQLite/WAL overhead |
+| Automatic ciphertext ceiling | 64 MiB, enforced during streaming, including chunked bodies |
+| Concurrent automatic transfers | One across accounts in a runtime |
+
+`None` disables automatic acquisition. Frozen/NSE runtimes also skip it. Explicit
+foreground downloads retain their 512 MiB ciphertext cap. Admission reserves a full
+maximum-size object against quota, so a final smaller remainder can stay unused.
+Unknown free space fails closed. These are resource limits, not an OS background-execution
+entitlement or mobile throughput evidence.
+
+Network and temporarily unavailable policy/secret failures back off durably from 15 seconds
+to one hour. Integrity/decryption failures and over-limit responses require explicit retry;
+locator failover still runs, and a remaining transient candidate keeps the attempt retryable.
+Twenty-minute leases cover the shared fifteen-minute transfer deadline and publication margin.
+Worker exit cancels active HTTP and releases permits; expired leases recover interrupted work.
+Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; no automatic LRU applies.
+
+C8-C2 retries complete bodies. It does **not** persist partial ciphertext or implement byte-offset
+resume. C8-C3 will add protected partials, Range/validator semantics and cleanup. C8-D will
+expose native availability/local bytes/progress and explicit remove/download-again operations.
+The legacy download API continues returning transient bytes until clients adopt that contract.
+[#1437](https://github.com/marmot-protocol/mdk/issues/1437) stays open across those slices.
 
 ## Issue audit and exclusions
 

@@ -719,3 +719,79 @@ fn attachment_policy_park_resumes_on_readmission_but_terminal_failure_does_not()
         vec![reference]
     );
 }
+
+#[test]
+fn attachment_background_demand_tracks_sources_and_acceptance() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let pending = || {
+        store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM attachment_worker_demand", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(pending(), 1);
+    sql(
+        &store,
+        "DELETE FROM attachment_worker_demand;
+        UPDATE account_groups SET pending_confirmation=1;",
+    );
+    seed(&store, "two");
+    assert_eq!(pending(), 0, "pending invitations never auto-download");
+    sql(&store, "UPDATE account_groups SET pending_confirmation=0;");
+    assert_eq!(
+        pending(),
+        2,
+        "acceptance discovers retained history without opening a screen"
+    );
+    sql(&store, "DELETE FROM app_events;");
+    assert_eq!(pending(), 0);
+}
+
+#[test]
+fn attachment_worker_acknowledgement_cannot_lose_source_updates_and_removal_stays_suppressed() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let first = store.attachment_worker_demands(1).unwrap().pop().unwrap();
+    // A repair can recreate the same slot while the caller holds a work item.
+    sql(
+        &store,
+        "UPDATE attachment_history SET timeline_at=timeline_at+1;",
+    );
+    store.acknowledge_attachment_worker_demand(&first).unwrap();
+    let next = store.attachment_worker_demands(1).unwrap().pop().unwrap();
+    assert_eq!(next.entry.source_epoch, Some(3));
+    store.remove_local_attachment(GROUP, "one", 0).unwrap();
+    assert_eq!(
+        store
+            .request_attachment_acquisition(GROUP, &next.entry, digest(), 11)
+            .unwrap(),
+        AttachmentDemand::Suppressed
+    );
+    store.acknowledge_attachment_worker_demand(&next).unwrap();
+    assert!(store.attachment_worker_demands(32).unwrap().is_empty());
+    // Routine account saves must not enqueue the whole retained history again.
+    sql(&store, "UPDATE account_groups SET updated_at=updated_at+1;");
+    assert!(store.attachment_worker_demands(32).unwrap().is_empty());
+}
+
+#[test]
+fn attachment_worker_pending_demand_survives_encrypted_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("worker.sqlite");
+    let key = SqlCipherKey::new("worker-restart-test").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for i in 0..35 {
+        seed(&store, &format!("{i:064x}"));
+    }
+    assert_eq!(store.attachment_worker_demands(32).unwrap().len(), 32);
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for demand in store.attachment_worker_demands(32).unwrap() {
+        store.acknowledge_attachment_worker_demand(&demand).unwrap();
+    }
+    assert_eq!(store.attachment_worker_demands(32).unwrap().len(), 3);
+}

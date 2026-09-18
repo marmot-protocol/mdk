@@ -22,7 +22,7 @@ not "fix" it into the per-account database.
 | `src/openmls_storage/` | Custom OpenMLS storage adapter. |
 | `src/account_projection.rs` | Account-level event projection. |
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |
-| `src/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes and explicit-removal suppression. No network worker or native API. |
+| `src/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |
 | `src/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |
 | `src/timeline.rs` | Materialized message-timeline aggregation. |
 | `src/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |

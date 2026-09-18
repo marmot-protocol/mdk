@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-17
+updated: 2026-09-18
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -34,7 +34,8 @@ C8-A/B provide indexed per-group attachment-slot discovery in SQLite and typed a
 runtime/native pages for #1448. Additions preserve cursors; destructive changes require
 replacement. Reads remain local without engine/relay readiness. C8-C1 adds storage-only
 durable demand/attempt fencing, protected retained bytes and removal suppression in migration 83.
-Background download scheduling and native retained-byte access remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+C8-C2 adds durable source demand (migration 84), bounded background acquisition and protected-byte publication
+for accepted conversations. Partial/range resume and native retained-byte access remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

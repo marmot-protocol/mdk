@@ -20,6 +20,7 @@ use crate::{AppError, ChatListAttachmentKind, SendSummary};
 
 mod blossom;
 mod crypto;
+pub(crate) use crypto::media_hash_from_reference;
 mod group_image;
 mod host_safety;
 
@@ -28,7 +29,7 @@ use blossom::{
 };
 use crypto::{
     canonical_media_type_v1, canonical_media_type_v2, derive_media_file_key, media_aad,
-    media_hash_from_reference, media_nonce_from_reference, validate_sha256_hex,
+    media_nonce_from_reference, validate_sha256_hex,
 };
 pub(crate) use host_safety::parse_profile_image_fetch_url;
 use host_safety::{validate_blossom_fetch_url, validate_locator};
@@ -917,6 +918,26 @@ pub(crate) async fn download_encrypted_media(
     .await
 }
 
+/// Retry policy internal to acquisition. The public API retains its established
+/// structural / unfetchable / download-failed error classes.
+#[derive(Debug)]
+pub(crate) enum AttachmentDownloadFailure {
+    Retry(AppError),
+    Stop(AppError),
+}
+impl From<AppError> for AttachmentDownloadFailure {
+    fn from(error: AppError) -> Self {
+        Self::Retry(error)
+    }
+}
+impl AttachmentDownloadFailure {
+    pub(crate) fn into_error(self) -> AppError {
+        match self {
+            Self::Retry(error) | Self::Stop(error) => error,
+        }
+    }
+}
+
 /// Download, authenticate, decrypt, and verify one attachment while optionally
 /// recording only reviewed aggregate phase outcomes.
 pub(crate) async fn download_encrypted_media_with_transport(
@@ -927,12 +948,34 @@ pub(crate) async fn download_encrypted_media_with_transport(
     transport: &BlossomHttpTransport,
     telemetry: Option<&AppPerformanceTelemetry>,
 ) -> Result<MediaDownloadResult, AppError> {
+    download_encrypted_media_classified(
+        reference,
+        media_secret,
+        fallback_endpoints,
+        allowed_locator_kinds,
+        transport,
+        telemetry,
+    )
+    .await
+    .map_err(AttachmentDownloadFailure::into_error)
+}
+
+pub(crate) async fn download_encrypted_media_classified(
+    reference: MediaAttachmentReference,
+    media_secret: &[u8],
+    fallback_endpoints: &[crate::AppBlobEndpoint],
+    allowed_locator_kinds: &[String],
+    transport: &BlossomHttpTransport,
+    telemetry: Option<&AppPerformanceTelemetry>,
+) -> Result<MediaDownloadResult, AttachmentDownloadFailure> {
     // Structural validation only: an out-of-policy or client-unsupported locator
     // is judged at fetch time below, where it degrades to an unfetchable outcome
     // rather than a hard "corrupt reference" error.
-    reference.validate(transport.allow_loopback_http)?;
+    reference
+        .validate(transport.allow_loopback_http)
+        .map_err(|e| AttachmentDownloadFailure::Stop(e.into()))?;
     let version = EncryptedMediaVersion::parse(&reference.version)?;
-    let encrypted = fetch_encrypted_media_blob_with_observer(
+    let encrypted = fetch_encrypted_media_blob_classified(
         &reference,
         fallback_endpoints,
         allowed_locator_kinds,
@@ -953,7 +996,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
         &media_type,
         &reference.file_name,
     )
-    .map_err(media_download_failure)?;
+    .map_err(|e| AttachmentDownloadFailure::Stop(media_download_failure(e)))?;
     let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
     let decrypt_started = Instant::now();
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key).map_err(|_| {
@@ -963,7 +1006,9 @@ pub(crate) async fn download_encrypted_media_with_transport(
             decrypt_started,
             false,
         );
-        AppError::MediaDownloadFailed("invalid media key length".into())
+        AttachmentDownloadFailure::Stop(AppError::MediaDownloadFailed(
+            "invalid media key length".into(),
+        ))
     })?;
     let mut plaintext = encrypted;
     if cipher
@@ -976,8 +1021,8 @@ pub(crate) async fn download_encrypted_media_with_transport(
             decrypt_started,
             false,
         );
-        return Err(AppError::MediaDownloadFailed(
-            "media decryption failed".into(),
+        return Err(AttachmentDownloadFailure::Stop(
+            AppError::MediaDownloadFailed("media decryption failed".into()),
         ));
     }
     record_media_download_phase(
@@ -995,8 +1040,8 @@ pub(crate) async fn download_encrypted_media_with_transport(
             plaintext_verify_started,
             false,
         );
-        return Err(AppError::MediaDownloadFailed(
-            "media plaintext hash does not match reference".into(),
+        return Err(AttachmentDownloadFailure::Stop(
+            AppError::MediaDownloadFailed("media plaintext hash does not match reference".into()),
         ));
     }
     record_media_download_phase(
@@ -1053,6 +1098,7 @@ async fn fetch_encrypted_media_blob_with_transport(
 }
 
 /// Try ordered locators under one deadline and record aggregate phase totals.
+#[cfg(test)]
 async fn fetch_encrypted_media_blob_with_observer(
     reference: &MediaAttachmentReference,
     fallback_endpoints: &[crate::AppBlobEndpoint],
@@ -1060,15 +1106,33 @@ async fn fetch_encrypted_media_blob_with_observer(
     transport: &BlossomHttpTransport,
     telemetry: Option<&AppPerformanceTelemetry>,
 ) -> Result<Vec<u8>, AppError> {
+    fetch_encrypted_media_blob_classified(
+        reference,
+        fallback_endpoints,
+        allowed_locator_kinds,
+        transport,
+        telemetry,
+    )
+    .await
+    .map_err(AttachmentDownloadFailure::into_error)
+}
+
+async fn fetch_encrypted_media_blob_classified(
+    reference: &MediaAttachmentReference,
+    fallback_endpoints: &[crate::AppBlobEndpoint],
+    allowed_locator_kinds: &[String],
+    transport: &BlossomHttpTransport,
+    telemetry: Option<&AppPerformanceTelemetry>,
+) -> Result<Vec<u8>, AttachmentDownloadFailure> {
     // Fetchability is judged against CURRENT policy + current client support.
     // This client only fetches `blossom-v1`, so if the group's current policy
     // does not allow `blossom-v1` there is no fetchable locator and the
     // reference degrades to unfetchable (not invalid): the reference may still
     // be valid and the message delivered, only the blob is unreachable here.
     if !locator_kind_allowed(BLOSSOM_LOCATOR_KIND_V1, allowed_locator_kinds) {
-        return Err(AppError::MediaUnfetchable(
-            "media reference has no supported locators".into(),
-        ));
+        return Err(
+            AppError::MediaUnfetchable("media reference has no supported locators".into()).into(),
+        );
     }
     let mut candidates = encrypted_media_fetch_candidates(reference, fallback_endpoints);
     // Host safety is client destination policy, judged before any dial: a
@@ -1084,11 +1148,13 @@ async fn fetch_encrypted_media_blob_with_observer(
         })
     });
     if candidates.is_empty() {
-        return Err(AppError::MediaUnfetchable(
-            "media reference has no supported locators".into(),
-        ));
+        return Err(
+            AppError::MediaUnfetchable("media reference has no supported locators".into()).into(),
+        );
     }
     let mut last_error = None;
+    let mut retryable_failure = false;
+    let mut terminal_failure = false;
     let expected_hash = reference.ciphertext_sha256.to_ascii_lowercase();
     let candidate_count = candidates.len();
     let download_deadline = tokio::time::Instant::now() + transport.transfer_timeout();
@@ -1134,16 +1200,14 @@ async fn fetch_encrypted_media_blob_with_observer(
             .saturating_duration_since(tokio::time::Instant::now())
             .is_zero()
         {
-            return Err(AppError::MediaDownloadFailed(
-                "media download timed out".into(),
-            ));
+            return Err(AppError::MediaDownloadFailed("media download timed out".into()).into());
         }
         let now = tokio::time::Instant::now();
         // ponytail: split the remaining budget evenly; size-based budgets need
         // a trusted expected ciphertext length that references do not carry.
         let candidate_budget =
             download_deadline.saturating_duration_since(now) / (candidate_count - index) as u32;
-        let fetched = blossom::fetch_blossom_blob_with_observer_until(
+        let fetched = blossom::fetch_blossom_blob_classified_until(
             &candidate,
             transport,
             telemetry,
@@ -1163,6 +1227,7 @@ async fn fetch_encrypted_media_blob_with_observer(
                 if matches {
                     return Ok(bytes);
                 }
+                terminal_failure = true;
                 record_candidate_failure(
                     &mut last_error,
                     AppError::MediaDownloadFailed(
@@ -1170,11 +1235,24 @@ async fn fetch_encrypted_media_blob_with_observer(
                     ),
                 );
             }
-            Err(err) => record_candidate_failure(&mut last_error, media_download_failure(err)),
+            Err(err) => {
+                match &err {
+                    AttachmentDownloadFailure::Stop(_) => terminal_failure = true,
+                    AttachmentDownloadFailure::Retry(AppError::UnsafeMediaFetch(_)) => {}
+                    AttachmentDownloadFailure::Retry(_) => retryable_failure = true,
+                }
+                record_candidate_failure(&mut last_error, media_download_failure(err.into_error()));
+            }
         }
         record_locator_failover_if_needed(telemetry, candidate_started, index, candidate_count);
     }
-    Err(last_error.unwrap_or_else(|| AppError::MediaDownloadFailed("download failed".into())))
+    let error =
+        last_error.unwrap_or_else(|| AppError::MediaDownloadFailed("download failed".into()));
+    if terminal_failure && !retryable_failure {
+        Err(AttachmentDownloadFailure::Stop(error))
+    } else {
+        Err(AttachmentDownloadFailure::Retry(error))
+    }
 }
 
 /// Record one candidate's failure as the attachment's provisional outcome.
@@ -1550,6 +1628,6 @@ fn validate_outbound_file_name(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(test)]
 mod tests_profile_image;

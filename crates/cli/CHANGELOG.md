@@ -11,6 +11,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Automatic attachment acquisition for accepted conversations, including retained
+  history, without opening a chat screen. Durable discovery and retry state survive
+  restart; verified bytes remain in SQLCipher until source deletion/expiry or explicit
+  removal. Defaults: 2 GiB per account, 256 MiB free disk reserve plus write overhead,
+  one transfer across accounts and a 64 MiB automatic transfer cap. Rust configuration
+  can disable or tune acquisition; explicit downloads keep their existing limit.
+  Partial/range resume and native retained-byte access remain follow-up slices.
+
 - Attachment retention storage foundation (migration 83): durable leased download
   jobs, restart-safe retries, protected local bytes and explicit-removal suppression
   that survives timeline repair. Capacity refusal preserves existing attachments.

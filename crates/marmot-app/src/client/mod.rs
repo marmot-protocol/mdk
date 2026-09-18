@@ -178,6 +178,20 @@ pub(crate) struct EncryptedMediaDownloadHttp {
 }
 
 impl EncryptedMediaDownloadHttp {
+    pub(crate) async fn run_classified(
+        self,
+    ) -> Result<MediaDownloadResult, crate::media::AttachmentDownloadFailure> {
+        crate::media::download_encrypted_media_classified(
+            self.reference,
+            self.media_secret.as_ref(),
+            &self.default_blob_endpoints,
+            &self.allowed_locator_kinds,
+            &self.transport,
+            None,
+        )
+        .await
+    }
+
     /// Run the prepared fetch and crypto work, optionally recording only the
     /// reviewed aggregate phase histograms.
     pub(crate) async fn run(
@@ -4547,6 +4561,51 @@ impl AppClient {
             .await?
             .run(None)
             .await
+    }
+
+    /// Storage-only preparation for automatic work. Secret warming belongs to
+    /// sync; missing/retired epoch material cannot trigger engine hydration here.
+    pub(crate) fn prepare_background_attachment_download(
+        &self,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+        max_bytes: u64,
+    ) -> Result<Option<EncryptedMediaDownloadHttp>, AppError> {
+        self.ensure_group(group_id)?;
+        let policy = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == hex::encode(group_id.as_slice()))
+            .ok_or_else(|| AppError::InvalidEncryptedMedia("group projection unavailable".into()))?
+            .encrypted_media
+            .endpoint_policy()?;
+        let version = EncryptedMediaVersion::parse(&reference.version)?;
+        let storage = self.app.account_storage(&self.state.label)?;
+        if !storage.encrypted_media_epoch_secret_may_be_served(
+            &hex::encode(group_id.as_slice()),
+            reference.source_epoch,
+        )? {
+            return Ok(None);
+        }
+        let Some(secret) = self.cached_encrypted_media_epoch_secret(
+            group_id,
+            version.component_id(),
+            reference.source_epoch,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(EncryptedMediaDownloadHttp {
+            reference,
+            media_secret: SecretBytes::new(secret),
+            default_blob_endpoints: policy.default_blob_endpoints,
+            allowed_locator_kinds: policy.allowed_locator_kinds,
+            transport: self
+                .blossom_http_transport
+                .clone()
+                .with_download_limit(max_bytes),
+        }))
     }
 
     pub(crate) async fn prepare_encrypted_media_download(

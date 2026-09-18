@@ -147,7 +147,72 @@ pub(crate) fn reconcile_attachment_acquisition_tx(
     Ok(())
 }
 
+/// A bounded parser work item. Its generation fences acknowledgement against
+/// a source update or rebuild that arrives while the caller is parsing it.
+pub struct AttachmentWorkerDemand {
+    pub group_id_hex: String,
+    pub entry: crate::AttachmentHistoryEntry,
+    generation: Vec<u8>,
+}
+
 impl SqliteAccountStorage {
+    /// Read source changes without a history scan. Oversized descriptors are
+    /// represented as null so the shared parser rejects them without allocation.
+    pub fn attachment_worker_demands(
+        &self,
+        limit: usize,
+    ) -> StorageResult<Vec<AttachmentWorkerDemand>> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment demand limit"));
+        }
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT d.group_id_hex,d.generation,h.message_id_hex,
+            h.attachment_index,h.source_message_id_hex,h.source_epoch,h.sender,h.timeline_at,h.received_at,
+            CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE 'null' END
+            FROM attachment_worker_demand d JOIN attachment_history h
+            USING(group_id_hex,message_id_hex,attachment_index)
+            ORDER BY d.group_id_hex,d.message_id_hex,d.attachment_index LIMIT ?1").storage()?;
+        stmt.query_map([limit as i64], |r| {
+            let slot: String = r.get(9)?;
+            Ok(AttachmentWorkerDemand {
+                group_id_hex: r.get(0)?,
+                generation: r.get(1)?,
+                entry: crate::AttachmentHistoryEntry {
+                    message_id_hex: r.get(2)?,
+                    attachment_index: r.get::<_, u32>(3)? as usize,
+                    source_message_id_hex: r.get(4)?,
+                    source_epoch: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    sender: r.get(6)?,
+                    timeline_at: nonnegative(r, 7)?,
+                    received_at: nonnegative(r, 8)?,
+                    slot: serde_json::from_str(&slot).unwrap_or(serde_json::Value::Null),
+                },
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+    }
+
+    pub fn acknowledge_attachment_worker_demand(
+        &self,
+        demand: &AttachmentWorkerDemand,
+    ) -> StorageResult<()> {
+        self.lock()?
+            .execute(
+                "DELETE FROM attachment_worker_demand
+            WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3 AND generation=?4",
+                params![
+                    demand.group_id_hex,
+                    demand.entry.message_id_hex,
+                    demand.entry.attachment_index as i64,
+                    demand.generation
+                ],
+            )
+            .storage()?;
+        Ok(())
+    }
+
     /// Persist source-bound demand after the app has validated this exact slot
     /// and its plaintext digest with the shared parser. Pending invitations,
     /// hidden/expired/missing sources and legacy unknown epochs are not admitted.

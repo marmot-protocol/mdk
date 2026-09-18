@@ -181,8 +181,8 @@ pub(crate) use client::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
 };
 pub use config::{
-    AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
-    MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
+    AttachmentAcquisitionPolicy, AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence,
+    MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
     RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{

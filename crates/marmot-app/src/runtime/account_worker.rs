@@ -1,6 +1,8 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
+mod attachments;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -1074,6 +1076,8 @@ async fn run_app_runtime_account_worker(
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut presentation_due = true;
     let mut avatar_due = true;
+    let mut attachment_due = true;
+    let mut attachment_admission = attachments::Admission::default();
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
@@ -1140,6 +1144,7 @@ async fn run_app_runtime_account_worker(
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
                         avatar_due = true;
+                        attachment_due = true;
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -1646,7 +1651,7 @@ async fn run_app_runtime_account_worker(
                 }
             }
             result = presentation_wakeups.changed() => {
-                if result.is_ok() { presentation_due = true; avatar_due = true; }
+                if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
             }
             _ = tokio::task::yield_now(), if presentation_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
@@ -1660,7 +1665,22 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
+            _ = attachment_admission.ready(), if attachment_admission.is_waiting() => {
+                attachment_due = true;
+            }
+            _ = tokio::task::yield_now(), if attachment_due => {
+                if lifecycle.is_stopping() { continue 'worker; }
+                attachment_due = match attachments::schedule(&client, &shared, &media_http, &mut attachment_admission) {
+                    Ok(more) => more,
+                    Err(_) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
+                            "attachment maintenance failed; retrying on next wakeup or tick");
+                        false
+                    }
+                };
+            }
             _ = maintenance_tick.tick() => {
+                attachment_due = true;
                 presentation_due = true;
                 avatar_due = true;
                 // Periodic maintenance is never urgent, and its longest legs
@@ -2499,6 +2519,12 @@ struct MediaHttpDone {
 }
 
 enum MediaHttpCompletion {
+    Attachment {
+        job: storage_sqlite::AttachmentAcquisition,
+        result: Result<MediaDownloadResult, crate::media::AttachmentDownloadFailure>,
+        byte_budget: u64,
+        background_permit: OwnedSemaphorePermit,
+    },
     Avatar {
         job: storage_sqlite::AvatarAcquisition,
         result: Result<storage_sqlite::AvatarImage, AppError>,
@@ -2690,6 +2716,18 @@ async fn complete_media_http(
         cancellation.discard();
     }
     match completion {
+        MediaHttpCompletion::Attachment {
+            job,
+            result,
+            byte_budget,
+            background_permit,
+        } => {
+            if attachments::complete(client, &job, result, byte_budget).is_err() {
+                tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
+                    "attachment completion failed; durable lease permits recovery");
+            }
+            drop(background_permit);
+        }
         MediaHttpCompletion::Avatar { job, result } => {
             if let Ok(storage) = client.app.account_storage(&client.state.label) {
                 let now = crate::unix_now_seconds();

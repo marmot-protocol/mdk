@@ -46,7 +46,7 @@ pub use account_projection::{
 pub use attachment_acquisition::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, AttachmentAcquisitionState,
     AttachmentAcquisitionStatus, AttachmentAssetRef, AttachmentDemand, AttachmentPublishResult,
-    MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
+    AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
 };
 pub use attachment_history::{
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
