@@ -127,7 +127,7 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    let free = fs2::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
+    let free = fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
     if !capacity(policy, storage.retained_attachment_byte_count()?, free) {
         admission.waiting = None;
         return Ok(more);
@@ -236,7 +236,7 @@ pub(super) fn complete(
                 .as_ref()
                 .map_or(u64::MAX, |p| p.minimum_free_disk_bytes);
             let free =
-                fs2::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
+                fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
             if free < reserve.saturating_add((plaintext.len() as u64).saturating_mul(4)) {
                 storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
                 return Ok(());
