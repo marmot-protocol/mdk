@@ -116,6 +116,20 @@ impl<S: StorageProvider> Engine<S> {
         //   those two arms in step: an application parked on a branch holding no
         //   parked commit would open this gate.
         //
+        // The gate cannot tell a parked branch message from an ordinary
+        // `FutureEpoch` one whose commit has since landed: both are
+        // `ConvergenceDeferred`, and the row carries no deferral reason (the
+        // only stored epoch authenticator, `OwnApplicationConvergenceStamp`,
+        // belongs to locally authored rows this drain already skips). It
+        // withholds both, and that is harmless only because this drain is not
+        // the deliverer of a matured row — a pass re-seeds every
+        // `ConvergenceDeferred` application above the retained anchor and
+        // delivers it, and it runs before `advance_convergence_inputs` reaches
+        // this arm. If that ever stops holding, this gate must distinguish the
+        // two reasons (by outcome: a matured row decrypts against canonical
+        // state, a branch message does not) rather than the state. Guarded by
+        // `tests/distributed_convergence.rs::an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival`.
+        //
         // Terminalizing stays with a later pass and the horizon arms below
         // (`BeyondAnchor`, `BeyondAppRetention`). Nothing runs on its own — a
         // parked row opens no pass (`ConvergenceDeferred` is in neither

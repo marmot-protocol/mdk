@@ -537,13 +537,22 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   beyond-ceiling row hold every parked application back. The gate's other half is a coupling to keep in step:
   `handle_app_message`'s park arm fires on exactly the materialized/eligible/non-selected branches for which
   `handle_commit` answers `NonSelectedEligibleBranch`, so a parked application always has a parked commit beside it.
+  What the gate cannot see is *why* an application is parked: `FutureEpoch` and `NonSelectedEligibleBranch` share
+  `ConvergenceDeferred`, and the row carries no deferral reason (the only stored epoch authenticator,
+  `OwnApplicationConvergenceStamp`, belongs to locally authored rows the drain already skips). It withholds both, which
+  is harmless only because the drain is not the deliverer of a matured row: a pass re-seeds every
+  `ConvergenceDeferred` application above the retained anchor and delivers it, and it runs before
+  `advance_convergence_inputs` reaches the drain arm. If a pass ever stops dominating the drain there, the gate must
+  distinguish the two reasons by outcome — a matured application decrypts against canonical state, a branch message
+  does not — rather than by state.
   Terminalization is owed to a later pass and the horizon arms (`BeyondAnchor`, `BeyondAppRetention`) — nothing runs on
   its own, because a parked row opens no pass (`ConvergenceDeferred` is in neither `PASS_OPENING_STATES` nor
   `OUTBOUND_GATING_STATES`, `convergence_input.rs`), so a fork frozen with no further input keeps its parked rows until
   some other input opens the next pass. Pinned by
   `tests/distributed_convergence.rs::a_reorg_delivers_the_application_that_rode_the_revived_branch`,
-  `::a_parked_application_whose_branch_never_wins_is_terminalized_undelivered`, and
-  `::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`.
+  `::a_parked_application_whose_branch_never_wins_is_terminalized_undelivered`,
+  `::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`, and
+  `::an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival` (the blast-radius guard).
 - **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `MissingCandidateParent` is the other commit deferral and
   it does not mean "branch selection put this commit on the losing side": `handle_commit` also reaches it when the pass
   selected NO branch at all, which is the case that actually occurs in practice. Withdrawing there would tombstone a

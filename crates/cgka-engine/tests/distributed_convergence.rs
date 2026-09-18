@@ -6714,6 +6714,82 @@ async fn a_commit_awaiting_adjudication_is_adjudicated_before_the_application_dr
     );
 }
 
+/// Blast-radius guard for the drain gate: an ordinary application parked ahead
+/// of its commit is still delivered while an unrelated rival stays parked.
+///
+/// `FutureEpoch` and `NonSelectedEligibleBranch` applications share the
+/// `ConvergenceDeferred` state, so the drain's gate cannot tell them apart from
+/// the row and withholds both. What keeps that harmless is that the drain is not
+/// the deliverer of a matured row: a convergence pass re-seeds every
+/// `ConvergenceDeferred` application above the retained anchor
+/// (`seed_stored_openmls_graph_inputs`) and delivers it, and any pass reaching
+/// this state runs before `advance_convergence_inputs` can reach the drain arm.
+/// Forcing the gate shut (`if false`) leaves this test green, which is the
+/// evidence; forcing it open is what the revival test catches. Keep this test:
+/// it is the assertion that would fail if the pass ever stopped dominating the
+/// drain for matured rows, at which point the gate needs to distinguish the two
+/// reasons rather than the state.
+#[tokio::test]
+async fn an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival() {
+    let ForkedBranchApplications {
+        mut alice,
+        mut bob,
+        mut carol,
+        carol_storage,
+        group_id,
+        apps,
+        first_winner,
+        revived,
+        ..
+    } = forked_branch_applications("matured-future-epoch-application").await;
+
+    // An ordinary message on the branch carol adopted, parked as a pass would
+    // park one it admitted ahead of its commit and never re-admitted.
+    let canonical_sender = if first_winner == 0 {
+        &mut alice
+    } else {
+        &mut bob
+    };
+    let matured = send_app(canonical_sender, &group_id, b"ordinary traffic".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, matured.clone(), 1_500)
+        .expect("ordinary application buffered");
+    carol_storage
+        .update_message_state(&content_id(&matured), MessageState::ConvergenceDeferred)
+        .expect("ordinary application parked");
+
+    carol
+        .advance_convergence_inputs_until_settled(&group_id, 1_500_000)
+        .await
+        .expect("background convergence settles");
+
+    assert_message_state(&carol_storage, &matured, MessageState::Processed);
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                if *event_group == group_id && app_content(payload) == b"ordinary traffic"
+        )),
+        "an ordinary matured application must not wait on an unrelated parked rival: {events:?}"
+    );
+    // The branch message beside it is still withheld: it decrypts on no
+    // canonical state, and its rival is still parked for revival.
+    assert_message_state(
+        &carol_storage,
+        &apps[revived],
+        MessageState::ConvergenceDeferred,
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&apps[revived])
+        )),
+        "the parked branch message must still not be withdrawn: {events:?}"
+    );
+}
+
 /// mdk#965: an app message delivered from the initially-selected branch must
 /// be withdrawn if a later-arriving competing commit wins a reorg.
 #[tokio::test]
