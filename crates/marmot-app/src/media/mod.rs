@@ -1,3 +1,4 @@
+pub(crate) mod attachment_resume;
 pub(crate) mod avatar;
 use std::time::Instant;
 
@@ -1219,7 +1220,8 @@ async fn fetch_encrypted_media_blob_classified(
         )
         .await;
         match fetched {
-            Ok(bytes) => {
+            Ok(blob) => {
+                let bytes = blob.bytes;
                 let verify_started = Instant::now();
                 let matches = encrypted_media_hash_matches(&bytes, &expected_hash);
                 record_media_download_phase(
@@ -1231,7 +1233,17 @@ async fn fetch_encrypted_media_blob_classified(
                 if matches {
                     return Ok(bytes);
                 }
-                terminal_failure = true;
+                if let Some(resume) = &transport.resume {
+                    let _ = resume.clear(Some(&blob.response_url)).await;
+                }
+                if blob.resumed {
+                    // Range headers alone cannot prove the server supplied the
+                    // correct suffix. Discard the checkpoint and let the durable
+                    // retry fetch from zero; a fresh hash miss stays terminal.
+                    retryable_failure = true;
+                } else {
+                    terminal_failure = true;
+                }
                 record_candidate_failure(
                     &mut last_error,
                     AppError::MediaDownloadFailed(

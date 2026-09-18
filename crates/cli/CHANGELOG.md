@@ -17,6 +17,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Opt-in attachment acquisition resumes interrupted downloads from protected ciphertext
+  checkpoints when a server supplies a strong ETag and valid HTTP Range responses.
+  Account/source/attempt fences and combined storage budgets protect checkpoint reuse;
+  incompatible responses restart safely and full authentication precedes publication.
+  Native retained-byte/progress controls and default enablement remain follow-up work.
+
 - Opt-in Rust attachment acquisition for accepted conversations, including retained
   history, without opening a chat screen. Durable discovery and retry state survive
   restart; verified bytes remain in SQLCipher until source deletion/expiry or explicit
@@ -24,7 +30,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   one transfer across accounts and a 64 MiB automatic transfer cap. Rust configuration
   enables/tunes acquisition; native constructors stay off until local access/removal
   and policy controls land. Explicit downloads keep their existing limit.
-  Partial/range resume and native retained-byte access remain follow-up slices.
+  Native retained-byte access remains a follow-up slice.
 
 - Attachment retention storage foundation (migration 83): durable leased download
   jobs, restart-safe retries, protected local bytes and explicit-removal suppression

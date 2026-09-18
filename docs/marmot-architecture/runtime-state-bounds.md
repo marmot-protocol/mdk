@@ -123,14 +123,15 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 These are attachment-storage bounds, not convergence-input or engine-recovery policy.
 C8-C2 schedules complete-body transfers only with explicit Rust opt-in; acquisition
-defaults off until native local access/removal and policy controls land. Partial downloads remain C8-C3.
+defaults off until native local access/removal and policy controls land. C8-C3 adds protected partial downloads below.
 
 | Worker structure | Bound | Reclamation |
 | --- | --- | --- |
 | Durable parser demand | One metadata row per eligible retained slot; 32 descriptors per turn, each at most 16 KiB | Generation-fenced acknowledgement after parse/admission; source deletion cascades; rebuild/acceptance regenerates affected demand. No repeated startup history scan. |
 | Global automatic transfer permit | One per runtime across all accounts, including completed plaintext awaiting publication | Released on completion or worker exit. FIFO waiter future per active account prevents an account with a large backlog monopolizing capacity. |
-| Background transfer body | Default 64 MiB ciphertext, configurable up to the existing 512 MiB ceiling; full-buffer crypto/publication plus SQLite copies | Cancellation discards interrupted whole bodies; the next exclusive worker reclaims abandoned attempts in batches of 64 before scheduling, fencing old completions. No persistent partials in C8-C2. |
+| Background transfer body | Default 64 MiB ciphertext, configurable up to the existing 512 MiB ceiling; full-buffer crypto/publication plus SQLite copies | Cancellation discards the uncommitted tail; C8-C3 retains compatible ciphertext checkpoints. The next exclusive worker reclaims abandoned attempts in batches of 64 before scheduling, fencing old completions. |
 | Resource admission | Default 2 GiB retained payload per account; 256 MiB disk reserve plus four maximum-size objects for SQLite/WAL | Pause on insufficient/unknown space without eviction or incrementing attempts. Existing 15-second maintenance tick revisits admission; network errors use durable 15-second to one-hour backoff; unavailable secrets defer one candidate for 15 seconds without consuming attempts. |
+| Protected partial ciphertext (C8-C3) | One prefix per job, at most the configured transfer ceiling; writes at most 1 MiB; full declared partial size is reserved alongside retained payload in the account budget | Source/attempt/expiry fences on every write; terminal/parked state, success, source removal and explicit removal cascade cleanup. A 24-hour last-progress expiry is reclaimed in batches of 64 by non-frozen maintenance even when acquisition is disabled. Strong ETag, exact locator and ciphertext identity gate Range reuse. |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 

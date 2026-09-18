@@ -12,7 +12,7 @@ Tracking: [projection plan #1742](https://github.com/marmot-protocol/mdk/issues/
 Source audit: master `ebb884b8` (MDK 0.10.1). This is an implementation plan;
 C8-A storage discovery and C8-B runtime/native discovery are implemented. C8-C1
 adds the durable storage foundation below. C8-C2 connects automatic worker acquisition;
-partial/range resume (C8-C3) and native retained-byte access (C8-D) remain later slices.
+C8-C3 adds protected partial/range resume; native retained-byte access (C8-D) remains separate.
 
 ## Problem and existing foundation
 
@@ -195,9 +195,8 @@ old completions remain fenced, and existing retry deadlines/ready bytes are unch
 Expired leases remain a fallback for interruption recovery.
 Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; no automatic LRU applies.
 
-C8-C2 retries complete bodies. It does **not** persist partial ciphertext or implement byte-offset
-resume. C8-C3 will add protected partials, Range/validator semantics and cleanup. C8-D will
-expose native availability/local bytes/progress and explicit remove/download-again operations.
+C8-C2 introduced complete-body retries. C8-C3 below preserves compatible partial transfers.
+C8-D will expose native availability/local bytes/progress and explicit remove/download-again operations.
 Before enabling acquisition by default, complete C8-D access/removal/policy controls,
 and validate shorter background transfer/idle deadlines, recent-message priority over
 backfill, size-limit re-admission when policy increases, and explicit invalid-policy
@@ -206,6 +205,56 @@ demand in queue order, blocks over-limit responses until explicit retry, and pau
 for invalid zero/over-ceiling transfer limits. These are tracked enablement gates.
 The legacy download API continues returning transient bytes until clients adopt that contract.
 [#1437](https://github.com/marmot-protocol/mdk/issues/1437) stays open across those slices.
+
+## C8-C3: protected partial downloads and Range resume
+
+Migration 85 stores ciphertext chunks and bounded validator metadata in the same SQLCipher
+account store. It creates no transfers on upgrade. Checkpoints append at an exact offset,
+in chunks of at most 1 MiB; every append rechecks the store/attempt, retained source,
+acceptance, expiry and combined retained-plus-reserved payload budget. Filesystem reserve
+is checked off the account worker before each checkpoint. No plaintext partial is stored
+or exposed. A cancelled transfer may lose its last uncommitted chunk; completed checkpoints
+survive process death and the existing startup attempt reclamation.
+
+The representation is bound to the admitted source, ciphertext digest, exact URL digest,
+strong ETag and known total length. Raw URLs are not duplicated in partial metadata.
+Resume sends `Range` and `If-Range` through the existing address-pinned, redirect-vetted
+HTTP path, with identity encoding. A `206` must describe the exact remaining suffix and
+same strong validator/total. A `200` starts a replacement body; the old checkpoint survives
+until a replacement checkpoint or final publication. Changed/missing validators, unusable
+ranges (including unknown totals), or a `416` discard the incompatible prefix and retry
+once from zero. Repeated invalid ranges, unsupported encoding and over-limit bodies fail closed. Servers without
+a strong ETag or known length still support complete downloads without durable checkpoints.
+Validator comparison follows [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-range);
+Last-Modified-only resume is deliberately not implemented.
+
+Each locator has its own validator scope; failover never combines a prefix from a different
+URL even when its ETag string matches. Candidate failure cleanup is fenced by ciphertext
+and final response URL (including redirects), so a bad alternative server cannot erase an
+unused prefix from another locator. Retryable redirect failures preserve valid checkpoints.
+Chunks carry local SHA-256 checksums to detect damaged checkpoint contents. The normal complete ciphertext hash, AEAD authentication and plaintext
+hash checks remain mandatory before publication. A ciphertext hash miss on a body containing
+saved checkpoint bytes discards that checkpoint and schedules a clean download on the durable
+retry path. A fresh full-download hash miss remains terminal. The regression
+`attachment_resume_hash_miss_retries_from_zero_after_reopen` covers both outcomes across
+store reopen, including a fully saved checkpoint. Resume still assembles a bounded full body
+for the existing crypto pipeline; it does not add streaming plaintext decryption.
+
+The first checkpoint reserves the complete declared ciphertext size against the same account
+budget as retained plaintext. Worker admission, append and publication share this accounting;
+existing prefixes can finish when reservations fill the budget. New demand pauses without
+spending transfer attempts. Atomic publication replaces its own reservation while preserving
+other jobs' allocations. Complete small responses skip the final checkpoint write. No retained-byte eviction is introduced. Success, terminal/parked state,
+source removal/invalidation, explicit removal and store reset delete partials transactionally.
+Expired message jobs cascade to their partials. Abandoned checkpoints expire 24 hours after
+last progress, reclaimed in indexed batches of 64 by non-frozen worker maintenance, including
+when acquisition is disabled. Disabling acquisition does not erase already acquired bytes.
+This temporary checkpoint lifetime does not change the agreed retained-media lifetime.
+
+Tests cover interrupted HTTP plus encrypted reopen and verified publication, task cancellation,
+Range ignored, changed/weak validators, malformed ranges, ciphertext corruption, over-limit
+responses, locator failover, bounded quota/rollback, chunk corruption and lifecycle fences.
+C8-D native availability, progress, controls and default enablement remain outstanding.
 
 ## Issue audit and exclusions
 

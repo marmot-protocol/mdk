@@ -45,21 +45,29 @@ async fn report(
 async fn missing_eose_exhausts_overall_budget_and_retains_prefix() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    // Setup and SQLCipher checkpoints can exceed this short budget under CI
-    // contention. Advance the repair deadline with Tokio timers, not wall time.
-    tokio::time::pause();
     let before = relay.subscription_count();
     let prefix = SyncSummary {
         joined_groups: vec![GroupId::new(vec![42])],
         ..Default::default()
     };
     client.pending_failed_sync_summary.merge(prefix.clone());
+    // Exercise missing EOSE after activation, not the speed of route/signing
+    // setup. Under CI load an 80 ms end-to-end budget can expire before the
+    // repair activates; that correctly leaves the prefix buffered for later.
+    client.runtime.activate_transport(None).await.unwrap();
+    let (summary, verdict) = client
+        .drain_full_history_repair(
+            &mut DrainCounts::default(),
+            &FullHistoryRepairControl {
+                started: Instant::now(),
+                timeout: Duration::from_millis(80),
+                cancelled: &|| false,
+            },
+        )
+        .await
+        .unwrap();
     let failure = client
-        .repair_full_history_with_control(&FullHistoryRepairControl {
-            started: tokio::time::Instant::now(),
-            timeout: Duration::from_millis(80),
-            cancelled: &|| false,
-        })
+        .finish_full_history_repair(summary, verdict)
         .await
         .unwrap_err();
     assert!(
@@ -98,7 +106,7 @@ async fn delayed_eose_completes_same_attempt_across_multiple_checkpoints() {
         false
     };
     let control = FullHistoryRepairControl {
-        started: tokio::time::Instant::now(),
+        started: Instant::now(),
         timeout: Duration::from_secs(2),
         cancelled: &cancelled,
     };
@@ -136,7 +144,7 @@ async fn cancellation_retains_prefix_and_old_eose_cannot_complete_next_attempt()
     let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= 4;
     let failure = client
         .repair_full_history_with_control(&FullHistoryRepairControl {
-            started: tokio::time::Instant::now(),
+            started: Instant::now(),
             timeout: Duration::from_secs(2),
             cancelled: &cancelled,
         })
@@ -152,7 +160,7 @@ async fn cancellation_retains_prefix_and_old_eose_cannot_complete_next_attempt()
     let old = relay.accepted_subscriptions();
     assert_eq!(old.len(), before + 1);
     let control = FullHistoryRepairControl {
-        started: tokio::time::Instant::now(),
+        started: Instant::now(),
         timeout: Duration::from_millis(100),
         cancelled: &|| false,
     };
@@ -230,7 +238,7 @@ async fn delayed_overflow_repair_clears_only_its_own_durable_generation() {
             false
         };
         let control = FullHistoryRepairControl {
-            started: tokio::time::Instant::now(),
+            started: Instant::now(),
             timeout: Duration::from_secs(2),
             cancelled: &cancelled,
         };
@@ -271,7 +279,7 @@ async fn unfinished_overflow_repair_survives_reopen() {
     client.delivery_overflow_recovery_marker_token = Some(7);
     let result = client
         .repair_full_history_with_control(&FullHistoryRepairControl {
-            started: tokio::time::Instant::now(),
+            started: Instant::now(),
             timeout: Duration::from_millis(80),
             cancelled: &|| false,
         })
@@ -310,7 +318,7 @@ async fn one_fast_endpoint_cannot_complete_full_history_repair() {
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let before = relay.subscription_count();
     let control = FullHistoryRepairControl {
-        started: tokio::time::Instant::now(),
+        started: Instant::now(),
         timeout: Duration::from_millis(80),
         cancelled: &|| false,
     };

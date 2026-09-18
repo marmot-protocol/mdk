@@ -70,10 +70,9 @@ fn admit_demands(
     Ok(more)
 }
 
-fn capacity(policy: &crate::AttachmentAcquisitionPolicy, retained: u64, free: u64) -> bool {
+fn capacity(policy: &crate::AttachmentAcquisitionPolicy, free: u64) -> bool {
     let max = policy.maximum_transfer_bytes;
     max > 0 && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
-        && retained.saturating_add(max) <= policy.retained_bytes_per_account
         // Conservative full-object reservation for SQLite pages, journal and WAL.
         && free >= policy.minimum_free_disk_bytes.saturating_add(max.saturating_mul(4))
 }
@@ -99,16 +98,18 @@ pub(super) fn schedule(
 ) -> Result<bool, AppError> {
     // Release an acquired global permit on every early/error return.
     let held_permit = admission.permit.take();
-    let Some(policy) = &client.app.config.attachment_acquisition else {
-        admission.waiting = None;
-        return Ok(false);
-    };
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen {
         admission.waiting = None;
         return Ok(false);
     }
     let storage = client.app.account_storage(&client.state.label)?;
     let now = crate::unix_now_seconds();
+    // Abandoned ciphertext expires even after automatic acquisition is disabled.
+    let partials = storage.prune_attachment_partials(now, 64)?;
+    let Some(policy) = &client.app.config.attachment_acquisition else {
+        admission.waiting = None;
+        return Ok(partials == 64);
+    };
     if !admission.resumed {
         if storage.resume_attachment_acquisitions(now, 64)? == 64 {
             return Ok(true);
@@ -120,7 +121,8 @@ pub(super) fn schedule(
         &storage,
         now,
         client.app.config.allow_loopback_blob_endpoints,
-    )? || expired == 64;
+    )? || expired == 64
+        || partials == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
     // Admission never evicts an acquired asset and never increments attempts while paused.
     if http.permits.available_permits() <= 1 {
@@ -128,7 +130,7 @@ pub(super) fn schedule(
         return Ok(more);
     }
     let free = fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
-    if !capacity(policy, storage.retained_attachment_byte_count()?, free) {
+    if !capacity(policy, free) {
         admission.waiting = None;
         return Ok(more);
     }
@@ -147,6 +149,16 @@ pub(super) fn schedule(
         return Ok(more);
     };
     for candidate in candidates {
+        if !storage.attachment_acquisition_fits_budget(
+            &candidate,
+            policy.maximum_transfer_bytes,
+            policy.retained_bytes_per_account,
+        )? {
+            // Defer without spending an attempt. This also lets reserved prefixes
+            // beyond the bounded candidate page reach the worker under pressure.
+            storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
+            continue;
+        }
         let Some(source) = storage.prepare_attachment_acquisition(&candidate, now)? else {
             continue;
         };
@@ -164,6 +176,13 @@ pub(super) fn schedule(
                 storage.finish_attachment_preparation(&candidate, now, None)?;
                 continue;
             }
+        };
+        let Some(ciphertext_digest) = hex::decode(&reference.ciphertext_sha256)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+        else {
+            storage.finish_attachment_preparation(&candidate, now, None)?;
+            continue;
         };
         let prepared = match client.prepare_background_attachment_download(
             &group,
@@ -193,11 +212,19 @@ pub(super) fn schedule(
             continue;
         };
         let byte_budget = policy.retained_bytes_per_account;
+        let resume = crate::media::attachment_resume::AttachmentResume {
+            storage: storage.clone(),
+            job: job.clone(),
+            ciphertext_digest,
+            budget: byte_budget,
+            directory: client.app.account_dir(&client.state.label),
+            disk_reserve: policy.minimum_free_disk_bytes,
+        };
         spawn_media_http(
             http,
             permit,
             async move {
-                let result = prepared.run_classified().await;
+                let result = prepared.run_classified(resume).await;
                 MediaHttpCompletion::Attachment {
                     job,
                     result,
