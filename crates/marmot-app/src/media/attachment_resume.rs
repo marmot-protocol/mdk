@@ -8,6 +8,11 @@ use storage_sqlite::{
     AttachmentPartialIdentity, SqliteAccountStorage,
 };
 
+pub(crate) const AUTOMATIC_TRANSFER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Clone)]
 pub(crate) struct AttachmentResume {
     pub storage: SqliteAccountStorage,
@@ -246,7 +251,7 @@ pub(super) async fn read_body(
                 .map_err(|_| retry("request timed out"))?
                 .map_err(|_| retry("body transfer failed"))
         } else {
-            tokio::time::timeout(std::time::Duration::from_secs(30), response.chunk())
+            tokio::time::timeout(BODY_IDLE_TIMEOUT, response.chunk())
                 .await
                 .map_err(|_| retry("body idle timeout"))
                 .and_then(|r| r.map_err(|_| retry("body transfer failed")))
@@ -273,7 +278,7 @@ pub(super) async fn read_body(
             return Err(stop("download exceeds response size bound"));
         }
         bytes.extend_from_slice(&chunk);
-        if reported.elapsed() >= std::time::Duration::from_millis(250) {
+        if reported.elapsed() >= PROGRESS_INTERVAL {
             context
                 .progress(bytes.len() as u64, expected_total, false)
                 .await?;

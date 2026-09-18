@@ -50,6 +50,14 @@ pub struct AttachmentTransferStatus {
     pub retry_at: Option<u64>,
 }
 
+/// One consistent metadata frame plus the next local visibility deadline.
+#[derive(Clone, Debug)]
+pub struct AttachmentTransferFrame {
+    pub store_epoch: Vec<u8>,
+    pub rows: Vec<Option<AttachmentTransferStatus>>,
+    pub next_expiry: Option<u64>,
+}
+
 impl SqliteAccountStorage {
     /// Capture store identity and all bounded source slots under one read transaction.
     pub fn attachment_transfer_snapshot(
@@ -58,23 +66,35 @@ impl SqliteAccountStorage {
         targets: &[(&str, &str, u32)],
         now: u64,
         automatic: bool,
-    ) -> StorageResult<(Vec<u8>, Vec<Option<AttachmentTransferStatus>>)> {
+    ) -> StorageResult<AttachmentTransferFrame> {
         if targets.len() > 64 {
             return Err(invalid("too many attachment targets"));
         }
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let identity = epoch(&conn)?;
-            drop(conn); // The outer transaction remains owned by this thread.
+        self.connection.with_deferred_read(|conn| {
+            let identity = epoch(conn)?;
+            let mut next_expiry = None;
             let rows = targets
                 .iter()
-                .map(|(message, source, index)| {
-                    self.attachment_transfer_status(group, message, source, *index, now, automatic)
+                .map(|target| {
+                    transfer_status(
+                        conn,
+                        &identity,
+                        group,
+                        *target,
+                        now,
+                        automatic,
+                        &mut next_expiry,
+                    )
                 })
                 .collect::<StorageResult<Vec<_>>>()?;
-            Ok((identity, rows))
+            Ok(AttachmentTransferFrame {
+                store_epoch: identity,
+                rows,
+                next_expiry,
+            })
         })
     }
+
     pub fn attachment_download_policy(
         &self,
         fallback: &AttachmentDownloadPolicy,
@@ -162,15 +182,16 @@ impl SqliteAccountStorage {
         }
         let conn = self.lock()?;
         let epoch = epoch(&conn)?;
-        // A concrete predicate lets SQLite seek directly into explicit work when
-        // automatic acquisition is disabled, without scanning the paused backlog.
-        let explicit_filter = if automatic {
-            ""
+        // Seek only due work before ordering eligible candidates by priority. The
+        // explicit-only index also skips paused automatic work. Future backoff
+        // and live leases must not be visited on every worker wakeup.
+        let (index, explicit_filter) = if automatic {
+            ("attachment_acquisition_due", "")
         } else {
-            " AND explicit_request=1"
+            ("attachment_acquisition_priority", " AND explicit_request=1")
         };
         let sql = format!(
-            "SELECT token FROM attachment_acquisition INDEXED BY attachment_acquisition_priority
+            "SELECT token FROM attachment_acquisition INDEXED BY {index}
             WHERE due IS NOT NULL AND due<=?1 AND cancelled=0{explicit_filter}
             ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2"
         );
@@ -218,11 +239,11 @@ impl SqliteAccountStorage {
         }
         conn.execute(
             "UPDATE attachment_acquisition SET
-            state=CASE WHEN explicit_request=1 AND ?3<536870912 THEN 0 ELSE 4 END,
-            due=CASE WHEN explicit_request=1 AND ?3<536870912 THEN ?4 ELSE NULL END,
-            attempt=NULL,size_blocked_max=CASE WHEN explicit_request=1 AND ?3<536870912 THEN NULL ELSE ?3 END
+            state=CASE WHEN explicit_request=1 AND ?3<?5 THEN 0 ELSE 4 END,
+            due=CASE WHEN explicit_request=1 AND ?3<?5 THEN ?4 ELSE NULL END,
+            attempt=NULL,size_blocked_max=CASE WHEN explicit_request=1 AND ?3<?5 THEN NULL ELSE ?3 END
             WHERE token=?1 AND state=1 AND attempt=?2",
-            params![job.reference.token, job.attempt, u64_to_i64(max)?,u64_to_i64(now)?],
+            params![job.reference.token, job.attempt, u64_to_i64(max)?,u64_to_i64(now)?, MAX_RETAINED_ATTACHMENT_BYTES as i64],
         )
         .storage()?;
         Ok(())
@@ -264,47 +285,16 @@ impl SqliteAccountStorage {
         now: u64,
         automatic: bool,
     ) -> StorageResult<Option<AttachmentTransferStatus>> {
-        self.connection.with_transaction(|| {
-            let conn=self.lock()?;
-            let visible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
-                WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.source_message_id_hex=?3 AND h.attachment_index=?4 AND h.visible=1
-                AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?5))",params![group,message,source,index,u64_to_i64(now)?],|r|r.get(0)).storage()?;
-            if !visible {return Ok(None);}
-            let removed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",params![group,message,index],|r|r.get(0)).storage()?;
-            let status=conn.query_row(&format!("SELECT token,state,cancelled,explicit_request,size_blocked_max,progress_epoch,progress_received,progress_total,progress_phase,due
-                FROM attachment_acquisition q WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND {SOURCE_MATCH}"),params![group,message,source,index],|r| {
-                let stored_state = r.get::<_,u8>(1)?;
-                let cancelled = r.get::<_,bool>(2)?;
-                let explicit = r.get::<_,bool>(3)?;
-                let size_blocked = r.get::<_,Option<i64>>(4)?.is_some();
-                let phase = r.get::<_,u8>(8)?;
-                let state = match stored_state {
-                    3 => AttachmentTransferState::Ready,
-                    _ if cancelled => AttachmentTransferState::Cancelled,
-                    _ if size_blocked => AttachmentTransferState::PolicyBlocked,
-                    4 => AttachmentTransferState::Failed,
-                    _ if !automatic && !explicit => AttachmentTransferState::Paused,
-                    0 => AttachmentTransferState::Queued,
-                    1 => match phase {
-                        2 => AttachmentTransferState::VerifyingCiphertext,
-                        3 => AttachmentTransferState::Decrypting,
-                        4 => AttachmentTransferState::VerifyingPlaintext,
-                        _ => AttachmentTransferState::Downloading,
-                    },
-                    2 => AttachmentTransferState::RetryScheduled,
-                    5 => AttachmentTransferState::Paused,
-                    _ => AttachmentTransferState::Failed,
-                };
-                Ok((
-                    r.get::<_,Vec<u8>>(0)?, state, nonnegative(r,5)?, nonnegative(r,6)?,
-                    r.get::<_,Option<i64>>(7)?.map(|v|v as u64),
-                    r.get::<_,Option<i64>>(9)?.map(|v|v as u64),
-                ))
-            }).optional().storage()?;
-            Ok(Some(match status {
-                Some((token,state,attempt,received,total,retry_at))=>AttachmentTransferStatus {reference:Some(AttachmentAssetRef{store_epoch:epoch(&conn)?,token}),state,attempt,received,total,retry_at:if state==AttachmentTransferState::RetryScheduled {retry_at}else{None}},
-                None=>AttachmentTransferStatus {reference:None,state:if removed {AttachmentTransferState::Removed}else{AttachmentTransferState::NotRequested},attempt:0,received:0,total:None,retry_at:None}
-            }))
+        self.connection.with_deferred_read(|conn| {
+            transfer_status(
+                conn,
+                &epoch(conn)?,
+                group,
+                (message, source, index),
+                now,
+                automatic,
+                &mut None,
+            )
         })
     }
 }
@@ -352,4 +342,88 @@ impl SqliteAccountStorage {
             Ok(true)
         })
     }
+}
+
+fn transfer_status(
+    conn: &rusqlite::Connection,
+    identity: &[u8],
+    group: &str,
+    target: (&str, &str, u32),
+    now: u64,
+    automatic: bool,
+    next_expiry: &mut Option<u64>,
+) -> StorageResult<Option<AttachmentTransferStatus>> {
+    let (message, source, index) = target;
+    let expiry: Option<Option<i64>> = conn.query_row("SELECT a.retention_expires_at
+        FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
+        WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.source_message_id_hex=?3 AND h.attachment_index=?4 AND h.visible=1
+        AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?5)",params![group,message,source,index,u64_to_i64(now)?],|r|r.get(0)).optional().storage()?;
+    let Some(expiry) = expiry else {
+        return Ok(None);
+    };
+    if let Some(expiry) = expiry {
+        let expiry = expiry as u64;
+        *next_expiry = Some(next_expiry.map_or(expiry, |old| old.min(expiry)));
+    }
+
+    let removed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",params![group,message,index],|r|r.get(0)).storage()?;
+    let status=conn.query_row(&format!("SELECT token,state,cancelled,explicit_request,size_blocked_max,progress_epoch,progress_received,progress_total,progress_phase,due
+                FROM attachment_acquisition q WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND {SOURCE_MATCH}"),params![group,message,source,index],|r| {
+                let stored_state = r.get::<_,u8>(1)?;
+                let cancelled = r.get::<_,bool>(2)?;
+                let explicit = r.get::<_,bool>(3)?;
+                let size_blocked = r.get::<_,Option<i64>>(4)?.is_some();
+                let phase = r.get::<_,u8>(8)?;
+                let state = match stored_state {
+                    3 => AttachmentTransferState::Ready,
+                    _ if cancelled => AttachmentTransferState::Cancelled,
+                    _ if size_blocked => AttachmentTransferState::PolicyBlocked,
+                    4 => AttachmentTransferState::Failed,
+                    _ if !automatic && !explicit => AttachmentTransferState::Paused,
+                    0 => AttachmentTransferState::Queued,
+                    1 => match phase {
+                        2 => AttachmentTransferState::VerifyingCiphertext,
+                        3 => AttachmentTransferState::Decrypting,
+                        4 => AttachmentTransferState::VerifyingPlaintext,
+                        _ => AttachmentTransferState::Downloading,
+                    },
+                    2 => AttachmentTransferState::RetryScheduled,
+                    5 => AttachmentTransferState::Paused,
+                    _ => AttachmentTransferState::Failed,
+                };
+                Ok((
+                    r.get::<_,Vec<u8>>(0)?, state, nonnegative(r,5)?, nonnegative(r,6)?,
+                    r.get::<_,Option<i64>>(7)?.map(|v|v as u64),
+                    r.get::<_,Option<i64>>(9)?.map(|v|v as u64),
+                ))
+            }).optional().storage()?;
+    Ok(Some(match status {
+        Some((token, state, attempt, received, total, retry_at)) => AttachmentTransferStatus {
+            reference: Some(AttachmentAssetRef {
+                store_epoch: identity.to_vec(),
+                token,
+            }),
+            state,
+            attempt,
+            received,
+            total,
+            retry_at: if state == AttachmentTransferState::RetryScheduled {
+                retry_at
+            } else {
+                None
+            },
+        },
+        None => AttachmentTransferStatus {
+            reference: None,
+            state: if removed {
+                AttachmentTransferState::Removed
+            } else {
+                AttachmentTransferState::NotRequested
+            },
+            attempt: 0,
+            received: 0,
+            total: None,
+            retry_at: None,
+        },
+    }))
 }

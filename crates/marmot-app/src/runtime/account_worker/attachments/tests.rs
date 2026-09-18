@@ -592,3 +592,23 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     assert_eq!(progress.retry_at, status.due);
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
 }
+
+#[tokio::test]
+async fn attachment_cancellation_observation_error_is_not_cancellation() {
+    let (_dir, _client, store, _reference) = offline_fixture().await;
+    let now = crate::unix_now_seconds();
+    admit_demands(&store, now, false).unwrap();
+    let asset = store.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    let job = store
+        .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
+        .unwrap()
+        .unwrap();
+    let (_updates, watch) = watch::channel(());
+    store.close().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), cancelled(store, job, watch))
+            .await
+            .is_err(),
+        "an unobservable store must not masquerade as a durable cancel"
+    );
+}

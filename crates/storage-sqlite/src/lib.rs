@@ -136,5 +136,6 @@ pub use timeline::reports::{
 };
 
 pub use attachment_acquisition::{
-    AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
+    AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
+    AttachmentTransferStatus,
 };

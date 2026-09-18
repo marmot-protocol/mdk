@@ -186,7 +186,8 @@ grow; a final remainder below the admission reservation can still stay unused.
 Unknown free space fails closed. These are resource limits, not an OS background-execution
 entitlement or mobile throughput evidence.
 
-Network failures back off durably from 15 seconds to one hour. Unavailable local
+Network failures back off durably from 15 seconds to one hour. New durable ciphertext
+checkpoint progress resets the failure streak; replaying an existing prefix does not. Unavailable local
 policy/secrets defer one candidate for 15 seconds before claiming it; no transfer attempt
 is consumed and due siblings keep their deadlines. Integrity/decryption failures,
 publication digest mismatches and over-limit responses require explicit retry;
@@ -323,9 +324,17 @@ and clears counters before HTTP starts; a later body restart or locator fallback
 again. The first body belongs to the claimed generation. Metadata write failures cannot mask
 integrity failures. Progress notifications do not wake the cancellation monitor; a separate
 control signal interrupts it immediately, with a one-second fallback for cross-writer changes.
-Visible subscriptions also refresh once per second for expiry and cross-writer updates.
+Snapshots use a deferred read transaction and load store identity once per frame. Active
+subscriptions keep a one-second fallback. Idle/terminal subscriptions refresh at most every
+30 seconds, or at their next known retention expiry if earlier; control and presentation
+notifications wake them promptly. Cross-writer changes without a notification may take up
+to 30 seconds to appear while idle. Every byte read still revalidates source/expiry immediately.
 
 Explicit requests precede automatic work, and recent incoming sources precede older backfill.
+Candidate queries seek the due range before sorting eligible jobs by priority, so future
+backoff and active leases are not scanned. The explicit-only path also seeks past disabled
+automatic work. Priority sorting still visits currently eligible jobs; this is not a claim
+of constant work for an arbitrarily large due backlog.
 The global one-transfer permit uses FIFO account admission. Transfer/idle deadlines prevent a
 stalled server retaining that slot indefinitely. Raising the automatic cap readmits size-policy
 failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy

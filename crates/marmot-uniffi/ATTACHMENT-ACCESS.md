@@ -18,10 +18,14 @@ reference means no readable retained bytes, including missing/in-flight/removed/
 or obsolete sources; it is **not** a download failure, progress event or request to fetch.
 An available empty file has a non-null reference and a zero byte count.
 
-The call loads no payload bytes and starts no download or engine worker. Rust automatic
-acquisition still requires explicit opt-in; this PR does not enable it for native apps.
-Keep using existing client acquisition/cache paths until C8-D2 controls and the enablement
-gates are available. Local access is useful only when MDK has acquired/published the bytes.
+The call loads no payload bytes and starts no download or engine worker. Automatic
+acquisition defaults on when the account runtime is running; use the C8-D2 controls below
+to observe transfers, remove local files, or change the durable per-account policy.
+Local access is useful only when MDK has acquired/published the bytes. Coordinate client
+adoption of those controls with the binding release (C9); publishing an MDK release alone
+does not add that UI to a client. Hosts needing a network-specific policy can set
+`automatic=false` before starting the runtime; toggling this flag cancels active automatic
+leases while preserving partials, explicit requests and retained files.
 
 ## Read and lifetime
 
@@ -110,3 +114,8 @@ Raising the cap readmits size-policy failures, never cryptographic failures. The
 
 Regenerate Swift/Kotlin bindings and C headers with the matching library. Release/client adoption,
 large-file chunk overhead and device measurements remain C9 work; retain host caches until validated.
+
+Idle transfer subscriptions use a 30-second fallback, shortened to the next known retention
+expiry. Controls and presentation notifications wake them promptly; active rows retain a
+one-second fallback. Cross-writer changes without notifications can take up to 30 seconds
+while idle. Local-byte reads always revalidate visibility and expiry immediately.

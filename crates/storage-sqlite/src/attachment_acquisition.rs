@@ -51,6 +51,7 @@ pub enum AttachmentDemand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentAcquisitionStatus {
     pub state: AttachmentAcquisitionState,
+    /// Claims since the last durable forward checkpoint (the retry failure streak).
     pub attempts: u64,
     pub due: Option<u64>,
     pub byte_count: u64,
@@ -864,4 +865,7 @@ mod access;
 pub use access::RetainedAttachmentAsset;
 
 mod controls;
-pub use controls::{AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus};
+pub use controls::{
+    AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
+    AttachmentTransferStatus,
+};

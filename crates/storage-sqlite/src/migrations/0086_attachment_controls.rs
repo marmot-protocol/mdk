@@ -18,7 +18,7 @@ CREATE TRIGGER attachment_acquisition_priority_update AFTER UPDATE OF received_a
  UPDATE attachment_acquisition SET priority_at=NEW.received_at
  WHERE group_id_hex=NEW.group_id_hex AND message_id_hex=NEW.message_id_hex AND attachment_index=NEW.attachment_index;
 END;
-CREATE INDEX attachment_acquisition_priority ON attachment_acquisition(explicit_request DESC,priority_at DESC,due,token) WHERE due IS NOT NULL;
+CREATE INDEX attachment_acquisition_priority ON attachment_acquisition(explicit_request DESC,due,priority_at DESC,token) WHERE due IS NOT NULL;
 ALTER TABLE attachment_acquisition ADD COLUMN progress_epoch INTEGER NOT NULL DEFAULT 0 CHECK(progress_epoch>=0);
 ALTER TABLE attachment_acquisition ADD COLUMN progress_received INTEGER NOT NULL DEFAULT 0 CHECK(progress_received>=0);
 ALTER TABLE attachment_acquisition ADD COLUMN progress_total INTEGER CHECK(progress_total>=progress_received);

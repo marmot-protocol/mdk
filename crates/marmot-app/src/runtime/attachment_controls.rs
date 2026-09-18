@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 pub use storage_sqlite::{
     AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 
 #[derive(Clone, Copy, Debug)]
 pub enum AttachmentControl {
@@ -132,7 +132,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group: &GroupId,
         mut targets: Vec<AttachmentLocalTarget>,
-    ) -> Result<(Vec<u8>, Vec<Option<AttachmentTransferStatus>>), AppError> {
+    ) -> Result<storage_sqlite::AttachmentTransferFrame, AppError> {
         super::attachment_access::validate_targets(&mut targets)?;
         let group = hex::encode(group.as_slice());
         let fallback = default_policy(&self.accounts.app.config);
@@ -168,7 +168,7 @@ impl MarmotAppRuntime {
     ) -> Result<Vec<Option<AttachmentTransferStatus>>, AppError> {
         self.attachment_transfer_frame(account_ref, group, targets)
             .await
-            .map(|(_, rows)| rows)
+            .map(|frame| frame.rows)
     }
     /// Initial snapshot followed by coalesced replacement snapshots, at most four
     /// per second. No unbounded event queue or per-byte FFI callback. Drop/close
@@ -180,7 +180,12 @@ impl MarmotAppRuntime {
         targets: Vec<AttachmentLocalTarget>,
     ) -> Result<Arc<RuntimeAttachmentTransferSubscription>, AppError> {
         let updates = self.shared.attachment_updates.subscribe();
-        let (identity, rows) = self
+        let presentation = self.accounts.app.presentation_signals.updates.subscribe();
+        let storage_sqlite::AttachmentTransferFrame {
+            store_epoch: identity,
+            rows,
+            next_expiry,
+        } = self
             .attachment_transfer_frame(account_ref, group, targets.clone())
             .await?;
         Ok(Arc::new(RuntimeAttachmentTransferSubscription {
@@ -192,6 +197,8 @@ impl MarmotAppRuntime {
             closed: watch::channel(false).0,
             state: Mutex::new(TransferSubscriptionState {
                 updates,
+                presentation,
+                next_expiry,
                 rows,
                 initial: true,
                 last: tokio::time::Instant::now(),
@@ -202,6 +209,8 @@ impl MarmotAppRuntime {
 
 struct TransferSubscriptionState {
     updates: watch::Receiver<()>,
+    presentation: broadcast::Receiver<crate::chat_presentation::signals::PresentationInvalidation>,
+    next_expiry: Option<u64>,
     rows: Vec<Option<AttachmentTransferStatus>>,
     initial: bool,
     last: tokio::time::Instant,
@@ -229,7 +238,11 @@ impl RuntimeAttachmentTransferSubscription {
         if state.initial {
             // A handle may sit unused across deletion or account reconstruction.
             // Revalidate before exposing its first metadata frame too.
-            let (identity, rows) = self
+            let storage_sqlite::AttachmentTransferFrame {
+                store_epoch: identity,
+                rows,
+                next_expiry,
+            } = self
                 .runtime
                 .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
                 .await?;
@@ -241,18 +254,28 @@ impl RuntimeAttachmentTransferSubscription {
                 return Ok(None);
             }
             state.rows = rows;
+            state.next_expiry = next_expiry;
             state.initial = false;
             state.last = tokio::time::Instant::now();
             return Ok(Some(state.rows.clone()));
         }
         loop {
+            let interval =
+                refresh_interval(&state.rows, state.next_expiry, crate::unix_now_seconds());
+            let TransferSubscriptionState {
+                updates,
+                presentation,
+                ..
+            } = &mut *state;
             tokio::select! {
                 biased;
                 _ = closed.changed()=>return Ok(None),
                 _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
-                _ = state.updates.changed()=>{},
-                // Visibility/expiry and changes made by another writer need no HTTP event.
-                _ = tokio::time::sleep(Duration::from_secs(1))=>{},
+                _ = updates.changed()=>{},
+                _ = presentation.recv()=>{},
+                // Slow idle fallback covers external writers; known expiry gets
+                // its own deadline even when every row is already ready.
+                _ = tokio::time::sleep(interval)=>{},
             }
             tokio::select! {
                 biased;
@@ -260,7 +283,11 @@ impl RuntimeAttachmentTransferSubscription {
                 _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
                 _ = tokio::time::sleep_until(state.last+Duration::from_millis(250))=>{},
             }
-            let (identity, rows) = self
+            let storage_sqlite::AttachmentTransferFrame {
+                store_epoch: identity,
+                rows,
+                next_expiry,
+            } = self
                 .runtime
                 .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
                 .await?;
@@ -272,10 +299,57 @@ impl RuntimeAttachmentTransferSubscription {
                 return Ok(None);
             }
             state.last = tokio::time::Instant::now();
+            state.next_expiry = next_expiry;
             if rows != state.rows {
                 state.rows = rows.clone();
                 return Ok(Some(rows));
             }
         }
+    }
+}
+
+fn refresh_interval(
+    rows: &[Option<AttachmentTransferStatus>],
+    next_expiry: Option<u64>,
+    now: u64,
+) -> Duration {
+    let active = rows.iter().flatten().any(|row| {
+        matches!(
+            row.state,
+            AttachmentTransferState::Queued
+                | AttachmentTransferState::Downloading
+                | AttachmentTransferState::VerifyingCiphertext
+                | AttachmentTransferState::Decrypting
+                | AttachmentTransferState::VerifyingPlaintext
+                | AttachmentTransferState::RetryScheduled
+        )
+    });
+    let seconds = if active { 1 } else { 30 };
+    Duration::from_secs(
+        next_expiry.map_or(seconds, |expiry| seconds.min(expiry.saturating_sub(now))),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn attachment_idle_refresh_is_slow_but_never_misses_known_expiry() {
+        let mut rows = vec![Some(AttachmentTransferStatus {
+            reference: None,
+            state: AttachmentTransferState::Ready,
+            attempt: 0,
+            received: 0,
+            total: None,
+            retry_at: None,
+        })];
+        assert_eq!(refresh_interval(&rows, None, 10), Duration::from_secs(30));
+        assert_eq!(
+            refresh_interval(&rows, Some(12), 10),
+            Duration::from_secs(2)
+        );
+        assert_eq!(refresh_interval(&rows, Some(10), 10), Duration::ZERO);
+        rows[0].as_mut().unwrap().state = AttachmentTransferState::Downloading;
+        assert_eq!(refresh_interval(&rows, None, 10), Duration::from_secs(1));
     }
 }

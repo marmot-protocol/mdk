@@ -89,7 +89,9 @@ async fn cancelled(
             store.attachment_transfer_is_active(&current, crate::unix_now_seconds())
         })
         .await;
-        if !matches!(active, Ok(Ok(true))) {
+        // Failure to observe is not cancellation. The transfer deadline and
+        // publication fence still bound work while a storage read is unavailable.
+        if matches!(active, Ok(Ok(false))) {
             return;
         }
         tokio::select! {
