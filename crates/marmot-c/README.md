@@ -116,7 +116,14 @@ to reuse debug/test-profile dependencies for a faster local or PR smoke run;
 release and scheduled validation use the default release build. On macOS both
 build scripts pin release `strip=none`, matching MarmotKit's Apple policy: Rust's
 debug-stripping path can emit a misaligned Mach-O string table that Xcode 27
-rejects. Optimization remains enabled; Linux packaging is unchanged.
+rejects. Optimization remains enabled; Linux packaging is unchanged. Revisit the
+pin after a Rust toolchain upgrade incorporating
+[rust-lang/rust#158410](https://github.com/rust-lang/rust/pull/158410), and remove it
+only after the default optimized shared/static smoke passes without the override.
+The C CI workflows run on Linux; the Darwin branch currently has local smoke
+evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
+alternating these scripts with an unpinned `cargo build --release` can rebuild
+release dependencies.
 
 ## Audit v4 adoption
 

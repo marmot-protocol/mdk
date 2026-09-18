@@ -47,6 +47,9 @@ Sources:
 
 ## Next implementation scope
 
+This is the proposal at the audited SHA/date. Track implementation progress and
+subsequent decisions in [#1742](https://github.com/marmot-protocol/mdk/issues/1742).
+
 1. **Complete selected list previews.** Add a typed selection for draft (bounded
    text/attachment metadata), message, invitation and empty state. Reuse the
    existing single-draft tables and revisioned acceptance path. Read only drafts
@@ -94,10 +97,13 @@ downgrading the database is unsupported. The release owner chooses the version
 and publishes a synchronized cohort using [release.md](../../../release.md).
 This audit does not change versions or start publication.
 
-### Local evidence
+### Local evidence — point-in-time record, 2026-09-19
 
-Rust sources are the audited master revision; the C scripts include the fix below.
-All checks use Rust 1.97.1 on Apple Silicon with Xcode 27.0.
+These are historical results for Rust sources at
+`dc7ddf752f33e921f265f3ac6394ca4d9f630f41` plus the C-script fix committed in
+`4101583e48028c81b8dd6b044db8f01440b0c335` ([#1918](https://github.com/marmot-protocol/mdk/pull/1918)).
+They are not a continuously updated statement about master or a later release.
+All checks used Rust 1.97.1 on Apple Silicon with Xcode 27.0.
 
 | Check | Result |
 | --- | --- |
@@ -144,10 +150,15 @@ ABI layouts, the compiler version or system linker, and does not patch binaries.
 See the related upstream debug-stripping reports
 [rust-lang/rust#157750](https://github.com/rust-lang/rust/issues/157750) and
 [llvm/llvm-project#203678](https://github.com/llvm/llvm-project/issues/203678).
+The upstream fix is merged in
+[rust-lang/rust#158410](https://github.com/rust-lang/rust/pull/158410); this host
+reproduction uses the repository's pinned Rust 1.97.1. Revisit the override after a
+toolchain upgrade, removing it only after an unmodified optimized smoke passes.
 
 The local C static link reports SDK deployment-target mismatch warnings in native
 dependencies; a smoke pass on this host is not minimum-supported-macOS evidence.
-Published Marmot C currently targets **Linux x86_64**. Apple MarmotKit packages
+Published Marmot C currently targets **Linux x86_64**. C CI also runs on Linux,
+so the Darwin override is covered by local smoke evidence rather than a CI gate. Apple MarmotKit packages
 **static XCFramework slices** and already uses a pinned `strip=none` release
 profile. Host binding-generation checks are useful preflight, but do not
 replace target-specific packaging and consuming-app validation.
