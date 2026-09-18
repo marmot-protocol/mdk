@@ -531,6 +531,8 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
+    key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
@@ -612,7 +614,21 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
+        let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
+            if event.kind == KIND_MARMOT_KEY_PACKAGE
+                && multi_author_only.contains(&event.id)
+                && request.queries.iter().all(|query| query.authors.len() == 1)
+            {
+                return false;
+            }
+            if event.kind == KIND_MARMOT_KEY_PACKAGE
+                && single_author_only.contains(&event.id)
+                && request.queries.iter().any(|query| query.authors.len() > 1)
+            {
+                return false;
+            }
             request
                 .queries
                 .iter()
@@ -9471,8 +9487,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        3,
-        "cold shared outboxes need one discovery batch, one outbox batch, and one KeyPackage batch"
+        11,
+        "three batches plus one preference refetch per untagged member"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9512,8 +9528,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        4,
-        "create must reuse discovery routes but fetch KeyPackages again"
+        20,
+        "create reuses discovery routes but repeats the package batch and eight preference refetches"
     );
 }
 
@@ -9571,8 +9587,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        2,
-        "the completed discovery query already covered the advertised outbox"
+        4,
+        "discovery covers the outbox; package lookup adds a batch and two preference refetches"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
@@ -9585,8 +9601,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        3,
-        "create must repeat only the KeyPackage query"
+        7,
+        "create repeats the package batch and two preference refetches, without relay discovery"
     );
 }
 
@@ -9651,8 +9667,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        4,
-        "both relay-list hops must retry each member after an incomplete batch"
+        6,
+        "both relay-list hops retry each member, and untagged package winners need preference refetches"
     );
 }
 

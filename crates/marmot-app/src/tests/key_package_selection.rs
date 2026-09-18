@@ -189,7 +189,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
 
 #[tokio::test]
 async fn client_preference_is_used_in_batch_and_single_author_fallback() {
-    for reject_batch in [false, true] {
+    for (reject_batch, truncate_batch) in [(false, false), (true, false), (false, true)] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         fetcher
             .reject_multi_author
@@ -217,6 +217,13 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
                 unix_now_seconds(),
             );
             expected.push(white.id.clone());
+            if truncate_batch {
+                fetcher
+                    .key_packages_only_in_single_author
+                    .lock()
+                    .unwrap()
+                    .insert(white.id.clone());
+            }
             fetcher.events.lock().unwrap().extend([amethyst, white]);
         }
         let refs = accounts
@@ -224,6 +231,18 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             .map(|a| a.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let actual = app.resolve_member_key_packages(&refs).await.unwrap();
+        let single_author_lookups = fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| &request.queries)
+            .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
+            .count();
+        assert_eq!(
+            single_author_lookups,
+            if reject_batch || truncate_batch { 2 } else { 0 }
+        );
         assert_eq!(
             actual
                 .iter()
@@ -232,6 +251,59 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let mut expected = Vec::new();
+    for account in &accounts {
+        let package = fresh_key_package_for_account(&app, account, false).await;
+        let now = unix_now_seconds();
+        let old = candidate(
+            account,
+            package.clone(),
+            "white",
+            Some("whitenoise"),
+            now - 20,
+        );
+        let mut replacement = candidate(account, package.clone(), "white", Some("whitenoise"), now);
+        replacement.content = "not base64".into();
+        let fallback = candidate(account, package, "amethyst", Some("amethyst"), now - 10);
+        fetcher
+            .key_packages_only_in_single_author
+            .lock()
+            .unwrap()
+            .insert(old.id.clone());
+        fetcher
+            .key_packages_only_in_multi_author
+            .lock()
+            .unwrap()
+            .insert(replacement.id.clone());
+        expected.push(fallback.id.clone());
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .extend([old, replacement, fallback]);
+    }
+    let refs = accounts
+        .iter()
+        .map(|a| a.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+    let actual = app.resolve_member_key_packages(&refs).await.unwrap();
+    assert_eq!(
+        actual
+            .iter()
+            .map(|kp| hex::encode(kp.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[tokio::test]

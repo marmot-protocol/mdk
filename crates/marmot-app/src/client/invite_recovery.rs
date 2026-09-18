@@ -278,11 +278,17 @@ impl AppClient {
                 if members.is_empty() || group.as_ref().is_none_or(|group| group.is_terminal()) {
                     vec![]
                 } else {
-                    let requirements = self
+                    let requirements = match self
                         .runtime
                         .session()
                         .invite_key_package_requirements(&record.group_id)
-                        .map_err(cgka_session::SessionError::from)?;
+                    {
+                        Ok(requirements) => requirements,
+                        Err(error @ cgka_traits::EngineError::Storage(_)) => {
+                            return Err(cgka_session::SessionError::from(error).into());
+                        }
+                        Err(_) => break,
+                    };
                     match self
                         .app
                         .resolve_compatible_member_key_packages(members, &requirements, true)

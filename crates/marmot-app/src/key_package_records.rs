@@ -128,11 +128,13 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
         .collect()
 }
 
-/// Temporary interoperability policy. Keep separate from cryptographic admission so
+/// Temporary interoperability policy. Retire this ranking when device-aware
+/// delivery in https://github.com/marmot-protocol/mdk/issues/1696 replaces
+/// single-package selection. Keep separate from cryptographic admission so
 /// multi-device selection can replace this preference without changing validity.
 /// Labels are self-asserted and do not authenticate an application; they only
 /// rank candidates after admission checks and never relax cryptographic gates.
-fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
+pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
     let mut tags = event.tags.iter().filter(|tag| {
         tag.first()
             .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
@@ -209,6 +211,10 @@ pub(crate) fn preferred_fresh_key_package_from_records(
         if selected.is_none() || priority > selected_priority {
             selected = Some(fetched);
             selected_priority = priority;
+            // Newest-first order already breaks ties; nothing can outrank this.
+            if selected_priority == 2 {
+                break;
+            }
         }
     }
     if selected.is_none()

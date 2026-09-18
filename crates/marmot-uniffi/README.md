@@ -570,7 +570,14 @@ malformed current publication never revives an older package in the same slot.
 If no usable slot remains, prewarm reports failure while retaining successfully
 discovered routes for other members. Its success must not imply readiness based
 on superseded material. Bounded batch results are not exhaustive, so rejected
-candidates still permit a per-account fallback fetch.
+candidates still permit a per-account fallback fetch. A lower-priority batch
+winner also triggers that fetch to look for a preferred slot omitted by a relay's
+batch limit. Already observed replacements remain authoritative during the refetch.
+Prewarm checks discovery readiness only; it has no proposed group configuration
+and does not guarantee capability compatibility. Final creation/invitation checks
+the actual group's requirements. Device-aware delivery in
+[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
+replacement for this temporary client ranking.
 
 Host applications opt into public tagging at construction. Existing constructors
 remain untagged. Swift hosts can use:

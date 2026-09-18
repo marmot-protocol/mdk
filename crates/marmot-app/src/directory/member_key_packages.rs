@@ -21,7 +21,7 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
-    fresh_relay_list_status_from_records, merge_relay_list_status,
+    fresh_relay_list_status_from_records, key_package_client_priority, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -861,11 +861,13 @@ impl MarmotApp {
             .await;
 
         let mut fallback = Vec::new();
+        let mut fallback_records = BTreeMap::new();
         for (indices, result) in batches {
             let Ok(records) = result else {
                 fallback.extend(indices);
                 continue;
             };
+            let multiple_authors = indices.len() > 1;
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records
@@ -875,7 +877,7 @@ impl MarmotApp {
                     .collect::<Vec<_>>();
                 let selected = preferred_fresh_key_package_from_records(
                     account_id,
-                    account_records,
+                    account_records.clone(),
                     self.directory_freshness(),
                     requirements,
                 )
@@ -885,14 +887,23 @@ impl MarmotApp {
                         .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))
                 });
                 match selected {
-                    Ok(mut fetched) => {
+                    Ok(mut fetched)
+                        if !multiple_authors
+                            || account_records.iter().any(|record| {
+                                record.event.id == fetched.key_package_event_id
+                                    && key_package_client_priority(&record.event) == 2
+                            }) =>
+                    {
                         fetched.relay_lists = targets[index].relay_lists.clone();
                         outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
                     }
-                    // A bounded multi-author result can omit a compatible
-                    // candidate. Re-fetch per author even when the batch only
-                    // contained incompatible packages; it is not exhaustive.
-                    Err(_) => fallback.push(index),
+                    // Bounded multi-author results can hide an older preferred
+                    // slot even when they contain a valid lower-priority one.
+                    // Keep observed slot replacements when combining the refetch.
+                    _ => {
+                        fallback.push(index);
+                        fallback_records.insert(index, account_records);
+                    }
                 }
             }
         }
@@ -917,45 +928,52 @@ impl MarmotApp {
                 if endpoints.is_empty() {
                     endpoints.clone_from(&defaults);
                 }
-                (!endpoints.is_empty()).then_some((index, target, endpoints))
+                (!endpoints.is_empty()).then_some((
+                    index,
+                    target,
+                    endpoints,
+                    fallback_records.remove(&index).unwrap_or_default(),
+                ))
             })
             .collect::<Vec<_>>();
         let app = self.clone();
-        let work = fallback_specs
-            .into_iter()
-            .map(move |(index, target, endpoints)| {
-                let app = app.clone();
-                async move {
-                    let query = DirectoryEventQuery::new(
-                        KIND_MARMOT_KEY_PACKAGE,
-                        vec![target.account_id_hex.clone()],
-                        KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                    );
-                    let result = async {
-                        let records = app
-                            .relay_plane
-                            .fetch_directory_events(endpoints, vec![query])
-                            .await
-                            .map_err(|error| {
-                                AppError::RelayDirectory(format!("fetch key packages: {error}"))
+        let work =
+            fallback_specs
+                .into_iter()
+                .map(move |(index, target, endpoints, observed_records)| {
+                    let app = app.clone();
+                    async move {
+                        let query = DirectoryEventQuery::new(
+                            KIND_MARMOT_KEY_PACKAGE,
+                            vec![target.account_id_hex.clone()],
+                            KEY_PACKAGE_EVENTS_PER_AUTHOR,
+                        );
+                        let result = async {
+                            let mut records = app
+                                .relay_plane
+                                .fetch_directory_events(endpoints, vec![query])
+                                .await
+                                .map_err(|error| {
+                                    AppError::RelayDirectory(format!("fetch key packages: {error}"))
+                                })?;
+                            records.extend(observed_records);
+                            let mut fetched = preferred_fresh_key_package_from_records(
+                                &target.account_id_hex,
+                                records,
+                                app.directory_freshness(),
+                                requirements,
+                            )?
+                            .value
+                            .ok_or_else(|| {
+                                AppError::MissingKeyPackage(target.account_id_hex.clone())
                             })?;
-                        let mut fetched = preferred_fresh_key_package_from_records(
-                            &target.account_id_hex,
-                            records,
-                            app.directory_freshness(),
-                            requirements,
-                        )?
-                        .value
-                        .ok_or_else(|| {
-                            AppError::MissingKeyPackage(target.account_id_hex.clone())
-                        })?;
-                        fetched.relay_lists = target.relay_lists;
-                        Ok::<_, AppError>(fetched)
+                            fetched.relay_lists = target.relay_lists;
+                            Ok::<_, AppError>(fetched)
+                        }
+                        .await;
+                        (index, result)
                     }
-                    .await;
-                    (index, result)
-                }
-            });
+                });
         let fallback_results = stream::iter(work)
             .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
             .collect::<Vec<_>>()
