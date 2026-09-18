@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-17
+updated: 2026-09-19
 tags: [marmot, architecture, index]
 ---
 
@@ -203,6 +203,9 @@ These are longer working documents. Go here when you need depth, not orientation
     `IdentityRemove` design space.
 
 ### Current state — facts and analysis
+
+- **Doc:** [`further-context/chat-row-contract-audit.md`](./further-context/chat-row-contract-audit.md)
+  - **What it covers:** Current native chat-row gaps, scoped C3 follow-ups and C9 release validation evidence.
 
 - **Doc:** [`further-context/attachment-acquisition.md`](./further-context/attachment-acquisition.md)
   - **What it covers:** C8 attachment audit, revisioned SQLite discovery, acquisition sequence and remaining decisions.

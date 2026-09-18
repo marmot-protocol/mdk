@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS C bundle and optimized smoke builds disable debug stripping, avoiding
+  misaligned Mach-O shared libraries rejected by Xcode 27. No ABI change;
+  optimization and Linux packaging are unchanged.
+
 ### Added
 
 - `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay

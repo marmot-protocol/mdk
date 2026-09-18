@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Optimized macOS C binding builds disable debug stripping to avoid the
+  misaligned Mach-O shared libraries rejected by Xcode 27. Linux packaging and
+  the C ABI are unchanged.
+
 - Size-rotated v4 audit logs repeat the latest source context (app version, platform, hardware model, and device
   identifier) so standalone segments retain metadata. Engine/account/session identities and existing event bytes
   are preserved. Requires rebuilt native libraries and client releases; historical logs are not rewritten.

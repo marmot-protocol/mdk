@@ -113,7 +113,10 @@ tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
 against both linkage models (valgrind when available). Pass `--debug` first
 to reuse debug/test-profile dependencies for a faster local or PR smoke run;
-release and scheduled validation use the default release build.
+release and scheduled validation use the default release build. On macOS both
+build scripts pin release `strip=none`, matching MarmotKit's Apple policy: Rust's
+debug-stripping path can emit a misaligned Mach-O string table that Xcode 27
+rejects. Optimization remains enabled; Linux packaging is unchanged.
 
 ## Audit v4 adoption
 

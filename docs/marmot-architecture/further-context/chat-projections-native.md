@@ -1,7 +1,7 @@
 ---
 title: "Native chat-list and account-attention handoff"
 created: 2026-09-14
-updated: 2026-09-15
+updated: 2026-09-19
 status: implementation
 ---
 
@@ -11,6 +11,10 @@ C4 M4 ([#1777](https://github.com/marmot-protocol/mdk/issues/1777)) exposes M2's
 bounded list windows and M3's independent attention through additive UniFFI and C
 APIs. Swift and Kotlin are generated from the same Rust declarations. This adds
 no schema, second projection store, or release version bump.
+
+For current remaining draft, delivery and lifecycle gaps and release evidence, see
+the [2026-09-19 chat-row contract audit](chat-row-contract-audit.md). The original
+complete-row contract is broader than the selected identity/navigation work.
 
 ## Host flow
 
