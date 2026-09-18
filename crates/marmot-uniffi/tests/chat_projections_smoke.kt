@@ -1,6 +1,15 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val localTarget = AttachmentLocalTargetFfi("message", "source", UInt.MAX_VALUE)
+    check(FfiConverterTypeAttachmentLocalTargetFfi.lift(FfiConverterTypeAttachmentLocalTargetFfi.lower(localTarget)) == localTarget)
+    for (asset in listOf(AttachmentLocalAssetFfi(null, 0uL), AttachmentLocalAssetFfi("opaque", ULong.MAX_VALUE))) {
+        check(FfiConverterTypeAttachmentLocalAssetFfi.lift(FfiConverterTypeAttachmentLocalAssetFfi.lower(asset)) == asset)
+    }
+    for (chunk in listOf(AttachmentLocalBytesFfi(false, byteArrayOf()), AttachmentLocalBytesFfi(true, byteArrayOf()), AttachmentLocalBytesFfi(true, byteArrayOf(0,-1,0,42)))) {
+        val copy = FfiConverterTypeAttachmentLocalBytesFfi.lift(FfiConverterTypeAttachmentLocalBytesFfi.lower(chunk))
+        check(copy.available == chunk.available && copy.bytes.contentEquals(chunk.bytes))
+    }
     for (state in AvatarAvailabilityFfi.entries) {
         for (acquisition in AvatarAcquisitionStateFfi.entries) {
             val asset = AvatarAssetFfi("opaque-target", "opaque-reference", state, acquisition, 7u, 4u)
@@ -150,5 +159,15 @@ suspend fun compileAttachmentCommands(marmot: Marmot, account: String, group: St
             current.changeSince(page.version)
         }
         if (page.hasMore) marmot.attachmentHistoryPage(account, group, 50u, page.nextCursor)
+    }
+}
+
+suspend fun compileLocalAttachmentCommands(marmot: Marmot, account: String, group: String,
+                                          message: String, source: String, index: UInt) {
+    val target = AttachmentLocalTargetFfi(message, source, index)
+    val assets = marmot.attachmentLocalAssets(account, group, listOf(target))
+    assets.firstOrNull()?.reference?.let { reference ->
+        val chunk = marmot.readAttachmentAsset(account, reference, 0uL, 65536u)
+        if (chunk.available) check(chunk.bytes.size <= 65536)
     }
 }

@@ -642,6 +642,14 @@ fn attachment_small_reads_do_not_materialize_the_whole_blob() {
     }
     assert_eq!(
         store
+            .retained_attachment_asset(GROUP, "one", "source-one", 0, 12)
+            .unwrap()
+            .unwrap()
+            .byte_count,
+        bytes.len() as u64,
+    );
+    assert_eq!(
+        store
             .read_retained_attachment(&reference, 12, 1024 * 1024, 17)
             .unwrap()
             .unwrap()
@@ -1243,5 +1251,101 @@ fn attachment_partial_cleanup_is_locator_ciphertext_and_attempt_scoped() {
         store
             .attachment_acquisition_fits_budget(&asset, 100, 100)
             .unwrap()
+    );
+}
+
+#[test]
+fn attachment_local_metadata_is_read_only_and_follows_byte_visibility() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let lookup = |now| {
+        store
+            .retained_attachment_asset(GROUP, "one", "source-one", 0, now)
+            .unwrap()
+    };
+    assert!(lookup(12).is_none());
+    assert!(
+        store
+            .due_attachment_acquisitions(12, 64)
+            .unwrap()
+            .is_empty()
+    );
+    let reference = request(&store, "one");
+    assert!(lookup(12).is_none());
+    publish(&store, &reference);
+    let asset = lookup(12).expect("published bytes must be discoverable without requesting them");
+    assert_eq!(asset.reference, reference);
+    assert_eq!(asset.byte_count, BODY.len() as u64);
+    assert!(
+        store
+            .retained_attachment_asset(GROUP, "one", "obsolete-source", 0, 12)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .retained_attachment_asset(GROUP, "one", "source-one", 1, 12)
+            .unwrap()
+            .is_none()
+    );
+    sql(&store, "UPDATE app_events SET retention_expires_at=20");
+    assert!(lookup(19).is_some());
+    assert!(lookup(20).is_none());
+    assert!(
+        store
+            .read_retained_attachment(&reference, 20, 0, 1)
+            .unwrap()
+            .is_none()
+    );
+    sql(&store, "UPDATE app_events SET retention_expires_at=NULL");
+    store.remove_local_attachment(GROUP, "one", 0).unwrap();
+    assert!(lookup(12).is_none());
+    assert!(
+        store
+            .read_retained_attachment(&reference, 12, 0, 1)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn attachment_asset_opaque_references_are_bounded_and_store_scoped() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let reference = request(&store, "one");
+    publish(&store, &reference);
+    let opaque = reference.to_opaque();
+    assert_eq!(AttachmentAssetRef::from_opaque(&opaque).unwrap(), reference);
+    for input in [
+        "".to_owned(),
+        "x".repeat(1000),
+        opaque.replacen("1:", "2:", 1),
+        opaque.replace(':', "/"),
+        format!("{opaque}:extra"),
+    ] {
+        assert!(AttachmentAssetRef::from_opaque(&input).is_err());
+    }
+    let other = SqliteAccountStorage::in_memory().unwrap();
+    assert!(
+        other
+            .read_retained_attachment(&reference, 12, 0, 1)
+            .unwrap()
+            .is_none()
+    );
+    sql(
+        &store,
+        "UPDATE chat_presentation_meta SET store_epoch=randomblob(16)",
+    );
+    assert!(
+        store
+            .read_retained_attachment(&reference, 12, 0, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .retained_attachment_asset(GROUP, "one", "source-one", 0, 12)
+            .unwrap()
+            .is_none()
     );
 }

@@ -1183,6 +1183,43 @@ typedef struct MarmotClientOptions {
 } MarmotClientOptions;
 
 /**
+ * NULL reference means unavailable, with byte_count zero. A non-NULL reference
+ * with byte_count zero is a verified empty file. References are opaque.
+ */
+typedef struct MarmotAttachmentLocalAsset {
+  char *reference;
+  uint64_t byte_count;
+} MarmotAttachmentLocalAsset;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAttachmentLocalAssetList {
+  struct MarmotAttachmentLocalAsset *items;
+  uintptr_t len;
+} MarmotAttachmentLocalAssetList;
+
+/**
+ * available=false means discard any assembled host result. Available with
+ * zero bytes is EOF. Hosts own decoding and plaintext buffer lifetime.
+ */
+typedef struct MarmotAttachmentLocalBytes {
+  bool available;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+} MarmotAttachmentLocalBytes;
+
+/**
+ * Borrowed original source slot from a timeline/history entry. Strings must be
+ * NUL-terminated; caller retains ownership throughout the call.
+ */
+typedef struct MarmotAttachmentLocalTarget {
+  const char *message_id_hex;
+  const char *source_message_id_hex;
+  uint32_t attachment_index;
+} MarmotAttachmentLocalTarget;
+
+/**
  * One storage locator for an encrypted attachment.
  */
 typedef struct MarmotMediaLocator {
@@ -5076,6 +5113,39 @@ void marmot_string_free(char *s);
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
 
 /**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_attachment_local_asset_list_free(struct MarmotAttachmentLocalAssetList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_local_bytes_free(struct MarmotAttachmentLocalBytes *ptr);
+
+/**
+ * Look up up to 64 original slots in one group, preserving input order/duplicates.
+ * Does not load bytes, enqueue demand, start a worker or perform network work.
+ * # Safety
+ * Client/strings and targets[0..targets_len] must be live. Targets may be NULL only
+ * with zero length. Out must be writable. Inputs are borrowed, outputs owned.
+ */
+MarmotStatus marmot_attachment_local_assets(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const struct MarmotAttachmentLocalTarget *targets,
+                                            uintptr_t targets_len,
+                                            struct MarmotAttachmentLocalAssetList **out);
+
+/**
  * Deep-free a page result and its cursor/version. NULL is a no-op.
  * # Safety
  * Value must be NULL or an owned result, not freed or borrowed by an active call.
@@ -5129,6 +5199,25 @@ MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client
 MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
                                                             const struct MarmotAttachmentHistoryVersion *previous,
                                                             uint32_t *out);
+
+/**
+ * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
+ * Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
+ * available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
+ * Free the result with `marmot_attachment_local_bytes_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_read_attachment_asset(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *reference,
+                                          uint64_t offset,
+                                          uint32_t limit,
+                                          struct MarmotAttachmentLocalBytes **out);
 
 /**
  * Register up to 16 visible avatar targets without awaiting HTTP.

@@ -3684,15 +3684,21 @@ impl MarmotApp {
         let nostr_signer = signer.as_nostr_signer();
         let peeler = NostrMlsPeeler::new().with_welcome_signer(nostr_signer.clone());
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
-        let session_key = if let AccountSigner::Local(keys) = &signer {
-            self.sqlcipher_key(label, keys, &session_path, SqlcipherDatabaseKind::Session)?
-        } else {
-            self.external_sqlcipher_key(
-                label,
-                &account.account_id_hex,
-                &session_path,
-                SqlcipherDatabaseKind::Session,
-            )?
+        // load_state/account_storage above completed the first database open.
+        // Serialize any remaining key-migration probe with other openers.
+        let session_key = {
+            let lock = sqlcipher::database_open_lock(&session_path);
+            let database = lock.lock();
+            if let AccountSigner::Local(keys) = &signer {
+                self.sqlcipher_key_locked(label, keys, &database, SqlcipherDatabaseKind::Session)?
+            } else {
+                self.external_sqlcipher_key(
+                    label,
+                    &account.account_id_hex,
+                    &database,
+                    SqlcipherDatabaseKind::Session,
+                )?
+            }
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
@@ -5467,15 +5473,28 @@ impl MarmotApp {
         )
         .entered();
         let path = self.account_storage_path(label);
+        let lock = sqlcipher::database_open_lock(&path);
+        let database = lock.lock();
+        // Another opener may have filled the cache while we waited. Hold the
+        // database guard through key selection, migrations and publication.
+        if let Some(storage) = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+        {
+            return Ok(storage);
+        }
         let account = self.account_home().account(label)?;
         let key = if account.local_signing {
             let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)?
+            self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
         } else {
             self.external_sqlcipher_key(
                 label,
                 &account.account_id_hex,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::Session,
             )?
         };
@@ -5971,20 +5990,22 @@ impl MarmotApp {
         label: &str,
     ) -> Result<LegacyAccountProjectionDb, AppError> {
         let path = self.legacy_account_projection_path(label);
+        let lock = sqlcipher::database_open_lock(&path);
+        let database = lock.lock();
         let account = self.account_home().account(label)?;
         let key = if account.local_signing {
             let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key(
+            self.sqlcipher_key_locked(
                 label,
                 &keys,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::AccountProjection,
             )?
         } else {
             self.external_sqlcipher_key(
                 label,
                 &account.account_id_hex,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::AccountProjection,
             )?
         };
@@ -6870,6 +6891,8 @@ pub use storage_sqlite::{
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
 
 pub use runtime::{
-    AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
-    AttachmentPage, AttachmentPageRead, MAX_ATTACHMENT_HISTORY_PAGE,
+    AttachmentAssetRef, AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor,
+    AttachmentHistoryVersion, AttachmentLocalTarget, AttachmentPage, AttachmentPageRead,
+    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    RetainedAttachmentAsset,
 };

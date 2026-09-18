@@ -24,6 +24,9 @@ use marmot_app::{
     MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination,
 };
 
+/// Shared metadata lookup bound for native adapters.
+pub use marmot_app::MAX_ATTACHMENT_ASSET_LOOKUPS;
+
 mod commands;
 pub use commands::user_blocks::{BlockListSnapshotFfi, BlockListSubscription, BlockedUserFfi};
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so

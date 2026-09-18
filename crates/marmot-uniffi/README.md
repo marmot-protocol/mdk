@@ -631,3 +631,11 @@ Absent or whitespace-only names omit the tag. New initial publications and norma
 rotations carry the configured label. Existing events are not republished, and
 already-signed pending publications retry with their original tags even if the
 configuration changes. No workspace/binding version bump is part of this change.
+
+## Local attachment access
+
+Use `attachmentLocalAssets` to locate verified retained bytes for visible source
+slots, then `readAttachmentAsset` for bounded local chunks without network work.
+See [the C8-D1 native handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
+source revalidation, host buffer ownership and integration guidance. Acquisition
+remains off by default; native progress and controls are the next slice.

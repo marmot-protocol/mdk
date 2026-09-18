@@ -10,6 +10,16 @@
 //! item is re-exported here so the rest of the crate keeps reaching them at
 //! `crate::conversions::*`.
 
+macro_rules! redact {
+    ($t:ty) => {
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($t)).finish_non_exhaustive()
+            }
+        }
+    };
+}
+
 mod product_analytics;
 pub use product_analytics::*;
 mod account;
@@ -802,3 +812,6 @@ pub use avatar::*;
 
 mod attachment_history;
 pub use attachment_history::*;
+
+mod attachment_access;
+pub use attachment_access::*;

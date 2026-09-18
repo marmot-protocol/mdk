@@ -37,15 +37,6 @@ pub struct AvatarBytesFfi {
     pub width: u32,
     pub height: u32,
 }
-macro_rules! redact {
-    ($t:ty) => {
-        impl std::fmt::Debug for $t {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct(stringify!($t)).finish_non_exhaustive()
-            }
-        }
-    };
-}
 redact!(AvatarAssetFfi);
 redact!(AvatarBytesFfi);
 impl From<app::AvatarAvailability> for AvatarAvailabilityFfi {

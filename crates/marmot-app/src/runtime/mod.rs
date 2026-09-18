@@ -81,7 +81,12 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+mod attachment_access;
 mod attachment_history;
+pub use attachment_access::{
+    AttachmentAssetRef, AttachmentLocalTarget, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+};
 mod avatar;
 pub use attachment_history::{
     AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
@@ -5001,6 +5006,7 @@ impl MarmotAppRuntime {
                     .app
                     .account_home()
                     .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
+                self.accounts.app.presentation_signals.catalog_changed();
                 Ok(bytes)
             } else {
                 let lifecycle = self

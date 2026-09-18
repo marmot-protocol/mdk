@@ -15,6 +15,7 @@
 //! Commands with struct/byte inputs are written by hand below the macro
 //! block.
 
+use crate::attachment_access::MarmotAttachmentLocalBytes;
 use crate::types::avatar::{MarmotAvatarAssetList, MarmotAvatarBytesList};
 use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
@@ -516,6 +517,12 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
+    /// Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
+    /// Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
+    /// available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
+    /// Free the result with `marmot_attachment_local_bytes_free`.
+    async fn marmot_read_attachment_asset(account_ref: str, reference: str, offset: val u64, limit: val u32) -> rec(MarmotAttachmentLocalBytes) = read_attachment_asset;
+
     /// Register up to 16 visible avatar targets without awaiting HTTP.
     /// Free the returned list with `marmot_avatar_asset_list_free`.
     async fn marmot_request_avatar_assets(account_ref: str, targets/targets_len: str_arr) -> rec(MarmotAvatarAssetList) = request_avatar_assets;

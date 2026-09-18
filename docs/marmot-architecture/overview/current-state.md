@@ -37,7 +37,8 @@ durable demand/attempt fencing, protected retained bytes and removal suppression
 C8-C2 adds durable source demand (migration 84), bounded background acquisition and protected-byte publication
 for accepted conversations, with Rust opt-in; native constructors keep acquisition off until
 local access/removal and policy controls land. C8-C3 adds protected ciphertext checkpoints and validated HTTP Range resume across interruption.
-Native retained-byte access/progress and default enablement remain C8-D. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+C8-D1 exposes local retained-asset metadata (up to 64 source slots) and verified byte ranges (up to 1 MiB)
+through Rust, UniFFI and C, with no network or engine prerequisite. Progress/control APIs and default enablement remain C8-D2. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
@@ -126,6 +127,13 @@ lost engine effects and restart. SQLCipher records release evidence atomically
 with raw-byte deletion; app recovery retires both inventory and duplicate
 receipts before readmission. See [released transport receipts](../storage-format-v2.md#released-transport-receipts).
 The production retention and retry limits remain unchanged.
+
+Same-database first opens now serialize SQLCipher key selection, schema migration
+and handle publication; salts cannot be overwritten by competing initializers.
+Generated identities remain unavailable to background attention and managed workers
+until local readiness. Failed pre-readiness setup preserves its files and keys
+without preventing healthy accounts from starting; it does not automatically erase
+or repair an unreadable database. See [local artifact safety](local-artifact-safety.md#initializing-encrypted-account-databases).
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.

@@ -842,3 +842,6 @@ mod tests;
 
 mod partial;
 pub use partial::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity};
+
+mod access;
+pub use access::RetainedAttachmentAsset;

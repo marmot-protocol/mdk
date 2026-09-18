@@ -18,7 +18,7 @@
 //! `docs/marmot-architecture/storage-format-v2.md`.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +34,9 @@ use zeroize::Zeroizing;
 
 use crate::{AppError, MarmotApp};
 use marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE;
+
+mod open_lock;
+pub(crate) use open_lock::{DatabaseOpenGuard, database_open_lock};
 
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
@@ -202,13 +205,14 @@ impl SqlcipherDatabaseKind {
 }
 
 impl MarmotApp {
-    pub(crate) fn sqlcipher_key(
+    pub(crate) fn sqlcipher_key_locked(
         &self,
         label: &str,
         keys: &nostr::Keys,
-        db_path: &Path,
+        database: &DatabaseOpenGuard<'_>,
         kind: SqlcipherDatabaseKind,
     ) -> Result<SqlCipherKey, AppError> {
+        let db_path = database.path;
         let salt = self.sqlcipher_salt(label, keys, db_path, kind)?;
         Ok(SqlCipherKey::new(derive_sqlcipher_key_material(
             label, keys, &salt, kind,
@@ -219,9 +223,10 @@ impl MarmotApp {
         &self,
         label: &str,
         account_id_hex: &str,
-        db_path: &Path,
+        database: &DatabaseOpenGuard<'_>,
         kind: SqlcipherDatabaseKind,
     ) -> Result<SqlCipherKey, AppError> {
+        let db_path = database.path;
         let salt = self.external_sqlcipher_salt(db_path)?;
         let secret = self.external_sqlcipher_secret(label)?;
         Ok(SqlCipherKey::new(derive_external_sqlcipher_key_material(
@@ -231,6 +236,18 @@ impl MarmotApp {
             &salt,
             kind,
         )?)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sqlcipher_key(
+        &self,
+        label: &str,
+        keys: &nostr::Keys,
+        path: &Path,
+        kind: SqlcipherDatabaseKind,
+    ) -> Result<SqlCipherKey, AppError> {
+        let lock = database_open_lock(path);
+        self.sqlcipher_key_locked(label, keys, &lock.lock(), kind)
     }
 
     fn external_sqlcipher_secret(
@@ -271,14 +288,7 @@ impl MarmotApp {
         }
         let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
-        let encoded = hex::encode(salt);
-        match write_private_new(&salt_path, encoded.as_bytes()) {
-            Ok(()) => Ok(salt),
-            Err(AppError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                read_sqlcipher_salt(&salt_path)
-            }
-            Err(err) => Err(err),
-        }
+        publish_or_read_sqlcipher_salt(&salt_path, &salt)
     }
 
     fn sqlcipher_salt(
@@ -361,6 +371,8 @@ impl MarmotApp {
             // next open runs recovery instead of deriving a v2 key the on-disk
             // database cannot honor.
             write_sqlcipher_migration_marker(&marker_path)?;
+            // A publication failure leaves the marker for the next open's
+            // recovery probe; never rekey with a salt we did not publish.
             write_sqlcipher_salt(&salt_path, &salt)?;
             let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
             let new_key =
@@ -394,7 +406,7 @@ impl MarmotApp {
             // Fresh database: no rekey needed. Persist the salt atomically so a
             // crash mid-write cannot leave a truncated salt that bricks the
             // fresh database on the next open.
-            write_sqlcipher_salt(&salt_path, &salt)?;
+            return publish_or_read_sqlcipher_salt(&salt_path, &salt);
         }
 
         Ok(salt)
@@ -427,61 +439,41 @@ fn read_sqlcipher_salt(path: &Path) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError
     })
 }
 
-/// Persist a file atomically: write to a sibling temp file, fsync its contents,
-/// rename it over the target, and fsync the parent directory so both the rename
-/// and the file data are durable. A crash at any point leaves either the old
-/// contents or the fully written new contents — never a truncated file.
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp_path = {
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_os_string())
-            .unwrap_or_default();
-        let mut tmp_name = file_name;
-        // Distinguish the temp file with a pid suffix so concurrent writers do
-        // not clobber each other's in-progress temp files.
-        tmp_name.push(format!(".tmp.{}", std::process::id()));
-        path.with_file_name(tmp_name)
-    };
-
-    // Owner-only from creation: the salt is key-derivation material and the
-    // rename target inherits the temp file's mode. write_private also
-    // tightens the inode before writing, so a leftover permissive temp file
-    // from an older build (or pid reuse) cannot smuggle its mode into place.
-    fs_private::write_private(&tmp_path, contents)?;
-
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
-
-    if let Some(parent) = path.parent() {
-        // Best-effort directory fsync so the rename itself is durable. Not all
-        // platforms allow opening a directory for this; ignore failures.
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
-}
-
+/// Publish complete private bytes without ever replacing existing key material.
+/// The unique staging file is synced before linking it into place; readers can
+/// see either no destination or the complete file, never a partial salt/secret.
+/// The storage filesystem must support same-directory hard links; falling back
+/// to writing the destination in place would expose partial key material.
 fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && !parent.is_dir()
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Do not chmod an existing host-managed directory (e.g. macOS's
+        // protected temporary directory); only create missing private parents.
+        fs_private::create_dir_all_private(parent)?;
     }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
+    let mut sequence = 0_u64;
+    let (mut file, tmp_path) = loop {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), sequence));
+        sequence += 1;
+        let tmp = path.with_file_name(name);
+        match fs_private::create_new_private(&tmp) {
+            Ok(file) => break (file, tmp),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        // Same-directory hard-link publication is atomic and fails if the
+        // target exists. rename would silently replace the winning salt.
+        fs::hard_link(&tmp_path, path)
+    })();
+    drop(file);
+    let _ = fs::remove_file(&tmp_path);
+    result?;
     if let Some(parent) = path.parent()
         && let Ok(dir) = File::open(parent)
     {
@@ -491,11 +483,27 @@ fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), AppError> {
 }
 
 fn write_sqlcipher_salt(path: &Path, salt: &[u8; SQLCIPHER_SALT_LEN]) -> Result<(), AppError> {
-    atomic_write(path, hex::encode(salt).as_bytes())
+    write_private_new(path, hex::encode(salt).as_bytes())
+}
+
+fn publish_or_read_sqlcipher_salt(
+    path: &Path,
+    salt: &[u8; SQLCIPHER_SALT_LEN],
+) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
+    match write_sqlcipher_salt(path, salt) {
+        Ok(()) => Ok(*salt),
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_sqlcipher_salt(path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn write_sqlcipher_migration_marker(path: &Path) -> Result<(), AppError> {
-    atomic_write(path, b"migrating\n")
+    match write_private_new(path, b"migrating\n") {
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        result => result,
+    }
 }
 
 /// Recover from a salt-migration that was interrupted before its marker was
@@ -710,17 +718,21 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let salt_path = dir.path().join("session.sqlite.salt");
-        // A crashed older build (or pid reuse) left the temp file behind at
-        // umask-default permissions; the rewrite must not rename that mode
-        // into the final salt path.
+        // A crash and pid reuse left the first staging candidate behind at
+        // permissive permissions. Exclusive creation must skip this inode.
         let tmp_path = dir
             .path()
-            .join(format!("session.sqlite.salt.tmp.{}", std::process::id()));
+            .join(format!("session.sqlite.salt.tmp.{}.0", std::process::id()));
         std::fs::write(&tmp_path, b"stale").unwrap();
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         write_sqlcipher_salt(&salt_path, &[0x5a; SQLCIPHER_SALT_LEN]).unwrap();
 
+        assert_eq!(std::fs::read(&tmp_path).unwrap(), b"stale");
+        assert_eq!(
+            read_sqlcipher_salt(&salt_path).unwrap(),
+            [0x5a; SQLCIPHER_SALT_LEN]
+        );
         assert_eq!(
             std::fs::metadata(&salt_path).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -1390,3 +1402,7 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "sqlcipher/concurrency_tests.rs"]
+mod concurrency_tests;

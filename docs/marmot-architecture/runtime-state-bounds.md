@@ -100,6 +100,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| SQLCipher database-open lock registry (`src/sqlcipher/open_lock.rs`) | One weak entry per concurrently requested database, bounded by peak simultaneous opens. | Each lookup sweeps expired weak entries. Only openers and waiters retain strong references; cached handles do not retain locks. Parent-canonical paths remain stable before/after file creation. |
 | `SQLCIPHER_V2_VERDICTS` probe-verdict cache | 256 entries (`SQLCIPHER_V2_VERDICT_CACHE_CAPACITY`) | Entries are keyed by canonical database path + salt and record only an observed "opens under the v2 key" verdict (mdk#1439). Removed when the database file set is deleted via `remove_sqlite_file_set`; replaced in place when the salt rotates; oldest-first eviction at the cap. Eviction or loss of an entry only ever causes one extra recovery probe, never a wrong-key assumption. The companion `SQLCIPHER_MIGRATION_PROBE_RUNS`/`SKIPS` counters are monotonic process-lifetime aggregates by design (telemetry gauges, not tracked state). |
 
 ### `marmot-app` client (`src/client/`)
@@ -161,3 +162,13 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
    section as every mutation, including resets.
 3. Give the structure an explicit bound (cap, TTL, or budget) and a test that drives churn and asserts the bound holds.
 4. Add a row to the inventory above.
+
+### Local attachment access (`marmot-app/src/runtime/attachment_access.rs`)
+
+| State/resource | Bound | Lifetime / invalidation |
+| --- | --- | --- |
+| Metadata lookup input/output | At most 64 original source slots per call, each with two fixed-size message IDs and a slot index; output is opaque reference plus byte count | Call-local only; does not enqueue acquisition or retain payloads. Indexed SQL with length-only BLOB metadata. |
+| Native local plaintext chunk | Caller-selected 1..=1 MiB per read through incremental SQLite BLOB access | Source visibility/expiry and account/store generation checked for every call. No background worker or network fallback; hosts discard assembled output if a later chunk is unavailable. |
+
+No new long-lived runtime collection or database schema is introduced. These are
+local-access bounds, not convergence or recovery policy.

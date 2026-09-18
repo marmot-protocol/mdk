@@ -17,25 +17,29 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Native attachment availability and bounded local reads let hosts reuse verified
+  MDK-retained media without network requests or engine readiness. Source/account
+  checks apply to each read; no partial ciphertext is exposed. Swift/Kotlin and C
+  APIs are additive; progress/controls and default acquisition enablement follow.
+
 - Opt-in attachment acquisition resumes interrupted downloads from protected ciphertext
   checkpoints when a server supplies a strong ETag and valid HTTP Range responses.
   Account/source/attempt fences and combined storage budgets protect checkpoint reuse;
   incompatible responses restart safely and full authentication precedes publication.
-  Native retained-byte/progress controls and default enablement remain follow-up work.
+  Native progress controls and default enablement remain follow-up work.
 
 - Opt-in Rust attachment acquisition for accepted conversations, including retained
   history, without opening a chat screen. Durable discovery and retry state survive
   restart; verified bytes remain in SQLCipher until source deletion/expiry or explicit
   removal. Defaults: 2 GiB per account, 256 MiB free disk reserve plus write overhead,
   one transfer across accounts and a 64 MiB automatic transfer cap. Rust configuration
-  enables/tunes acquisition; native constructors stay off until local access/removal
+  enables/tunes acquisition; native constructors stay off until removal
   and policy controls land. Explicit downloads keep their existing limit.
-  Native retained-byte access remains a follow-up slice.
 
 - Attachment retention storage foundation (migration 83): durable leased download
   jobs, restart-safe retries, protected local bytes and explicit-removal suppression
   that survives timeline repair. Capacity refusal preserves existing attachments.
-  Background acquisition and native local-byte APIs are not enabled by this slice.
+  Acquisition remains opt-in; native progress and controls follow.
 
 - Bounded local attachment-history pages across Rust, Swift/Kotlin and C, with media
   categories, opaque cursors and change versions for authoritative removal/refresh.

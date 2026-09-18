@@ -15,7 +15,8 @@ App runtime bridge for the first real Marmot app surfaces.
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
   tracker upload worker), `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers), and `avatar.rs`
   (local identity-avatar demand and bounded maintenance), plus `avatar_access.rs` (bounded local native batches) and `attachment_history.rs`
-  (bounded local attachment discovery and shared-parser presentation), and `account_worker/attachments.rs`
+  (bounded local attachment discovery and shared-parser presentation), `attachment_access.rs`
+  (read-only source-slot availability and verified local byte ranges), and `account_worker/attachments.rs`
   (durable attachment demand admission, fair background transfer capacity and retained-byte publication). Keep `mod.rs`
   re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
