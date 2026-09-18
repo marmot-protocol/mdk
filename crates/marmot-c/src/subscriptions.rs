@@ -1048,6 +1048,8 @@ pub unsafe extern "C" fn marmot_agent_stream_subscription_stream_id_hex(
     })
 }
 
+pub mod attachment_controls;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1377,5 +1379,3 @@ pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
         }
     })
 }
-
-pub mod attachment_controls;

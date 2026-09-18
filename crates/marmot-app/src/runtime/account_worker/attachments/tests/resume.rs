@@ -366,6 +366,12 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
         let result = prepared
             .run_classified(resume_context(&store, &job, dir.path(), &reference))
             .await;
+        if ["oversized", "chunked_oversized"].contains(&case) {
+            assert!(
+                matches!(result, Err(AttachmentDownloadFailure::SizeLimit(_, _))),
+                "size failures must be readmitted by a higher policy cap"
+            );
+        }
         if [
             "oversized",
             "corrupt",

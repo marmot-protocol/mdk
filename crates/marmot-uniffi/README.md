@@ -636,6 +636,7 @@ configuration changes. No workspace/binding version bump is part of this change.
 
 Use `attachmentLocalAssets` to locate verified retained bytes for visible source
 slots, then `readAttachmentAsset` for bounded local chunks without network work.
-See [the C8-D1 native handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
+See [the native attachment handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
 source revalidation, host buffer ownership and integration guidance. Acquisition
-remains off by default; native progress and controls are the next slice.
+now defaults on with bounded per-account policy. Native progress snapshots/subscriptions
+and durable cancellation, retry, remove and download-again controls use the same source slots.

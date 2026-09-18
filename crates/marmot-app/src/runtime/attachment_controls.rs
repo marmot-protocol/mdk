@@ -226,7 +226,22 @@ impl RuntimeAttachmentTransferSubscription {
             return Ok(None);
         }
         if state.initial {
+            // A handle may sit unused across deletion or account reconstruction.
+            // Revalidate before exposing its first metadata frame too.
+            let (identity, rows) = self
+                .runtime
+                .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
+                .await?;
+            if identity != self.identity
+                || *closed.borrow()
+                || self.runtime.shared.lifecycle().ensure_running().is_err()
+            {
+                self.close();
+                return Ok(None);
+            }
+            state.rows = rows;
             state.initial = false;
+            state.last = tokio::time::Instant::now();
             return Ok(Some(state.rows.clone()));
         }
         loop {
@@ -248,7 +263,10 @@ impl RuntimeAttachmentTransferSubscription {
                 .runtime
                 .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
                 .await?;
-            if identity != self.identity {
+            if identity != self.identity
+                || *closed.borrow()
+                || self.runtime.shared.lifecycle().ensure_running().is_err()
+            {
                 self.close();
                 return Ok(None);
             }

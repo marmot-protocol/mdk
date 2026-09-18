@@ -65,6 +65,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let identity = epoch(&conn)?;
+            drop(conn); // The outer transaction remains owned by this thread.
             let rows = targets
                 .iter()
                 .map(|(message, source, index)| {
@@ -144,6 +145,7 @@ impl SqliteAccountStorage {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
             let source=conn.query_row("SELECT group_id_hex,message_id_hex,attachment_index FROM attachment_acquisition WHERE token=?1",[&reference.token],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?))).optional().storage()?;
+            drop(conn); // Nested storage calls must acquire their own connection guard.
             match source { Some((g,m,i))=>self.remove_local_attachment(&g,&m,i),None=>Ok(false) }
         })
     }
@@ -160,14 +162,20 @@ impl SqliteAccountStorage {
         }
         let conn = self.lock()?;
         let epoch = epoch(&conn)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT token FROM attachment_acquisition INDEXED BY attachment_acquisition_priority
-            WHERE due IS NOT NULL AND due<=?1 AND cancelled=0 AND (?3 OR explicit_request=1)
-            ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2",
-            )
-            .storage()?;
-        stmt.query_map(params![u64_to_i64(now)?, limit as i64, automatic], |r| {
+        // A concrete predicate lets SQLite seek directly into explicit work when
+        // automatic acquisition is disabled, without scanning the paused backlog.
+        let explicit_filter = if automatic {
+            ""
+        } else {
+            " AND explicit_request=1"
+        };
+        let sql = format!(
+            "SELECT token FROM attachment_acquisition INDEXED BY attachment_acquisition_priority
+            WHERE due IS NOT NULL AND due<=?1 AND cancelled=0{explicit_filter}
+            ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).storage()?;
+        stmt.query_map(params![u64_to_i64(now)?, limit as i64], |r| {
             Ok(AttachmentAssetRef {
                 store_epoch: epoch.clone(),
                 token: r.get(0)?,

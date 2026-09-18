@@ -73,7 +73,7 @@ mod tests {
         run(&mut conn, MIGRATIONS).unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM attachment_download_policy", [], |r| r
-                .get::<_, u64>(0))
+                .get::<_, i64>(0))
                 .unwrap(),
             0
         );

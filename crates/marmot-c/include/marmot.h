@@ -830,6 +830,12 @@ typedef enum MarmotAttachmentTransferState {
   MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
 } MarmotAttachmentTransferState;
 
+typedef enum MarmotAttachmentControl {
+  MARMOT_ATTACHMENT_CONTROL_CANCEL,
+  MARMOT_ATTACHMENT_CONTROL_RETRY,
+  MARMOT_ATTACHMENT_CONTROL_REMOVE,
+} MarmotAttachmentControl;
+
 typedef enum MarmotAttachmentHistoryChange {
   MARMOT_ATTACHMENT_HISTORY_CHANGE_UNCHANGED,
   MARMOT_ATTACHMENT_HISTORY_CHANGE_ADDITIONS,

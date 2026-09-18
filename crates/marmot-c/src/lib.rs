@@ -662,6 +662,8 @@ pub unsafe extern "C" fn marmot_bytes_free(data: *mut u8, len: usize) {
     memory::free_guard(|| unsafe { memory::free_vec(data, len) });
 }
 
+pub mod attachment_controls;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +722,3 @@ mod tests {
         );
     }
 }
-
-pub mod attachment_controls;

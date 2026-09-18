@@ -68,15 +68,14 @@ Deep-free results with `marmot_attachment_local_asset_list_free` and
 `marmot_attachment_local_bytes_free`; both accept NULL. No pointers to database buffers
 or filesystem paths cross the ABI.
 
-Progress subscriptions and cancellation/retry/remove/download-again/policy controls
-remain C8-D2. C9 owns released-artifact integration and real-device measurements.
+Progress and controls are described below. C9 owns released-artifact integration and real-device measurements.
 
 ## Transfer progress and controls (C8-D2)
 
 `attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded
 original-slot targets as local access. `next()` returns an initial snapshot then complete
 replacements in target order (maximum four per second). `cancel()` stops observation only;
-drop/destroy the subscription when its screen leaves. Recreate it when the visible target set
+call it to wake pending receivers, then drop/destroy the subscription when its screen leaves. Recreate it when the visible target set
 changes. C provides blocking `next` with a timeout; call off the UI thread. A timeout does not
 consume an update. Close/error/runtime shutdown ends observation. No transfer is requested by lookup.
 

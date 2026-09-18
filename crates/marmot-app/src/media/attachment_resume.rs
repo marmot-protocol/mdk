@@ -229,7 +229,7 @@ pub(super) async fn read_body(
     if expected_total.is_some_and(|n| n > max) {
         return Err(AttachmentDownloadFailure::SizeLimit(
             AppError::BlobStore("download exceeds size limit".into()),
-            max as u64,
+            max,
         ));
     }
     context
@@ -265,7 +265,7 @@ pub(super) async fn read_body(
         if size > max {
             return Err(AttachmentDownloadFailure::SizeLimit(
                 AppError::BlobStore("download exceeds size limit".into()),
-                max as u64,
+                max,
             ));
         }
         if expected_total.is_some_and(|n| size > n) {
