@@ -115,12 +115,14 @@ pub(super) fn schedule(
         }
         admission.resumed = true;
     }
+    let partials = storage.prune_attachment_partials(now, 64)?;
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
     let more = admit_demands(
         &storage,
         now,
         client.app.config.allow_loopback_blob_endpoints,
-    )? || expired == 64;
+    )? || expired == 64
+        || partials == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
     // Admission never evicts an acquired asset and never increments attempts while paused.
     if http.permits.available_permits() <= 1 {
@@ -193,11 +195,19 @@ pub(super) fn schedule(
             continue;
         };
         let byte_budget = policy.retained_bytes_per_account;
+        let resume = crate::media::attachment_resume::AttachmentResume {
+            storage: storage.clone(),
+            job: job.clone(),
+            ciphertext_digest: [0; 32],
+            budget: byte_budget,
+            directory: client.app.account_dir(&client.state.label),
+            disk_reserve: policy.minimum_free_disk_bytes,
+        };
         spawn_media_http(
             http,
             permit,
             async move {
-                let result = prepared.run_classified().await;
+                let result = prepared.run_classified(resume).await;
                 MediaHttpCompletion::Attachment {
                     job,
                     result,

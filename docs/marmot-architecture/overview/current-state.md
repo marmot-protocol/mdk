@@ -36,7 +36,8 @@ replacement. Reads remain local without engine/relay readiness. C8-C1 adds stora
 durable demand/attempt fencing, protected retained bytes and removal suppression in migration 83.
 C8-C2 adds durable source demand (migration 84), bounded background acquisition and protected-byte publication
 for accepted conversations, with Rust opt-in; native constructors keep acquisition off until
-local access/removal and policy controls land. Partial/range resume and native retained-byte access remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+local access/removal and policy controls land. C8-C3 adds protected ciphertext checkpoints and validated HTTP Range resume across interruption.
+Native retained-byte access/progress and default enablement remain C8-D. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

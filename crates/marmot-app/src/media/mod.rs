@@ -1,3 +1,4 @@
+pub(crate) mod attachment_resume;
 pub(crate) mod avatar;
 use std::time::Instant;
 
@@ -1230,6 +1231,9 @@ async fn fetch_encrypted_media_blob_classified(
                 );
                 if matches {
                     return Ok(bytes);
+                }
+                if let Some(resume) = &transport.resume {
+                    resume.clear().await?;
                 }
                 terminal_failure = true;
                 record_candidate_failure(

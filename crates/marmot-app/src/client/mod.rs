@@ -180,16 +180,34 @@ pub(crate) struct EncryptedMediaDownloadHttp {
 impl EncryptedMediaDownloadHttp {
     pub(crate) async fn run_classified(
         self,
+        mut resume: crate::media::attachment_resume::AttachmentResume,
     ) -> Result<MediaDownloadResult, crate::media::AttachmentDownloadFailure> {
-        crate::media::download_encrypted_media_classified(
+        resume.ciphertext_digest = hex::decode(&self.reference.ciphertext_sha256)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| {
+                crate::media::AttachmentDownloadFailure::Stop(AppError::InvalidEncryptedMedia(
+                    "invalid ciphertext digest".into(),
+                ))
+            })?;
+        let resume = Arc::new(resume);
+        let transport = self.transport.with_resume(resume.clone());
+        let result = crate::media::download_encrypted_media_classified(
             self.reference,
             self.media_secret.as_ref(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
-            &self.transport,
+            &transport,
             None,
         )
-        .await
+        .await;
+        if matches!(
+            result,
+            Err(crate::media::AttachmentDownloadFailure::Stop(_))
+        ) {
+            resume.clear().await?;
+        }
+        result
     }
 
     /// Run the prepared fetch and crypto work, optionally recording only the

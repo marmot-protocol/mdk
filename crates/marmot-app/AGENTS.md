@@ -45,6 +45,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
+  `media/attachment_resume.rs` adapts attempt-fenced storage checkpoints to the shared safe HTTP path;
+  keep Range validation, protected partials and complete-body authentication separate from native progress/access.
 - Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
   typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
   `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment

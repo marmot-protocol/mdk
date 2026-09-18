@@ -866,3 +866,234 @@ fn attachment_startup_reclaims_only_abandoned_attempts_in_bounded_batches() {
     );
     assert_eq!(read(&store, &ready), BODY);
 }
+
+#[test]
+fn attachment_partial_storage_is_provisioned_without_network() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let count: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT count(*) FROM attachment_partial", [], |r| r.get(0))
+        .expect("resumable acquisition needs a durable protected checkpoint store");
+    assert_eq!(count, 0);
+}
+
+fn partial_identity(total: u64) -> AttachmentPartialIdentity {
+    AttachmentPartialIdentity {
+        ciphertext_digest: [1; 32],
+        locator_digest: [2; 32],
+        etag: "\"v1\"".into(),
+        total,
+    }
+}
+fn partial_usage(store: &SqliteAccountStorage) -> u64 {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT byte_count FROM attachment_partial_usage WHERE id=1",
+            [],
+            |r| nonnegative(r, 0),
+        )
+        .unwrap()
+}
+#[test]
+fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.sqlite");
+    let key = SqlCipherKey::new("partial-test-key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    let old = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&old, &identity, 0, b"abc", 12, 100)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .checkpoint_attachment_partial(&old, &identity, 2, b"x", 12, 100)
+            .unwrap()
+    );
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    store.resume_attachment_acquisitions(13, 64).unwrap();
+    let job = store
+        .claim_attachment_acquisition(&asset, 13, 100)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .checkpoint_attachment_partial(&old, &identity, 3, b"old", 13, 100)
+            .unwrap()
+    );
+    assert!(!store.clear_attachment_partial(&old, 13).unwrap());
+    assert_eq!(
+        store
+            .load_attachment_partial(&job, 13, 10)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"abc"
+    );
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 3, b"def", 13, 100)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .load_attachment_partial(&job, 13, 10)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"abcdef"
+    );
+    store.remove_local_attachment(GROUP, "one", 0).unwrap();
+    assert_eq!(partial_usage(&store), 0);
+    assert!(
+        !store
+            .checkpoint_attachment_partial(&job, &identity, 0, b"late", 13, 100)
+            .unwrap()
+    );
+}
+#[test]
+fn attachment_partial_quota_rollback_corruption_and_terminal_cleanup() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    seed(&store, "two");
+    let a = request(&store, "one");
+    let b = request(&store, "two");
+    let job = store
+        .claim_attachment_acquisition(&a, 12, 100)
+        .unwrap()
+        .unwrap();
+    let other = store
+        .claim_attachment_acquisition(&b, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, b"abcdef", 12, 10)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .checkpoint_attachment_partial(&other, &identity, 0, b"12345", 12, 10)
+            .unwrap()
+    );
+    assert_eq!(partial_usage(&store), 6);
+    store.lock().unwrap().execute_batch("CREATE TRIGGER refuse_checkpoint BEFORE INSERT ON attachment_partial_chunk BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 6, b"xyz", 12, 100)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_attachment_partial(&job, 12, 10)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"abcdef"
+    );
+    store.lock().unwrap().execute_batch("DROP TRIGGER refuse_checkpoint; UPDATE attachment_partial_chunk SET bytes=x'010203040506';").unwrap();
+    assert!(
+        store
+            .load_attachment_partial(&job, 12, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(partial_usage(&store), 0);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, b"abc", 12, 100)
+            .unwrap()
+    );
+    store.fail_attachment_acquisition(&job, None).unwrap();
+    assert_eq!(partial_usage(&store), 0);
+}
+#[test]
+fn attachment_partial_publication_accounts_other_partials_and_releases_own() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    seed(&store, "two");
+    let a = request(&store, "one");
+    let b = request(&store, "two");
+    let job = store
+        .claim_attachment_acquisition(&a, 12, 100)
+        .unwrap()
+        .unwrap();
+    let other = store
+        .claim_attachment_acquisition(&b, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    store
+        .checkpoint_attachment_partial(&job, &identity, 0, b"123456", 12, 100)
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&other, &identity, 0, b"123456", 12, 100)
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, 12, BODY.len() as u64 + 5)
+            .unwrap(),
+        AttachmentPublishResult::CapacityBlocked
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, 12, BODY.len() as u64 + 6)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert_eq!(partial_usage(&store), 6);
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        BODY.len() as u64
+    );
+    store
+        .invalidate_app_event_by_message_id(GROUP, "two", "branch_selection_withdrawn")
+        .unwrap();
+    assert_eq!(partial_usage(&store), 0);
+}
+#[test]
+fn attachment_partial_expiry_is_bounded_and_shrinking_limit_discards() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for name in ["one", "two"] {
+        seed(&store, name);
+        let asset = request(&store, name);
+        let job = store
+            .claim_attachment_acquisition(&asset, 12, 100000)
+            .unwrap()
+            .unwrap();
+        store
+            .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+            .unwrap();
+    }
+    assert_eq!(store.prune_attachment_partials(86412, 1).unwrap(), 1);
+    assert_eq!(store.prune_attachment_partials(86412, 1).unwrap(), 1);
+    assert_eq!(partial_usage(&store), 0);
+    seed(&store, "three");
+    let asset = request(&store, "three");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    assert!(
+        store
+            .load_attachment_partial(&job, 12, 9)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(partial_usage(&store), 0);
+}

@@ -57,6 +57,7 @@ pub struct AttachmentAcquisitionStatus {
 }
 /// Opaque completion fence, scoped to the store and a single attempt. Source
 /// locators remain protected in SQLite; Debug never exposes their contents.
+#[derive(Clone)]
 pub struct AttachmentAcquisition {
     pub reference: AttachmentAssetRef,
     pub group_id_hex: String,
@@ -572,7 +573,25 @@ impl SqliteAccountStorage {
                     |r| nonnegative(r, 0),
                 )
                 .storage()?;
-            if used.saturating_add(plaintext.len() as u64) > byte_budget {
+            let partial_used: u64 = conn
+                .query_row(
+                    "SELECT byte_count FROM attachment_partial_usage WHERE id=1",
+                    [],
+                    |r| nonnegative(r, 0),
+                )
+                .storage()?;
+            let own_partial: u64 = conn
+                .query_row(
+                    "SELECT coalesce((SELECT received FROM attachment_partial WHERE token=?1),0)",
+                    [&job.reference.token],
+                    |r| nonnegative(r, 0),
+                )
+                .storage()?;
+            if used
+                .saturating_add(partial_used.saturating_sub(own_partial))
+                .saturating_add(plaintext.len() as u64)
+                > byte_budget
+            {
                 return Ok(AttachmentPublishResult::CapacityBlocked);
             }
             conn.execute(
@@ -820,3 +839,6 @@ impl SqliteAccountStorage {
 }
 #[cfg(test)]
 mod tests;
+
+mod partial;
+pub use partial::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity};

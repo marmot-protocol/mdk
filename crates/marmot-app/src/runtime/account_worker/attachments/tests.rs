@@ -547,3 +547,5 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_off
     );
     assert!(status.due.is_none());
 }
+
+mod resume;

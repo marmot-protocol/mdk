@@ -44,8 +44,9 @@ pub use account_projection::{
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use attachment_acquisition::{
-    ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, AttachmentAcquisitionSource,
-    AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef, AttachmentDemand,
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, AttachmentAcquisition,
+    AttachmentAcquisitionSource, AttachmentAcquisitionState, AttachmentAcquisitionStatus,
+    AttachmentAssetRef, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
     AttachmentPublishResult, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
     MAX_RETAINED_ATTACHMENT_BYTES,
 };
