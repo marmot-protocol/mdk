@@ -30,6 +30,9 @@ impl DatabaseOpenLock {
 pub(crate) fn database_open_lock(path: &Path) -> Arc<DatabaseOpenLock> {
     // Canonicalize the parent, not the file: the identity must stay the same
     // before and after SQLite creates it, including /var vs /private/var.
+    // Account creation establishes the directory before any database opener.
+    // Callers must preserve that ordering: creating a missing parent between
+    // lookups could change a raw fallback path into a different canonical key.
     let path = match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => parent
             .canonicalize()

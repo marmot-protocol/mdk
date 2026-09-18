@@ -55,11 +55,19 @@ waits for admitted opens before draining caches.
 Salts and external-signing storage secrets are published from unique 0600 staging
 files only after their contents are synced. Atomic hard-link publication refuses
 to replace existing key material and exposes no partially written destination.
+Storage roots must support same-directory hard links; filesystems that reject
+them cannot initialize encrypted storage. There is no in-place-write fallback
+because concurrent readers could consume incomplete key material.
 Generated accounts remain unavailable to attention readers and managed workers
 until the setup journal reaches `LocalReady`. A failed pre-readiness resume keeps
 its account files and keys while healthy accounts start. Neither journal state
 nor file size proves an unreadable encrypted database empty; no automatic deletion
 or salt replacement is a recovery operation.
+If setup context was never persisted, startup reports an account error and
+leaves the identity preparing. Retrying generated-account creation with the
+host's setup request resumes that same identity and supplies the missing context;
+startup cannot guess the user's relay configuration. Interrupted staging files
+remain private and are never adopted or swept during another writer's publication.
 
 ## Releasing artifacts before host suspension
 

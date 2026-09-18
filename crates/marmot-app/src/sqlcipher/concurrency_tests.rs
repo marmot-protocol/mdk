@@ -14,6 +14,21 @@ fn salt_publication_never_replaces_existing_bytes() {
 }
 
 #[test]
+fn fresh_salt_publication_adopts_the_complete_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.sqlite.salt");
+    assert_eq!(
+        publish_or_read_sqlcipher_salt(&path, &[1; SQLCIPHER_SALT_LEN]).unwrap(),
+        [1; SQLCIPHER_SALT_LEN]
+    );
+    assert_eq!(
+        publish_or_read_sqlcipher_salt(&path, &[2; SQLCIPHER_SALT_LEN]).unwrap(),
+        [1; SQLCIPHER_SALT_LEN]
+    );
+    assert_eq!(read_sqlcipher_salt(&path).unwrap(), [1; SQLCIPHER_SALT_LEN]);
+}
+
+#[test]
 fn concurrent_first_account_opens_preserve_reopenability() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -63,6 +78,40 @@ async fn generated_account_attention_waits_for_local_readiness() {
     );
     assert!(!app.account_storage_path(&account.label).exists());
     drop(attention);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generated_account_without_setup_context_retries_the_same_identity() {
+    use crate::{AccountSetupRequest, MarmotAppRuntime};
+    use cgka_traits::TransportEndpoint;
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    // Simulate a crash after identity creation but before setup context is saved.
+    let unfinished = app.account_home().create_nostr_account_for_setup().unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    assert!(!app.account_storage_path(&unfinished.label).exists());
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .all(|account| !account.running)
+    );
+    let retried = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried.account.account_id_hex, unfinished.account_id_hex);
+    assert_eq!(retried.account.label, unfinished.label);
+    assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
     runtime.shutdown_and_close().await.unwrap();
 }
 
