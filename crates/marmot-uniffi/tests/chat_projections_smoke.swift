@@ -3,6 +3,17 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        let localTarget = AttachmentLocalTargetFfi(messageIdHex: "message", sourceMessageIdHex: "source", attachmentIndex: UInt32.max)
+        let localTargetCopy = try FfiConverterTypeAttachmentLocalTargetFfi.lift(FfiConverterTypeAttachmentLocalTargetFfi.lower(localTarget))
+        precondition(localTargetCopy == localTarget)
+        for asset in [AttachmentLocalAssetFfi(reference: nil, byteCount: 0), AttachmentLocalAssetFfi(reference: "opaque", byteCount: UInt64.max)] {
+            let copy = try FfiConverterTypeAttachmentLocalAssetFfi.lift(FfiConverterTypeAttachmentLocalAssetFfi.lower(asset))
+            precondition(copy == asset)
+        }
+        for chunk in [AttachmentLocalBytesFfi(available: false, bytes: Data()), AttachmentLocalBytesFfi(available: true, bytes: Data()), AttachmentLocalBytesFfi(available: true, bytes: Data([0,255,0,42]))] {
+            let copy = try FfiConverterTypeAttachmentLocalBytesFfi.lift(FfiConverterTypeAttachmentLocalBytesFfi.lower(chunk))
+            precondition(copy == chunk)
+        }
         for state in [AvatarAvailabilityFfi.missing, .ready, .stale, .invalidated] {
             for acquisition in [AvatarAcquisitionStateFfi.idle, .queued, .fetching, .retryScheduled, .blocked] {
                 let asset = AvatarAssetFfi(target: "opaque-target", reference: "opaque-reference", availability: state, acquisition: acquisition, contentRevision: 7, byteCount: 4)
@@ -173,5 +184,15 @@ func compileAttachmentCommands(_ marmot: Marmot, account: String, group: String)
         if page.hasMore {
             _ = try await marmot.attachmentHistoryPage(accountRef: account, groupIdHex: group, limit: 50, cursor: page.nextCursor)
         }
+    }
+}
+
+func compileLocalAttachmentCommands(_ marmot: Marmot, account: String, group: String,
+                                    message: String, source: String, index: UInt32) async throws {
+    let target = AttachmentLocalTargetFfi(messageIdHex: message, sourceMessageIdHex: source, attachmentIndex: index)
+    let assets = try await marmot.attachmentLocalAssets(accountRef: account, groupIdHex: group, targets: [target])
+    if let reference = assets.first?.reference {
+        let chunk = try await marmot.readAttachmentAsset(accountRef: account, reference: reference, offset: 0, limit: 65536)
+        if chunk.available { _ = chunk.bytes }
     }
 }

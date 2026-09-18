@@ -161,3 +161,13 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
    section as every mutation, including resets.
 3. Give the structure an explicit bound (cap, TTL, or budget) and a test that drives churn and asserts the bound holds.
 4. Add a row to the inventory above.
+
+### Local attachment access (`marmot-app/src/runtime/attachment_access.rs`)
+
+| State/resource | Bound | Lifetime / invalidation |
+| --- | --- | --- |
+| Metadata lookup input/output | At most 64 original source slots per call, each with two fixed-size message IDs and a slot index; output is opaque reference plus byte count | Call-local only; does not enqueue acquisition or retain payloads. Indexed SQL with length-only BLOB metadata. |
+| Native local plaintext chunk | Caller-selected 1..=1 MiB per read through incremental SQLite BLOB access | Source visibility/expiry and account/store generation checked for every call. No background worker or network fallback; hosts discard assembled output if a later chunk is unavailable. |
+
+No new long-lived runtime collection or database schema is introduced. These are
+local-access bounds, not convergence or recovery policy.

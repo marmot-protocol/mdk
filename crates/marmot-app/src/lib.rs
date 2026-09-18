@@ -6861,3 +6861,8 @@ pub use runtime::{
     AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
     AttachmentPage, AttachmentPageRead, MAX_ATTACHMENT_HISTORY_PAGE,
 };
+
+pub use runtime::{
+    AttachmentAssetRef, AttachmentLocalTarget, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+};

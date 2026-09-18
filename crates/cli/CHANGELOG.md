@@ -17,11 +17,16 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Native attachment availability and bounded local reads let hosts reuse verified
+  MDK-retained media without network requests or engine readiness. Source/account
+  checks apply to each read; no partial ciphertext is exposed. Swift/Kotlin and C
+  APIs are additive; progress/controls and default acquisition enablement follow.
+
 - Opt-in attachment acquisition resumes interrupted downloads from protected ciphertext
   checkpoints when a server supplies a strong ETag and valid HTTP Range responses.
   Account/source/attempt fences and combined storage budgets protect checkpoint reuse;
   incompatible responses restart safely and full authentication precedes publication.
-  Native retained-byte/progress controls and default enablement remain follow-up work.
+  Native progress controls and default enablement remain follow-up work.
 
 - Opt-in Rust attachment acquisition for accepted conversations, including retained
   history, without opening a chat screen. Durable discovery and retry state survive

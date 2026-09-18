@@ -48,7 +48,7 @@ pub use attachment_acquisition::{
     AttachmentAcquisitionSource, AttachmentAcquisitionState, AttachmentAcquisitionStatus,
     AttachmentAssetRef, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
     AttachmentPublishResult, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    MAX_RETAINED_ATTACHMENT_BYTES,
+    MAX_RETAINED_ATTACHMENT_BYTES, RetainedAttachmentAsset,
 };
 pub use attachment_history::{
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,

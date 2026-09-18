@@ -104,7 +104,7 @@ fn present(
     })
 }
 impl MarmotAppRuntime {
-    async fn attachment_read<T: Send + 'static>(
+    pub(super) async fn attachment_read<T: Send + 'static>(
         &self,
         account_ref: &str,
         read: impl FnOnce(storage_sqlite::SqliteAccountStorage, bool) -> Result<T, AppError>

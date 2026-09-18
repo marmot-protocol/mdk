@@ -311,6 +311,19 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_OK && random_name != NULL, "random profile pseudonym");
     marmot_string_free(random_name);
 
+    /* Local attachment APIs never turn a missing account into a download. */
+    MarmotAttachmentLocalTarget local_target = {unknown_id, unknown_id, 0};
+    MarmotAttachmentLocalAssetList *local_assets = NULL;
+    st = marmot_attachment_local_assets(client, unknown_id, "abab", &local_target, 1, &local_assets);
+    check(st != MARMOT_STATUS_OK && local_assets == NULL, "local assets reject unknown account");
+    st = marmot_attachment_local_assets(client, unknown_id, "abab", NULL, 65, &local_assets);
+    check(st == MARMOT_STATUS_INVALID_ARGUMENT && local_assets == NULL, "local asset lookup bound");
+    MarmotAttachmentLocalBytes *local_bytes = NULL;
+    st = marmot_read_attachment_asset(client, unknown_id, "invalid", 0, 65536, &local_bytes);
+    check(st != MARMOT_STATUS_OK && local_bytes == NULL, "local attachment reference validation");
+    marmot_attachment_local_asset_list_free(local_assets);
+    marmot_attachment_local_bytes_free(local_bytes);
+
     /* ---- boundary validation ------------------------------------------ */
     /* Out-of-range enum discriminants are rejected instead of becoming
      * invalid Rust enum values. */

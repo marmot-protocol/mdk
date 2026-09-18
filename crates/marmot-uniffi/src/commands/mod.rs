@@ -44,3 +44,5 @@ mod avatar;
 pub mod moderation;
 
 mod attachment_history;
+
+mod attachment_access;

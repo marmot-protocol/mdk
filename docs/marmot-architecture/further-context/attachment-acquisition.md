@@ -196,7 +196,7 @@ Expired leases remain a fallback for interruption recovery.
 Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; no automatic LRU applies.
 
 C8-C2 introduced complete-body retries. C8-C3 below preserves compatible partial transfers.
-C8-D will expose native availability/local bytes/progress and explicit remove/download-again operations.
+C8-D1 exposes native availability/local bytes; C8-D2 will add progress and explicit remove/download-again operations.
 Before enabling acquisition by default, complete C8-D access/removal/policy controls,
 and validate shorter background transfer/idle deadlines, recent-message priority over
 backfill, size-limit re-admission when policy increases, and explicit invalid-policy
@@ -254,7 +254,7 @@ This temporary checkpoint lifetime does not change the agreed retained-media lif
 Tests cover interrupted HTTP plus encrypted reopen and verified publication, task cancellation,
 Range ignored, changed/weak validators, malformed ranges, ciphertext corruption, over-limit
 responses, locator failover, bounded quota/rollback, chunk corruption and lifecycle fences.
-C8-D native availability, progress, controls and default enablement remain outstanding.
+C8-D1 local-byte access is described below; progress, controls and default enablement remain outstanding.
 
 ## Issue audit and exclusions
 
@@ -274,3 +274,33 @@ identified by title. This is a scope/overlap audit, not reproduction of every is
 
 C9 still owns released-artifact adoption and device evidence. Storage tests do not
 establish download throughput, native rendering speed or mobile background survival.
+
+## C8-D1: local native attachment access
+
+`attachment_local_assets(account, group, targets)` resolves at most 64 original
+message/source/index tuples to current readable retained assets. Results preserve
+input order and duplicates; a missing reference means only that local bytes are
+unavailable. It neither enqueues demand nor reports download progress. The metadata
+query uses indexed source lookup and SQLite BLOB length, never materializing payloads.
+
+`read_attachment_asset(account, reference, offset, limit)` reads at most 1 MiB through
+incremental SQLite BLOB access. Each read rechecks the store generation, current source
+visibility and retention deadline. A true/empty result means EOF, including empty files;
+unavailable means discard any assembled host result. Retained history after leaving
+remains readable. Explicit removal, source replacement/deletion/expiry and account reset
+invalidate old references. Bytes must have passed complete ciphertext/AEAD/plaintext
+verification at publication; partial checkpoints are never reachable here.
+
+These async Rust/UniFFI methods run account/store work on the blocking pool without
+an account worker, hydration, secret warming or network fallback. C wrappers are
+blocking; call them off the UI thread. Existing `download_media` is unchanged and
+still returns transient complete downloads. Hosts must reacquire metadata after runtime
+reconstruction and keep their existing caches until release/device adoption is validated.
+See [native usage and lifetime contract](../../../crates/marmot-uniffi/ATTACHMENT-ACCESS.md).
+
+`attachment_local_access_is_bounded_offline_and_survives_reopen` covers chunk boundaries,
+offline reconstruction, cross-account handles, retained-left history and local removal.
+`attachment_local_metadata_is_read_only_and_follows_byte_visibility` covers no-demand
+lookup, exact source selection and immediate retention expiry before maintenance.
+Progress, cancellation, retry/remove/download-again and policy controls remain C8-D2;
+automatic acquisition stays disabled by default.

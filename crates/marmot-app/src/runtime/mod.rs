@@ -81,7 +81,9 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+mod attachment_access;
 mod attachment_history;
+pub use attachment_access::*;
 mod avatar;
 pub use attachment_history::{
     AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
