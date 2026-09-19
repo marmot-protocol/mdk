@@ -632,6 +632,26 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   state makes `recorded_message_outcome` answer `Duplicate` forever, so a never-applied message would be dead for this
   device. (Convergence graph seeding is not the hazard; it skips raw-transport payloads.) Pinned by
   `tests/deferred_peel_lifecycle.rs::replay_keeps_a_row_refused_for_lack_of_room_redeliverable`.
+- **A `Buffered` outcome never lets the caller retire the wrapper; ingest owns retirement.** Every site that returns
+  `IngestOutcome::Buffered` AFTER a peel retires its own raw transport wrapper through one mechanism,
+  `Engine::retire_raw_wrapper` (five call sites today: the content-record seam, the missing-anchor fork rival, the
+  parent-dependent proposal pass, the inbound disband candidate, and `buffer_openmls_message_into_convergence`). Grep
+  that helper for the current set rather than trusting this list. The `Buffered` that retires nothing is the
+  **pre-peel** halt gate (`!can_ingest`): it parked bytes NOBODY OPENED and keeps the row as their only redelivery
+  source, so a caller that stamps `Processed` on every `Buffered` makes `recorded_message_outcome` answer `Duplicate`
+  for that id forever — on exactly the halted and forked groups that carry the largest deferred backlogs. Only ingest
+  can tell the two apart, so `replay_buffered_messages` and `reingest_deferred_peel_row` stamp nothing on `Buffered`
+  and read the row's current state instead. (`do_ingest`'s durable dedup seam also answers `Buffered` for an existing
+  `Created`/`Retryable` row, pre-peel; internal replay enters below it.) Two consequences worth keeping straight: the
+  halt gate is write-once, because internal replay re-enters ingest below that dedup seam and re-stamping a
+  `PeelDeferred` row `Retryable` would drop its deferred-peel lifecycle; and the flood-cap slot belongs to the
+  `PeelDeferred` STATE, not to the stamp, so both callers release it via
+  `release_cap_slot_if_row_left_peel_deferred` — on the direct path, where wrapper and content share one id, a content
+  row replaces the deferred row without `retire_raw_wrapper` ever running. Pinned by
+  `tests/deferred_peel_lifecycle.rs::replay_keeps_a_row_the_halt_gate_never_peeled_redeliverable` and its
+  retiring-direction controls `::replay_still_retires_a_deferred_row_it_resolves`,
+  `::unchanged_192_row_contested_backlog_enumerates_candidates_once`, and
+  `tests/mip03_guards.rs::a_retained_wrapper_is_retired_when_its_proposal_waits_for_its_fork_parent`.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
   do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
   `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so
