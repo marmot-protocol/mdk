@@ -3199,16 +3199,45 @@ async fn app_component_lifecycle() {
         .unwrap()
         .as_millis() as u64
         + 86_400_000;
-    let sweep = runtime
-        .sweep_expired_retention(&alice, later)
-        .await
-        .unwrap();
-    assert!(
-        sweep
-            .groups
-            .iter()
-            .any(|outcome| outcome.pruned_messages > 0)
-    );
+    // The sweep reports nothing until alice's own retention row is projected,
+    // and defers while any received row is still unread, so mark the group read
+    // and retry until it actually prunes.
+    let group_hex = hex::encode(group.as_slice());
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let newest = runtime
+                .timeline_messages_with_query(
+                    &alice,
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap()
+                .messages
+                .into_iter()
+                .max_by_key(|message| message.timeline_at);
+            if let Some(newest) = newest {
+                runtime
+                    .mark_timeline_message_read(&alice, &group_hex, &newest.message_id_hex)
+                    .unwrap();
+            }
+            let sweep = runtime
+                .sweep_expired_retention(&alice, later)
+                .await
+                .unwrap();
+            if sweep
+                .groups
+                .iter()
+                .any(|outcome| outcome.pruned_messages > 0)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("retention sweep must prune the expired message");
     wait_app_component(&runtime, &alice, &group, &[1, 0]).await;
     runtime
         .update_app_component(&alice, &group, COMPONENT, vec![])
