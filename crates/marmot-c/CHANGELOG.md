@@ -85,7 +85,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `marmot_group_app_component` and admin-only `marmot_update_app_component`
   expose opaque optional group state for application-owned private-use IDs.
   Protocol-owned and required component IDs cannot be updated through this API.
-  Absent reads return NULL; present empty data returns a non-NULL record.
+  An absent component writes NULL to `*out` and still returns OK; present
+  empty data writes a record with zero length.
   Release records with `marmot_app_component_free`. Invalid component IDs return
   the appended `MARMOT_STATUS_INVALID_APP_COMPONENT` status (93).
   Existing record layouts and status values are unchanged.

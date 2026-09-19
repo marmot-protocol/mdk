@@ -6204,9 +6204,10 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
                                              struct MarmotSendSummary **out);
 
 /**
- * Read application-owned local group state. OK with NULL means absent;
- * a non-NULL record with zero data_len is present empty state. Refresh on
- * group events. Free with `marmot_app_component_free`.
+ * Read application-owned local group state. An absent component writes
+ * NULL to `*out` and still returns `MARMOT_STATUS_OK`; a written record
+ * with zero `data_len` is present empty state. Refresh on group events.
+ * Free with `marmot_app_component_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

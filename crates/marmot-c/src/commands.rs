@@ -711,9 +711,10 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_update_message_retention(account_ref: str, group_id_hex: str, disappearing_message_secs: val u64) -> rec(MarmotSendSummary) = update_message_retention;
 
-    /// Read application-owned local group state. OK with NULL means absent;
-    /// a non-NULL record with zero data_len is present empty state. Refresh on
-    /// group events. Free with `marmot_app_component_free`.
+    /// Read application-owned local group state. An absent component writes
+    /// NULL to `*out` and still returns `MARMOT_STATUS_OK`; a written record
+    /// with zero `data_len` is present empty state. Refresh on group events.
+    /// Free with `marmot_app_component_free`.
     async fn marmot_group_app_component(account_ref: str, group_id_hex: str, component_id: val u16) -> opt_rec(MarmotGroupAppComponent) = group_app_component;
 
     /// Query advisory membership health and pending rejoin offers.
