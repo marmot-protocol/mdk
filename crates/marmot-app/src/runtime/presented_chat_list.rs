@@ -80,7 +80,7 @@ impl RuntimePresentedChatListSubscription {
                     if update.is_none() { return Ok(None); }
                     self.dirty = true;
                 }
-                event = self.drafts.recv() => match event { Ok(event) if event.account_label == self.account_label => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
+                event = self.drafts.recv() => match event { Ok(event) if event.account_label == self.account_label && self.current.rows.iter().any(|row| row.row.group_id_hex == event.group_id_hex) => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
                 event = self.avatars.recv() => match event { Ok(label) if label == self.account_label => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
                 update = self.presentation.recv() => match update {
                     Ok(update) => {

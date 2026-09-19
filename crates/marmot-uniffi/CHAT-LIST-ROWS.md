@@ -59,10 +59,13 @@ command authorization. Commands continue checking authoritative current state.
 - `can_archive` / `can_restore`: the explicit archive toggle, including retained
   departed history. Restoring archive state does not rejoin a group or move a departed
   group out of Left. Rejoining is a separate authoritative operation.
-- `can_start_leave`: offer the existing leave flow for locally active membership.
+- `can_start_leave`: offer the existing leave flow for locally active, accepted membership.
   **Run authoritative leave preflight** before acting: an admin may need demotion,
   another admin, or a disband decision. This flag never promises `leave_group` will
-  succeed and does not load the engine to make that promise.
+  succeed and does not load the engine to make that promise. The row only knows
+  projected lifecycle and membership: preflight can additionally reject unknown
+  engine membership or an engine-only unrecoverable flag that is not yet reflected
+  in the lifecycle projection. Admin demotion requirements also remain in preflight.
 - `can_delete_local`: offer local deletion for terminal disbanded/left/removed
   history, with neither an unresolved leave request nor disbanding in progress.
   Confirmation UI remains client-owned. Queued departure exposes neither leave nor delete.

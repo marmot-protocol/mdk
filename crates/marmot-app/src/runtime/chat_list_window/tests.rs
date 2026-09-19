@@ -1379,3 +1379,85 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
     );
     f.runtime.shutdown_and_close().await.unwrap();
 }
+
+#[test]
+fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states() {
+    use crate::conversation_presentation::{ConversationAuthority, ConversationParticipation};
+    use cgka_traits::GroupLifecycleState as L;
+    let f = Fixture::new(1);
+    let mut row = f.store.chat_list_row("0000").unwrap().unwrap();
+    // Compare independently implemented public policies, including admin preflight.
+    // Engine-only facts are deliberately tested separately below: list rendering
+    // must not hydrate an engine just to obtain those facts.
+    for membership in [
+        SelfMembership::Member,
+        SelfMembership::Left,
+        SelfMembership::Removed,
+    ] {
+        for lifecycle in [
+            L::Stable,
+            L::PendingPublish,
+            L::Merging,
+            L::Recovering,
+            L::Unrecoverable,
+            L::Disbanded,
+        ] {
+            for pending in [false, true] {
+                for leaving in [false, true] {
+                    for disbanding in [false, true] {
+                        for admin in [false, true] {
+                            row.self_membership = membership;
+                            row.lifecycle_state = lifecycle;
+                            row.pending_confirmation = pending;
+                            row.leave_requested_at_ms = leaving.then_some(1);
+                            row.disbanding = disbanding;
+                            let authority = ConversationAuthority {
+                                is_member: membership == SelfMembership::Member,
+                                self_membership: membership,
+                                is_admin: admin,
+                                admin_count: 1,
+                                pending_confirmation: pending,
+                                leave_request_pending: leaving,
+                                lifecycle: lifecycle.into(),
+                                unrecoverable: false,
+                                disbanding,
+                                disbanding_enabled: false,
+                                has_disbanding_blockers: false,
+                            };
+                            let capabilities = authority.capabilities();
+                            assert_eq!(
+                                ChatListRowActions::for_row(&row).can_start_leave,
+                                capabilities.can_leave
+                                    || capabilities.requires_self_demote_before_leave,
+                                "{authority:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let row = f.store.chat_list_row("0000").unwrap().unwrap();
+    assert!(ChatListRowActions::for_row(&row).can_start_leave);
+    for (is_member, unrecoverable, participation) in [
+        (false, false, ConversationParticipation::Unavailable),
+        (true, true, ConversationParticipation::Active),
+    ] {
+        let capabilities = ConversationAuthority {
+            is_member,
+            self_membership: row.self_membership,
+            is_admin: false,
+            admin_count: 1,
+            pending_confirmation: false,
+            leave_request_pending: false,
+            lifecycle: row.lifecycle_state.into(),
+            unrecoverable,
+            disbanding: false,
+            disbanding_enabled: false,
+            has_disbanding_blockers: false,
+        }
+        .capabilities();
+        assert_eq!(capabilities.participation, participation);
+        assert!(!capabilities.can_leave && !capabilities.requires_self_demote_before_leave);
+    }
+}

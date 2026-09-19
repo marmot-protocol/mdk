@@ -76,7 +76,7 @@ impl ChatListRowActions {
             can_unmute: row.muted,
             can_archive: !row.archived,
             can_restore: row.archived,
-            can_start_leave: active && row.lifecycle_state != GroupLifecycleState::Unrecoverable,
+            can_start_leave: attention && row.lifecycle_state != GroupLifecycleState::Unrecoverable,
             can_delete_local: departed && !departing,
         }
     }
@@ -287,7 +287,7 @@ mod tests {
         assert!(!a.can_delete_local);
         row.pending_confirmation = true;
         let a = ChatListRowActions::for_row(&row);
-        assert!(!a.can_mark_read && !a.can_mark_unread);
+        assert!(!a.can_mark_read && !a.can_mark_unread && !a.can_start_leave);
         row.self_membership = SelfMembership::Left;
         row.leave_requested_at_ms = Some(1);
         let a = ChatListRowActions::for_row(&row);

@@ -220,7 +220,9 @@ diff-gates the checked-in header.
 ## Selected chat-list presentation
 
 The additive `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
-plus MDK-selected title/avatar descriptors. Existing struct layouts and functions are unchanged.
+plus MDK-selected title/avatar descriptors. The unreleased C3 additions extend
+`MarmotPresentedChatRow` with preview and action fields, changing its binary layout.
+Rebuild consumers with the matching generated header and native library; function signatures are unchanged.
 `marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
 whole-list replacements. The initial item has sequence zero. A repeated snapshot call returns CLOSED with NULL.
 

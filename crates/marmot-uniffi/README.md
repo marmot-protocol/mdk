@@ -4,8 +4,6 @@ UniFFI bindings for the Marmot app runtime.
 
 ## Integration guide and API reference
 
-For the unreleased C3 additions, see [selected chat-list previews and row actions](CHAT-LIST-ROWS.md).
-
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
 The [C guide](../marmot-c/README.md) adds ABI ownership and blocking-call rules for C and raw FFI hosts.
 Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.
@@ -17,6 +15,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 | [Release integration index](../../docs/integration/README.md) | Find the companion guide for your upgrade; read intervening guides when skipping versions. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
+| [Chat-list rows](CHAT-LIST-ROWS.md) | Unreleased C3 selected previews, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
 

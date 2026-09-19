@@ -65,7 +65,7 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
   a supported primitive as deprecated simply because a chat-screen projection exists. State a
   replacement and its scope for compatibility recommendations; claim formal deprecation only when
   the source actually declares it. Preserve non-chat consumers.
-- Keep detailed contracts in `CONVERSATION-WINDOW.md`, `ATTACHMENT-HISTORY.md`, `ATTACHMENT-ACCESS.md`
+- Keep detailed contracts in `CHAT-LIST-ROWS.md`, `CONVERSATION-WINDOW.md`, `ATTACHMENT-HISTORY.md`, `ATTACHMENT-ACCESS.md`
   and linked architecture docs; make the README the discoverable entry point rather than accumulating
   unindexed release snippets. Source/binary pairing, ownership, cancellation, local/network behavior,
   pagination, localization and privacy must be explicit for new public surfaces.
