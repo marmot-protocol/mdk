@@ -74,7 +74,9 @@ across the boundary. That deserves its own focused design + tests rather than a 
 
 - Keep `README.md` as the C integration/ownership entry point and `API-REFERENCE.md` complete for
   every generated header function, including frees, handle methods and compatibility shims.
-  Run `python3 scripts/check_binding_docs.py` after header or method-reference edits.
+  Use `just binding-docs-update` to refresh signatures/source anchors without replacing authored
+  prose, then complete new scaffolds and explicitly review removed/duplicate entries. Run
+  `just binding-docs-gate` after edits; it also runs the companion regression tests. Prose needs manual review.
 - Link shared runtime concepts and API-selection guidance from `marmot-uniffi/README.md`; describe
   C-only differences explicitly (blocking calls, timeouts, callbacks, deep frees, unsupported signer APIs).
 - Update the companion `docs/integration/<version>.md` for each release beginning with 0.10.2.

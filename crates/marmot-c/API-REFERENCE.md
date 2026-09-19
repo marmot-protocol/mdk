@@ -22,11 +22,15 @@ new media UI. Older primitives remain supported. `marmot_set_audit_log_tracker_c
 is a compatibility-only C shim: its old device-label field is ignored; new integrations
 use `marmot_set_audit_log_tracker_config_v4` and system hardware-model metadata.
 
-Each declaration links directly to its generated header documentation. Regenerate this
-inventory whenever the header changes and run `python3 scripts/check_binding_docs.py`.
+Each declaration links directly to its generated header documentation. Run
+`just binding-docs-update` to refresh signatures and source anchors while preserving authored
+prose, then review descriptions against the changed behavior. New methods require authored
+guidance before their scaffold can pass. Removed/duplicate entries require explicit cleanup.
+`just binding-docs-gate` checks names, signatures and source anchors and runs regression tests;
+it does not validate prose. Counts are reported by the tool rather than duplicated here.
 
 <details>
-<summary>marmot_a… — 80 functions</summary>
+<summary>marmot_a…</summary>
 
 ### `marmot_attachment_local_asset_list_free`
 
@@ -831,7 +835,7 @@ Read up to 64 progress entries in input order. No network demand is created. # S
 </details>
 
 <details>
-<summary>marmot_b… — 12 functions</summary>
+<summary>marmot_b…</summary>
 
 ### `marmot_bytes_free`
 
@@ -956,7 +960,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_c… — 74 functions</summary>
+<summary>marmot_c…</summary>
 
 ### `marmot_client_new_with_options`
 
@@ -1701,7 +1705,7 @@ Apply a MarmotAttachmentControl discriminant to an opaque reference. # Safety Cl
 </details>
 
 <details>
-<summary>marmot_d… — 18 functions</summary>
+<summary>marmot_d…</summary>
 
 ### `marmot_delete_account_key_package`
 
@@ -1886,7 +1890,7 @@ Explicitly request the current slot, including after cancellation/removal. NULL 
 </details>
 
 <details>
-<summary>marmot_e… — 10 functions</summary>
+<summary>marmot_e…</summary>
 
 ### `marmot_export_encrypted_secret_key`
 
@@ -1991,7 +1995,7 @@ Free an event returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_f… — 3 functions</summary>
+<summary>marmot_f…</summary>
 
 ### `marmot_forget_group_local`
 
@@ -2026,7 +2030,7 @@ MarmotStatus marmot_flush_product_analytics(const struct MarmotClient *client);
 </details>
 
 <details>
-<summary>marmot_g… — 25 functions</summary>
+<summary>marmot_g…</summary>
 
 ### `marmot_group_members`
 
@@ -2281,7 +2285,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_i… — 8 functions</summary>
+<summary>marmot_i…</summary>
 
 ### `marmot_invite_members`
 
@@ -2366,7 +2370,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_k… — 2 functions</summary>
+<summary>marmot_k…</summary>
 
 ### `marmot_key_package_maintenance_status`
 
@@ -2391,7 +2395,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_l… — 7 functions</summary>
+<summary>marmot_l…</summary>
 
 ### `marmot_last_error_message`
 
@@ -2466,7 +2470,7 @@ Sign in and finish a setup that was interrupted partway. Free with `marmot_accou
 </details>
 
 <details>
-<summary>marmot_m… — 23 functions</summary>
+<summary>marmot_m…</summary>
 
 ### `marmot_mark_timeline_message_read`
 
@@ -2701,7 +2705,7 @@ Free a message update returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_n… — 10 functions</summary>
+<summary>marmot_n…</summary>
 
 ### `marmot_normalize_member_ref`
 
@@ -2806,7 +2810,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_o… — 11 functions</summary>
+<summary>marmot_o…</summary>
 
 ### `marmot_onboarding_recovery_required`
 
@@ -2921,7 +2925,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_p… — 34 functions</summary>
+<summary>marmot_p…</summary>
 
 ### `marmot_publish_relay_lists`
 
@@ -3266,7 +3270,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_q… — 1 functions</summary>
+<summary>marmot_q…</summary>
 
 ### `marmot_quarantined_groups`
 
@@ -3281,7 +3285,7 @@ Stored groups that failed session-open hydration and were skipped. Surface them 
 </details>
 
 <details>
-<summary>marmot_r… — 40 functions</summary>
+<summary>marmot_r…</summary>
 
 ### `marmot_read_attachment_asset`
 
@@ -3686,7 +3690,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_s… — 58 functions</summary>
+<summary>marmot_s…</summary>
 
 ### `marmot_string_free`
 
@@ -4271,7 +4275,7 @@ Persist policy. Disable pauses automatic work but preserves explicit transfers a
 </details>
 
 <details>
-<summary>marmot_t… — 14 functions</summary>
+<summary>marmot_t…</summary>
 
 ### `marmot_telemetry_install_id`
 
@@ -4416,7 +4420,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_u… — 25 functions</summary>
+<summary>marmot_u…</summary>
 
 ### `marmot_update_message_retention`
 
@@ -4671,7 +4675,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 </details>
 
 <details>
-<summary>marmot_w… — 2 functions</summary>
+<summary>marmot_w…</summary>
 
 ### `marmot_watch_agent_text_stream`
 

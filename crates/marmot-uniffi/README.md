@@ -137,8 +137,12 @@ An additive Rust method does not imply that an old generated binding can call a 
 C record layouts are especially sensitive. Database upgrades are separate from source-level API
 compatibility, and rolling back only the library can be unsupported.
 
-The reference is checked against exports with `python3 scripts/check_binding_docs.py`.
-When an API changes, update its method entry, selection guidance and affected feature contract.
+The reference's names, signatures and source-line links are checked with `just binding-docs-gate`.
+Use `just binding-docs-update` (or `python3 scripts/check_binding_docs.py --write`) to refresh
+mechanical metadata while preserving authored prose. New exports receive scaffold entries that
+fail validation until their guidance is completed; removed/duplicate entries require explicit
+editorial cleanup. Review prose, selection guidance and affected feature contracts after changes:
+the gate cannot tell whether those descriptions still match runtime behavior.
 Every release from 0.10.2 has concise release notes and a separate detailed integration guide;
 see [the release checklist](../../release.md#release-documentation).
 

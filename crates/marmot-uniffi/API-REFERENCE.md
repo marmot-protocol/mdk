@@ -5,8 +5,7 @@ alongside source changes. Start with the [integration guide](README.md#integrati
 for API selection, lifecycle, localization and ownership. For this release's changes, read
 [0.10.1 → 0.10.2](../../docs/integration/0.10.2.md).
 
-There are **314 exported callables** here: 302 runtime/object methods, one free function,
-and 11 host callback methods. `AttachmentHistoryCursor` is an opaque object with no exported
+This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor` is an opaque object with no exported
 methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
 MDK commands. C has a separate [complete symbol index](../marmot-c/API-REFERENCE.md), including
 its lifetime helpers and compatibility-only entry points.
@@ -32,6 +31,16 @@ its lifetime helpers and compatibility-only entry points.
   a transfer subscription delivers its initial value from `next`, while a screen window
   has a separate initial snapshot. Do not infer cancellation support from another handle.
 
+## Maintaining the reference
+
+Run `just binding-docs-update` to refresh exact signatures and source anchors without
+rewriting the surrounding guidance. New exports receive blocking scaffolds for an author
+to complete and organize; removed/duplicate entries need explicit editorial cleanup.
+`just binding-docs-gate` checks that metadata and runs the companion regression tests.
+Descriptions and API-selection recommendations still require source-aware human review;
+they are not verified by the mechanical gate. Counts are reported by the tool rather than
+hard-coded in these pages.
+
 ## Methods by source module
 
 Each expandable section lists every export in that module. Search this page for the exact
@@ -39,7 +48,7 @@ Rust or owning-type method name. Signatures are kept intact to make input/output
 synchronous versus asynchronous behavior and drift review explicit.
 
 <details>
-<summary>commands/account.rs — 37 callables</summary>
+<summary>commands/account.rs</summary>
 
 ### `Marmot::list_accounts`
 
@@ -488,7 +497,7 @@ Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS policy
 </details>
 
 <details>
-<summary>commands/agent_stream.rs — 2 callables</summary>
+<summary>commands/agent_stream.rs</summary>
 
 ### `Marmot::start_agent_text_stream`
 
@@ -517,7 +526,7 @@ Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_h
 </details>
 
 <details>
-<summary>commands/attachment_access.rs — 2 callables</summary>
+<summary>commands/attachment_access.rs</summary>
 
 ### `Marmot::attachment_local_assets`
 
@@ -546,7 +555,7 @@ Read 1..=1048576 bytes at an offset from an opaque local asset reference. Unavai
 </details>
 
 <details>
-<summary>commands/attachment_controls.rs — 8 callables</summary>
+<summary>commands/attachment_controls.rs</summary>
 
 ### `AttachmentTransferSubscription::next`
 
@@ -647,7 +656,7 @@ Observe initial transfer state and coalesced complete replacements for bounded s
 </details>
 
 <details>
-<summary>commands/attachment_history.rs — 2 callables</summary>
+<summary>commands/attachment_history.rs</summary>
 
 ### `Marmot::attachment_history_page`
 
@@ -676,7 +685,7 @@ Cheap local refresh signal, including for a fully loaded or empty library. Compa
 </details>
 
 <details>
-<summary>commands/audit.rs — 7 callables</summary>
+<summary>commands/audit.rs</summary>
 
 ### `Marmot::audit_log_settings`
 
@@ -765,7 +774,7 @@ POST all local audit logs to the configured tracker when audit logging is enable
 </details>
 
 <details>
-<summary>commands/avatar.rs — 3 callables</summary>
+<summary>commands/avatar.rs</summary>
 
 ### `Marmot::request_avatar_assets`
 
@@ -806,7 +815,7 @@ Clear durable avatar bytes and demand; later visible requests can acquire again.
 </details>
 
 <details>
-<summary>commands/chat_list.rs — 11 callables</summary>
+<summary>commands/chat_list.rs</summary>
 
 ### `Marmot::chat_list`
 
@@ -943,7 +952,7 @@ Clear either a finite or indefinite MDK chat mute.
 </details>
 
 <details>
-<summary>commands/chat_window.rs — 2 callables</summary>
+<summary>commands/chat_window.rs</summary>
 
 ### `Marmot::open_chat_list_window`
 
@@ -972,7 +981,7 @@ Signed-in local/external accounts, independent of any list or active worker.
 </details>
 
 <details>
-<summary>commands/conversation_window.rs — 6 callables</summary>
+<summary>commands/conversation_window.rs</summary>
 
 ### `Marmot::open_conversation_window`
 
@@ -1049,7 +1058,7 @@ Read only the requested local attachment, rejecting a changed selected draft.
 </details>
 
 <details>
-<summary>commands/directory.rs — 14 callables</summary>
+<summary>commands/directory.rs</summary>
 
 ### `Marmot::display_name`
 
@@ -1059,7 +1068,7 @@ Read only the requested local attachment, rejecting a changed selected draft.
 pub fn display_name(&self, account_id_hex: String) -> Option<String>
 ```
 
-Best-effort cached display name for an account id. Returns the Nostr kind:0 display_name/name when the runtime has projected one, or the local account label if the id refers to one of our own accounts. `None` when nothing is known yet — call `refresh_directory` to fetch.
+Best-effort cached display name for an account id. Returns the Nostr kind:0 display_name/name when the runtime has projected one, or the local account label if the id refers to one of our own accounts. `None` when nothing is known yet — call `refresh_profile` to fetch.
 
 [Source](src/commands/directory.rs#L21)
 
@@ -1131,7 +1140,7 @@ Parse plaintext message content into the same Markdown AST returned on message a
 pub fn user_profile( &self, account_id_hex: String, ) -> Result<Option<UserProfileMetadataFfi>, MarmotKitError>
 ```
 
-Full cached Nostr kind:0 profile for an account id (name, display name, about, picture, nip05, lud16), if the runtime has one projected. The local account's own profile is cached immediately after `publish_user_profile`; other accounts' profiles populate via `refresh_directory`. Returns `None` when nothing is cached yet.
+Full cached Nostr kind:0 profile for an account id (name, display name, about, picture, nip05, lud16), if the runtime has one projected. The local account's own profile is cached immediately after `publish_user_profile`; other accounts' profiles populate via `refresh_profile`. Returns `None` when nothing is cached yet.
 
 [Source](src/commands/directory.rs#L75)
 
@@ -1222,7 +1231,7 @@ Stream cached public identities across accounts, then independent provider and g
 </details>
 
 <details>
-<summary>commands/draft.rs — 4 callables</summary>
+<summary>commands/draft.rs</summary>
 
 ### `Marmot::message_drafts`
 
@@ -1275,7 +1284,7 @@ Delete a saved composer draft. This is a no-op when no draft exists.
 </details>
 
 <details>
-<summary>commands/group.rs — 61 callables</summary>
+<summary>commands/group.rs</summary>
 
 ### `Marmot::prewarm_group_member_key_packages`
 
@@ -2012,11 +2021,11 @@ Run due maintenance for an account.
 </details>
 
 <details>
-<summary>commands/media.rs — 7 callables</summary>
+<summary>commands/media.rs</summary>
 
-### `free::parse_media_imeta_tag`
+### `parse_media_imeta_tag`
 
-**Current.**
+**Current free function.** Generated Swift/Kotlin name: `parseMediaImetaTag`.
 
 ```rust
 pub fn parse_media_imeta_tag( tag: MessageTagFfi, source_epoch: u64, ) -> Result<MediaAttachmentReferenceFfi, MarmotKitError>
@@ -2101,7 +2110,7 @@ Typed media references projected from group message history. Host apps can pass 
 </details>
 
 <details>
-<summary>commands/message.rs — 11 callables</summary>
+<summary>commands/message.rs</summary>
 
 ### `Marmot::send_text`
 
@@ -2238,7 +2247,7 @@ Initial history fetch for a group (or, when `group_id_hex` is None, the account-
 </details>
 
 <details>
-<summary>commands/moderation.rs — 5 callables</summary>
+<summary>commands/moderation.rs</summary>
 
 ### `Marmot::report_message`
 
@@ -2303,7 +2312,7 @@ Read a bounded page of dismissal labels.
 </details>
 
 <details>
-<summary>commands/notification.rs — 6 callables</summary>
+<summary>commands/notification.rs</summary>
 
 ### `Marmot::notification_settings`
 
@@ -2380,7 +2389,7 @@ Collect notifications after bounded wake/catch-up processing.
 </details>
 
 <details>
-<summary>commands/onboarding.rs — 22 callables</summary>
+<summary>commands/onboarding.rs</summary>
 
 ### `OnboardingSubscription::snapshot`
 
@@ -2649,7 +2658,7 @@ Dismiss an unapproved repair proposal; this cannot undo already-approved publica
 </details>
 
 <details>
-<summary>commands/presentation.rs — 3 callables</summary>
+<summary>commands/presentation.rs</summary>
 
 ### `Marmot::presented_chat_list`
 
@@ -2690,7 +2699,7 @@ Returns an attached handle containing the initial snapshot. Take its snapshot on
 </details>
 
 <details>
-<summary>commands/product_analytics.rs — 7 callables</summary>
+<summary>commands/product_analytics.rs</summary>
 
 ### `Marmot::usage_diagnostics_settings`
 
@@ -2779,7 +2788,7 @@ Flush pending eligible product analytics work.
 </details>
 
 <details>
-<summary>commands/push.rs — 4 callables</summary>
+<summary>commands/push.rs</summary>
 
 ### `Marmot::push_registration`
 
@@ -2832,7 +2841,7 @@ Inspect group push-routing debug information; do not log sensitive identifiers i
 </details>
 
 <details>
-<summary>commands/relay.rs — 8 callables</summary>
+<summary>commands/relay.rs</summary>
 
 ### `Marmot::retired_relay_hosts`
 
@@ -2933,7 +2942,7 @@ Deprecated consent control. Use `set_usage_diagnostics_consent` instead. Enable 
 </details>
 
 <details>
-<summary>commands/subscription.rs — 7 callables</summary>
+<summary>commands/subscription.rs</summary>
 
 ### `Marmot::subscribe_events`
 
@@ -3022,7 +3031,7 @@ Member/profile/roster changes for one group. Async for the same tokio-runtime re
 </details>
 
 <details>
-<summary>commands/telemetry.rs — 3 callables</summary>
+<summary>commands/telemetry.rs</summary>
 
 ### `Marmot::record_host_timing`
 
@@ -3063,7 +3072,7 @@ Read the process-wide app-performance snapshot for debug/diagnostics surfaces an
 </details>
 
 <details>
-<summary>commands/timeline.rs — 2 callables</summary>
+<summary>commands/timeline.rs</summary>
 
 ### `Marmot::message_edit_history`
 
@@ -3092,7 +3101,7 @@ Materialized conversation timeline for a group or account-wide tail.
 </details>
 
 <details>
-<summary>commands/user_blocks.rs — 7 callables</summary>
+<summary>commands/user_blocks.rs</summary>
 
 ### `BlockListSubscription::snapshot`
 
@@ -3181,7 +3190,7 @@ Observe block-list snapshots.
 </details>
 
 <details>
-<summary>conversions/attachment_history.rs — 1 callables</summary>
+<summary>conversions/attachment_history.rs</summary>
 
 ### `AttachmentHistoryVersion::change_since`
 
@@ -3198,7 +3207,7 @@ Compare current with an older version, including after the last page. RestartReq
 </details>
 
 <details>
-<summary>external_signer.rs — 6 callables</summary>
+<summary>external_signer.rs</summary>
 
 ### `ExternalAccountSignerFfi::public_key`
 
@@ -3275,7 +3284,7 @@ Host callback for NIP-44 payload decryption.
 </details>
 
 <details>
-<summary>lib.rs — 11 callables</summary>
+<summary>lib.rs</summary>
 
 ### `Marmot::new_with_configuration`
 
@@ -3412,7 +3421,7 @@ True once shutdown has started. Host apps can use this to avoid launching more s
 </details>
 
 <details>
-<summary>publisher.rs — 5 callables</summary>
+<summary>publisher.rs</summary>
 
 ### `Marmot::open_agent_publisher`
 
@@ -3477,7 +3486,7 @@ Stop the preview; an already-running finish wins. State is not restored after pr
 </details>
 
 <details>
-<summary>secret_store.rs — 5 callables</summary>
+<summary>secret_store.rs</summary>
 
 ### `SecretStore::has_secret_for_label`
 
@@ -3542,7 +3551,7 @@ Remove this account's credential. Removing a missing credential succeeds.
 </details>
 
 <details>
-<summary>subscriptions/chat_window.rs — 7 callables</summary>
+<summary>subscriptions/chat_window.rs</summary>
 
 ### `ChatListWindowSubscription::snapshot`
 
@@ -3631,7 +3640,7 @@ Wait for the next value; None means the observation ended. Bind one receive loop
 </details>
 
 <details>
-<summary>subscriptions/conversation_window.rs — 7 callables</summary>
+<summary>subscriptions/conversation_window.rs</summary>
 
 ### `ConversationWindowSubscription::snapshot`
 
@@ -3720,7 +3729,7 @@ Missing targets fail explicitly. Commands may run while next() waits.
 </details>
 
 <details>
-<summary>subscriptions.rs — 21 callables</summary>
+<summary>subscriptions.rs</summary>
 
 ### `ChatsSubscription::snapshot`
 

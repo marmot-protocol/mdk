@@ -149,7 +149,7 @@ Before the release commit:
    upgrades. Keep known limitations and unresolved release blockers explicit.
 6. Run `just binding-docs-gate`, verify local Markdown links and source signatures,
    review examples against generated sources, then run the normal release preflight.
-   This gate checks exported names/signatures only; it cannot establish semantic prose,
+   This gate checks exported names, signatures and source links; it cannot establish semantic prose,
    DTO compatibility or platform adoption.
 
 Publish pointers to **both documents** in the MDK, MarmotKit and C GitHub Release bodies
@@ -176,10 +176,17 @@ git fetch origin
 Confirm the version, release notes, companion integration guide and complete method inventory:
 
 ```sh
-rg -n '^version = ' Cargo.toml
+release_version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
 sed -n '1,120p' crates/cli/CHANGELOG.md
+python3 scripts/check_binding_docs.py --release-version "$release_version"
 just binding-docs-gate
 ```
+
+The versioned check requires both `docs/release/$release_version.md` and
+`docs/integration/$release_version.md` from 0.10.2 onward and verifies their reciprocal
+links. It also rejects a supplied version that differs from the workspace. The full-cohort
+release coordinator runs this check before any tag/release mutation, including dry runs.
+A successful check verifies existence/linkage, not the accuracy or completeness of prose.
 
 Run the normal workspace checks:
 

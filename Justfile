@@ -610,6 +610,12 @@ c-parity-gate:
 # Keep the complete client method inventories aligned with source/header signatures.
 binding-docs-gate:
     python3 scripts/check_binding_docs.py
+    python3 scripts/test_check_binding_docs.py
+
+# Refresh mechanical signatures/source links while preserving integration prose.
+# New exports are scaffolded and remain failing until an author completes their guidance.
+binding-docs-update:
+    python3 scripts/check_binding_docs.py --write
 
 # Keep convergence policy, resource, scheduler, and history-recovery constants
 # attached to reviewed convergence-constant ledger entries.
