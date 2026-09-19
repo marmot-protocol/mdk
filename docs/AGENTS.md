@@ -25,6 +25,21 @@ implementation checklist.
 - When a protocol rule graduates from exploratory architecture text, link to the matching document in
   `github.com/marmot-protocol/marmot` instead of copying the rule into multiple docs.
 
+## Client integration and release documentation
+
+`../crates/marmot-uniffi/README.md` is the current client integration entry point;
+its method reference and the C symbol reference enumerate all exports. Versioned
+`integration/<version>.md` guides explain the exact upgrade delta, while
+`release/<version>.md` remains concise. Starting with 0.10.2, each release requires
+both, with reciprocal links and an entry in `integration/README.md`.
+
+Follow `../release.md#release-documentation`. Verify behavior against the named tags,
+separate required adoption from optional features and automatic fixes, include platform
+ownership/lifecycle examples and concrete validation, and state any remaining limitations.
+Do not move release tags for documentation added after publication; mark those guides as
+supplements and use a merged documentation commit URL when publishing release links.
+Do not label lower-level APIs deprecated without actual source deprecation evidence.
+
 ## Verification
 
 After doc changes, run:

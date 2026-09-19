@@ -3,6 +3,28 @@
 C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
 any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
 
+## Integration documentation
+
+Start with the [shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference)
+for runtime lifecycle, screen contracts, API selection, localization and upgrade policy.
+Use the [complete C symbol reference](API-REFERENCE.md) for every function declaration,
+including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
+for runtime purposes and recommended alternatives to older screen paths.
+
+The [0.10.1 → 0.10.2 integration guide](../../docs/integration/0.10.2.md) explains
+new defaults, media adoption, KeyPackages and changed records. Future releases have
+companions in the [integration index](../../docs/integration/README.md).
+Read the exact version's header and docs; C record layout compatibility is not implied
+by a shared major/minor number. External-signer onboarding/login/registration remain
+UniFFI-only until a C signer callback interface exists; the host secret-store vtable
+is already supported and is a different interface.
+
+Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
+its status; `marmot_client_shutdown` alone does not close shared database handles.
+Release subscriptions before clients, and never free an object while another call uses it.
+The catalog includes C-only compatibility shims; prefer the v4 audit configuration
+setter and the composable runtime options constructor for new integrations.
+
 ## What you get
 
 - `libmarmot_c.so` / `libmarmot_c.a` (cdylib + staticlib).
@@ -54,8 +76,8 @@ int main(void) {
         return 1;
     }
     /* ... */
-    if (marmot_client_shutdown(client) != MARMOT_STATUS_OK) {
-        report("client_shutdown");
+    if (marmot_client_shutdown_and_close(client) != MARMOT_STATUS_OK) {
+        report("client_shutdown_and_close");
         marmot_client_free(client);
         return 1;
     }
@@ -148,8 +170,9 @@ it never reinterprets an old device name as a hardware model. Both setters use t
   discriminants — use the generated `MARMOT_*` constants. Out-of-range
   values are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`.
 - Required out-pointers are checked and zeroed before the call does any
-  work, so a rejected call never leaves a side effect behind and is always
-  safe to retry.
+  work, so an invalid required output pointer cannot cause the operation
+  to run. Other failures/timeouts can follow durable intent or external side
+  effects; inspect authoritative state before retrying a mutation.
 - Blocking functions may be called from a subscription callback.
 - Subscriptions offer blocking `*_next` (`0` timeout = wait forever;
   `MARMOT_STATUS_TIMEOUT` / `MARMOT_STATUS_CLOSED` otherwise) or callback

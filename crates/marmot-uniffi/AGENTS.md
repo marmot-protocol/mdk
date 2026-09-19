@@ -1,6 +1,6 @@
 # AGENTS.md - marmot-uniffi
 
-UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scripts and platform setup.
+UniFFI bindings for the Marmot app runtime. Read `README.md` first for integration concepts, API selection and platform setup; then `API-REFERENCE.md` for the complete exported method inventory.
 
 ## Scope
 
@@ -52,6 +52,26 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
   of feature, fix, binding, or review-feedback work. Workspace versions are bumped only as an explicit, user-directed
   release operation; UniFFI records, enums, object methods, and error variants may change while the current workspace
   version remains unchanged.
+
+## Documentation contract
+
+- Every exported constructor, runtime/object method, free function and foreign callback belongs in
+  `API-REFERENCE.md`, with its exact Rust signature, purpose and source link. Update it in the same PR
+  as API changes; run `python3 scripts/check_binding_docs.py` to catch omissions/signature drift.
+  The check does not validate prose, records/enums or generated-language ABI: review those manually.
+- Keep the README's recommended/compatibility/lower-level selection table accurate. Do not describe
+  a supported primitive as deprecated simply because a chat-screen projection exists. State a
+  replacement and its scope for compatibility recommendations; claim formal deprecation only when
+  the source actually declares it. Preserve non-chat consumers.
+- Keep detailed contracts in `CONVERSATION-WINDOW.md`, `ATTACHMENT-HISTORY.md`, `ATTACHMENT-ACCESS.md`
+  and linked architecture docs; make the README the discoverable entry point rather than accumulating
+  unindexed release snippets. Source/binary pairing, ownership, cancellation, local/network behavior,
+  pagination, localization and privacy must be explicit for new public surfaces.
+- Starting with 0.10.2, every release needs `docs/integration/<version>.md` alongside concise
+  `docs/release/<version>.md`. Follow `release.md#release-documentation`: compare the prior tag,
+  distinguish required migration/default changes from optional adoption and automatic fixes,
+  include Swift/Kotlin/C implications and concrete consumer validation. Link both directions and
+  update `docs/integration/README.md`. Never move an existing tag for a later documentation supplement.
 
 ## Verification
 

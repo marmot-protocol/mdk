@@ -607,6 +607,10 @@ uniffi-projections-smoke language="swift":
 c-parity-gate:
     python3 scripts/check_c_binding_parity.py
 
+# Keep the complete client method inventories aligned with source/header signatures.
+binding-docs-gate:
+    python3 scripts/check_binding_docs.py
+
 # Keep convergence policy, resource, scheduler, and history-recovery constants
 # attached to reviewed convergence-constant ledger entries.
 convergence-ledger-gate:
@@ -627,6 +631,6 @@ apple-privacy-gate:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin test
