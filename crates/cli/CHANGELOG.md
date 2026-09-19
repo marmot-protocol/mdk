@@ -2566,6 +2566,7 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
 [Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/marmot-protocol/mdk/compare/v0.10.1...v0.10.2
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...v0.9.19
 [0.9.18]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...v0.9.18
