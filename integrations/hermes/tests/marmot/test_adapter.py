@@ -161,6 +161,9 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         async def remove_reaction(self, chat_id, message_id=None):
             raise NotImplementedError
 
+        def resume_typing_for_chat(self, chat_id):
+            pass
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
@@ -8883,6 +8886,19 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret_group, joined)
         self.assertNotIn(secret_subject, joined)
         self.assertNotIn("close failed", joined)
+
+class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_metadata_alone_cannot_authorize_reactions(self):
+        module = load_adapter_module()
+        adapter = module.MarmotPlatformAdapter(
+            sys.modules["gateway.config"].PlatformConfig(extra={
+                "account_id_hex": "11" * 32, "approval_reactions": True,
+            }), client=_DeliveryRoutingFakeClient(),
+        )
+        await adapter.send("22" * 16, "not a host request",
+                           metadata={"is_approval_prompt": True})
+        self.assertEqual(adapter._approval_prompt_messages, {})
+        await adapter.disconnect()
 
 
 if __name__ == "__main__":

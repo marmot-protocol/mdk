@@ -24,6 +24,33 @@ model-callable `marmot_history` tool can fetch one exact message id or page olde
 messages using a `(recorded_at, message_id_hex)` cursor. Automatic history
 lookup is best-effort and never drops the current inbound message if it fails.
 
+## Approval reactions (opt in)
+
+Set `platforms.marmot.extra.approval_reactions: true` in Hermes configuration.
+Only senders explicitly listed in `MARMOT_ALLOWED_USERS` can decide a prompt;
+`MARMOT_ALLOW_ALL_USERS` does not grant approval authority. React 👍 to approve
+once, 👎 to deny, or ❤️ to approve permanently. Permanent consent is unavailable
+for one-operation-only or Smart DENY requests. Typed `/approve` and `/deny`
+remain available. The default is off.
+
+Supported host: Hermes 0.19.0, source revision
+`3ef6bbd201263d354fd83ec55b3c306ded2eb72a` in `hermes-agent.lock`.
+The plugin uses its `send_exec_approval` notification hook and binds durable
+message receipts to the actual pending approval entry. Consumption uses the
+host queue lock; an expired/resolved prompt cannot resolve a newer request,
+even if the commands are identical. Parallel pending requests are typed-only.
+Rejected slash commands do not retire prompts. This compatibility boundary
+uses pinned host internals and must be retested before changing the host pin.
+
+To run the host contract regressions with that source checkout and its Python
+environment (in addition to the ordinary adapter suite):
+
+```sh
+HERMES_APPROVAL_CONTRACT=1 PYTHONPATH=/path/to/pinned/hermes-agent \
+  /path/to/hermes-python -m unittest discover \
+  -s integrations/hermes/tests/marmot -p test_approval_host_contract.py
+```
+
 ## Inbound durability boundary
 
 Every normalized `inbound_message` is committed to a private, schema-versioned
