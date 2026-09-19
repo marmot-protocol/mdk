@@ -70,6 +70,7 @@ marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = "0.26"
 
 [[bench]]
 name = "media_download_backlog"

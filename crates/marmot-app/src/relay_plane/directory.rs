@@ -482,7 +482,14 @@ impl NostrSdkDirectoryRelayFetcher {
     }
 
     pub(crate) fn standalone() -> Self {
-        Self::new(NostrSdkClient::builder().build())
+        // Public directory reads have no account signer. An optional NIP-42
+        // challenge must not trigger a failed authentication attempt that
+        // closes the SDK's active profile fetch before its events arrive.
+        Self::new(
+            NostrSdkClient::builder()
+                .opts(nostr_sdk::ClientOptions::new().automatic_authentication(false))
+                .build(),
+        )
     }
 }
 
@@ -899,6 +906,78 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn anonymous_directory_fetch_accepts_profiles_after_optional_auth_challenge() {
+        use futures::{SinkExt, StreamExt};
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let keys = Keys::generate();
+        let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"jack"}"#)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let expected_id = profile.id.to_hex();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                let subscription = request[1].as_str().unwrap();
+                socket
+                    .send(Message::Text(r#"["AUTH","optional-challenge"]"#.into()))
+                    .await
+                    .unwrap();
+                // Let the SDK process the challenge before the public result.
+                // With auto-auth enabled, its missing signer closes this fetch.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                for response in [
+                    serde_json::json!(["EVENT", subscription, profile]),
+                    serde_json::json!(["EOSE", subscription]),
+                ] {
+                    if socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Keep the connection alive until the bounded fetch shuts down.
+            }
+        });
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(
+                0,
+                vec![keys.public_key().to_hex()],
+                4,
+            )],
+        )
+        .unwrap();
+        let transport = NostrSdkClient::builder().signer(keys).build();
+        let fetcher = NostrSdkDirectoryRelayFetcher::new(transport.clone());
+        let result = timeout(
+            Duration::from_secs(5),
+            fetcher.fetch_directory_events(request),
+        )
+        .await;
+        server.abort();
+        let records = result.unwrap().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event.id, expected_id);
+        assert!(transport.pool().state().is_auto_authentication_enabled());
+        assert!(transport.signer().await.is_ok());
+    }
 
     #[tokio::test]
     async fn signerless_inspection_never_retains_relays_in_the_shared_client() {
