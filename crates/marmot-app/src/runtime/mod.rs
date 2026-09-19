@@ -2375,6 +2375,35 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Read application-owned private-use state. None means absent; Some(empty)
+    /// is present. Refresh after group events, including convergence changes.
+    pub async fn group_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.accounts
+            .group_app_component(account_ref, group_id, component_id)
+            .await
+    }
+
+    /// Admin-only replacement of optional application-owned state. Protocol-owned
+    /// and required IDs are rejected. Apps own their schema and ID allocation.
+    /// Empty bytes are stored, not removed. Normal commit publication and
+    /// convergence apply, including GroupChangeSuperseded notifications.
+    pub async fn update_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .update_app_component(account_ref, group_id, component_id, data)
+            .await
+    }
+
     pub async fn update_message_retention(
         &self,
         account_ref: &str,

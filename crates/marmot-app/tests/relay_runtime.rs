@@ -3042,6 +3042,196 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     runtime.shutdown().await;
 }
 
+async fn wait_component_epoch(
+    runtime: &MarmotAppRuntime,
+    source: &str,
+    peer: &str,
+    group: &GroupId,
+) {
+    let epoch = runtime.group_mls_state(source, group).await.unwrap().epoch;
+    timeout(Duration::from_secs(15), async {
+        while runtime.group_mls_state(peer, group).await.unwrap().epoch < epoch {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("peer must adopt admin change");
+}
+
+async fn wait_app_component(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    expected: &[u8],
+) {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if runtime
+                .group_app_component(account, group, 0xf301)
+                .await
+                .unwrap()
+                .as_deref()
+                == Some(expected)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("component must converge");
+}
+
+#[tokio::test]
+async fn app_component_lifecycle() {
+    const COMPONENT: u16 = 0xf301;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account
+        .account_id_hex;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account
+        .account_id_hex;
+    let carol = create_network_ready_identity(&runtime, setup)
+        .await
+        .account
+        .account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(&alice, "components", std::slice::from_ref(&bob), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| matches!(event,
+        MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &bob && group_id == &group
+    )).await;
+    accept_group_invite_retrying_busy(&runtime, &bob, &group)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .group_app_component(&alice, &group, COMPONENT)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let epoch = runtime.group_mls_state(&alice, &group).await.unwrap().epoch;
+    let reserved = runtime
+        .update_app_component(&alice, &group, 0x8003, vec![])
+        .await
+        .unwrap_err();
+    assert!(matches!(reserved, AppError::InvalidAppComponent(_)));
+    let forbidden = runtime
+        .update_app_component(&bob, &group, COMPONENT, vec![1, 1])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        forbidden.as_engine_error(),
+        Some(cgka_traits::EngineError::NotGroupAdmin { .. })
+    ));
+    assert_eq!(
+        runtime.group_mls_state(&alice, &group).await.unwrap().epoch,
+        epoch
+    );
+
+    runtime
+        .update_app_component(&alice, &group, COMPONENT, vec![1, 1])
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &bob, &group, &[1, 1]).await;
+    // A group event lets a client invalidate its local view without chat traffic.
+    wait_for_event(&mut events, |event| matches!(event,
+        MarmotAppEvent::GroupEvent(event) if event.account_id_hex == bob && matches!(
+            &event.event, cgka_traits::engine::GroupEvent::EpochChanged { group_id, .. } if group_id == &group
+        )
+    )).await;
+
+    runtime
+        .invite_members(&alice, &group, std::slice::from_ref(&carol))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| matches!(event,
+        MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &carol && group_id == &group
+    )).await;
+    accept_group_invite_retrying_busy(&runtime, &carol, &group)
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &carol, &group, &[1, 1]).await;
+
+    runtime.promote_admin(&alice, &group, &bob).await.unwrap();
+    wait_component_epoch(&runtime, &alice, &bob, &group).await;
+    runtime
+        .update_app_component(&bob, &group, COMPONENT, vec![1, 0])
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &alice, &group, &[1, 0]).await;
+    runtime.demote_admin(&alice, &group, &bob).await.unwrap();
+    wait_component_epoch(&runtime, &alice, &bob, &group).await;
+    let forbidden = runtime
+        .update_app_component(&bob, &group, COMPONENT, vec![1, 1])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        forbidden.as_engine_error(),
+        Some(cgka_traits::EngineError::NotGroupAdmin { .. })
+    ));
+
+    runtime
+        .update_message_retention(&alice, &group, 1)
+        .await
+        .unwrap();
+    runtime
+        .send_message(&alice, &group, b"expires".to_vec())
+        .await
+        .unwrap();
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 86_400_000;
+    let sweep = runtime
+        .sweep_expired_retention(&alice, later)
+        .await
+        .unwrap();
+    assert!(
+        sweep
+            .groups
+            .iter()
+            .any(|outcome| outcome.pruned_messages > 0)
+    );
+    wait_app_component(&runtime, &alice, &group, &[1, 0]).await;
+    runtime
+        .update_app_component(&alice, &group, COMPONENT, vec![])
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &carol, &group, &[]).await;
+
+    runtime.shutdown_and_close().await.unwrap();
+    drop(runtime);
+    drop(app);
+    let reopened = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(reopened);
+    runtime.reconcile_accounts().await.unwrap();
+    for account in [&alice, &bob, &carol] {
+        wait_app_component(&runtime, account, &group, &[]).await;
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test]
 async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
     let dir = tempfile::tempdir().unwrap();

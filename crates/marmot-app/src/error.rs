@@ -224,6 +224,8 @@ pub enum AppError {
     InvalidDirectorySearch(String),
     #[error("invalid group profile: {0}")]
     InvalidGroupProfile(String),
+    #[error("invalid app component: {0}")]
+    InvalidAppComponent(String),
     #[error("invalid Nostr routing component: {0}")]
     InvalidNostrRouting(String),
     #[error("invalid group avatar URL: {0}")]
@@ -456,6 +458,7 @@ impl AppError {
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",
             Self::InvalidGroupProfile(_) => "invalid_group_profile",
+            Self::InvalidAppComponent(_) => "invalid_app_component",
             Self::InvalidNostrRouting(_) => "invalid_nostr_routing",
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
@@ -540,6 +543,7 @@ impl AppError {
             Self::Json(_)
             | Self::Hex(_)
             | Self::InvalidAppMessagePayload(_)
+            | Self::InvalidAppComponent(_)
             | Self::InvalidNostrRouting(_)
             | Self::InvalidKeyPackageEvent(_) => SyncErrorClass::Protocol,
             _ => SyncErrorClass::Unknown,

@@ -4,11 +4,11 @@ use marmot_uniffi::conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupHydrationQuarantineReasonFfi,
     AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
     AppProtocolProfileFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandFailureReasonFfi,
-    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
-    GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi,
-    GroupRecoveryStatusFfi, GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi,
-    SelfMembershipFfi,
+    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupAppComponentFfi,
+    GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
+    GroupLifecycleStateFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
+    GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRecoveryStatusFfi,
+    GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi, SelfMembershipFfi,
 };
 // Group-creation option/image records live on the command module rather
 // than `conversions`, because they are inputs, not projections.
@@ -21,6 +21,14 @@ use super::account::MarmotSendSummary;
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, optional_str, required_str};
+
+c_mirror! {
+    /// Opaque application-owned group state. Empty data is distinct from absence.
+    MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_app_component_free {
+        copy component_id: u16,
+        bytes data/data_len,
+    }
+}
 
 c_enum! {
     /// Marmot protocol profile the group runs.
@@ -354,6 +362,32 @@ mod tests {
     use super::*;
     use crate::memory::boxed;
     use marmot_uniffi::conversions::SendAcceptDispositionFfi;
+
+    #[test]
+    fn app_component_deep_free() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        for data in [vec![1, 0, 255], vec![]] {
+            let mirror: MarmotGroupAppComponent = GroupAppComponentFfi {
+                component_id: 0xf301,
+                data: data.clone(),
+            }
+            .into();
+            assert_eq!(mirror.component_id, 0xf301);
+            assert_eq!(mirror.data_len, data.len());
+            if !data.is_empty() {
+                assert_eq!(
+                    unsafe { std::slice::from_raw_parts(mirror.data, mirror.data_len) },
+                    data
+                );
+            }
+            unsafe { marmot_app_component_free(boxed(mirror)) };
+        }
+        unsafe { marmot_app_component_free(std::ptr::null_mut()) };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
 
     #[test]
     fn recovery_status_deep_free_preserves_all_fields() {

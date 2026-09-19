@@ -176,6 +176,29 @@ Encrypted group images differ: no endpoint is stored in group state, so upload a
 build's primary endpoint. Clients compiled with different defaults therefore look for group images in different
 places; re-setting the group image on a current build republishes it to the current primary endpoint.
 
+## Application-owned group state
+
+`MarmotAppRuntime::group_app_component` reads opaque private-use component
+bytes from local MLS state; `update_app_component` replaces one optional
+component through an admin-authorized MLS commit. The same methods are exported
+by UniFFI and C. Applications coordinate their own component IDs and version
+their payloads. Protocol-owned IDs and updates to required components are
+rejected; use the existing typed APIs for protocol settings.
+
+An absent component returns `None`; a present empty payload returns
+`Some(Vec::new())`. Empty payloads do not remove a component. The state survives
+message expiry and reaches newly invited members in their Welcome, without
+sharing earlier application-message history. Unsupported clients preserve
+optional component bytes without interpreting them.
+
+Refresh on runtime group events (including `EpochChanged` and convergence)
+and after local updates. Reads are serialized through the account worker and
+may wait behind an in-flight mutation. Updates use existing publication and
+convergence semantics; hosts must handle publication uncertainty and
+`GroupChangeSuperseded` rather than assuming a successful local change wins
+every later concurrent commit. This API does not add automatic retries of an
+application's desired value.
+
 ## Run the tests
 
 ```sh

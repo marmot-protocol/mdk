@@ -177,6 +177,7 @@ enum MarmotStatus
    * A signed-out account cannot grant automatic network permission.
    */
   MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
+  MARMOT_STATUS_INVALID_APP_COMPONENT = 95,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2036,6 +2037,15 @@ typedef struct MarmotSendSummary {
   enum MarmotSendAcceptDisposition accept_disposition;
   enum MarmotSendMaintenanceDisposition maintenance_disposition;
 } MarmotSendSummary;
+
+/**
+ * Opaque application-owned group state. Empty data is distinct from absence.
+ */
+typedef struct MarmotGroupAppComponent {
+  uint16_t component_id;
+  uint8_t *data;
+  uintptr_t data_len;
+} MarmotGroupAppComponent;
 
 /**
  * Embedded replacement offer; show the authenticated inviter before confirmation.
@@ -6194,6 +6204,23 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
                                              struct MarmotSendSummary **out);
 
 /**
+ * Read application-owned local group state. OK with NULL means absent;
+ * a non-NULL record with zero data_len is present empty state. Refresh on
+ * group events. Free with `marmot_app_component_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_app_component(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        uint16_t component_id,
+                                        struct MarmotGroupAppComponent **out);
+
+/**
  * Query advisory membership health and pending rejoin offers.
  * Free with `marmot_group_recovery_status_free`.
  *
@@ -8478,6 +8505,23 @@ MarmotStatus marmot_record_host_performance(const struct MarmotClient *client,
                                             uint32_t outcome);
 
 /**
+ * Replace an optional application-owned component through an admin MLS commit.
+ * Rejects protocol-owned and required IDs. Empty bytes are stored, not removed.
+ * Free the returned summary with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be live; strings valid; `data` must hold `data_len` bytes
+ * (or be NULL with zero length); `out` must be writable. Inputs are borrowed.
+ */
+MarmotStatus marmot_update_app_component(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         uint16_t component_id,
+                                         const uint8_t *data,
+                                         uintptr_t data_len,
+                                         struct MarmotSendSummary **out);
+
+/**
  * Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
@@ -10415,6 +10459,16 @@ void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList
  * `event` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_event_free(struct MarmotEvent *event);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_app_component_free(struct MarmotGroupAppComponent *ptr);
 
 /**
  * Free a disband request returned by `marmot_disband_group`. NULL is a

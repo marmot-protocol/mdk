@@ -82,6 +82,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_group_app_component` and admin-only `marmot_update_app_component`
+  expose opaque optional group state for application-owned private-use IDs.
+  Protocol-owned and required component IDs cannot be updated through this API.
+  Absent reads return NULL; present empty data returns a non-NULL record.
+  Release records with `marmot_app_component_free`. Invalid component IDs return
+  the appended `MARMOT_STATUS_INVALID_APP_COMPONENT` status (93).
+  Existing record layouts and status values are unchanged.
+
 - `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay
   policy, cursor persistence, client label and optional host secret storage.
   Zero-initialized options preserve the existing defaults. Use matching headers

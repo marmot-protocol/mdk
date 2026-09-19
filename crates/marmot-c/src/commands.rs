@@ -49,7 +49,7 @@ use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
     MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
     MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
-    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest,
+    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest, MarmotGroupAppComponent,
     MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
     MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
@@ -710,6 +710,11 @@ c_cmd! {
     /// `disappearing_message_secs` of `0` disables expiry. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_update_message_retention(account_ref: str, group_id_hex: str, disappearing_message_secs: val u64) -> rec(MarmotSendSummary) = update_message_retention;
+
+    /// Read application-owned local group state. OK with NULL means absent;
+    /// a non-NULL record with zero data_len is present empty state. Refresh on
+    /// group events. Free with `marmot_app_component_free`.
+    async fn marmot_group_app_component(account_ref: str, group_id_hex: str, component_id: val u16) -> opt_rec(MarmotGroupAppComponent) = group_app_component;
 
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.
@@ -2477,6 +2482,43 @@ pub unsafe extern "C" fn marmot_record_host_performance(
             .marmot
             .record_host_performance(operation.into(), duration_ms, outcome.into());
         MarmotStatus::Ok
+    })
+}
+
+/// Replace an optional application-owned component through an admin MLS commit.
+/// Rejects protocol-owned and required IDs. Empty bytes are stored, not removed.
+/// Free the returned summary with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be live; strings valid; `data` must hold `data_len` bytes
+/// (or be NULL with zero length); `out` must be writable. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_update_app_component(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    component_id: u16,
+    data: *const u8,
+    data_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let data = try_arg!(unsafe { byte_array(data, data_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.update_app_component(
+                    account_ref,
+                    group_id_hex,
+                    component_id,
+                    data,
+                )),
+                out,
+            )
+        }
     })
 }
 
