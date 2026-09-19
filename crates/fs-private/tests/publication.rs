@@ -69,11 +69,14 @@ fn publication_rejects_symlink_lock_and_releases_lock_after_error() {
     fs_private::write_private(&unrelated, b"untouched").unwrap();
     symlink(&unrelated, &lock).unwrap();
     fs_private::write_private(&stage, b"salt").unwrap();
-    assert!(rename_noreplace_with_lock(&stage, &target).is_err());
+    let error = rename_noreplace_with_lock(&stage, &target).unwrap_err();
+    assert!(error.to_string().contains("open publication lock"));
     assert_eq!(fs::read(&unrelated).unwrap(), b"untouched");
     assert!(!target.exists());
     fs::remove_file(&lock).unwrap(); // No live publisher: remove the test symlink only.
-    assert!(rename_noreplace_with_lock(&dir.path().join("missing"), &target).is_err());
+    let error = rename_noreplace_with_lock(&dir.path().join("missing"), &target).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(error.to_string().contains("publish staging file"));
     rename_noreplace_with_lock(&stage, &target).unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"salt");
 }

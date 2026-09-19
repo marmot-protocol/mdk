@@ -38,15 +38,22 @@ pub fn rename_noreplace_with_lock(source: &Path, destination: &Path) -> io::Resu
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     crate::set_private_file_mode(&mut options);
-    let file = options.open(&lock_path)?;
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| crate::io_context("open publication lock", &lock_path, error))?;
     let _lease = crate::finish_private_exclusive_file_lease(file, &lock_path, libc::LOCK_EX)?;
 
     // `exists()` follows symlinks and hides errors; neither behavior is safe
     // for a check that authorizes replacement of key material.
     match fs::symlink_metadata(destination) {
         Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::rename(source, destination),
-        Err(error) => Err(error),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::rename(source, destination)
+            .map_err(|error| crate::io_context("publish staging file", destination, error)),
+        Err(error) => Err(crate::io_context(
+            "inspect publication destination",
+            destination,
+            error,
+        )),
     }
 }
 
