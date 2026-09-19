@@ -11,6 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Prepared chat rows now select draft/message/invitation/empty previews, include bounded draft text and attachment summaries, and expose advisory list actions. Both live list APIs refresh after draft changes without changing activity order or unread state. Rust, Swift/Kotlin and C share the contract; regenerate bindings and ship matching native libraries/headers.
+
 - Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
   installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
   `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on

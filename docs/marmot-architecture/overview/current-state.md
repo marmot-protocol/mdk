@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-18
+updated: 2026-09-19
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -115,6 +115,11 @@ pending/failed inviter recovery, and an `automatic_recovery_failed` warning afte
 replays recover nothing. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
 Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
 See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
+
+The C3 row completion adds bounded selected draft/message/invitation/empty previews and local
+row-action availability to presented rows. Draft invalidations refresh both list APIs without
+changing activity order or unread state. See [the native contract](../../../crates/marmot-uniffi/CHAT-LIST-ROWS.md);
+this is an unreleased follow-up to 0.10.2, with C9 client/device adoption still separate.
 
 The additive presented-chat-list contract exposes complete existing rows plus durable MDK-selected title/avatar
 through Rust, UniFFI and C. An attached initial snapshot and ordered replacement updates cover both presentation and

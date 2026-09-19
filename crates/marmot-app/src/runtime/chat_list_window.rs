@@ -203,6 +203,7 @@ impl MarmotAppRuntime {
             .subscribe();
         let presentation = self.accounts.app.presentation_signals.updates.subscribe();
         let avatars = self.accounts.app.presentation_signals.avatars.subscribe();
+        let drafts = self.accounts.app.subscribe_message_draft_changes();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let mut resets = self
             .accounts
@@ -244,6 +245,7 @@ impl MarmotAppRuntime {
             position,
             snapshot.clone(),
             Sources {
+                drafts,
                 avatars,
                 profiles,
                 events,
@@ -429,6 +431,7 @@ fn snapshot(
     }
 }
 struct Sources {
+    drafts: broadcast::Receiver<crate::drafts::MessageDraftInvalidation>,
     avatars: broadcast::Receiver<String>,
     profiles: broadcast::Receiver<String>,
     events: broadcast::Receiver<MarmotAppEvent>,
@@ -441,6 +444,9 @@ impl Sources {
             || chat_list_event_route(event).is_some_and(|(account, _)| account == reader.account_id)
     }
     fn drain(&mut self) {
+        for _ in 0..self.drafts.len().min(INVALIDATION_DRAIN_LIMIT) {
+            let _ = self.drafts.try_recv();
+        }
         for _ in 0..self.avatars.len().min(INVALIDATION_DRAIN_LIMIT) {
             let _ = self.avatars.try_recv();
         }
@@ -463,6 +469,10 @@ impl Sources {
     ) {
         loop {
             tokio::select! {
+                event = self.drafts.recv() => match event {
+                    Ok(event) if event.account_label == reader.label && rows.iter().any(|r| r.row.group_id_hex == event.group_id_hex) => return,
+                    Err(_) => return, _ => {}
+                },
                 event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 profile = self.profiles.recv() => match profile {
                     Ok(profile) if rows.iter().any(|r| {

@@ -35,6 +35,7 @@ pub struct RuntimePresentedChatListSubscription {
     legacy: RuntimeChatListSubscription,
     presentation: broadcast::Receiver<PresentationInvalidation>,
     avatars: broadcast::Receiver<String>,
+    drafts: broadcast::Receiver<crate::drafts::MessageDraftInvalidation>,
     stopping: watch::Receiver<bool>,
     current: PresentedChatListSnapshot,
     sequence: u64,
@@ -79,6 +80,7 @@ impl RuntimePresentedChatListSubscription {
                     if update.is_none() { return Ok(None); }
                     self.dirty = true;
                 }
+                event = self.drafts.recv() => match event { Ok(event) if event.account_label == self.account_label => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
                 event = self.avatars.recv() => match event { Ok(label) if label == self.account_label => self.dirty = true, Err(broadcast::error::RecvError::Lagged(_)) => self.dirty = true, Err(broadcast::error::RecvError::Closed) => return Ok(None), _ => {} },
                 update = self.presentation.recv() => match update {
                     Ok(update) => {
@@ -140,6 +142,7 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let presentation = self.accounts.app.presentation_signals.updates.subscribe();
         let avatars = self.accounts.app.presentation_signals.avatars.subscribe();
+        let drafts = self.accounts.app.subscribe_message_draft_changes();
         let mut legacy = self
             .subscribe_chat_list(&account.label, include_archived)
             .await?;
@@ -163,6 +166,7 @@ impl MarmotAppRuntime {
             legacy,
             presentation,
             avatars,
+            drafts,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
             sequence: 0,
             dirty: false,

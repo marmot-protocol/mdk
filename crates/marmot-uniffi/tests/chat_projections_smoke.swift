@@ -3,6 +3,14 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        for preview in [SelectedChatPreviewFfi.draft(draft: ChatListDraftPreviewFfi(text: "draft 🦀", textTruncated: true, attachmentCount: 2, attachmentKind: .mixed)), .message, .invitation, .empty] {
+            let copy = try FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
+            precondition(copy == preview)
+        }
+        let rowActions = ChatListRowActionsFfi(canMarkRead: true, canMarkUnread: false, canPin: true, canUnpin: false, canMute: true, canUnmute: false, canArchive: true, canRestore: false, canStartLeave: true, canDeleteLocal: false)
+        let rowActionsCopy = try FfiConverterTypeChatListRowActionsFfi.lift(FfiConverterTypeChatListRowActionsFfi.lower(rowActions))
+        precondition(rowActionsCopy == rowActions)
+
         let transfer = AttachmentTransferStatusFfi(reference: "job", state: .verifyingPlaintext, attempt: UInt64.max, received: 17, total: nil, retryAt: 42)
         let transferFrame = AttachmentTransferSnapshotFfi(items: [transfer])
         let transferCopy = try FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame))

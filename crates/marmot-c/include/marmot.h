@@ -2644,6 +2644,51 @@ typedef struct MarmotChatListRowList {
   uintptr_t len;
 } MarmotChatListRowList;
 
+typedef struct MarmotChatListDraftPreview {
+  char *text;
+  bool text_truncated;
+  uint64_t attachment_count;
+  bool has_attachment_kind;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotChatListAttachmentKind attachment_kind;
+} MarmotChatListDraftPreview;
+
+/**
+ * Message refers to row.last_message; Invitation/Empty are localized by the host.
+ */
+typedef enum MarmotSelectedChatPreview_Tag {
+  MARMOT_SELECTED_CHAT_PREVIEW_DRAFT,
+  MARMOT_SELECTED_CHAT_PREVIEW_MESSAGE,
+  MARMOT_SELECTED_CHAT_PREVIEW_INVITATION,
+  MARMOT_SELECTED_CHAT_PREVIEW_EMPTY,
+} MarmotSelectedChatPreview_Tag;
+
+typedef struct MarmotSelectedChatPreview_Draft_Body {
+  struct MarmotChatListDraftPreview draft;
+} MarmotSelectedChatPreview_Draft_Body;
+
+typedef struct MarmotSelectedChatPreview {
+  MarmotSelectedChatPreview_Tag tag;
+  union {
+    MarmotSelectedChatPreview_Draft_Body DRAFT;
+  };
+} MarmotSelectedChatPreview;
+
+typedef struct MarmotChatListRowActions {
+  bool can_mark_read;
+  bool can_mark_unread;
+  bool can_pin;
+  bool can_unpin;
+  bool can_mute;
+  bool can_unmute;
+  bool can_archive;
+  bool can_restore;
+  bool can_start_leave;
+  bool can_delete_local;
+} MarmotChatListRowActions;
+
 /**
  * Typed text; hosts localize the fallback cases.
  */
@@ -2713,6 +2758,8 @@ typedef struct MarmotConversationPresentation {
 } MarmotConversationPresentation;
 
 typedef struct MarmotPresentedChatRow {
+  struct MarmotSelectedChatPreview preview;
+  struct MarmotChatListRowActions actions;
   struct MarmotChatListRow row;
   struct MarmotConversationPresentation presentation;
   struct MarmotAvatarAsset *avatar_asset;

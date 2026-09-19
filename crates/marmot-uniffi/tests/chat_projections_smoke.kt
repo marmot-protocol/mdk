@@ -1,6 +1,13 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    for (preview in listOf(SelectedChatPreviewFfi.Draft(ChatListDraftPreviewFfi("draft 🦀", true, 2u, ChatListAttachmentKindFfi.MIXED)), SelectedChatPreviewFfi.Message, SelectedChatPreviewFfi.Invitation, SelectedChatPreviewFfi.Empty)) {
+        val copy = FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
+        check(copy == preview)
+    }
+    val rowActions = ChatListRowActionsFfi(true, false, true, false, true, false, true, false, true, false)
+    check(FfiConverterTypeChatListRowActionsFfi.lift(FfiConverterTypeChatListRowActionsFfi.lower(rowActions)) == rowActions)
+
     val transfer = AttachmentTransferStatusFfi("job", AttachmentTransferStateFfi.VERIFYING_PLAINTEXT, ULong.MAX_VALUE, 17uL, null, 42uL)
     val transferFrame = AttachmentTransferSnapshotFfi(listOf(transfer))
     check(FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame)) == transferFrame)

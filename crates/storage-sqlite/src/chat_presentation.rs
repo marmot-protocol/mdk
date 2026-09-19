@@ -5,12 +5,16 @@
 //! produces a typed fallback, not a retry loop; later roster hydration must call that same
 //! setter, which requeues the row. P2 wires both lifecycle paths before enabling its worker.
 mod maintenance;
+pub(crate) mod row_contract;
 use crate::connection::CachedSql;
 use crate::{ChatListAvatar, SqliteAccountStorage, SqliteResultExt, serialize, u64_to_i64};
 use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
 use cgka_traits::storage::{StorageError, StorageResult};
 pub use maintenance::{
     ChatPresentationActivePeer, ChatPresentationCatchUp, ChatPresentationCheckpoint,
+};
+pub use row_contract::{
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, SelectedChatPreview,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -475,6 +479,10 @@ mod tests;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresentedChatRow {
     #[serde(default)]
+    pub preview: SelectedChatPreview,
+    #[serde(default)]
+    pub actions: ChatListRowActions,
+    #[serde(default)]
     pub avatar_asset: Option<crate::AvatarAssetPresentation>,
     pub row: crate::ChatListRow,
     pub presentation: ConversationPresentation,
@@ -562,6 +570,8 @@ impl SqliteAccountStorage {
                 crate::codec::unix_now_seconds(),
             )?;
             presented.push(PresentedChatRow {
+                preview: row_contract::selected_preview_tx(&tx, &row)?,
+                actions: ChatListRowActions::for_row(&row),
                 row,
                 presentation,
                 avatar_asset,

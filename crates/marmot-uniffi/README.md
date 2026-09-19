@@ -4,6 +4,8 @@ UniFFI bindings for the Marmot app runtime.
 
 ## Integration guide and API reference
 
+For the unreleased C3 additions, see [selected chat-list previews and row actions](CHAT-LIST-ROWS.md).
+
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
 The [C guide](../marmot-c/README.md) adds ABI ownership and blocking-call rules for C and raw FFI hosts.
 Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.

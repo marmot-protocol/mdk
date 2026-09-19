@@ -157,10 +157,11 @@ pub use runtime::{
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
-    ChatPinState, ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
+    ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
     PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
-    PresentedChatRow, SelectedAvatar, TimelineMessageChange, TimelineRemoveReason,
-    TimelineUpdateTrigger,
+    PresentedChatRow, SelectedAvatar, SelectedChatPreview, TimelineMessageChange,
+    TimelineRemoveReason, TimelineUpdateTrigger,
 };
 
 pub use agent_streams::{

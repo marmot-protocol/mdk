@@ -855,3 +855,46 @@ fn avatar_ownership_does_not_limit_opaque_group_id_length() {
         .store_chat_presentation(&input, &selected)
         .expect("avatar ownership must not impose a new MLS group ID bound");
 }
+
+#[test]
+fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("draft-preview.db");
+    let key = SqlCipherKey::new("draft preview fixture key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "11");
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    store
+        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+        .unwrap();
+    store
+        .save_message_draft("11", "persisted draft", None, &[])
+        .unwrap();
+    store.close().unwrap();
+    drop(store);
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let before: i64 = reopened
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    let snapshot = reopened
+        .read_presented_chat_list(
+            crate::ChatListQuery {
+                include_archived: true,
+            },
+            Some("11"),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&snapshot.rows[0].preview, SelectedChatPreview::Draft(d) if d.text == "persisted draft")
+    );
+    assert_eq!(snapshot.rows[0].row.activity_sort_at, 19);
+    let after: i64 = reopened
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+}

@@ -69,11 +69,12 @@ pub use chat_list::{
     ExistingDirectConversation, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
-    CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,
+    ChatListRowActions, ChatPresentationActivePeer, ChatPresentationCatchUp,
     ChatPresentationCheckpoint, ChatPresentationInput, ChatPresentationRead,
     ChatPresentationVersion, ChatPresentationWrite, ConversationPresentation,
     PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
-    PresentedChatRow, SelectedAvatar, StoredChatPresentation,
+    PresentedChatRow, SelectedAvatar, SelectedChatPreview, StoredChatPresentation,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;

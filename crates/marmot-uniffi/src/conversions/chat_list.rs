@@ -94,6 +94,7 @@ impl From<ChatListAttachmentKind> for ChatListAttachmentKindFfi {
 pub enum ChatListMessageDeliveryStateFfi {
     NotApplicable,
     Pending,
+    /// Locally source-backed publication state, not a recipient delivery/read receipt.
     Delivered,
     Failed,
 }

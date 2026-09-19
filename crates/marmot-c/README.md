@@ -248,3 +248,7 @@ opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 
 `marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
 `marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions. Regenerate/recompile consumers against the
 matching header and library; the resolved chat/conversation records now contain an optional avatar metadata pointer.
+
+### Selected chat-list previews and actions (unreleased)
+
+`MarmotPresentedChatRow` now embeds `preview` and `actions`. The Draft preview owns its text; the parent row/snapshot free releases it. Message selection refers to the same row’s `last_message`. Rebuild with the matching header/library; see the [shared C3 integration contract](../marmot-uniffi/CHAT-LIST-ROWS.md).

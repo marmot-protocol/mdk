@@ -1,6 +1,7 @@
-//! Additive selected-presentation mirrors. Existing chat-row layouts remain stable.
+//! Selected-presentation mirrors. Match the generated header to the native library;
+//! the C3 preview/action fields extend the presented-row layout.
 use super::avatar::MarmotAvatarAsset;
-use super::chat_list::{MarmotChatListAvatar, MarmotChatListRow};
+use super::chat_list::{MarmotChatListAttachmentKind, MarmotChatListAvatar, MarmotChatListRow};
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, owned_c_string};
 use marmot_uniffi::conversions::*;
@@ -109,7 +110,56 @@ c_mirror! { MarmotPresentationVersion from PresentationVersionFfi {
     bytes account_store_epoch/account_store_epoch_len,
     copy revision: u64,
 } }
+c_mirror! { MarmotChatListDraftPreview from ChatListDraftPreviewFfi {
+    str text,
+    copy text_truncated: bool,
+    copy attachment_count: u64,
+    opt_copy has_attachment_kind/attachment_kind: MarmotChatListAttachmentKind,
+} }
+/// Message refers to row.last_message; Invitation/Empty are localized by the host.
+#[repr(C)]
+pub enum MarmotSelectedChatPreview {
+    Draft { draft: MarmotChatListDraftPreview },
+    Message,
+    Invitation,
+    Empty,
+}
+impl From<SelectedChatPreviewFfi> for MarmotSelectedChatPreview {
+    fn from(v: SelectedChatPreviewFfi) -> Self {
+        match v {
+            SelectedChatPreviewFfi::Draft { draft } => Self::Draft {
+                draft: draft.into(),
+            },
+            SelectedChatPreviewFfi::Message => Self::Message,
+            SelectedChatPreviewFfi::Invitation => Self::Invitation,
+            SelectedChatPreviewFfi::Empty => Self::Empty,
+        }
+    }
+}
+impl CFree for MarmotSelectedChatPreview {
+    unsafe fn free_in_place(&mut self) {
+        if let Self::Draft { draft } = self {
+            unsafe {
+                draft.free_in_place();
+            }
+        }
+    }
+}
+c_mirror! { MarmotChatListRowActions from ChatListRowActionsFfi {
+    copy can_mark_read: bool,
+    copy can_mark_unread: bool,
+    copy can_pin: bool,
+    copy can_unpin: bool,
+    copy can_mute: bool,
+    copy can_unmute: bool,
+    copy can_archive: bool,
+    copy can_restore: bool,
+    copy can_start_leave: bool,
+    copy can_delete_local: bool,
+} }
 c_mirror! { MarmotPresentedChatRow from PresentedChatRowFfi, free marmot_presented_chat_row_free {
+    rec preview: MarmotSelectedChatPreview,
+    rec actions: MarmotChatListRowActions,
     rec row: MarmotChatListRow,
     rec presentation: MarmotConversationPresentation,
     opt_rec avatar_asset: MarmotAvatarAsset,
@@ -184,6 +234,18 @@ mod tests {
                 sequence: 3,
                 snapshot: PresentedChatListSnapshotFfi {
                     rows: vec![PresentedChatRowFfi {
+                        preview: SelectedChatPreviewFfi::Draft {
+                            draft: ChatListDraftPreviewFfi {
+                                text: "draft".into(),
+                                text_truncated: true,
+                                attachment_count: 2,
+                                attachment_kind: Some(ChatListAttachmentKindFfi::Mixed),
+                            },
+                        },
+                        actions: ChatListRowActionsFfi {
+                            can_start_leave: true,
+                            ..Default::default()
+                        },
                         row,
                         presentation,
                         avatar_asset: Some(AvatarAssetFfi {
@@ -216,6 +278,46 @@ mod tests {
             marmot_presented_chat_list_update_free(std::ptr::null_mut());
             marmot_presented_chat_row_free(std::ptr::null_mut());
             marmot_presented_chat_list_snapshot_free(std::ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(audit::live_allocations(), before);
+    }
+    #[test]
+    fn chat_list_preview_variants_preserve_fields_and_free_owned_text() {
+        let _guard = audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = audit::live_allocations();
+        for preview in [
+            SelectedChatPreviewFfi::Draft {
+                draft: ChatListDraftPreviewFfi {
+                    text: "draft 🦀".into(),
+                    text_truncated: true,
+                    attachment_count: 3,
+                    attachment_kind: Some(ChatListAttachmentKindFfi::Audio),
+                },
+            },
+            SelectedChatPreviewFfi::Message,
+            SelectedChatPreviewFfi::Invitation,
+            SelectedChatPreviewFfi::Empty,
+        ] {
+            let mut mirror: MarmotSelectedChatPreview = preview.into();
+            if let MarmotSelectedChatPreview::Draft { draft } = &mirror {
+                assert_eq!(
+                    unsafe { std::ffi::CStr::from_ptr(draft.text) }
+                        .to_str()
+                        .unwrap(),
+                    "draft 🦀"
+                );
+                assert!(draft.text_truncated && draft.has_attachment_kind);
+                assert_eq!(draft.attachment_count, 3);
+                assert!(matches!(
+                    draft.attachment_kind,
+                    MarmotChatListAttachmentKind::Audio
+                ));
+            }
+            unsafe {
+                mirror.free_in_place();
+            }
         }
         #[cfg(feature = "alloc-audit")]
         assert_eq!(audit::live_allocations(), before);
