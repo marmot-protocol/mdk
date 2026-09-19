@@ -20,6 +20,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   A transient inbound setup failure no longer leaves the shared sender
   authorizer stopped across the gateway retry, and host-supplied status
   snapshots cannot report connected while that policy is unenforceable.
+  Authorized inbound finals now require the host delivery-queue identity so
+  a successful turn is an acknowledged `send_final`.
 
 ## [0.10.2] - 2026-09-19
 

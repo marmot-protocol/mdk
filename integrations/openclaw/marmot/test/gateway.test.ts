@@ -27,7 +27,8 @@ import {
 import type { MarmotSenderAuthorizer } from "../src/sender-policy.js";
 
 const syncCalls: Array<{ channelAccountId?: string | null }> = [];
-const statusPatches: Array<Record<string, unknown>> = [];
+const statusPatches: Array<Record<string, unknown> & { subscribeCalls?: number }> = [];
+let recordedSubscribeCalls = 0;
 let lifecycleStarts = 0;
 const lifecycleByAccount = new Map<
   string,
@@ -37,7 +38,7 @@ const lifecycleByAccount = new Map<
 vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
   createAccountStatusSink: ({ setStatus }: { setStatus: (next: unknown) => void }) => {
     return (patch: Record<string, unknown>) => {
-      statusPatches.push(patch);
+      statusPatches.push({ ...patch, subscribeCalls: recordedSubscribeCalls });
       setStatus(patch);
     };
   },
@@ -190,6 +191,7 @@ afterEach(async () => {
   resetMarmotGatewayRecoveryForTests();
   syncCalls.length = 0;
   statusPatches.length = 0;
+  recordedSubscribeCalls = 0;
   lifecycleStarts = 0;
   vi.clearAllMocks();
   vi.useRealTimers();
@@ -594,6 +596,7 @@ describe("startMarmotGatewayAccount", () => {
                   hooks?: { onReady?: () => void },
                 ) {
                   subscribeCalls += 1;
+                  recordedSubscribeCalls = subscribeCalls;
                   hooks?.onReady?.();
                   const queued: Array<Record<string, unknown>> = [];
                   let notify: (() => void) | undefined;
@@ -636,9 +639,9 @@ describe("startMarmotGatewayAccount", () => {
     expect(accountListFailures).toBe(6);
     expect(subscribeCalls).toBe(1);
     expect(Math.max(...startCounts)).toBeLessThanOrEqual(1);
-    expect(statusPatches.some((patch) => patch.connected === true && subscribeCalls === 0)).toBe(
-      false,
-    );
+    expect(
+      statusPatches.some((patch) => patch.connected === true && patch.subscribeCalls === 0),
+    ).toBe(false);
     expect(sharedAuthorizer?.lifecycle()).toBe("active");
     expect(
       sharedAuthorizer?.authorize({

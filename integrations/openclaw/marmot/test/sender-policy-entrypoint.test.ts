@@ -1,5 +1,5 @@
 import { createServer, type Server, type Socket } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -152,7 +152,41 @@ async function startRecordingControl(root: string): Promise<RecordingControl> {
   };
 }
 
-function recordingRuntime(turns: string[]): OpenClawChannelRuntime {
+interface RegisteredTextSend {
+  (
+    ctx: {
+      cfg: unknown;
+      accountId?: string;
+      to: string;
+      text: string;
+      replyToId?: string;
+      deliveryQueueId: string;
+    },
+  ): Promise<unknown>;
+}
+
+function inboundReplyTarget(ctx: Record<string, unknown>): { to: string; replyToId?: string } {
+  const reply = ctx.reply as { to?: string; replyToId?: string } | undefined;
+  const to =
+    (typeof reply?.to === "string" && reply.to) ||
+    (typeof ctx.OriginatingTo === "string" && ctx.OriginatingTo) ||
+    (typeof ctx.To === "string" && ctx.To) ||
+    "";
+  if (!to) {
+    throw new Error("registered Marmot send is missing a destination");
+  }
+  const replyToId =
+    (typeof reply?.replyToId === "string" && reply.replyToId) ||
+    (typeof ctx.MessageSid === "string" && ctx.MessageSid) ||
+    undefined;
+  return { to, ...(replyToId ? { replyToId } : {}) };
+}
+
+function recordingRuntime(
+  turns: string[],
+  sessionStorePath: string,
+  sendText?: RegisteredTextSend,
+): OpenClawChannelRuntime {
   return {
     routing: {
       resolveAgentRoute: () => {
@@ -163,7 +197,7 @@ function recordingRuntime(turns: string[]): OpenClawChannelRuntime {
     session: {
       resolveStorePath: () => {
         turns.push("session");
-        return "/tmp/marmot-sender-policy-entrypoint-sessions.json";
+        return sessionStorePath;
       },
       recordInboundSession: () => {
         turns.push("record");
@@ -172,29 +206,50 @@ function recordingRuntime(turns: string[]): OpenClawChannelRuntime {
     reply: {
       dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
         turns.push("kernel");
-        const deliver = (
-          params as {
-            dispatcherOptions: {
-              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
-            };
-          }
-        ).dispatcherOptions.deliver;
-        try {
-          await deliver({ text: "ok" }, { kind: "final" });
+        const typed = params as {
+          ctx: Record<string, unknown>;
+          cfg?: unknown;
+          dispatcherOptions: {
+            deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+          };
+        };
+        if (sendText) {
+          const target = inboundReplyTarget(typed.ctx ?? {});
+          await sendText({
+            cfg: typed.cfg,
+            accountId: "default",
+            to: target.to,
+            text: "ok",
+            replyToId: target.replyToId,
+            deliveryQueueId: "entrypoint-authorized-turn:0",
+          });
           turns.push("durable_final");
-        } catch (error) {
-          // Isolated loader fixtures do not construct OpenClaw's delivery queue.
-          // Reaching this adapter error still proves one real durable-send attempt.
-          if (
-            error instanceof Error &&
-            error.message.includes("delivery queue identity")
-          ) {
-            turns.push("durable_final");
-          } else {
-            throw error;
-          }
+          return;
         }
+        await typed.dispatcherOptions.deliver({ text: "ok" }, { kind: "final" });
+        turns.push("durable_final");
       },
+    },
+  };
+}
+
+function isolateOpenClawState(root: string): { restore: () => void } {
+  const previousHome = process.env.OPENCLAW_HOME;
+  const previousState = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_HOME = join(root, "openclaw-home");
+  process.env.OPENCLAW_STATE_DIR = join(root, "openclaw-state");
+  return {
+    restore() {
+      if (previousHome === undefined) {
+        delete process.env.OPENCLAW_HOME;
+      } else {
+        process.env.OPENCLAW_HOME = previousHome;
+      }
+      if (previousState === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousState;
+      }
     },
   };
 }
@@ -233,6 +288,16 @@ function loadRegisteredMarmotPlugin(cfg: Record<string, unknown>, workspaceDir: 
   return plugin;
 }
 
+function registeredTextSend(plugin: {
+  message?: { send?: { text?: (ctx: never) => Promise<unknown> } };
+}): RegisteredTextSend {
+  const send = plugin.message?.send?.text;
+  if (typeof send !== "function") {
+    throw new Error("registered Marmot plugin is missing message.send.text");
+  }
+  return (ctx) => send(ctx as never);
+}
+
 function eventEffects(types: string[], setupTypes: string[]): string[] {
   return types.filter((type) => !setupTypes.includes(type) && type !== "subscribe_inbound");
 }
@@ -244,6 +309,8 @@ function hostStatusContext(
     abort: AbortController;
     turns: string[];
     logs: string[];
+    sessionStorePath: string;
+    sendText?: RegisteredTextSend;
     accountId?: string;
   },
 ): {
@@ -263,7 +330,7 @@ function hostStatusContext(
     setStatus: (next: Record<string, unknown>) => {
       snapshots.push(next);
     },
-    channelRuntime: recordingRuntime(options.turns),
+    channelRuntime: recordingRuntime(options.turns, options.sessionStorePath, options.sendText),
     log: {
       info: (message: string) => options.logs.push(message),
       warn: (message: string) => options.logs.push(message),
@@ -273,81 +340,190 @@ function hostStatusContext(
   return { ctx, snapshots };
 }
 
+async function preparePackagedHost(root: string): Promise<{
+  pluginRoot: string;
+  sessionStorePath: string;
+  restoreState: () => void;
+}> {
+  const pluginRoot = await materializeOwnedPluginRoot(root);
+  const workspace = join(root, "workspace");
+  const sessionStorePath = join(root, "sessions.json");
+  await mkdir(join(root, "openclaw-home"), { recursive: true, mode: 0o700 });
+  await mkdir(join(root, "openclaw-state"), { recursive: true, mode: 0o700 });
+  await mkdir(workspace, { recursive: true, mode: 0o700 });
+  return {
+    pluginRoot,
+    sessionStorePath,
+    restoreState: isolateOpenClawState(root).restore,
+  };
+}
+
+function packagedConfig(
+  pluginRoot: string,
+  workspace: string,
+  channel: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    plugins: {
+      allow: ["marmot"],
+      load: { paths: [pluginRoot] },
+      entries: { marmot: { enabled: true } },
+    },
+    agents: { list: [{ id: "main", workspace }] },
+    channels: { marmot: channel },
+  };
+}
+
 describe("packaged OpenClaw sender-policy entrypoint", () => {
+  it("does not treat a delivery-queue identity failure as a durable final", async () => {
+    const turns: string[] = [];
+    const runtime = recordingRuntime(turns, "/tmp/marmot-sender-policy-entrypoint-sessions.json");
+    await expect(
+      runtime.reply.dispatchReplyWithBufferedBlockDispatcher({
+        dispatcherOptions: {
+          deliver: async () => {
+            throw new Error("marmot: durable text send requires OpenClaw delivery queue identity");
+          },
+        },
+      }),
+    ).rejects.toThrow(/delivery queue identity/);
+    expect(turns).toEqual(["kernel"]);
+    expect(turns.includes("durable_final")).toBe(false);
+  });
+
   it("loads the plugin and enforces sender ACL through registered gateway.startAccount", async () => {
     const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-entrypoint-"));
     const control = await startRecordingControl(root);
     const turns: string[] = [];
     const logs: string[] = [];
+    const host = await preparePackagedHost(root);
     try {
-      const pluginRoot = await materializeOwnedPluginRoot(root);
-      const cfg = {
-        plugins: {
-          allow: ["marmot"],
-          load: { paths: [pluginRoot] },
-          entries: { marmot: { enabled: true } },
-        },
-        channels: {
-          marmot: {
-            socketPath: control.socketPath,
-            accountIdHex: ACCOUNT,
-            profileNameOnboarding: false,
-            debounceMs: 40,
-            senderPolicy: { allowedUsers: [ALLOWED] },
-          },
-        },
+      const channel = {
+        socketPath: control.socketPath,
+        accountIdHex: ACCOUNT,
+        profileNameOnboarding: false,
+        debounceMs: 40,
+        senderPolicy: { allowedUsers: [ALLOWED] },
       };
+      const cfg = packagedConfig(host.pluginRoot, join(root, "workspace"), channel);
       const plugin = loadRegisteredMarmotPlugin(cfg, root);
-      const account = resolveMarmotAccount(cfg.channels.marmot, "default", {
+      const account = resolveMarmotAccount(channel, "default", {
         env: {},
         homeDir: () => root,
       });
       const abort = new AbortController();
-      const { ctx, snapshots } = hostStatusContext(cfg, account, { abort, turns, logs });
+      const { ctx, snapshots } = hostStatusContext(cfg, account, {
+        abort,
+        turns,
+        logs,
+        sessionStorePath: host.sessionStorePath,
+        sendText: registeredTextSend(plugin),
+      });
       const running = plugin.gateway!.startAccount!(ctx);
       try {
-      await vi.waitFor(() => {
-        expect(snapshots.at(-1)).toMatchObject({ running: true, connected: true });
-      });
-
-      const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
-      const deniedCases = [
-        inboundEvent({ messageId: HEX32("d1"), sender: DENIED, mentionsSelf: true }),
-        inboundEvent({ messageId: HEX32("d3"), sender: ALLOWED, isSelf: true }),
-        inboundEvent({
-          messageId: HEX32("d4"),
-          sender: "not-a-valid-account-id",
-          mentionsSelf: true,
-        }),
-      ];
-      for (const event of deniedCases) {
-        const before = logs.length;
-        control.push(event);
         await vi.waitFor(() => {
-          expect(logs.length).toBeGreaterThan(before);
+          expect(snapshots.at(-1)).toMatchObject({ running: true, connected: true });
         });
-      }
-      expect(turns).toEqual([]);
-      expect(eventEffects(control.types, setupTypes)).toEqual([]);
-      expect(logs.some((line) => line.includes("reason=sender_not_allowed"))).toBe(true);
-      expect(logs.some((line) => line.includes("reason=self_sender"))).toBe(true);
-      expect(logs.some((line) => line.includes("reason=malformed_sender"))).toBe(true);
-      expect(logs.join("\n")).not.toContain(DENIED);
-      expect(logs.join("\n")).not.toContain(ALLOWED);
-      expect(logs.join("\n")).not.toContain(ACCOUNT);
 
-      control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
-      control.push(inboundEvent({ messageId: HEX32("d5"), sender: ALLOWED, mentionsSelf: true }));
-      await vi.waitFor(() => {
-        expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
-        expect(turns.filter((item) => item === "durable_final")).toEqual(["durable_final"]);
-      });
-      expect(control.types.filter((type) => type === "send_final").length).toBeLessThanOrEqual(1);
+        const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
+        const deniedCases = [
+          inboundEvent({ messageId: HEX32("d1"), sender: DENIED, mentionsSelf: true }),
+          inboundEvent({ messageId: HEX32("d3"), sender: ALLOWED, isSelf: true }),
+          inboundEvent({
+            messageId: HEX32("d4"),
+            sender: "not-a-valid-account-id",
+            mentionsSelf: true,
+          }),
+        ];
+        for (const event of deniedCases) {
+          const before = logs.length;
+          control.push(event);
+          await vi.waitFor(() => {
+            expect(logs.length).toBeGreaterThan(before);
+          });
+        }
+        expect(turns).toEqual([]);
+        expect(eventEffects(control.types, setupTypes)).toEqual([]);
+        expect(logs.some((line) => line.includes("reason=sender_not_allowed"))).toBe(true);
+        expect(logs.some((line) => line.includes("reason=self_sender"))).toBe(true);
+        expect(logs.some((line) => line.includes("reason=malformed_sender"))).toBe(true);
+        expect(logs.join("\n")).not.toContain(DENIED);
+        expect(logs.join("\n")).not.toContain(ALLOWED);
+        expect(logs.join("\n")).not.toContain(ACCOUNT);
+
+        control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
+        control.push(inboundEvent({ messageId: HEX32("d5"), sender: ALLOWED, mentionsSelf: true }));
+        await vi.waitFor(() => {
+          expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
+          expect(turns.filter((item) => item === "durable_final")).toEqual(["durable_final"]);
+          expect(control.types.filter((type) => type === "send_final")).toEqual(["send_final"]);
+        });
       } finally {
         abort.abort();
         await running.catch(() => undefined);
       }
     } finally {
+      host.restoreState();
+      await control.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("denies unauthorized senders before profile onboarding side effects", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-onboarding-"));
+    const control = await startRecordingControl(root);
+    const turns: string[] = [];
+    const logs: string[] = [];
+    const onboardingPath = join(root, "profile-onboarding.json");
+    const host = await preparePackagedHost(root);
+    try {
+      const channel = {
+        socketPath: control.socketPath,
+        accountIdHex: ACCOUNT,
+        profileNameOnboarding: true,
+        debounceMs: 40,
+        senderPolicy: { allowedUsers: [ALLOWED] },
+      };
+      const cfg = packagedConfig(host.pluginRoot, join(root, "workspace"), channel);
+      const plugin = loadRegisteredMarmotPlugin(cfg, root);
+      const account = resolveMarmotAccount(channel, "default", {
+        env: { MARMOT_PROFILE_ONBOARDING_STATE: onboardingPath },
+        homeDir: () => root,
+      });
+      expect(account.profileNameOnboarding).toBe(true);
+      expect(account.profileOnboardingStatePath).toBe(onboardingPath);
+      const abort = new AbortController();
+      const { ctx, snapshots } = hostStatusContext(cfg, account, {
+        abort,
+        turns,
+        logs,
+        sessionStorePath: host.sessionStorePath,
+      });
+      const running = plugin.gateway!.startAccount!(ctx);
+      try {
+        await vi.waitFor(() => {
+          expect(snapshots.at(-1)).toMatchObject({ running: true, connected: true });
+        });
+        const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
+        control.push(inboundEvent({ messageId: HEX32("d7"), sender: DENIED, mentionsSelf: true }));
+        await vi.waitFor(() => {
+          expect(logs.some((line) => line.includes("reason=sender_not_allowed"))).toBe(true);
+        });
+        expect(turns).toEqual([]);
+        expect(eventEffects(control.types, setupTypes)).toEqual([]);
+        expect(control.types.includes("send_final")).toBe(false);
+        expect(control.types.includes("account_publish_profile")).toBe(false);
+        expect(control.types.includes("account_profile_lookup")).toBe(false);
+        await expect(access(onboardingPath)).rejects.toThrow();
+        expect(logs.join("\n")).not.toContain(DENIED);
+        expect(logs.join("\n")).not.toContain(ALLOWED);
+        expect(logs.join("\n")).not.toContain(ACCOUNT);
+      } finally {
+        abort.abort();
+        await running.catch(() => undefined);
+      }
+    } finally {
+      host.restoreState();
       await control.close();
       await rm(root, { recursive: true, force: true });
     }
@@ -359,22 +535,15 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
       const control = await startRecordingControl(root);
       const turns: string[] = [];
       const logs: string[] = [];
+      const host = await preparePackagedHost(root);
       try {
-        const pluginRoot = await materializeOwnedPluginRoot(root);
         const channel = {
           socketPath: control.socketPath,
           accountIdHex: ACCOUNT,
           profileNameOnboarding: false,
           ...(senderPolicy ? { senderPolicy } : {}),
         };
-        const cfg = {
-          plugins: {
-            allow: ["marmot"],
-            load: { paths: [pluginRoot] },
-            entries: { marmot: { enabled: true } },
-          },
-          channels: { marmot: channel },
-        };
+        const cfg = packagedConfig(host.pluginRoot, join(root, "workspace"), channel);
         const plugin = loadRegisteredMarmotPlugin(cfg, root);
         const account = resolveMarmotAccount(channel, "default", {
           env: {},
@@ -382,38 +551,44 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
         });
         expect(account.senderPolicy.state).toBe(senderPolicy ? "invalid" : "missing");
         const abort = new AbortController();
-        const { ctx, snapshots } = hostStatusContext(cfg, account, { abort, turns, logs });
+        const { ctx, snapshots } = hostStatusContext(cfg, account, {
+          abort,
+          turns,
+          logs,
+          sessionStorePath: host.sessionStorePath,
+        });
         const running = plugin.gateway!.startAccount!(ctx);
         try {
-        await vi.waitFor(() => {
-          expect(snapshots.at(-1)).toMatchObject({ running: true });
-        });
-        expect(snapshots.at(-1)).toMatchObject({
-          connected: false,
-          lastError: senderPolicy ? "marmot_sender_policy_invalid" : "marmot_sender_policy_missing",
-        });
-        await vi.waitFor(() => {
-          expect(control.types.includes("subscribe_inbound")).toBe(true);
-        });
-        const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
-        control.push(inboundEvent({ messageId: HEX32("d6"), sender: ALLOWED, mentionsSelf: true }));
-        await vi.waitFor(() => {
-          expect({
-            logs,
-            types: eventEffects(control.types, setupTypes),
-          }).toMatchObject({
-            logs: expect.arrayContaining([
-              expect.stringMatching(/reason=(invalid_policy|missing_policy|lifecycle_invalid)/),
-            ]),
+          await vi.waitFor(() => {
+            expect(snapshots.at(-1)).toMatchObject({ running: true });
           });
-        });
-        expect(turns).toEqual([]);
-        expect(eventEffects(control.types, setupTypes)).toEqual([]);
+          expect(snapshots.at(-1)).toMatchObject({
+            connected: false,
+            lastError: senderPolicy ? "marmot_sender_policy_invalid" : "marmot_sender_policy_missing",
+          });
+          await vi.waitFor(() => {
+            expect(control.types.includes("subscribe_inbound")).toBe(true);
+          });
+          const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
+          control.push(inboundEvent({ messageId: HEX32("d6"), sender: ALLOWED, mentionsSelf: true }));
+          await vi.waitFor(() => {
+            expect({
+              logs,
+              types: eventEffects(control.types, setupTypes),
+            }).toMatchObject({
+              logs: expect.arrayContaining([
+                expect.stringMatching(/reason=(invalid_policy|missing_policy|lifecycle_invalid)/),
+              ]),
+            });
+          });
+          expect(turns).toEqual([]);
+          expect(eventEffects(control.types, setupTypes)).toEqual([]);
         } finally {
           abort.abort();
           await running.catch(() => undefined);
         }
       } finally {
+        host.restoreState();
         await control.close();
         await rm(root, { recursive: true, force: true });
       }
