@@ -106,6 +106,30 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId =
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
+
+/// Every component id the protocol owns, in assignment order. Applications
+/// must not write these; ids outside this list and at or above
+/// [`PRIVATE_USE_APP_COMPONENT_ID_START`] are theirs to allocate.
+///
+/// Add every new protocol component constant here. The app-facing
+/// `update_app_component` gate and the engine's GroupContext format validation
+/// both read this list, so an id left out silently becomes app-writable.
+pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
+    APP_COMPONENTS_COMPONENT_ID,
+    SAFE_AAD_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ADMIN_POLICY_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_LIFECYCLE_COMPONENT_ID,
+];
+
 /// Lookup key for the encrypted-media secret in the
 /// [`crate::group_context::GroupContextSnapshot`] secrets map. This is an
 /// internal cache key, NOT the MLS exporter label/context: the secret is derived

@@ -715,25 +715,10 @@ fn record_app_performance(
 
 fn validate_app_component_id(component_id: u16) -> Result<(), AppError> {
     use cgka_traits::app_components::{
-        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-        GROUP_LIFECYCLE_COMPONENT_ID, PRIVATE_USE_APP_COMPONENT_ID_START,
+        PRIVATE_USE_APP_COMPONENT_ID_START, PROTOCOL_OWNED_APP_COMPONENT_IDS,
     };
     if component_id < PRIVATE_USE_APP_COMPONENT_ID_START
-        || matches!(
-            component_id,
-            GROUP_PROFILE_COMPONENT_ID
-                | GROUP_BLOSSOM_IMAGE_COMPONENT_ID
-                | GROUP_ADMIN_POLICY_COMPONENT_ID
-                | NOSTR_ROUTING_COMPONENT_ID
-                | GROUP_MESSAGE_RETENTION_COMPONENT_ID
-                | AGENT_TEXT_STREAM_QUIC_COMPONENT_ID
-                | GROUP_AVATAR_URL_COMPONENT_ID
-                | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
-                | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
-                | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
-                | GROUP_LIFECYCLE_COMPONENT_ID
-        )
+        || PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
     {
         return Err(AppError::InvalidAppComponent(
             "component id is reserved for protocol use".into(),
@@ -744,16 +729,20 @@ fn validate_app_component_id(component_id: u16) -> Result<(), AppError> {
 
 #[test]
 fn app_component_ids_are_scoped() {
-    for id in [
-        0, 1, 2, 0x7fff, 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006, 0x8007, 0x8008, 0x8009,
-        0x800b, 0x800c,
-    ] {
+    use cgka_traits::app_components::PROTOCOL_OWNED_APP_COMPONENT_IDS;
+    // Driving the rejection set from the canonical list means a newly assigned
+    // protocol component id cannot stay writable through this API.
+    for id in PROTOCOL_OWNED_APP_COMPONENT_IDS
+        .iter()
+        .copied()
+        .chain([0, 1, 2, 0x7fff])
+    {
         assert!(matches!(
             validate_app_component_id(id),
             Err(AppError::InvalidAppComponent(_))
         ));
     }
-    for id in [0x8000, 0xf301, 0xffff] {
+    for id in [0x8000, 0x800a, 0xf301, 0xffff] {
         assert!(validate_app_component_id(id).is_ok());
     }
 }

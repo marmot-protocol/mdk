@@ -9,10 +9,10 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
     GroupLifecycleV1, GroupProfileV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
-    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
-    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, decode_components_list,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
+    decode_group_blossom_image_v1, decode_group_lifecycle_v1, decode_group_profile_v1,
+    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
@@ -1143,21 +1143,11 @@ fn required_app_components_of_extensions(
 }
 
 fn is_known_group_component(component_id: AppComponentId) -> bool {
-    matches!(
-        component_id,
-        APP_COMPONENTS_COMPONENT_ID
-            | SAFE_AAD_COMPONENT_ID
-            | GROUP_PROFILE_COMPONENT_ID
-            | GROUP_BLOSSOM_IMAGE_COMPONENT_ID
-            | GROUP_ADMIN_POLICY_COMPONENT_ID
-            | NOSTR_ROUTING_COMPONENT_ID
-            | GROUP_MESSAGE_RETENTION_COMPONENT_ID
-            | AGENT_TEXT_STREAM_QUIC_COMPONENT_ID
-            | GROUP_AVATAR_URL_COMPONENT_ID
-            | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
-            | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
-            | GROUP_LIFECYCLE_COMPONENT_ID
-    )
+    // Protocol-owned minus the leaf-only account proof, which never carries
+    // GroupContext state. Reading the canonical list keeps a newly assigned
+    // component id format-validated without editing this function.
+    PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
+        && !CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(&component_id)
 }
 
 pub(crate) fn ratchet_tree_nodes(
