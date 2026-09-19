@@ -382,10 +382,17 @@ or `unknown`. Unavailable evidence uses `value: null`.
 Exit `0` is healthy, `1` is degraded (unknown/partial relays, missing or
 unresolved home, restart required, reconciliation or inbound recovery), and
 `2` is fatal (unusable install/config/auth/account selection, required service
-stopped, unreachable control, or unsafe private artifacts). Fatal dominates
+failed or stopped, unreachable control, or unsafe private artifacts). Fatal dominates
 degraded. Historical catch-up errors do not keep a recovered current state
 degraded. Manual installs without a service manager report service evidence as
 unknown, not stopped.
+
+For systemd, `service.state` distinguishes `fatal/failed` (inspect the unit's
+journal) from `fatal/stopped` (inactive or stopping). An observed
+`ActiveState=activating` with `SubState=auto-restart` reports
+`degraded/recovering`; a single sample does not establish a persistent crash
+loop. Ordinary activation remains `unknown/unknown` until readiness can be
+observed. A missing unit reports `unknown/not_managed`.
 
 `delivery.probe` stays `not_probed`/`unknown` and is excluded from health.
 Inbound receipt, Hermes dispatch, reply acceptance, relay acknowledgement, and

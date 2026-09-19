@@ -557,15 +557,25 @@ class DoctorReportTests(unittest.TestCase):
         self.assertEqual(checks[1]["status"], "fatal")
         self.assertEqual(checks[1]["code"], "invalid")
 
-    def test_systemd_failed_and_deactivating_are_fatal(self) -> None:
-        for state in ("failed", "deactivating"):
-            with self.subTest(state=state), mock.patch.object(
-                diag, "bounded_run", return_value=f"LoadState=loaded\nActiveState={state}\n"
+    def test_systemd_failure_restart_and_activation_states(self) -> None:
+        cases = (
+            ("failed", "failed", "fatal", "failed", 2),
+            ("inactive", "dead", "fatal", "stopped", 2),
+            ("deactivating", "stop", "fatal", "stopped", 2),
+            ("activating", "auto-restart", "degraded", "recovering", 1),
+            ("activating", "start", "unknown", "unknown", 1),
+            ("active", "running", "healthy", "running", 0),
+        )
+        for active, substate, status, code, exit_code in cases:
+            with self.subTest(active=active, substate=substate), mock.patch.object(
+                diag, "bounded_run",
+                return_value=f"LoadState=loaded\nActiveState={active}\nSubState={substate}\n",
             ):
                 checks = doctor._service_checks("wn-agent-hermes", "label", True)
-            self.assertEqual(checks[1]["status"], "fatal")
-            self.assertEqual(checks[1]["code"], "stopped")
-            self.assertEqual(diag.report_exit_code(diag.report_object(checks)), 2)
+                self.assertEqual(checks[1]["status"], status)
+                self.assertEqual(checks[1]["code"], code)
+                self.assertEqual(diag.report_exit_code(diag.report_object(checks)), exit_code)
+                self.assertIn(f"service.state: {status}/{code}", diag.render_human(diag.report_object(checks)))
 
     def test_home_uses_platform_channel_not_inbound_filter(self) -> None:
         home_b = "bb" * 16

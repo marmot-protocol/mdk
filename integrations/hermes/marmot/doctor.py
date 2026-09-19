@@ -309,7 +309,11 @@ def _service_checks(
             status, code = "fatal", "invalid"
         elif active == "active":
             status, code = "healthy", "running"
-        elif active in {"inactive", "failed", "deactivating"}:
+        elif active == "failed":
+            status, code = "fatal", "failed"
+        elif active == "activating" and properties.get("SubState") == "auto-restart":
+            status, code = "degraded", "recovering"
+        elif active in {"inactive", "deactivating"}:
             status, code = "fatal", "stopped"
         else:
             status, code = "unknown", "unknown"
