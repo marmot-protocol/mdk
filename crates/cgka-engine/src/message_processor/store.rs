@@ -1053,6 +1053,12 @@ impl<S: StorageProvider> Engine<S> {
     /// caller retire the wrapper" (AGENTS.md): every ingest site that returns
     /// `Buffered` after a peel calls this, so no caller has to guess which of
     /// them did.
+    ///
+    /// Deliberately not atomic with the content admission it follows. A
+    /// wrapper left awaiting retry beside a durable content record is a
+    /// legitimate state, not a torn one: internal replay and the sweep re-enter
+    /// ingest below the transport-id dedup seam, and the content-record seam
+    /// retires the wrapper on that pass.
     pub(crate) fn retire_raw_wrapper(
         &mut self,
         raw_msg_id: &MessageId,
