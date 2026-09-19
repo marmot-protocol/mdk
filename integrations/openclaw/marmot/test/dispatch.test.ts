@@ -10,6 +10,7 @@ import {
   type MarmotDispatchClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
+import { testAllowlistAuthorizer, testInboundActor } from "./sender-policy-fixtures.js";
 
 import {
   buildChannelInboundEventContext,
@@ -116,6 +117,79 @@ function stubClient(
   } as unknown as MarmotDispatchClient;
 }
 describe("createMarmotInboundDispatcher", () => {
+  it("denies unauthorized or incomplete sender facts before activation work", async () => {
+    const groupInfo = vi.fn();
+    const timelineList = vi.fn();
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: { resolveAgentRoute: vi.fn() },
+      session: {
+        resolveStorePath: vi.fn(),
+        recordInboundSession: vi.fn(),
+      },
+      reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+    };
+    const client = {
+      groupInfo,
+      timelineList,
+      downloadMedia: vi.fn(),
+    } as unknown as MarmotDispatchClient;
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: ["agent"],
+      authorizer: testAllowlistAuthorizer(),
+    });
+
+    expect(
+      await dispatch({
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        messageIdHex: HEX32("d1"),
+        senderAccountIdHex: HEX32("99"),
+        sender: testInboundActor(HEX32("99")),
+        text: "hey agent",
+        mentionsSelf: true,
+      }),
+    ).toBe(false);
+    expect(
+      await dispatch({
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        messageIdHex: HEX32("d2"),
+        senderAccountIdHex: HEX32("bb"),
+        text: "hey agent",
+        mentionsSelf: true,
+      } as MarmotInboundMessage),
+    ).toBe(false);
+
+    const missing = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client,
+      channelAccountId: "default",
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+    expect(
+      await missing({
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        messageIdHex: HEX32("d3"),
+        senderAccountIdHex: HEX32("bb"),
+        sender: testInboundActor(),
+        text: "hey agent",
+        mentionsSelf: true,
+      }),
+    ).toBe(false);
+    expect(groupInfo).not.toHaveBeenCalled();
+    expect(timelineList).not.toHaveBeenCalled();
+    expect(runtimeChannel.routing.resolveAgentRoute).not.toHaveBeenCalled();
+    expect(runInboundEventMock).not.toHaveBeenCalled();
+  });
+
   it("routes a final through OpenClaw's durable message context with streaming disabled", async () => {
     const calls = emptyCalls();
     const captured: unknown[] = [];
@@ -154,6 +228,7 @@ describe("createMarmotInboundDispatcher", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
 
     await dispatch({
@@ -161,6 +236,7 @@ describe("createMarmotInboundDispatcher", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "hello",
     });
 
@@ -218,6 +294,12 @@ describe("createMarmotInboundDispatcher", () => {
         agentId: "agent",
         payload: { text: "done" },
         replyToId: HEX32("dd"),
+        requiredCapabilities: {
+          text: true,
+          replyTo: true,
+          messageSendingHooks: true,
+          reconcileUnknownSend: true,
+        },
         ctxPayload: expect.objectContaining({
           reply: expect.objectContaining({ to: HEX32("cc") }),
         }),
@@ -273,6 +355,7 @@ describe("createMarmotInboundDispatcher", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
 
     await dispatch({
@@ -280,6 +363,7 @@ describe("createMarmotInboundDispatcher", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "new message",
       recordedAt: 1_721_000_000,
       replyToMessageIdHex: HEX32("11"),
@@ -406,6 +490,7 @@ describe("createMarmotInboundDispatcher", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
 
     for (const byte of ["d1", "d2", "d3"]) {
@@ -414,6 +499,7 @@ describe("createMarmotInboundDispatcher", () => {
         groupIdHex,
         messageIdHex: HEX32(byte),
         senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
         text: "hello",
       });
     }
@@ -466,6 +552,7 @@ describe("createMarmotInboundDispatcher activation gating", () => {
     groupIdHex: HEX32("cc"),
     messageIdHex: HEX32("dd"),
     senderAccountIdHex: HEX32("bb"),
+    sender: testInboundActor(),
     text: "just chatting amongst ourselves",
   };
 
@@ -485,6 +572,7 @@ describe("createMarmotInboundDispatcher activation gating", () => {
       channelAccountId: "default",
       groupActivation: opts.groupActivation,
       mentionPatterns: opts.mentionPatterns ?? [],
+      authorizer: testAllowlistAuthorizer(),
     });
     await dispatch({ ...baseMessage, ...opts.message });
     return turnRan.value;
@@ -585,6 +673,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
     groupIdHex: HEX32("cc"),
     messageIdHex: HEX32("dd"),
     senderAccountIdHex: HEX32("bb"),
+    sender: testInboundActor(),
     text: "just chatting amongst ourselves",
   };
 
@@ -596,6 +685,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       channelAccountId: "default",
       groupActivation: "mention",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
   }
 
@@ -723,6 +813,8 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       mentionsSelf: true,
       messageIdHex: HEX32("02"),
     });
+    // A dispatcher is bound to one receiving account; a mismatched account id
+    // is denied before group-info lookup.
     await dispatch({
       ...baseMessage,
       accountIdHex: otherAccount,
@@ -735,7 +827,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       mentionsSelf: true,
       messageIdHex: HEX32("04"),
     });
-    expect(groupInfoCalls()).toBe(4);
+    expect(groupInfoCalls()).toBe(3);
 
     dispatch.invalidateGroupActivation(baseMessage.accountIdHex, otherGroup);
     await dispatch({
@@ -745,7 +837,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       messageIdHex: HEX32("05"),
     });
     await dispatch({ ...baseMessage, mentionsSelf: true, messageIdHex: HEX32("06") });
-    expect(groupInfoCalls()).toBe(5);
+    expect(groupInfoCalls()).toBe(4);
   });
 
   it("passes a normalized subject as conversation.label and omits malformed ones", async () => {
@@ -785,6 +877,7 @@ describe("createMarmotInboundDispatcher activation cache", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
     await malformed({ ...baseMessage, messageIdHex: HEX32("99") });
     const omitted = buildCtxMock.mock.calls.at(-1)?.[0] as {
@@ -890,6 +983,7 @@ describe("createMarmotInboundDispatcher inbound media", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
   }
 
@@ -904,6 +998,7 @@ describe("createMarmotInboundDispatcher inbound media", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "look",
       media: [ref],
     });
@@ -933,6 +1028,7 @@ describe("createMarmotInboundDispatcher inbound media", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "doc",
       media: [ok],
     });
@@ -951,6 +1047,7 @@ describe("createMarmotInboundDispatcher inbound media", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "broken",
       media: [imageRef("e3")],
     });
@@ -970,6 +1067,7 @@ describe("createMarmotInboundDispatcher inbound media", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "no media",
     });
 
@@ -1022,6 +1120,7 @@ describe("timeline context budget", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
     });
 
     await dispatch({
@@ -1029,6 +1128,7 @@ describe("timeline context budget", () => {
       groupIdHex: HEX32("cc"),
       messageIdHex: HEX32("dd"),
       senderAccountIdHex: HEX32("bb"),
+      sender: testInboundActor(),
       text: "ping",
       recordedAt: 1_721_000_000,
     });

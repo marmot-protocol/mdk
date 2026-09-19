@@ -11,6 +11,12 @@ import type {
   AgentControlMediaRef,
   MarmotAgentControlClient,
 } from "./client.js";
+import {
+  authorizeInboundSender,
+  senderAuthorizationInputFromMessage,
+  type MarmotSenderAuthorizer,
+  type SenderDenyReason,
+} from "./sender-policy.js";
 
 export type InboundSubscribeClient = Pick<MarmotAgentControlClient, "subscribeInbound">;
 
@@ -19,7 +25,7 @@ export interface MarmotInboundMessage {
   groupIdHex: string;
   messageIdHex: string;
   senderAccountIdHex: string;
-  sender?: AgentControlActor;
+  sender: AgentControlActor;
   text: string;
   /** Sender-authenticated event time in Unix seconds. */
   recordedAt?: number;
@@ -78,13 +84,14 @@ export type MarmotAmbientEvent = MarmotMutationEvent | {
   detail?: string | null;
 };
 
-export type MarmotInboundAdmissionOutcome = "admitted" | "coalesced" | "overloaded";
+export type MarmotInboundAdmissionOutcome = "admitted" | "coalesced" | "overloaded" | "denied";
 export type MarmotInboundCompletionOutcome =
   | "dispatched"
   | "not_dispatched"
   | "onboarding_intercepted"
   | "coalesced"
-  | "overloaded";
+  | "overloaded"
+  | "denied";
 
 /** Admission settles independently from completion so the subscription can keep reading. */
 export interface MarmotInboundSubmission {
@@ -99,6 +106,13 @@ export interface MarmotInboundBridgeOptions {
   onMessage: (
     message: MarmotInboundMessage,
   ) => void | MarmotInboundSubmission | Promise<void | MarmotInboundSubmission>;
+  /**
+   * Account-bound sender ACL. Missing authorizer is fail-closed: the message
+   * is denied before reservation, debounce, or queue admission.
+   */
+  authorizer?: MarmotSenderAuthorizer | null;
+  /** Aggregate-only denial diagnostic; reason codes only, never identifiers. */
+  onDenied?: (reason: SenderDenyReason) => void;
   /** The agent joined a group via a welcome (used to greet/onboard on join). */
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
   /** A durable mutation/group-state fact that must not trigger a turn. */
@@ -276,26 +290,37 @@ export class MarmotInboundBridge {
     if (this.recent.has(messageIdHex) || this.pending.has(messageIdHex)) {
       return;
     }
+    const message: MarmotInboundMessage = {
+      accountIdHex: event.account_id_hex,
+      groupIdHex: event.group_id_hex,
+      messageIdHex,
+      senderAccountIdHex: event.message.sender.account_id_hex,
+      sender: event.message.sender,
+      text: event.message.text,
+      recordedAt: event.message.recorded_at,
+      mentionsSelf: event.mentions_self ?? false,
+      replyToMessageIdHex: event.reply_to?.message_id_hex ?? null,
+      replyTo: event.reply_to ?? null,
+      senderDisplayName: event.message.sender.display_name ?? null,
+      media: event.message.media ?? [],
+    };
+    const authorization = authorizeInboundSender(
+      this.options.authorizer,
+      senderAuthorizationInputFromMessage(message),
+    );
+    if (authorization.outcome === "deny") {
+      // Terminal denial: suppress replay without allocating a pending turn.
+      this.recent.add(messageIdHex);
+      this.options.onDenied?.(authorization.reason);
+      return;
+    }
     // Reserve before submission: rapid replay must not start a duplicate while
     // queue/debounce admission or the accepted turn is still pending. A typed
     // overload releases the reservation without adding it to completed dedupe.
     this.pending.add(messageIdHex);
     let submitted: void | MarmotInboundSubmission | Promise<void | MarmotInboundSubmission>;
     try {
-      submitted = this.options.onMessage({
-        accountIdHex: event.account_id_hex,
-        groupIdHex: event.group_id_hex,
-        messageIdHex,
-        senderAccountIdHex: event.message.sender.account_id_hex,
-        sender: event.message.sender,
-        text: event.message.text,
-        recordedAt: event.message.recorded_at,
-        mentionsSelf: event.mentions_self ?? false,
-        replyToMessageIdHex: event.reply_to?.message_id_hex ?? null,
-        replyTo: event.reply_to ?? null,
-        senderDisplayName: event.message.sender.display_name ?? null,
-        media: event.message.media ?? [],
-      });
+      submitted = this.options.onMessage(message);
     } catch (error) {
       this.pending.delete(messageIdHex);
       this.options.onSubmissionError?.(error);

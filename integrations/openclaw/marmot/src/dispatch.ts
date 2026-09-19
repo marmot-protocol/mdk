@@ -26,6 +26,11 @@ import type { GroupActivation } from "./config.js";
 import { GroupInfoCache, type GroupInfoFacts } from "./group-info-cache.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
+import {
+  authorizeInboundSender,
+  senderAuthorizationInputFromMessage,
+  type MarmotSenderAuthorizer,
+} from "./sender-policy.js";
 
 // --- inbound turn dispatch (SDK-coupled; harness-validated) ------------------
 
@@ -94,6 +99,11 @@ export interface MarmotDispatchDeps {
   groupActivation: GroupActivation;
   /** Case-insensitive trigger phrases that count as addressing the agent. */
   mentionPatterns: string[];
+  /**
+   * Account-bound sender ACL. Missing authorizer is fail-closed so a direct
+   * caller or wiring error cannot skip intake authorization.
+   */
+  authorizer?: MarmotSenderAuthorizer | null;
   /** Optional privacy-safe lifecycle logger. */
   log?: (message: string) => void;
   /** Override OpenClaw durable delivery in focused tests. */
@@ -475,6 +485,14 @@ export function createMarmotInboundDispatcher(
   // lives exactly as long as the inbound subscription that owns it.
   const groupInfoCache = new GroupInfoCache();
   const dispatch = async (message: MarmotInboundMessage): Promise<boolean> => {
+    const authorization = authorizeInboundSender(
+      deps.authorizer,
+      senderAuthorizationInputFromMessage(message),
+    );
+    if (authorization.outcome === "deny") {
+      deps.log?.(`marmot: inbound sender denied (reason=${authorization.reason})`);
+      return false;
+    }
     // Activation gating: in a multi-party group, only run a turn when addressed.
     const decision = await decideActivation(deps, groupInfoCache, message);
     if (!decision.run) {
@@ -606,6 +624,16 @@ export function createMarmotInboundDispatcher(
                     // triggered this turn. The destination itself comes from
                     // ctxPayload.OriginatingTo / ctxPayload.To.
                     replyToId: message.messageIdHex,
+                    // Marmot's adapter requires the host delivery-queue
+                    // identity. Ask for required unknown-send reconciliation
+                    // so the host constructs that context instead of calling
+                    // send.text without a queue id.
+                    requiredCapabilities: {
+                      text: true,
+                      replyTo: true,
+                      messageSendingHooks: true,
+                      reconcileUnknownSend: true,
+                    },
                   });
                   assertDurableReplyHandled(result);
                 },

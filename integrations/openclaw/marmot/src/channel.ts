@@ -36,6 +36,7 @@ import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   marmotInboundRuntimeSnapshot,
 } from "./runtime-state.js";
+import { senderPolicyErrorCode, senderPolicyIsReady } from "./sender-policy.js";
 
 export const MARMOT_CHANNEL_ID = "marmot";
 
@@ -43,6 +44,8 @@ interface MarmotStatusProbe {
   ok: boolean;
   accounts: number;
   localSigningAccounts: number;
+  senderPolicyState?: string;
+  senderPolicyAllowedUserCount?: number;
 }
 
 interface MarmotChannelsConfig {
@@ -105,17 +108,21 @@ function accountSnapshot(
   const fallback = marmotInboundRuntimeSnapshot(accountId);
   // Prefer a supplied host runtime, including a deliberate `lastError: null`.
   // Do not overlay the compatibility snapshot or resurrect stale errors.
+  // Sender-policy readiness still constrains connected/healthy: a stale host
+  // connected=true cannot mask a missing or invalid policy.
   const source = runtime ?? fallback;
+  const policyError = senderPolicyErrorCode(account.senderPolicy.state);
+  const senderReady = senderPolicyIsReady(account.senderPolicy.state);
   return {
     accountId,
     name: accountId,
     enabled: true,
     configured: true,
     running: source.running === true,
-    connected: source.connected === true,
+    connected: senderReady && source.connected === true,
     lastStartAt: source.lastStartAt ?? null,
     lastStopAt: source.lastStopAt ?? null,
-    lastError: source.lastError ?? null,
+    lastError: policyError ?? source.lastError ?? null,
     lastInboundAt: source.lastInboundAt,
     lastOutboundAt: source.lastOutboundAt,
     reconnectAttempts: source.reconnectAttempts,
@@ -126,12 +133,15 @@ function accountSnapshot(
 }
 
 async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<MarmotStatusProbe> {
+  const senderReady = senderPolicyIsReady(account.senderPolicy.state);
   const response = await clientForAccount(account).accountList();
   const localSigningAccounts = response.accounts.filter((entry) => entry.local_signing).length;
   return {
-    ok: localSigningAccounts > 0,
+    ok: localSigningAccounts > 0 && senderReady,
     accounts: response.accounts.length,
     localSigningAccounts,
+    senderPolicyState: account.senderPolicy.state,
+    senderPolicyAllowedUserCount: account.senderPolicy.allowedUserCount,
   };
 }
 

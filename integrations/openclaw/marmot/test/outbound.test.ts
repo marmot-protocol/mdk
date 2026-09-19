@@ -22,6 +22,7 @@ import {
 import {
   markMarmotInboundReady,
   markMarmotInboundStarting,
+  markMarmotSenderPolicyResult,
   marmotInboundRuntimeSnapshot,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
@@ -271,6 +272,7 @@ describe("createMarmotMessageAdapter", () => {
   });
 
   it("does not evict another account's active inbound status after a send", async () => {
+    markMarmotSenderPolicyResult("work", { state: "allow_all", allowedUserCount: 0 });
     markMarmotInboundStarting("work");
     markMarmotInboundReady("work");
     const adapter = createMarmotMessageAdapter({

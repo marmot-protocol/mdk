@@ -24,9 +24,11 @@ import {
   MARMOT_ALLOWLIST_SYNC_FAILED,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
+import type { MarmotSenderAuthorizer } from "../src/sender-policy.js";
 
 const syncCalls: Array<{ channelAccountId?: string | null }> = [];
-const statusPatches: Array<Record<string, unknown>> = [];
+const statusPatches: Array<Record<string, unknown> & { subscribeCalls?: number }> = [];
+let recordedSubscribeCalls = 0;
 let lifecycleStarts = 0;
 const lifecycleByAccount = new Map<
   string,
@@ -36,7 +38,7 @@ const lifecycleByAccount = new Map<
 vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
   createAccountStatusSink: ({ setStatus }: { setStatus: (next: unknown) => void }) => {
     return (patch: Record<string, unknown>) => {
-      statusPatches.push(patch);
+      statusPatches.push({ ...patch, subscribeCalls: recordedSubscribeCalls });
       setStatus(patch);
     };
   },
@@ -125,6 +127,7 @@ function account(overrides: Partial<ResolvedMarmotAccount> = {}): ResolvedMarmot
     profileOnboardingStatePath: "/tmp/onboarding.json",
     debounceMs: 0,
     dmPolicy: "allowlist",
+    senderPolicy: { state: "allow_all", allowedUsers: [], allowedUserCount: 0 },
     ...overrides,
   };
 }
@@ -188,6 +191,7 @@ afterEach(async () => {
   resetMarmotGatewayRecoveryForTests();
   syncCalls.length = 0;
   statusPatches.length = 0;
+  recordedSubscribeCalls = 0;
   lifecycleStarts = 0;
   vi.clearAllMocks();
   vi.useRealTimers();
@@ -511,20 +515,58 @@ describe("startMarmotGatewayAccount", () => {
       throw new Error("expected unmocked startMarmotInbound");
     }
     const hex = (byte: string) => byte.repeat(32);
+    const allowed = hex("bb");
+    const denied = hex("99");
     const abort = new AbortController();
     let constructionFailures = 0;
     let accountListFailures = 0;
     let subscribeCalls = 0;
     let mode: "construct" | "accountList" | "ready" = "construct";
     const startCounts: number[] = [];
+    const admitted: string[] = [];
+    const logs: string[] = [];
+    let sharedAuthorizer: MarmotSenderAuthorizer | undefined;
+    let pushEvent: ((event: Record<string, unknown>) => void) | undefined;
 
-    const running = startMarmotGatewayAccount(
-      gatewayContext(account(), { accountId: "work", abortSignal: abort.signal }),
-      {
-        random: () => 0,
-        delay: async () => undefined,
-        startInbound: (api, dispatch, options) => {
-          const started = realStart(api, dispatch, {
+    const inboundMessage = (sender: string, messageByte: string, isSelf = false) => ({
+      type: "inbound_message",
+      account_id_hex: hex("aa"),
+      group_id_hex: hex("cc"),
+      mentions_self: true,
+      message: {
+        message_id_hex: hex(messageByte),
+        sender: { account_id_hex: sender, display_name: "Peer", is_self: isSelf },
+        text: "please help",
+        recorded_at: 1_721_000_000,
+        media: [],
+      },
+    });
+
+    const ctx = gatewayContext(
+      account({
+        marmotAccountIdHex: hex("aa"),
+        senderPolicy: { state: "allowlist", allowedUsers: [allowed], allowedUserCount: 1 },
+      }),
+      { accountId: "work", abortSignal: abort.signal },
+    );
+    ctx.log = {
+      info: (message: string) => logs.push(message),
+      warn: (message: string) => logs.push(message),
+      error: (message: string) => logs.push(message),
+    };
+
+    const running = startMarmotGatewayAccount(ctx, {
+      random: () => 0,
+      delay: async () => undefined,
+      startInbound: (api, _dispatch, options = {}) => {
+        sharedAuthorizer = options.authorizer;
+        const started = realStart(
+          api,
+          async (message) => {
+            admitted.push(message.senderAccountIdHex);
+            return true;
+          },
+          {
             ...options,
             clientFactory: () => {
               if (mode === "construct") {
@@ -550,21 +592,42 @@ describe("startMarmotGatewayAccount", () => {
                 },
                 async *subscribeInbound(
                   _filter?: unknown,
-                  _signal?: AbortSignal,
+                  signal?: AbortSignal,
                   hooks?: { onReady?: () => void },
                 ) {
                   subscribeCalls += 1;
+                  recordedSubscribeCalls = subscribeCalls;
                   hooks?.onReady?.();
-                  await new Promise<void>(() => undefined);
+                  const queued: Array<Record<string, unknown>> = [];
+                  let notify: (() => void) | undefined;
+                  pushEvent = (event) => {
+                    queued.push(event);
+                    notify?.();
+                  };
+                  while (!signal?.aborted) {
+                    if (queued.length === 0) {
+                      await new Promise<void>((resolve) => {
+                        if (signal?.aborted) {
+                          resolve();
+                          return;
+                        }
+                        notify = resolve;
+                        signal?.addEventListener("abort", () => resolve(), { once: true });
+                      });
+                    }
+                    while (queued.length > 0) {
+                      yield queued.shift() as never;
+                    }
+                  }
                 },
               } as unknown as MarmotAgentControlClient;
             },
-          });
-          startCounts.push(getEventListeners(options?.signal ?? abort.signal, "abort").length);
-          return started;
-        },
+          },
+        );
+        startCounts.push(getEventListeners(options?.signal ?? abort.signal, "abort").length);
+        return started;
       },
-    );
+    });
     const lifecycle = await waitForLifecycle("work");
     await vi.waitFor(() => {
       expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
@@ -576,6 +639,45 @@ describe("startMarmotGatewayAccount", () => {
     expect(accountListFailures).toBe(6);
     expect(subscribeCalls).toBe(1);
     expect(Math.max(...startCounts)).toBeLessThanOrEqual(1);
+    expect(
+      statusPatches.some((patch) => patch.connected === true && patch.subscribeCalls === 0),
+    ).toBe(false);
+    expect(sharedAuthorizer?.lifecycle()).toBe("active");
+    expect(
+      sharedAuthorizer?.authorize({
+        receivingAccountIdHex: hex("aa"),
+        mappedSenderAccountIdHex: allowed,
+        sender: { account_id_hex: allowed, is_self: false },
+      }),
+    ).toEqual({ outcome: "allow", reason: "allowlist" });
+    expect(
+      sharedAuthorizer?.authorize({
+        receivingAccountIdHex: hex("aa"),
+        mappedSenderAccountIdHex: denied,
+        sender: { account_id_hex: denied, is_self: false },
+      }),
+    ).toEqual({ outcome: "deny", reason: "sender_not_allowed" });
+
+    pushEvent?.(inboundMessage(denied, "d1"));
+    await vi.waitFor(() => {
+      expect(logs.some((line) => line.includes("reason=sender_not_allowed"))).toBe(true);
+    });
+    expect(admitted).toEqual([]);
+    pushEvent?.(inboundMessage(allowed, "d2"));
+    await vi.waitFor(() => {
+      expect(admitted).toEqual([allowed]);
+    });
+    expect(logs.join("\n")).not.toContain(allowed);
+    expect(logs.join("\n")).not.toContain(denied);
+
+    sharedAuthorizer?.setLifecycle("replaced");
+    expect(
+      sharedAuthorizer?.authorize({
+        receivingAccountIdHex: hex("aa"),
+        mappedSenderAccountIdHex: allowed,
+        sender: { account_id_hex: allowed, is_self: false },
+      }),
+    ).toEqual({ outcome: "deny", reason: "lifecycle_replaced" });
 
     const patchesAfterReady = statusPatches.length;
     abort.abort();
@@ -583,6 +685,7 @@ describe("startMarmotGatewayAccount", () => {
     await running;
     await Promise.resolve();
     expect(subscribeCalls).toBe(1);
+    expect(admitted).toEqual([allowed]);
     expect(statusPatches.length).toBeGreaterThanOrEqual(patchesAfterReady);
     expect(statusPatches.at(-1)).toMatchObject({ running: false, connected: false });
     expect(JSON.stringify(statusPatches)).not.toContain("secret socket");
