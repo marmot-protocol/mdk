@@ -135,6 +135,7 @@ pub enum MarmotStatus {
     AttachmentModeRequired = 93,
     /// A signed-out account cannot grant automatic network permission.
     AttachmentAccountSignedOut = 94,
+    InvalidAppComponent = 95,
 }
 
 thread_local! {
@@ -227,6 +228,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::GroupHydrationPending { .. } => MarmotStatus::GroupHydrationPending,
         MarmotKitError::InvalidChatPin { .. } => MarmotStatus::InvalidChatPin,
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
+        MarmotKitError::InvalidAppComponent { .. } => MarmotStatus::InvalidAppComponent,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
         MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
         MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
@@ -313,6 +315,9 @@ mod tests {
             MarmotKitError::ConversationWindowClosed,
             MarmotKitError::ConversationWindowNotReady,
             MarmotKitError::ConversationWindowTimedOut,
+            MarmotKitError::InvalidAppComponent {
+                details: "reserved id".into(),
+            },
             MarmotKitError::ConversationWindowInvalidTarget,
             MarmotKitError::ConversationWindowQuery {
                 details: "test".into(),
@@ -480,7 +485,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            85,
+            86,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
