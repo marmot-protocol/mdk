@@ -564,7 +564,22 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
         if !self.epoch_manager.can_ingest(&group_id) {
-            self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Retryable)?;
+            // No peel happened, so nobody opened these bytes: the row stays the
+            // only redelivery source, which is why no caller may read this
+            // `Buffered` as licence to retire it (AGENTS.md, "a `Buffered`
+            // outcome never lets the caller retire the wrapper"). Write-once for
+            // the same reason `retain_transport_message_refused_while_removed`
+            // is: internal replay re-enters ingest below the durable dedup seam,
+            // and re-stamping a `PeelDeferred` row `Retryable` would drop its
+            // deferred-peel lifecycle and leak its flood-cap slot (mdk#339).
+            if !self.raw_transport_row_awaiting_retry(&msg.id)? {
+                self.persist_transport_message(
+                    msg,
+                    &group_id,
+                    current_epoch,
+                    MessageState::Retryable,
+                )?;
+            }
             self.return_unmodified_mls_group(&group_id, mls_group);
             return reported(IngestOutcome::Buffered {
                 group_id,
@@ -935,6 +950,11 @@ impl<S: StorageProvider> Engine<S> {
             // marker pool so a later restart can short-circuit before peel.
             self.storage
                 .put_processed_transport_id(&group_id, &raw_msg_id)?;
+            // This wrapper is one of the arbitrarily many re-wraps a member can
+            // mint for the same MLS bytes, and the content record already
+            // stands for them. See AGENTS.md, "a `Buffered` outcome never lets
+            // the caller retire the wrapper".
+            self.retire_raw_wrapper(&raw_msg_id, &content_id, "content_record_already_durable")?;
             return reported(outcome);
         }
         if self.seen_message_ids.contains(&content_id) {
@@ -1240,15 +1260,12 @@ impl<S: StorageProvider> Engine<S> {
                 if convergence_refused_for_missing_anchor {
                     // The retained content row is now the durable convergence
                     // witness for this rival and the group is scheduled for a
-                    // pass; a raw wrapper that arrived through the retry
-                    // lifecycle has done its job and leaves it the same way
-                    // the convergence-buffer path retires it.
-                    if raw_msg_id != msg.id {
-                        self.mark_raw_transport_message_processed_if_awaiting_retry(
-                            &raw_msg_id,
-                            "fork_rival_missing_retained_anchor",
-                        )?;
-                    }
+                    // pass.
+                    self.retire_raw_wrapper(
+                        &raw_msg_id,
+                        &msg.id,
+                        "fork_rival_missing_retained_anchor",
+                    )?;
                     return reported(
                         self.unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current)?,
                     );
@@ -1298,6 +1315,15 @@ impl<S: StorageProvider> Engine<S> {
                     // Sender and membership-tag authentication can depend
                     // on a retained same-epoch parent. Try every retained
                     // branch before classifying the proposal as terminal.
+                    //
+                    // The pass below can report `Buffered`, so the wrapper is
+                    // retired here: see AGENTS.md, "a `Buffered` outcome never
+                    // lets the caller retire the wrapper".
+                    self.retire_raw_wrapper(
+                        &raw_msg_id,
+                        &msg.id,
+                        "parent_dependent_proposal_converged",
+                    )?;
                     let result = self
                         .converge_stored_openmls_messages(&group_id)
                         .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
@@ -1588,6 +1614,14 @@ impl<S: StorageProvider> Engine<S> {
                         mls_bytes.as_slice(),
                         commit_committer,
                         committer_index == mls_group.own_leaf_index(),
+                    )?;
+                    // The pass below can report `Buffered`, so the wrapper is
+                    // retired here: see AGENTS.md, "a `Buffered` outcome never
+                    // lets the caller retire the wrapper".
+                    self.retire_raw_wrapper(
+                        &raw_msg_id,
+                        &msg.id,
+                        "inbound_disband_candidate_converged",
                     )?;
                     let result = self
                         .converge_stored_openmls_messages(&group_id)
@@ -2726,12 +2760,7 @@ impl<S: StorageProvider> Engine<S> {
             Some(raw_msg_id),
         )
         .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
-        if raw_msg_id != &msg.id {
-            self.mark_raw_transport_message_processed_if_awaiting_retry(
-                raw_msg_id,
-                wrapper_retirement_reason,
-            )?;
-        }
+        self.retire_raw_wrapper(raw_msg_id, &msg.id, wrapper_retirement_reason)?;
         if drain == ConvergenceDrain::DeferredToCaller {
             // Durably buffered and awaiting the caller's single drain. There is
             // no verdict to report yet — by design: the point of deferring is

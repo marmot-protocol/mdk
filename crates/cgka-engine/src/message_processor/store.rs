@@ -156,6 +156,16 @@ pub(crate) fn normalized_deferred_peel_lifecycle(
     (normalized, true)
 }
 
+/// Whether a row in this state is still awaiting retry — the same
+/// `Created | Retryable | PeelDeferred` set `replay_buffered_messages` and the
+/// deferred-peel sweep admit at entry. `None` (a vanished row) is not.
+pub(crate) fn row_state_is_awaiting_retry(state: Option<MessageState>) -> bool {
+    matches!(
+        state,
+        Some(MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred)
+    )
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn recorded_message_outcome(
         &self,
@@ -244,14 +254,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: &MessageId,
     ) -> Result<bool, EngineError> {
-        match self.storage.get_message(id) {
-            Ok(record) => Ok(matches!(
-                record.state,
-                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
-            )),
-            Err(StorageError::NotFound) => Ok(false),
-            Err(e) => Err(EngineError::Storage(e)),
-        }
+        Ok(row_state_is_awaiting_retry(self.stored_message_state(id)?))
     }
 
     pub(crate) fn record_sent_message(
@@ -1040,6 +1043,32 @@ impl<S: StorageProvider> Engine<S> {
             Ok(_) | Err(StorageError::NotFound) => Ok(()),
             Err(err) => Err(EngineError::Storage(err)),
         }
+    }
+
+    /// Retire the raw transport wrapper that carried `content_msg_id`, now that
+    /// a durable record stands for that content. No-op on the direct path,
+    /// where wrapper and content share one id and therefore one row.
+    ///
+    /// This is the single mechanism behind "a `Buffered` outcome never lets the
+    /// caller retire the wrapper" (AGENTS.md): every ingest site that returns
+    /// `Buffered` after a peel calls this, so no caller has to guess which of
+    /// them did.
+    ///
+    /// Deliberately not atomic with the content admission it follows. A
+    /// wrapper left awaiting retry beside a durable content record is a
+    /// legitimate state, not a torn one: internal replay and the sweep re-enter
+    /// ingest below the transport-id dedup seam, and the content-record seam
+    /// retires the wrapper on that pass.
+    pub(crate) fn retire_raw_wrapper(
+        &mut self,
+        raw_msg_id: &MessageId,
+        content_msg_id: &MessageId,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        if raw_msg_id == content_msg_id {
+            return Ok(());
+        }
+        self.mark_raw_transport_message_processed_if_awaiting_retry(raw_msg_id, reason)
     }
 
     /// Retire a raw transport wrapper whose content-derived row is now the

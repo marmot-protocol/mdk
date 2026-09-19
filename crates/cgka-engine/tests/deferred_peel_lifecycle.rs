@@ -2058,6 +2058,122 @@ async fn replay_still_retires_a_row_that_applies() {
     ));
 }
 
+/// A `Buffered` outcome is not the caller's to retire. The pre-peel halt gate
+/// reports `Buffered` for a row NOBODY OPENED — it only parked the bytes until
+/// the group can ingest again — so stamping that row `Processed` would make
+/// `recorded_message_outcome` answer `Duplicate` to every later redelivery of an
+/// id this device never peeled, and redelivery is the only way those bytes
+/// arrive again. The groups that reach this gate mid-replay are the halted and
+/// forked ones, which is where the deferred backlogs are.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn replay_keeps_a_row_the_halt_gate_never_peeled_redeliverable() {
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+
+    // Sealed two epochs ahead of carol, so it parks for the deferred-peel sweep.
+    let unpeelable = send_app(&mut alice, &group_id, "sealed beyond carol's epoch").await;
+    assert!(matches!(
+        carol.ingest(unpeelable.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&unpeelable.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    // The group halts while a publish is staged, so the replay `publish_failed`
+    // runs meets a group that can no longer ingest anything.
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    halt_group_durably(&carol_storage, &group_id);
+    carol.publish_failed(pending).await.unwrap();
+
+    assert_eq!(
+        carol_storage.get_message(&unpeelable.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "a row the halt gate buffered before any peel keeps its deferred-peel \
+         lifecycle, and its flood-cap slot with it"
+    );
+    assert_eq!(
+        rows_in_state(&carol_storage, &group_id, MessageState::PeelDeferred),
+        1,
+        "the per-group deferred count must still match the rows actually parked"
+    );
+    assert!(
+        matches!(
+            carol.ingest(unpeelable).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ),
+        "a halt-gated row must stay redeliverable, never answer Duplicate"
+    );
+}
+
+/// The half of the rule that must NOT change: a `PeelDeferred` row the replay
+/// really does resolve still leaves the retry lifecycle exactly once, releases
+/// its flood-cap slot, and answers `Duplicate` on redelivery. Deleting the
+/// caller's blanket retirement must not cost a resolved wrapper its retirement.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn replay_still_retires_a_deferred_row_it_resolves() {
+    let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs().await;
+
+    // Room for exactly one parked row, so the slot release is observable.
+    carol.set_deferred_peel_limits_for_tests(1, usize::MAX, usize::MAX);
+
+    // The epoch-3 commit is sealed a whole epoch beyond carol, so it parks.
+    assert!(matches!(
+        carol.ingest(commit3.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&commit3.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    // Epoch 2 arrives, so the replay below can finally peel the parked row.
+    carol.ingest(commit2).await.unwrap();
+    let pending = stage_publish_halting_ingest(&mut carol, &group_id).await;
+    carol.publish_failed(pending).await.unwrap();
+
+    assert_eq!(
+        carol_storage.get_message(&commit3.id).unwrap().state,
+        MessageState::Processed,
+        "a replayed deferred row that resolves still retires its wrapper"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        rows_in_state(&carol_storage, &group_id, MessageState::PeelDeferred),
+        0,
+        "the retired wrapper leaves the deferred-peel lifecycle"
+    );
+    assert!(matches!(
+        carol.ingest(commit3).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        }
+    ));
+
+    // The slot came back: the single-row cap admits a fresh unpeelable row
+    // again, which it could not do while the retired row still held it.
+    let (_, alice_pending) = evolution(
+        alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("alice moves on alone".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    let ahead = send_app(&mut alice, &group_id, "sealed a fresh epoch ahead").await;
+    assert!(matches!(
+        carol.ingest(ahead).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+}
+
 /// If account accounting was initialized by group A, a later deferral in
 /// group B is charged incrementally. Group B's first sweep must reconcile that
 /// contribution rather than adding the same durable bytes again.
