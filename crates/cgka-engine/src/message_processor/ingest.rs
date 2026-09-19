@@ -6,6 +6,7 @@
 //! typed outcomes. `Err` is reserved for storage, peeler, serialization, and
 //! unclassified OpenMLS failures.
 
+use super::store::RowEpochs;
 use super::{DeferredPeelPayloadPreparationError, content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
@@ -1205,10 +1206,19 @@ impl<S: StorageProvider> Engine<S> {
         // which require the application to compute the resulting
         // AppDataDictionary before OpenMLS stages the commit.
         let processed = match self.storage.with_transaction(|_storage| {
-            self.persist_openmls_wire_message_with_processed_transport_id(
+            // A commit row's epoch is the epoch it forks from, and the
+            // `commit_should_enter_convergence` decision above left only
+            // past-epoch commits on this path. See the commit-row rule in
+            // `AGENTS.md`; the forensic row keeps reporting `current_epoch`.
+            let row_epoch = if msg_content_type == ContentType::Commit {
+                msg_epoch
+            } else {
+                current_epoch
+            };
+            self.persist_openmls_wire_message_with_processed_transport_id_at(
                 &openmls_msg,
                 &group_id,
-                current_epoch,
+                RowEpochs::row_at(row_epoch, current_epoch),
                 MessageState::Created,
                 &raw_msg_id,
             )?;
@@ -1242,7 +1252,13 @@ impl<S: StorageProvider> Engine<S> {
                         MessageDisposition::AppPayloadRetentionExpired.tag(),
                     ),
                 };
-                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                // The row may carry the message's own epoch; the forensic
+                // trail must not.
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Failed,
+                    current_epoch,
+                )?;
                 self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                 return reported(IngestOutcome::Stale { reason });
             }
@@ -1271,7 +1287,11 @@ impl<S: StorageProvider> Engine<S> {
                     );
                 }
 
-                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Failed,
+                    current,
+                )?;
                 return reported(IngestOutcome::Stale {
                     reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
                 });
@@ -2560,15 +2580,12 @@ impl<S: StorageProvider> Engine<S> {
     /// be known; a device with a legitimate gap (`join_epoch == 0` legacy
     /// records defeat the pre-membership carve-out) is exactly the target.
     ///
-    /// Parking the rival `ConvergenceDeferred` keyed by `msg_epoch` was the same
-    /// defect one level down. That key is the row's `source_epoch`, and
-    /// `openmls_projection::historical_replay_start_epoch` takes the `min` over
-    /// unresolved rows to pick where a pass rewinds to — so the claimed epoch
-    /// would steer the convergence coordinator into its own
-    /// `MissingRetainedAnchor` halt on every later pass. The row this seam
-    /// leaves alone is the one ingest already persisted `Created` at
-    /// `current_epoch`: still retained, still pass-opening, but never a
-    /// historical rewind target chosen by an unauthenticated claim.
+    /// Parking the rival `ConvergenceDeferred` was the same defect one level
+    /// down: a durable disposition is a verdict, and this seam has none to
+    /// give. The row this seam leaves alone is the one ingest already persisted
+    /// `Created` — still retained, still pass-opening, and carrying the epoch
+    /// the rival forks from like every other commit row (see the persist site
+    /// above).
     ///
     /// # Retiring that row is the repair path's job, not this seam's
     ///

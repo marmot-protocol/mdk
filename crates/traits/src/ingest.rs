@@ -24,6 +24,10 @@ pub enum IngestOutcome {
     /// which only re-ingests retained raw transport rows. So an engine seam that
     /// leaves a retained content row unapplied MUST schedule the group for
     /// convergence; otherwise this outcome promises a replay that never happens.
+    ///
+    /// `epoch` is the epoch the engine reported when it parked the message, and
+    /// is informational: it is not a claim about the message's own source epoch,
+    /// and a byte-identical redelivery may report a different one.
     Buffered { group_id: GroupId, epoch: EpochId },
     /// Rejected before convergence admission because routing or deduplication
     /// proved the input cannot affect this account-device's canonical state.
