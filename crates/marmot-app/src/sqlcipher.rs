@@ -440,11 +440,29 @@ fn read_sqlcipher_salt(path: &Path) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError
 }
 
 /// Publish complete private bytes without ever replacing existing key material.
-/// The unique staging file is synced before linking it into place; readers can
+/// The unique staging file is synced before publishing it; readers can
 /// see either no destination or the complete file, never a partial salt/secret.
-/// The storage filesystem must support same-directory hard links; falling back
-/// to writing the destination in place would expose partial key material.
+/// Android uses a per-destination lock and rename because app SELinux domains
+/// forbid hard links. Other platforms retain atomic hard-link publication.
 fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), AppError> {
+    #[cfg(target_os = "android")]
+    let publish = fs_private::rename_noreplace_with_lock;
+    #[cfg(not(target_os = "android"))]
+    let publish = |source: &Path, destination: &Path| {
+        fs::hard_link(source, destination)?;
+        let _ = fs::remove_file(source);
+        Ok(())
+    };
+    write_private_new_using(path, contents, publish)
+}
+
+// The publisher consumes the staging pathname on success. Never unlink it a
+// second time: after rename (or unlink), another thread can reuse that name.
+fn write_private_new_using(
+    path: &Path,
+    contents: &[u8],
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), AppError> {
     if let Some(parent) = path.parent()
         && !parent.is_dir()
     {
@@ -467,12 +485,15 @@ fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), AppError> {
     let result = (|| {
         file.write_all(contents)?;
         file.sync_all()?;
-        // Same-directory hard-link publication is atomic and fails if the
-        // target exists. rename would silently replace the winning salt.
-        fs::hard_link(&tmp_path, path)
+        // Every publisher must preserve the complete winning bytes. Android's
+        // helper holds its file lock across the existence check and rename;
+        // the database-open lock alone cannot protect account-shared secrets.
+        publish(&tmp_path, path)
     })();
     drop(file);
-    let _ = fs::remove_file(&tmp_path);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
     result?;
     if let Some(parent) = path.parent()
         && let Ok(dir) = File::open(parent)

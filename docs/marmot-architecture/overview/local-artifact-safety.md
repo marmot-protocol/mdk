@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-09-18
+updated: 2026-09-19
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -36,7 +36,7 @@ mdk#357, mdk#367, mdk#396).
 
 `crates/fs-private` owns the shared implementations: `write_private`, `open_private_append`, `create_new_private`,
 `ensure_private_file`, `tighten_existing_private_file`, `create_dir_all_private`, `set_private_file_mode`,
-`parse_octal_mode`, and `bind_unix_listener_private`.
+`parse_octal_mode`, `bind_unix_listener_private`, and `rename_noreplace_with_lock`.
 
 **Coverage rule:** new code that creates a local file, socket, or database calls these helpers (or proves equivalent
 restrictive-by-construction posture with an on-disk mode test) instead of re-deriving umask/chmod/PRAGMA ordering.
@@ -53,11 +53,18 @@ then the per-database initialization lock, then cache publication; terminal clos
 waits for admitted opens before draining caches.
 
 Salts and external-signing storage secrets are published from unique 0600 staging
-files only after their contents are synced. Atomic hard-link publication refuses
-to replace existing key material and exposes no partially written destination.
-Storage roots must support same-directory hard links; filesystems that reject
-them cannot initialize encrypted storage. There is no in-place-write fallback
-because concurrent readers could consume incomplete key material.
+files only after their contents are synced. On Android, where app SELinux domains
+forbid hard links, all publishers take an exclusive `flock` on a stable 0600
+`<destination>.publish.lock` sibling, check for an existing entry without following
+symlinks, and rename only when absent. Competing publishers wait and adopt the
+complete winner. The lock covers each destination, including storage secrets
+shared by different databases, and releases on descriptor close or process exit.
+Lock files remain in place; never unlink or replace them while publishers can run.
+This uses Android API 26-compatible operations and adds no minimum-API requirement.
+Other platforms, including iOS and macOS, retain atomic hard-link publication and
+require storage roots to support same-directory hard links. Both paths refuse to
+replace existing key material and expose no partially written destination. There
+is no in-place-write fallback because readers could consume incomplete key material.
 Generated accounts remain unavailable to attention readers and managed workers
 until the setup journal reaches `LocalReady`. A failed pre-readiness resume keeps
 its account files and keys while healthy accounts start. Neither journal state

@@ -1,6 +1,144 @@
 use super::*;
 use std::sync::{Arc, Barrier};
 
+#[cfg(unix)]
+#[test]
+fn android_publication_does_not_unlink_a_reused_staging_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("salt");
+    let mut reused = None;
+    write_private_new_using(&destination, b"winner", |source, target| {
+        fs_private::rename_noreplace_with_lock(source, target)?;
+        // A concurrent writer may reuse the now-vacant staging name before
+        // this publisher closes its descriptor and finishes cleanup.
+        fs_private::write_private(source, b"next-writer")?;
+        reused = Some(source.to_path_buf());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"winner");
+    assert_eq!(fs::read(reused.unwrap()).unwrap(), b"next-writer");
+}
+
+/// Exercise the actual Android publication path on Unix hosts as well, rather
+/// than relying on the host's hard-link path to catch Android regressions.
+#[cfg(unix)]
+#[test]
+fn android_publication_competing_salts_preserve_database_reopenability() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.account_home().create_account("new").unwrap();
+    let salt_path = sqlcipher_salt_path(&app.account_storage_path("new"));
+    let barrier = Barrier::new(8);
+    let results = std::thread::scope(|scope| {
+        let tasks: Vec<_> = (1..=8u8)
+            .map(|byte| {
+                let (app, salt_path, barrier) = (&app, &salt_path, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let result = write_private_new_using(
+                        salt_path,
+                        hex::encode([byte; SQLCIPHER_SALT_LEN]).as_bytes(),
+                        fs_private::rename_noreplace_with_lock,
+                    );
+                    let salt = read_sqlcipher_salt(salt_path).unwrap();
+                    app.account_storage("new")
+                        .expect("every opener must use the winning salt");
+                    (byte, result, salt)
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .map(|task| task.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let winners: Vec<_> = results
+        .iter()
+        .filter(|(_, result, _)| result.is_ok())
+        .collect();
+    assert_eq!(winners.len(), 1);
+    let winning_byte = winners[0].0;
+    for (_, result, salt) in results {
+        if let Err(error) = result {
+            assert!(
+                matches!(error, AppError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
+            );
+        }
+        assert_eq!(salt, [winning_byte; SQLCIPHER_SALT_LEN]);
+    }
+    let bytes = fs::read(&salt_path).unwrap();
+    app.close_storage().unwrap();
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    reopened
+        .account_storage("new")
+        .expect("winning salt must reopen the encrypted database");
+    assert_eq!(fs::read(&salt_path).unwrap(), bytes);
+    for entry in fs::read_dir(salt_path.parent().unwrap()).unwrap() {
+        let path = entry.unwrap().path();
+        assert!(
+            !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".tmp.")
+        );
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "lock" || extension == "salt")
+        {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn android_publication_preserves_shared_secret_and_migration_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        EXTERNAL_SQLCIPHER_SECRET_FILE,
+        "session.sqlite.salt-migrating",
+    ] {
+        let path = dir.path().join(name);
+        let barrier = Barrier::new(8);
+        let winners = std::thread::scope(|scope| {
+            let tasks: Vec<_> = (1..=8u8)
+                .map(|byte| {
+                    let (path, barrier) = (&path, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        match write_private_new_using(
+                            path,
+                            &[byte; 64],
+                            fs_private::rename_noreplace_with_lock,
+                        ) {
+                            Ok(()) => Some(byte),
+                            Err(AppError::Io(error))
+                                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                            {
+                                None
+                            }
+                            Err(error) => panic!("unexpected publication error: {error}"),
+                        }
+                    })
+                })
+                .collect();
+            tasks
+                .into_iter()
+                .filter_map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(winners.len(), 1);
+        assert_eq!(fs::read(path).unwrap(), vec![winners[0]; 64]);
+    }
+}
+
 #[test]
 fn salt_publication_never_replaces_existing_bytes() {
     let dir = tempfile::tempdir().unwrap();

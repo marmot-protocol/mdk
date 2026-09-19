@@ -15,6 +15,11 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(unix)]
+mod publication;
+#[cfg(unix)]
+pub use publication::rename_noreplace_with_lock;
+
 /// Owner-only mode for files holding private data.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Owner-only mode for directories holding private artifacts.
@@ -55,13 +60,14 @@ pub fn try_acquire_private_exclusive_file_lease(
     let file = options
         .open(path)
         .map_err(|error| io_context("open private lease file", path, error))?;
-    finish_private_exclusive_file_lease(file, path)
+    finish_private_exclusive_file_lease(file, path, libc::LOCK_EX | libc::LOCK_NB)
 }
 
 #[cfg(unix)]
 fn finish_private_exclusive_file_lease(
     file: std::fs::File,
     path: &Path,
+    operation: libc::c_int,
 ) -> io::Result<PrivateExclusiveFileLease> {
     use std::os::fd::AsRawFd;
 
@@ -81,7 +87,7 @@ fn finish_private_exclusive_file_lease(
         .map_err(|error| io_context("set private lease file mode", path, error))?;
 
     loop {
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
         if result == 0 {
             return Ok(PrivateExclusiveFileLease { _file: file });
         }
@@ -89,7 +95,7 @@ fn finish_private_exclusive_file_lease(
         if error.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        return Err(io_context("acquire nonblocking private lease", path, error));
+        return Err(io_context("acquire private lease", path, error));
     }
 }
 
@@ -178,7 +184,7 @@ impl PreparedDirectory {
             ));
         }
         let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-        finish_private_exclusive_file_lease(file, &path)
+        finish_private_exclusive_file_lease(file, &path, libc::LOCK_EX | libc::LOCK_NB)
     }
 }
 

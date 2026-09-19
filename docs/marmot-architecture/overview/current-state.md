@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-18
+updated: 2026-09-19
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -129,6 +129,8 @@ The production retention and retry limits remain unchanged.
 
 Same-database first opens now serialize SQLCipher key selection, schema migration
 and handle publication; salts cannot be overwritten by competing initializers.
+Android publishes key material with a per-destination file lock and atomic rename,
+preserving API 26 support without hard links; iOS and macOS retain hard-link publication.
 Generated identities remain unavailable to background attention and managed workers
 until local readiness. Failed pre-readiness setup preserves its files and keys
 without preventing healthy accounts from starting; it does not automatically erase
