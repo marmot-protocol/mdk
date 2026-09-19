@@ -1919,6 +1919,48 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn diagnostic_key_package_maintenance_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<Option<cgka_traits::KeyPackageLifecycleState>>, AppError> {
+        let Some(command) = self.existing_worker_commands(account_ref).await? else {
+            return Ok(None);
+        };
+        let (respond, response) = oneshot::channel();
+        command
+            .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    AppError::AccountWorkerResponseTimedOut
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
+            })?;
+        Ok(Some(account_worker_response(response).await?))
+    }
+
+    pub async fn diagnostic_group_mls_state(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<AppGroupMlsState>, AppError> {
+        let Some(command) = self.existing_worker_commands(account_ref).await? else {
+            return Ok(None);
+        };
+        let (respond, response) = oneshot::channel();
+        command
+            .try_send(AccountWorkerCommand::GroupMlsState {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    AppError::AccountWorkerResponseTimedOut
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
+            })?;
+        Ok(Some(account_worker_response(response).await?))
+    }
+
     pub async fn durably_owned_key_packages(
         &self,
         account_ref: &str,
@@ -2121,5 +2163,138 @@ mod tests {
         .await
         .unwrap();
         assert!(manager.workers.lock().await.is_empty(), "no reconciliation");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reads_reject_saturated_worker_queue() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+        let (commands, mut received) = mpsc::channel(1);
+        let (respond, _response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
+            .unwrap();
+        let (shutdown, stopped) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        runtime.accounts().workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                ready: true,
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
+                handle,
+                commands,
+                shutdown,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert!(matches!(
+                runtime
+                    .diagnostic_key_package_maintenance_status(&account.label)
+                    .await,
+                Err(AppError::AccountWorkerResponseTimedOut)
+            ));
+            assert!(matches!(
+                runtime
+                    .diagnostic_group_mls_state(&account.label, &GroupId::new([1; 16]))
+                    .await,
+                Err(AppError::AccountWorkerResponseTimedOut)
+            ));
+        })
+        .await
+        .expect("diagnostic enqueue must not wait for queue capacity");
+        assert_eq!(runtime.reconcile_invocation_count().await, 0);
+        assert!(received.try_recv().is_ok());
+        assert!(received.try_recv().is_err());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reads_do_not_start_or_reconcile_workers() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+        let group_id = GroupId::new([1; 16]);
+        assert!(
+            runtime
+                .diagnostic_key_package_maintenance_status(&account.label)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .diagnostic_group_mls_state(&account.label, &group_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(runtime.reconcile_invocation_count().await, 0);
+        assert!(runtime.accounts().workers.lock().await.is_empty());
+
+        let manager = runtime.accounts();
+        let (commands, mut received) = mpsc::channel(1);
+        let (shutdown, stopped) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            while let Some(command) = received.recv().await {
+                match command {
+                    AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => {
+                        respond.send(Ok(None)).unwrap();
+                    }
+                    AccountWorkerCommand::GroupMlsState { respond, .. } => {
+                        respond
+                            .send(Err(AppError::UnknownGroup("missing".into())))
+                            .unwrap();
+                    }
+                    _ => panic!("diagnostic path sent an unexpected command"),
+                }
+            }
+            let _ = stopped.await;
+        });
+        manager.workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                ready: true,
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
+                handle,
+                commands,
+                shutdown,
+            },
+        );
+        assert!(
+            runtime
+                .diagnostic_key_package_maintenance_status(&account.label)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            runtime
+                .diagnostic_group_mls_state(&account.label, &group_id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown local group")
+        );
+        assert_eq!(runtime.reconcile_invocation_count().await, 0);
+        runtime.shutdown().await;
     }
 }

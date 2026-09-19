@@ -39,6 +39,7 @@ from .agent_control import (
     _normalize_stream_capability,
 )
 from .ambient_context import AmbientContextStore
+from . import diagnostics as marmot_diagnostics
 from .inbound_spool import InboundSpool, InboundSpoolError, StaleClaim
 
 from gateway.config import Platform, PlatformConfig
@@ -753,24 +754,15 @@ async def sync_allowlist(
 
 
 def resolve_marmot_home(extra: Dict[str, Any], socket_path: str | Path) -> Path:
-    home = _first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME")
-    if home:
-        return Path(str(home)).expanduser()
-    return Path(socket_path).expanduser().parent.parent
+    return marmot_diagnostics.resolve_marmot_home(extra, socket_path)
 
 
 def resolve_inbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
-    configured = _first_config_value(extra, "inbound_media_dir", env="MARMOT_INBOUND_MEDIA_DIR")
-    if configured:
-        return Path(str(configured)).expanduser()
-    return resolve_marmot_home(extra, socket_path) / "dev" / "inbound-media"
+    return marmot_diagnostics.resolve_inbound_media_dir(extra, socket_path)
 
 
 def resolve_outbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
-    configured = _first_config_value(extra, "outbound_media_dir", env="MARMOT_OUTBOUND_MEDIA_DIR")
-    if configured:
-        return Path(str(configured)).expanduser()
-    return resolve_marmot_home(extra, socket_path) / "dev" / "outbound-media"
+    return marmot_diagnostics.resolve_outbound_media_dir(extra, socket_path)
 
 
 def resolve_inbound_spool_path(extra: Dict[str, Any], socket_path: str | Path) -> Path:
@@ -799,6 +791,12 @@ def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) 
 
 
 def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
+    """Keep the pre-doctor raw environment precedence for live reconciliation.
+
+    Doctor projection must match this function; do not delegate the running
+    adapter through diagnostic helpers that may strip or rewrite values.
+    """
+
     for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
         if key in extra:
             return _split_config_list(extra[key])
@@ -1458,6 +1456,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Set true once the current subscription yields/acks (healthy); used by
         # the reconnect-backoff loop to reset its attempt counter.
         self._inbound_established = False
+        self._observations = marmot_diagnostics.PluginObservations()
+        self._diagnostic_server: Optional[marmot_diagnostics.DiagnosticSocketServer] = None
+        self._load_observation_config(extra)
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -1568,6 +1569,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._inbound_spool_admission_enabled = False
+        self._observations.mark("starting")
+        await self._ensure_diagnostics_endpoint()
         try:
             self._enable_store_generation()
             await self._ensure_account_id()
@@ -1603,6 +1606,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             set_fatal = getattr(self, "_set_fatal_error", None)
             if callable(set_fatal):
                 set_fatal("marmot_connect_failed", str(exc), retryable=True)
+            self._observations.mark("failed", reason=_observation_reason(exc))
             await self._cleanup_failed_connect()
             return False
 
@@ -1639,9 +1643,90 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._store_generation_enabled = True
         self._ambient_context.enable_generation()
 
+    def _loaded_sender_ids(self, extra: Dict[str, Any]) -> list[str]:
+        return marmot_diagnostics.loaded_sender_ids(extra)
+
+    def _load_observation_config(self, extra: Dict[str, Any]) -> None:
+        senders = self._loaded_sender_ids(extra)
+        allow_all = marmot_diagnostics.parse_config_bool(
+            marmot_diagnostics.first_config_value(extra, "allow_all_users", env="MARMOT_ALLOW_ALL_USERS"),
+            default=False,
+        )
+        home_route = self._configured_home_route(extra)
+        fields = marmot_diagnostics.nonsecret_config_fields(
+            senders=[str(item) for item in senders],
+            allow_all=allow_all,
+            welcomers=[str(item) for item in (self.welcomer_allowlist or [])],
+            account_id_hex=self.account_id_hex,
+            socket_path=self.socket_path,
+            home_route=home_route,
+            inbound_media_dir=str(self._inbound_media_dir),
+            outbound_media_dir=str(self._outbound_media_dir),
+        )
+        self._observations.loaded_fingerprint = marmot_diagnostics.config_fingerprint(fields)
+        self._observations.sender_count = len(fields["senders"])
+        self._observations.allow_all = allow_all
+        self._observations.welcomer_count = len(self.welcomer_allowlist or [])
+        self._observations.account_selected = bool(self.account_id_hex)
+        self._observations.home_configured = bool(home_route)
+        self._observations.loaded_home_digest = marmot_diagnostics.identity_digest(home_route)
+        self._observations.plugin_version = marmot_diagnostics.plugin_version_from_manifest(
+            Path(__file__).resolve().parent
+        )
+
+    def _configured_home_route(self, extra: Dict[str, Any]) -> Optional[str]:
+        home_channel = getattr(self.config, "home_channel", None)
+        platform = None
+        chat_id = None
+        if home_channel is not None:
+            platform = str(getattr(home_channel, "platform", "") or "").strip().lower() or None
+            chat_id = getattr(home_channel, "chat_id", None)
+        route, error = marmot_diagnostics.resolve_home_route(
+            extra,
+            home_channel=chat_id if chat_id not in (None, "") else extra.get("home_channel"),
+            home_platform=platform,
+        )
+        del error
+        return route
+
+    def _hermes_home(self) -> Path:
+        return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+
+    async def _ensure_diagnostics_endpoint(self) -> None:
+        if self._diagnostic_server is not None:
+            return
+        server = marmot_diagnostics.DiagnosticSocketServer(
+            marmot_diagnostics.diagnostics_socket_path(self._hermes_home()),
+            self._observations,
+        )
+        try:
+            started = await server.start()
+        except Exception:
+            logger.debug("Marmot diagnostics endpoint unavailable", exc_info=True)
+            return
+        if started:
+            self._diagnostic_server = server
+
+    async def _stop_diagnostics_endpoint(self) -> None:
+        server, self._diagnostic_server = self._diagnostic_server, None
+        if server is None:
+            return
+        try:
+            await server.stop()
+        except Exception:
+            logger.debug("Marmot diagnostics endpoint cleanup failed", exc_info=True)
+
+    def _on_inbound_ack(self) -> None:
+        # Diagnostic readiness only. The retry flag flips on the first event so
+        # ACK-then-EOF connections keep geometric backoff and the first-event
+        # callback still runs.
+        self._observations.mark("established")
+
     async def _sync_welcomer_allowlist(self) -> None:
         if not self.welcomer_allowlist:
+            self._observations.reconciliation = "not_configured"
             return
+        self._observations.reconciliation = "pending"
         try:
             account_id = await self._ensure_account_id()
             result = await sync_allowlist(self.client, account_id, self.welcomer_allowlist)
@@ -1650,7 +1735,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 len(result["added"]),
                 len(result["removed"]),
             )
+            self._observations.reconciliation = "succeeded"
         except Exception:
+            self._observations.reconciliation = "failed"
             logger.debug("Marmot welcomer allowlist sync failed", exc_info=True)
 
     async def _stop_inbound_tasks(self) -> None:
@@ -1704,6 +1791,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         executor, self._inbound_spool_executor = self._inbound_spool_executor, None
         if executor is not None:
             await asyncio.to_thread(executor.shutdown, True)
+        self._observations.mark("stopped")
+        await self._stop_diagnostics_endpoint()
         self._mark_disconnected()
 
     async def _cancel_debounce_tasks(self) -> None:
@@ -2877,8 +2966,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         attempt = 0
         while True:
             try:
-                await self._consume_inbound_once(on_established=lambda: None)
+                self._observations.mark("awaiting_ack")
+                await self._consume_inbound_once(on_established=self._on_inbound_ack)
             except asyncio.CancelledError:
+                self._observations.mark("stopped")
                 raise
             except _ResyncRequired as exc:
                 # The connector could not auto-replay the messages dropped on broadcast lag and
@@ -2886,8 +2977,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # re-runs the connector's catch_up_accounts() and a fresh storage-backed replay,
                 # which recovers the missed inbound messages we would otherwise never see. A
                 # resync is just another reconnect reason and uses the same backoff.
+                self._observations.mark("reconnecting", reason="resync_required")
                 logger.warning("Marmot inbound resync requested, reconnecting: %s", exc)
             except Exception as exc:
+                self._observations.mark("reconnecting", reason=_observation_reason(exc))
                 logger.warning("Marmot inbound subscription failed, retrying: %s", exc)
             else:
                 # A clean return means the subscription was dropped (the connector
@@ -2898,6 +2991,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # MarmotInboundBridge.run(), which backs off after stream completion
                 # too). The _inbound_established check below keeps an established-then-
                 # idle subscription reconnecting promptly.
+                self._observations.mark("reconnecting", reason="clean_eof")
                 logger.debug("Marmot inbound subscription closed cleanly, reconnecting")
             # Reset the attempt counter whenever the subscription was healthy
             # (it established and yielded/acked at least once) so the next failure
@@ -2928,6 +3022,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             async for event in self.client.inbound_events(
                 account_id_hex=self.account_id_hex,
                 group_id_hex=self.group_id_hex,
+                on_ack=self._on_inbound_ack,
             ):
                 # A yielded event means the subscription was acked and is healthy;
                 # mark it established so the reconnect loop resets its backoff
@@ -3809,14 +3904,20 @@ def check_requirements() -> bool:
     return True
 
 
+def _observation_reason(exc: BaseException) -> str:
+    if isinstance(exc, AgentControlError):
+        if exc.code in {"timeout", "socket_closed", "socket_io", "unauthorized"}:
+            return exc.code
+        return "transport"
+    return "transport"
+
+
 def media_capability_status() -> Dict[str, Any]:
     """Return passive, truthful media support without probing or mutation."""
 
-    return {
-        "inbound": sorted(MarmotPlatformAdapter.INBOUND_MEDIA_KINDS),
-        "outbound": sorted(MarmotPlatformAdapter.OUTBOUND_MEDIA_KINDS),
-        "host_outbound_dispatch": _HermesMediaKind is not None,
-    }
+    return marmot_diagnostics.media_capability_status(
+        host_outbound_dispatch=_HermesMediaKind is not None,
+    )
 
 
 def _plugin_settings(ctx) -> Dict[str, Any]:
@@ -3969,53 +4070,13 @@ async def probe_readiness(
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
-    socket = os.getenv("MARMOT_AGENT_SOCKET", "").strip()
-    home = os.getenv("MARMOT_HOME", "").strip()
-    account = os.getenv("MARMOT_ACCOUNT_ID_HEX", "").strip()
-    group = os.getenv("MARMOT_GROUP_ID_HEX", "").strip()
-    candidates = os.getenv("MARMOT_QUIC_CANDIDATES", "").strip() or os.getenv("MARMOT_QUIC_CANDIDATE", "").strip()
-    if not (socket or home):
-        return None
-
-    seed: Dict[str, Any] = {}
-    if socket:
-        seed["socket_path"] = socket
-    if home:
-        seed["home"] = home
-    if account:
-        seed["account_id_hex"] = account
-    if group:
-        seed["group_id_hex"] = group
-    if candidates:
-        seed["quic_candidates"] = _split_config_list(candidates)
-    auth_token_file = os.getenv("MARMOT_AGENT_AUTH_TOKEN_FILE", "").strip()
-    if auth_token_file:
-        seed["auth_token_file"] = auth_token_file
-
-    home_channel = os.getenv("MARMOT_HOME_CHANNEL", "").strip()
-    if home_channel:
-        seed["home_channel"] = {
-            "chat_id": home_channel,
-            "name": os.getenv("MARMOT_HOME_CHANNEL_NAME", "Marmot"),
-        }
-    return seed
+    return marmot_diagnostics.env_enablement_seed()
 
 
 def _enablement_seed(plugin_settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Layer namespaced plugin settings behind higher-priority environment values."""
 
-    seed = dict(_env_enablement() or {})
-    for key in ("socket_path", "home", "account_id_hex", "group_id_hex"):
-        value = plugin_settings.get(key)
-        if value not in (None, ""):
-            seed.setdefault(key, value)
-    home_channel = plugin_settings.get("home_channel")
-    if home_channel not in (None, ""):
-        seed.setdefault(
-            "home_channel",
-            {"chat_id": str(home_channel), "name": "Marmot"},
-        )
-    return seed or None
+    return marmot_diagnostics.env_enablement_seed(plugin_settings)
 
 
 async def _standalone_send(
@@ -4095,6 +4156,16 @@ async def _marmot_status_tool(
             status = await probe_readiness(config)
         else:
             status = await probe_readiness(adapter.config, client=adapter.client)
+            observations = getattr(adapter, "_observations", None)
+            if observations is not None:
+                live = observations.snapshot()
+                status["subscription"] = live.get("lifecycle")
+                status["reconciliation"] = live.get("reconciliation")
+                config_matches = live.get("config_matches")
+                if config_matches is None:
+                    status["restart_required"] = None
+                else:
+                    status["restart_required"] = config_matches is False
     except Exception as exc:
         logger.debug("Marmot readiness probe failed", exc_info=True)
         return json.dumps(

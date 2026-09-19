@@ -7,6 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Documentation
+
+- Clarify that retry safety for invalid required out-pointers does not cover all errors:
+  a mutation can have recorded durable intent or external effects before another failure.
+  Clients using blanket retry-on-error should inspect authoritative state and the method's
+  retry contract. This corrects earlier wording, not runtime behavior.
+- Clarify the existing exact header/library pairing requirement: “versioned C ABI” does
+  not promise cross-release record-layout compatibility. No declaration or ABI change is
+  introduced by this documentation correction. See the
+  [0.10.2 integration supplement](../../docs/integration/0.10.2.md#c-compatibility-and-retry-guidance-corrections).
+
 ### Fixed
 
 - macOS C bundle and optimized smoke builds disable debug stripping, avoiding

@@ -9,7 +9,10 @@
 //! large-session regression harness asserts on and that operators can diff
 //! between scrapes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use agent_control::{AgentControlDiagnosticReplay, AgentControlReplayState};
 
 /// Which background reconciliation source a scheduled pass belongs to. Used as
 /// the `source` field on per-pass tracing events so operators can attribute
@@ -63,6 +66,14 @@ pub(crate) struct ReconcileTelemetry {
     pub(crate) invite_policy_applied: AtomicU64,
     /// Policy apply attempts that failed and are retry-pending.
     pub(crate) invite_policy_apply_failures: AtomicU64,
+    /// Current catch-up pass is in flight.
+    pub(crate) catch_up_in_flight: AtomicBool,
+    /// Last completed catch-up pass failed. Cleared by a later success.
+    pub(crate) catch_up_last_failed: AtomicBool,
+    /// Bounded last catch-up reason (`catch_up_failed` or `cancelled`).
+    pub(crate) catch_up_last_reason: Mutex<Option<&'static str>>,
+    pub(crate) resync_required: AtomicU64,
+    pub(crate) catch_up_cancelled: AtomicU64,
 }
 
 /// Point-in-time copy of [`ReconcileTelemetry`], for harness assertions.
@@ -93,6 +104,87 @@ impl ReconcileTelemetry {
         counter.fetch_add(value as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn begin_catch_up(&self) {
+        self.catch_up_in_flight.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish_catch_up_ok(&self) {
+        self.catch_up_in_flight.store(false, Ordering::Relaxed);
+        self.catch_up_last_failed.store(false, Ordering::Relaxed);
+        if let Ok(mut reason) = self.catch_up_last_reason.lock() {
+            *reason = None;
+        }
+    }
+
+    pub(crate) fn finish_catch_up_err(&self, reason: &'static str) {
+        self.catch_up_in_flight.store(false, Ordering::Relaxed);
+        self.catch_up_last_failed.store(true, Ordering::Relaxed);
+        if let Ok(mut last_reason) = self.catch_up_last_reason.lock() {
+            *last_reason = Some(reason);
+        }
+    }
+}
+
+/// Marks catch-up as running and finishes it even if the caller future is dropped.
+pub(crate) struct CatchUpInFlightGuard<'a> {
+    telemetry: &'a ReconcileTelemetry,
+    finished: bool,
+}
+
+impl<'a> CatchUpInFlightGuard<'a> {
+    pub(crate) fn begin(telemetry: &'a ReconcileTelemetry) -> Self {
+        telemetry.begin_catch_up();
+        Self {
+            telemetry,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish_ok(mut self) {
+        self.telemetry.finish_catch_up_ok();
+        self.finished = true;
+    }
+
+    pub(crate) fn finish_err(mut self, reason: &'static str) {
+        self.telemetry.finish_catch_up_err(reason);
+        self.finished = true;
+    }
+}
+
+impl Drop for CatchUpInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            ReconcileTelemetry::bump(&self.telemetry.catch_up_cancelled);
+            self.telemetry.finish_catch_up_err("cancelled");
+        }
+    }
+}
+
+impl ReconcileTelemetry {
+    pub(crate) fn diagnostic_replay(&self) -> AgentControlDiagnosticReplay {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let state = if self.catch_up_in_flight.load(Ordering::Relaxed) {
+            AgentControlReplayState::Running
+        } else if self.catch_up_last_failed.load(Ordering::Relaxed) {
+            AgentControlReplayState::Failed
+        } else {
+            AgentControlReplayState::Idle
+        };
+        let last_reason = self
+            .catch_up_last_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.map(str::to_owned));
+        AgentControlDiagnosticReplay {
+            state,
+            last_reason,
+            success_count: load(&self.catch_up_passes_completed),
+            failure_count: load(&self.catch_up_passes_failed),
+            resync_count: load(&self.resync_required),
+            cancelled_count: load(&self.catch_up_cancelled),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ReconcileTelemetrySnapshot {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -111,5 +203,79 @@ impl ReconcileTelemetry {
             invite_policy_applied: load(&self.invite_policy_applied),
             invite_policy_apply_failures: load(&self.invite_policy_apply_failures),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentControlReplayState, CatchUpInFlightGuard, ReconcileTelemetry};
+
+    #[test]
+    fn diagnostic_replay_recovers_from_failure() {
+        let telemetry = ReconcileTelemetry::default();
+        telemetry.begin_catch_up();
+        assert_eq!(
+            telemetry.diagnostic_replay().state,
+            AgentControlReplayState::Running
+        );
+        telemetry.finish_catch_up_err("catch_up_failed");
+        let failed = telemetry.diagnostic_replay();
+        assert_eq!(failed.state, AgentControlReplayState::Failed);
+        assert_eq!(failed.last_reason.as_deref(), Some("catch_up_failed"));
+        telemetry.begin_catch_up();
+        telemetry.finish_catch_up_ok();
+        let idle = telemetry.diagnostic_replay();
+        assert_eq!(idle.state, AgentControlReplayState::Idle);
+        assert!(idle.last_reason.is_none());
+    }
+
+    #[test]
+    fn dropping_unfinished_guard_marks_catch_up_cancelled() {
+        let telemetry = ReconcileTelemetry::default();
+        {
+            let _guard = CatchUpInFlightGuard::begin(&telemetry);
+            assert_eq!(
+                telemetry.diagnostic_replay().state,
+                AgentControlReplayState::Running
+            );
+        }
+        let replay = telemetry.diagnostic_replay();
+        assert_eq!(replay.state, AgentControlReplayState::Failed);
+        assert_eq!(replay.last_reason.as_deref(), Some("cancelled"));
+        assert_eq!(replay.cancelled_count, 1);
+        assert!(
+            !telemetry
+                .catch_up_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_catch_up_future_clears_in_flight() {
+        let telemetry = std::sync::Arc::new(ReconcileTelemetry::default());
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task_telemetry = telemetry.clone();
+        let task_started = started.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = CatchUpInFlightGuard::begin(&task_telemetry);
+            task_started.notify_one();
+            std::future::pending::<()>().await
+        });
+        started.notified().await;
+        assert_eq!(
+            telemetry.diagnostic_replay().state,
+            AgentControlReplayState::Running
+        );
+        handle.abort();
+        let _ = handle.await;
+        let replay = telemetry.diagnostic_replay();
+        assert_eq!(replay.state, AgentControlReplayState::Failed);
+        assert_eq!(replay.last_reason.as_deref(), Some("cancelled"));
+        assert_eq!(replay.cancelled_count, 1);
+        assert!(
+            !telemetry
+                .catch_up_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }

@@ -1,10 +1,10 @@
 //! White-box tests for the connector exercising private/`pub(crate)` internals across modules.
 
 use agent_control::{
-    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
-    AgentControlInvitePolicy, AgentControlProfileLookupStatus, AgentControlRequest,
-    AgentControlResponse, AgentControlSendMaintenanceDisposition, decode_frame, encode_frame,
-    read_envelope, write_frame,
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccountSelection, AgentControlEnvelope,
+    AgentControlEvent, AgentControlInvitePolicy, AgentControlProfileLookupStatus,
+    AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
+    decode_frame, encode_frame, read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -1346,6 +1346,116 @@ async fn connector_socket_serves_account_list() {
     assert!(accounts[0].local_signing);
 
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn diagnostic_status_reports_selection_and_omits_identifiers() {
+    let empty_dir = tempfile::tempdir().unwrap();
+    let empty = AgentConnector::open(test_config(
+        empty_dir.path(),
+        empty_dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let AgentControlResponse::DiagnosticStatus { report } =
+        empty.diagnostic_status_response(None, None).await.unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(report.selection, AgentControlAccountSelection::None);
+    assert_eq!(report.account_count, 0);
+    assert_eq!(report.local_signing_account_count, 0);
+    assert_eq!(
+        report.key_package.availability,
+        agent_control::AgentControlKeyPackageAvailability::Unavailable
+    );
+    assert_eq!(
+        report.replay.state,
+        agent_control::AgentControlReplayState::Idle
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let first = home.create_account("agent-a").unwrap();
+    let second = home.create_account("agent-b").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec!["wss://relay.example".to_owned()],
+        true,
+        true,
+    ))
+    .unwrap();
+    connector
+        .allowlists
+        .add(&first.account_id_hex, &"cc".repeat(32))
+        .unwrap();
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(None, None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(report.selection, AgentControlAccountSelection::Ambiguous);
+    assert_eq!(report.local_signing_account_count, 2);
+    assert!(report.allow_any);
+    assert_eq!(report.relays.configured, 1);
+    assert_eq!(report.welcomer_count, 0);
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&first.account_id_hex), None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(report.selection, AgentControlAccountSelection::Selected);
+    assert_eq!(report.welcomer_count, 1);
+    assert_eq!(
+        report.key_package.availability,
+        agent_control::AgentControlKeyPackageAvailability::Unavailable
+    );
+    assert!(!report.home.requested);
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&"dd".repeat(32)), None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(
+        report.selection,
+        AgentControlAccountSelection::ExplicitUnavailable
+    );
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&second.account_id_hex), Some(&"22".repeat(16)))
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert!(report.home.requested);
+    assert!(!report.home.resolved);
+    let encoded =
+        serde_json::to_string(&AgentControlResponse::DiagnosticStatus { report }).unwrap();
+    for forbidden in [
+        &first.account_id_hex,
+        &second.account_id_hex,
+        "wss://relay.example",
+        "agent-a",
+        "agent-b",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "diagnostic report leaked {forbidden}"
+        );
+    }
 }
 
 #[tokio::test]

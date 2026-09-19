@@ -10,7 +10,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Optional
 
 PROTOCOL = "marmot.agent-control.v2"
 MAX_FRAME_BYTES = 1024 * 1024
@@ -29,6 +29,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
     "group_info": frozenset({"group_info"}),
+    "diagnostic_status": frozenset({"diagnostic_status"}),
     "send_media": frozenset({"final_sent"}),
     "download_media": frozenset({"media_downloaded"}),
     "allowlist_list": frozenset({"allowlist"}),
@@ -594,6 +595,7 @@ class MarmotAgentControlClient:
         *,
         account_id_hex: Optional[str] = None,
         group_id_hex: Optional[str] = None,
+        on_ack: Optional[Callable[[], Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         request_id = uuid.uuid4().hex
         writer: Optional[asyncio.StreamWriter] = None
@@ -628,6 +630,10 @@ class MarmotAgentControlClient:
             self._raise_if_error(ack)
             if ack.get("type") != "ack":
                 raise AgentControlError(f"expected subscribe ack, got {ack.get('type')!r}")
+            if on_ack is not None:
+                acknowledged = on_ack()
+                if isinstance(acknowledged, Awaitable):
+                    await acknowledged
 
             while True:
                 envelope = await self._read_envelope(reader, allow_eof=True, timeout=None)

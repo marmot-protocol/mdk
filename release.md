@@ -106,6 +106,64 @@ Each release artifact should include a manifest recording the source commit, wor
 version, `Cargo.lock` hash when relevant, toolchain version, and package contents. Add explicit protocol or ABI fields
 to manifests when downstream compatibility depends on more than the workspace version.
 
+## Release documentation
+
+Starting with **0.10.2**, each release has two companion documents:
+
+- `docs/release/<version>.md`: concise highlights, essential compatibility warnings
+  and artifact pointers. Keep it readable as release notes; link to the integration guide.
+- `docs/integration/<version>.md`: a detailed, source-verified upgrade guide from the
+  preceding supported release. Use the [template](docs/integration/TEMPLATE.md) and
+  update the [integration index](docs/integration/README.md).
+
+The binding [README](crates/marmot-uniffi/README.md) is the current conceptual integration
+reference; its [method inventory](crates/marmot-uniffi/API-REFERENCE.md) and the
+[C symbol inventory](crates/marmot-c/API-REFERENCE.md) must match the release source.
+These current references and versioned guides serve different purposes: avoid copying
+an entire current reference into every release note.
+
+Before the release commit:
+
+1. Compare the prior source/binding tag with the intended source. Inventory exported
+   constructors/methods/callbacks, changed records/enums/errors, defaults, migrations,
+   ownership/cancellation behavior, feature flags and distribution requirements.
+   Audit runtime behavior as well as signature changes; an unchanged method can now
+   start network work or acquire storage by default.
+2. Explain required upgrade steps, default behavior changes, optional feature adoption,
+   and fixes received automatically as distinct categories. State what already existed,
+   what remains future work, and which older methods remain supported. Never imply
+   formal deprecation/removal simply because a newer screen API is preferred.
+3. For each new/changed client contract, include purpose, call sequence, inputs/outputs,
+   state/error handling, local versus network work, threading, cancellation/lifetime,
+   bounds/paging, privacy/localization and storage implications where relevant. Include
+   Swift/Kotlin examples and C/raw-FFI ownership/layout differences. Explain Rust-host
+   implications for runtime changes. A patch with no client action should say so with
+   the comparison evidence rather than omit its guide.
+4. Specify concrete client acceptance checks: compile actual matched artifacts, exercise
+   upgrade/reopen, offline/cold start, foreground/background, cancellation, deletion/expiry,
+   and representative device/memory workloads affected by the change. Report evidence
+   by stage: source, host smoke, packaged artifact, consuming app, real device. Do not
+   call a release adopted merely because binding generation passed.
+5. Link notes → guide → notes; update the index and relevant binding README/AGENTS when
+   the integration contract or preferred API changes. Link the previous guide for skipped
+   upgrades. Keep known limitations and unresolved release blockers explicit.
+6. Run `just binding-docs-gate`, verify local Markdown links and source signatures,
+   review examples against generated sources, then run the normal release preflight.
+   This gate checks exported names, signatures and source links; it cannot establish semantic prose,
+   DTO compatibility or platform adoption.
+
+Publish pointers to **both documents** in the MDK, MarmotKit and C GitHub Release bodies
+(and WN Agent when applicable). Existing auto-generated notes/workflow bodies do not
+replace this editorial step: preserve their asset/checksum guidance when adding links.
+Before publication, verify links against their actual target revision. Normally use the
+immutable `v<version>` source tag, since the documents are in the release commit.
+
+The first 0.10.2 integration guide is an explicit post-tag documentation supplement.
+For it, use the merged **documentation commit SHA** in the guide URL; `v0.10.2` does
+not contain the new file. Do not repoint a tag or replace immutable artifacts to add a
+guide. A later guide correction likewise records its scope and uses a documented
+supplement link; do not silently rewrite the source/binary provenance.
+
 ## Preflight For Any Release
 
 Start from a clean checkout at the commit you intend to release:
@@ -115,12 +173,20 @@ git status --short --branch
 git fetch origin
 ```
 
-Confirm the version and release notes:
+Confirm the version, release notes, companion integration guide and complete method inventory:
 
 ```sh
-rg -n '^version = ' Cargo.toml
+release_version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
 sed -n '1,120p' crates/cli/CHANGELOG.md
+python3 scripts/check_binding_docs.py --release-version "$release_version"
+just binding-docs-gate
 ```
+
+The versioned check requires both `docs/release/$release_version.md` and
+`docs/integration/$release_version.md` from 0.10.2 onward and verifies their reciprocal
+links. It also rejects a supplied version that differs from the workspace. The full-cohort
+release coordinator runs this check before any tag/release mutation, including dry runs.
+A successful check verifies existence/linkage, not the accuracy or completeness of prose.
 
 Run the normal workspace checks:
 
@@ -217,7 +283,7 @@ Use this for a versioned MDK source/library release.
 
 1. Update the workspace version in `Cargo.toml`.
 2. Move relevant `crates/cli/CHANGELOG.md` entries out of `Unreleased`.
-3. Update docs that describe changed public behavior.
+3. Update the current binding reference and both versioned documents using [Release documentation](#release-documentation).
 4. Run the preflight checks above.
 5. Create an annotated tag:
 
@@ -227,7 +293,7 @@ Use this for a versioned MDK source/library release.
    ```
 
 6. Create or update the GitHub Release for `v0.9.0` on the MDK repo releases page.
-7. Include release notes that name the source commit, major user-visible changes, and any migration notes.
+7. Include release notes naming the source commit, major user-visible changes and migration notes, plus verified links to the concise notes and detailed integration guide. Preserve generated asset/checksum instructions.
 
 Until a dedicated whole-workspace release workflow exists, the whole-workspace GitHub Release is a source release. The
 GitHub-generated source archives are the downloadable artifacts.

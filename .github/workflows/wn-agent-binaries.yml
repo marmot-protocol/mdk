@@ -291,6 +291,8 @@ jobs:
           cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
           cp integrations/hermes/marmot/agent_control.py "$bundle_dir/"
           cp integrations/hermes/marmot/ambient_context.py "$bundle_dir/"
+          cp integrations/hermes/marmot/diagnostics.py "$bundle_dir/"
+          cp integrations/hermes/marmot/doctor.py "$bundle_dir/"
           cp integrations/hermes/marmot/inbound_spool.py "$bundle_dir/"
           cp integrations/hermes/marmot/README.md "$bundle_dir/"
           cp scripts/hermes_marmot_configure_gateway.py "$bundle_dir/configure_gateway.py"
@@ -308,6 +310,8 @@ jobs:
               "adapter.py",
               "agent_control.py",
               "ambient_context.py",
+              "diagnostics.py",
+              "doctor.py",
               "inbound_spool.py",
               "configure_gateway.py",
               "README.md",

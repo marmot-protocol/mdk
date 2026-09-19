@@ -207,7 +207,7 @@ present it on every later stream operation. They also reuse one stable envelope 
 
 The release installers are published with the `wn-agent-v*` release family:
 
-- `scripts/install-hermes-marmot.sh`
+- `scripts/install-hermes-marmot.sh` (passive `--doctor [--json]` report; not delivery proof)
 - `scripts/install-openclaw-marmot.sh`
 - `scripts/install-claude-marmot.sh`
 - `scripts/install-codex-marmot.sh`

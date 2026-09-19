@@ -93,6 +93,11 @@ The canonical protocol specification lives in
 - Treat workspace and conformance-fixture version bumps as manual release operations. Never change the root workspace
   version, workspace package versions in `Cargo.lock`, or vector `conformance_version` values during feature, fix,
   binding, or review-feedback work unless the user explicitly requests that version bump.
+- Keep binding READMEs and complete method references current with API changes; run `just binding-docs-gate`.
+  Starting with 0.10.2, every release requires concise `docs/release/<version>.md` notes and a detailed
+  `docs/integration/<version>.md` companion, indexed and linked both ways. Follow `release.md#release-documentation`:
+  distinguish required changes, new defaults, optional adoption and automatic fixes; preserve supported lower-level
+  APIs and exact artifact provenance. Post-tag documentation uses a supplement commit, never a moved release tag.
 - Title GitHub Releases with the version first so release lists group by cohort: whole-workspace `v<version> - MDK`,
   WN Agent `v<version> - wn-agent`, and MarmotKit `v<version> - MarmotKit`.
 - Prefer `just release-all <version>` for a full MDK/WN Agent/MarmotKit cohort release, or

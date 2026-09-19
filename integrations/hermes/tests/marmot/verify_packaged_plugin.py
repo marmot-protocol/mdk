@@ -92,8 +92,15 @@ def verify(archive: Path) -> None:
             raise AssertionError(
                 f"archive contents differ from its manifest: {sorted(files)} vs {sorted(declared)}"
             )
-        if not {"manifest.json", "adapter.py", "ambient_context.py"}.issubset(files):
-            raise AssertionError("archive is missing required adapter/ambient entry points")
+        required = {
+            "manifest.json",
+            "adapter.py",
+            "ambient_context.py",
+            "diagnostics.py",
+            "doctor.py",
+        }
+        if not required.issubset(files):
+            raise AssertionError("archive is missing required adapter/doctor entry points")
 
         with tempfile.TemporaryDirectory(prefix="hermes-marmot-artifact-") as directory:
             package_dir = Path(directory) / "marmot"
@@ -103,9 +110,16 @@ def verify(archive: Path) -> None:
                 if source is None:
                     raise AssertionError(f"cannot read archive member: {member.name}")
                 (package_dir / name).write_bytes(source.read())
-            _install_fake_hermes_modules()
             sys.path.insert(0, directory)
             try:
+                doctor = importlib.import_module("marmot.doctor")
+                if "marmot.adapter" in sys.modules:
+                    raise AssertionError("packaged doctor imported the adapter")
+                if "gateway" in sys.modules:
+                    raise AssertionError("packaged doctor imported Hermes gateway modules")
+                if not hasattr(doctor, "collect") or not hasattr(doctor, "main"):
+                    raise AssertionError("packaged doctor is missing collect/main")
+                _install_fake_hermes_modules()
                 module = importlib.import_module("marmot.adapter")
             finally:
                 sys.path.remove(directory)

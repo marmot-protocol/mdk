@@ -181,6 +181,7 @@ impl AgentConnector {
             | AgentControlRequest::TimelineMessageGet { .. }
             | AgentControlRequest::TimelineList { .. }
             | AgentControlRequest::AccountProfileLookup { .. }
+            | AgentControlRequest::DiagnosticStatus { .. }
             | AgentControlRequest::GroupInfo { .. }
             | AgentControlRequest::MaintenanceStatus { .. }
             | AgentControlRequest::KeyPackageMaintenanceStatus { .. }
@@ -269,6 +270,16 @@ impl AgentConnector {
                 account_id_hex,
                 policy,
             } => self.invite_policy_set_response(&account_id_hex, policy),
+            AgentControlRequest::DiagnosticStatus {
+                account_id_hex,
+                home_group_id_hex,
+            } => {
+                self.diagnostic_status_response(
+                    account_id_hex.as_deref(),
+                    home_group_id_hex.as_deref(),
+                )
+                .await
+            }
             AgentControlRequest::GroupInfo {
                 account_id_hex,
                 group_id_hex,

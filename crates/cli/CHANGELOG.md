@@ -25,6 +25,25 @@ versioning through the workspace version in the root `Cargo.toml`.
   acceptance goes through that production delivery callback rather than a
   fabricated outbound send.
 
+- Hermes Marmot installation doctor: `install-hermes-marmot.sh --doctor [--json]` reports provenance-labelled
+  installation, service, connector, and plugin observations without installing, repairing, or probing delivery.
+  `wn-agent` adds an identifier-free `diagnostic_status` readback, and the plugin exposes ACK/lifecycle state on
+  a private diagnostics socket.
+
+### Fixed
+
+- Hermes doctor distinguishes failed, stopped, and automatically restarting systemd units, keeps socket-check ownership stable,
+  and removes the always-ready media check and inline-token command-line option. Diagnostic replay and
+  KeyPackage states are typed, and replay no longer exposes overlapping failure/error counters.
+
+- Hermes doctor fails closed on ambiguous dotenv bindings, sanitizes startup failures and version evidence, bounds diagnostic queue admission, and preserves loaded sender values in restart fingerprints, supports `--doctor --no-service`, and reports privacy-safe directory modes. ([#1880](https://github.com/marmot-protocol/mdk/pull/1880))
+
+- Hermes Marmot doctor now exits 0 on a healthy report, reads the configured home channel instead of the inbound filter, uses the same effective socket/account/auth and config fingerprint as the running plugin, treats an absent systemd unit as unknown, and keeps ACK-only diagnostic readiness from changing reconnect backoff.
+- Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
+- Hermes Marmot doctor now applies the same Hermes enablement-seed and user-dotenv override order as the running plugin, so a process or installed `.env` home/socket/account/token wins over conflicting YAML values.
+- Hermes Marmot doctor now preserves explicit empty dotenv assignments, expands supported dotenv variable references, and inspects the adapter's configured media directories instead of installer defaults. Unsupported dotenv interpolations are reported unknown and do not send inherited or YAML credentials.
+- Hermes Marmot doctor dotenv interpolation now matches python-dotenv 1.2.2: bare `$VAR` stays literal, `${VAR}` expands in every quoting form, and references resolve from preceding file assignments then the process environment. Live welcomer resolution keeps the pre-doctor raw environment precedence so a whitespace-only primary allowlist does not fall back to the legacy alias or change gateway reconciliation.
+
 ## [0.10.2] - 2026-09-19
 
 Update generated bindings, native libraries, and C headers together. Account storage advances through migration 86; back up before upgrade because downgrade is unsupported. See [0.10.2 release notes](../../docs/release/0.10.2.md).
