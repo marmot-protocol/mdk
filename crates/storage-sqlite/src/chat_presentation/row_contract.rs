@@ -113,6 +113,9 @@ pub(crate) fn selected_preview_tx(
             Err(_) => return Err(StorageError::Serialization("invalid draft UTF-8".into())),
         };
         let mut text = valid.to_owned();
+        // Sibling category policy: marmot_app::media::classify_chat_list_attachments.
+        // These are local composer attachments, not received imeta with rejection
+        // outcomes. Keep the categories aligned while aggregating before allocation.
         // At most four aggregate rows. No attachment plaintext, filename, URL,
         // waveform or thumbhash enters the list snapshot. The PK scopes work to
         // this returned group's draft, independently of other account drafts.
