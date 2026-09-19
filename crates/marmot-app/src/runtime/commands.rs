@@ -1162,6 +1162,50 @@ impl AccountManager {
         long_account_worker_response(response).await
     }
 
+    pub async fn group_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupAppComponent {
+                group_id: group_id.clone(),
+                component_id,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn update_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpdateAppComponent {
+                group_id: group_id.clone(),
+                component_id,
+                data,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_committed(command, "update_app_component")
+            .await;
+        self.schedule_audit_log_tracker_update("update_app_component");
+        Ok(summary)
+    }
+
     pub async fn update_message_retention(
         &self,
         account_ref: &str,
