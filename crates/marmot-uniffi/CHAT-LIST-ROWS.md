@@ -1,6 +1,6 @@
 # Complete chat-list row previews and actions
 
-This is the **unreleased C3 follow-up to MDK 0.10.2**. It adds fields to
+This is the **MDK 0.10.3 C3 follow-up to MDK 0.10.2**. It adds fields to
 `PresentedChatRowFfi` (Swift/Kotlin) and `MarmotPresentedChatRow` (C). Ship matching
 generated source, native library and C header together; existing record layouts
 are not binary-compatible. No database migration or new draft store is required.

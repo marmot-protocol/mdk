@@ -51,7 +51,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.2"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.3"
 install_verified "$base_url/install-claude-marmot.sh" \
   "$base_url/install-claude-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
