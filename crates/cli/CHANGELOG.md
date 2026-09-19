@@ -24,6 +24,9 @@ Update generated bindings, native libraries, and C headers together for the chan
 
 ### Fixed
 
+- C client teardown on ordinary host threads drains runtime workers before returning,
+  preventing a SQLCipher process-exit race after publisher shutdown.
+
 - Public profile searches continue when relays request optional authentication.
 - Android identity salt publication uses a locked, no-replace path compatible with API 26; concurrent creators retain one canonical salt.
 

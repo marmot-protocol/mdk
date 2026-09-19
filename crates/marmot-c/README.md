@@ -22,6 +22,10 @@ is already supported and is a different interface.
 Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
 its status; `marmot_client_shutdown` alone does not close shared database handles.
 Release subscriptions before clients, and never free an object while another call uses it.
+Starting with 0.10.3, `marmot_client_free` waits for runtime worker cleanup on an
+ordinary host thread, preventing pending database destructors from racing process
+exit. Run final free off the UI thread. Calls from a Tokio runtime context retain
+nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 The catalog includes C-only compatibility shims; prefer the v4 audit configuration
 setter and the composable runtime options constructor for new integrations.
 

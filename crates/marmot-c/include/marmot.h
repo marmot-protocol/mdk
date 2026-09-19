@@ -5217,6 +5217,9 @@ MarmotStatus marmot_client_is_stopping(const struct MarmotClient *client, bool *
 /**
  * Destroy a client handle. Call `marmot_client_shutdown` first for a
  * graceful stop. NULL is a no-op. The handle must not be used afterwards.
+ * Ordinary host threads wait for runtime worker cleanup; calls from a Tokio
+ * context retain nonblocking cleanup. For final process teardown, release
+ * subscriptions and free the client on an ordinary host thread off the UI.
  *
  * # Safety
  * `client` must be NULL or a live handle from `marmot_client_new` that

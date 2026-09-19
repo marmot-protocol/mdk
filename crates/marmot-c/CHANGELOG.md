@@ -7,6 +7,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Fixed
+
+- 0.10.3 release preflight: ordinary host-thread client free waits for embedded
+  runtime workers to release resources, preventing pending SQLCipher connection
+  destructors from racing process-exit cleanup. Tokio-context free remains
+  nonblocking to avoid deadlock; final process teardown belongs on a host thread.
+
 ### Added
 
 - `MarmotPresentedChatRow` gains selected draft/message/invitation/empty preview and row-action records. Draft text is owned and deep-freed with the row. This changes record layout: regenerate and recompile with matching headers/libraries. See [C3 integration](../marmot-uniffi/CHAT-LIST-ROWS.md).
