@@ -51,12 +51,23 @@ async fn missing_eose_exhausts_overall_budget_and_retains_prefix() {
         ..Default::default()
     };
     client.pending_failed_sync_summary.merge(prefix.clone());
+    // Exercise missing EOSE after activation, not the speed of route/signing
+    // setup. Under CI load an 80 ms end-to-end budget can expire before the
+    // repair activates; that correctly leaves the prefix buffered for later.
+    client.runtime.activate_transport(None).await.unwrap();
+    let (summary, verdict) = client
+        .drain_full_history_repair(
+            &mut DrainCounts::default(),
+            &FullHistoryRepairControl {
+                started: Instant::now(),
+                timeout: Duration::from_millis(80),
+                cancelled: &|| false,
+            },
+        )
+        .await
+        .unwrap();
     let failure = client
-        .repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
-            timeout: Duration::from_millis(80),
-            cancelled: &|| false,
-        })
+        .finish_full_history_repair(summary, verdict)
         .await
         .unwrap_err();
     assert!(

@@ -12,6 +12,7 @@ pub use group_system::{
 
 mod account_projection;
 mod agent_stream_sequences;
+mod attachment_acquisition;
 mod attachment_history;
 mod avatar_cache;
 mod chat_list;
@@ -42,6 +43,13 @@ pub use account_projection::{
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
+pub use attachment_acquisition::{
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, AttachmentAcquisition,
+    AttachmentAcquisitionSource, AttachmentAcquisitionState, AttachmentAcquisitionStatus,
+    AttachmentAssetRef, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
+    AttachmentPublishResult, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    MAX_RETAINED_ATTACHMENT_BYTES, RetainedAttachmentAsset,
+};
 pub use attachment_history::{
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
     AttachmentHistoryVersion, MAX_ATTACHMENT_HISTORY_PAGE,
@@ -71,7 +79,8 @@ pub use chat_presentation::{
 pub use connection::SqliteStorage;
 pub use connection::{
     CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
-    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
+    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
+    SqliteTimingOperation, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
     MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,
@@ -100,7 +109,7 @@ pub use timeline::{
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
-    ConversationWindowQuery, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
+    ConversationWindowQuery, DeletionSource, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
     SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
     TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
     TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
@@ -125,4 +134,9 @@ pub(crate) use codec::{
 
 pub use timeline::reports::{
     ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage,
+};
+
+pub use attachment_acquisition::{
+    AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
+    AttachmentTransferStatus,
 };

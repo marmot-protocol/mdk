@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -119,7 +120,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     fingerprint_fields = diag.nonsecret_config_fields(
-        senders=senders,
+        senders=diag.loaded_sender_ids(extra, env_values=effective_env),
         allow_all=allow_all,
         welcomers=welcomers,
         account_id_hex=account_hex,
@@ -129,10 +130,16 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         outbound_media_dir=str(outbound_dir) if outbound_dir is not None else None,
     )
     fingerprint = None
-    if config_error in (None, "missing"):
+    if config_error in (None, "missing") and not unsupported_keys:
         fingerprint = diag.config_fingerprint(fingerprint_fields)
 
-    checks.append(_socket_check(socket_path))
+    if "MARMOT_AGENT_SOCKET" in unsupported_keys:
+        checks.append(diag.check(
+            "socket.control", owner="hermes_config", provenance="observed",
+            status="unknown", code="unsupported",
+        ))
+    else:
+        checks.append(_socket_check(socket_path))
     checks.extend(
         _file_checks(
             extra,
@@ -222,22 +229,33 @@ def _split_sender_list(raw: Any) -> list[str]:
     return values
 
 
+def _safe_version(value: Any) -> Optional[str]:
+    """Only expose numeric release versions and known prerelease labels."""
+    if isinstance(value, str) and re.fullmatch(
+        r"v?(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})(?:-(?:alpha|beta|rc|dev)(?:[.-][0-9]{1,6})?)?",
+        value,
+    ):
+        return value
+    return None
+
+
 def _release_check(check_id: str, version: Optional[str]) -> dict[str, Any]:
-    if version:
+    safe_version = _safe_version(version)
+    if safe_version:
         return diag.check(
             check_id,
             owner="installer",
             provenance="observed",
             status="healthy",
             code="present",
-            value=version,
+            value=safe_version,
         )
     return diag.check(
         check_id,
         owner="installer",
         provenance="observed",
         status="unknown",
-        code="missing",
+        code="invalid" if version else "missing",
     )
 
 
@@ -443,6 +461,7 @@ def _file_checks(
                 provenance="observed",
                 status=status,
                 code=code,
+                value={"mode": f"{inspected['mode']:04o}"} if "mode" in inspected else None,
             )
         )
     return checks
@@ -653,7 +672,7 @@ def _connector_checks(
     if not isinstance(report, dict):
         return [_unsupported("account.selection")]
     checks = []
-    running = report.get("connector_version")
+    running = _safe_version(report.get("connector_version"))
     if running:
         checks.append(
             diag.check(

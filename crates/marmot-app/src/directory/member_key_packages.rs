@@ -21,8 +21,8 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
-    fresh_relay_list_status_from_records, latest_fresh_key_package_from_records,
-    merge_relay_list_status,
+    fresh_relay_list_status_from_records, merge_relay_list_status,
+    preferred_fresh_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
@@ -146,7 +146,7 @@ impl MemberKeyPackagePrewarmCache {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemberResolutionPurpose {
+pub(crate) enum MemberResolutionPurpose {
     Commit,
     CommitFresh,
     Prewarm,
@@ -229,19 +229,14 @@ impl MarmotApp {
             .key_packages)
     }
 
-    /// A superseded invite must not reuse the directory/prewarm package that
-    /// its first Welcome consumed. Fetch through the existing safe discovery path.
-    pub(crate) async fn resolve_fresh_reinvite_key_packages(
+    pub(crate) async fn resolve_compatible_member_key_packages(
         &self,
-        members: &[String],
-    ) -> Result<Vec<KeyPackage>, AppError> {
-        Ok(self
-            .resolve_member_key_packages_for_purpose(
-                members.to_vec(),
-                MemberResolutionPurpose::CommitFresh,
-            )
-            .await?
-            .key_packages)
+        member_refs: Vec<String>,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+        purpose: MemberResolutionPurpose,
+    ) -> Result<ResolvedMemberKeyPackages, AppError> {
+        self.resolve_member_key_packages_for_purpose(member_refs, purpose, Some(requirements))
+            .await
     }
 
     /// Prewarm group composition without reserving or consuming any package.
@@ -251,6 +246,8 @@ impl MarmotApp {
     /// The roster must also resolve a safe Marmot inbox route for every member;
     /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
     /// discovered routes remain cached even when another member fails readiness.
+    /// A malformed current slot publication suppresses older packages here too;
+    /// return an error rather than report readiness from superseded material.
     /// Every call fetches packages for a fresh readiness signal; hosts should
     /// debounce composition changes. A later create call can reuse discovery routes,
     /// but fetches KeyPackages again because prewarmed material may have been
@@ -263,23 +260,32 @@ impl MarmotApp {
             .iter()
             .map(|member_ref| (*member_ref).to_owned())
             .collect::<Vec<_>>();
-        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Prewarm)
-            .await
-            .map(|resolved| resolved.stats.into())
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Prewarm,
+            None,
+        )
+        .await
+        .map(|resolved| resolved.stats.into())
     }
 
     pub(crate) async fn resolve_member_key_packages_with_stats(
         &self,
         member_refs: Vec<String>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
-        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Commit)
-            .await
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Commit,
+            None,
+        )
+        .await
     }
 
     async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
@@ -288,7 +294,7 @@ impl MarmotApp {
         );
         let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose),
+            self.resolve_member_key_packages_inner(&member_refs, purpose, requirements),
         )
         .await
         {
@@ -312,6 +318,7 @@ impl MarmotApp {
         &self,
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let directory_observation = self
             .product_analytics
@@ -407,6 +414,7 @@ impl MarmotApp {
             &key_package_unresolved,
             &mut outcomes,
             purpose,
+            requirements,
         )
         .await;
 
@@ -772,6 +780,7 @@ impl MarmotApp {
         unresolved: &[usize],
         outcomes: &mut [Option<Result<KeyPackage, AppError>>],
         purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -844,22 +853,28 @@ impl MarmotApp {
             .await;
 
         let mut fallback = Vec::new();
+        let mut fallback_records = BTreeMap::new();
         for (indices, result) in batches {
             let Ok(records) = result else {
                 fallback.extend(indices);
                 continue;
             };
+            let multiple_authors = indices.len() > 1;
+            let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
+            for record in records {
+                records_by_author
+                    .entry(record.event.pubkey.clone())
+                    .or_default()
+                    .push(record);
+            }
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
-                let account_records = records
-                    .iter()
-                    .filter(|record| record.event.pubkey == *account_id)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let selected = latest_fresh_key_package_from_records(
+                let account_records = records_by_author.remove(account_id).unwrap_or_default();
+                let selected = preferred_fresh_key_package_from_records(
                     account_id,
-                    account_records,
+                    &account_records,
                     self.directory_freshness(),
+                    requirements,
                 )
                 .and_then(|selection| {
                     selection
@@ -867,11 +882,29 @@ impl MarmotApp {
                         .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))
                 });
                 match selected {
-                    Ok(mut fetched) => {
+                    Ok(selected)
+                        if purpose == MemberResolutionPurpose::Prewarm
+                            || !multiple_authors
+                            || selected.priority == 2 =>
+                    {
+                        let mut fetched = selected.fetched;
                         fetched.relay_lists = targets[index].relay_lists.clone();
                         outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
                     }
-                    Err(_) => fallback.push(index),
+                    // Bounded multi-author results can hide an older preferred
+                    // slot even when they contain a valid lower-priority one.
+                    // Relays may cap below our requested limit, so even a
+                    // short batch does not prove completeness. Prewarm only
+                    // needs existence, while commits seek the preferred slot.
+                    // A priority-2 winner already has the best tier in a
+                    // newest-first prefix. This is a bounded preference search,
+                    // not proof of relay completeness: neither path can detect
+                    // a newer publication omitted from a non-prefix response.
+                    // Keep observed slot replacements when combining the refetch.
+                    _ => {
+                        fallback.push(index);
+                        fallback_records.insert(index, account_records);
+                    }
                 }
             }
         }
@@ -896,44 +929,64 @@ impl MarmotApp {
                 if endpoints.is_empty() {
                     endpoints.clone_from(&defaults);
                 }
-                (!endpoints.is_empty()).then_some((index, target, endpoints))
+                (!endpoints.is_empty()).then_some((
+                    index,
+                    target,
+                    endpoints,
+                    fallback_records.remove(&index).unwrap_or_default(),
+                ))
             })
             .collect::<Vec<_>>();
         let app = self.clone();
-        let work = fallback_specs
-            .into_iter()
-            .map(move |(index, target, endpoints)| {
-                let app = app.clone();
-                async move {
-                    let query = DirectoryEventQuery::new(
-                        KIND_MARMOT_KEY_PACKAGE,
-                        vec![target.account_id_hex.clone()],
-                        KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                    );
-                    let result = async {
-                        let records = app
-                            .relay_plane
-                            .fetch_directory_events(endpoints, vec![query])
-                            .await
-                            .map_err(|error| {
-                                AppError::RelayDirectory(format!("fetch key packages: {error}"))
-                            })?;
-                        let mut fetched = latest_fresh_key_package_from_records(
-                            &target.account_id_hex,
-                            records,
-                            app.directory_freshness(),
-                        )?
-                        .value
-                        .ok_or_else(|| {
-                            AppError::MissingKeyPackage(target.account_id_hex.clone())
-                        })?;
-                        fetched.relay_lists = target.relay_lists;
-                        Ok::<_, AppError>(fetched)
+        let work =
+            fallback_specs
+                .into_iter()
+                .map(move |(index, target, endpoints, observed_records)| {
+                    let app = app.clone();
+                    async move {
+                        let query = DirectoryEventQuery::new(
+                            KIND_MARMOT_KEY_PACKAGE,
+                            vec![target.account_id_hex.clone()],
+                            KEY_PACKAGE_EVENTS_PER_AUTHOR,
+                        );
+                        let result = async {
+                            let (mut records, refetch_error) = match app
+                                .relay_plane
+                                .fetch_directory_events(endpoints, vec![query])
+                                .await
+                            {
+                                Ok(records) => (records, None),
+                                Err(error) => (
+                                    Vec::new(),
+                                    Some(AppError::RelayDirectory(format!(
+                                        "fetch key packages: {error}"
+                                    ))),
+                                ),
+                            };
+                            // This supplementary lookup must not discard a
+                            // valid package observed in this call's batch.
+                            // Never load a previously cached package here.
+                            records.extend(observed_records);
+                            let mut fetched = preferred_fresh_key_package_from_records(
+                                &target.account_id_hex,
+                                &records,
+                                app.directory_freshness(),
+                                requirements,
+                            )?
+                            .value
+                            .ok_or_else(|| {
+                                refetch_error.unwrap_or_else(|| {
+                                    AppError::MissingKeyPackage(target.account_id_hex.clone())
+                                })
+                            })?
+                            .fetched;
+                            fetched.relay_lists = target.relay_lists;
+                            Ok::<_, AppError>(fetched)
+                        }
+                        .await;
+                        (index, result)
                     }
-                    .await;
-                    (index, result)
-                }
-            });
+                });
         let fallback_results = stream::iter(work)
             .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
             .collect::<Vec<_>>()

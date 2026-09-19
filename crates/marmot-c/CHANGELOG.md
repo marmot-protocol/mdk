@@ -7,7 +7,56 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS C bundle and optimized smoke builds disable debug stripping, avoiding
+  misaligned Mach-O shared libraries rejected by Xcode 27. No ABI change;
+  optimization and Linux packaging are unchanged.
+
 ### Added
+
+- `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay
+  policy, cursor persistence, client label and optional host secret storage.
+  Zero-initialized options preserve the existing defaults. Use matching headers
+  and libraries; existing constructor signatures remain available.
+
+- `marmot_client_new_with_client_name` configures an optional public KeyPackage
+  client tag, with cursor policy and optional host secret store. Existing
+  constructors remain untagged. Use the matching header and library.
+
+- Attachment transfer snapshot/subscription, durable cancel/retry/remove/download-again,
+  and per-account download policy APIs. The subscription uses blocking next, cancel and free;
+  results have a dedicated deep-free. Automatic acquisition now defaults on with the approved
+  bounded policy. Regenerate the header and use its matching library.
+
+- `marmot_attachment_local_assets` resolves up to 64 source slots to opaque local
+  references without fetching or registering demand. `marmot_read_attachment_asset`
+  returns verified plaintext ranges of at most 1 MiB, with unavailable distinct from
+  empty EOF. Free results with `marmot_attachment_local_asset_list_free` and
+  `marmot_attachment_local_bytes_free`. Additive API; regenerate headers and use
+  the matching library. Acquisition policy is controlled through the additive C8-D2 APIs.
+
+- Runtime performance snapshots with bounded operation names, terminal outcomes,
+  duration histograms and unfinished-work gauges. Host timing enums add conversation
+  local-visible/composer-ready milestones and cancelled/timeout/unavailable outcomes.
+  `MarmotAppPerformanceSnapshot` gains an owned runtime-operation array; its existing
+  free function releases the array and nested records. Use matching regenerated
+  headers and libraries because the output record layout changed.
+
+- `MarmotDeletionSource` and `deletion_source` on `MarmotTimelineMessageRecord`,
+  `MarmotTimelineReplyPreview`, and `MarmotChatListMessagePreview` distinguish
+  accepted author/admin deletions with an unknown fallback for legacy evidence.
+  Regenerate headers and use the matching library: these output record layouts
+  have changed. Custom-event conversation windows also retain undeleted tags.
+
+- Bounded local attachment discovery via `marmot_attachment_history_page` and
+  `marmot_attachment_history_version`, with typed page results, categories and
+  opaque cursor/version handles. Compare refresh versions with
+  `marmot_attachment_history_version_change_since`; retain an independent baseline
+  with `marmot_attachment_history_version_clone`. Release owned results with
+  `marmot_attachment_page_read_free` and `marmot_attachment_history_version_free`.
+  Reads do not require an engine or start downloads. Regenerate headers and use
+  the matching library.
 
 - `MarmotAccountKeyPackageLocalState`, `MarmotAccountKeyPackageInventoryEntry`,
   `MarmotAccountKeyPackageInventoryEntryList`,

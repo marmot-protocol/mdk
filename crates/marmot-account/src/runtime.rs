@@ -1,6 +1,13 @@
 //! Account-device runtime: drives session effects through transport publish,
 //! confirmation, and rollback, and the effect aggregates it produces.
 
+/// Closed timing boundaries; callbacks receive no delivery or identity data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountIngestPhase {
+    Engine,
+    EffectPublication,
+}
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2522,16 +2529,41 @@ where
         &mut self,
         delivery: TransportDelivery,
     ) -> AccountResult<AccountIngestEffects> {
+        self.ingest_delivery_with_observer(delivery, |_, _, _| {})
+            .await
+    }
+
+    /// Observe completed phase timings without changing ingest/publication ordering.
+    /// Cancellation does not emit a completed phase; callers own whole-operation tracking.
+    pub async fn ingest_delivery_with_observer(
+        &mut self,
+        delivery: TransportDelivery,
+        mut observe: impl FnMut(AccountIngestPhase, Duration, bool) + Send,
+    ) -> AccountResult<AccountIngestEffects> {
         if delivery.account_id != self.session.self_id() {
             return Err(AccountError::WrongAccountDelivery);
         }
+        let started = Instant::now();
+        let ingested = self.session.ingest_delivery(delivery).await;
+        observe(
+            AccountIngestPhase::Engine,
+            started.elapsed(),
+            ingested.is_ok(),
+        );
         let IngestEffects {
             outcome,
             left_object_unpersisted,
             effects,
             valid_proposal_groups,
-        } = self.session.ingest_delivery(delivery).await?;
-        let effects = self.publish_session_effects(effects).await?;
+        } = ingested?;
+        let started = Instant::now();
+        let published = self.publish_session_effects(effects).await;
+        observe(
+            AccountIngestPhase::EffectPublication,
+            started.elapsed(),
+            published.is_ok(),
+        );
+        let effects = published?;
         let mut state_bearing_groups = effects
             .events
             .iter()

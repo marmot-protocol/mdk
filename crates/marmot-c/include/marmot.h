@@ -178,6 +178,42 @@ typedef int32_t MarmotStatus;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
+typedef enum MarmotAttachmentCategory {
+  MARMOT_ATTACHMENT_CATEGORY_IMAGE,
+  MARMOT_ATTACHMENT_CATEGORY_VIDEO,
+  MARMOT_ATTACHMENT_CATEGORY_AUDIO,
+  MARMOT_ATTACHMENT_CATEGORY_FILE,
+  MARMOT_ATTACHMENT_CATEGORY_REJECTED,
+} MarmotAttachmentCategory;
+
+/**
+ * Stable category of a rejected encrypted-media attachment (mdk#1787).
+ * Branch on this rather than on `detail`; the set only grows.
+ */
+typedef enum MarmotMediaAttachmentRejectionKind {
+  /**
+   * Not a decodable encrypted-media `imeta` tag.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_INVALID_STRUCTURE,
+  /**
+   * The `v` field is absent or names a format this build does not
+   * implement (legacy MIP-era and future shapes).
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_UNSUPPORTED_FORMAT,
+  /**
+   * A required field is absent or empty.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MISSING_FIELD,
+  /**
+   * A single-occurrence field appears more than once.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_DUPLICATE_FIELD,
+  /**
+   * A present field has an invalid value.
+   */
+  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MALFORMED_FIELD,
+} MarmotMediaAttachmentRejectionKind;
+
 typedef enum MarmotAvatarAvailability {
   MARMOT_AVATAR_AVAILABILITY_MISSING,
   MARMOT_AVATAR_AVAILABILITY_READY,
@@ -457,6 +493,15 @@ typedef enum MarmotMarkdownAlignment {
 } MarmotMarkdownAlignment;
 
 /**
+ * Accepted deletion origin; meaningful only for deleted rows.
+ */
+typedef enum MarmotDeletionSource {
+  MARMOT_DELETION_SOURCE_UNKNOWN,
+  MARMOT_DELETION_SOURCE_AUTHOR,
+  MARMOT_DELETION_SOURCE_ADMIN,
+} MarmotDeletionSource;
+
+/**
  * Kind of the last message's attachments.
  */
 typedef enum MarmotChatListAttachmentKind {
@@ -619,34 +664,6 @@ typedef enum MarmotRetentionSweepStatus {
 } MarmotRetentionSweepStatus;
 
 /**
- * Stable category of a rejected encrypted-media attachment (mdk#1787).
- * Branch on this rather than on `detail`; the set only grows.
- */
-typedef enum MarmotMediaAttachmentRejectionKind {
-  /**
-   * Not a decodable encrypted-media `imeta` tag.
-   */
-  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_INVALID_STRUCTURE,
-  /**
-   * The `v` field is absent or names a format this build does not
-   * implement (legacy MIP-era and future shapes).
-   */
-  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_UNSUPPORTED_FORMAT,
-  /**
-   * A required field is absent or empty.
-   */
-  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MISSING_FIELD,
-  /**
-   * A single-occurrence field appears more than once.
-   */
-  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_DUPLICATE_FIELD,
-  /**
-   * A present field has an invalid value.
-   */
-  MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MALFORMED_FIELD,
-} MarmotMediaAttachmentRejectionKind;
-
-/**
  * Outcome class of a background collection.
  */
 typedef enum MarmotNotificationCollectionStatus {
@@ -763,6 +780,23 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_LAST_MESSAGE_CONTENT_CHANGED,
 } MarmotChatListUpdateTrigger;
 
+typedef enum MarmotAttachmentTransferState {
+  MARMOT_ATTACHMENT_TRANSFER_STATE_UNAVAILABLE,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_NOT_REQUESTED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_QUEUED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_DOWNLOADING,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_CIPHERTEXT,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_DECRYPTING,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_VERIFYING_PLAINTEXT,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_READY,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_SCHEDULED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_FAILED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_CANCELLED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_PAUSED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_REMOVED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
+} MarmotAttachmentTransferState;
+
 typedef enum MarmotChatListView {
   MARMOT_CHAT_LIST_VIEW_CHATS,
   MARMOT_CHAT_LIST_VIEW_UNREAD,
@@ -795,6 +829,18 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_NEXT,
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
+
+typedef enum MarmotAttachmentControl {
+  MARMOT_ATTACHMENT_CONTROL_CANCEL,
+  MARMOT_ATTACHMENT_CONTROL_RETRY,
+  MARMOT_ATTACHMENT_CONTROL_REMOVE,
+} MarmotAttachmentControl;
+
+typedef enum MarmotAttachmentHistoryChange {
+  MARMOT_ATTACHMENT_HISTORY_CHANGE_UNCHANGED,
+  MARMOT_ATTACHMENT_HISTORY_CHANGE_ADDITIONS,
+  MARMOT_ATTACHMENT_HISTORY_CHANGE_RESTART_REQUIRED,
+} MarmotAttachmentHistoryChange;
 
 typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
@@ -939,6 +985,8 @@ typedef enum MarmotHostPerformanceOperation {
   MARMOT_HOST_PERFORMANCE_OPERATION_FOREGROUND_LOCAL_READY,
   MARMOT_HOST_PERFORMANCE_OPERATION_OUTBOUND_MESSAGE_VISIBLE,
   MARMOT_HOST_PERFORMANCE_OPERATION_INBOUND_MESSAGE_VISIBLE,
+  MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_LOCAL_VISIBLE,
+  MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY,
 } MarmotHostPerformanceOperation;
 
 /**
@@ -947,6 +995,9 @@ typedef enum MarmotHostPerformanceOperation {
 typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_SUCCESS,
   MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_CANCELLED,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_TIMEOUT,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_UNAVAILABLE,
 } MarmotHostPerformanceOutcome;
 
 /**
@@ -967,6 +1018,15 @@ typedef struct MarmotAgentPublisher MarmotAgentPublisher;
  * matching anchor/start command is `marmot_start_agent_text_stream`.
  */
 typedef struct MarmotAgentStreamSubscription MarmotAgentStreamSubscription;
+
+typedef struct MarmotAttachmentHistoryCursor MarmotAttachmentHistoryCursor;
+
+typedef struct MarmotAttachmentHistoryVersion MarmotAttachmentHistoryVersion;
+
+/**
+ * Close/free before freeing its client. Never free during an active call.
+ */
+typedef struct MarmotAttachmentTransferSubscription MarmotAttachmentTransferSubscription;
 
 /**
  * Account-private block list changes.
@@ -1130,6 +1190,184 @@ typedef struct MarmotSecretStore {
    */
   MarmotSecretStoreDestroyFn destroy;
 } MarmotSecretStore;
+
+/**
+ * Borrowed construction options. Zero initialization selects public-only
+ * endpoints, an advancing cursor, no client label, and the platform keychain.
+ * Use this struct only with the matching header/library version.
+ */
+typedef struct MarmotClientOptions {
+  /**
+   * A MarmotRelayPolicy discriminant.
+   */
+  uint32_t relay_policy;
+  /**
+   * A MarmotCursorPersistence discriminant.
+   */
+  uint32_t cursor_persistence;
+  /**
+   * Optional UTF-8 label; NULL or blank omits the public tag.
+   */
+  const char *client_name;
+  /**
+   * Optional callback store; NULL selects the platform keychain.
+   */
+  const struct MarmotSecretStore *store;
+} MarmotClientOptions;
+
+/**
+ * NULL reference means unavailable, with byte_count zero. A non-NULL reference
+ * with byte_count zero is a verified empty file. References are opaque.
+ */
+typedef struct MarmotAttachmentLocalAsset {
+  char *reference;
+  uint64_t byte_count;
+} MarmotAttachmentLocalAsset;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAttachmentLocalAssetList {
+  struct MarmotAttachmentLocalAsset *items;
+  uintptr_t len;
+} MarmotAttachmentLocalAssetList;
+
+/**
+ * available=false means discard any assembled host result. Available with
+ * zero bytes is EOF. Hosts own decoding and plaintext buffer lifetime.
+ */
+typedef struct MarmotAttachmentLocalBytes {
+  bool available;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+} MarmotAttachmentLocalBytes;
+
+/**
+ * Borrowed original source slot from a timeline/history entry. Strings must be
+ * NUL-terminated; caller retains ownership throughout the call.
+ */
+typedef struct MarmotAttachmentLocalTarget {
+  const char *message_id_hex;
+  const char *source_message_id_hex;
+  uint32_t attachment_index;
+} MarmotAttachmentLocalTarget;
+
+/**
+ * One storage locator for an encrypted attachment.
+ */
+typedef struct MarmotMediaLocator {
+  char *kind;
+  char *value;
+} MarmotMediaLocator;
+
+/**
+ * Fully-resolved encrypted attachment reference. Also a borrowed
+ * input to `marmot_send_media_reference` /
+ * `marmot_send_media_attachments` / `marmot_download_media`.
+ */
+typedef struct MarmotMediaAttachmentReference {
+  struct MarmotMediaLocator *locators;
+  uintptr_t locators_len;
+  char *ciphertext_sha256;
+  char *plaintext_sha256;
+  char *nonce_hex;
+  char *file_name;
+  char *media_type;
+  /**
+   * `MarmotEncryptedMediaVersion` discriminant.
+   */
+  uint32_t version;
+  uint64_t source_epoch;
+  char *dim;
+  char *thumbhash;
+} MarmotMediaAttachmentReference;
+
+/**
+ * Why one attachment was rejected. `detail` is privacy-safe
+ * presentation text from the shared parser; it never echoes tag
+ * content.
+ */
+typedef struct MarmotMediaAttachmentRejection {
+  enum MarmotMediaAttachmentRejectionKind kind;
+  char *detail;
+} MarmotMediaAttachmentRejection;
+
+/**
+ * One `imeta` attachment of a message, in tag order. `attachment_index`
+ * is the position among the message's `imeta` tags, rejected siblings
+ * included, so a host can render media and placeholders in order and
+ * correlate a timeline row with `MarmotMediaRecord` entries for the same
+ * message. Pass an `Accepted` reference to `marmot_download_media`;
+ * render `Rejected` as an unsupported/invalid attachment placeholder
+ * using `rejection.kind`.
+ */
+typedef enum MarmotMediaAttachmentOutcome_Tag {
+  MARMOT_MEDIA_ATTACHMENT_OUTCOME_ACCEPTED,
+  MARMOT_MEDIA_ATTACHMENT_OUTCOME_REJECTED,
+} MarmotMediaAttachmentOutcome_Tag;
+
+typedef struct MarmotMediaAttachmentOutcome_Accepted_Body {
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentReference reference;
+} MarmotMediaAttachmentOutcome_Accepted_Body;
+
+typedef struct MarmotMediaAttachmentOutcome_Rejected_Body {
+  uint32_t attachment_index;
+  struct MarmotMediaAttachmentRejection rejection;
+} MarmotMediaAttachmentOutcome_Rejected_Body;
+
+typedef struct MarmotMediaAttachmentOutcome {
+  MarmotMediaAttachmentOutcome_Tag tag;
+  union {
+    MarmotMediaAttachmentOutcome_Accepted_Body ACCEPTED;
+    MarmotMediaAttachmentOutcome_Rejected_Body REJECTED;
+  };
+} MarmotMediaAttachmentOutcome;
+
+typedef struct MarmotAttachmentEntry {
+  char *message_id_hex;
+  char *source_message_id_hex;
+  char *sender;
+  uint64_t timeline_at;
+  uint64_t received_at;
+  bool has_source_epoch;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t source_epoch;
+  enum MarmotAttachmentCategory category;
+  struct MarmotMediaAttachmentOutcome attachment;
+} MarmotAttachmentEntry;
+
+/**
+ * All fields, including opaque handles, are owned by this page's result.
+ * Keep that result live while borrowing its cursor/version; do not free fields separately.
+ */
+typedef struct MarmotAttachmentPage {
+  struct MarmotAttachmentEntry *entries;
+  uintptr_t entries_len;
+  struct MarmotAttachmentHistoryVersion *version;
+  struct MarmotAttachmentHistoryCursor *next_cursor;
+  bool has_more;
+} MarmotAttachmentPage;
+
+typedef enum MarmotAttachmentPageRead_Tag {
+  MARMOT_ATTACHMENT_PAGE_READ_PAGE,
+  MARMOT_ATTACHMENT_PAGE_READ_RESTART_REQUIRED,
+  MARMOT_ATTACHMENT_PAGE_READ_CURSOR_MISMATCH,
+  MARMOT_ATTACHMENT_PAGE_READ_INVALID_LIMIT,
+} MarmotAttachmentPageRead_Tag;
+
+typedef struct MarmotAttachmentPageRead_Page_Body {
+  struct MarmotAttachmentPage page;
+} MarmotAttachmentPageRead_Page_Body;
+
+typedef struct MarmotAttachmentPageRead {
+  MarmotAttachmentPageRead_Tag tag;
+  union {
+    MarmotAttachmentPageRead_Page_Body PAGE;
+  };
+} MarmotAttachmentPageRead;
 
 typedef struct MarmotAvatarAsset {
   char *target;
@@ -2312,6 +2550,7 @@ typedef struct MarmotChatListMessagePreview {
   uint64_t kind;
   uint64_t timeline_at;
   bool deleted;
+  enum MarmotDeletionSource deletion_source;
   bool has_attachment_kind;
   /**
    *Only meaningful when the matching `has_` flag is set.
@@ -2582,36 +2821,6 @@ typedef struct MarmotAppMessageRecordList {
   struct MarmotAppMessageRecord *items;
   uintptr_t len;
 } MarmotAppMessageRecordList;
-
-/**
- * One storage locator for an encrypted attachment.
- */
-typedef struct MarmotMediaLocator {
-  char *kind;
-  char *value;
-} MarmotMediaLocator;
-
-/**
- * Fully-resolved encrypted attachment reference. Also a borrowed
- * input to `marmot_send_media_reference` /
- * `marmot_send_media_attachments` / `marmot_download_media`.
- */
-typedef struct MarmotMediaAttachmentReference {
-  struct MarmotMediaLocator *locators;
-  uintptr_t locators_len;
-  char *ciphertext_sha256;
-  char *plaintext_sha256;
-  char *nonce_hex;
-  char *file_name;
-  char *media_type;
-  /**
-   * `MarmotEncryptedMediaVersion` discriminant.
-   */
-  uint32_t version;
-  uint64_t source_epoch;
-  char *dim;
-  char *thumbhash;
-} MarmotMediaAttachmentReference;
 
 /**
  * One stored media record.
@@ -3264,48 +3473,6 @@ typedef struct MarmotTimelineMessageQuery {
 } MarmotTimelineMessageQuery;
 
 /**
- * Why one attachment was rejected. `detail` is privacy-safe
- * presentation text from the shared parser; it never echoes tag
- * content.
- */
-typedef struct MarmotMediaAttachmentRejection {
-  enum MarmotMediaAttachmentRejectionKind kind;
-  char *detail;
-} MarmotMediaAttachmentRejection;
-
-/**
- * One `imeta` attachment of a message, in tag order. `attachment_index`
- * is the position among the message's `imeta` tags, rejected siblings
- * included, so a host can render media and placeholders in order and
- * correlate a timeline row with `MarmotMediaRecord` entries for the same
- * message. Pass an `Accepted` reference to `marmot_download_media`;
- * render `Rejected` as an unsupported/invalid attachment placeholder
- * using `rejection.kind`.
- */
-typedef enum MarmotMediaAttachmentOutcome_Tag {
-  MARMOT_MEDIA_ATTACHMENT_OUTCOME_ACCEPTED,
-  MARMOT_MEDIA_ATTACHMENT_OUTCOME_REJECTED,
-} MarmotMediaAttachmentOutcome_Tag;
-
-typedef struct MarmotMediaAttachmentOutcome_Accepted_Body {
-  uint32_t attachment_index;
-  struct MarmotMediaAttachmentReference reference;
-} MarmotMediaAttachmentOutcome_Accepted_Body;
-
-typedef struct MarmotMediaAttachmentOutcome_Rejected_Body {
-  uint32_t attachment_index;
-  struct MarmotMediaAttachmentRejection rejection;
-} MarmotMediaAttachmentOutcome_Rejected_Body;
-
-typedef struct MarmotMediaAttachmentOutcome {
-  MarmotMediaAttachmentOutcome_Tag tag;
-  union {
-    MarmotMediaAttachmentOutcome_Accepted_Body ACCEPTED;
-    MarmotMediaAttachmentOutcome_Rejected_Body REJECTED;
-  };
-} MarmotMediaAttachmentOutcome;
-
-/**
  * Preview of the message a timeline row replies to.
  */
 typedef struct MarmotTimelineReplyPreview {
@@ -3323,6 +3490,7 @@ typedef struct MarmotTimelineReplyPreview {
   uintptr_t media_len;
   char *agent_text_stream_json;
   bool deleted;
+  enum MarmotDeletionSource deletion_source;
   /**
    * Convergence invalidation reason for the previewed message.
    * Nullable.
@@ -3446,6 +3614,7 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotTimelineReactionSummary reactions;
   struct MarmotTimelineEditSummary *edit;
   bool deleted;
+  enum MarmotDeletionSource deletion_source;
   char *deleted_by_message_id_hex;
   /**
    * Convergence invalidation reason (e.g. `LosingBranch`); NULL
@@ -3662,6 +3831,24 @@ typedef struct MarmotAppPerformanceOperationSnapshot {
 } MarmotAppPerformanceOperationSnapshot;
 
 /**
+ * Bounded runtime timings and unfinished operation counts.
+ */
+typedef struct MarmotRuntimePerformanceSnapshot {
+  char *operation;
+  uint64_t started;
+  uint64_t completed;
+  uint64_t successes;
+  uint64_t failures;
+  uint64_t cancelled;
+  uint64_t timeouts;
+  uint64_t not_ready;
+  uint64_t in_flight;
+  uint64_t oldest_tracked_in_flight_ms;
+  uint64_t untracked_in_flight;
+  struct MarmotDurationHistogramSnapshot duration_ms;
+} MarmotRuntimePerformanceSnapshot;
+
+/**
  * Process-wide performance counters. Free with
  * `marmot_app_performance_snapshot_free`.
  */
@@ -3759,6 +3946,8 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot media_download_plaintext_verify;
   struct MarmotAppPerformanceOperationSnapshot host_splash_ready;
   struct MarmotAppPerformanceOperationSnapshot host_foreground_local_ready;
+  struct MarmotRuntimePerformanceSnapshot *runtime_operations;
+  uintptr_t runtime_operations_len;
 } MarmotAppPerformanceSnapshot;
 
 typedef struct MarmotUsageDiagnosticsSettings {
@@ -4551,6 +4740,28 @@ typedef struct MarmotBlockListSnapshot {
  */
 typedef void (*MarmotBlockListCallback)(const struct MarmotBlockListSnapshot *item, void *user_data);
 
+typedef struct MarmotAttachmentTransferStatus {
+  char *reference;
+  enum MarmotAttachmentTransferState state;
+  uint64_t attempt;
+  uint64_t received;
+  bool has_total;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t total;
+  bool has_retry_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retry_at;
+} MarmotAttachmentTransferStatus;
+
+typedef struct MarmotAttachmentTransferSnapshot {
+  struct MarmotAttachmentTransferStatus *items;
+  uintptr_t items_len;
+} MarmotAttachmentTransferSnapshot;
+
 typedef enum MarmotChatListAnchorOutcome_Tag {
   MARMOT_CHAT_LIST_ANCHOR_OUTCOME_TOP,
   MARMOT_CHAT_LIST_ANCHOR_OUTCOME_RETAINED,
@@ -4788,6 +4999,23 @@ typedef struct MarmotConversationWindowSnapshot {
   bool has_more_after;
 } MarmotConversationWindowSnapshot;
 
+typedef struct MarmotAttachmentDownloadPolicy {
+  bool automatic;
+  uint64_t retained_bytes;
+  uint64_t disk_reserve;
+  uint64_t transfer_limit;
+} MarmotAttachmentDownloadPolicy;
+
+/**
+ * Borrowed policy input. Nonzero automatic enables acquisition.
+ */
+typedef struct MarmotAttachmentDownloadPolicyInput {
+  uint8_t automatic;
+  uint64_t retained_bytes;
+  uint64_t disk_reserve;
+  uint64_t transfer_limit;
+} MarmotAttachmentDownloadPolicyInput;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -4879,6 +5107,41 @@ MarmotStatus marmot_client_new_with_secret_store(const char *root_path,
                                                  struct MarmotClient **out_client);
 
 /**
+ * Open with an optional public client name for newly prepared KeyPackages.
+ * NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+ * their original tags. NULL `store` selects the platform keychain.
+ * Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
+ *
+ * # Safety
+ * Same pointer contracts as `marmot_client_new_with_secret_store`, except
+ * `store` may be NULL. `client_name` must be NULL or a valid UTF-8 C string.
+ * `cursor_persistence` must be a `MarmotCursorPersistence` discriminant.
+ */
+MarmotStatus marmot_client_new_with_client_name(const char *root_path,
+                                                const char *const *relay_urls,
+                                                uintptr_t relay_urls_len,
+                                                const char *client_name,
+                                                uint32_t cursor_persistence,
+                                                const struct MarmotSecretStore *store,
+                                                struct MarmotClient **out_client);
+
+/**
+ * Create a client with combined relay, cursor, label and secret-storage options.
+ * NULL options uses defaults. Store ownership transfers only on success, with
+ * the same callback lifetime contract as marmot_client_new_with_secret_store.
+ *
+ * # Safety
+ * Same root, relay and output pointer contracts as marmot_client_new.
+ * Non-NULL options must point to a readable MarmotClientOptions for this call;
+ * its label and store pointers obey marmot_client_new_with_client_name's contract.
+ */
+MarmotStatus marmot_client_new_with_configuration(const char *root_path,
+                                                  const char *const *relay_urls,
+                                                  uintptr_t relay_urls_len,
+                                                  const struct MarmotClientOptions *options,
+                                                  struct MarmotClient **out_client);
+
+/**
  * Start the runtime (reconcile accounts, start workers, subscribe
  * transport). Must be called before subscribing.
  *
@@ -4940,6 +5203,113 @@ void marmot_string_free(char *s);
  * been freed already.
  */
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_attachment_local_asset_list_free(struct MarmotAttachmentLocalAssetList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_local_bytes_free(struct MarmotAttachmentLocalBytes *ptr);
+
+/**
+ * Look up up to 64 original slots in one group, preserving input order/duplicates.
+ * Does not load bytes, enqueue demand, start a worker or perform network work.
+ * # Safety
+ * Client/strings and targets[0..targets_len] must be live. Targets may be NULL only
+ * with zero length. Out must be writable. Inputs are borrowed, outputs owned.
+ */
+MarmotStatus marmot_attachment_local_assets(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const struct MarmotAttachmentLocalTarget *targets,
+                                            uintptr_t targets_len,
+                                            struct MarmotAttachmentLocalAssetList **out);
+
+/**
+ * Deep-free a page result and its cursor/version. NULL is a no-op.
+ * # Safety
+ * Value must be NULL or an owned result, not freed or borrowed by an active call.
+ */
+void marmot_attachment_page_read_free(struct MarmotAttachmentPageRead *value);
+
+/**
+ * Free a standalone version returned by a version read or clone, not a page field.
+ * # Safety
+ * Value must be NULL or a standalone owned version, with no active borrows.
+ */
+void marmot_attachment_history_version_free(struct MarmotAttachmentHistoryVersion *value);
+
+/**
+ * Retain a standalone baseline version without retaining its owning page.
+ * Free the result with marmot_attachment_history_version_free.
+ * # Safety
+ * Value must be a live standalone version or borrowed page field; out must be writable.
+ */
+MarmotStatus marmot_attachment_history_version_clone(const struct MarmotAttachmentHistoryVersion *value,
+                                                     struct MarmotAttachmentHistoryVersion **out);
+
+/**
+ * Blocking local read. Call off the UI thread; limit is 1..=100 slots.
+ * NULL cursor starts at the head. Cursor is borrowed for this call; no network work starts.
+ * # Safety
+ * Client and strings must be live; cursor must be NULL or live; out must be writable.
+ */
+MarmotStatus marmot_attachment_history_page(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            uint32_t limit,
+                                            const struct MarmotAttachmentHistoryCursor *cursor,
+                                            struct MarmotAttachmentPageRead **out);
+
+/**
+ * Blocking local revision read, including after exhaustion. Free the standalone result.
+ * # Safety
+ * Client/strings must be live and out writable.
+ */
+MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               struct MarmotAttachmentHistoryVersion **out);
+
+/**
+ * Compare a current version with the retained baseline. Output is a MarmotAttachmentHistoryChange discriminant.
+ * # Safety
+ * Both versions must be live (standalone or borrowed page fields); out must be writable.
+ */
+MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
+                                                            const struct MarmotAttachmentHistoryVersion *previous,
+                                                            uint32_t *out);
+
+/**
+ * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
+ * Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
+ * available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
+ * Free the result with `marmot_attachment_local_bytes_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_read_attachment_asset(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *reference,
+                                          uint64_t offset,
+                                          uint32_t limit,
+                                          struct MarmotAttachmentLocalBytes **out);
 
 /**
  * Register up to 16 visible avatar targets without awaiting HTTP.
@@ -9070,6 +9440,42 @@ MarmotStatus marmot_block_list_subscription_snapshot(const struct MarmotBlockLis
                                                      struct MarmotBlockListSnapshot **out);
 
 /**
+ * Open a bounded progress stream. First next returns the initial snapshot.
+ * # Safety
+ * Inputs must be live, targets NULL only with zero length, out writable.
+ */
+MarmotStatus marmot_subscribe_attachment_transfers(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const char *group_id_hex,
+                                                   const struct MarmotAttachmentLocalTarget *targets,
+                                                   uintptr_t targets_len,
+                                                   struct MarmotAttachmentTransferSubscription **out);
+
+/**
+ * Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely.
+ * Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free.
+ * # Safety
+ * Sub must be live and out writable. Use one receiver per handle.
+ */
+MarmotStatus marmot_attachment_transfer_subscription_next(const struct MarmotAttachmentTransferSubscription *sub,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotAttachmentTransferSnapshot **out);
+
+/**
+ * Close observation and wake receivers. Does not cancel downloads.
+ * # Safety
+ * Sub must remain live throughout the call.
+ */
+MarmotStatus marmot_attachment_transfer_subscription_cancel(const struct MarmotAttachmentTransferSubscription *sub);
+
+/**
+ * NULL-safe free. Already returned snapshots remain separately owned.
+ * # Safety
+ * Sub must be NULL or library-owned with no active calls.
+ */
+void marmot_attachment_transfer_subscription_free(struct MarmotAttachmentTransferSubscription *sub);
+
+/**
  * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
  * # Safety
  * sub must be live and out writable.
@@ -10358,6 +10764,78 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_download_policy_free(struct MarmotAttachmentDownloadPolicy *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_transfer_snapshot_free(struct MarmotAttachmentTransferSnapshot *ptr);
+
+/**
+ * Read the effective durable policy.
+ * # Safety
+ * Client and strings must be live, out writable. Free the returned record.
+ */
+MarmotStatus marmot_attachment_download_policy(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               struct MarmotAttachmentDownloadPolicy **out);
+
+/**
+ * Persist policy. Disable pauses automatic work but preserves explicit transfers and cached bytes.
+ * # Safety
+ * Client, strings and policy must be live throughout this call. Inputs are borrowed.
+ */
+MarmotStatus marmot_set_attachment_download_policy(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const struct MarmotAttachmentDownloadPolicyInput *policy);
+
+/**
+ * Apply a MarmotAttachmentControl discriminant to an opaque reference.
+ * # Safety
+ * Client/strings must be live and out writable. No inputs are retained.
+ */
+MarmotStatus marmot_control_attachment(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *reference,
+                                       uint32_t control,
+                                       bool *out);
+
+/**
+ * Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable.
+ * # Safety
+ * Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
+ */
+MarmotStatus marmot_download_attachment_again(const struct MarmotClient *client,
+                                              const char *account_ref,
+                                              const char *group_id_hex,
+                                              const struct MarmotAttachmentLocalTarget *target,
+                                              char **out);
+
+/**
+ * Read up to 64 progress entries in input order. No network demand is created.
+ * # Safety
+ * Inputs must be live; targets may be NULL only for zero length; out writable.
+ */
+MarmotStatus marmot_attachment_transfer_snapshot(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *group_id_hex,
+                                                 const struct MarmotAttachmentLocalTarget *targets,
+                                                 uintptr_t targets_len,
+                                                 struct MarmotAttachmentTransferSnapshot **out);
 
 #ifdef __cplusplus
 }  // extern "C"

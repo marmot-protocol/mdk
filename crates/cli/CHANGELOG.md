@@ -9,7 +9,57 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-09-19
+
+Update generated bindings, native libraries, and C headers together. Account storage advances through migration 86; back up before upgrade because downgrade is unsupported. See [0.10.2 release notes](../../docs/release/0.10.2.md).
+
+### Fixed
+
+- Optimized macOS C binding builds disable debug stripping to avoid the
+  misaligned Mach-O shared libraries rejected by Xcode 27. Linux packaging and
+  the C ABI are unchanged.
+
+- Size-rotated v4 audit logs repeat the latest source context (app version, platform, hardware model, and device
+  identifier) so standalone segments retain metadata. Engine/account/session identities and existing event bytes
+  are preserved. Requires rebuilt native libraries and client releases; historical logs are not rewritten.
+
 ### Added
+
+- Attachment acquisition now defaults on for accepted conversations, with durable
+  per-account policy and native cancel, retry, remove, and download-again controls.
+  Bounded Swift/Kotlin and C snapshots/subscriptions report progress and verification
+  phases. Disabling automatic work preserves explicit downloads and retained files;
+  cancellation survives restart. Admission remains bounded by quota, disk reserve,
+  and one transfer across accounts. Regenerate bindings before client adoption.
+
+- Native attachment availability and bounded local reads let hosts reuse verified
+  MDK-retained media without network requests or engine readiness. Source/account
+  checks apply to each read; no partial ciphertext is exposed. Swift/Kotlin and C
+  APIs are additive; the controls below share the same durable acquisition store.
+
+- Attachment acquisition resumes interrupted downloads from protected ciphertext
+  checkpoints when a server supplies a strong ETag and valid HTTP Range responses.
+  Account/source/attempt fences and combined storage budgets protect checkpoint reuse;
+  incompatible responses restart safely and full authentication precedes publication.
+
+- Rust attachment acquisition for accepted conversations, including retained
+  history, without opening a chat screen. Durable discovery and retry state survive
+  restart; verified bytes remain in SQLCipher until source deletion/expiry or explicit
+  removal. Defaults: 2 GiB per account, 256 MiB free disk reserve plus write overhead,
+  one transfer across accounts and a 64 MiB automatic transfer cap. Rust configuration
+  tunes acquisition; native hosts can override policy per account. Explicit downloads
+  keep their existing limit.
+
+- Attachment retention storage foundation (migration 83): durable leased download
+  jobs, restart-safe retries, protected local bytes and explicit-removal suppression
+  that survives timeline repair. Capacity refusal preserves existing attachments.
+  Native progress and controls use this same store.
+
+- Bounded local attachment-history pages across Rust, Swift/Kotlin and C, with media
+  categories, opaque cursors and change versions for authoritative removal/refresh.
+  Migration 81 indexes canonical attachment slots; browsing no longer requires a
+  full-history scan or live engine. This does not enable background downloads.
+  Regenerate native bindings and C headers with the matching library.
 
 - Local-first KeyPackage inventory across Rust, Swift/Kotlin and C, including
   `localAccountKeyPackages`, `refreshAccountKeyPackages` and typed ownership via
@@ -24,11 +74,23 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Hermes doctor fails closed on ambiguous dotenv bindings, sanitizes startup failures and version evidence, bounds diagnostic queue admission, and preserves loaded sender values in restart fingerprints, supports `--doctor --no-service`, and reports privacy-safe directory modes. ([#1880](https://github.com/marmot-protocol/mdk/pull/1880))
+
 - Hermes Marmot doctor now exits 0 on a healthy report, reads the configured home channel instead of the inbound filter, uses the same effective socket/account/auth and config fingerprint as the running plugin, treats an absent systemd unit as unknown, and keeps ACK-only diagnostic readiness from changing reconnect backoff.
 - Hermes Marmot doctor now resolves `MARMOT_HOME_CHANNEL` and installed Hermes dotenv connector fields with the plugin's precedence, keeps inline auth tokens above token files, and fingerprints every supported welcomer alias including explicit empty lists.
 - Hermes Marmot doctor now applies the same Hermes enablement-seed and user-dotenv override order as the running plugin, so a process or installed `.env` home/socket/account/token wins over conflicting YAML values.
 - Hermes Marmot doctor now preserves explicit empty dotenv assignments, expands supported dotenv variable references, and inspects the adapter's configured media directories instead of installer defaults. Unsupported dotenv interpolations are reported unknown and do not send inherited or YAML credentials.
 - Hermes Marmot doctor dotenv interpolation now matches python-dotenv 1.2.2: bare `$VAR` stays literal, `${VAR}` expands in every quoting form, and references resolve from preceding file assignments then the process environment. Live welcomer resolution keeps the pre-doctor raw environment precedence so a whitespace-only primary allowlist does not fall back to the legacy alias or change gateway reconciliation.
+
+- Message presentation records expose typed deletion provenance (`author`, `admin`, or `unknown`),
+  including conversation windows, chat-list and reply previews, moderation reads, and timeline JSON.
+  Provenance comes from the selected accepted deletion, independently of the original message kind.
+- Conversation-window bindings preserve custom-event tags for client-defined renderers.
+
+Update generated Swift/Kotlin bindings, native libraries, and C headers together. Storage migration 82
+adds provenance columns defaulting to unknown and preserves existing tombstones and deletion IDs.
+No historical backfill is scheduled; older tombstones can remain unknown indefinitely.
+See the [binding contract](../marmot-uniffi/README.md#deletion-provenance-and-custom-events).
 
 ## [0.10.1] - 2026-09-16
 
@@ -2516,7 +2578,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.20...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/marmot-protocol/mdk/compare/v0.10.1...v0.10.2
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...v0.9.19
 [0.9.18]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...v0.9.18

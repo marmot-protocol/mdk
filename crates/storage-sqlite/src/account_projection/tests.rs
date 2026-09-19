@@ -19,6 +19,111 @@ fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
 }
 
 #[test]
+fn keyed_group_read_is_bounded() {
+    use crate::query_work_test_support::measure;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+    thread_local! {
+        static READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let statements = || {
+        store.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event| {
+                if let TraceEvent::Stmt(statement, _) = event {
+                    READS.with_borrow_mut(|reads| reads.push(statement.sql().into_owned()));
+                }
+            }),
+        );
+        store.account_groups(Some("aa")).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+        READS.with_borrow_mut(std::mem::take)
+    };
+    let mut target = group("aa", "");
+    target.archived = true;
+    target.pending_confirmation = true;
+    target.member_count = Some(2);
+    target.direct_member_ids_hex = Some(vec!["11".repeat(32), "22".repeat(32)]);
+    target.presentation_member_ids_hex = target.direct_member_ids_hex.clone();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                groups: vec![target],
+                ..Default::default()
+            },
+            16_384,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .set_group_self_membership("aa", SelfMembership::Removed)
+        .unwrap();
+    let (expected, full_before_steps) = measure(&store, || {
+        store
+            .load_account_projection_state("alice", 16_384)
+            .unwrap()
+            .groups
+    });
+    let (first, first_steps) = measure(&store, || store.account_groups(Some("aa")).unwrap());
+    assert_eq!(first, expected);
+    let first_statements = statements();
+    assert_eq!(first_statements.len(), 4);
+    assert!(
+        first_statements
+            .iter()
+            .all(|sql| { sql.contains("WHERE group_id_hex = ?1") && !sql.contains("seen_events") })
+    );
+
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<16384)
+         INSERT INTO seen_events(event_id, seen_at) SELECT printf('%064x',x),x FROM n;
+         WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<500)
+         INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
+         SELECT printf('%032x',x),'',x FROM n;
+         INSERT INTO account_group_app_components
+             (group_id_hex,component_id,component_name,component_data_hex,updated_at)
+         SELECT group_id_hex,1,'unrelated','00',0 FROM account_groups WHERE group_id_hex<>'aa';
+         INSERT INTO direct_conversation_members(group_id_hex,member_id_hex)
+         SELECT group_id_hex,'unrelated' FROM account_groups WHERE group_id_hex<>'aa';
+         INSERT INTO chat_presentation_members(group_id_hex,member_id_hex)
+         SELECT group_id_hex,'unrelated' FROM account_groups WHERE group_id_hex<>'aa';",
+        )
+        .unwrap();
+    let (second, second_steps) = measure(&store, || store.account_groups(Some("aa")).unwrap());
+    assert_eq!(second, expected);
+    assert_eq!(first_steps, second_steps);
+    assert_eq!(first_statements, statements());
+    let (full, full_after_steps) = measure(&store, || {
+        store
+            .load_account_projection_state("alice", 16_384)
+            .unwrap()
+            .groups
+    });
+    eprintln!(
+        "group projection VM steps: full={full_before_steps}->{full_after_steps}, keyed={first_steps}->{second_steps}"
+    );
+    assert_eq!(store.account_groups(None).unwrap(), full);
+    // Neither keyed nor list reads require the transport's seen-event table.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TABLE seen_events")
+        .unwrap();
+    assert_eq!(store.account_groups(Some("aa")).unwrap(), expected);
+    assert_eq!(store.account_groups(None).unwrap().len(), 501);
+    assert!(store.account_groups(Some("missing")).unwrap().is_empty());
+}
+
+#[test]
 fn secure_delete_restore_failure_preserves_committed_outcome() {
     let result = combine_secure_delete_operation_and_restore::<usize>(
         Ok(7),

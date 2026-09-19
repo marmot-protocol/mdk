@@ -323,7 +323,13 @@ pub fn evaluate(input: &ReferenceInput) -> ReferenceResult {
     for message in &input.app_messages {
         dispositions.insert(
             message.message_id.clone(),
-            app_disposition(input, message, selected_id.as_ref(), selected_tip_epoch),
+            app_disposition(
+                input,
+                message,
+                &graph,
+                selected_id.as_ref(),
+                selected_tip_epoch,
+            ),
         );
     }
 
@@ -448,6 +454,7 @@ fn proposal_disposition(
 fn app_disposition(
     input: &ReferenceInput,
     message: &ReferenceAppMessage,
+    graph: &BTreeMap<String, MaterializedBranch>,
     selected_id: Option<&String>,
     selected_tip: Option<u64>,
 ) -> ReferenceDisposition {
@@ -476,6 +483,19 @@ fn app_disposition(
         ReferenceDisposition::DeferredFutureEpoch
     } else if message.decrypts_on_branches.is_empty() {
         ReferenceDisposition::InvalidatedUndecryptable
+    } else if message
+        .decrypts_on_branches
+        .iter()
+        .filter_map(|branch_id| graph.get(branch_id))
+        .any(|branch| {
+            branch.candidate.fork_epoch >= input.retained_anchor_epoch
+                && eligible(input.current_tip_epoch, &branch.candidate, &input.policy)
+        })
+    {
+        // Parked with the branch's commits, which take
+        // `DeferredLosingEligibleBranch` above: a later pass holding deeper
+        // evidence can adopt the branch, and this application comes with it.
+        ReferenceDisposition::DeferredLosingEligibleBranch
     } else {
         ReferenceDisposition::InvalidatedLosingBranch
     }

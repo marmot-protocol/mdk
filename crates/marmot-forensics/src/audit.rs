@@ -34,7 +34,9 @@ use sha2::{Digest, Sha256};
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 
 /// Size at which [`JsonlRecorder`] seals the active file into an immutable
-/// segment and continues into a fresh one (mdk#1181).
+/// segment and continues into a fresh one (mdk#1181). The repeated source
+/// prefix is excluded from this budget; a file can exceed it by that prefix
+/// and the final threshold-crossing row.
 ///
 /// The number is picked from measured rows, not from the upload ceiling:
 ///
@@ -49,7 +51,8 @@ pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 ///   mean upload measured in the field that is a 5-10x cut, and it does not
 ///   decay as a device keeps running.
 /// - It leaves a 64x margin under the app's 64 MiB per-request upload ceiling,
-///   so no automatically produced file can reach the permanent-failure cliff.
+///   for normal rows. Arbitrarily large host metadata or individual rows can
+///   still exceed the ceiling and are rejected by the upload size gate.
 ///
 /// Smaller segments would cut the residual further but multiply file count
 /// (segments are never deleted here — retention is mdk#1014); larger ones
@@ -1357,11 +1360,13 @@ struct JsonlInner {
     next_segment_index: Option<u32>,
     /// Most recently explicitly recorded `AuditEventKind::SourceContext`.
     /// Retained even when the best-effort write fails so a later successful
-    /// destructive rotation can replay it. Not inferred from
-    /// `AuditEventContext.source`. Survives destructive swaps; size-based
-    /// segment rolls do not replay it.
+    /// rotation can repeat it. Not inferred from
+    /// `AuditEventContext.source`. Survives destructive swaps.
     retained_source_context: Option<AuditSourceContext>,
-    /// Test seam: fail the next `write_record` after capturing any source
+    /// Repeated source bytes do not consume the next segment's event budget.
+    /// Even an oversized source must not cause a roll on every ordinary event.
+    repeated_source_bytes: u64,
+    /// Test seam: fail the next row or segment-prefix write after capturing source
     /// context, so retention can be proven independently of a durable write.
     #[cfg(test)]
     fail_next_write: bool,
@@ -1413,6 +1418,7 @@ impl JsonlRecorder {
                 writer_path: path.clone(),
                 next_segment_index: None,
                 retained_source_context: None,
+                repeated_source_bytes: 0,
                 #[cfg(test)]
                 fail_next_write: false,
             }),
@@ -1444,7 +1450,7 @@ impl JsonlRecorder {
 }
 
 /// The `recorder_started` boundary row recorded by [`JsonlRecorder::open`] and
-/// after each rotation. The recorder session id lives on the enclosing
+/// after each destructive rotation. The recorder session id lives on the enclosing
 /// [`AuditEvent::recorder_session_id`], so the kind only names the recorder.
 fn recorder_started_kind() -> AuditEventKind {
     AuditEventKind::RecorderStarted {
@@ -1596,7 +1602,10 @@ impl JsonlRecorder {
         if self.disable_segment_rotation.load(Ordering::Relaxed) {
             return;
         }
-        if inner.active_bytes < AUDIT_LOG_SEGMENT_MAX_BYTES
+        if inner
+            .active_bytes
+            .saturating_sub(inner.repeated_source_bytes)
+            < AUDIT_LOG_SEGMENT_MAX_BYTES
             || inner
                 .segment_retry_after
                 .is_some_and(|deadline| now < deadline)
@@ -1656,6 +1665,7 @@ impl JsonlRecorder {
         inner.recorder_session_id = generate_recorder_session_id();
         inner.health = AuditRecorderHealthSnapshot::default();
         inner.active_bytes = 0;
+        inner.repeated_source_bytes = 0;
         inner.segment_retry_after = None;
         inner.writer_path = self.path.clone();
         Ok(())
@@ -1666,9 +1676,9 @@ impl JsonlRecorder {
     /// hold the inner lock.
     ///
     /// Nothing is deleted or truncated: the rename hands the *same inode* — and
-    /// therefore every recorded byte — to the segment name, and the concatenation
-    /// of the segments and the active file is byte-identical to the single file
-    /// this recorder would otherwise have written. Retention and disk bounding
+    /// therefore every recorded byte — to the segment name. Only the latest
+    /// source context is repeated, with a fresh sequence, in the new file.
+    /// Ordinary events are never replayed. Retention and disk bounding
     /// of the sealed segments are deliberately out of scope here; they belong to
     /// mdk#1014.
     ///
@@ -1698,6 +1708,15 @@ impl JsonlRecorder {
                 inner.active_bytes = 0;
                 inner.next_segment_index = Some(index.saturating_add(1));
                 inner.writer_path = self.path.clone();
+                // Use the same best-effort write and health accounting as all
+                // other rows. write_record neither relocks nor attempts rollover.
+                if let Some(source) = inner.retained_source_context.clone() {
+                    Self::write_record(
+                        inner,
+                        AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                    );
+                }
+                inner.repeated_source_bytes = inner.active_bytes;
                 Ok(())
             }
             Err(err) => {

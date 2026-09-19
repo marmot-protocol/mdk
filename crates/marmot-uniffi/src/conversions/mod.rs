@@ -10,6 +10,16 @@
 //! item is re-exported here so the rest of the crate keeps reaching them at
 //! `crate::conversions::*`.
 
+macro_rules! redact {
+    ($t:ty) => {
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($t)).finish_non_exhaustive()
+            }
+        }
+    };
+}
+
 mod product_analytics;
 pub use product_analytics::*;
 mod account;
@@ -520,6 +530,7 @@ mod tests {
                 media: None,
                 agent_text_stream: None,
                 deleted: false,
+                deletion_source: Default::default(),
                 invalidation_status: Some("LosingBranch".to_owned()),
             }),
             media: Some(serde_json::json!({
@@ -539,6 +550,7 @@ mod tests {
                 }],
             },
             deleted: true,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
             invalidation_status: None,
         };
@@ -647,6 +659,7 @@ mod tests {
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         };
@@ -696,6 +709,7 @@ mod tests {
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         };
@@ -795,3 +809,12 @@ pub use conversation_window::*;
 
 mod avatar;
 pub use avatar::*;
+
+mod attachment_history;
+pub use attachment_history::*;
+
+mod attachment_access;
+pub use attachment_access::*;
+
+mod attachment_controls;
+pub use attachment_controls::*;

@@ -24,6 +24,9 @@ use marmot_app::{
     MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination,
 };
 
+/// Shared metadata lookup bound for native adapters.
+pub use marmot_app::MAX_ATTACHMENT_ASSET_LOOKUPS;
+
 mod commands;
 pub use commands::user_blocks::{BlockListSnapshotFfi, BlockListSubscription, BlockedUserFfi};
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so
@@ -180,6 +183,42 @@ pub(crate) fn timeline_query_from_ffi(
     })
 }
 
+/// Composable runtime construction options. Omitted policies use public-only
+/// endpoints and an advancing cursor. Omitted labels stay untagged; omitted
+/// secret storage uses the platform keychain.
+#[derive(Clone, Default, uniffi::Record)]
+pub struct MarmotOptions {
+    #[uniffi(default = None)]
+    pub relay_policy: Option<RelayPolicyFfi>,
+    #[uniffi(default = None)]
+    pub cursor_persistence: Option<CursorPersistenceFfi>,
+    #[uniffi(default = None)]
+    pub client_name: Option<String>,
+    #[uniffi(default = None)]
+    pub secret_store: Option<Arc<dyn SecretStore>>,
+}
+
+impl MarmotOptions {
+    fn app_config(&self) -> MarmotAppConfig {
+        let relay_policy = self.relay_policy.unwrap_or(RelayPolicyFfi::PublicOnly);
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(matches!(
+                relay_policy,
+                RelayPolicyFfi::AllowLoopback | RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
+            ))
+            .with_allow_loopback_blob_endpoints(matches!(
+                relay_policy,
+                RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
+            ))
+            .with_cursor_persistence(
+                self.cursor_persistence
+                    .unwrap_or(CursorPersistenceFfi::Advance)
+                    .into(),
+            )
+            .with_key_package_client_name(self.client_name.clone())
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct Marmot {
     pub(crate) app: MarmotApp,
@@ -188,6 +227,22 @@ pub struct Marmot {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Open with any combination of runtime options. Existing constructors are
+    /// compatibility wrappers around this entry point.
+    #[uniffi::constructor]
+    pub fn new_with_configuration(
+        root_path: String,
+        relay_urls: Vec<String>,
+        options: MarmotOptions,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        let config = options.app_config();
+        let store = options.secret_store.map(|store| {
+            Arc::new(secret_store::ForeignSecretStore::new(store))
+                as Arc<dyn marmot_account::AccountSecretStore>
+        });
+        Self::open(root_path, relay_urls, config, store)
+    }
+
     /// Open with an explicit relay policy and optional host-owned key storage.
     /// Existing constructors retain their public-only relay policy.
     #[uniffi::constructor]
@@ -197,20 +252,15 @@ impl Marmot {
         relay_policy: RelayPolicyFfi,
         secret_store: Option<Arc<dyn SecretStore>>,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        let config = MarmotAppConfig::default()
-            .with_allow_loopback_relay_endpoints(matches!(
-                relay_policy,
-                RelayPolicyFfi::AllowLoopback | RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
-            ))
-            .with_allow_loopback_blob_endpoints(matches!(
-                relay_policy,
-                RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
-            ));
-        let store = secret_store.map(|store| {
-            Arc::new(secret_store::ForeignSecretStore::new(store))
-                as Arc<dyn marmot_account::AccountSecretStore>
-        });
-        Self::open(root_path, relay_urls, config, store)
+        Self::new_with_configuration(
+            root_path,
+            relay_urls,
+            MarmotOptions {
+                relay_policy: Some(relay_policy),
+                secret_store,
+                ..Default::default()
+            },
+        )
     }
 
     /// Open the Marmot app at `root_path`, configured with the given default
@@ -225,7 +275,7 @@ impl Marmot {
     /// to events.
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
-        Self::open(root_path, relay_urls, MarmotAppConfig::default(), None)
+        Self::new_with_configuration(root_path, relay_urls, MarmotOptions::default())
     }
 
     /// Open the Marmot app with host-supplied account-secret storage instead
@@ -247,13 +297,13 @@ impl Marmot {
         relay_urls: Vec<String>,
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        Self::open(
+        Self::new_with_configuration(
             root_path,
             relay_urls,
-            MarmotAppConfig::default(),
-            Some(Arc::new(secret_store::ForeignSecretStore::new(
-                secret_store,
-            ))),
+            MarmotOptions {
+                secret_store: Some(secret_store),
+                ..Default::default()
+            },
         )
     }
 
@@ -277,11 +327,36 @@ impl Marmot {
         relay_urls: Vec<String>,
         cursor_persistence: CursorPersistenceFfi,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        Self::open(
+        Self::new_with_configuration(
             root_path,
             relay_urls,
-            MarmotAppConfig::default().with_cursor_persistence(cursor_persistence.into()),
-            None,
+            MarmotOptions {
+                cursor_persistence: Some(cursor_persistence),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Open with an optional public client label for new KeyPackage publications.
+    /// Existing constructors remain untagged. Whitespace-only labels are omitted.
+    /// Hosts must supply this on every foreground/background runtime construction.
+    #[uniffi::constructor]
+    pub fn new_with_client_name(
+        root_path: String,
+        relay_urls: Vec<String>,
+        client_name: Option<String>,
+        cursor_persistence: CursorPersistenceFfi,
+        secret_store: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        Self::new_with_configuration(
+            root_path,
+            relay_urls,
+            MarmotOptions {
+                client_name,
+                cursor_persistence: Some(cursor_persistence),
+                secret_store,
+                ..Default::default()
+            },
         )
     }
 
@@ -407,9 +482,46 @@ pub use subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription
 
 pub use commands::moderation::*;
 
+pub use commands::AttachmentTransferSubscription;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_options_defaults_and_combined_policies() {
+        let defaults = MarmotOptions::default().app_config();
+        assert!(!defaults.allow_loopback_relay_endpoints);
+        assert!(!defaults.allow_loopback_blob_endpoints);
+        assert_eq!(
+            defaults.cursor_persistence,
+            marmot_app::CursorPersistence::Advance
+        );
+        assert_eq!(defaults.key_package_client_name, None);
+        for (policy, relay, blob) in [
+            (RelayPolicyFfi::PublicOnly, false, false),
+            (RelayPolicyFfi::AllowLoopback, true, false),
+            (RelayPolicyFfi::AllowLoopbackRelaysAndBlobs, true, true),
+        ] {
+            let config = MarmotOptions {
+                relay_policy: Some(policy),
+                cursor_persistence: Some(CursorPersistenceFfi::Frozen),
+                client_name: Some(" whitenoise ".into()),
+                ..Default::default()
+            }
+            .app_config();
+            assert_eq!(config.allow_loopback_relay_endpoints, relay);
+            assert_eq!(config.allow_loopback_blob_endpoints, blob);
+            assert_eq!(
+                config.cursor_persistence,
+                marmot_app::CursorPersistence::Frozen
+            );
+            assert_eq!(
+                config.key_package_client_name.as_deref(),
+                Some(" whitenoise ")
+            );
+        }
+    }
 
     #[test]
     fn optional_message_id_hex_trims_and_canonicalizes() {

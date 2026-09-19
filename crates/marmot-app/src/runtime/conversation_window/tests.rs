@@ -6,6 +6,42 @@ use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 
+#[tokio::test]
+async fn rejected_open_does_not_start_readiness_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
+    let result = runtime
+        .open_conversation_window(
+            "unknown",
+            &GroupId::new(vec![1; 16]),
+            ConversationOpenQuery {
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(ConversationWindowError::InvalidLimit)));
+    let snapshot = runtime.shared.app_performance_telemetry().snapshot();
+    for operation in [
+        RuntimeOp::ConversationAuthorityReady,
+        RuntimeOp::ConversationSendReady,
+    ] {
+        let sample = snapshot
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == operation)
+            .unwrap();
+        assert_eq!(sample.started, 0);
+        assert_eq!(sample.cancelled, 0);
+    }
+    let open = snapshot
+        .runtime_operations
+        .iter()
+        .find(|s| s.operation == RuntimeOp::ConversationOpen)
+        .unwrap();
+    assert_eq!((open.started, open.failures), (1, 1));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     app: MarmotApp,
@@ -47,7 +83,7 @@ impl Fixture {
                 tokio::select! {
                     _ = &mut stop => return,
                     command = rx.recv() => match command {
-                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, observer, respond }) => {
+                        Some(AccountWorkerCommand::CaptureConversation { group_id, query, store_epoch, observer, respond, queued }) => {
                             n.fetch_add(1, Ordering::SeqCst);
                             client.register_conversation_capture(observer);
                             let mode = m.load(Ordering::SeqCst);
@@ -65,6 +101,7 @@ impl Fixture {
                                 reached.notify_one();
                                 tokio::select! { _ = resume.notified() => {}, _ = &mut stop => return }
                             }
+                            if let Some(queued) = queued { queued.finish(telemetry_outcome(&result)); }
                             let _ = respond.send(result);
                         }
                         None => return,
@@ -868,6 +905,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
         let (respond, response) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::CaptureConversation {
+                queued: None,
                 group_id: f.group.clone(),
                 query: Default::default(),
                 store_epoch: f.store.chat_presentation_version().unwrap().store_epoch,
@@ -993,6 +1031,18 @@ async fn cold_open_returns_stored_history_while_authority_is_not_ready() {
     assert_eq!(ids(&sub.snapshot).last(), Some(&id(199)));
     assert!(!sub.snapshot.presentation.header.capabilities.can_send);
     assert!(sub.snapshot.presentation.header.epoch.is_none());
+    let telemetry = f.runtime.shared.app_performance_telemetry();
+    let sample = |op| {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|s| s.operation == op)
+            .unwrap()
+    };
+    assert_eq!(sample(RuntimeOp::ConversationOpen).successes, 1);
+    assert_eq!(sample(RuntimeOp::ConversationAuthorityReady).in_flight, 1);
+    assert_eq!(sample(RuntimeOp::ConversationSendReady).successes, 0);
     // Wait for the first authority attempt to settle into quiet retry, then
     // ensure local draft invalidation is not held behind that one-second timer.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1012,6 +1062,10 @@ async fn cold_open_returns_stored_history_while_authority_is_not_ready() {
     assert!(ready.presentation.header.capabilities.can_send);
     assert!(ready.presentation.header.epoch.is_some());
     assert_eq!(ids(&ready), ids(&sub.snapshot));
+    assert_eq!(sample(RuntimeOp::ConversationAuthorityReady).successes, 1);
+    assert_eq!(sample(RuntimeOp::ConversationAuthorityReady).in_flight, 0);
+    assert_eq!(sample(RuntimeOp::ConversationSendReady).successes, 1);
+    assert!(sample(RuntimeOp::ConversationAuthorityAttempt).not_ready > 0);
     f.close().await;
 }
 
@@ -1162,6 +1216,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
     let (respond, response) = oneshot::channel();
     worker
         .send(AccountWorkerCommand::CaptureConversation {
+            queued: None,
             group_id: f.group.clone(),
             query: query.clone(),
             store_epoch: epoch.clone(),
@@ -1178,6 +1233,9 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
     ));
     capture.state.lock().unwrap().pending = Some(checkpoint);
     let reader = Reader {
+        telemetry: f.runtime.shared.app_performance_telemetry().clone(),
+        authority_ready: None,
+        send_ready: None,
         app: f.app.clone(),
         label: "alice".into(),
         account_id: f.account.clone(),
@@ -1553,6 +1611,75 @@ async fn avatar_identity_sidecar_tracks_local_bytes_without_new_timeline_activit
             .unwrap()
             .reference
             .is_none()
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn closing_a_cold_window_accounts_for_unfinished_readiness() {
+    let f = Fixture::new(1).await;
+    f.mode.store(1, Ordering::SeqCst);
+    let sub = f
+        .runtime
+        .open_conversation_window("alice", &f.group, ConversationOpenQuery::default())
+        .await
+        .unwrap();
+    let handle = sub.window_handle();
+    let revision = sub.snapshot.revision.clone();
+    let telemetry = f.runtime.shared.app_performance_telemetry();
+    drop(sub);
+    assert!(matches!(
+        timeout(Duration::from_secs(2), handle.return_to_latest(&revision))
+            .await
+            .unwrap(),
+        Err(ConversationWindowError::Closed)
+    ));
+    // The actor closes commands as it exits; allow its remaining fields to drop.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshots = telemetry.snapshot().runtime_operations;
+            if snapshots
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.operation,
+                        RuntimeOp::ConversationAuthorityReady | RuntimeOp::ConversationSendReady
+                    )
+                })
+                .all(|s| s.in_flight == 0 && s.cancelled == 1 && s.successes == 0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    f.close().await;
+}
+
+#[tokio::test]
+async fn authoritative_removed_conversation_finishes_send_readiness_as_unavailable() {
+    let f = Fixture::new(1).await;
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    let sub = f.open(ConversationOpenTarget::Latest, 50).await;
+    assert!(!sub.snapshot.presentation.header.capabilities.can_send);
+    let snapshot = f.runtime.shared.app_performance_telemetry().snapshot();
+    let readiness = snapshot
+        .runtime_operations
+        .iter()
+        .find(|s| s.operation == RuntimeOp::ConversationSendReady)
+        .unwrap();
+    assert_eq!(
+        (
+            readiness.started,
+            readiness.not_ready,
+            readiness.in_flight,
+            readiness.successes
+        ),
+        (1, 1, 0, 0)
     );
     f.close().await;
 }

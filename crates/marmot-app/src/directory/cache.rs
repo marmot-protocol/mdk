@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use storage_sqlite::{
@@ -30,6 +30,8 @@ pub(crate) const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// Message carried by every storage error this cache raises after a close.
 const CLOSED_DETAIL: &str = "directory cache is closed";
+// Stay below SQLite's historical 999-variable limit.
+const PROFILE_QUERY_BATCH_SIZE: usize = 900;
 
 #[cfg(test)]
 thread_local! {
@@ -132,6 +134,31 @@ impl DirectoryCache {
             entries.push(Self::record_from_directory_user_row(&conn, row?)?);
         }
         Ok(entries)
+    }
+
+    pub(crate) fn profiles_for_ids(
+        &self,
+        account_ids: &[String],
+    ) -> Result<Vec<(String, Option<UserProfileMetadata>)>, AppError> {
+        let conn = self.lock()?;
+        let mut profiles = Vec::new();
+        for ids in account_ids.chunks(PROFILE_QUERY_BATCH_SIZE) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn.prepare_cached(&format!(
+                "SELECT account_id_hex, profile_json FROM directory_users
+                 WHERE account_id_hex IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(params_from_iter(ids), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, json) = row?;
+                profiles.push((id, optional_value(json)?));
+            }
+        }
+        Ok(profiles)
     }
 
     /// Public identity/profile fields only: no follow, key-package, or local-label reads.
@@ -786,6 +813,55 @@ mod tests {
     use super::*;
     use crate::ids::npub_for_account_id_lossy;
     use crate::{AccountRelayListStatus, UserProfileMetadata};
+
+    #[test]
+    fn profile_batch_skips_metadata() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        thread_local! {
+            static SELECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        let (_root, cache) = test_cache();
+        cache.lock().unwrap().execute(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
+             INSERT INTO directory_users(account_id_hex,npub,profile_json,relay_lists_json,updated_at)
+             SELECT printf('%064x',x),'npub',NULL,?1,0 FROM n;",
+            [serde_json::to_string(&AccountRelayListStatus::empty()).unwrap()],
+        ).unwrap();
+        let ids = (1..=1000)
+            .map(|id| format!("{id:064x}"))
+            .collect::<Vec<_>>();
+        cache.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|event| {
+                if let TraceEvent::Stmt(_, sql) = event
+                    && sql.starts_with("SELECT")
+                {
+                    SELECTS.set(SELECTS.get() + 1);
+                }
+            }),
+        );
+        for id in &ids {
+            assert!(cache.entry(id).unwrap().is_some());
+        }
+        assert_eq!(SELECTS.replace(0), 3000);
+        assert_eq!(cache.profiles_for_ids(&ids).unwrap().len(), ids.len());
+        assert_eq!(SELECTS.replace(0), 2);
+        cache
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+        cache
+            .lock()
+            .unwrap()
+            .execute("UPDATE directory_users SET relay_lists_json = 'broken'", [])
+            .unwrap();
+        assert!(cache.entry(&ids[0]).is_err());
+        assert!(cache.profiles_for_ids(&[]).unwrap().is_empty());
+        assert_eq!(cache.profiles_for_ids(&ids).unwrap().len(), ids.len());
+        let selected = cache.profiles_for_ids(&ids[10..12]).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|(id, _)| ids[10..12].contains(id)));
+    }
 
     fn test_cache() -> (tempfile::TempDir, DirectoryCache) {
         let dir = tempfile::tempdir().unwrap();

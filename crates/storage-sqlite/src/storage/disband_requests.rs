@@ -62,6 +62,17 @@ pub(crate) fn disbanding_group_ids_hex_with_requests_tx(
 }
 
 impl SqliteAccountStorage {
+    /// Whether an authenticated terminal candidate awaits convergence for this group.
+    pub fn has_disband_candidates(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM cgka_disband_candidates WHERE group_id = ?1)",
+                params![group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     pub fn disband_requests_by_group_hex(&self) -> StorageResult<HashMap<String, DisbandRequest>> {
         let conn = self.lock()?;
         disband_requests_by_group_hex_tx(&conn)
@@ -286,6 +297,44 @@ mod tests {
         DisbandRequestStorage, DisbandTombstoneStorage, GroupStorage,
     };
     use cgka_traits::types::EpochId;
+
+    #[test]
+    fn candidate_probe_is_bounded() {
+        use crate::query_work_test_support::measure;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let target = sample_group(gid(1), 0, 0);
+        let other = sample_group(gid(2), 0, 0);
+        store.put_group(&target).unwrap();
+        store.put_group(&other).unwrap();
+        let probe = || store.has_disband_candidates(&target.id).unwrap();
+        let (absent, before) = measure(&store, probe);
+        assert!(!absent);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
+             INSERT INTO cgka_disband_candidates(group_id,commit_id,record)
+             SELECT ?1,printf('%064x',x),X'00' FROM n",
+                [other.id.as_slice()],
+            )
+            .unwrap();
+        let (absent, after) = measure(&store, probe);
+        assert!(!absent);
+        assert_eq!(before, after);
+        // Existence must not decode records that the projection never uses.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_disband_candidates(group_id,commit_id,record)
+             VALUES (?1,X'01',X'00')",
+                [target.id.as_slice()],
+            )
+            .unwrap();
+        assert!(probe());
+    }
 
     #[test]
     fn disband_request_roundtrips_and_cascades_with_group() {

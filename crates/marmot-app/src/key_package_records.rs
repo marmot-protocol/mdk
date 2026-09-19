@@ -128,54 +128,124 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
         .collect()
 }
 
-fn latest_key_package_from_records(
+/// Temporary interoperability policy. Retire this ranking when device-aware
+/// delivery in https://github.com/marmot-protocol/mdk/issues/1696 replaces
+/// single-package selection. Keep separate from cryptographic admission so
+/// multi-device selection can replace this preference without changing validity.
+/// Labels are self-asserted and do not authenticate an application; they only
+/// rank candidates after admission checks and never relax cryptographic gates.
+pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
+    let mut tags = event.tags.iter().filter(|tag| {
+        tag.first()
+            .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
+    });
+    let Some(tag) = tags.next() else {
+        return 1;
+    };
+    if tags.next().is_some() || tag.len() < 2 {
+        return 1;
+    }
+    let name = tag[1].trim();
+    if name.eq_ignore_ascii_case("whitenoise") {
+        2
+    } else if name.eq_ignore_ascii_case("amethyst") {
+        0
+    } else {
+        1
+    }
+}
+
+/// Directory reads deliberately share the client ranking and slot-supersession
+/// policy used by invitation discovery, but have no target-group requirements.
+/// A malformed current slot never revives an older publication; if no usable
+/// slot remains, the lookup returns the validation error.
+pub(crate) fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-) -> Result<FetchedKeyPackage, AppError> {
-    sort_directory_records(&mut records);
+    records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+    let selection =
+        preferred_fresh_key_package_from_records(account_id_hex, &records, freshness, None)?;
+    Ok(DirectorySelection {
+        value: selection.value.map(|selected| selected.fetched),
+        rejected_future: selection.rejected_future,
+    })
+}
+
+pub(crate) struct PreferredKeyPackage {
+    pub(crate) fetched: FetchedKeyPackage,
+    pub(crate) priority: u8,
+}
+
+pub(crate) fn preferred_fresh_key_package_from_records(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    let mut records = records.iter().collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    let mut rejected_future = false;
     let mut newest_error = None;
+    let mut selected = None;
+    let mut selected_priority = 0;
+    let mut slots = BTreeSet::new();
     for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
         }
-        match key_package_from_record(record) {
+        if !freshness.accepts(record) {
+            rejected_future = true;
+            continue;
+        }
+        // A fresh publication supersedes its slot even when its payload or
+        // metadata is invalid. Falling back within that slot can invite a
+        // package whose private material has already been retired.
+        if let Some(slot) = record.event.tag_value("d").filter(|slot| !slot.is_empty())
+            && !slots.insert(slot.to_owned())
+        {
+            continue;
+        }
+        let priority = key_package_client_priority(&record.event);
+        let fetched = match key_package_from_borrowed_record(record) {
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
-                return Ok(fetched);
+                fetched
             }
-            Ok(_) => {}
+            Ok(_) => continue,
             Err(error) => {
                 newest_error.get_or_insert(error);
+                continue;
+            }
+        };
+        if let Some(requirements) = requirements
+            && let Err(error) = requirements.validate(&fetched.key_package)
+        {
+            newest_error.get_or_insert(AppError::from(cgka_session::SessionError::from(error)));
+            continue;
+        }
+        if selected.is_none() || priority > selected_priority {
+            selected = Some(PreferredKeyPackage { fetched, priority });
+            selected_priority = priority;
+            // Newest-first order already breaks ties; nothing can outrank this.
+            if selected_priority == 2 {
+                break;
             }
         }
     }
-    Err(newest_error.unwrap_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned())))
-}
-
-pub(crate) fn latest_fresh_key_package_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-    freshness: DirectoryFreshness,
-) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
-    let mut rejected_future = false;
-    records.retain(|record| {
-        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            return true;
-        }
-        let accepted = freshness.accepts(record);
-        rejected_future |= !accepted;
-        accepted
-    });
-    match latest_key_package_from_records(account_id_hex, records) {
-        Ok(value) => Ok(DirectorySelection {
-            value: Some(value),
-            rejected_future,
-        }),
-        Err(AppError::MissingKeyPackage(_)) => Ok(DirectorySelection {
-            value: None,
-            rejected_future,
-        }),
-        Err(err) => Err(err),
+    if selected.is_none()
+        && let Some(error) = newest_error
+    {
+        return Err(error);
     }
+    Ok(DirectorySelection {
+        value: selected,
+        rejected_future,
+    })
 }
 
 fn cached_key_package_from_entry(
@@ -291,8 +361,14 @@ pub(crate) fn fresh_or_cached_key_package(
 pub(crate) fn key_package_from_record(
     record: RelayEventRecord,
 ) -> Result<FetchedKeyPackage, AppError> {
-    let event = record.event;
-    require_key_package_tag(&event, "mls_protocol_version", |value| value == "1.0")?;
+    key_package_from_borrowed_record(&record)
+}
+
+fn key_package_from_borrowed_record(
+    record: &RelayEventRecord,
+) -> Result<FetchedKeyPackage, AppError> {
+    let event = &record.event;
+    require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
         .tag_value("d")
         .filter(|value| !value.is_empty())
@@ -323,21 +399,21 @@ pub(crate) fn key_package_from_record(
     .with_protocol_profile(ProtocolProfile::Current);
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
-    require_key_package_tag(&event, "mls_ciphersuite", |value| {
+    require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "mls_extensions",
         metadata.mls_extensions.iter().copied(),
     )?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "mls_proposals",
         metadata.mls_proposals.iter().copied(),
     )?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "app_components",
         metadata
             .app_components
@@ -361,16 +437,16 @@ pub(crate) fn key_package_from_record(
         &mut source_relays,
         record
             .endpoints
-            .into_iter()
-            .map(|endpoint| endpoint.0)
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
             .collect::<Vec<_>>(),
     );
     Ok(FetchedKeyPackage {
-        account_id_hex: event.pubkey,
+        account_id_hex: event.pubkey.clone(),
         key_package,
         key_package_id,
         key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id,
+        key_package_event_id: event.id.clone(),
         created_at: event.created_at,
         source_relays,
         relay_lists: AccountRelayListStatus::empty(),

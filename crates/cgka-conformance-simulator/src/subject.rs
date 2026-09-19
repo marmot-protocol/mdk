@@ -2431,6 +2431,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::InvalidWelcome
+        | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeAlreadyProcessed
         | EngineError::UnknownGroup(_)
         | EngineError::GroupNotHydrated(_)
@@ -2499,6 +2500,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         // verdict: `audit_helpers::engine_error_kind` names it the same way.
         EngineError::Serialize(_) => "serialize",
         EngineError::InvalidWelcome => "invalid_welcome",
+        EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::GroupUnrecoverableRepairRequired { .. } => {
@@ -4608,6 +4610,11 @@ mod tests {
                 EngineError::UnknownGroup(cgka_traits::GroupId::new(vec![0xAA; 16])),
                 SubjectFailureCategory::ExpectedRefusal,
                 "unknown_group",
+            ),
+            (
+                EngineError::MissingWelcomeKeyPackage,
+                SubjectFailureCategory::ExpectedRefusal,
+                "missing_welcome_key_package",
             ),
         ];
         for (error, category, code) in cases {

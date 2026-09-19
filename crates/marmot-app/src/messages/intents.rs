@@ -66,8 +66,17 @@ pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
 /// (mdk#617). Event/coordinate references (`note`/`nevent`/`naddr`) and
 /// unparseable tokens are ignored.
 pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
+    let content = markdown_mention_scan_input(content);
+    // Both pubkey token forms require these literal HRPs. Keep escaped/entity
+    // input on the parser path so Markdown normalization remains authoritative.
+    if !content.contains("npub1")
+        && !content.contains("nprofile1")
+        && !content.contains(['\\', '&'])
+    {
+        return Vec::new();
+    }
     let mut hexes = Vec::new();
-    for block in &marmot_markdown::parse(markdown_mention_scan_input(content)).blocks {
+    for block in &marmot_markdown::parse(content).blocks {
         collect_block_mention_hexes(block, &mut hexes);
     }
     hexes
@@ -881,6 +890,28 @@ mod mention_tests {
         let npub = npub_for_account_id(&hex).unwrap();
         let content = format!("hey @{npub} how are you?");
         assert_eq!(mention_p_tags(&content), vec![vec!["p".to_owned(), hex]]);
+    }
+
+    #[test]
+    fn mention_prefilter_matches_ast() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let profile = nprofile_for_account_id(&hex, &[]).unwrap();
+        for content in [
+            "ordinary **Markdown**, no references".to_owned(),
+            "日本語\n\n```rust\nlet n = 1;\n```".to_owned(),
+            format!("{npub} @{npub} nostr:{profile}"),
+            format!("`@{npub}` [@{npub}](https://example.com)"),
+            format!("&#64;{npub} \\@{npub}"),
+            format!("<details>\n<summary>@{npub}</summary>\nnostr:{profile}\n</details>"),
+            format!("{} @{npub}", "x".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES)),
+        ] {
+            let mut expected = Vec::new();
+            for block in &marmot_markdown::parse(markdown_mention_scan_input(&content)).blocks {
+                collect_block_mention_hexes(block, &mut expected);
+            }
+            assert_eq!(inline_mention_pubkey_hexes(&content), expected);
+        }
     }
 
     #[test]

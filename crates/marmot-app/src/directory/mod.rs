@@ -10,8 +10,8 @@ mod sync;
 pub(crate) use cache::DirectoryCache;
 #[cfg(test)]
 pub(crate) use cache::DirectorySearchGraphRecord;
-pub(crate) use member_key_packages::MemberKeyPackagePrewarmCache;
 pub use member_key_packages::MemberKeyPackagePrewarmSummary;
+pub(crate) use member_key_packages::{MemberKeyPackagePrewarmCache, MemberResolutionPurpose};
 #[cfg(test)]
 pub(crate) use methods::cached_or_unknown_follow_list;
 pub(crate) use records::FetchedFollowList;

@@ -220,10 +220,15 @@ impl MarmotApp {
             // per chunk would reacquire every account's directory handles.
             let caches = self.directory_caches()?;
             let shared = self.shared_storage()?;
-            let local_labels = self.local_account_labels_by_id()?;
+            let local_accounts = self.local_accounts_by_id()?;
             for id in ids {
                 let profile = self
-                    .directory_entry_for_account_id_with_handles(&id, &caches, &shared)?
+                    .directory_entry_for_account_id_with_handles(
+                        &id,
+                        &caches,
+                        &shared,
+                        &local_accounts,
+                    )?
                     .and_then(|entry| entry.profile);
                 if peer.as_ref() == Some(&id) {
                     peer_profile = profile.clone();
@@ -235,7 +240,9 @@ impl MarmotApp {
                     identity(
                         &id,
                         profile.as_ref(),
-                        local_labels.get(&id).map(String::as_str),
+                        local_accounts
+                            .get(&id)
+                            .map(|account| account.label.as_str()),
                         input,
                         &account.account_id_hex,
                     ),

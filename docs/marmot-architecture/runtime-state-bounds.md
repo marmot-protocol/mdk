@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-16
+updated: 2026-09-18
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -23,6 +23,17 @@ Tracking issue: marmot-protocol/mdk#381.
 - **Each structure documents its bound** (max size, TTL, or eviction policy) below and enforces it in code.
 
 ## Inventory
+
+### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Runtime operation aggregates | One fixed array entry per closed `RuntimePerformanceOperation`, with atomic completed-only counters/buckets and a separate mutex for live observations; no account/group/message keys | Runtime telemetry drop reclaims aggregates; snapshots include untouched operations as zeroes |
+| Active-operation age slots | At most `TRACKED_STARTS` (64) monotonic starts per operation | RAII completion or cancellation releases a slot; excess starts still increment exact active/outcome counts and appear in `untracked_in_flight` |
+
+Age tracking never drops or delays application work. When slots overflow, the oldest tracked
+age is a lower bound; `untracked_in_flight` exposes that limitation. Each observation owns
+only telemetry, a closed operation and timing metadata, never a client or storage handle.
 
 ### `cgka-engine` candidate reconstruction (`src/openmls_projection/resumable.rs`)
 
@@ -100,6 +111,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| SQLCipher database-open lock registry (`src/sqlcipher/open_lock.rs`) | One weak entry per concurrently requested database, bounded by peak simultaneous opens. | Each lookup sweeps expired weak entries. Only openers and waiters retain strong references; cached handles do not retain locks. Parent-canonical paths remain stable before/after file creation. |
 | `SQLCIPHER_V2_VERDICTS` probe-verdict cache | 256 entries (`SQLCIPHER_V2_VERDICT_CACHE_CAPACITY`) | Entries are keyed by canonical database path + salt and record only an observed "opens under the v2 key" verdict (mdk#1439). Removed when the database file set is deleted via `remove_sqlite_file_set`; replaced in place when the salt rotates; oldest-first eviction at the cap. Eviction or loss of an entry only ever causes one extra recovery probe, never a wrong-key assumption. The companion `SQLCIPHER_MIGRATION_PROBE_RUNS`/`SKIPS` counters are monotonic process-lifetime aggregates by design (telemetry gauges, not tracked state). |
 
 ### `marmot-app` client (`src/client/`)
@@ -112,6 +124,26 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Avatar identity demand | 2,048 explicit registrations; 64 inspected per batch after directory version changes | Eviction removes registration; group deletion/account cache clear removes demand. Placeholder registrations remain eligible for later profile updates. No historical-roster crawl. |
 | Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
+
+### `storage-sqlite` attachment acquisition (`src/attachment_acquisition.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Durable jobs | One per requested retained message slot; source descriptor at most 16 KiB; due/expiry scans at most 64 rows | Raw-source deletion cascades. Canonical source replacement/invalidation reconciles transactionally; matching timeline repair preserves work. Expired leases are reclaimable with a new attempt token; stale completion cannot publish. Eligible demand resumes policy-parked work; explicit-retry failures remain blocked. Worker policy changes must re-admit affected sources. No in-memory history-sized queue. |
+| Retained attachment bytes | At most 512 MiB per object; caller-supplied account payload-byte budget checked atomically at publication; local reads at most 1 MiB; publication retains a full plaintext buffer plus SQLite binding cost | No LRU eviction. Budget refusal commits no bytes. Source deletion/expiry, explicit removal and store-generation reset release objects. Separate copies per message slot give independent erasure. Worker admission reserves filesystem/WAL overhead and prunes up to 64 expired jobs per turn. |
+| Removal suppression | One tombstone per explicitly removed source slot, owned by the raw app event rather than a rebuildable timeline row | Survives reopen, repair and source revalidation; cleared only by explicit download-again, raw-source deletion or store-generation reset. |
+
+These are attachment-storage bounds, not convergence-input or engine-recovery policy.
+C8-C2 schedules complete-body transfers only with explicit Rust opt-in; acquisition
+defaults off until native local access/removal and policy controls land. C8-C3 adds protected partial downloads below.
+
+| Worker structure | Bound | Reclamation |
+| --- | --- | --- |
+| Durable parser demand | One metadata row per eligible retained slot; 32 descriptors per turn, each at most 16 KiB | Generation-fenced acknowledgement after parse/admission; source deletion cascades; rebuild/acceptance regenerates affected demand. No repeated startup history scan. |
+| Global automatic transfer permit | One per runtime across all accounts, including completed plaintext awaiting publication | Released on completion or worker exit. FIFO waiter future per active account prevents an account with a large backlog monopolizing capacity. |
+| Background transfer body | Default 64 MiB ciphertext, configurable up to the existing 512 MiB ceiling; full-buffer crypto/publication plus SQLite copies | Cancellation discards the uncommitted tail; C8-C3 retains compatible ciphertext checkpoints. The next exclusive worker reclaims abandoned attempts in batches of 64 before scheduling, fencing old completions. |
+| Resource admission | Default 2 GiB retained payload per account; 256 MiB disk reserve plus four maximum-size objects for SQLite/WAL | Pause on insufficient/unknown space without eviction or incrementing attempts. Existing 15-second maintenance tick revisits admission; network errors use durable 15-second to one-hour backoff; unavailable secrets defer one candidate for 15 seconds without consuming attempts. |
+| Protected partial ciphertext (C8-C3) | One prefix per job, at most the configured transfer ceiling; writes at most 1 MiB; full declared partial size is reserved alongside retained payload in the account budget | Source/attempt/expiry fences on every write; terminal/parked state, success, source removal and explicit removal cascade cleanup. A 24-hour last-progress expiry is reclaimed in batches of 64 by non-frozen maintenance even when acquisition is disabled. Strong ETag, exact locator and ciphertext identity gate Range reuse. |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 
@@ -141,3 +173,13 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
    section as every mutation, including resets.
 3. Give the structure an explicit bound (cap, TTL, or budget) and a test that drives churn and asserts the bound holds.
 4. Add a row to the inventory above.
+
+### Local attachment access (`marmot-app/src/runtime/attachment_access.rs`)
+
+| State/resource | Bound | Lifetime / invalidation |
+| --- | --- | --- |
+| Metadata lookup input/output | At most 64 original source slots per call, each with two fixed-size message IDs and a slot index; output is opaque reference plus byte count | Call-local only; does not enqueue acquisition or retain payloads. Indexed SQL with length-only BLOB metadata. |
+| Native local plaintext chunk | Caller-selected 1..=1 MiB per read through incremental SQLite BLOB access | Source visibility/expiry and account/store generation checked for every call. No background worker or network fallback; hosts discard assembled output if a later chunk is unavailable. |
+
+No new long-lived runtime collection or database schema is introduced. These are
+local-access bounds, not convergence or recovery policy.

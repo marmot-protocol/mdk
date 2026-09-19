@@ -2,6 +2,7 @@
 //! [`AccountWorkerCommand`] to the per-account worker and awaits its oneshot
 //! reply.
 
+use crate::RuntimePerformanceOperation as RuntimeOp;
 use zeroize::Zeroizing;
 
 use std::collections::BTreeSet;
@@ -89,7 +90,13 @@ impl AccountManager {
         command: mpsc::Sender<AccountWorkerCommand>,
         method: &'static str,
     ) {
-        if let Err(error) = self.catch_up_account_commands(vec![command]).await {
+        let observation = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::CatchUpAfterMutation);
+        let result = self.catch_up_account_commands(vec![command]).await;
+        observation.finish_app(&result);
+        if let Err(error) = result {
             tracing::warn!(
                 target: "marmot_app::runtime",
                 method = method,
@@ -583,8 +590,8 @@ impl AccountManager {
     }
 
     /// Capture the group record, member projection, and MLS state in one
-    /// account-worker command, then enrich member display names without an
-    /// await or worker queue re-entry.
+    /// account-worker command, then enrich member display names on a blocking
+    /// task without worker queue re-entry.
     pub async fn group_conversation_snapshot(
         &self,
         account_ref: &str,
@@ -608,10 +615,11 @@ impl AccountManager {
             .collect::<Vec<_>>();
         // Display names are optional directory enrichment; preserve the
         // authoritative roster if that cache is unavailable.
-        let display_names = self
-            .app
-            .display_names_for_account_ids(&member_ids)
-            .unwrap_or_default();
+        let app = self.app.clone();
+        let display_names =
+            crate::blocking_app_task(move || app.display_names_for_account_ids(&member_ids))
+                .await
+                .unwrap_or_default();
         Ok(AppGroupConversationSnapshot {
             my_account_id_hex: account.account_id_hex,
             group: session.group_record,
@@ -1333,18 +1341,39 @@ impl AccountManager {
         revision: crate::MessageDraftRevision,
         attachments: Vec<MediaAttachmentReference>,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::SendMessageDraft {
-                group_id: group_id.clone(),
-                revision,
-                attachments,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let telemetry = self.shared.app_performance_telemetry();
+        let caller = telemetry.observe(RuntimeOp::DraftSendCaller);
+        let enqueued_at = Instant::now();
+        let result = async {
+            let acquire = telemetry.observe(RuntimeOp::SendWorkerAcquire);
+            let command = self.worker_commands(account_ref).await;
+            acquire.finish_app(&command);
+            let command = command?;
+            let (respond, response) = oneshot::channel();
+            let admission = telemetry.observe(RuntimeOp::SendAdmission);
+            let admitted = command
+                .send(AccountWorkerCommand::SendMessageDraft {
+                    enqueued_at,
+                    queued: Some(telemetry.observe(RuntimeOp::SendQueue)),
+                    group_id: group_id.clone(),
+                    revision,
+                    attachments,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed);
+            admission.finish_app(&admitted);
+            admitted?;
+            account_worker_response(response).await
+        }
+        .await;
+        caller.finish_app(&result);
+        telemetry.record(
+            AppPerformanceOperation::OutboundMessageResponse,
+            enqueued_at.elapsed(),
+            result.is_ok(),
+        );
+        let summary = result?;
         self.schedule_audit_log_tracker_update("send_message_draft");
         Ok(summary)
     }
@@ -1355,22 +1384,32 @@ impl AccountManager {
         group_id: &GroupId,
         payload: Vec<u8>,
     ) -> Result<SendSummary, AppError> {
+        let telemetry = self.shared.app_performance_telemetry();
+        let caller = telemetry.observe(RuntimeOp::DirectSendCaller);
         let enqueued_at = Instant::now();
         let result = async {
-            let command = self.worker_commands(account_ref).await?;
+            let acquire = telemetry.observe(RuntimeOp::SendWorkerAcquire);
+            let command = self.worker_commands(account_ref).await;
+            acquire.finish_app(&command);
+            let command = command?;
             let (respond, response) = oneshot::channel();
-            command
+            let admission = telemetry.observe(RuntimeOp::SendAdmission);
+            let admitted = command
                 .send(AccountWorkerCommand::SendMessage {
                     enqueued_at,
+                    queued: Some(telemetry.observe(RuntimeOp::SendQueue)),
                     group_id: group_id.clone(),
                     payload,
                     respond,
                 })
                 .await
-                .map_err(|_| AppError::TransportClosed)?;
+                .map_err(|_| AppError::TransportClosed);
+            admission.finish_app(&admitted);
+            admitted?;
             account_worker_response(response).await
         }
         .await;
+        caller.finish_app(&result);
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::OutboundMessageResponse,
             enqueued_at.elapsed(),
@@ -1889,9 +1928,13 @@ impl AccountManager {
         };
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
+            .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    AppError::AccountWorkerResponseTimedOut
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
+            })?;
         Ok(Some(account_worker_response(response).await?))
     }
 
@@ -1905,12 +1948,16 @@ impl AccountManager {
         };
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::GroupMlsState {
+            .try_send(AccountWorkerCommand::GroupMlsState {
                 group_id: group_id.clone(),
                 respond,
             })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    AppError::AccountWorkerResponseTimedOut
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::TransportClosed,
+            })?;
         Ok(Some(account_worker_response(response).await?))
     }
 
@@ -2116,6 +2163,60 @@ mod tests {
         .await
         .unwrap();
         assert!(manager.workers.lock().await.is_empty(), "no reconciliation");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reads_reject_saturated_worker_queue() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+        let (commands, mut received) = mpsc::channel(1);
+        let (respond, _response) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
+            .unwrap();
+        let (shutdown, stopped) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        runtime.accounts().workers.lock().await.insert(
+            account.account_id_hex.clone(),
+            ManagedAccountWorker {
+                ready: true,
+                media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                )),
+                handle,
+                commands,
+                shutdown,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert!(matches!(
+                runtime
+                    .diagnostic_key_package_maintenance_status(&account.label)
+                    .await,
+                Err(AppError::AccountWorkerResponseTimedOut)
+            ));
+            assert!(matches!(
+                runtime
+                    .diagnostic_group_mls_state(&account.label, &GroupId::new([1; 16]))
+                    .await,
+                Err(AppError::AccountWorkerResponseTimedOut)
+            ));
+        })
+        .await
+        .expect("diagnostic enqueue must not wait for queue capacity");
+        assert_eq!(runtime.reconcile_invocation_count().await, 0);
+        assert!(received.try_recv().is_ok());
+        assert!(received.try_recv().is_err());
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

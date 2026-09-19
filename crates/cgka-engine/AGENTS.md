@@ -475,7 +475,9 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   queries, the safe-export family, `own_leaf_index`) calls `ensure_group_live` first and returns `UnknownGroup`; `do_send` and
   `converge_and_drain_queued_outbound_intents` refuse to run; `ingest_group_message` retains inbound input as
   `PeelDeferred` and classifies it `Stale { reason: Quarantined }`; `converge_stored_openmls_messages` reports a
-  `Blocked` run without touching state; `retry_deferred_peels` skips the group. When you add a new accessor or data
+  `Blocked` run without touching state; `retry_deferred_peels` skips the group, and because no sweep can ever
+  drain them, those retained rows (like a group halted `Unrecoverable`) are bounded by the per-group deferred-peel
+  caps alone and never charge the account-wide byte budget. When you add a new accessor or data
   path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
   `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
   both of which schedule retained input for replay.
@@ -516,6 +518,42 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   for every deferral. The app side must mirror the asymmetry: its tombstone is terminal by default (#1608), and only the
   explicitly evidenced `GroupStateRevalidated` path clears a `SupersededByBranchSelection` row. Withdrawals under every
   other reason stay terminal on both sides.
+- **An application moves with the branch it rode.** A never-delivered application that decrypts only on non-selected
+  branches is parked `ConvergenceDeferred` under `NonSelectedEligibleBranch` while any of those branches is still
+  eligible — `handle_app_message`'s losing arm mirrors `classify_losing_materialized_candidate_commits`. Graph seeding
+  re-admits a parked application, so the same later pass that revives the commits accepts and delivers it: applications
+  need no revival emitter of their own. Parking also keeps the branch's witness weight in the candidate graph, which is
+  what makes selection independent of local arrival order (the same reason a `Processed` application is re-admitted as
+  `already_delivered`). A parked application is announced to nobody: withdrawing a payload the application was never
+  shown retracts nothing, exactly as a never-applied parked commit emits no `CommitRolledBack`. Terminal
+  `AppMessageInvalidationReason::LosingBranch` is therefore reserved for the two cases that really are final — an
+  application no branch it decrypts on can be reconsidered any more, and an already-delivered application a reorg takes
+  back (mdk#965), whose app-layer tombstone has no revival path. The background drain honours the same park: while the
+  group still holds a parked commit — a rival branch — `pending_canonical_applications` reports no parked application as
+  drainable work, so the drain can neither hand a parked row the terminal `UndecryptableInCanonicalState` verdict the
+  pass withheld nor rearm the scheduler on it. "Parked", not "pending", is the right question on both sides: a commit
+  that still owes a verdict gates unconditionally (`ConvergenceInputContext::gates_outbound`, `CommitEdge => true`) and
+  so keeps the drain arm unreachable, while widening the gate to any pending commit would let one forged
+  beyond-ceiling row hold every parked application back. The gate's other half is a coupling to keep in step:
+  `handle_app_message`'s park arm fires on exactly the materialized/eligible/non-selected branches for which
+  `handle_commit` answers `NonSelectedEligibleBranch`, so a parked application always has a parked commit beside it.
+  What the gate cannot see is *why* an application is parked: `FutureEpoch` and `NonSelectedEligibleBranch` share
+  `ConvergenceDeferred`, and the row carries no deferral reason (the only stored epoch authenticator,
+  `OwnApplicationConvergenceStamp`, belongs to locally authored rows the drain already skips). It withholds both, which
+  is harmless only because the drain is not the deliverer of a matured row: a pass re-seeds every
+  `ConvergenceDeferred` application above the retained anchor and re-evaluates its disposition — one that decrypts on
+  the selected canonical branch is delivered, one that decrypts only on a still-eligible losing branch is re-deferred
+  `NonSelectedEligibleBranch` — and it runs before `advance_convergence_inputs` reaches the drain arm. If a pass ever stops dominating the drain there, the gate must
+  distinguish the two reasons by outcome — a matured application decrypts against canonical state, a branch message
+  does not — rather than by state.
+  Terminalization is owed to a later pass and the horizon arms (`BeyondAnchor`, `BeyondAppRetention`) — nothing runs on
+  its own, because a parked row opens no pass (`ConvergenceDeferred` is in neither `PASS_OPENING_STATES` nor
+  `OUTBOUND_GATING_STATES`, `convergence_input.rs`), so a fork frozen with no further input keeps its parked rows until
+  some other input opens the next pass. Pinned by
+  `tests/distributed_convergence.rs::a_reorg_delivers_the_application_that_rode_the_revived_branch`,
+  `::a_parked_application_whose_branch_never_wins_is_terminalized_undelivered`,
+  `::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`, and
+  `::an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival` (the blast-radius guard).
 - **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `MissingCandidateParent` is the other commit deferral and
   it does not mean "branch selection put this commit on the losing side": `handle_commit` also reaches it when the pass
   selected NO branch at all, which is the case that actually occurs in practice. Withdrawing there would tombstone a
@@ -587,6 +625,13 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   select and cannot reach `set_stable` with one. Both halves are pinned by
   `tests/publish_lifecycle.rs::a_publication_is_never_staged_while_a_convergence_input_is_unresolved` and
   `::an_inbound_commit_under_a_held_publication_is_retained_not_converged`.
+- **A refusal for lack of room is never a verdict.** `IngestOutcome::ResourceRefused` has one mint site
+  (`peel_deferred_capacity_refused`) and means the group's deferred-peel cap had no slot for an unopenable row right now.
+  Every seam that meets it leaves the row exactly as it was — live ingest keeps the id redeliverable, `replay_buffered_messages`
+  leaves the `Retryable` row and continues, the sweep leaves the `PeelDeferred` row — and none stamps `Processed`: a terminal
+  state makes `recorded_message_outcome` answer `Duplicate` forever, so a never-applied message would be dead for this
+  device. (Convergence graph seeding is not the hazard; it skips raw-transport payloads.) Pinned by
+  `tests/deferred_peel_lifecycle.rs::replay_keeps_a_row_refused_for_lack_of_room_redeliverable`.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
   do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
   `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so

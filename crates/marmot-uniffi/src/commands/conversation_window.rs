@@ -356,9 +356,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(update.draft.draft.unwrap().content, "new edit");
+        let before_send = kit.app_performance_snapshot();
         kit.send_message_draft(account.clone(), fresh.revision, vec![])
             .await
             .unwrap();
+        let sent = kit.app_performance_snapshot();
+        assert_eq!(
+            sent.outbound_message_response.attempts,
+            before_send.outbound_message_response.attempts + 1
+        );
+        assert_eq!(
+            sent.outbound_message_queue_wait.attempts,
+            before_send.outbound_message_queue_wait.attempts + 1
+        );
+        assert_eq!(
+            sent.outbound_message_local_accept.attempts,
+            before_send.outbound_message_local_accept.attempts + 1
+        );
+        assert_eq!(
+            sent.outbound_message_publish.attempts,
+            before_send.outbound_message_publish.attempts + 1
+        );
+        let draft = sent
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == "draft_send_caller")
+            .unwrap();
+        assert_eq!((draft.started, draft.successes, draft.in_flight), (1, 1, 0));
         assert!(
             kit.selected_message_draft(account.clone(), group.clone())
                 .unwrap()

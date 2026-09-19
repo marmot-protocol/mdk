@@ -6283,10 +6283,20 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
         result.accepted_app_messages,
         vec![content_hex(&app_messages[selected_index])]
     );
-    assert!(result.invalidated_app_messages.iter().any(|invalidated| {
-        invalidated.message_id == content_hex(&app_messages[losing_index])
-            && invalidated.reason == InvalidatedAppMessageReason::LosingBranch
-    }));
+    // The rival branch is still inside the rewind horizon, so its application
+    // is parked for revival exactly like its commit rather than withdrawn.
+    // `a_reorg_delivers_the_application_that_rode_the_revived_branch` owns the
+    // revival; `a_parked_application_whose_branch_never_wins_is_terminalized_undelivered`
+    // owns the terminal end of the same lifecycle.
+    assert!(
+        result.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == content_hex(&app_messages[losing_index])
+                && deferred.kind == MessageKind::AppMessage
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
+        }),
+        "got {:?}",
+        result.deferred_messages
+    );
     assert_message_state(
         &carol_storage,
         &app_messages[selected_index],
@@ -6295,7 +6305,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     assert_message_state(
         &carol_storage,
         &app_messages[losing_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
 
     let events = carol.drain_events();
@@ -6314,20 +6324,473 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
             b"bob branch payload".to_vec()
         }]
     );
-    assert!(events.iter().any(|event| {
-        matches!(
+    // Nothing to retract: this payload was never delivered, and a parked
+    // application may yet become canonical.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&app_messages[losing_index])
+        )),
+        "got {events:?}"
+    );
+}
+
+/// Two rival epoch-1 commits, each carrying one application message sent on
+/// its own branch at epoch 2, with the first pass already settled on the
+/// tiebreak winner. `revived` names the branch that pass rejected.
+struct ForkedBranchApplications {
+    alice: Engine<SqliteAccountStorage>,
+    bob: Engine<SqliteAccountStorage>,
+    carol: Engine<SqliteAccountStorage>,
+    carol_storage: SqliteAccountStorage,
+    group_id: GroupId,
+    commits: [TransportMessage; 2],
+    apps: [TransportMessage; 2],
+    first_winner: usize,
+    revived: usize,
+}
+
+const FORKED_BRANCH_PAYLOADS: [&[u8]; 2] = [b"alice branch payload", b"bob branch payload"];
+
+async fn forked_branch_applications(group_name: &str) -> ForkedBranchApplications {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: group_name.into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id(), bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    let commits = [route(alice_commit, &group_id), route(bob_commit, &group_id)];
+    let apps = [
+        send_app(&mut alice, &group_id, FORKED_BRANCH_PAYLOADS[0].to_vec()).await,
+        send_app(&mut bob, &group_id, FORKED_BRANCH_PAYLOADS[1].to_vec()).await,
+    ];
+
+    // Neither branch is deeper, so the tiebreak decides the first pass.
+    let first_winner = commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
+    for message in commits.iter().chain(apps.iter()) {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, message.clone(), 1_000)
+            .expect("message buffered");
+    }
+    let first = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("the first pass settles on the tiebreak winner");
+    assert_eq!(first.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        first.accepted_app_messages,
+        vec![content_hex(&apps[first_winner])]
+    );
+    let revived = 1 - first_winner;
+    // The rejected branch's application is parked exactly like its commit:
+    // reconsiderable, not withdrawn.
+    assert!(
+        first.deferred_messages.iter().any(|deferred| {
+            deferred.message_id == content_hex(&apps[revived])
+                && deferred.kind == MessageKind::AppMessage
+                && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
+        }),
+        "the rejected branch's application should be deferred on the eligible branch, got {:?}",
+        first.deferred_messages
+    );
+    assert_message_state(
+        &carol_storage,
+        &apps[revived],
+        MessageState::ConvergenceDeferred,
+    );
+    let events = carol.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { payload, .. } => Some(app_content(payload)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![FORKED_BRANCH_PAYLOADS[first_winner].to_vec()],
+        "only the selected branch's payload reaches the application: {events:?}"
+    );
+    // The application was never shown this payload, so there is nothing to
+    // retract — the same reason a never-applied losing commit emits no
+    // rollback.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&apps[revived])
+        )),
+        "a parked application must not be retracted: {events:?}"
+    );
+
+    ForkedBranchApplications {
+        alice,
+        bob,
+        carol,
+        carol_storage,
+        group_id,
+        commits,
+        apps,
+        first_winner,
+        revived,
+    }
+}
+
+/// The other end of the parked-application lifecycle: a branch that never
+/// gains deeper evidence eventually leaves the rewind horizon, and the
+/// application that rode it must then receive the terminal verdict the earlier
+/// passes withheld — without ever having been delivered.
+#[tokio::test]
+async fn a_parked_application_whose_branch_never_wins_is_terminalized_undelivered() {
+    let ForkedBranchApplications {
+        mut alice,
+        mut bob,
+        mut carol,
+        carol_storage,
+        group_id,
+        apps,
+        first_winner,
+        revived,
+        ..
+    } = forked_branch_applications("abandoned-branch-application").await;
+
+    // Drive the adopted branch forward until the rival's fork epoch drops below
+    // the retained anchor (`V1_MAX_REWIND_COMMITS`), so its branch can no
+    // longer be reconsidered.
+    let extend = if first_winner == 0 {
+        &mut alice
+    } else {
+        &mut bob
+    };
+    let mut events = Vec::new();
+    for round in 0..6u64 {
+        let result = extend
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("round {round}")),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let (commit, pending) = evolution(result);
+        extend.confirm_published(pending).await.unwrap();
+        carol
+            .buffer_openmls_convergence_message_at(
+                &group_id,
+                route(commit, &group_id),
+                2_000 + round * 1_000,
+            )
+            .expect("adopted-branch commit buffered");
+        carol
+            .converge_stored_openmls_messages_at(&group_id, 2_000_000 + round * 1_000_000)
+            .expect("the adopted branch keeps advancing");
+        carol
+            .advance_convergence_inputs_until_settled(&group_id, 3_000_000 + round * 1_000_000)
+            .await
+            .expect("background convergence settles");
+        events.extend(carol.drain_events());
+    }
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(8));
+    assert_message_state(
+        &carol_storage,
+        &apps[revived],
+        MessageState::EpochInvalidated,
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { payload, .. }
+                if app_content(payload) == FORKED_BRANCH_PAYLOADS[revived]
+        )),
+        "the abandoned branch's payload must never be delivered: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&apps[revived])
+        )),
+        "the abandoned branch's application must be withdrawn once for good: {events:?}"
+    );
+}
+
+/// A reorg that adopts a previously-losing branch must bring that branch's
+/// application messages with it.
+///
+/// The losing branch's *commits* are parked `ConvergenceDeferred` precisely so
+/// a later pass holding deeper evidence can revive them. An application that
+/// rode the same branch has to be parked the same way: stamping it terminal
+/// leaves a block of chat history permanently unreachable the moment the fork
+/// heals the other way, and drops the message from the candidate graph so the
+/// branch loses its witness weight (which would make selection depend on local
+/// arrival order).
+#[tokio::test]
+async fn a_reorg_delivers_the_application_that_rode_the_revived_branch() {
+    let ForkedBranchApplications {
+        mut alice,
+        mut bob,
+        mut carol,
+        carol_storage,
+        group_id,
+        commits,
+        apps,
+        first_winner,
+        revived,
+    } = forked_branch_applications("revived-branch-application").await;
+    let payloads = FORKED_BRANCH_PAYLOADS;
+
+    // The background convergence seam runs between passes in production. It
+    // must leave the parked application alone: it is retained for a branch
+    // that can still be adopted, not undelivered work to be terminalized
+    // against the branch that happened to win.
+    carol
+        .advance_convergence_inputs_until_settled(&group_id, 1_500_000)
+        .await
+        .expect("background convergence settles");
+    assert_message_state(
+        &carol_storage,
+        &apps[revived],
+        MessageState::ConvergenceDeferred,
+    );
+
+    // Deeper evidence for the rejected branch: its committer extends it by one
+    // epoch, so it now outscores the branch the first pass adopted.
+    let deepen = if revived == 0 { &mut alice } else { &mut bob };
+    let deepening = deepen
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("revived branch".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (deep_commit, deep_pending) = evolution(deepening);
+    deepen.confirm_published(deep_pending).await.unwrap();
+    let deep_commit = route(deep_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, deep_commit.clone(), 2_000)
+        .expect("deepening commit buffered");
+    let second = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the second pass adopts the deeper branch");
+
+    assert_eq!(second.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        second.accepted_commits,
+        vec![content_hex(&commits[revived]), content_hex(&deep_commit),]
+    );
+    assert_eq!(
+        second.accepted_app_messages,
+        vec![content_hex(&apps[revived])],
+        "the revived branch's application must be accepted with its commits"
+    );
+    assert_message_state(&carol_storage, &apps[revived], MessageState::Processed);
+
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                if *event_group == group_id && app_content(payload) == payloads[revived]
+        )),
+        "the revived branch's payload must be delivered, got {events:?}"
+    );
+    // mdk#965 still holds for the payload the application was shown: a
+    // delivered message that loses a reorg is withdrawn terminally, because
+    // the app-layer timeline tombstone has no revival path.
+    assert_message_state(
+        &carol_storage,
+        &apps[first_winner],
+        MessageState::EpochInvalidated,
+    );
+    assert!(
+        events.iter().any(|event| matches!(
             event,
             GroupEvent::AppMessageInvalidated {
-                group_id: event_group,
                 message_id,
-                epoch,
                 reason: AppMessageInvalidationReason::LosingBranch,
-                decrypted_payload_ref: Some(_),
-            } if *event_group == group_id
-                && *message_id == content_id(&app_messages[losing_index])
-                && *epoch == EpochId(2)
-        )
-    }));
+                ..
+            } if *message_id == content_id(&apps[first_winner])
+        )),
+        "the delivered payload that lost the reorg must be retracted, got {events:?}"
+    );
+}
+
+/// A commit awaiting adjudication is adjudicated before the drain can run, so
+/// the drain never decides a parked application while deeper evidence is owed a
+/// verdict.
+///
+/// This is what makes the drain's parked-commit gate sufficient rather than
+/// lucky. Any `Created`/`Retryable` commit inside `[anchor, ceiling]` gates
+/// unconditionally (`ConvergenceInputContext::gates_outbound`,
+/// `CommitEdge => true`), and `advance_convergence_inputs` reaches
+/// `drain_canonical_applications` only on the `!has_unresolved_convergence_inputs`
+/// arm. So while a rival commit still owes a verdict the drain arm is
+/// unreachable, and by the time it runs that commit is either parked (gate
+/// closed) or terminal (the branch really is gone).
+#[tokio::test]
+async fn a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain() {
+    let ForkedBranchApplications {
+        mut carol,
+        carol_storage,
+        group_id,
+        commits,
+        apps,
+        revived,
+        ..
+    } = forked_branch_applications("commit-awaiting-adjudication").await;
+
+    // Model the rival commit's verdict becoming owed again — a redelivered or
+    // re-ingested copy the completed pass has not adjudicated — so for a moment
+    // no commit for this group is parked while its application still is.
+    carol_storage
+        .update_message_state(&content_id(&commits[revived]), MessageState::Created)
+        .expect("rival commit awaits adjudication");
+
+    carol
+        .advance_convergence_inputs_until_settled(&group_id, 1_500_000)
+        .await
+        .expect("background convergence settles");
+
+    assert_message_state(
+        &carol_storage,
+        &apps[revived],
+        MessageState::ConvergenceDeferred,
+    );
+    assert!(
+        !carol.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&apps[revived])
+        )),
+        "an application must not be withdrawn while a commit still owes a verdict"
+    );
+}
+
+/// Blast-radius guard for the drain gate: an ordinary application parked ahead
+/// of its commit is still delivered while an unrelated rival stays parked.
+///
+/// `FutureEpoch` and `NonSelectedEligibleBranch` applications share the
+/// `ConvergenceDeferred` state, so the drain's gate cannot tell them apart from
+/// the row and withholds both. What keeps that harmless is that the drain is not
+/// the deliverer of a matured row: a convergence pass re-seeds every
+/// `ConvergenceDeferred` application above the retained anchor
+/// (`seed_stored_openmls_graph_inputs`) and re-evaluates its disposition —
+/// delivered if it decrypts on the selected canonical branch, re-deferred
+/// `NonSelectedEligibleBranch` if only on a still-eligible losing branch — and
+/// any pass reaching this state runs before `advance_convergence_inputs` can
+/// reach the drain arm.
+/// Forcing the gate shut (`if false`) leaves this test green, which is the
+/// evidence; forcing it open is what the revival test catches. Keep this test:
+/// it is the assertion that would fail if the pass ever stopped dominating the
+/// drain for matured rows, at which point the gate needs to distinguish the two
+/// reasons rather than the state.
+#[tokio::test]
+async fn an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival() {
+    let ForkedBranchApplications {
+        mut alice,
+        mut bob,
+        mut carol,
+        carol_storage,
+        group_id,
+        apps,
+        first_winner,
+        revived,
+        ..
+    } = forked_branch_applications("matured-future-epoch-application").await;
+
+    // An ordinary message on the branch carol adopted, parked as a pass would
+    // park one it admitted ahead of its commit and never re-admitted.
+    let canonical_sender = if first_winner == 0 {
+        &mut alice
+    } else {
+        &mut bob
+    };
+    let matured = send_app(canonical_sender, &group_id, b"ordinary traffic".to_vec()).await;
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, matured.clone(), 1_500)
+        .expect("ordinary application buffered");
+    carol_storage
+        .update_message_state(&content_id(&matured), MessageState::ConvergenceDeferred)
+        .expect("ordinary application parked");
+
+    carol
+        .advance_convergence_inputs_until_settled(&group_id, 1_500_000)
+        .await
+        .expect("background convergence settles");
+
+    assert_message_state(&carol_storage, &matured, MessageState::Processed);
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                if *event_group == group_id && app_content(payload) == b"ordinary traffic"
+        )),
+        "an ordinary matured application must not wait on an unrelated parked rival: {events:?}"
+    );
+    // The branch message beside it is still withheld: it decrypts on no
+    // canonical state, and its rival is still parked for revival.
+    assert_message_state(
+        &carol_storage,
+        &apps[revived],
+        MessageState::ConvergenceDeferred,
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == content_id(&apps[revived])
+        )),
+        "the parked branch message must still not be withdrawn: {events:?}"
+    );
 }
 
 /// mdk#965: an app message delivered from the initially-selected branch must
@@ -6728,7 +7191,7 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
 }
 
 #[tokio::test]
-async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence() {
+async fn rebuilt_engine_parks_losing_branch_app_for_revival_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let carol_storage = SqliteAccountStorage::in_memory().unwrap();
@@ -6819,21 +7282,21 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
     assert_message_state(
         &carol_storage,
         &app_messages[losing_index],
-        MessageState::EpochInvalidated,
+        MessageState::ConvergenceDeferred,
     );
     let losing_content_id = content_id(&app_messages[losing_index]);
     let events = restarted.drain_events();
-    assert!(events.iter().any(|event| {
-        matches!(
+    // The rebuilt engine reaches the same verdict as a live one: the rival
+    // branch is still eligible, so its application is parked for revival and
+    // never retracted.
+    assert!(
+        !events.iter().any(|event| matches!(
             event,
-            GroupEvent::AppMessageInvalidated {
-                group_id: event_group,
-                message_id,
-                reason: AppMessageInvalidationReason::LosingBranch,
-                ..
-            } if *event_group == group_id && *message_id == losing_content_id
-        )
-    }));
+            GroupEvent::AppMessageInvalidated { message_id, .. }
+                if *message_id == losing_content_id
+        )),
+        "got {events:?}"
+    );
     let received_payloads: Vec<Vec<u8>> = events
         .iter()
         .filter_map(|event| match event {

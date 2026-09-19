@@ -2987,3 +2987,124 @@ async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
         AppError::MediaUnfetchable(_)
     ));
 }
+
+/// Shared runtime/media fixture: valid v2 ciphertext with a deterministic nonce.
+pub(crate) fn attachment_worker_fixture(plaintext: &[u8]) -> (MediaAttachmentReference, Vec<u8>) {
+    let hash: [u8; 32] = Sha256::digest(plaintext).into();
+    let mime = "application/octet-stream";
+    let name = "fixture.bin";
+    let nonce = [3; 12];
+    let key =
+        derive_media_file_key(&[7; 32], EncryptedMediaVersion::V2, &hash, mime, name).unwrap();
+    let aad = media_aad(EncryptedMediaVersion::V2, &hash, mime, name);
+    let mut encrypted = plaintext.to_vec();
+    ChaCha20Poly1305::new_from_slice(&key)
+        .unwrap()
+        .encrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut encrypted)
+        .unwrap();
+    (
+        MediaAttachmentReference {
+            locators: vec![],
+            ciphertext_sha256: hex::encode(Sha256::digest(&encrypted)),
+            plaintext_sha256: hex::encode(hash),
+            nonce_hex: hex::encode(nonce),
+            file_name: name.into(),
+            media_type: mime.into(),
+            version: EncryptedMediaVersion::V2.as_str().into(),
+            source_epoch: 3,
+            dim: None,
+            thumbhash: None,
+        },
+        encrypted,
+    )
+}
+
+#[tokio::test]
+async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_without_changing_explicit_limit()
+ {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
+    for (body, cap, expected_stop) in [
+        (b"bad ciphertext".to_vec(), 1024, true),
+        (vec![0; 64], 32, true),
+    ] {
+        let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+        let server = spawn_http_response(http_ok_response(&body));
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+            value: format!("{server}/{}", reference.ciphertext_sha256),
+        }];
+        let result = download_encrypted_media_classified(
+            reference,
+            &[7; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true).with_download_limit(cap),
+            None,
+        )
+        .await;
+        assert_eq!(
+            matches!(result, Err(AttachmentDownloadFailure::Stop(_))),
+            expected_stop
+        );
+    }
+    // Chunked bodies enforce the same ceiling without Content-Length.
+    let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+    let server = spawn_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n".to_vec());
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+        value: format!("{server}/{}", reference.ciphertext_sha256),
+    }];
+    assert!(matches!(
+        download_encrypted_media_classified(
+            reference,
+            &[7; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true).with_download_limit(8),
+            None
+        )
+        .await,
+        Err(AttachmentDownloadFailure::Stop(_))
+    ));
+
+    for wrong_secret in [false, true] {
+        let (mut reference, body) = attachment_worker_fixture(b"authenticated plaintext");
+        let server = spawn_http_response(http_ok_response(&body));
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+            value: format!("{server}/{}", reference.ciphertext_sha256),
+        }];
+        let result = download_encrypted_media_classified(
+            reference,
+            &[if wrong_secret { 8 } else { 7 }; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true),
+            None,
+        )
+        .await;
+        if wrong_secret {
+            assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+        } else {
+            assert_eq!(result.unwrap().plaintext, b"authenticated plaintext");
+        }
+    }
+    let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+    let server = spawn_http_response(http_not_found_response());
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+        value: format!("{server}/{}", reference.ciphertext_sha256),
+    }];
+    assert!(matches!(
+        download_encrypted_media_classified(
+            reference,
+            &[7; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true),
+            None
+        )
+        .await,
+        Err(AttachmentDownloadFailure::Retry(_))
+    ));
+}

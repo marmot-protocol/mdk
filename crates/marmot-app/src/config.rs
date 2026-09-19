@@ -51,8 +51,33 @@ pub enum CursorPersistence {
     Frozen,
 }
 
+/// Automatic attachment policy. Quota is retained plaintext; disk admission
+/// additionally reserves space for SQLite/WAL copies. No automatic eviction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentAcquisitionPolicy {
+    pub retained_bytes_per_account: u64,
+    pub minimum_free_disk_bytes: u64,
+    pub maximum_transfer_bytes: u64,
+}
+impl Default for AttachmentAcquisitionPolicy {
+    fn default() -> Self {
+        Self {
+            retained_bytes_per_account: 2 * 1024 * 1024 * 1024,
+            minimum_free_disk_bytes: 256 * 1024 * 1024,
+            maximum_transfer_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
+    /// Optional public client label for newly prepared KeyPackage events.
+    /// None leaves publications untagged; signed retries retain their original tags.
+    pub key_package_client_name: Option<String>,
+    /// Automatic acquisition defaults on with bounded resource limits.
+    /// None disables automatic acquisition; frozen runtimes always disable it.
+    /// Per-account native policy overrides are durable.
+    pub attachment_acquisition: Option<AttachmentAcquisitionPolicy>,
     /// Disable exporters for short-lived command processes. Frozen cursors always disable them.
     pub usage_diagnostics_silent: bool,
     pub directory_max_future_skew: Duration,
@@ -228,6 +253,8 @@ pub struct MarmotServiceEndpoints {
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
+            key_package_client_name: None,
+            attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
@@ -258,6 +285,11 @@ impl Default for MarmotAppConfig {
 }
 
 impl MarmotAppConfig {
+    pub fn with_key_package_client_name(mut self, name: Option<String>) -> Self {
+        self.key_package_client_name = name;
+        self
+    }
+
     pub fn with_directory_max_future_skew(mut self, skew: Duration) -> Self {
         self.directory_max_future_skew = skew;
         self

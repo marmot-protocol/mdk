@@ -183,6 +183,27 @@ int main(int argc, char **argv) {
     }
     ok("client constructed");
 
+    st = marmot_record_host_performance(client,
+        MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,
+        MARMOT_HOST_PERFORMANCE_OUTCOME_CANCELLED);
+    check(st == MARMOT_STATUS_OK, "conversation host timing accepted");
+    MarmotAppPerformanceSnapshot *performance = NULL;
+    st = marmot_app_performance_snapshot(client, &performance);
+    check(st == MARMOT_STATUS_OK && performance != NULL, "runtime performance snapshot");
+    bool found_timing = false;
+    if (performance != NULL) {
+        for (uintptr_t i = 0; i < performance->runtime_operations_len; i++) {
+            const MarmotRuntimePerformanceSnapshot *timing = &performance->runtime_operations[i];
+            if (strcmp(timing->operation, "host_conversation_composer_ready") == 0) {
+                found_timing = timing->started == 1 && timing->completed == 1 &&
+                    timing->cancelled == 1 && timing->in_flight == 0 &&
+                    timing->duration_ms.sum_ms == 125 && timing->duration_ms.buckets_len > 0;
+            }
+        }
+    }
+    check(found_timing, "runtime timing array, outcome and histogram cross C ABI");
+    marmot_app_performance_snapshot_free(performance);
+
     bool stopping = true;
     st = marmot_client_is_stopping(client, &stopping);
     check(st == MARMOT_STATUS_OK && !stopping, "client not stopping");
@@ -310,6 +331,19 @@ int main(int argc, char **argv) {
     st = marmot_random_profile_pseudonym(client, &random_name);
     check(st == MARMOT_STATUS_OK && random_name != NULL, "random profile pseudonym");
     marmot_string_free(random_name);
+
+    /* Local attachment APIs never turn a missing account into a download. */
+    MarmotAttachmentLocalTarget local_target = {unknown_id, unknown_id, 0};
+    MarmotAttachmentLocalAssetList *local_assets = NULL;
+    st = marmot_attachment_local_assets(client, unknown_id, "abab", &local_target, 1, &local_assets);
+    check(st != MARMOT_STATUS_OK && local_assets == NULL, "local assets reject unknown account");
+    st = marmot_attachment_local_assets(client, unknown_id, "abab", NULL, 65, &local_assets);
+    check(st == MARMOT_STATUS_INVALID_ARGUMENT && local_assets == NULL, "local asset lookup bound");
+    MarmotAttachmentLocalBytes *local_bytes = NULL;
+    st = marmot_read_attachment_asset(client, unknown_id, "invalid", 0, 65536, &local_bytes);
+    check(st != MARMOT_STATUS_OK && local_bytes == NULL, "local attachment reference validation");
+    marmot_attachment_local_asset_list_free(local_assets);
+    marmot_attachment_local_bytes_free(local_bytes);
 
     /* ---- boundary validation ------------------------------------------ */
     /* Out-of-range enum discriminants are rejected instead of becoming

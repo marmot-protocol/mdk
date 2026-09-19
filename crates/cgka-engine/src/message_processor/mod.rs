@@ -17,7 +17,6 @@ mod send;
 mod store;
 
 pub(crate) use ingest::avatar_component_snapshot;
-pub(crate) use send::merge_capabilities;
 pub(crate) use store::fail_deferred_peel_rows_in_terminal_group;
 #[cfg(feature = "test-conformance-snapshot")]
 pub(crate) use store::normalized_deferred_peel_lifecycle;
@@ -50,6 +49,15 @@ use web_time::Instant;
 pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
+
+// Retained commits supply fork context even when their state cannot gate sends.
+const GATE_CLASSIFIER_STATES: [MessageState; 5] = [
+    MessageState::Sent,
+    MessageState::Created,
+    MessageState::Retryable,
+    MessageState::ConvergenceDeferred,
+    MessageState::Processed,
+];
 
 /// Retry budget for a `PeelDeferred` row (mdk#339). Each unit is one
 /// actual re-peel attempt under a *changed* peel context (the fingerprint
@@ -377,6 +385,44 @@ impl DeferredPeelGroupState {
 
 #[derive(Default)]
 pub(crate) struct DeferredPeelAccountState {
+    /// Account-wide `PeelDeferred` bytes, in the sense the account cap is
+    /// meant to bound: bytes *awaiting a sweep*.
+    ///
+    /// The total sums only groups the deferred-peel sweep will actually enter.
+    /// Rows in a group it refuses at the door — see
+    /// [`Engine::deferred_peel_sweep_is_blocked`] — are parked, not queued: no
+    /// sweep will ever drain them, so charging them would let one stuck group
+    /// spend the whole account budget and refuse inbound traffic for every
+    /// healthy group on the device.
+    ///
+    /// Four sites share that rule and must keep agreeing:
+    /// [`Engine::ensure_peel_deferred_usage_initialized`] reconstructs the sum,
+    /// [`Engine::note_peel_deferred_row_persisted`] adds each later row,
+    /// [`Engine::has_peel_deferred_capacity`] measures admission against it,
+    /// and `Engine::enter_hydration_quarantine` / `leave_hydration_quarantine`
+    /// move a group's bytes out and back as quarantine is established or
+    /// lifted. The reconstruction is lazy and a quarantine is established
+    /// during per-group hydration, so those two orders must agree.
+    ///
+    /// The bound this relaxes: on-disk `PeelDeferred` bytes may exceed the
+    /// account cap by at most one per-group cap per un-sweepable group, since
+    /// an un-sweepable group cannot grow past its own per-group cap.
+    ///
+    /// Those quarantine moves are keyed on the whole predicate, not on the
+    /// quarantine alone, so a group that is also halted moves no bytes in
+    /// either direction.
+    ///
+    /// One approximation remains. `Unrecoverable` transitions are raw record
+    /// writes with no such hook, so a group halted mid-session keeps the charge
+    /// it already had, and a group halted before the reconstruction that later
+    /// repairs drains rows it was never charged for. Both are bounded by that
+    /// group's per-group cap and end at the next open, which recomputes the
+    /// total — as does `Engine::forget_group_local`.
+    ///
+    /// Membership is keyed on the group's state when each write happens, never
+    /// at retire time: a sweep that enters a `Stable` group and halts it
+    /// part-way through must still decrement the rows the reconstruction
+    /// charged, so the retire path is deliberately ungated.
     bytes: usize,
     counted: bool,
 }
@@ -1577,7 +1623,11 @@ impl<S: StorageProvider> Engine<S> {
         )? {
             return Ok(false);
         }
-        let records = self.storage.list_messages(group_id, EpochId(anchor))?;
+        let records = self.storage.list_messages_in_states(
+            group_id,
+            &GATE_CLASSIFIER_STATES,
+            EpochId(anchor),
+        )?;
         Ok(self.any_gating_convergence_input(anchor, ceiling, &records))
     }
 
@@ -1656,14 +1706,8 @@ impl<S: StorageProvider> Engine<S> {
             if record.epoch.0 < anchor {
                 continue;
             }
-            if !matches!(
-                record.state,
-                MessageState::Sent
-                    | MessageState::Created
-                    | MessageState::Retryable
-                    | MessageState::ConvergenceDeferred
-                    | MessageState::Processed
-            ) {
+            // Hydration also calls this classifier with an unfiltered list.
+            if !GATE_CLASSIFIER_STATES.contains(&record.state) {
                 continue;
             }
             // Fail OPEN, not closed (mdk#736): a row we cannot decode, is not an
@@ -1838,6 +1882,43 @@ impl<S: StorageProvider> Engine<S> {
             .progressed)
     }
 
+    /// Whether the deferred-peel sweep refuses to enter this group for a
+    /// reason that outlives the sweep attempt.
+    ///
+    /// Two reasons, both durable and both needing an explicit repair before a
+    /// sweep can ever run again:
+    ///
+    /// - A hydration quarantine leaves no `epoch_manager` entry at all, so the
+    ///   `Stable` gate below would fall through and re-ingest retained rows
+    ///   against the very state validation rejected (mdk#364). The rows replay
+    ///   once repair clears the quarantine.
+    /// - A durable `Unrecoverable` halt freezes the group until an
+    ///   authenticated repair Welcome, and the `Stable` gate refuses it for as
+    ///   long as the halt lasts.
+    ///
+    /// Rows retained behind either gate are parked, not queued, which is why
+    /// [`DeferredPeelAccountState::bytes`] leaves them out of the account
+    /// total. Transient non-`Stable` states are deliberately excluded: they
+    /// resolve on their own, so their rows really are awaiting a sweep.
+    ///
+    /// Deliberately reads only the in-memory state the sweep itself reads, so
+    /// the prediction and the refusal cannot disagree. The two legs reach that
+    /// state differently, and only the halt is settled before ingest:
+    ///
+    /// - a durable `Unrecoverable` halt is restored into the epoch map by the
+    ///   session-open cheap pass (`Engine::hydrate_stable_groups_from_storage`),
+    ///   with [`Self::sync_unrecoverable_halt_from_record`] as the syncing form
+    ///   for paths that run without it;
+    /// - a hydration quarantine is established only inside per-group hydration,
+    ///   which under `defer_group_hydration` can run after the account
+    ///   reconstruction. `Engine::enter_hydration_quarantine` moves the group's
+    ///   bytes out of the account total at that moment (and
+    ///   `leave_hydration_quarantine` back in), so the ordering cannot change
+    ///   the total.
+    pub(crate) fn deferred_peel_sweep_is_blocked(&self, group_id: &GroupId) -> bool {
+        self.quarantined_reason(group_id).is_some() || self.epoch_manager.is_unrecoverable(group_id)
+    }
+
     async fn retry_deferred_peels_with_execution(
         &mut self,
         group_id: &GroupId,
@@ -1856,11 +1937,10 @@ impl<S: StorageProvider> Engine<S> {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
             DeferredPeelExecution::Background { .. } => None,
         };
-        // A quarantined group has no epoch_manager entry, so the Stable gate
-        // below would fall through and re-ingest its retained rows against
-        // the very state validation rejected (mdk#364). The rows replay
-        // once repair clears the quarantine.
-        if self.quarantined_reason(group_id).is_some() {
+        // Durably blocked: quarantined or halted Unrecoverable. This is the
+        // same question `ensure_peel_deferred_usage_initialized` asks when it
+        // decides whose rows the account budget is bounding.
+        if self.deferred_peel_sweep_is_blocked(group_id) {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -2646,10 +2726,15 @@ impl<S: StorageProvider> Engine<S> {
             // sweep consumes only retention/progress, so its opaque result
             // deliberately carries no lineage and does not scan stored history.
             Ok(Deferred(_)) | Ok(Outcome(IngestOutcome::TransportDeferred { .. })) => Ok(false),
-            Ok(Outcome(IngestOutcome::ResourceRefused {
-                resource: InboundResourceLimit::TransportDeferredCapacity,
-                ..
-            })) => Ok(false),
+            // A refusal names a local resource bound, never a verdict on the
+            // message, so NO resource may retire this row: the terminal arm
+            // below would answer `Duplicate` to every later redelivery of an id
+            // this device never opened. Defense-in-depth — this row already
+            // holds its slot, so `has_peel_deferred_capacity` charges it no row
+            // and no byte and admits it — but the rule is the refusal's, not the
+            // resource's, so the arm is written for all of them. The row keeps
+            // `PeelDeferred` and its cap slot, and the next sweep re-attempts it.
+            Ok(Outcome(IngestOutcome::ResourceRefused { .. })) => Ok(false),
             Ok(Outcome(IngestOutcome::LocalState {
                 state: LocalIngestState::Quarantined,
             })) => {
@@ -2697,7 +2782,6 @@ impl<S: StorageProvider> Engine<S> {
                 IngestOutcome::Stale { .. }
                 | IngestOutcome::Ignored { .. }
                 | IngestOutcome::LocalState { .. }
-                | IngestOutcome::ResourceRefused { .. }
                 | IngestOutcome::Rejected { .. },
             )) => {
                 // Terminal stale classifications are still successful
@@ -2925,6 +3009,9 @@ impl<S: StorageProvider> Engine<S> {
             let bytes = records.iter().fold(0_usize, |sum, record| {
                 sum.saturating_add(record.payload.len())
             });
+            // Per-group state is reconstructed for every group; only the
+            // account total is scoped to sweepable ones.
+            let sweep_is_blocked = self.deferred_peel_sweep_is_blocked(&group_id);
             let state = self.deferred_peel.entry(group_id).or_default();
             state.deferred_rows = rows;
             state.deferred_bytes = bytes;
@@ -2935,7 +3022,15 @@ impl<S: StorageProvider> Engine<S> {
                     (record.id, payload_bytes)
                 })
                 .collect();
-            account_bytes = account_bytes.saturating_add(bytes);
+            if !sweep_is_blocked {
+                account_bytes = account_bytes.saturating_add(bytes);
+            }
+            // `peak_group_*` stay account-wide on purpose: a blocked group's
+            // rows are real per-group usage and still bind its per-group cap,
+            // even though nothing is waiting to sweep them. The third metric,
+            // `deferred_peel_peak_bytes_per_account`, instead receives
+            // `account_bytes` below, so it reports the sweepable-scoped total
+            // the cap is actually compared against.
             peak_group_rows = peak_group_rows.max(rows);
             peak_group_bytes = peak_group_bytes.max(bytes);
         }
@@ -2947,6 +3042,53 @@ impl<S: StorageProvider> Engine<S> {
             account_bytes,
         );
         Ok(())
+    }
+
+    /// Stop counting one group's retained rows toward the account total because
+    /// it just stopped being sweepable, and its inverse. Together these keep a
+    /// quarantine transition exact in both directions without a second copy of
+    /// the membership rule: the amount moved is always the per-group state the
+    /// reconstruction would have used.
+    ///
+    /// Both no-op before the reconstruction has run — an uncounted total is
+    /// rebuilt from the predicate anyway — and for a group with no retained
+    /// rows.
+    pub(crate) fn discharge_deferred_peel_account_for_group(&mut self, group_id: &GroupId) {
+        let bytes = self.charged_deferred_peel_bytes(group_id);
+        self.deferred_peel_account.bytes = self.deferred_peel_account.bytes.saturating_sub(bytes);
+    }
+
+    /// Inverse of [`Self::discharge_deferred_peel_account_for_group`].
+    pub(crate) fn recharge_deferred_peel_account_for_group(&mut self, group_id: &GroupId) {
+        let bytes = self.charged_deferred_peel_bytes(group_id);
+        self.deferred_peel_account.bytes = self.deferred_peel_account.bytes.saturating_add(bytes);
+    }
+
+    fn charged_deferred_peel_bytes(&self, group_id: &GroupId) -> usize {
+        if !self.deferred_peel_account.counted {
+            return 0;
+        }
+        // A group that is *also* halted contributes nothing either way: the
+        // reconstruction and the per-row add both skipped it for the halt, and
+        // lifting its quarantine leaves the sweep refusing it just the same. So
+        // the amount a quarantine transition moves is keyed on the rest of the
+        // predicate, not on the quarantine alone.
+        //
+        // The durable marker is the fallback because `Engine::ensure_hydrated`
+        // retracts the provisional epoch entry before re-deriving it, so the
+        // in-memory halt is absent for exactly the window in which a failed
+        // hydration lands a quarantine. A storage error here can only move
+        // bytes that the next reconstruction puts back.
+        if self.epoch_manager.is_unrecoverable(group_id)
+            || self
+                .stored_group_record(group_id)
+                .is_ok_and(|group| group.is_some_and(|group| group.unrecoverable))
+        {
+            return 0;
+        }
+        self.deferred_peel
+            .get(group_id)
+            .map_or(0, |state| state.deferred_bytes)
     }
 
     /// Refresh one group's cached usage from a durable row enumeration. This
@@ -2992,6 +3134,13 @@ impl<S: StorageProvider> Engine<S> {
         let incoming_rows = usize::from(previous_payload_bytes.is_none());
         let additional_bytes =
             incoming_payload_bytes.saturating_sub(previous_payload_bytes.unwrap_or_default());
+        // Read before the `deferred_peel` borrow below. A blocked group's rows
+        // never enter the account total, so measuring its inbound against that
+        // total would let live groups' backlog decide whether a parked group
+        // may retain anything — the account-wide refusal this rule removes,
+        // arriving from the admission side instead. Its per-group cap, checked
+        // below, is its bound.
+        let charges_account = !self.deferred_peel_sweep_is_blocked(group_id);
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
         let group_has_capacity = state.has_capacity(
             incoming_rows,
@@ -3000,6 +3149,7 @@ impl<S: StorageProvider> Engine<S> {
             self.deferred_peel_group_byte_limit,
         );
         let account_has_capacity = additional_bytes == 0
+            || !charges_account
             || self
                 .deferred_peel_account
                 .bytes
@@ -3079,11 +3229,18 @@ impl<S: StorageProvider> Engine<S> {
         message_id: &MessageId,
         payload_bytes: usize,
     ) {
+        // The account total sums only sweepable groups, so this add has to skip
+        // exactly the groups `ensure_peel_deferred_usage_initialized` skips —
+        // ingest keeps retaining rows for a quarantined group, and charging
+        // them would let the account creep back up one retained row at a time.
+        // The per-group add below is unconditional: the per-group cap is the
+        // only thing bounding a blocked group's backlog.
+        let charges_account = !self.deferred_peel_sweep_is_blocked(group_id);
         let (group_rows, group_bytes) = {
             let state = self.deferred_peel.entry(group_id.clone()).or_default();
             match state.note_row_persisted(message_id.clone(), payload_bytes) {
                 Some(previous) => {
-                    if self.deferred_peel_account.counted {
+                    if charges_account && self.deferred_peel_account.counted {
                         self.deferred_peel_account.bytes = self
                             .deferred_peel_account
                             .bytes
@@ -3092,7 +3249,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 None => {
-                    if self.deferred_peel_account.counted {
+                    if charges_account && self.deferred_peel_account.counted {
                         self.deferred_peel_account.bytes = self
                             .deferred_peel_account
                             .bytes
@@ -3438,11 +3595,11 @@ impl<S: StorageProvider> Engine<S> {
                     // Leave it and stop: the record is terminal from here, so
                     // every row behind this one gets the same refusal.
                     //
-                    // Never relabel it `Processed`: that is an OpenMLS graph
-                    // input state (`OPENMLS_GRAPH_INPUT_STATES`), so a
-                    // never-applied commit would score as canonical evidence, and
-                    // it is outside `unresolved_commit_state`, so the re-join
-                    // sweep would not clean it up. Retained is also the useful
+                    // Never relabel it `Processed`: `recorded_message_outcome`
+                    // answers `Duplicate` for every terminal state, so retiring a
+                    // row nothing ever opened makes its id permanently
+                    // undeliverable — redelivery is the only way these bytes
+                    // arrive again. Retained is also the useful
                     // state: a commit published after our removal is the "raced
                     // ahead of the re-add Welcome" case, and this replay runs
                     // again from `do_join_welcome`. Nothing spins on it meanwhile
@@ -3451,6 +3608,28 @@ impl<S: StorageProvider> Engine<S> {
                     // and a `PeelDeferred` row's cap slot was already returned
                     // when the removal retired the deferred backlog.
                     break;
+                }
+                Ok(IngestOutcome::ResourceRefused { .. }) => {
+                    // Refused for lack of room, not on the message's merits: the
+                    // group's deferred-peel cap had no slot for this row right
+                    // now. Leave it exactly as ingest found it — still awaiting
+                    // retry, still the redelivery source — and release nothing:
+                    // only a `PeelDeferred` row holds a cap slot, and such a row
+                    // cannot be refused here, because re-ingesting an already
+                    // retained row asks `has_peel_deferred_capacity` for no
+                    // additional rows or bytes.
+                    //
+                    // Never relabel it `Processed`, for the same reason as the
+                    // `Removed` arm above: `recorded_message_outcome` answers
+                    // `Duplicate` for every terminal state, so a row retired here
+                    // would be dead for this device forever — the one thing
+                    // `IngestOutcome::ResourceRefused` promises a local resource
+                    // bound must never do.
+                    //
+                    // Continue rather than stop: the cap bounds only rows that
+                    // need parking, so a later row may still peel and apply. This
+                    // replay runs again on every publish cycle, so the retry cost
+                    // stays bounded by the rows still retained.
                 }
                 Ok(_) => {
                     // Terminal reclassification of the raw wrapper: the content-

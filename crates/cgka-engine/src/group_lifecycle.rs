@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
-    required_capabilities_extension_for_features,
 };
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -22,7 +21,7 @@ use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet, default_group_components,
 };
-use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
+use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
@@ -128,6 +127,7 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
             | EngineError::Serialize(_)
             | EngineError::InvalidWelcome
+            | EngineError::MissingWelcomeKeyPackage
             | EngineError::InvalidCredentialIdentity(_)
             | EngineError::InvalidAccountIdentityProof(_)
             | EngineError::MissingRequiredCapabilities { .. }
@@ -140,6 +140,7 @@ fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
     error: WelcomeError<StorageError>,
 ) -> EngineError {
     match error {
+        WelcomeError::NoMatchingKeyPackage => EngineError::MissingWelcomeKeyPackage,
         WelcomeError::StorageError(_)
         | WelcomeError::PublicGroupError(CreationFromExternalError::WriteToStorageError(_)) => {
             // OpenMLS storage errors are backend-specific and cannot be converted
@@ -239,20 +240,14 @@ impl<S: StorageProvider> Engine<S> {
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         // 1. Validate invitees against required capabilities.
-        let active_transports: [TransportKind; 0] = []; // engine-layer: no transports
-        let (mut required_caps, _) = required_capabilities_extension_for_features(
-            &self.registry,
-            &active_transports,
-            &req.required_features,
-            self.new_protocol_profile,
-        )?;
+        let crate::key_package::CreationKeyPackageCapabilities {
+            required: mut required_caps,
+            mandatory_components,
+            required_roles: required_role_caps,
+        } = self.creation_key_package_capabilities(&req)?;
         let mut desired_components = AppComponentSet::from(default_group_components());
-        for component_id in required_caps.app_components.ids.clone() {
-            desired_components.insert(component_id);
-        }
-        for component in &req.app_components {
-            required_caps.app_components.insert(component.component_id);
-            desired_components.insert(component.component_id);
+        for component_id in &required_caps.app_components.ids {
+            desired_components.insert(*component_id);
         }
         let mut self_supported_components = self.supported_app_components.clone();
         if self.new_protocol_profile == ProtocolProfile::Current {
@@ -296,19 +291,10 @@ impl<S: StorageProvider> Engine<S> {
         // invitee KeyPackage but are NOT folded into the group's
         // RequiredCapabilities — they are a component-driven per-member
         // advertisement requirement, not an MLS-level group requirement.
-        let required_role_caps =
-            crate::capability_manager::required_role_capabilities_from_request_components(
-                &req.app_components,
-            );
-
         let mut parsed_kps = Vec::with_capacity(req.members.len());
         let mut negotiated_components = desired_components.intersection(&self_supported_components);
         // Engine-owned components (profile + admin policy) are NON-NEGOTIABLE
         // (mdk#746).
-        let mut mandatory_components = AppComponentSet::from(default_group_components());
-        if self.new_protocol_profile == ProtocolProfile::Current {
-            mandatory_components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
-        }
         for kp in &req.members {
             let parsed = self.parse_key_package(kp)?;
             if kp.protocol_profile != self.new_protocol_profile {
@@ -1142,7 +1128,7 @@ impl<S: StorageProvider> Engine<S> {
                 }
             }
             let consumed_key_package_ref =
-                consumed_key_package_ref.ok_or(EngineError::InvalidWelcome)?;
+                consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?;
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
@@ -1298,7 +1284,7 @@ impl<S: StorageProvider> Engine<S> {
             // apply, including required agent-stream roles.
             let mut group_required =
                 crate::capability_manager::required_capabilities_from_group(&mls_group);
-            crate::message_processor::merge_capabilities(
+            crate::capability_manager::merge_capabilities(
                 &mut group_required,
                 &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
             );
@@ -1670,7 +1656,7 @@ impl<S: StorageProvider> Engine<S> {
         // the now-live group (and so an unrepairable group can always be
         // recovered by re-invite). The buffered-message replay below picks up
         // any input retained while quarantined.
-        if self.quarantined_groups.remove(&group_id).is_some() {
+        if self.leave_hydration_quarantine(&group_id) {
             let recovered_epoch = EpochId(mls_group.epoch().as_u64());
             tracing::info!(
                 target: "cgka_engine::hydrate",
@@ -2086,5 +2072,12 @@ mod tests {
         let invalid = classify_openmls_welcome_error(WelcomeError::<&str>::UnableToDecrypt);
         assert!(matches!(invalid, EngineError::InvalidWelcome));
         assert!(terminal_welcome_error(&invalid));
+    }
+
+    #[test]
+    fn missing_welcome_key_package() {
+        let error = classify_openmls_welcome_error(WelcomeError::<&str>::NoMatchingKeyPackage);
+        assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
+        assert!(terminal_welcome_error(&error));
     }
 }

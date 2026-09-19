@@ -26,8 +26,11 @@ async fn lifecycle_and_output_mutants_start_from_shared_baseline_observations() 
             "phase:Collecting:frozen:None",
         ),
         (
+            // A losing branch inside the rewind horizon is still adoptable, so
+            // its output is parked rather than withdrawn. Either way it must
+            // never read `Accepted`, which is the mutant.
             SemanticMutation::OutputInvalidation,
-            "InvalidatedLosingBranch",
+            "DeferredLosingEligibleBranch",
         ),
         (SemanticMutation::PublicationAcknowledgement, "pending:2->0"),
         (

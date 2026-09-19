@@ -1,5 +1,7 @@
 mod draft_lifecycle;
+mod group_lookup;
 mod key_package_inventory;
+mod key_package_selection;
 mod message_journeys;
 mod report_backfill;
 mod user_blocks;
@@ -529,6 +531,8 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
+    key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
+    key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
@@ -610,7 +614,21 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
+        let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
+            if event.kind == KIND_MARMOT_KEY_PACKAGE
+                && multi_author_only.contains(&event.id)
+                && request.queries.iter().all(|query| query.authors.len() == 1)
+            {
+                return false;
+            }
+            if event.kind == KIND_MARMOT_KEY_PACKAGE
+                && single_author_only.contains(&event.id)
+                && request.queries.iter().any(|query| query.authors.len() > 1)
+            {
+                return false;
+            }
             request
                 .queries
                 .iter()
@@ -8334,6 +8352,15 @@ async fn fresh_key_package_for_account(
     account: &AccountSummary,
     legacy: bool,
 ) -> KeyPackage {
+    fresh_key_package_with_components(app, account, legacy, app.supported_app_component_ids()).await
+}
+
+async fn fresh_key_package_with_components(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    legacy: bool,
+    components: Vec<u16>,
+) -> KeyPackage {
     let signer = app.account_signer_for_summary(account).unwrap();
     let session_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let keys = app
@@ -8357,7 +8384,7 @@ async fn fresh_key_package_for_account(
     )
     .account_identity_proof_signer(signer.as_proof_signer())
     .feature_registry(app_feature_registry())
-    .supported_app_components(app.supported_app_component_ids());
+    .supported_app_components(components);
     if legacy {
         config = config.legacy_compatibility_profile();
     }
@@ -8522,6 +8549,7 @@ fn member_resolution_key_package_event(
 ) -> NostrTransportEvent {
     let metadata = cgka_engine::key_package::key_package_metadata(&key_package).unwrap();
     transport_nostr_adapter::NostrKeyPackagePublication {
+        client_name: None,
         account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
         key_package,
         key_package_slot_id: format!("{}-slot", account.label),
@@ -9381,9 +9409,24 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .iter()
             .map(|account| account.account_id_hex.clone())
             .collect::<Vec<_>>();
-        app.resolve_fresh_reinvite_key_packages(&members)
+        app.account_home().create_account("reinviter").unwrap();
+        let mut inviter = client_on_app_relay_plane(&app, "reinviter").await;
+        let group = inviter
+            .create_group("reinvite discovery", &[])
             .await
             .unwrap();
+        let requirements = inviter
+            .runtime
+            .session()
+            .invite_key_package_requirements(&group)
+            .unwrap();
+        app.resolve_compatible_member_key_packages(
+            members.clone(),
+            &requirements,
+            crate::directory::MemberResolutionPurpose::CommitFresh,
+        )
+        .await
+        .unwrap();
         for member in &members {
             assert!(
                 app.directory_entry_for_account_id(member)
@@ -9403,9 +9446,14 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         }
         fetcher.requests.lock().unwrap().clear();
         let error = app
-            .resolve_fresh_reinvite_key_packages(&members)
+            .resolve_compatible_member_key_packages(
+                members.clone(),
+                &requirements,
+                crate::directory::MemberResolutionPurpose::CommitFresh,
+            )
             .await
-            .unwrap_err();
+            .err()
+            .expect("future-only discovery must fail closed");
         assert!(matches!(error, AppError::MissingKeyPackage(id) if id == members[0]));
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -9448,7 +9496,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         requests.len(),
         3,
-        "cold shared outboxes need one discovery batch, one outbox batch, and one KeyPackage batch"
+        "prewarm needs discovery, outbox and package batches, without preference refetches"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9488,8 +9536,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        4,
-        "create must reuse discovery routes but fetch KeyPackages again"
+        12,
+        "create reuses discovery routes but adds a package batch and eight preference refetches"
     );
 }
 
@@ -9548,7 +9596,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     assert_eq!(
         requests.len(),
         2,
-        "the completed discovery query already covered the advertised outbox"
+        "discovery covers the outbox; prewarm adds only the package batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
@@ -9561,8 +9609,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        3,
-        "create must repeat only the KeyPackage query"
+        5,
+        "create adds the package batch and two preference refetches, without relay discovery"
     );
 }
 
@@ -9628,7 +9676,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
         4,
-        "both relay-list hops must retry each member after an incomplete batch"
+        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
     );
 }
 
@@ -9759,7 +9807,7 @@ async fn member_key_package_resolution_ignores_older_malformed_publication() {
 }
 
 #[tokio::test]
-async fn member_key_package_resolution_falls_back_from_newest_malformed_publication() {
+async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_replacement() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
     {
@@ -9776,13 +9824,12 @@ async fn member_key_package_resolution_falls_back_from_newest_malformed_publicat
         events.push(newer_malformed);
     }
 
-    let summary = app
+    let error = app
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
-        .expect("an invalid newest publication must not hide an older valid KeyPackage");
+        .expect_err("a malformed replacement must suppress the superseded KeyPackage in its slot");
 
-    assert_eq!(summary.unique_members, 1);
-    assert_eq!(summary.network_resolved_members, 1);
+    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
 }
 
 #[tokio::test]
@@ -10797,6 +10844,75 @@ fn repeated_display_name_lookup_reuses_directory_cache_handle() {
 }
 
 #[test]
+fn batch_names_preserve_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let caches = app.directory_caches().unwrap();
+    let shared = app.shared_storage().unwrap();
+    let ids = (11..=16).map(|id| format!("{id:064x}")).collect::<Vec<_>>();
+    for id in &ids[..4] {
+        caches[0]
+            .put(&test_directory_record(id, "first", 2))
+            .unwrap();
+        caches[1]
+            .put(&test_directory_record(id, "second", 5))
+            .unwrap();
+    }
+    for (id, timestamp) in [(&ids[0], 1), (&ids[1], 2), (&ids[3], 3), (&ids[5], 1)] {
+        shared
+            .put_public_directory_user(
+                &public_directory_user_record(&test_directory_record(id, "shared", timestamp))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let mut empty = test_directory_record(&ids[2], "unused", 0);
+    empty.profile = None;
+    caches[0].put(&empty).unwrap();
+    caches[1]
+        .put(&test_directory_record(&ids[4], "second", 5))
+        .unwrap();
+
+    let mut requested = ids.clone();
+    requested.extend([
+        alice.account_id_hex.clone(),
+        ids[0].to_uppercase(),
+        format!("{:064x}", 100),
+    ]);
+    let expected = HashMap::from([
+        (ids[0].clone(), "first".to_owned()),
+        (ids[1].clone(), "first".to_owned()),
+        (ids[3].clone(), "shared".to_owned()),
+        (ids[4].clone(), "second".to_owned()),
+        (ids[5].clone(), "shared".to_owned()),
+        (alice.account_id_hex.clone(), "alice".to_owned()),
+    ]);
+    assert_eq!(
+        app.display_names_for_account_ids(&requested).unwrap(),
+        expected
+    );
+    assert!(app.display_names_for_account_ids(&[]).unwrap().is_empty());
+    assert!(
+        app.display_names_for_account_ids(&["invalid".into()])
+            .is_err()
+    );
+
+    // Every read sees new writes; no process-level invalidation is needed.
+    shared
+        .put_public_directory_user(
+            &public_directory_user_record(&test_directory_record(&ids[1], "updated", 6)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        app.display_names_for_account_ids(&requested).unwrap()[&ids[1]],
+        "updated"
+    );
+}
+
+#[test]
 fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -10831,6 +10947,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         timeline_at: 1,
         deleted: false,
+        deletion_source: Default::default(),
         attachment_kind: None,
         attachment_count: 0,
         delivery_state: ChatListMessageDeliveryState::NotApplicable,

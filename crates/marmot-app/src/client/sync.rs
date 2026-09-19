@@ -1,3 +1,5 @@
+use crate::RuntimePerformanceOperation as RuntimeOp;
+use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -2621,7 +2623,37 @@ impl AppClient {
             if welcome { "process" } else { "receive" },
             crate::ProductUnit::Attempt,
         );
-        let ingest = client.runtime.ingest_delivery(delivery).await;
+        let telemetry = client.runtime_telemetry.clone();
+        let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
+        let ingest = client
+            .runtime
+            .ingest_delivery_with_observer(delivery, |phase, duration, success| {
+                if let Some(telemetry) = &telemetry {
+                    let operation = match phase {
+                        marmot_account::AccountIngestPhase::Engine => RuntimeOp::IngestEngine,
+                        marmot_account::AccountIngestPhase::EffectPublication => {
+                            RuntimeOp::IngestEffectPublish
+                        }
+                    };
+                    telemetry.record_runtime(
+                        operation,
+                        duration,
+                        if success {
+                            TelemetryOutcome::Success
+                        } else {
+                            TelemetryOutcome::Failure
+                        },
+                    );
+                }
+            })
+            .await;
+        if let Some(observation) = ingest_observation {
+            observation.finish(if ingest.is_ok() {
+                TelemetryOutcome::Success
+            } else {
+                TelemetryOutcome::Failure
+            });
+        }
         if let Some(observation) = observation {
             observation.finish(match &ingest {
                 Ok(effects) => match &effects.outcome {
@@ -4622,56 +4654,66 @@ impl AppClient {
         &mut self,
         created_group_id_hex: Option<&str>,
     ) -> Result<Option<crate::ChatListRow>, AppError> {
-        let seen_events = self.transport_receipts()?.pending_seen_events();
-        let frontiers_to_clear = self
-            .pending_local_group_deletion_frontier_clears
-            .iter()
-            .map(|(group_id_hex, frontier)| (group_id_hex.clone(), *frontier))
-            .collect::<Vec<_>>();
-        let application_event_ids_to_ack = self
-            .pending_application_event_acks
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let delta = AccountState {
-            label: self.state.label.clone(),
-            seen_events,
-            last_transport_timestamp: self.checkpointed_transport_timestamp,
-            groups: self
-                .state
-                .groups
+        let observation = self
+            .runtime_telemetry
+            .as_ref()
+            .map(|t| t.observe(RuntimeOp::ProjectionCheckpoint));
+        let result = (|| {
+            let seen_events = self.transport_receipts()?.pending_seen_events();
+            let frontiers_to_clear = self
+                .pending_local_group_deletion_frontier_clears
                 .iter()
-                .filter(|group| {
-                    self.pending_group_projection_updates
-                        .contains(&group.group_id_hex)
-                })
+                .map(|(group_id_hex, frontier)| (group_id_hex.clone(), *frontier))
+                .collect::<Vec<_>>();
+            let application_event_ids_to_ack = self
+                .pending_application_event_acks
+                .iter()
                 .cloned()
-                .collect(),
-        };
-        let created_chat_list_row = if let Some(group_id_hex) = created_group_id_hex {
-            Some(
+                .collect::<Vec<_>>();
+            let delta = AccountState {
+                label: self.state.label.clone(),
+                seen_events,
+                last_transport_timestamp: self.checkpointed_transport_timestamp,
+                groups: self
+                    .state
+                    .groups
+                    .iter()
+                    .filter(|group| {
+                        self.pending_group_projection_updates
+                            .contains(&group.group_id_hex)
+                    })
+                    .cloned()
+                    .collect(),
+            };
+            let created_chat_list_row = if let Some(group_id_hex) = created_group_id_hex {
+                Some(
+                    self.app
+                        .save_state_delta_and_refresh_created_chat_list_row(
+                            &delta,
+                            &frontiers_to_clear,
+                            &application_event_ids_to_ack,
+                            group_id_hex,
+                        )?,
+                )
+            } else {
                 self.app
-                    .save_state_delta_and_refresh_created_chat_list_row(
-                        &delta,
-                        &frontiers_to_clear,
-                        &application_event_ids_to_ack,
-                        group_id_hex,
-                    )?,
-            )
-        } else {
-            self.app
                 .save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
                     &delta,
                     &frontiers_to_clear,
                     &application_event_ids_to_ack,
                 )?;
-            None
-        };
-        self.pending_seen_event_count = 0;
-        self.pending_group_projection_updates.clear();
-        self.pending_local_group_deletion_frontier_clears.clear();
-        self.pending_application_event_acks.clear();
-        Ok(created_chat_list_row)
+                None
+            };
+            self.pending_seen_event_count = 0;
+            self.pending_group_projection_updates.clear();
+            self.pending_local_group_deletion_frontier_clears.clear();
+            self.pending_application_event_acks.clear();
+            Ok(created_chat_list_row)
+        })();
+        if let Some(observation) = observation {
+            observation.finish_app(&result);
+        }
+        result
     }
 
     /// Terminal disposition for accepted-but-unpublished sends (#1177).

@@ -6,6 +6,68 @@ pub enum HostPerformanceOperationFfi {
     ForegroundLocalReady,
     OutboundMessageVisible,
     InboundMessageVisible,
+    ConversationLocalVisible,
+    ConversationComposerReady,
+}
+
+/// Bounded runtime diagnostics. Operation names are defined by MDK, never callers.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RuntimePerformanceSnapshotFfi {
+    pub operation: String,
+    pub started: u64,
+    pub completed: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub cancelled: u64,
+    pub timeouts: u64,
+    pub not_ready: u64,
+    pub in_flight: u64,
+    pub oldest_tracked_in_flight_ms: u64,
+    pub untracked_in_flight: u64,
+    pub duration_ms: DurationHistogramSnapshotFfi,
+}
+impl From<marmot_app::RuntimePerformanceSnapshot> for RuntimePerformanceSnapshotFfi {
+    fn from(v: marmot_app::RuntimePerformanceSnapshot) -> Self {
+        let marmot_app::RuntimePerformanceSnapshot {
+            operation,
+            started,
+            completed,
+            successes,
+            failures,
+            cancelled,
+            timeouts,
+            not_ready,
+            in_flight,
+            oldest_tracked_in_flight_ms,
+            untracked_in_flight,
+            duration_ms,
+        } = v;
+        Self {
+            operation: operation.as_str().into(),
+            started,
+            completed,
+            successes,
+            failures,
+            cancelled,
+            timeouts,
+            not_ready,
+            in_flight,
+            oldest_tracked_in_flight_ms,
+            untracked_in_flight,
+            duration_ms: DurationHistogramSnapshotFfi {
+                buckets: duration_ms
+                    .buckets
+                    .into_iter()
+                    .map(|b| DurationHistogramBucketFfi {
+                        upper_bound_ms: b.upper_bound_ms,
+                        count: b.count,
+                    })
+                    .collect(),
+                overflow_count: duration_ms.overflow_count,
+                sum_ms: duration_ms.sum_ms,
+            },
+        }
+    }
 }
 
 /// One fixed-bucket duration histogram bucket.
@@ -76,6 +138,7 @@ impl From<marmot_app::AppPerformanceOperationSnapshot> for AppPerformanceOperati
 /// surface is reviewed and updated in lockstep.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AppPerformanceSnapshotFfi {
+    pub runtime_operations: Vec<RuntimePerformanceSnapshotFfi>,
     pub app_start: AppPerformanceOperationSnapshotFfi,
     pub directory_subscription_sync: AppPerformanceOperationSnapshotFfi,
     pub account_reconcile: AppPerformanceOperationSnapshotFfi,
@@ -174,6 +237,7 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
         // when the destination record is edited — until the FFI surface is
         // reviewed and grows the same field in lockstep.
         let marmot_app::AppPerformanceSnapshot {
+            runtime_operations,
             app_start,
             directory_subscription_sync,
             account_reconcile,
@@ -258,6 +322,7 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             host_foreground_local_ready,
         } = value;
         Self {
+            runtime_operations: runtime_operations.into_iter().map(Into::into).collect(),
             app_start: app_start.into(),
             directory_subscription_sync: directory_subscription_sync.into(),
             account_reconcile: account_reconcile.into(),
@@ -352,6 +417,10 @@ impl From<HostPerformanceOperationFfi> for marmot_app::HostPerformanceOperation 
             HostPerformanceOperationFfi::OutboundMessageVisible => Self::OutboundMessageVisible,
             HostPerformanceOperationFfi::InboundMessageVisible => Self::InboundMessageVisible,
             HostPerformanceOperationFfi::SplashReady => Self::SplashReady,
+            HostPerformanceOperationFfi::ConversationComposerReady => {
+                Self::ConversationComposerReady
+            }
+            HostPerformanceOperationFfi::ConversationLocalVisible => Self::ConversationLocalVisible,
             HostPerformanceOperationFfi::ForegroundLocalReady => Self::ForegroundLocalReady,
         }
     }
@@ -361,6 +430,9 @@ impl From<HostPerformanceOperationFfi> for marmot_app::HostPerformanceOperation 
 pub enum HostPerformanceOutcomeFfi {
     Success,
     Failure,
+    Cancelled,
+    Timeout,
+    Unavailable,
 }
 
 impl From<HostPerformanceOutcomeFfi> for marmot_app::HostPerformanceOutcome {
@@ -368,6 +440,9 @@ impl From<HostPerformanceOutcomeFfi> for marmot_app::HostPerformanceOutcome {
         match value {
             HostPerformanceOutcomeFfi::Success => Self::Success,
             HostPerformanceOutcomeFfi::Failure => Self::Failure,
+            HostPerformanceOutcomeFfi::Unavailable => Self::Unavailable,
+            HostPerformanceOutcomeFfi::Timeout => Self::Timeout,
+            HostPerformanceOutcomeFfi::Cancelled => Self::Cancelled,
         }
     }
 }
@@ -377,6 +452,46 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn conversation_host_outcomes_and_runtime_snapshots_cross_bindings() {
+        let telemetry = marmot_app::AppPerformanceTelemetry::default();
+        for outcome in [
+            HostPerformanceOutcomeFfi::Success,
+            HostPerformanceOutcomeFfi::Failure,
+            HostPerformanceOutcomeFfi::Cancelled,
+            HostPerformanceOutcomeFfi::Timeout,
+            HostPerformanceOutcomeFfi::Unavailable,
+        ] {
+            telemetry.record_host_performance(
+                HostPerformanceOperationFfi::ConversationComposerReady.into(),
+                Duration::from_millis(100),
+                outcome.into(),
+            );
+        }
+        let snapshot: AppPerformanceSnapshotFfi = telemetry.snapshot().into();
+        assert_eq!(
+            snapshot.runtime_operations.len(),
+            marmot_app::RuntimePerformanceOperation::ALL.len()
+        );
+        let s = snapshot
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == "host_conversation_composer_ready")
+            .unwrap();
+        assert_eq!((s.started, s.completed, s.in_flight), (5, 5, 0));
+        assert_eq!(
+            (
+                s.successes,
+                s.failures,
+                s.cancelled,
+                s.timeouts,
+                s.not_ready
+            ),
+            (1, 1, 1, 1, 1)
+        );
+        assert_eq!(s.duration_ms.sum_ms, 500);
+    }
 
     #[test]
     fn message_journey_host_metrics() {

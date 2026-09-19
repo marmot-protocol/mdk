@@ -11,6 +11,15 @@ set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# Avoid Rust/LLVM debug stripping producing a misaligned Mach-O LINKEDIT pool
+# rejected by Xcode 27. Match MarmotKit's unstripped Apple artifact policy.
+# https://github.com/rust-lang/rust/issues/157750
+# Revisit after upgrading the pinned Rust toolchain (fix: rust-lang/rust#158410).
+# Remove only after the default optimized shared/static smoke passes without it.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    export CARGO_PROFILE_RELEASE_STRIP=none
+fi
+
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"

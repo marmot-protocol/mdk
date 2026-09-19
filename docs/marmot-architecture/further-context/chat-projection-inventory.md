@@ -1,7 +1,7 @@
 ---
 title: "Chat and conversation projection inventory"
 created: 2026-09-07
-updated: 2026-09-15
+updated: 2026-09-19
 tags: [marmot, architecture, projections, chat]
 ---
 
@@ -24,6 +24,10 @@ The intended direction is an optimized, MDK-owned chat presentation API alongsid
 A complete response does not require one physical table, one SQL statement, or a separate database for every API.
 Persist expensive derived state where it buys predictable reads; preserve the domain records and queries that support
 other Marmot applications. Remove competing presentation ownership only after its replacement and consumers are known.
+
+For current remaining draft, delivery and lifecycle gaps and release evidence, see
+the [2026-09-19 chat-row contract audit](chat-row-contract-audit.md). The original
+complete-row contract is broader than the selected identity/navigation work.
 
 ## 1. Existing persistent data and projections
 

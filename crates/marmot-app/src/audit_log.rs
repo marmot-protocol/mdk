@@ -809,6 +809,8 @@ impl MarmotApp {
             Ok(recorder) => {
                 // Emit a source_context row identifying the producing account and
                 // the host-supplied device/client metadata from tracker config.
+                // JsonlRecorder repeats the latest explicit source row in each
+                // size-rotated segment; metadata remains in the validated body.
                 use marmot_forensics::ForensicRecorder as _;
                 let source = self.audit_source_context_for_recorder(&device_id_hex, account_id);
                 recorder.record(marmot_forensics::AuditRecord::new(
@@ -1543,6 +1545,50 @@ mod tests {
         assert_ne!(event["account_ref"], source["local_member_ref"]);
         assert!(!first_line.contains(&hex::encode(account_id.as_slice())));
         assert!(!first_line.contains("alice"));
+    }
+
+    #[tokio::test]
+    async fn size_rotated_audit_segments_keep_configured_source_in_validated_body() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.set_audit_log_tracker_config(AuditLogTrackerConfig {
+            source: AuditLogUploadSource {
+                hardware_model: Some("iPhone17,3".into()),
+                platform: Some("ios".into()),
+                app_version: Some("2026.9.18".into()),
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        let recorder = app.build_audit_recorder("alice", true);
+        let path = recorder.audit_log_path().unwrap();
+        let initial = source_context_event(&path);
+        for _ in 0..8000 {
+            recorder.record(marmot_forensics::AuditRecord::new(
+                None,
+                marmot_forensics::AuditEventKind::SendEntry {
+                    intent_kind: "app_message".into(),
+                },
+            ));
+        }
+        let files = app.audit_log_files().unwrap();
+        assert!(files.len() >= 3);
+        for file in files {
+            let source = source_context_event(Path::new(&file.path));
+            assert_eq!(source["kind"]["source"], initial["kind"]["source"]);
+            for field in ["account_ref", "engine_id", "recorder_session_id"] {
+                assert_eq!(source[field], initial[field]);
+            }
+            let snapshot =
+                AuditUploadSnapshot::capture(tokio::fs::File::open(&file.path).await.unwrap())
+                    .await
+                    .unwrap();
+            assert!(snapshot.complete);
+            snapshot.validate().unwrap();
+        }
     }
 
     #[test]

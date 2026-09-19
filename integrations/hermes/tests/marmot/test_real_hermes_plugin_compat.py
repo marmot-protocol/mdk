@@ -58,20 +58,19 @@ class SourceInstallCapabilityTests(unittest.TestCase):
             pkg_root = Path(temp) / "pkg"
             pkg_root.mkdir()
             (pkg_root / "marmot").symlink_to(artifact)
-            sys.path.insert(0, str(pkg_root))
-            try:
-                for name in ("marmot.doctor", "marmot.diagnostics"):
-                    sys.modules.pop(name, None)
-                sys.modules.pop("marmot", None)
-                doctor = importlib.import_module("marmot.doctor")
-                self.assertTrue(callable(doctor.collect))
-                self.assertTrue(callable(doctor.main))
-                self.assertNotIn("marmot.adapter", sys.modules)
-            finally:
-                if sys.path and sys.path[0] == str(pkg_root):
-                    sys.path.pop(0)
-                for name in ("marmot.doctor", "marmot.diagnostics", "marmot"):
-                    sys.modules.pop(name, None)
+            subprocess.run(
+                [
+                    sys.executable, "-B", "-c",
+                    "import sys; sys.path.insert(0, sys.argv[1]); "
+                    "from marmot import doctor; "
+                    "assert callable(doctor.collect); assert callable(doctor.main); "
+                    "assert 'marmot.adapter' not in sys.modules",
+                    str(pkg_root),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     def test_ref_parameter_does_not_imply_subdirectory_support(self):
         class RefOnlyPluginsCommand:

@@ -1,6 +1,6 @@
 # marmot-c
 
-Stable C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
+C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
 any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
 
 ## What you get
@@ -17,6 +17,16 @@ Build the bundle locally:
 
 Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip with the same
 contents.
+
+## Binary compatibility
+
+Build clients against the header shipped with the exact native library they load.
+Output records have concrete C layouts; this API has no tail-extension or
+cross-release layout-compatibility guarantee. Do not swap in a new library under
+an application compiled against older record layouts.
+
+See [the changelog](CHANGELOG.md) for record-layout changes and upgrade requirements
+for each release.
 
 ## Using the ABI
 
@@ -103,7 +113,17 @@ tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
 against both linkage models (valgrind when available). Pass `--debug` first
 to reuse debug/test-profile dependencies for a faster local or PR smoke run;
-release and scheduled validation use the default release build.
+release and scheduled validation use the default release build. On macOS both
+build scripts pin release `strip=none`, matching MarmotKit's Apple policy: Rust's
+debug-stripping path can emit a misaligned Mach-O string table that Xcode 27
+rejects. Optimization remains enabled; Linux packaging is unchanged. Revisit the
+pin after a Rust toolchain upgrade incorporating
+[rust-lang/rust#158410](https://github.com/rust-lang/rust/pull/158410), and remove it
+only after the default optimized shared/static smoke passes without the override.
+The C CI workflows run on Linux; the Darwin branch currently has local smoke
+evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
+alternating these scripts with an unpinned `cargo build --release` can rebuild
+release dependencies.
 
 ## Audit v4 adoption
 

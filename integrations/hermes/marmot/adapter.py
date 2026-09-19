@@ -1644,17 +1644,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._ambient_context.enable_generation()
 
     def _loaded_sender_ids(self, extra: Dict[str, Any]) -> list[str]:
-        raw = extra.get("allowed_users") or extra.get("allowed_users_hex")
-        if isinstance(raw, str):
-            values = [item.strip() for item in raw.split(",") if item.strip()]
-        elif isinstance(raw, list):
-            values = [str(item).strip() for item in raw if str(item).strip()]
-        else:
-            values = []
-        if not values:
-            env_users = os.getenv("MARMOT_ALLOWED_USERS", "").strip()
-            values = [item.strip() for item in env_users.split(",") if item.strip()]
-        return values
+        return marmot_diagnostics.loaded_sender_ids(extra)
 
     def _load_observation_config(self, extra: Dict[str, Any]) -> None:
         senders = self._loaded_sender_ids(extra)

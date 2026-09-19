@@ -5,6 +5,9 @@
 //! are no fields for account, group, message, relay, URL, pubkey, payload, or
 //! key material.
 
+pub(crate) mod runtime;
+pub use runtime::{RuntimePerformanceOperation, RuntimePerformanceSnapshot};
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -117,12 +120,17 @@ pub enum HostPerformanceOperation {
     OutboundMessageVisible,
     /// From the host receiving a message update until it is rendered.
     InboundMessageVisible,
+    ConversationLocalVisible,
+    ConversationComposerReady,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostPerformanceOutcome {
     Success,
     Failure,
+    Cancelled,
+    Timeout,
+    Unavailable,
 }
 
 /// Fixed sync/catch-up boundary at which an attempt stopped.
@@ -237,6 +245,8 @@ pub struct AppPerformanceOperationSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPerformanceSnapshot {
+    #[serde(default)]
+    pub runtime_operations: Vec<RuntimePerformanceSnapshot>,
     pub app_start: AppPerformanceOperationSnapshot,
     pub directory_subscription_sync: AppPerformanceOperationSnapshot,
     pub account_reconcile: AppPerformanceOperationSnapshot,
@@ -405,6 +415,7 @@ pub struct AppPerformanceSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct AppPerformanceTelemetry {
+    runtime: runtime::RuntimeTelemetry,
     product: Option<crate::ProductAnalytics>,
     inner: Arc<Mutex<AppPerformanceTelemetryInner>>,
 }
@@ -978,7 +989,7 @@ impl AppPerformanceTelemetry {
         }
     }
 
-    /// Record a terminal sync or invite acceptance result with its bounded failure
+    /// Record a terminal account-open, sync or invite acceptance result with its bounded failure
     /// classification. Successful samples carry no failure attributes.
     pub(crate) fn record_classified_result(
         &self,
@@ -986,7 +997,10 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         failure: Option<SyncFailureClassification>,
     ) {
-        if operation == AppPerformanceOperation::GroupAcceptInvite {
+        if matches!(
+            operation,
+            AppPerformanceOperation::GroupAcceptInvite | AppPerformanceOperation::AccountOpen
+        ) {
             self.record_product(operation, duration, failure.is_none());
         } else if let Some(product) = &self.product {
             product.observe_sync(
@@ -1001,7 +1015,8 @@ impl AppPerformanceTelemetry {
         }
         debug_assert!(matches!(
             operation,
-            AppPerformanceOperation::AccountSync
+            AppPerformanceOperation::AccountOpen
+                | AppPerformanceOperation::AccountSync
                 | AppPerformanceOperation::AccountCatchUp
                 | AppPerformanceOperation::GroupAcceptInvite
         ));
@@ -1010,6 +1025,7 @@ impl AppPerformanceTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let target = match operation {
+            AppPerformanceOperation::AccountOpen => &mut inner.account_open,
             AppPerformanceOperation::AccountSync => &mut inner.account_sync,
             AppPerformanceOperation::AccountCatchUp => &mut inner.account_catch_up,
             AppPerformanceOperation::GroupAcceptInvite => &mut inner.group_accept_invite,
@@ -1026,23 +1042,44 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         outcome: HostPerformanceOutcome,
     ) {
-        let operation = match operation {
-            HostPerformanceOperation::OutboundMessageVisible => {
-                AppPerformanceOperation::HostOutboundMessageVisible
-            }
-            HostPerformanceOperation::InboundMessageVisible => {
-                AppPerformanceOperation::HostInboundMessageVisible
-            }
-            HostPerformanceOperation::SplashReady => AppPerformanceOperation::HostSplashReady,
-            HostPerformanceOperation::ForegroundLocalReady => {
-                AppPerformanceOperation::HostForegroundLocalReady
-            }
+        let runtime_outcome = match outcome {
+            HostPerformanceOutcome::Success => runtime::Outcome::Success,
+            HostPerformanceOutcome::Failure => runtime::Outcome::Failure,
+            HostPerformanceOutcome::Cancelled => runtime::Outcome::Cancelled,
+            HostPerformanceOutcome::Timeout => runtime::Outcome::Timeout,
+            HostPerformanceOutcome::Unavailable => runtime::Outcome::NotReady,
         };
-        self.record(
-            operation,
-            duration,
-            matches!(outcome, HostPerformanceOutcome::Success),
-        );
+        let success = matches!(outcome, HostPerformanceOutcome::Success);
+        match operation {
+            HostPerformanceOperation::ConversationLocalVisible => self.record_runtime(
+                RuntimePerformanceOperation::HostConversationLocalVisible,
+                duration,
+                runtime_outcome,
+            ),
+            HostPerformanceOperation::ConversationComposerReady => self.record_runtime(
+                RuntimePerformanceOperation::HostConversationComposerReady,
+                duration,
+                runtime_outcome,
+            ),
+            HostPerformanceOperation::OutboundMessageVisible => self.record(
+                AppPerformanceOperation::HostOutboundMessageVisible,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::InboundMessageVisible => self.record(
+                AppPerformanceOperation::HostInboundMessageVisible,
+                duration,
+                success,
+            ),
+            HostPerformanceOperation::SplashReady => {
+                self.record(AppPerformanceOperation::HostSplashReady, duration, success)
+            }
+            HostPerformanceOperation::ForegroundLocalReady => self.record(
+                AppPerformanceOperation::HostForegroundLocalReady,
+                duration,
+                success,
+            ),
+        }
     }
 
     /// Return cumulative process-wide aggregates suitable for the opt-in
@@ -1055,6 +1092,7 @@ impl AppPerformanceTelemetry {
         let (sqlcipher_migration_probe_runs, sqlcipher_migration_probe_skips) =
             crate::sqlcipher::sqlcipher_migration_probe_counters();
         AppPerformanceSnapshot {
+            runtime_operations: self.runtime.snapshot(),
             app_start: inner.app_start.snapshot(),
             directory_subscription_sync: inner.directory_subscription_sync.snapshot(),
             account_reconcile: inner.account_reconcile.snapshot(),

@@ -304,3 +304,63 @@ fn prepared_conversion_refreshes_report_indicator_without_reparsing_text() {
         assert_eq!((cache.conversions, cache.parses), (index + 1, 1));
     }
 }
+
+#[test]
+fn custom_tags_and_deletion_provenance_invalidate_prepared_conversion() {
+    let mut cache = ConversationConversionCache::default();
+    let mut row = record(0);
+    row.kind = 30402;
+    row.plaintext = "Classified listing".into();
+    row.tags = vec![
+        vec!["title".into(), "Bicycle".into()],
+        vec!["price".into(), "100".into(), "EUR".into()],
+    ];
+    let first = cache.row(&row, false);
+    assert_eq!(first.kind, row.kind);
+    assert_eq!(first.plaintext, row.plaintext);
+    assert_eq!(
+        first
+            .tags
+            .iter()
+            .map(|t| t.values.clone())
+            .collect::<Vec<_>>(),
+        row.tags
+    );
+    row.tags[1][1] = "90".into();
+    assert_eq!(cache.row(&row, false).tags[1].values[1], "90");
+    row.deleted = true;
+    row.plaintext.clear();
+    row.deletion_source = app::DeletionSource::Author;
+    assert!(cache.row(&row, false).tags.is_empty());
+    assert_eq!(
+        cache.row(&row, false).deletion_source,
+        super::super::timeline::DeletionSourceFfi::Author
+    );
+    row.deletion_source = app::DeletionSource::Admin;
+    let admin = cache.row(&row, false);
+    assert_eq!(
+        admin.deletion_source,
+        super::super::timeline::DeletionSourceFfi::Admin
+    );
+    assert_eq!(wire(admin), wire(presented_timeline(&row, false)));
+    assert_eq!(cache.conversions, 4);
+}
+
+#[test]
+fn legacy_deleted_record_defaults_to_unknown_provenance() {
+    let mut row = record(0);
+    row.deleted = true;
+    row.plaintext.clear();
+    row.deleted_by_message_id_hex = Some("legacy-delete".into());
+    assert_eq!(row.deletion_source, app::DeletionSource::Unknown);
+    let converted = presented_timeline(&row, false);
+    assert!(converted.deleted && converted.plaintext.is_empty());
+    assert_eq!(
+        converted.deleted_by_message_id_hex.as_deref(),
+        Some("legacy-delete")
+    );
+    assert_eq!(
+        converted.deletion_source,
+        super::super::timeline::DeletionSourceFfi::Unknown
+    );
+}

@@ -1,6 +1,24 @@
 package dev.ipf.marmotkit
 
 fun main() {
+    val transfer = AttachmentTransferStatusFfi("job", AttachmentTransferStateFfi.VERIFYING_PLAINTEXT, ULong.MAX_VALUE, 17uL, null, 42uL)
+    val transferFrame = AttachmentTransferSnapshotFfi(listOf(transfer))
+    check(FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame)) == transferFrame)
+    val localTarget = AttachmentLocalTargetFfi("message", "source", UInt.MAX_VALUE)
+    check(FfiConverterTypeAttachmentLocalTargetFfi.lift(FfiConverterTypeAttachmentLocalTargetFfi.lower(localTarget)) == localTarget)
+    for (asset in listOf(AttachmentLocalAssetFfi(null, 0uL), AttachmentLocalAssetFfi("opaque", ULong.MAX_VALUE))) {
+        check(FfiConverterTypeAttachmentLocalAssetFfi.lift(FfiConverterTypeAttachmentLocalAssetFfi.lower(asset)) == asset)
+    }
+    for (chunk in listOf(AttachmentLocalBytesFfi(false, byteArrayOf()), AttachmentLocalBytesFfi(true, byteArrayOf()), AttachmentLocalBytesFfi(true, byteArrayOf(0,-1,0,42)))) {
+        val copy = FfiConverterTypeAttachmentLocalBytesFfi.lift(FfiConverterTypeAttachmentLocalBytesFfi.lower(chunk))
+        check(copy.available == chunk.available && copy.bytes.contentEquals(chunk.bytes))
+    }
+    val timing = RuntimePerformanceSnapshotFfi("conversation_open", 5u, 4u, 1u, 1u, 1u, 1u, 0u,
+        1u, 800u, 0u, DurationHistogramSnapshotFfi(listOf(DurationHistogramBucketFfi(100u, 4u)), 0u, 400u))
+    check(FfiConverterTypeRuntimePerformanceSnapshotFfi.lift(FfiConverterTypeRuntimePerformanceSnapshotFfi.lower(timing)) == timing)
+    for (outcome in HostPerformanceOutcomeFfi.entries) {
+        check(FfiConverterTypeHostPerformanceOutcomeFfi.lift(FfiConverterTypeHostPerformanceOutcomeFfi.lower(outcome)) == outcome)
+    }
     for (state in AvatarAvailabilityFfi.entries) {
         for (acquisition in AvatarAcquisitionStateFfi.entries) {
             val asset = AvatarAssetFfi("opaque-target", "opaque-reference", state, acquisition, 7u, 4u)
@@ -13,12 +31,18 @@ fun main() {
     for (provenance in GroupSystemEventProvenanceFfi.entries) {
         val event = GroupSystemEventFfi(provenance, "Actor", "Subject", "member_added", "Member added", "actor", "subject", null, null, null, null)
         val preview = ChatListMessagePreviewFfi(event, "selected", "actor", null, "raw", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
-            1210u, 50u, false, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
+            1210u, 50u, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
         val copy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
         // Kotlin ByteArray equality is referential; compare the nested bytes by content.
         check(copy.contentTokens.blankLinesBefore.contentEquals(preview.contentTokens.blankLinesBefore))
         check(copy.contentTokens.blocks == preview.contentTokens.blocks && copy.contentTokens.truncated == preview.contentTokens.truncated)
         check(copy.copy(contentTokens = preview.contentTokens) == preview && copy.groupSystem?.provenance == provenance)
+    }
+    for (source in DeletionSourceFfi.entries) {
+        val preview = TimelineReplyPreviewFfi("deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
+            9u, null, emptyList(), null, true, source, null)
+        val copy = FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
+        check(copy.deletionSource == source && copy.deleted && copy.plaintext.isEmpty())
     }
     val edit = TimelineEditSummaryFfi(3u, "edit", 17u)
     check(FfiConverterTypeTimelineEditSummaryFfi.lift(FfiConverterTypeTimelineEditSummaryFfi.lower(edit)) == edit)
@@ -134,4 +158,41 @@ suspend fun compileAvatarCommands(marmot: Marmot, account: String, asset: Avatar
     val requested = marmot.requestAvatarAssets(account, listOf(asset.target))
     marmot.readAvatarAssets(account, requested.mapNotNull { it.reference }, 1024uL * 1024uL)
     marmot.clearAvatarCache(account)
+}
+
+suspend fun compileAttachmentCommands(marmot: Marmot, account: String, group: String) {
+    val result = marmot.attachmentHistoryPage(account, group, 50u, null)
+    if (result is AttachmentPageReadFfi.Page) {
+        val page = result.page
+        marmot.attachmentHistoryVersion(account, group).use { current ->
+            current.changeSince(page.version)
+        }
+        if (page.hasMore) marmot.attachmentHistoryPage(account, group, 50u, page.nextCursor)
+    }
+}
+
+suspend fun compileLocalAttachmentCommands(marmot: Marmot, account: String, group: String,
+                                          message: String, source: String, index: UInt) {
+    val target = AttachmentLocalTargetFfi(message, source, index)
+    val assets = marmot.attachmentLocalAssets(account, group, listOf(target))
+    assets.firstOrNull()?.reference?.let { reference ->
+        val chunk = marmot.readAttachmentAsset(account, reference, 0uL, 65536u)
+        if (chunk.available) check(chunk.bytes.size <= 65536)
+    }
+}
+
+suspend fun compileAttachmentControls(marmot: Marmot, account: String, group: String, target: AttachmentLocalTargetFfi) {
+    val policy = marmot.attachmentDownloadPolicy(account)
+    marmot.setAttachmentDownloadPolicy(account, policy.copy(automatic = false))
+    val snapshot = marmot.attachmentTransferSnapshot(account, group, listOf(target))
+    snapshot.items.firstOrNull()?.reference?.let { reference ->
+        marmot.controlAttachment(account, reference, AttachmentControlFfi.CANCEL)
+        marmot.controlAttachment(account, reference, AttachmentControlFfi.RETRY)
+        marmot.controlAttachment(account, reference, AttachmentControlFfi.REMOVE)
+    }
+    marmot.downloadAttachmentAgain(account, group, target)
+    marmot.subscribeAttachmentTransfers(account, group, listOf(target)).use { stream ->
+        stream.next()
+        stream.cancel()
+    }
 }

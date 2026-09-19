@@ -15,6 +15,16 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+/// Closed storage boundaries. Observers must only aggregate timings; they must
+/// not access storage or block on I/O, since a connection may still be held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteTimingOperation {
+    ConnectionWait,
+    Transaction,
+    WriteBegin,
+}
+pub type SqliteTimingObserver = Arc<dyn Fn(SqliteTimingOperation, Duration, bool) + Send + Sync>;
+
 /// Maximum number of attempts a write operation makes before giving up and
 /// surfacing the transient `Busy` error. The connection already sets
 /// `PRAGMA busy_timeout`, so each attempt blocks for that long inside SQLite
@@ -308,6 +318,8 @@ pub(crate) struct SharedConnection {
 }
 
 struct SharedConnectionInner {
+    timing: Mutex<Option<SqliteTimingObserver>>,
+    timing_enabled: AtomicBool,
     connection: CloseableConnection,
     /// Set before the connection is taken so threads parked on
     /// [`SharedConnectionInner::transaction_released`] wake up and bail out
@@ -332,6 +344,8 @@ impl SharedConnection {
     fn new(connection: rusqlite::Connection) -> Self {
         Self {
             inner: Arc::new(SharedConnectionInner {
+                timing: Mutex::new(None),
+                timing_enabled: AtomicBool::new(false),
                 connection: CloseableConnection::new(connection, CLOSED_DETAIL),
                 closed: AtomicBool::new(false),
                 transaction_owner: Mutex::new(None),
@@ -343,26 +357,49 @@ impl SharedConnection {
         }
     }
 
-    pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
-        let current = std::thread::current().id();
-        loop {
-            self.wait_for_transaction_slot(current)?;
-            let connection = self.inner.connection.lock()?;
-            let owner = self
-                .inner
-                .transaction_owner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(err) = self.unusable_error() {
-                return Err(err);
-            }
-            if !owner.as_ref().is_some_and(|owner| owner != &current) {
-                drop(owner);
-                return Ok(connection);
-            }
-            drop(owner);
-            drop(connection);
+    fn start_timing(&self) -> Option<(SqliteTimingObserver, std::time::Instant)> {
+        if !self.inner.timing_enabled.load(Ordering::Acquire) {
+            return None;
         }
+        self.inner
+            .timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .map(|observer| (observer, std::time::Instant::now()))
+    }
+
+    pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
+        let timing = self.start_timing();
+        let result = (|| {
+            let current = std::thread::current().id();
+            loop {
+                self.wait_for_transaction_slot(current)?;
+                let connection = self.inner.connection.lock()?;
+                let owner = self
+                    .inner
+                    .transaction_owner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = self.unusable_error() {
+                    return Err(err);
+                }
+                if !owner.as_ref().is_some_and(|owner| owner != &current) {
+                    drop(owner);
+                    return Ok(connection);
+                }
+                drop(owner);
+                drop(connection);
+            }
+        })();
+        if let Some((observer, started)) = timing {
+            observer(
+                SqliteTimingOperation::ConnectionWait,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     /// Whether [`Self::close`] has run (or is running) on this connection.
@@ -502,48 +539,50 @@ impl SharedConnection {
         E: From<StorageError>,
         F: FnOnce() -> Result<T, E>,
     {
-        let current = std::thread::current().id();
-        let mut owner = self
-            .inner
-            .transaction_owner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while owner.as_ref().is_some_and(|owner| owner != &current) {
+        let timing = self.start_timing();
+        let result = (|| {
+            let current = std::thread::current().id();
+            let mut owner = self
+                .inner
+                .transaction_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while owner.as_ref().is_some_and(|owner| owner != &current) {
+                if let Some(err) = self.unusable_error() {
+                    return Err(E::from(err));
+                }
+                owner = self
+                    .inner
+                    .transaction_released
+                    .wait(owner)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
             if let Some(err) = self.unusable_error() {
                 return Err(E::from(err));
             }
-            owner = self
-                .inner
-                .transaction_released
-                .wait(owner)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        if let Some(err) = self.unusable_error() {
-            return Err(E::from(err));
-        }
 
-        // Nested transaction on the same thread: the outer SQL transaction is
-        // already active and owns rollback/commit.
-        if owner.as_ref().is_some_and(|owner| owner == &current) {
+            // Nested transaction on the same thread: the outer SQL transaction is
+            // already active and owns rollback/commit.
+            if owner.as_ref().is_some_and(|owner| owner == &current) {
+                drop(owner);
+                return f();
+            }
+
+            *owner = Some(current);
             drop(owner);
-            return f();
-        }
 
-        *owner = Some(current);
-        drop(owner);
+            let begin = if deferred {
+                self.begin_deferred_with_retry()
+            } else {
+                self.begin_immediate_with_retry()
+            };
+            if let Err(err) = begin {
+                self.clear_transaction_owner();
+                return Err(E::from(err));
+            }
 
-        let begin = if deferred {
-            self.begin_deferred_with_retry()
-        } else {
-            self.begin_immediate_with_retry()
-        };
-        if let Err(err) = begin {
-            self.clear_transaction_owner();
-            return Err(E::from(err));
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match result {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            match result {
             Ok(Ok(value)) => match self.execute_transaction_boundary_with_retry("COMMIT") {
                 Ok(()) => {
                     let callbacks = self.take_post_commit();
@@ -585,6 +624,15 @@ impl SharedConnection {
                 }
             },
         }
+        })();
+        if let Some((observer, started)) = timing {
+            observer(
+                SqliteTimingOperation::Transaction,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     fn wait_for_transaction_slot(&self, current: ThreadId) -> StorageResult<()> {
@@ -652,14 +700,23 @@ impl SharedConnection {
     /// [`StorageError::Busy`] so callers can tell it apart from a fatal backend
     /// fault (issue #484).
     fn begin_immediate_with_retry(&self) -> StorageResult<()> {
-        retry_on_busy(|| {
+        let timing = self.start_timing();
+        let result = retry_on_busy(|| {
             self.inner
                 .connection
                 .lock()?
                 .execute_cached("BEGIN IMMEDIATE", [])
                 .map(|_| ())
                 .map_err(crate::codec::map_sqlite_error)
-        })
+        });
+        if let Some((observer, started)) = timing {
+            observer(
+                SqliteTimingOperation::WriteBegin,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     fn begin_deferred_with_retry(&self) -> StorageResult<()> {
@@ -1004,6 +1061,22 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Set an aggregate-only observer shared by all clones. No identities or SQL
+    /// are passed. Install once per runtime; `None` disables observation.
+    pub fn set_timing_observer(&self, observer: Option<SqliteTimingObserver>) {
+        let mut slot = self
+            .connection
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *slot = observer;
+        self.connection
+            .inner
+            .timing_enabled
+            .store(slot.is_some(), Ordering::Release);
+    }
+
     pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
         self.connection.lock()
     }
@@ -1279,6 +1352,59 @@ mod tests {
     };
     use tracing::{Event, Subscriber, field::Visit};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    #[test]
+    fn disabled_timing_skips_observer_lock_and_can_be_reenabled() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let events = Arc::new(AtomicU32::new(0));
+        let output = events.clone();
+        let observer: SqliteTimingObserver = Arc::new(move |_, _, _| {
+            output.fetch_add(1, Ordering::Relaxed);
+        });
+        for enabled in [false, true, false, true] {
+            store.set_timing_observer(enabled.then(|| observer.clone()));
+            if !enabled {
+                let _guard = store.connection.inner.timing.lock().unwrap();
+                assert!(store.connection.start_timing().is_none());
+            }
+            drop(store.lock().unwrap());
+        }
+        assert_eq!(events.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn timing_observer_preserves_transaction_rollback_and_closed_errors() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE timing_test(value INTEGER)")
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        store.set_timing_observer(Some(Arc::new(move |operation, _duration, success| {
+            output.lock().unwrap().push((operation, success));
+        })));
+        let result: StorageResult<()> = store.with_transaction(|s| {
+            s.lock()?
+                .execute("INSERT INTO timing_test VALUES(1)", [])
+                .storage()?;
+            Err(StorageError::Closed("deliberate rollback".into()))
+        });
+        assert!(result.is_err());
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM timing_test", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store.close().unwrap();
+        assert!(matches!(store.lock(), Err(StorageError::Closed(_))));
+        let events = events.lock().unwrap();
+        assert!(events.contains(&(SqliteTimingOperation::WriteBegin, true)));
+        assert!(events.contains(&(SqliteTimingOperation::Transaction, false)));
+        assert!(events.contains(&(SqliteTimingOperation::ConnectionWait, false)));
+    }
 
     #[test]
     fn read_snapshot_pins_foreign_writes_and_mls_generation() {

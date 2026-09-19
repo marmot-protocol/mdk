@@ -322,6 +322,9 @@ impl<S: StorageProvider> Engine<S> {
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
                 let category = match error {
+                    EngineError::MissingWelcomeKeyPackage => {
+                        InputRejectionCategory::MissingWelcomeKeyPackage
+                    }
                     EngineError::Peeler(PeelerError::InvalidSignature)
                     | EngineError::InvalidCredentialIdentity(_)
                     | EngineError::InvalidAccountIdentityProof(_) => {
@@ -418,8 +421,9 @@ impl<S: StorageProvider> Engine<S> {
         // seams that retire a replayed row — `replay_buffered_messages` and
         // `reingest_deferred_peel_row` — handle `Removed` explicitly for that
         // reason: their catch-alls would stamp an unresolved row `Processed`,
-        // making a never-applied message a canonicalization input that the
-        // re-join sweep does not clean up.
+        // and `recorded_message_outcome` answers `Duplicate` for every terminal
+        // state, so a never-applied message would be dead for this device
+        // (graph seeding is not the hazard: it skips raw-transport payloads).
         if let Some(record) = self
             .stored_group_record(&group_id)?
             .filter(|group| group.removed)

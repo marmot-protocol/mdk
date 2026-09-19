@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-17
+updated: 2026-09-18
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -30,9 +30,14 @@ validated URL/encrypted acquisition and worker-lifetime cancellation. C7-C adds 
 and native local access. Released-artifact adoption and device evidence remain C9 work; clients should retain host caches until validated.
 See [avatar cache storage](../further-context/avatar-cache-storage.md).
 
-C8-A adds indexed, revisioned per-group attachment-slot discovery in SQLite. This is the
-storage foundation for #1448; typed runtime/native pages and durable background attachment
-acquisition remain separate slices. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+C8-A/B provide indexed per-group attachment-slot discovery in SQLite and typed async
+runtime/native pages for #1448. Additions preserve cursors; destructive changes require
+replacement. Reads remain local without engine/relay readiness. C8-C1 adds storage-only
+durable demand/attempt fencing, protected retained bytes and removal suppression in migration 83.
+C8-C2 adds durable source demand (migration 84), bounded background acquisition and protected-byte publication
+for accepted conversations. C8-C3 adds protected ciphertext checkpoints and validated HTTP Range resume across interruption.
+C8-D1 exposes local retained-asset metadata (up to 64 source slots) and verified byte ranges (up to 1 MiB)
+through Rust, UniFFI and C, with no network or engine prerequisite. C8-D2 adds durable cancellation/retry/removal and policy, bounded progress streams, and enables automatic acquisition with the approved limits. Frozen runtimes skip transfers; pending invitations defer attachments. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections
@@ -121,6 +126,13 @@ lost engine effects and restart. SQLCipher records release evidence atomically
 with raw-byte deletion; app recovery retires both inventory and duplicate
 receipts before readmission. See [released transport receipts](../storage-format-v2.md#released-transport-receipts).
 The production retention and retry limits remain unchanged.
+
+Same-database first opens now serialize SQLCipher key selection, schema migration
+and handle publication; salts cannot be overwritten by competing initializers.
+Generated identities remain unavailable to background attention and managed workers
+until local readiness. Failed pre-readiness setup preserves its files and keys
+without preventing healthy accounts from starting; it does not automatically erase
+or repair an unreadable database. See [local artifact safety](local-artifact-safety.md#initializing-encrypted-account-databases).
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
@@ -271,7 +283,8 @@ This repository now has the main engine candidate:
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
 - `crates/marmot-forensics` — opt-in v4 JSONL forensic audit schema and recorder traits. Account/device display names
-  are excluded; platform, app version and optional system hardware model are retained. App uploads validate v4-only
+  are excluded; platform, app version and optional system hardware model are retained. Size-rotated segments repeat
+  the latest source context with fresh sequence numbers in the same recorder session. App uploads validate v4-only
   snapshots. Exclusive-root app startup removes recognized legacy forensic files and segments, including failed-wipe
   remnants, while preserving v4 files and the separate key-reveal log. See [audit logging](../audit-logging.md).
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.

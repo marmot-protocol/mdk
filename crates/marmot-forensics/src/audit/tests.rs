@@ -1573,11 +1573,9 @@ fn a_failed_segment_reopen_renames_the_segment_back_and_keeps_recording() {
     );
 }
 
-/// mdk#1181: the concatenation of a session's segments and its active file is
-/// byte-identical to the single file the recorder would otherwise have
-/// written.
+/// Segmentation preserves ordinary events and repeats only source metadata.
 #[test]
-fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
+fn segments_repeat_source_context_and_preserve_ordinary_events() {
     // Enough rows to seal more than one segment, so this covers two boundaries
     // rather than one.
     const ROWS: usize = 8_000;
@@ -1627,22 +1625,47 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
     );
     let plain_bytes = fs::read(&plain_path).unwrap();
 
-    // Only the session id and the wall clock may differ, and both are
-    // fixed-width here, so even the raw lengths must match.
-    assert_eq!(
-        rotated_bytes.len(),
-        plain_bytes.len(),
-        "rotation must not add, drop, or pad a single byte"
-    );
-    assert_eq!(normalize_run(&rotated_bytes), normalize_run(&plain_bytes));
-    let source_rows = normalize_run(&rotated_bytes)
+    // Repeated metadata consumes fresh sequence numbers; all ordinary rows
+    // still occur exactly once with the same payload and relative order.
+    fn ordinary_rows(bytes: &[u8]) -> Vec<serde_json::Value> {
+        normalize_run(bytes)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"]["type"] != "source_context")
+            .map(|mut row| {
+                row.as_object_mut().unwrap().remove("seq");
+                row
+            })
+            .collect()
+    }
+    assert_eq!(ordinary_rows(&rotated_bytes), ordinary_rows(&plain_bytes));
+    let rows: Vec<AuditEvent> = std::str::from_utf8(&rotated_bytes)
+        .unwrap()
         .lines()
-        .filter(|line| line.contains("\"source_context\""))
-        .count();
-    assert_eq!(
-        source_rows, 1,
-        "size-based segment rolls must not replay source_context"
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1));
+    assert!(
+        rows.iter()
+            .all(|row| row.recorder_session_id == rows[0].recorder_session_id)
     );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row.kind, AuditEventKind::SourceContext { .. }))
+            .count(),
+        segments.len() + 1
+    );
+    for path in segments
+        .iter()
+        .skip(1)
+        .chain(std::iter::once(&rotated_path))
+    {
+        assert!(matches!(
+            recorded_events(path)[0].kind,
+            AuditEventKind::SourceContext { .. }
+        ));
+        assert_jsonl_matches_v4_schema(path);
+    }
 }
 
 #[test]
@@ -2096,5 +2119,171 @@ fn failed_destructive_swap_preserves_writer_and_source_context() {
             );
         }
         other => panic!("expected preserved source after failed swap, got {other:?}"),
+    }
+}
+
+#[test]
+fn segment_prefix_uses_latest_context_and_preserves_sealed_bytes_and_identity() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder =
+        JsonlRecorder::open_with_account_ref(&path, "engine-abc".into(), Some("a".repeat(32)))
+            .unwrap();
+    for version in ["first", "latest"] {
+        let source = AuditSourceContext {
+            app_version: Some(version.into()),
+            platform: Some("ios".into()),
+            hardware_model: Some("iPhone17,1".into()),
+            device_id: Some("b".repeat(32)),
+            ..Default::default()
+        };
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SourceContext { source },
+        ));
+    }
+    let identity = recorded_events(&path)[0].clone();
+    for index in 0..3 {
+        let before = fs::read(&path).unwrap();
+        let health = recorder.health_snapshot();
+        {
+            let mut inner = recorder.inner.lock().unwrap();
+            recorder.roll_into_segment(&mut inner).unwrap();
+        }
+        assert_eq!(fs::read(&segment_paths(&path)[index]).unwrap(), before);
+        let rows = recorded_events(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].engine_id, identity.engine_id);
+        assert_eq!(rows[0].account_ref, identity.account_ref);
+        assert_eq!(rows[0].recorder_session_id, identity.recorder_session_id);
+        assert_eq!(rows[0].seq, 3 + index as u64);
+        let AuditEventKind::SourceContext { source } = &rows[0].kind else {
+            panic!("source prefix")
+        };
+        assert_eq!(source.app_version.as_deref(), Some("latest"));
+        assert_eq!(source.platform.as_deref(), Some("ios"));
+        assert_eq!(source.hardware_model.as_deref(), Some("iPhone17,1"));
+        assert_eq!(
+            source.device_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(recorder.health_snapshot(), health);
+        assert_jsonl_matches_v4_schema(&path);
+    }
+}
+
+#[test]
+fn segment_source_write_failure_preserves_recording_and_latest_context() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: sample_source("cccccccccccccccccccccccccccccccc"),
+        },
+    ));
+    let before = fs::read(&path).unwrap();
+    recorder.fail_next_segment_reopen();
+    {
+        let mut inner = recorder.inner.lock().unwrap();
+        assert!(recorder.roll_into_segment(&mut inner).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        inner.fail_next_write = true;
+        recorder.roll_into_segment(&mut inner).unwrap();
+    }
+    assert_eq!(recorder.health_snapshot().write_failures, 1);
+    assert!(fs::read(&path).unwrap().is_empty());
+    record_numbered_rows(&recorder, 1);
+    assert_eq!(
+        recorded_events(&path).len(),
+        1,
+        "failed metadata must not suppress ordinary events"
+    );
+    let latest = sample_source("dddddddddddddddddddddddddddddddd");
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: latest.clone(),
+        },
+    ));
+    let rows = recorded_events(&path);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].seq, rows[0].seq + 1);
+    assert_eq!(
+        rows[1].kind,
+        AuditEventKind::SourceContext {
+            source: latest.clone()
+        }
+    );
+    recorder
+        .roll_into_segment(&mut recorder.inner.lock().unwrap())
+        .unwrap();
+    let prefix = recorded_events(&path);
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(
+        prefix[0].kind,
+        AuditEventKind::SourceContext { source: latest }
+    );
+    assert_eq!(prefix[0].seq, rows[1].seq + 1);
+    assert_eq!(recorder.health_snapshot().write_failures, 1);
+    assert_eq!(fs::read(&segment_paths(&path)[0]).unwrap(), before);
+    assert_jsonl_matches_v4_schema(&path);
+}
+
+#[test]
+fn oversized_source_prefix_neither_recursively_rolls_nor_amplifies_each_event() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext {
+                app_version: Some("v".repeat(AUDIT_LOG_SEGMENT_MAX_BYTES as usize)),
+                ..Default::default()
+            },
+        },
+    ));
+    assert_eq!(segment_paths(&path).len(), 1);
+    assert_eq!(recorded_events(&path).len(), 1);
+    record_numbered_rows(&recorder, 100);
+    assert_eq!(
+        segment_paths(&path).len(),
+        1,
+        "metadata alone must not exhaust the next segment budget"
+    );
+    assert_eq!(recorded_events(&path).len(), 101);
+    record_until_segment_rolls(&recorder, &path, 1);
+    assert_eq!(
+        segment_paths(&path).len(),
+        2,
+        "ordinary bytes must still trigger rotation"
+    );
+    assert_eq!(recorded_events(&path).len(), 1);
+}
+
+#[test]
+fn size_rotation_without_source_context_does_not_invent_metadata() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    let session = recorded_events(&path)[0].recorder_session_id.clone();
+    for index in 0..3 {
+        let before = fs::read(&path).unwrap();
+        recorder
+            .roll_into_segment(&mut recorder.inner.lock().unwrap())
+            .unwrap();
+        assert_eq!(fs::read(&segment_paths(&path)[index]).unwrap(), before);
+        assert!(fs::read(&path).unwrap().is_empty());
+        record_numbered_rows(&recorder, 1);
+        let rows = recorded_events(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, index as u64 + 1);
+        assert_eq!(rows[0].recorder_session_id, session);
+        assert!(!matches!(
+            rows[0].kind,
+            AuditEventKind::SourceContext { .. }
+        ));
     }
 }

@@ -123,7 +123,7 @@ Hermes accepts after gateway restart via $HERMES_HOME/.env.
 
 Verified download (then choose one invocation below):
   set -eu
-  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.1
+  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.2
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
   installer_script=install-hermes-marmot.sh
@@ -1350,7 +1350,7 @@ EOF
 }
 
 run_doctor() {
-    local python_root doctor_json
+    local python_root doctor_json doctor_output doctor_status
     if ! command -v python3 >/dev/null 2>&1; then
         emit_doctor_fatal
         return 2
@@ -1371,8 +1371,21 @@ run_doctor() {
     if [ "$INSTALL_SERVICE" -eq 0 ]; then
         doctor_service+=(--no-install-service)
     fi
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -B -m marmot.doctor \
+    if doctor_output=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -B -c '
+import contextlib, io, sys
+output = io.StringIO()
+try:
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        from marmot.doctor import main
+        status = main()
+    if status not in (0, 1, 2) or not output.getvalue():
+        raise RuntimeError()
+except BaseException:
+    sys.exit(3)
+sys.stdout.write(output.getvalue())
+sys.exit(status)
+'  \
             --home "$MARMOT_HOME" \
             --hermes-home "$HERMES_HOME" \
             --plugin-dir "$MARMOT_PLUGIN_DIR" \
@@ -1381,7 +1394,17 @@ run_doctor() {
             --service-name "$MARMOT_AGENT_SERVICE_NAME" \
             --launchd-label "$MARMOT_AGENT_LAUNCHD_LABEL" \
             ${doctor_json[@]+"${doctor_json[@]}"} \
-            ${doctor_service[@]+"${doctor_service[@]}"}
+            ${doctor_service[@]+"${doctor_service[@]}"} 2>/dev/null); then
+        doctor_status=0
+    else
+        doctor_status=$?
+    fi
+    if [ "$doctor_status" -le 2 ] && [ -n "$doctor_output" ]; then
+        printf '%s\n' "$doctor_output"
+        return "$doctor_status"
+    fi
+    emit_doctor_fatal
+    return 2
 }
 
 while [ "$#" -gt 0 ]; do
@@ -1501,7 +1524,7 @@ if [ "$DOCTOR" -eq 1 ]; then
     if [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ] \
         || [ "$SYSTEM_INSTALL" -eq 1 ] || [ "$ENABLE_STREAMING" -eq 1 ] \
         || [ "$NO_START_WN_AGENT" -eq 1 ] || [ "$CONFIGURE_HERMES" -eq 0 ] \
-        || [ "$INSTALL_SERVICE" -eq 0 ] || [ "$CLI_RELAYS" -eq 1 ] \
+        || [ "$CLI_RELAYS" -eq 1 ] \
         || [ "$EXPLICIT_ALLOW_ALL" -eq 1 ] || [ "$GENERATE_IDENTITY_EXPLICIT" -eq 1 ] \
         || [ -n "$EXISTING_IDENTITY_FILE" ] || [ -n "$EXPECTED_IDENTITY" ] \
         || [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ] || [ "${#ALLOW_USERS[@]}" -gt 0 ] \

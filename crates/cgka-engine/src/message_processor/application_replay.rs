@@ -57,7 +57,9 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
         let tip = group.epoch.0;
-        let mut messages = Vec::new();
+        let mut fresh = Vec::new();
+        let mut parked = Vec::new();
+        let mut rival_branch_parked = false;
         self.storage.visit_messages_in_states(
             group_id,
             &[
@@ -72,13 +74,73 @@ impl<S: StorageProvider> Engine<S> {
                 #[cfg(test)]
                 super::application_replay_tests::SCANNED_ROWS
                     .with(|count| count.set(count.get() + 1));
-                if let Some(message) = Self::canonical_application_from_record(&record, tip) {
-                    messages.push(message);
+                let parked_row = record.state == MessageState::ConvergenceDeferred;
+                match Self::retained_convergence_row(&record, tip) {
+                    Some(RetainedConvergenceRow::Application(message)) if parked_row => {
+                        if parked.len() < limit {
+                            parked.push(message);
+                        }
+                    }
+                    Some(RetainedConvergenceRow::Application(message)) => fresh.push(message),
+                    Some(RetainedConvergenceRow::Commit) => {
+                        rival_branch_parked |= parked_row;
+                    }
+                    None => {}
                 }
-                messages.len() < limit
+                fresh.len() < limit
             },
         )?;
-        Ok(messages)
+        // A parked commit is a rival branch a later pass holding deeper
+        // evidence can still adopt, and convergence parks that branch's
+        // applications alongside it. Draining one against the branch that
+        // currently wins would give it the terminal verdict the pass
+        // deliberately withheld — and reporting it as pending work would rearm
+        // the scheduler forever on a row nothing may dispose of. So the parked
+        // set waits while any branch edge is still reconsiderable.
+        //
+        // Two facts make "a commit is parked" the right question, rather than
+        // the broader "a commit is pending", which a single forged
+        // beyond-ceiling row could use to hold every parked application out of
+        // this drain for as long as the tip stands still:
+        //
+        // * A commit that still owes a verdict keeps this drain unreachable. A
+        //   `Created`/`Retryable` commit inside `[anchor, ceiling]` gates
+        //   unconditionally (`ConvergenceInputContext::gates_outbound`,
+        //   `CommitEdge => true`), and `advance_convergence_inputs` only reaches
+        //   here on its `!has_unresolved_convergence_inputs` arm. Pinned by
+        //   `tests/distributed_convergence.rs::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`.
+        // * A pass never parks an application without parking its branch's
+        //   commits. `handle_app_message`'s park arm requires a materialized,
+        //   eligible, non-selected branch, which is exactly when `handle_commit`
+        //   answers `NonSelectedEligibleBranch` for that branch's commits. Keep
+        //   those two arms in step: an application parked on a branch holding no
+        //   parked commit would open this gate.
+        //
+        // The gate cannot tell a parked branch message from an ordinary
+        // `FutureEpoch` one whose commit has since landed: both are
+        // `ConvergenceDeferred`, and the row carries no deferral reason (the
+        // only stored epoch authenticator, `OwnApplicationConvergenceStamp`,
+        // belongs to locally authored rows this drain already skips). It
+        // withholds both, and that is harmless only because this drain is not
+        // the deliverer of a matured row — a pass re-seeds every
+        // `ConvergenceDeferred` application above the retained anchor and
+        // delivers it, and it runs before `advance_convergence_inputs` reaches
+        // this arm. If that ever stops holding, this gate must distinguish the
+        // two reasons (by outcome: a matured row decrypts against canonical
+        // state, a branch message does not) rather than the state. Guarded by
+        // `tests/distributed_convergence.rs::an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival`.
+        //
+        // Terminalizing stays with a later pass and the horizon arms below
+        // (`BeyondAnchor`, `BeyondAppRetention`). Nothing runs on its own — a
+        // parked row opens no pass (`ConvergenceDeferred` is in neither
+        // `PASS_OPENING_STATES` nor `OUTBOUND_GATING_STATES`) — so a fork frozen
+        // with no further input keeps its parked rows until some other input
+        // opens the next pass.
+        if !rival_branch_parked {
+            fresh.append(&mut parked);
+            fresh.truncate(limit);
+        }
+        Ok(fresh)
     }
 
     /// Shared with hydration, which already holds the complete record scan.
@@ -86,6 +148,18 @@ impl<S: StorageProvider> Engine<S> {
         record: &MessageRecord,
         tip: u64,
     ) -> Option<TransportMessage> {
+        match Self::retained_convergence_row(record, tip)? {
+            RetainedConvergenceRow::Application(message) => Some(message),
+            RetainedConvergenceRow::Commit => None,
+        }
+    }
+
+    /// What one retained convergence row is to the application drain, decoded
+    /// once so a caller never pays for the payload twice.
+    fn retained_convergence_row(
+        record: &MessageRecord,
+        tip: u64,
+    ) -> Option<RetainedConvergenceRow> {
         if !matches!(
             record.state,
             MessageState::Created | MessageState::Retryable | MessageState::ConvergenceDeferred
@@ -95,17 +169,26 @@ impl<S: StorageProvider> Engine<S> {
         // Match the convergence work classifier: undecodable rows are not
         // runnable input and must not poison hydration or scheduler polling.
         let payload = StoredMessagePayload::decode(&record.payload).ok()?;
-        // Locally authored inputs already have a send-side projection. Their
-        // durable stamps remain branch witnesses; encryption-only sender
-        // ratchets cannot decrypt them through the inbound drain.
-        if payload.own_application_stamp().is_some() {
-            return None;
-        }
         let message = payload.as_openmls_wire()?;
         let projection = project_mls_message(&message.payload).ok()?;
-        (projection.kind == OpenMlsContentKind::Application
-            && projection.source_epoch.is_some_and(|epoch| epoch <= tip))
-        .then(|| message.clone())
+        match projection.kind {
+            OpenMlsContentKind::Commit => Some(RetainedConvergenceRow::Commit),
+            OpenMlsContentKind::Application => {
+                // Locally authored inputs already have a send-side projection.
+                // Their durable stamps remain branch witnesses; encryption-only
+                // sender ratchets cannot decrypt them through the inbound drain.
+                if payload.own_application_stamp().is_some() {
+                    return None;
+                }
+                projection
+                    .source_epoch
+                    .is_some_and(|epoch| epoch <= tip)
+                    .then(|| RetainedConvergenceRow::Application(message.clone()))
+            }
+            OpenMlsContentKind::Proposal
+            | OpenMlsContentKind::Welcome
+            | OpenMlsContentKind::Other => None,
+        }
     }
 
     pub(super) fn drain_canonical_applications(
@@ -223,6 +306,14 @@ impl<S: StorageProvider> Engine<S> {
         // intent. The scheduling edge/query above carries it to another turn.
         Ok(AdvanceConvergenceStatus::Settled)
     }
+}
+
+/// A retained convergence row the application drain can act on.
+enum RetainedConvergenceRow {
+    /// An inbound application whose source epoch the canonical tip has reached.
+    Application(TransportMessage),
+    /// A branch edge. Parked, it is a rival branch a later pass can adopt.
+    Commit,
 }
 
 fn replay_error(error: OpenMlsProjectionError) -> EngineError {

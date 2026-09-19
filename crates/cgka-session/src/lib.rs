@@ -834,6 +834,20 @@ impl AccountDeviceSession {
             .current_safe_export_epoch(group_id, component_id)
     }
 
+    pub fn invite_key_package_requirements(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<cgka_engine::key_package::KeyPackageRequirements, EngineError> {
+        self.engine.invite_key_package_requirements(group_id)
+    }
+
+    pub fn create_key_package_requirements(
+        &self,
+        request: &CreateGroupRequest,
+    ) -> Result<cgka_engine::key_package::KeyPackageRequirements, EngineError> {
+        self.engine.create_key_package_requirements(request)
+    }
+
     pub fn constructable_capabilities(
         &self,
         key_packages: &[KeyPackage],

@@ -14,7 +14,10 @@ App runtime bridge for the first real Marmot app surfaces.
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
   tracker upload worker), `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers), and `avatar.rs`
-  (local identity-avatar demand and bounded maintenance), plus `avatar_access.rs` (bounded local native batches). Keep `mod.rs`
+  (local identity-avatar demand and bounded maintenance), plus `avatar_access.rs` (bounded local native batches) and `attachment_history.rs`
+  (bounded local attachment discovery and shared-parser presentation), `attachment_access.rs`
+  (read-only source-slot availability and verified local byte ranges), and `account_worker/attachments.rs`
+  (durable attachment demand admission, fair background transfer capacity and retained-byte publication). Keep `mod.rs`
   re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
@@ -43,6 +46,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
+  `media/attachment_resume.rs` adapts attempt-fenced storage checkpoints to the shared safe HTTP path;
+  keep Range validation, protected partials and complete-body authentication separate from native progress/access.
 - Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
   typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
   `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment

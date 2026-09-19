@@ -532,10 +532,13 @@ fn canonicalize_internal(
                 &mut result,
                 &input,
                 message,
-                *epoch,
-                decrypts_on_branches,
-                decrypted_payload_ref.clone(),
-                *already_delivered,
+                AppDispositionContext {
+                    epoch: *epoch,
+                    decrypts_on_branches,
+                    decrypted_payload_ref: decrypted_payload_ref.clone(),
+                    already_delivered: *already_delivered,
+                    candidates: &materialized_graph.candidates,
+                },
             ),
         }
     }
@@ -929,14 +932,27 @@ fn handle_proposal(
     }
 }
 
+struct AppDispositionContext<'a> {
+    epoch: u64,
+    decrypts_on_branches: &'a [String],
+    decrypted_payload_ref: Option<String>,
+    /// Already applied/delivered on a prior pass, re-admitted only to witness
+    /// its branch. See `PeeledMessageKind::AppMessage`.
+    already_delivered: bool,
+    candidates: &'a [BranchCandidate],
+}
+
 fn handle_app_message(
     result: &mut CanonicalizationResult,
     input: &CanonicalizationInput,
     message: &PeeledMessage,
-    epoch: u64,
-    decrypts_on_branches: &[String],
-    decrypted_payload_ref: Option<String>,
-    already_delivered: bool,
+    AppDispositionContext {
+        epoch,
+        decrypts_on_branches,
+        decrypted_payload_ref,
+        already_delivered,
+        candidates,
+    }: AppDispositionContext<'_>,
 ) {
     // A message applied on a prior pass is re-admitted so it can witness its
     // branch again (see `attach_app_witnesses`). It must never be re-delivered,
@@ -1002,7 +1018,29 @@ fn handle_app_message(
             InvalidatedAppMessageReason::UndecryptableInCanonicalState,
             decrypted_payload_ref,
         ));
+    } else if decrypts_on_branches
+        .iter()
+        .filter_map(|branch_id| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == *branch_id)
+        })
+        .any(|candidate| branch_ineligibility_reason(input, candidate).is_none())
+    {
+        // Parked exactly like the commits of the branch it rode
+        // (`classify_losing_materialized_candidate_commits`): the branch is
+        // still eligible, so a later pass holding deeper evidence can adopt it,
+        // and this application has to come back with it. Stamping it terminal
+        // here would both strand the history it carries and drop it from the
+        // candidate graph, so the branch would lose its witness weight and
+        // selection would depend on local arrival order.
+        result.deferred_messages.push(deferred(
+            message,
+            DeferredMessageReason::NonSelectedEligibleBranch,
+        ));
     } else {
+        // No branch this message decrypts on can be revisited any more, so the
+        // withdrawal is final.
         result.invalidated_app_messages.push(invalidated_app(
             message,
             epoch,

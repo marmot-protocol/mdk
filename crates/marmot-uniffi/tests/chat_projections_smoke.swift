@@ -3,6 +3,31 @@ import Foundation
 @main
 struct ChatProjectionsSmoke {
     static func main() throws {
+        let transfer = AttachmentTransferStatusFfi(reference: "job", state: .verifyingPlaintext, attempt: UInt64.max, received: 17, total: nil, retryAt: 42)
+        let transferFrame = AttachmentTransferSnapshotFfi(items: [transfer])
+        let transferCopy = try FfiConverterTypeAttachmentTransferSnapshotFfi.lift(FfiConverterTypeAttachmentTransferSnapshotFfi.lower(transferFrame))
+        precondition(transferCopy == transferFrame)
+        let localTarget = AttachmentLocalTargetFfi(messageIdHex: "message", sourceMessageIdHex: "source", attachmentIndex: UInt32.max)
+        let localTargetCopy = try FfiConverterTypeAttachmentLocalTargetFfi.lift(FfiConverterTypeAttachmentLocalTargetFfi.lower(localTarget))
+        precondition(localTargetCopy == localTarget)
+        for asset in [AttachmentLocalAssetFfi(reference: nil, byteCount: 0), AttachmentLocalAssetFfi(reference: "opaque", byteCount: UInt64.max)] {
+            let copy = try FfiConverterTypeAttachmentLocalAssetFfi.lift(FfiConverterTypeAttachmentLocalAssetFfi.lower(asset))
+            precondition(copy == asset)
+        }
+        for chunk in [AttachmentLocalBytesFfi(available: false, bytes: Data()), AttachmentLocalBytesFfi(available: true, bytes: Data()), AttachmentLocalBytesFfi(available: true, bytes: Data([0,255,0,42]))] {
+            let copy = try FfiConverterTypeAttachmentLocalBytesFfi.lift(FfiConverterTypeAttachmentLocalBytesFfi.lower(chunk))
+            precondition(copy == chunk)
+        }
+        let timing = RuntimePerformanceSnapshotFfi(operation: "conversation_open", started: 5,
+            completed: 4, successes: 1, failures: 1, cancelled: 1, timeouts: 1, notReady: 0,
+            inFlight: 1, oldestTrackedInFlightMs: 800, untrackedInFlight: 0,
+            durationMs: DurationHistogramSnapshotFfi(buckets: [DurationHistogramBucketFfi(upperBoundMs: 100, count: 4)], overflowCount: 0, sumMs: 400))
+        let timingCopy = try FfiConverterTypeRuntimePerformanceSnapshotFfi.lift(FfiConverterTypeRuntimePerformanceSnapshotFfi.lower(timing))
+        precondition(timingCopy == timing)
+        for outcome in [HostPerformanceOutcomeFfi.success, .failure, .cancelled, .timeout, .unavailable] {
+            let outcomeCopy = try FfiConverterTypeHostPerformanceOutcomeFfi.lift(FfiConverterTypeHostPerformanceOutcomeFfi.lower(outcome))
+            precondition(outcomeCopy == outcome)
+        }
         for state in [AvatarAvailabilityFfi.missing, .ready, .stale, .invalidated] {
             for acquisition in [AvatarAcquisitionStateFfi.idle, .queued, .fetching, .retryScheduled, .blocked] {
                 let asset = AvatarAssetFfi(target: "opaque-target", reference: "opaque-reference", availability: state, acquisition: acquisition, contentRevision: 7, byteCount: 4)
@@ -18,10 +43,17 @@ struct ChatProjectionsSmoke {
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
                 name: nil, oldName: nil, oldRetentionSeconds: nil, newRetentionSeconds: nil)
             let preview = ChatListMessagePreviewFfi(groupSystem: event, messageIdHex: "selected", sender: "actor", senderDisplayName: nil,
-                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false,
+                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50, deleted: false, deletionSource: .unknown,
                 attachmentKind: nil, attachmentCount: 0, deliveryState: .notApplicable)
             let copy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
             precondition(copy == preview && copy.groupSystem?.provenance == provenance)
+        }
+        for source in [DeletionSourceFfi.author, .admin, .unknown] {
+            let preview = TimelineReplyPreviewFfi(messageIdHex: "deleted", sender: "author", plaintext: "",
+                contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 9,
+                mediaJson: nil, media: [], agentTextStreamJson: nil, deleted: true, deletionSource: source, invalidationStatus: nil)
+            let copy = try FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
+            precondition(copy == preview && copy.deletionSource == source)
         }
         let blocks = BlockListSnapshotFfi(revision: UInt64.max, users: [BlockedUserFfi(publicKey: "key", isPrivate: true, createdAtMs: 123)])
         let blockCopy = try FfiConverterTypeBlockListSnapshotFfi.lift(FfiConverterTypeBlockListSnapshotFfi.lower(blocks))
@@ -156,4 +188,41 @@ func compileAvatarCommands(_ marmot: Marmot, account: String, asset: AvatarAsset
     let requested = try await marmot.requestAvatarAssets(accountRef: account, targets: [asset.target])
     _ = try await marmot.readAvatarAssets(accountRef: account, references: requested.compactMap(\.reference), maxBytes: 1024 * 1024)
     try await marmot.clearAvatarCache(accountRef: account)
+}
+
+func compileAttachmentCommands(_ marmot: Marmot, account: String, group: String) async throws {
+    let result = try await marmot.attachmentHistoryPage(accountRef: account, groupIdHex: group, limit: 50, cursor: nil)
+    if case let .page(page) = result {
+        let current = try await marmot.attachmentHistoryVersion(accountRef: account, groupIdHex: group)
+        _ = current.changeSince(previous: page.version)
+        if page.hasMore {
+            _ = try await marmot.attachmentHistoryPage(accountRef: account, groupIdHex: group, limit: 50, cursor: page.nextCursor)
+        }
+    }
+}
+
+func compileLocalAttachmentCommands(_ marmot: Marmot, account: String, group: String,
+                                    message: String, source: String, index: UInt32) async throws {
+    let target = AttachmentLocalTargetFfi(messageIdHex: message, sourceMessageIdHex: source, attachmentIndex: index)
+    let assets = try await marmot.attachmentLocalAssets(accountRef: account, groupIdHex: group, targets: [target])
+    if let reference = assets.first?.reference {
+        let chunk = try await marmot.readAttachmentAsset(accountRef: account, reference: reference, offset: 0, limit: 65536)
+        if chunk.available { _ = chunk.bytes }
+    }
+}
+
+func compileAttachmentControls(_ marmot: Marmot, account: String, group: String, target: AttachmentLocalTargetFfi) async throws {
+    var policy = try await marmot.attachmentDownloadPolicy(accountRef: account)
+    policy.automatic = false
+    try await marmot.setAttachmentDownloadPolicy(accountRef: account, policy: policy)
+    let snapshot = try await marmot.attachmentTransferSnapshot(accountRef: account, groupIdHex: group, targets: [target])
+    if let reference = snapshot.items.first?.reference {
+        _ = try await marmot.controlAttachment(accountRef: account, reference: reference, control: .cancel)
+        _ = try await marmot.controlAttachment(accountRef: account, reference: reference, control: .retry)
+        _ = try await marmot.controlAttachment(accountRef: account, reference: reference, control: .remove)
+    }
+    _ = try await marmot.downloadAttachmentAgain(accountRef: account, groupIdHex: group, target: target)
+    let stream = try await marmot.subscribeAttachmentTransfers(accountRef: account, groupIdHex: group, targets: [target])
+    _ = try await stream.next()
+    stream.cancel()
 }

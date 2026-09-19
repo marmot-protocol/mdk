@@ -828,6 +828,7 @@ pub(crate) fn timeline_message_record_json(
         "reactions": message.reactions,
         "edit": message.edit,
         "deleted": message.deleted,
+        "deletion_source": message.deletion_source,
         "deleted_by_message_id": message.deleted_by_message_id_hex,
         "retention_seconds": message.retention_seconds,
         "retention_expires_at": message.retention_expires_at,
@@ -1074,6 +1075,7 @@ mod tests {
             agent_text_stream: None,
             reactions: TimelineReactionSummary::default(),
             deleted: false,
+            deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
         };

@@ -188,3 +188,100 @@ fn a_null_store_is_rejected_before_the_client_is_built() {
     assert_eq!(status, MarmotStatus::NullPointer);
     assert!(client.is_null(), "out-pointer must be cleared at entry");
 }
+
+#[test]
+fn client_name_constructor_validates_arguments_without_taking_store_ownership() {
+    let mut client: *mut MarmotClient = std::ptr::dangling_mut();
+    let name = CString::new("whitenoise").unwrap();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_client_name(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            name.as_ptr(),
+            u32::MAX,
+            std::ptr::null(),
+            &raw mut client,
+        )
+    };
+    assert_eq!(status, MarmotStatus::InvalidArgument);
+    assert!(client.is_null());
+}
+
+#[test]
+fn combined_options_validate_before_transferring_store_ownership() {
+    unsafe extern "C" fn mark_destroyed(data: *mut c_void) {
+        unsafe { &*(data as *const AtomicBool) }.store(true, Ordering::SeqCst);
+    }
+    let destroyed = AtomicBool::new(false);
+    let store = MarmotSecretStore {
+        user_data: (&destroyed as *const AtomicBool).cast_mut().cast(),
+        has_secret_for_label: Some(has),
+        has_secret_for_account_id: Some(has),
+        write_secret: Some(write_secret),
+        load_secret: Some(load_secret),
+        remove_secret: Some(remove_secret),
+        free_secret: Some(free_secret),
+        destroy: Some(mark_destroyed),
+    };
+    let name = CString::new("whitenoise").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = CString::new(root.path().to_str().unwrap()).unwrap();
+    let relay = CString::new("ws://127.0.0.1:1").unwrap();
+    let relays = [relay.as_ptr()];
+    let mut options = marmot_c::MarmotClientOptions {
+        relay_policy: 2,
+        cursor_persistence: 1,
+        client_name: name.as_ptr(),
+        store: &store,
+    };
+    for (relay_policy, cursor_persistence) in [(u32::MAX, 1), (2, u32::MAX)] {
+        options.relay_policy = relay_policy;
+        options.cursor_persistence = cursor_persistence;
+        let mut client = std::ptr::dangling_mut();
+        let status = unsafe {
+            marmot_c::marmot_client_new_with_configuration(
+                path.as_ptr(),
+                relays.as_ptr(),
+                1,
+                &options,
+                &raw mut client,
+            )
+        };
+        assert_eq!(status, MarmotStatus::InvalidArgument);
+        assert!(client.is_null());
+        assert!(!destroyed.load(Ordering::SeqCst));
+    }
+    options.relay_policy = 2;
+    options.cursor_persistence = 1;
+    let mut client = std::ptr::dangling_mut();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_configuration(
+            std::ptr::null(),
+            relays.as_ptr(),
+            1,
+            &options,
+            &raw mut client,
+        )
+    };
+    assert_eq!(status, MarmotStatus::NullPointer);
+    assert!(client.is_null());
+    assert!(
+        !destroyed.load(Ordering::SeqCst),
+        "failed construction leaves the store with its owner"
+    );
+    let mut client = std::ptr::null_mut();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_configuration(
+            path.as_ptr(),
+            relays.as_ptr(),
+            1,
+            &options,
+            &raw mut client,
+        )
+    };
+    assert_eq!(status, MarmotStatus::Ok);
+    assert!(!destroyed.load(Ordering::SeqCst));
+    unsafe { marmot_client_free(client) };
+    assert!(destroyed.load(Ordering::SeqCst));
+}

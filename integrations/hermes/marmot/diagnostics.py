@@ -521,6 +521,23 @@ def config_fingerprint(fields: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def loaded_sender_ids(
+    extra: dict[str, Any], *, env_values: Optional[dict[str, str]] = None
+) -> list[str]:
+    """Preserve the adapter's loaded sender values for diagnostic fingerprints."""
+    raw = extra.get("allowed_users") or extra.get("allowed_users_hex")
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",") if item.strip()]
+    elif isinstance(raw, list):
+        values = [str(item).strip() for item in raw if str(item).strip()]
+    else:
+        values = []
+    if not values:
+        env = os.environ if env_values is None else env_values
+        values = [item.strip() for item in env.get("MARMOT_ALLOWED_USERS", "").split(",") if item.strip()]
+    return values
+
+
 def nonsecret_config_fields(
     *,
     senders: list[str],
@@ -1015,8 +1032,8 @@ def inspect_path(path: Path, *, expect_dir: bool = False, expect_socket: bool = 
     if info.st_uid != os.getuid():
         return {"code": "unsafe_owner", "status": "fatal"}
     if info.st_mode & 0o077:
-        return {"code": "unsafe_mode", "status": "fatal"}
-    return {"code": "present", "status": "healthy", "mode": info.st_mode & 0o777}
+        return {"code": "unsafe_mode", "status": "fatal", "mode": stat.S_IMODE(info.st_mode)}
+    return {"code": "present", "status": "healthy", "mode": stat.S_IMODE(info.st_mode)}
 
 
 def bounded_run(command: list[str], *, timeout: float = SUBPROCESS_TIMEOUT_S) -> Optional[str]:
@@ -1085,37 +1102,55 @@ def parse_dotenv_assignments(
     *,
     environ: Optional[dict[str, str]] = None,
 ) -> tuple[dict[str, str], Optional[str], frozenset[str]]:
+    """Read complete bindings; fail closed when their boundaries are ambiguous."""
     source = dict(environ if environ is not None else os.environ)
-    resolved: dict[str, str] = {}
+    resolved: dict[str, Optional[str]] = {}
     values: dict[str, str] = {}
-    unsupported_keys: set[str] = set()
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
+    unsupported: set[str] = set()
+    # Quoted values consume embedded newlines, including connector-looking text.
+    binding = re.compile(
+        r"(?:export[^\S\r\n]+)?"
+        r"(?:'(?P<quoted_key>[^']+)'|(?P<key>[^'=\#\s][^=\#\s]*))"
+        r"[^\S\r\n]*(?:=[^\S\r\n]*(?P<value>"
+        r"'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"|[^'\"\s][^\r\n]*|))?"
+        r"[^\S\r\n]*(?:\#[^\r\n]*)?(?:\r\n|\n|\r|$)"
+    )
+    whitespace = re.compile(r"\s*")
+    comment = re.compile(r"[^\r\n]*")
+    cursor = 0
+    while cursor < len(text):
+        cursor = whitespace.match(text, cursor).end()
+        if cursor == len(text):
+            break
+        if text[cursor] == "#":
+            cursor = comment.match(text, cursor).end()
             continue
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[7:].strip()
-        if not key:
+        match = binding.match(text, cursor)
+        if match is None:
+            # Do not reinterpret a continuation as a fresh connector assignment.
+            return {}, "unsupported", DOTENV_CONNECTOR_KEYS
+        cursor = match.end()
+        key = match.group("quoted_key") or match.group("key")
+        raw = match.group("value")
+        if raw is None:
+            resolved[key] = None
+            values.pop(key, None)
+            unsupported.discard(key)
             continue
-        parsed, supported_scalar = _parse_dotenv_scalar(value)
-        if not supported_scalar:
-            if key in DOTENV_CONNECTOR_KEYS:
-                unsupported_keys.add(key)
-            continue
-        # override=True: process environment, then preceding file assignments.
-        env_map = dict(source)
-        env_map.update(resolved)
+        parsed, _ = _parse_dotenv_scalar(raw)
+        env_map = {**source, **resolved}
         expanded, supported = interpolate_dotenv_value(parsed, env_map)
-        if not supported:
-            if key in DOTENV_CONNECTOR_KEYS:
-                unsupported_keys.add(key)
+        dependencies = {m.group("name") for m in _DOTENV_INTERPOLATION.finditer(parsed)}
+        if not supported or dependencies & unsupported:
+            unsupported.add(key)
+            values.pop(key, None)
             continue
+        unsupported.discard(key)
         resolved[key] = expanded
         if key in DOTENV_CONNECTOR_KEYS:
             values[key] = expanded
-    return values, ("unsupported" if unsupported_keys else None), frozenset(unsupported_keys)
+    unsupported_keys = frozenset(unsupported & DOTENV_CONNECTOR_KEYS)
+    return values, ("unsupported" if unsupported_keys else None), unsupported_keys
 
 
 def parse_env_safely(path: Path) -> ParsedHermesEnv:

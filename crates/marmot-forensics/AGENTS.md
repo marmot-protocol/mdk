@@ -11,7 +11,8 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 - Keep `JsonlRecorder` segment rotation transparent (mdk#1181). Sealing the active file at
   `AUDIT_LOG_SEGMENT_MAX_BYTES` is a rename into an `audit-*-seg<NNNNNN>.jsonl` sibling that deletes and truncates
   nothing; `seq`, the recorder session id, and health counters carry across the boundary and no `recorder_started` row
-  is written, so a session's segments plus its active file concatenate back to one continuous log. Retention and disk
+  is written. Each fresh segment repeats the latest explicit `source_context` with a fresh sequence number; ordinary
+  events and sealed bytes remain unchanged. Retention and disk
   bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
@@ -25,7 +26,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   cleanly with a property missing. `sample_events_serialize_within_schema_property_names` walks every sample kind's
   serialized JSON against the schema's `additionalProperties: false` branches, so it is what catches an added *field*
   the schema does not list. A new field therefore needs a `sample_audit_event_kinds` entry that populates it, or
-  nothing checks it. Bump `AUDIT_LOG_SCHEMA_VERSION` and add a new versioned schema file when changing required
+  nothing checks it. Coordinate even optional additions with strict downstream consumers such as Goggles before
+  shipping producers: its `additionalProperties: false` validation rejected whole v4 uploads containing
+  `local_member_ref` until its schema was synchronized. Bump `AUDIT_LOG_SCHEMA_VERSION` and add a new versioned schema file when changing required
   fields; analyzers reject unknown versions. An additive optional field needs no bump, but note in its doc comment
   that absence is then ambiguous between "old row" and "value known absent".
 

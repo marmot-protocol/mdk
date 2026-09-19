@@ -4,11 +4,9 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import io
 import json
 import os
-import re
 import socket
 import stat
 import subprocess
@@ -243,6 +241,41 @@ class _PluginFixture:
 
 
 class DoctorReportTests(unittest.TestCase):
+    def test_collect_fingerprints_loaded_senders_without_route_normalization(self) -> None:
+        for extra, env, expected in (
+            ({"allowed_users": " npub1example, 0xABCD "}, {}, ["npub1example", "0xABCD"]),
+            ({"allowed_users_hex": [" NPUB1EXAMPLE "]}, {}, ["NPUB1EXAMPLE"]),
+            ({"allowed_users": [" "]}, {"MARMOT_ALLOWED_USERS": "npub1env"}, ["npub1env"]),
+            ({"allowed_users": "npub1yaml"}, {"MARMOT_ALLOWED_USERS": "npub1env"}, ["npub1yaml"]),
+        ):
+            with self.subTest(extra=extra, env=env), tempfile.TemporaryDirectory() as raw:
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                    diag, "parse_config_safely", return_value=({"platforms": {"marmot": {"extra": extra}}}, None)
+                ), mock.patch.object(diag, "bounded_run", return_value=None), mock.patch.object(
+                    doctor, "_connector_report", return_value=None
+                ), mock.patch.object(diag, "read_plugin_status", new_callable=mock.AsyncMock, return_value=None), mock.patch.object(
+                    diag, "nonsecret_config_fields", wraps=diag.nonsecret_config_fields
+                ) as fields:
+                    doctor.collect(_args(Path(raw)))
+                self.assertEqual(fields.call_args.kwargs["senders"], expected)
+
+    def test_file_modes_are_reported_without_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            for mode in (0o700, 0o755):
+                home.chmod(mode)
+                checks = doctor._file_checks({}, home / "dev" / "wn-agent.sock", installer_home=home, env_values={})
+                report = diag.report_object(checks)
+                item = next(check for check in checks if check["id"] == "files.home")
+                self.assertEqual(item["value"], {"mode": f"{mode:04o}"})
+                self.assertEqual(item["code"], "present" if mode == 0o700 else "unsafe_mode")
+                human = diag.render_human(report)
+                encoded = json.dumps(report)
+                self.assertIn(f"mode={mode:04o}", human)
+                self.assertIn(f'"mode": "{mode:04o}"', encoded)
+                self.assertNotIn(raw, human + encoded)
+                self.assertIsNone(next(check for check in checks if check["id"] == "files.inbound_dir")["value"])
+
     def test_fatal_dominates_and_delivery_is_excluded(self) -> None:
         report = diag.report_object(
             [
@@ -1359,57 +1392,14 @@ class DoctorReportTests(unittest.TestCase):
         self.assertEqual(projected["MARMOT_AGENT_SOCKET"], "")
 
     def test_dotenv_assignments_match_python_dotenv_1_2_2(self) -> None:
-        host_braced = re.compile(r"\$\{(?P<name>[^}:]*)(?::-(?P<default>[^}]*))?\}")
-        single_quoted = re.compile(r"'((?:\\'|[^'])*)'")
-        double_quoted = re.compile(r'"((?:\\"|[^"])*)"')
-        single_escapes = re.compile(r"\\[\\']")
-        double_escapes = re.compile(r"\\[\\'\"abfnrtv]")
-
-        def decode(regex: re.Pattern[str], value: str) -> str:
-            return regex.sub(lambda match: codecs.decode(match.group(0), "unicode-escape"), value)
-
-        def host_parse_scalar(raw: str) -> str | None:
-            value = raw.lstrip()
-            if not value:
-                return ""
-            if value[0] == "'":
-                match = single_quoted.match(value)
-                return None if match is None else decode(single_escapes, match.group(1))
-            if value[0] == '"':
-                match = double_quoted.match(value)
-                return None if match is None else decode(double_escapes, match.group(1))
-            return re.sub(r"\s+#.*", "", value).rstrip()
-
-        def host_dotenv_values(text: str, environ: dict[str, str]) -> dict[str, str]:
-            resolved: dict[str, str] = {}
-            for line in text.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                key, raw = stripped.split("=", 1)
-                key = key.strip()
-                if key.startswith("export "):
-                    key = key[7:].strip()
-                parsed = host_parse_scalar(raw)
-                if parsed is None:
-                    continue
-                env = dict(environ)
-                env.update(resolved)
-                parts: list[str] = []
-                cursor = 0
-                for match in host_braced.finditer(parsed):
-                    parts.append(parsed[cursor : match.start()])
-                    name = match.group("name")
-                    default = match.group("default")
-                    if name in env:
-                        found = env[name]
-                        parts.append("" if found is None else str(found))
-                    else:
-                        parts.append(default if default is not None else "")
-                    cursor = match.end()
-                parts.append(parsed[cursor:])
-                resolved[key] = "".join(parts)
-            return resolved
+        import importlib.metadata
+        try:
+            import dotenv
+            version = importlib.metadata.version("python-dotenv")
+        except ImportError:
+            self.skipTest("python-dotenv 1.2.2 oracle is not installed")
+        if version != "1.2.2":
+            self.skipTest("python-dotenv 1.2.2 oracle is required")
 
         environ = {
             "SYNTHETIC_TOKEN": "expanded-secret",
@@ -1428,38 +1418,69 @@ class DoctorReportTests(unittest.TestCase):
             "MARMOT_HOME=first\nMARMOT_HOME=second\nMARMOT_GROUP_ID_HEX=${MARMOT_HOME}\n",
             "export MARMOT_AGENT_AUTH_TOKEN=${SYNTHETIC_TOKEN}\nMARMOT_HOME=plain # comment\n",
         )
+        cases += (
+            "'MARMOT_AGENT_AUTH_TOKEN'=quoted-key\n",
+            "export\tMARMOT_AGENT_AUTH_TOKEN=tab-export\n",
+            "LOCAL='first\nsecond'\nMARMOT_AGENT_AUTH_TOKEN=${LOCAL}\n",
+            "LOCAL\nMARMOT_AGENT_AUTH_TOKEN=${LOCAL:-default}\n",
+            "MARMOT_AGENT_AUTH_TOKEN=first\nMARMOT_AGENT_AUTH_TOKEN\n",
+            "UNRELATED='start\nMARMOT_AGENT_SOCKET=/wrong/socket\nend'\n",
+            "LOCAL=${UNSUPPORTED:=value}\nMARMOT_AGENT_AUTH_TOKEN=${LOCAL}\n",
+            "MARMOT_AGENT_AUTH_TOKEN='value' junk\n",
+            "MARMOT_AGENT_AUTH_TOKEN= 'value' junk\n",
+        )
         for text in cases:
-            with self.subTest(text=text):
-                host = host_dotenv_values(text, environ)
+            with self.subTest(text=text), mock.patch.dict(os.environ, environ, clear=True):
+                host = dotenv.dotenv_values(stream=io.StringIO(text))
                 values, error, unsupported = diag.parse_dotenv_assignments(text, environ=environ)
-                leftover = {
-                    key
-                    for key, value in host.items()
-                    if key in diag.DOTENV_CONNECTOR_KEYS and "${" in value
-                }
-                expected = {
-                    key: value
-                    for key, value in host.items()
-                    if key in diag.DOTENV_CONNECTOR_KEYS and key not in leftover
-                }
-                self.assertEqual(values, expected)
-                self.assertEqual(unsupported, leftover)
-                self.assertEqual(error, "unsupported" if leftover else None)
-                dotenv_module = None
-                dotenv_version = ""
-                try:
-                    import importlib.metadata as importlib_metadata
+                if error:
+                    self.assertTrue(unsupported)
+                    self.assertFalse(set(values) & unsupported)
+                else:
+                    expected = {key: value for key, value in host.items()
+                                if key in diag.DOTENV_CONNECTOR_KEYS and value is not None}
+                    self.assertEqual(values, expected)
 
-                    import dotenv as dotenv_module
-                    dotenv_version = importlib_metadata.version("python-dotenv")
-                except Exception:
-                    dotenv_module = None
-                    dotenv_version = ""
-                if dotenv_module is not None and dotenv_version == "1.2.2":
-                    with mock.patch.dict(os.environ, environ, clear=False):
-                        live = dotenv_module.dotenv_values(stream=io.StringIO(text))
-                    for key, value in expected.items():
-                        self.assertEqual(live.get(key), value)
+    def test_dotenv_multiline_does_not_contact_embedded_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args = _args(root)
+            _write(Path(args.hermes_home) / ".env",
+                   "UNRELATED='start\nMARMOT_AGENT_SOCKET=/wrong/socket\nend'\n")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                doctor, "_connector_report", return_value=None
+            ) as connector, mock.patch.object(diag, "bounded_run", return_value=None):
+                doctor.collect(args)
+            self.assertEqual(connector.call_args.args[0], Path(args.socket))
+
+    def test_dotenv_unsupported_dependencies_prevent_requests(self) -> None:
+        for text in ("LOCAL=${TOKEN:=bad}\nMARMOT_AGENT_AUTH_TOKEN=${LOCAL}\n",
+                     "MARMOT_AGENT_AUTH_TOKEN='value' junk\n"):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as raw:
+                args = _args(Path(raw))
+                _write(Path(args.hermes_home) / ".env", text)
+                with mock.patch.object(doctor, "_connector_report") as connector, mock.patch.object(
+                    diag, "bounded_run", return_value=None
+                ):
+                    report = doctor.collect(args)
+                connector.assert_not_called()
+                self.assertEqual(next(c for c in report["checks"] if c["id"] == "account.selection")["code"], "unsupported")
+                if "junk" in text:
+                    self.assertEqual(next(c for c in report["checks"] if c["id"] == "socket.control")["code"], "unsupported")
+
+    def test_versions_reject_private_text(self) -> None:
+        for version in (*CANARIES, "1.2.3-/private/path", "1.2.3-nsec1secretcanary"):
+            check = doctor._release_check("release.plugin_version", version)
+            self.assertIsNone(check["value"])
+            self.assertEqual(check["code"], "invalid")
+            checks = doctor._connector_checks(
+                {"type": "diagnostic_status", "report": {"connector_version": version}},
+                None, None, None, "auto",
+            )
+            encoded = json.dumps(checks) + diag.render_human(diag.report_object(checks))
+            self.assertNotIn(version, encoded)
+        for version in ("0.10.1", "1.2.3-rc.1", "v1.2.3"):
+            self.assertEqual(doctor._release_check("release.plugin_version", version)["value"], version)
 
     def test_collect_bare_dollar_socket_does_not_use_expanded_path(self) -> None:
         expanded_home = "cc" * 16
@@ -1500,6 +1521,41 @@ class DoctorReportTests(unittest.TestCase):
                 self.assertNotIn(expanded_account, encoded)
             finally:
                 connector.stop()
+
+    def test_complete_dotenv_bindings_send_host_selected_credentials(self) -> None:
+        import importlib.metadata
+        try:
+            import dotenv
+        except ImportError:
+            self.skipTest("python-dotenv 1.2.2 oracle is not installed")
+        if importlib.metadata.version("python-dotenv") != "1.2.2":
+            self.skipTest("python-dotenv 1.2.2 oracle is required")
+        for text in (
+            "'MARMOT_AGENT_AUTH_TOKEN'=quoted-key\n",
+            "export\tMARMOT_AGENT_AUTH_TOKEN=tab-export\n",
+            "LOCAL='first\nsecond'\nMARMOT_AGENT_AUTH_TOKEN=${LOCAL}\n",
+            "LOCAL\nMARMOT_AGENT_AUTH_TOKEN=prefix${LOCAL:-default}suffix\n",
+        ):
+            with self.subTest(text=text), _short_tempdir("hb-") as raw:
+                root = Path(raw)
+                args = _args(root)
+                socket_path = root / "c.sock"
+                text += f"MARMOT_AGENT_SOCKET={socket_path}\n"
+                _write(Path(args.hermes_home) / ".env", text)
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    host = dotenv.dotenv_values(stream=io.StringIO(text))
+                    token, error = diag.resolve_auth_token({}, env_values=host)
+                    self.assertIsNone(error)
+                    connector = _ConnectorFixture(socket_path, expected_token=token)
+                    connector.start()
+                    try:
+                        with mock.patch.object(diag, "bounded_run", return_value=None):
+                            report = doctor.collect(args)
+                        self.assertTrue(connector.requests)
+                        self.assertEqual(connector.requests[0]["auth_token"], token)
+                        self.assertEqual(next(c for c in report["checks"] if c["id"] == "account.selection")["code"], "selected")
+                    finally:
+                        connector.stop()
 
     def test_collect_host_equivalent_dotenv_sends_adapter_selected_token(self) -> None:
         expanded_home = "cc" * 16
@@ -1964,6 +2020,20 @@ class DiagnosticSocketTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InstallerDoctorDispatchTests(unittest.TestCase):
+    def test_doctor_no_service_is_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            plugin = root / "plugins" / "marmot"
+            _write(plugin / "__init__.py", "")
+            _write(plugin / "doctor.py", "import sys\ndef main():\n    assert '--no-install-service' in sys.argv\n    print('passive doctor')\n    return 0\n")
+            completed = subprocess.run(
+                [str(INSTALLER), "--doctor", "--no-service", "--hermes-home", str(root)],
+                env={**os.environ, "MARMOT_PLUGIN_DIR": str(plugin)},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "passive doctor")
+
     def test_json_requires_doctor(self) -> None:
         completed = subprocess.run(
             [str(INSTALLER), "--json"],
@@ -1973,6 +2043,26 @@ class InstallerDoctorDispatchTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("--json requires --doctor", completed.stderr)
+
+    def test_startup_failures_are_private_fatal_reports(self) -> None:
+        for source in ("from . import diagnostics", "raise RuntimeError('/private/nsec1secretcanary')"):
+            for json_flag in ([], ["--json"]):
+                with self.subTest(source=source, json=json_flag), tempfile.TemporaryDirectory() as raw:
+                    plugin = Path(raw) / "marmot"
+                    _write(plugin / "__init__.py", "")
+                    _write(plugin / "doctor.py", source)
+                    result = subprocess.run(
+                        [str(INSTALLER), "--doctor", *json_flag],
+                        env={**os.environ, "MARMOT_PLUGIN_DIR": str(plugin)},
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stderr, "")
+                    self.assertNotIn(raw, result.stdout)
+                    self.assertNotIn("nsec1secretcanary", result.stdout)
+                    self.assertIn("helper_unavailable", result.stdout)
+                    if json_flag:
+                        self.assertEqual(json.loads(result.stdout)["exit_code"], 2)
 
     def test_mutating_flags_rejected(self) -> None:
         completed = subprocess.run(

@@ -1388,15 +1388,21 @@ async fn create_group_rejects_invitee_missing_required_role_capability() {
     );
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
+    let request = CreateGroupRequest {
+        name: "agent-stream".into(),
+        description: "".into(),
+        members: vec![bob_kp.clone()],
+        required_features: vec![],
+        app_components: agent_stream_component(),
+        initial_admins: vec![],
+    };
+    let requirements = alice.create_key_package_requirements(&request).unwrap();
+    assert!(matches!(
+        requirements.validate(&bob_kp),
+        Err(EngineError::MissingRequiredCapabilities { .. })
+    ));
     let err = alice
-        .create_group(CreateGroupRequest {
-            name: "agent-stream".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: agent_stream_component(),
-            initial_admins: vec![],
-        })
+        .create_group(request)
         .await
         .expect_err("bob lacks the required receive role capability");
     assert!(
@@ -1466,6 +1472,12 @@ async fn invite_rejects_member_missing_required_role_capability() {
         agent_stream_supported_components(),
     );
     let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let requirements = alice.invite_key_package_requirements(&group_id).unwrap();
+    assert!(matches!(
+        requirements.validate(&bob_kp),
+        Err(EngineError::MissingRequiredCapabilities { .. })
+    ));
 
     let err = alice
         .send(cgka_traits::engine::SendIntent::Invite {

@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use marmot_uniffi::Marmot;
 
+pub mod attachment_access;
+pub mod attachment_history;
 pub mod commands;
 pub(crate) mod macros;
 pub mod memory;
@@ -33,7 +35,7 @@ pub mod types;
 
 pub use status::MarmotStatus;
 
-use memory::{owned_c_string, required_str, str_array};
+use memory::{optional_str, owned_c_string, required_str, str_array};
 use secret_store::{CSecretStore, MarmotSecretStore};
 use status::set_last_error;
 use types::notification::MarmotCursorPersistence;
@@ -324,6 +326,160 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
     })
 }
 
+/// Open with an optional public client name for newly prepared KeyPackages.
+/// NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+/// their original tags. NULL `store` selects the platform keychain.
+/// Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
+///
+/// # Safety
+/// Same pointer contracts as `marmot_client_new_with_secret_store`, except
+/// `store` may be NULL. `client_name` must be NULL or a valid UTF-8 C string.
+/// `cursor_persistence` must be a `MarmotCursorPersistence` discriminant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_client_name(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    client_name: *const c_char,
+    cursor_persistence: u32,
+    store: *const MarmotSecretStore,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
+        let cursor = match MarmotCursorPersistence::from_c(cursor_persistence) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let name = match unsafe { optional_str(client_name) } {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
+        let store = if store.is_null() {
+            None
+        } else {
+            match unsafe { CSecretStore::from_c(store) } {
+                Ok(store) => Some(Arc::new(store)),
+                Err(status) => return status,
+            }
+        };
+        let status = unsafe {
+            open_client(root_path, relay_urls, relay_urls_len, out_client, {
+                let store = store
+                    .as_ref()
+                    .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
+                move |root, relays| {
+                    Marmot::new_with_client_name(root, relays, name, cursor.into(), store)
+                }
+            })
+        };
+        if status == MarmotStatus::Ok
+            && let Some(store) = store
+        {
+            store.arm();
+        }
+        status
+    })
+}
+
+/// Borrowed construction options. Zero initialization selects public-only
+/// endpoints, an advancing cursor, no client label, and the platform keychain.
+/// Use this struct only with the matching header/library version.
+#[repr(C)]
+pub struct MarmotClientOptions {
+    /// A MarmotRelayPolicy discriminant.
+    pub relay_policy: u32,
+    /// A MarmotCursorPersistence discriminant.
+    pub cursor_persistence: u32,
+    /// Optional UTF-8 label; NULL or blank omits the public tag.
+    pub client_name: *const c_char,
+    /// Optional callback store; NULL selects the platform keychain.
+    pub store: *const MarmotSecretStore,
+}
+
+/// Create a client with combined relay, cursor, label and secret-storage options.
+/// NULL options uses defaults. Store ownership transfers only on success, with
+/// the same callback lifetime contract as marmot_client_new_with_secret_store.
+///
+/// # Safety
+/// Same root, relay and output pointer contracts as marmot_client_new.
+/// Non-NULL options must point to a readable MarmotClientOptions for this call;
+/// its label and store pointers obey marmot_client_new_with_client_name's contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_configuration(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    options: *const MarmotClientOptions,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
+        let defaults = MarmotClientOptions {
+            relay_policy: 0,
+            cursor_persistence: 0,
+            client_name: std::ptr::null(),
+            store: std::ptr::null(),
+        };
+        let options = unsafe { options.as_ref() }.unwrap_or(&defaults);
+        let policy = match options.relay_policy {
+            0 => marmot_uniffi::RelayPolicyFfi::PublicOnly,
+            1 => marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            2 => marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
+            _ => {
+                set_last_error("invalid relay policy");
+                return MarmotStatus::InvalidArgument;
+            }
+        };
+        let store = options.store;
+        let cursor = match MarmotCursorPersistence::from_c(options.cursor_persistence) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let name = match unsafe { optional_str(options.client_name) } {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
+        let store = if store.is_null() {
+            None
+        } else {
+            match unsafe { CSecretStore::from_c(store) } {
+                Ok(store) => Some(Arc::new(store)),
+                Err(status) => return status,
+            }
+        };
+        let status = unsafe {
+            open_client(root_path, relay_urls, relay_urls_len, out_client, {
+                let store = store
+                    .as_ref()
+                    .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
+                move |root, relays| {
+                    Marmot::new_with_configuration(
+                        root,
+                        relays,
+                        marmot_uniffi::MarmotOptions {
+                            relay_policy: Some(policy),
+                            cursor_persistence: Some(cursor.into()),
+                            client_name: name,
+                            secret_store: store,
+                        },
+                    )
+                }
+            })
+        };
+        if status == MarmotStatus::Ok
+            && let Some(store) = store
+        {
+            store.arm();
+        }
+        status
+    })
+}
+
 /// Shared body of the client constructors: read the borrowed arguments,
 /// build the embedded runtime, run `construct` inside it, and hand the
 /// handle out.
@@ -505,6 +661,8 @@ pub unsafe extern "C" fn marmot_string_free(s: *mut c_char) {
 pub unsafe extern "C" fn marmot_bytes_free(data: *mut u8, len: usize) {
     memory::free_guard(|| unsafe { memory::free_vec(data, len) });
 }
+
+pub mod attachment_controls;
 
 #[cfg(test)]
 mod tests {

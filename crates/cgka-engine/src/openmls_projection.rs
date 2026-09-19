@@ -3442,7 +3442,13 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 /// back to `previous_tip` when no branch was selected).
 ///
 /// The remaining reasons (`LosingBranch`, `BeyondAnchor`, `BeyondAppRetention`)
-/// are genuinely terminal and stay `EpochInvalidated`.
+/// are genuinely terminal and stay `EpochInvalidated`. `LosingBranch` earns
+/// that only because `handle_app_message` withholds it while the branch the
+/// message rode is still eligible — such a message is *deferred*
+/// (`NonSelectedEligibleBranch`) alongside that branch's commits, so a later
+/// pass can revive both. By the time this reason arrives, either no branch the
+/// message decrypts on can be reconsidered, or the message was already
+/// delivered and the reorg withdrew it for good (mdk#965).
 fn message_state_for_invalidated_reason(
     reason: InvalidatedAppMessageReason,
     message_epoch: u64,

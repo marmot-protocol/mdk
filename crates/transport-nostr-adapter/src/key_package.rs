@@ -10,6 +10,8 @@ use crate::{NostrPublishOutcome, NostrRelayClient};
 
 pub const KIND_MARMOT_KEY_PACKAGE: u64 = 30_443;
 
+pub const CLIENT_TAG: &str = "client";
+
 const D_TAG: &str = "d";
 const IDENTITY_TAG: &str = "i";
 const MLS_PROTOCOL_VERSION_TAG: &str = "mls_protocol_version";
@@ -20,6 +22,8 @@ const APP_COMPONENTS_TAG: &str = "app_components";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrKeyPackagePublication {
+    /// Advisory host application label, absent for generic MDK consumers.
+    pub client_name: Option<String>,
     pub account_id: MemberId,
     pub key_package: KeyPackage,
     pub key_package_slot_id: String,
@@ -82,7 +86,7 @@ impl NostrKeyPackagePublication {
         }
 
         let identity = hex::encode(self.account_id.as_slice());
-        let tags = vec![
+        let mut tags = vec![
             vec![D_TAG.into(), self.key_package_slot_id.clone()],
             vec![MLS_PROTOCOL_VERSION_TAG.into(), "1.0".into()],
             vec![IDENTITY_TAG.into(), self.key_package_ref.clone()],
@@ -91,6 +95,10 @@ impl NostrKeyPackagePublication {
             values_tag(MLS_PROPOSALS_TAG, &self.mls_proposals),
             values_tag(APP_COMPONENTS_TAG, &self.app_components),
         ];
+
+        if let Some(name) = &self.client_name {
+            tags.push(vec![CLIENT_TAG.into(), name.clone()]);
+        }
 
         Ok(NostrTransportEvent::new_unsigned_at(
             identity,
@@ -275,6 +283,7 @@ mod tests {
 
     fn sample_publication() -> NostrKeyPackagePublication {
         NostrKeyPackagePublication {
+            client_name: None,
             account_id: MemberId::new(vec![0xA1; 32]),
             key_package: KeyPackage::new(vec![1, 2, 3, 4]),
             key_package_slot_id: "slot-1".into(),

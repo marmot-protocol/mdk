@@ -802,6 +802,16 @@ impl SqliteAccountStorage {
         Ok(invites)
     }
 
+    /// Read projected groups without loading the transport cursor or seen-event window.
+    /// A supplied id restricts every projection query to that group.
+    pub fn account_groups(
+        &self,
+        group_id_hex: Option<&str>,
+    ) -> StorageResult<Vec<StoredAccountGroup>> {
+        let conn = self.lock()?;
+        load_account_groups(&conn, group_id_hex)
+    }
+
     pub fn load_account_projection_state(
         &self,
         label: &str,
@@ -836,85 +846,7 @@ impl SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
 
-        let mut group_statement = conn
-            .prepare_cached(
-                "SELECT group_id_hex, endpoint, profile_name, profile_description,
-                        image_hash_hex, image_key_hex, image_nonce_hex,
-                        image_upload_key_hex, image_media_type, admin_keys_hex,
-                        archived, pending_confirmation, welcomer_account_id_hex,
-                        via_welcome_message_id_hex, nostr_routing_last_epoch,
-                        prior_nostr_routes_json, self_membership, member_count
-                 FROM account_groups
-                 ORDER BY updated_at, group_id_hex",
-            )
-            .storage()?;
-        let raw_groups = group_statement
-            .query_map([], |row| {
-                Ok(RawStoredAccountGroup {
-                    group_id_hex: row.get(0)?,
-                    endpoint: row.get(1)?,
-                    profile_name: row.get(2)?,
-                    profile_description: row.get(3)?,
-                    image_hash_hex: row.get(4)?,
-                    image_key_hex: row.get(5)?,
-                    image_nonce_hex: row.get(6)?,
-                    image_upload_key_hex: row.get(7)?,
-                    image_media_type: row.get(8)?,
-                    admin_keys_hex: row.get(9)?,
-                    archived: row.get::<_, i64>(10)? != 0,
-                    pending_confirmation: row.get::<_, i64>(11)? != 0,
-                    welcomer_account_id_hex: row.get(12)?,
-                    via_welcome_message_id_hex: row.get(13)?,
-                    nostr_routing_last_epoch: row.get(14)?,
-                    prior_nostr_routes_json: row.get(15)?,
-                    self_membership: SelfMembership::from_storage(&row.get::<_, String>(16)?),
-                    member_count: row.get(17)?,
-                })
-            })
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        drop(group_statement);
-
-        let mut components_by_group = all_account_group_components(&conn)?;
-        let mut members_by_group = load_direct_conversation_members(&conn)?;
-        let mut presentation_members = load_presentation_members(&conn)?;
-        let mut groups = Vec::with_capacity(raw_groups.len());
-        for raw in raw_groups {
-            let prior_nostr_routes = serde_json::from_str(&raw.prior_nostr_routes_json)
-                .map_err(|err| StorageError::Serialization(err.to_string()))?;
-            let components = components_by_group
-                .remove(&raw.group_id_hex)
-                .unwrap_or_default();
-            let direct_member_ids_hex = members_by_group.remove(&raw.group_id_hex);
-            let presentation_member_ids_hex = presentation_members.remove(&raw.group_id_hex);
-            groups.push(StoredAccountGroup {
-                group_id_hex: raw.group_id_hex,
-                endpoint: raw.endpoint,
-                profile_name: raw.profile_name,
-                profile_description: raw.profile_description,
-                image_hash_hex: raw.image_hash_hex,
-                image_key_hex: raw.image_key_hex,
-                image_nonce_hex: raw.image_nonce_hex,
-                image_upload_key_hex: raw.image_upload_key_hex,
-                image_media_type: raw.image_media_type,
-                admin_keys_hex: raw.admin_keys_hex,
-                archived: raw.archived,
-                pending_confirmation: raw.pending_confirmation,
-                member_count: raw.member_count.and_then(|value| value.try_into().ok()),
-                direct_member_ids_hex,
-                presentation_member_ids_hex,
-                welcomer_account_id_hex: raw.welcomer_account_id_hex,
-                via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
-                nostr_routing_last_epoch: raw
-                    .nostr_routing_last_epoch
-                    .try_into()
-                    .unwrap_or_default(),
-                prior_nostr_routes,
-                self_membership: raw.self_membership,
-                components,
-            });
-        }
+        let groups = load_account_groups(&conn, None)?;
 
         Ok(StoredAccountState {
             label: label.to_owned(),
@@ -3604,16 +3536,19 @@ fn checkpoint_wal_truncate_after_secure_delete(conn: &Connection) -> StorageResu
 /// `component_id` order (matching the prior per-group `ORDER BY component_id`).
 fn all_account_group_components(
     conn: &rusqlite::Connection,
+    group_id_hex: Option<&str>,
 ) -> StorageResult<std::collections::HashMap<String, Vec<StoredAccountGroupComponent>>> {
     let mut statement = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT group_id_hex, component_id, component_name, component_data_hex
              FROM account_group_app_components
+             {}
              ORDER BY group_id_hex, component_id",
-        )
+            group_filter(group_id_hex),
+        ))
         .storage()?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params_from_iter(group_id_hex), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 StoredAccountGroupComponent {
@@ -3960,16 +3895,19 @@ fn i64_to_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
 
 fn load_direct_conversation_members(
     conn: &Connection,
+    group_id_hex: Option<&str>,
 ) -> StorageResult<HashMap<String, Vec<String>>> {
     let mut statement = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT group_id_hex, member_id_hex
              FROM direct_conversation_members
+             {}
              ORDER BY group_id_hex, member_id_hex",
-        )
+            group_filter(group_id_hex),
+        ))
         .storage()?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params_from_iter(group_id_hex), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .storage()?;
@@ -3983,16 +3921,21 @@ fn load_direct_conversation_members(
     }
     Ok(members_by_group)
 }
-fn load_presentation_members(conn: &Connection) -> StorageResult<HashMap<String, Vec<String>>> {
+fn load_presentation_members(
+    conn: &Connection,
+    group_id_hex: Option<&str>,
+) -> StorageResult<HashMap<String, Vec<String>>> {
     let mut statement = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT group_id_hex, member_id_hex
              FROM chat_presentation_members
+             {}
              ORDER BY group_id_hex, member_id_hex",
-        )
+            group_filter(group_id_hex),
+        ))
         .storage()?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params_from_iter(group_id_hex), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .storage()?;
@@ -4049,6 +3992,100 @@ pub(crate) fn replace_direct_conversation_members_tx(
         .storage()?;
     }
     Ok(())
+}
+
+// Separate SQL shapes keep keyed reads on the group-id indexes.
+fn group_filter(group_id_hex: Option<&str>) -> &'static str {
+    if group_id_hex.is_some() {
+        return "WHERE group_id_hex = ?1";
+    }
+    ""
+}
+
+fn load_account_groups(
+    conn: &Connection,
+    group_id_hex: Option<&str>,
+) -> StorageResult<Vec<StoredAccountGroup>> {
+    let mut group_statement = conn
+        .prepare_cached(&format!(
+            "SELECT group_id_hex, endpoint, profile_name, profile_description,
+                    image_hash_hex, image_key_hex, image_nonce_hex,
+                    image_upload_key_hex, image_media_type, admin_keys_hex,
+                    archived, pending_confirmation, welcomer_account_id_hex,
+                    via_welcome_message_id_hex, nostr_routing_last_epoch,
+                    prior_nostr_routes_json, self_membership, member_count
+             FROM account_groups
+             {}
+             ORDER BY updated_at, group_id_hex",
+            group_filter(group_id_hex),
+        ))
+        .storage()?;
+    let raw_groups = group_statement
+        .query_map(params_from_iter(group_id_hex), |row| {
+            Ok(RawStoredAccountGroup {
+                group_id_hex: row.get(0)?,
+                endpoint: row.get(1)?,
+                profile_name: row.get(2)?,
+                profile_description: row.get(3)?,
+                image_hash_hex: row.get(4)?,
+                image_key_hex: row.get(5)?,
+                image_nonce_hex: row.get(6)?,
+                image_upload_key_hex: row.get(7)?,
+                image_media_type: row.get(8)?,
+                admin_keys_hex: row.get(9)?,
+                archived: row.get::<_, i64>(10)? != 0,
+                pending_confirmation: row.get::<_, i64>(11)? != 0,
+                welcomer_account_id_hex: row.get(12)?,
+                via_welcome_message_id_hex: row.get(13)?,
+                nostr_routing_last_epoch: row.get(14)?,
+                prior_nostr_routes_json: row.get(15)?,
+                self_membership: SelfMembership::from_storage(&row.get::<_, String>(16)?),
+                member_count: row.get(17)?,
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    drop(group_statement);
+
+    let mut components_by_group = all_account_group_components(conn, group_id_hex)?;
+    let mut members_by_group = load_direct_conversation_members(conn, group_id_hex)?;
+    let mut presentation_members = load_presentation_members(conn, group_id_hex)?;
+    let mut groups = Vec::with_capacity(raw_groups.len());
+    for raw in raw_groups {
+        let prior_nostr_routes = serde_json::from_str(&raw.prior_nostr_routes_json)
+            .map_err(|err| StorageError::Serialization(err.to_string()))?;
+        let components = components_by_group
+            .remove(&raw.group_id_hex)
+            .unwrap_or_default();
+        let direct_member_ids_hex = members_by_group.remove(&raw.group_id_hex);
+        let presentation_member_ids_hex = presentation_members.remove(&raw.group_id_hex);
+        groups.push(StoredAccountGroup {
+            group_id_hex: raw.group_id_hex,
+            endpoint: raw.endpoint,
+            profile_name: raw.profile_name,
+            profile_description: raw.profile_description,
+            image_hash_hex: raw.image_hash_hex,
+            image_key_hex: raw.image_key_hex,
+            image_nonce_hex: raw.image_nonce_hex,
+            image_upload_key_hex: raw.image_upload_key_hex,
+            image_media_type: raw.image_media_type,
+            admin_keys_hex: raw.admin_keys_hex,
+            archived: raw.archived,
+            pending_confirmation: raw.pending_confirmation,
+            member_count: raw.member_count.and_then(|value| value.try_into().ok()),
+            direct_member_ids_hex,
+            presentation_member_ids_hex,
+            welcomer_account_id_hex: raw.welcomer_account_id_hex,
+            via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
+            nostr_routing_last_epoch: raw.nostr_routing_last_epoch.try_into().unwrap_or_default(),
+            prior_nostr_routes,
+            self_membership: raw.self_membership,
+            components,
+        });
+    }
+
+    Ok(groups)
 }
 
 #[cfg(test)]

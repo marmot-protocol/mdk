@@ -773,3 +773,11 @@ cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 
 The repo-level `just check` and `just test` recipes include the `otlp-export` feature set through the shared
 `diagnostics-features` variable.
+
+
+## Conversation readiness and worker contention
+
+The [runtime latency measurements](runtime-latency-telemetry.md) define conversation-open,
+first-authority, send, worker, storage and host-render boundaries, cancellation accounting,
+fixed operation names and native integration requirements. These aggregates share the existing
+opt-in OTLP exporter and are also available from the app performance snapshot.

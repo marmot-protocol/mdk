@@ -6,6 +6,7 @@
 use marmot_uniffi::conversions::{
     AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi, DurationHistogramBucketFfi,
     DurationHistogramSnapshotFfi, HostPerformanceOperationFfi, HostPerformanceOutcomeFfi,
+    RuntimePerformanceSnapshotFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -17,6 +18,8 @@ c_enum! {
         ForegroundLocalReady,
         OutboundMessageVisible,
         InboundMessageVisible,
+        ConversationLocalVisible,
+        ConversationComposerReady,
     }
 }
 
@@ -26,6 +29,12 @@ impl From<MarmotHostPerformanceOperation> for HostPerformanceOperationFfi {
             MarmotHostPerformanceOperation::OutboundMessageVisible => Self::OutboundMessageVisible,
             MarmotHostPerformanceOperation::InboundMessageVisible => Self::InboundMessageVisible,
             MarmotHostPerformanceOperation::SplashReady => Self::SplashReady,
+            MarmotHostPerformanceOperation::ConversationComposerReady => {
+                Self::ConversationComposerReady
+            }
+            MarmotHostPerformanceOperation::ConversationLocalVisible => {
+                Self::ConversationLocalVisible
+            }
             MarmotHostPerformanceOperation::ForegroundLocalReady => Self::ForegroundLocalReady,
         }
     }
@@ -36,6 +45,9 @@ c_enum! {
     MarmotHostPerformanceOutcome from HostPerformanceOutcomeFfi {
         Success,
         Failure,
+        Cancelled,
+        Timeout,
+        Unavailable,
     }
 }
 
@@ -44,6 +56,9 @@ impl From<MarmotHostPerformanceOutcome> for HostPerformanceOutcomeFfi {
         match value {
             MarmotHostPerformanceOutcome::Success => Self::Success,
             MarmotHostPerformanceOutcome::Failure => Self::Failure,
+            MarmotHostPerformanceOutcome::Unavailable => Self::Unavailable,
+            MarmotHostPerformanceOutcome::Timeout => Self::Timeout,
+            MarmotHostPerformanceOutcome::Cancelled => Self::Cancelled,
         }
     }
 }
@@ -72,6 +87,24 @@ c_mirror! {
         copy attempts: u64,
         copy successes: u64,
         copy failures: u64,
+        rec duration_ms: MarmotDurationHistogramSnapshot,
+    }
+}
+
+c_mirror! {
+    /// Bounded runtime timings and unfinished operation counts.
+    MarmotRuntimePerformanceSnapshot from RuntimePerformanceSnapshotFfi {
+        str operation,
+        copy started: u64,
+        copy completed: u64,
+        copy successes: u64,
+        copy failures: u64,
+        copy cancelled: u64,
+        copy timeouts: u64,
+        copy not_ready: u64,
+        copy in_flight: u64,
+        copy oldest_tracked_in_flight_ms: u64,
+        copy untracked_in_flight: u64,
         rec duration_ms: MarmotDurationHistogramSnapshot,
     }
 }
@@ -169,5 +202,48 @@ c_mirror! {
         rec media_download_plaintext_verify: MarmotAppPerformanceOperationSnapshot,
         rec host_splash_ready: MarmotAppPerformanceOperationSnapshot,
         rec host_foreground_local_ready: MarmotAppPerformanceOperationSnapshot,
+        vec runtime_operations/runtime_operations_len: MarmotRuntimePerformanceSnapshot,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::CFree;
+
+    #[test]
+    fn runtime_snapshot_deep_free_reclaims_name_and_histogram() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let mut mirror: MarmotRuntimePerformanceSnapshot = RuntimePerformanceSnapshotFfi {
+            operation: "conversation_open".into(),
+            started: 3,
+            completed: 2,
+            successes: 1,
+            failures: 0,
+            cancelled: 1,
+            timeouts: 0,
+            not_ready: 0,
+            in_flight: 1,
+            oldest_tracked_in_flight_ms: 500,
+            untracked_in_flight: 0,
+            duration_ms: DurationHistogramSnapshotFfi {
+                buckets: vec![DurationHistogramBucketFfi {
+                    upper_bound_ms: 50,
+                    count: 2,
+                }],
+                overflow_count: 0,
+                sum_ms: 100,
+            },
+        }
+        .into();
+        assert_eq!(mirror.in_flight, 1);
+        assert_eq!(mirror.duration_ms.buckets_len, 1);
+        unsafe {
+            mirror.free_in_place();
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
     }
 }
