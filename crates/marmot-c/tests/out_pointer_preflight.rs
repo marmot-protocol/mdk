@@ -7,7 +7,9 @@
 use std::ffi::CString;
 use std::time::Instant;
 
-use marmot_c::commands::marmot_set_group_archived;
+use marmot_c::commands::{
+    marmot_group_app_component, marmot_set_group_archived, marmot_update_app_component,
+};
 use marmot_c::subscriptions::{
     MarmotEventsSubscription, marmot_events_subscription_free, marmot_events_subscription_next,
     marmot_subscribe_events,
@@ -56,6 +58,48 @@ fn null_out_is_rejected_before_the_command_runs() {
 
     unsafe { marmot_client_shutdown(client) };
     unsafe { marmot_client_free(client) };
+}
+
+#[test]
+fn app_component_out_preflight() {
+    unsafe {
+        assert_eq!(
+            marmot_group_app_component(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0xf301,
+                std::ptr::null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_update_app_component(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0xf301,
+                std::ptr::null(),
+                1,
+                std::ptr::null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        let mut out = std::ptr::dangling_mut();
+        assert_eq!(
+            marmot_update_app_component(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0xf301,
+                std::ptr::null(),
+                0,
+                &raw mut out
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+    }
 }
 
 #[test]

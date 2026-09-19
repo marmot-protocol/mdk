@@ -709,6 +709,40 @@ fn record_app_performance(
     }
 }
 
+fn validate_app_component_id(component_id: u16) -> Result<(), AppError> {
+    use cgka_traits::app_components::{
+        PRIVATE_USE_APP_COMPONENT_ID_START, PROTOCOL_OWNED_APP_COMPONENT_IDS,
+    };
+    if component_id < PRIVATE_USE_APP_COMPONENT_ID_START
+        || PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
+    {
+        return Err(AppError::InvalidAppComponent(
+            "component id is reserved for protocol use".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn app_component_ids_are_scoped() {
+    use cgka_traits::app_components::PROTOCOL_OWNED_APP_COMPONENT_IDS;
+    // Driving the rejection set from the canonical list means a newly assigned
+    // protocol component id cannot stay writable through this API.
+    for id in PROTOCOL_OWNED_APP_COMPONENT_IDS
+        .iter()
+        .copied()
+        .chain([0, 1, 2, 0x7fff])
+    {
+        assert!(matches!(
+            validate_app_component_id(id),
+            Err(AppError::InvalidAppComponent(_))
+        ));
+    }
+    for id in [0x8000, 0x800a, 0xf301, 0xffff] {
+        assert!(validate_app_component_id(id).is_ok());
+    }
+}
+
 impl AppClient {
     /// Persist the exact first KeyPackage and signed publication artifact
     /// without activating transport or contacting a relay.
@@ -3340,6 +3374,63 @@ impl AppClient {
             &effects.events,
         )
         .await;
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    /// Read opaque application-owned group state. Absent and empty differ.
+    pub fn group_app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        validate_app_component_id(component_id)?;
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.app_component(group_id, component_id)?)
+    }
+
+    /// Replace optional application-owned state through an admin MLS commit.
+    pub async fn update_app_component(
+        &mut self,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        validate_app_component_id(component_id)?;
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        if self
+            .runtime
+            .group_record(group_id)?
+            .required_capabilities
+            .app_components
+            .contains(component_id)
+        {
+            return Err(AppError::InvalidAppComponent(
+                "component is required by the group".into(),
+            ));
+        }
+        let audit_context = Self::local_human_action_context(
+            "update_app_component",
+            vec!["app_component"],
+            vec![component_id],
+            None,
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![AppComponentData { component_id, data }],
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
