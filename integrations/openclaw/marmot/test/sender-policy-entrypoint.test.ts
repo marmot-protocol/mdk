@@ -152,40 +152,14 @@ async function startRecordingControl(root: string): Promise<RecordingControl> {
   };
 }
 
-interface RegisteredTextSend {
-  (
-    ctx: {
-      cfg: unknown;
-      accountId?: string;
-      to: string;
-      text: string;
-      replyToId?: string;
-      deliveryQueueId: string;
-    },
-  ): Promise<unknown>;
-}
-
-function inboundReplyTarget(ctx: Record<string, unknown>): { to: string; replyToId?: string } {
-  const reply = ctx.reply as { to?: string; replyToId?: string } | undefined;
-  const to =
-    (typeof reply?.to === "string" && reply.to) ||
-    (typeof ctx.OriginatingTo === "string" && ctx.OriginatingTo) ||
-    (typeof ctx.To === "string" && ctx.To) ||
-    "";
-  if (!to) {
-    throw new Error("registered Marmot send is missing a destination");
-  }
-  const replyToId =
-    (typeof reply?.replyToId === "string" && reply.replyToId) ||
-    (typeof ctx.MessageSid === "string" && ctx.MessageSid) ||
-    undefined;
-  return { to, ...(replyToId ? { replyToId } : {}) };
-}
+type FinalDeliver = (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
 
 function recordingRuntime(
   turns: string[],
   sessionStorePath: string,
-  sendText?: RegisteredTextSend,
+  options?: {
+    wrapDeliver?: (deliver: FinalDeliver) => FinalDeliver;
+  },
 ): OpenClawChannelRuntime {
   return {
     routing: {
@@ -207,26 +181,14 @@ function recordingRuntime(
       dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
         turns.push("kernel");
         const typed = params as {
-          ctx: Record<string, unknown>;
-          cfg?: unknown;
           dispatcherOptions: {
-            deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            deliver: FinalDeliver;
           };
         };
-        if (sendText) {
-          const target = inboundReplyTarget(typed.ctx ?? {});
-          await sendText({
-            cfg: typed.cfg,
-            accountId: "default",
-            to: target.to,
-            text: "ok",
-            replyToId: target.replyToId,
-            deliveryQueueId: "entrypoint-authorized-turn:0",
-          });
-          turns.push("durable_final");
-          return;
-        }
-        await typed.dispatcherOptions.deliver({ text: "ok" }, { kind: "final" });
+        const deliver = options?.wrapDeliver
+          ? options.wrapDeliver(typed.dispatcherOptions.deliver)
+          : typed.dispatcherOptions.deliver;
+        await deliver({ text: "ok" }, { kind: "final" });
         turns.push("durable_final");
       },
     },
@@ -290,7 +252,14 @@ function loadRegisteredMarmotPlugin(cfg: Record<string, unknown>, workspaceDir: 
 
 function registeredTextSend(plugin: {
   message?: { send?: { text?: (ctx: never) => Promise<unknown> } };
-}): RegisteredTextSend {
+}): (ctx: {
+  cfg: unknown;
+  accountId?: string;
+  to: string;
+  text: string;
+  replyToId?: string;
+  deliveryQueueId: string;
+}) => Promise<unknown> {
   const send = plugin.message?.send?.text;
   if (typeof send !== "function") {
     throw new Error("registered Marmot plugin is missing message.send.text");
@@ -310,7 +279,7 @@ function hostStatusContext(
     turns: string[];
     logs: string[];
     sessionStorePath: string;
-    sendText?: RegisteredTextSend;
+    wrapDeliver?: (deliver: FinalDeliver) => FinalDeliver;
     accountId?: string;
   },
 ): {
@@ -330,7 +299,9 @@ function hostStatusContext(
     setStatus: (next: Record<string, unknown>) => {
       snapshots.push(next);
     },
-    channelRuntime: recordingRuntime(options.turns, options.sessionStorePath, options.sendText),
+    channelRuntime: recordingRuntime(options.turns, options.sessionStorePath, {
+      wrapDeliver: options.wrapDeliver,
+    }),
     log: {
       info: (message: string) => options.logs.push(message),
       warn: (message: string) => options.logs.push(message),
@@ -377,13 +348,15 @@ function packagedConfig(
 describe("packaged OpenClaw sender-policy entrypoint", () => {
   it("does not treat a delivery-queue identity failure as a durable final", async () => {
     const turns: string[] = [];
-    const runtime = recordingRuntime(turns, "/tmp/marmot-sender-policy-entrypoint-sessions.json");
+    const runtime = recordingRuntime(turns, "/tmp/marmot-sender-policy-entrypoint-sessions.json", {
+      wrapDeliver: () => async () => {
+        throw new Error("marmot: durable text send requires OpenClaw delivery queue identity");
+      },
+    });
     await expect(
       runtime.reply.dispatchReplyWithBufferedBlockDispatcher({
         dispatcherOptions: {
-          deliver: async () => {
-            throw new Error("marmot: durable text send requires OpenClaw delivery queue identity");
-          },
+          deliver: async () => undefined,
         },
       }),
     ).rejects.toThrow(/delivery queue identity/);
@@ -412,12 +385,16 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
         homeDir: () => root,
       });
       const abort = new AbortController();
+      let productionDeliverCalls = 0;
       const { ctx, snapshots } = hostStatusContext(cfg, account, {
         abort,
         turns,
         logs,
         sessionStorePath: host.sessionStorePath,
-        sendText: registeredTextSend(plugin),
+        wrapDeliver: (deliver) => async (payload, info) => {
+          productionDeliverCalls += 1;
+          await deliver(payload, info);
+        },
       });
       const running = plugin.gateway!.startAccount!(ctx);
       try {
@@ -454,10 +431,140 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
         control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
         control.push(inboundEvent({ messageId: HEX32("d5"), sender: ALLOWED, mentionsSelf: true }));
         await vi.waitFor(() => {
+          expect(productionDeliverCalls).toBe(1);
           expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
           expect(turns.filter((item) => item === "durable_final")).toEqual(["durable_final"]);
           expect(control.types.filter((type) => type === "send_final")).toEqual(["send_final"]);
         });
+        expect(productionDeliverCalls).toBe(1);
+      } finally {
+        abort.abort();
+        await running.catch(() => undefined);
+      }
+    } finally {
+      host.restoreState();
+      await control.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the authorized packaged turn when production delivery is a no-op", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-noop-deliver-"));
+    const control = await startRecordingControl(root);
+    const turns: string[] = [];
+    const logs: string[] = [];
+    const host = await preparePackagedHost(root);
+    try {
+      const channel = {
+        socketPath: control.socketPath,
+        accountIdHex: ACCOUNT,
+        profileNameOnboarding: false,
+        debounceMs: 40,
+        senderPolicy: { allowedUsers: [ALLOWED] },
+      };
+      const cfg = packagedConfig(host.pluginRoot, join(root, "workspace"), channel);
+      const plugin = loadRegisteredMarmotPlugin(cfg, root);
+      const sendText = registeredTextSend(plugin);
+      const account = resolveMarmotAccount(channel, "default", {
+        env: {},
+        homeDir: () => root,
+      });
+      const abort = new AbortController();
+      let productionDeliverCalls = 0;
+      const { ctx, snapshots } = hostStatusContext(cfg, account, {
+        abort,
+        turns,
+        logs,
+        sessionStorePath: host.sessionStorePath,
+        wrapDeliver: (deliver) => async () => {
+          expect(typeof deliver).toBe("function");
+          productionDeliverCalls += 1;
+        },
+      });
+      const running = plugin.gateway!.startAccount!(ctx);
+      try {
+        await vi.waitFor(() => {
+          expect(snapshots.at(-1)).toMatchObject({ running: true, connected: true });
+        });
+        const setupTypes = control.types.filter((type) => type !== "subscribe_inbound");
+        control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
+        control.push(inboundEvent({ messageId: HEX32("d5"), sender: ALLOWED, mentionsSelf: true }));
+        await vi.waitFor(() => {
+          expect(productionDeliverCalls).toBe(1);
+          expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
+          expect(turns.filter((item) => item === "durable_final")).toEqual(["durable_final"]);
+        });
+        expect(eventEffects(control.types, setupTypes)).not.toContain("send_final");
+        expect(control.types.filter((type) => type === "send_final")).toEqual([]);
+        await sendText({
+          cfg,
+          accountId: "default",
+          to: GROUP,
+          text: "ok",
+          deliveryQueueId: "adapter-still-functional:0",
+        });
+        expect(control.types.filter((type) => type === "send_final")).toEqual(["send_final"]);
+      } finally {
+        abort.abort();
+        await running.catch(() => undefined);
+      }
+    } finally {
+      host.restoreState();
+      await control.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the authorized packaged turn when production delivery throws", async () => {
+    const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-throw-deliver-"));
+    const control = await startRecordingControl(root);
+    const turns: string[] = [];
+    const logs: string[] = [];
+    const host = await preparePackagedHost(root);
+    try {
+      const channel = {
+        socketPath: control.socketPath,
+        accountIdHex: ACCOUNT,
+        profileNameOnboarding: false,
+        debounceMs: 40,
+        senderPolicy: { allowedUsers: [ALLOWED] },
+      };
+      const cfg = packagedConfig(host.pluginRoot, join(root, "workspace"), channel);
+      const plugin = loadRegisteredMarmotPlugin(cfg, root);
+      const sendText = registeredTextSend(plugin);
+      const account = resolveMarmotAccount(channel, "default", {
+        env: {},
+        homeDir: () => root,
+      });
+      const abort = new AbortController();
+      const { ctx, snapshots } = hostStatusContext(cfg, account, {
+        abort,
+        turns,
+        logs,
+        sessionStorePath: host.sessionStorePath,
+        wrapDeliver: () => async () => {
+          throw new Error("marmot: durable text send requires OpenClaw delivery queue identity");
+        },
+      });
+      const running = plugin.gateway!.startAccount!(ctx);
+      try {
+        await vi.waitFor(() => {
+          expect(snapshots.at(-1)).toMatchObject({ running: true, connected: true });
+        });
+        control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
+        await vi.waitFor(() => {
+          expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
+        });
+        expect(turns.includes("durable_final")).toBe(false);
+        expect(control.types.filter((type) => type === "send_final")).toEqual([]);
+        await sendText({
+          cfg,
+          accountId: "default",
+          to: GROUP,
+          text: "ok",
+          deliveryQueueId: "adapter-still-functional:1",
+        });
+        expect(control.types.filter((type) => type === "send_final")).toEqual(["send_final"]);
       } finally {
         abort.abort();
         await running.catch(() => undefined);

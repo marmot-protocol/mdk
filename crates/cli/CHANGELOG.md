@@ -21,7 +21,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   authorizer stopped across the gateway retry, and host-supplied status
   snapshots cannot report connected while that policy is unenforceable.
   Authorized inbound finals now require the host delivery-queue identity so
-  a successful turn is an acknowledged `send_final`.
+  a successful turn is an acknowledged `send_final`. Packaged sender-policy
+  acceptance goes through that production delivery callback rather than a
+  fabricated outbound send.
 
 ## [0.10.2] - 2026-09-19
 
