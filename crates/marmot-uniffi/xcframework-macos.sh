@@ -32,7 +32,7 @@ export CXXFLAGS_aarch64_apple_darwin="${CXXFLAGS_aarch64_apple_darwin:--mmacosx-
 # merging with it, so a workspace-wide flag added later would be silently
 # dropped for this build alone. Scoping also keeps the flag off the host dylib
 # build below, whose target/release fingerprint is shared with xcframework.sh.
-export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -C embed-bitcode=no"
 
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Keep production release behavior and debug-symbol policy in one source of truth.
@@ -97,11 +97,14 @@ cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.h" "$BUILD_DIR/headers/"
 # XCFramework expects the modulemap to be named module.modulemap
 cp "$BUILD_DIR/swift/${LIB_BASENAME}FFI.modulemap" "$BUILD_DIR/headers/module.modulemap"
 
-# The static library is packaged exactly as cargo produced it, matching
-# xcframework.sh. Do not strip it here: marmotkit-release-profile.env pins
-# strip=none and debug=0, and package-macos-artifacts.sh publishes that profile
-# as provenance, so a post-link strip would make the manifest describe an
-# artifact that is not the one shipped.
+# Keep strip=none/debug=0. Bitcode sanitization is not a symbol strip: Apple
+# rustc and the toolchain compiler_builtins rlib can leave __LLVM,__bitcode
+# in members. Remove those sections from every member, then package the
+# resulting native archive. Do not skip compiler_builtins by name.
+echo "==> Removing leftover Apple bitcode sections from cargo archive"
+python3 "$TOOL_DIR/release-profile-archive.py" --sanitize \
+  "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a"
+
 echo "==> Creating $FRAMEWORK_NAME.xcframework"
 xcodebuild -create-xcframework \
   -library "$TARGET_DIR/$MACOS_TARGET/release/lib${LIB_BASENAME}.a" -headers "$BUILD_DIR/headers" \

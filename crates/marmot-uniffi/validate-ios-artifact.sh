@@ -127,6 +127,16 @@ while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index
       in_build_version = 0
       next
     }
+    /^[[:space:]]*segname __LLVM/ {
+      printf "error: %s member %s contains LLVM bitcode segment\n", identifier, member > "/dev/stderr"
+      failed = 1
+      next
+    }
+    /^[[:space:]]*sectname __bitcode/ {
+      printf "error: %s member %s contains embedded bitcode section\n", identifier, member > "/dev/stderr"
+      failed = 1
+      next
+    }
     END {
       if (count == 0) {
         printf "error: %s contains no LC_BUILD_VERSION commands\n", identifier > "/dev/stderr"
@@ -139,6 +149,7 @@ while identifier="$(/usr/libexec/PlistBuddy -c "Print :AvailableLibraries:$index
       exit failed
     }
   ' <<< "$build_info"
+  python3 "$(dirname "$0")/release-profile-archive.py" "$library"
   index=$((index + 1))
 done
 

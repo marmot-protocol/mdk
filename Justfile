@@ -635,8 +635,11 @@ test-convergence-policy-pin:
 apple-privacy-gate:
     python3 crates/marmot-uniffi/test-apple-privacy.py
 
+release-profile-gate:
+    python3 crates/marmot-uniffi/test-release-profile.py
+
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate binding-docs-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate check clippy test-convergence-policy-pin test

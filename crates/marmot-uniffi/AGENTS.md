@@ -12,6 +12,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
 - Own `apple-privacy.py`, `apple-privacy/`, `validate-apple-privacy.py`, `validate-apple-archive.py`,
   and `test-apple-privacy.py` for SDK declarations and resource delivery into Apple app archives.
 - Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
+- Own `release-profile-json.py`, `release-profile-archive.py`, `test-release-profile.py`, and
+  `measure-release-profile.py` for provenance JSON, native-archive bitcode checks, and controlled
+  baseline/candidate measurements.
 - Own `chat-projections-smoke.sh`, the host Swift/Kotlin chat-screen DTO round-trip check.
 - Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
@@ -25,10 +28,16 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
 - Build and validate an Apple artifact against the same deployment target. Objects compiled under
   `MACOSX_DEPLOYMENT_TARGET` / `IPHONEOS_DEPLOYMENT_TARGET` report exactly that minimum, and the validators fail on a
   minimum *newer* than expected, so validating against a lower number fails. macOS publishes at `15.0`.
-- Package Apple static libraries exactly as cargo produced them. Neither `xcframework.sh` nor `xcframework-macos.sh`
-  strips post-link: `marmotkit-release-profile.env` pins `strip=none` and `debug=0`, and the packagers publish that
-  profile as provenance, so a post-link strip would make the manifest describe an artifact that was not shipped.
-  Package unchanged archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
+- Package Apple static libraries as native objects. Apple Cargo invocations set target-scoped
+  `-C embed-bitcode=no` (iOS rustc defaults to embedding bitcode). After cargo writes each `.a`,
+  `release-profile-archive.py --sanitize` removes leftover `__LLVM` / `__bitcode` segments and
+  MH_OBJECT section-level `__LLVM` leftovers from every member, including toolchain
+  `compiler_builtins` objects; it does not skip names or accept raw LLVM bitcode. Mid-file
+  leftover removal keeps offset-free load commands such as `LC_VERSION_MIN_IPHONEOS`
+  and snaps a parent segment whose `fileoff` equals the leftover bitcode start onto
+  the remaining native data. This is not a symbol strip: `marmotkit-release-profile.env` still pins `strip=none` and
+  `debug=0`, and the packagers publish that profile as provenance. Package the sanitized native
+  archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
   from the packaged source's `apple-privacy/` and publish it separately with a checksum; also include it in the
   existing provenance bundle. Never stage resource-bearing framework wrappers or another complete-package ZIP.
   Consumers must synchronize binary, Swift and privacy inputs and declare the privacy resource in their Swift target.

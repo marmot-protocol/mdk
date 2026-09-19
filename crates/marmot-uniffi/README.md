@@ -385,6 +385,32 @@ Build all Android ABIs:
 The script keeps the host library's UniFFI metadata intact while stripping
 debug and static symbol sections from each packaged Android JNI library.
 
+Standard MarmotKit release builds use the workspace `[profile.release]` together with
+`marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,
+`debug=0`, `panic=unwind`, and `strip=none`. Android target invocations override only
+`CARGO_PROFILE_RELEASE_STRIP=symbols`. Apple target invocations add
+`-C embed-bitcode=no` and sanitize leftover `__LLVM` / `__bitcode` sections
+before packaging so shipped archives stay native; that is not a symbol strip.
+Those builder-owned settings are not a user-facing escape hatch; measurement
+scripts may override LTO and codegen units on direct Cargo commands for a
+controlled baseline comparison.
+
+```sh
+# Inexpensive regressions, including provenance JSON and archive bitcode checks:
+python3 crates/marmot-uniffi/test-release-profile.py
+
+# Controlled host/Android/Apple/CPU comparison. Missing platforms are recorded as
+# unavailable, never as zero. Isolated target directories keep the two variants
+# from overwriting each other. `--cpu` fails if a benchmark invocation fails or
+# only stale Criterion estimates remain:
+python3 crates/marmot-uniffi/measure-release-profile.py \
+  --source-sha "$(git rev-parse HEAD)" \
+  --builder-sha "$(git rev-parse HEAD)" \
+  --host --cpu \
+  --output release-profile-measurements.json \
+  --markdown release-profile-measurements.md
+```
+
 To build a subset:
 
 ```sh

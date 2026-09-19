@@ -9,6 +9,29 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- MarmotKit release-profile measurements now fail closed when `create_group` benchmarks error or
+  omit fresh Criterion estimates, including when stale results are already on disk. The Apple
+  archive helper classifies little-endian Mach-O magic correctly so embedded `__LLVM` / `__bitcode`
+  members are rejected without otool, and the non-publishing profile workflow uploads logs, raw
+  Criterion data, and toolchain versions even when a later step fails.
+- MarmotKit Apple archives no longer ship leftover LLVM bitcode. Apple Cargo invocations pass
+  `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments and
+  MH_OBJECT section-level leftovers from every archive member (including toolchain
+  `compiler_builtins` objects) without skipping names or weakening the native-archive
+  validator. Mid-file leftover removal keeps offset-free load commands such as
+  `LC_VERSION_MIN_IPHONEOS` intact and snaps a parent segment whose `fileoff`
+  equals the leftover bitcode start onto the remaining native data. This is not a
+  symbol strip.
+
+### Changed
+
+- MarmotKit standard release builds now use thin LTO and one codegen unit, kept in lockstep between the
+  workspace profile and the builder-owned MarmotKit environment. Host and Apple archives still keep
+  symbols; Android JNI libraries still strip per invocation. Apple provenance records `lto` as JSON
+  `false` or `"thin"`.
+
 ## [0.10.3] - 2026-09-19
 
 Update generated bindings, native libraries, and C headers together for the changed prepared-row layout. Storage remains at migration 86. See [release notes](../../docs/release/0.10.3.md) and the [client upgrade guide](../../docs/integration/0.10.3.md).
