@@ -6,6 +6,7 @@ import {
   reconnectBackoffMs,
   type InboundSubscribeClient,
 } from "../src/inbound.js";
+import { testAllowlistAuthorizer } from "./sender-policy-fixtures.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 
@@ -63,6 +64,7 @@ describe("MarmotInboundBridge", () => {
       },
     } as unknown as InboundSubscribeClient;
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 1,
       onMessage: async () => {
         calls += 1;
@@ -96,6 +98,7 @@ describe("MarmotInboundBridge", () => {
     } as unknown as InboundSubscribeClient;
     const seen: string[] = [];
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       dedupeWindow: 1,
       reconnectDelayMs: 1,
       onMessage: (message) => {
@@ -127,6 +130,7 @@ describe("MarmotInboundBridge", () => {
     } as unknown as InboundSubscribeClient;
     let calls = 0;
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 1,
       onMessage: () => {
         calls += 1;
@@ -156,6 +160,7 @@ describe("MarmotInboundBridge", () => {
     const submissionErrors: unknown[] = [];
     const transportErrors: unknown[] = [];
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 1,
       onMessage: async () => {
         throw new Error("local queue failure");
@@ -189,6 +194,7 @@ describe("MarmotInboundBridge", () => {
     let droppedEvents = -1;
     const controller = new AbortController();
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 1,
       onMessage: (message) => {
         delivered.push(message.messageIdHex);
@@ -226,6 +232,7 @@ describe("MarmotInboundBridge", () => {
 
     const controller = new AbortController();
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 4,
       maxReconnectDelayMs: 1000,
       onMessage: () => {},
@@ -258,6 +265,7 @@ describe("MarmotInboundBridge", () => {
     let deletedTarget = "";
     const controller = new AbortController();
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 1,
       onMessage: () => {},
       onAmbientEvent: (event) => {
@@ -285,6 +293,7 @@ describe("MarmotInboundBridge", () => {
     let observedDetail: string | null = "";
     const controller = new AbortController();
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 1,
       onMessage: () => {},
       onAmbientEvent: (event) => {
@@ -305,6 +314,7 @@ describe("MarmotInboundBridge", () => {
     const { client, subscribeCalls } = makeClient([]);
     const controller = new AbortController();
     const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(),
       reconnectDelayMs: 5,
       onMessage: () => {},
     });
@@ -314,6 +324,56 @@ describe("MarmotInboundBridge", () => {
     await run;
 
     expect(subscribeCalls()).toBeGreaterThanOrEqual(1);
+  });
+
+  it("denies before reservation when the authorizer is missing and suppresses replay", async () => {
+    const id = HEX32("ee");
+    const denied: string[] = [];
+    let calls = 0;
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(id);
+        yield inboundMessage(id);
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onDenied: (reason) => denied.push(reason),
+      onMessage: () => {
+        calls += 1;
+      },
+    });
+
+    await bridge.run(controller.signal);
+    expect(calls).toBe(0);
+    expect(denied).toEqual(["missing_authorizer"]);
+  });
+
+  it("denies an unlisted sender without calling onMessage", async () => {
+    const id = HEX32("ef");
+    const denied: string[] = [];
+    let calls = 0;
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(id);
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const bridge = new MarmotInboundBridge(client, {
+      authorizer: testAllowlistAuthorizer(HEX32("aa"), [HEX32("99")]),
+      reconnectDelayMs: 1,
+      onDenied: (reason) => denied.push(reason),
+      onMessage: () => {
+        calls += 1;
+      },
+    });
+
+    await bridge.run(controller.signal);
+    expect(calls).toBe(0);
+    expect(denied).toEqual(["sender_not_allowed"]);
   });
 });
 

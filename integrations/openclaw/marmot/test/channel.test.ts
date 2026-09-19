@@ -14,6 +14,7 @@ import {
   markMarmotInboundReady,
   markMarmotInboundReceived,
   markMarmotInboundStarting,
+  markMarmotSenderPolicyResult,
   MARMOT_ALLOWLIST_SYNC_FAILED,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
@@ -92,6 +93,26 @@ describe("resolveMarmotChannelAccount", () => {
     expect(resolveMarmotChannelAccount(cfg, null).socketPath).toBe("/d.sock");
   });
 
+  it("does not merge a sibling account's senderPolicy", () => {
+    const allowed = HEX32("bb");
+    const cfg = {
+      channels: {
+        marmot: {
+          senderPolicy: { allowAll: true },
+          accounts: {
+            default: { senderPolicy: { allowedUsers: [allowed] } },
+            other: {},
+          },
+        },
+      },
+    } as unknown as Cfg;
+    expect(resolveMarmotChannelAccount(cfg, "default").senderPolicy).toMatchObject({
+      state: "allowlist",
+      allowedUsers: [allowed],
+    });
+    expect(resolveMarmotChannelAccount(cfg, "other").senderPolicy.state).toBe("missing");
+  });
+
   it("throws for an unknown account id in multi-account mode", () => {
     const cfg = {
       channels: { marmot: { accounts: { default: { socketPath: "/d.sock" } } } },
@@ -109,6 +130,7 @@ describe("resolveMarmotChannelAccount", () => {
     const account = resolveMarmotChannelAccount(cfg, "default");
     const probe = { ok: true, accounts: 1, localSigningAccounts: 1 };
 
+    markMarmotSenderPolicyResult("default", { state: "allowlist", allowedUserCount: 1 });
     markMarmotInboundStarting("default");
     markMarmotInboundReady("default");
     markMarmotInboundReceived("default");

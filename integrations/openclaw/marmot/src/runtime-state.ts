@@ -6,13 +6,24 @@
 // routing key so one account's start/stop/retry cannot overwrite another.
 
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
+import {
+  senderPolicyErrorCode,
+  senderPolicyIsReady,
+  type SenderPolicyReadinessState,
+  type SenderPolicyResolution,
+} from "./sender-policy.js";
 
 export const DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID = "default";
 
 /** Stable machine-readable policy-readiness failure published on snapshots. */
 export const MARMOT_ALLOWLIST_SYNC_FAILED = "marmot_allowlist_sync_failed";
+export {
+  MARMOT_SENDER_POLICY_INVALID,
+  MARMOT_SENDER_POLICY_MISSING,
+} from "./sender-policy.js";
 
 export type MarmotAllowlistPolicyState = "pending" | "unmanaged" | "reconciled" | "failed";
+export type MarmotSenderPolicyState = SenderPolicyReadinessState;
 
 export type MarmotAllowlistSyncResult =
   | { state: "unmanaged" }
@@ -31,6 +42,8 @@ interface AccountLiveFacts {
   inboundAcknowledged: boolean;
   inboundError: string | null;
   policy: MarmotAllowlistPolicyState;
+  senderPolicy: MarmotSenderPolicyState;
+  senderPolicyAllowedUserCount: number;
   reconnectAttempts: number;
   lastStartAt: number | null;
   lastStopAt: number | null;
@@ -45,13 +58,19 @@ export function accountIdOrDefault(accountId: string | null | undefined): string
   return trimmed.length > 0 ? trimmed : DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
 }
 
-function emptyFacts(accountId: string, policy: MarmotAllowlistPolicyState): AccountLiveFacts {
+function emptyFacts(
+  accountId: string,
+  policy: MarmotAllowlistPolicyState,
+  senderPolicy: MarmotSenderPolicyState = "pending",
+): AccountLiveFacts {
   return {
     accountId,
     running: false,
     inboundAcknowledged: false,
     inboundError: null,
     policy,
+    senderPolicy,
+    senderPolicyAllowedUserCount: 0,
     reconnectAttempts: 0,
     lastStartAt: null,
     lastStopAt: null,
@@ -59,16 +78,19 @@ function emptyFacts(accountId: string, policy: MarmotAllowlistPolicyState): Acco
 }
 
 function project(facts: AccountLiveFacts): ChannelAccountSnapshot {
-  const policyReady = facts.policy === "unmanaged" || facts.policy === "reconciled";
+  const welcomerReady = facts.policy === "unmanaged" || facts.policy === "reconciled";
+  const senderReady = senderPolicyIsReady(facts.senderPolicy);
+  const senderError = senderPolicyErrorCode(facts.senderPolicy);
   return {
     accountId: facts.accountId,
     running: facts.running,
-    connected: facts.inboundAcknowledged && policyReady,
+    connected: facts.inboundAcknowledged && welcomerReady && senderReady,
     reconnectAttempts: facts.reconnectAttempts,
     lastStartAt: facts.lastStartAt,
     lastStopAt: facts.lastStopAt,
     lastError:
-      facts.policy === "failed" ? MARMOT_ALLOWLIST_SYNC_FAILED : facts.inboundError,
+      senderError ??
+      (facts.policy === "failed" ? MARMOT_ALLOWLIST_SYNC_FAILED : facts.inboundError),
     lastInboundAt: facts.lastInboundAt,
     lastOutboundAt: facts.lastOutboundAt,
   };
@@ -90,9 +112,26 @@ function stoppedSnapshot(accountId: string): ChannelAccountSnapshot {
 export function beginMarmotAccountLifecycle(accountId?: string | null): ChannelAccountSnapshot {
   const nextAccountId = accountIdOrDefault(accountId);
   return write({
-    ...emptyFacts(nextAccountId, "pending"),
+    ...emptyFacts(nextAccountId, "pending", "pending"),
     running: true,
     lastStartAt: Date.now(),
+  });
+}
+
+export function markMarmotSenderPolicyResult(
+  accountId: string | null | undefined,
+  result: SenderPolicyResolution | { state: MarmotSenderPolicyState; allowedUserCount?: number },
+): ChannelAccountSnapshot {
+  const nextAccountId = accountIdOrDefault(accountId);
+  const prev = live.get(nextAccountId) ?? emptyFacts(nextAccountId, "unmanaged", "pending");
+  return write({
+    ...prev,
+    accountId: nextAccountId,
+    senderPolicy: result.state,
+    senderPolicyAllowedUserCount:
+      "allowedUserCount" in result && typeof result.allowedUserCount === "number"
+        ? result.allowedUserCount
+        : 0,
   });
 }
 
@@ -125,6 +164,8 @@ export function markMarmotInboundStarting(accountId?: string | null): ChannelAcc
     inboundAcknowledged: false,
     inboundError: null,
     policy: prev?.policy ?? "unmanaged",
+    senderPolicy: prev?.senderPolicy ?? "pending",
+    senderPolicyAllowedUserCount: prev?.senderPolicyAllowedUserCount ?? 0,
     reconnectAttempts: sameAccount ? (prev.reconnectAttempts ?? 0) : 0,
     lastStartAt: sameAccount && prev.lastStartAt ? prev.lastStartAt : Date.now(),
     lastStopAt: null,
@@ -236,6 +277,12 @@ export function marmotAllowlistPolicyState(
   accountId?: string | null,
 ): MarmotAllowlistPolicyState | null {
   return live.get(accountIdOrDefault(accountId))?.policy ?? null;
+}
+
+export function marmotSenderPolicyState(
+  accountId?: string | null,
+): MarmotSenderPolicyState | null {
+  return live.get(accountIdOrDefault(accountId))?.senderPolicy ?? null;
 }
 
 export function resetMarmotInboundRuntimeForTests(): void {

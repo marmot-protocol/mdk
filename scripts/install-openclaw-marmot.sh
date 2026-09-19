@@ -74,7 +74,11 @@ Options:
   --yes, --non-interactive Use defaults and do not prompt
   --home PATH              Marmot agent home (default: ~/.marmot-agents/openclaw)
   --openclaw-home PATH     OpenClaw home (default: $OPENCLAW_HOME or $HOME)
-  --allow-welcomer VALUE   Allow invites from this npub or hex pubkey; may repeat
+  --allow-welcomer VALUE   Allow invites from this npub or hex pubkey; may repeat.
+                           This is invite admission only. It is not copied into
+                           channels.marmot.senderPolicy. Configure senderPolicy
+                           or MARMOT_ALLOWED_USERS / MARMOT_ALLOW_ALL_USERS
+                           before claiming chat readiness.
   --existing-identity-file PATH
                            Import an existing nsec/raw-hex identity from an
                            owner-only regular file before bootstrap
@@ -106,7 +110,9 @@ Environment:
   MARMOT_AGENT_SERVICE_NAME Linux systemd user service name (default: wn-agent-openclaw)
   MARMOT_AGENT_LAUNCHD_LABEL macOS LaunchAgent label (default: org.marmot.wn-agent.openclaw)
   MARMOT_RELAYS            Relay CSV used by wn-agent and bootstrap
-  MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
+  MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex welcomer values
+  MARMOT_ALLOWED_USERS     Optional env fallback for inbound sender hex ids
+  MARMOT_ALLOW_ALL_USERS   Optional explicit opt-in to accept any sender
 
 Verified download (then choose one invocation below):
   set -eu
@@ -711,8 +717,10 @@ configure_openclaw_gateway() {
     fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "would patch OpenClaw config: $config_path"
-        log "would preserve other OpenClaw channels and only update channels.marmot"
+    log "would patch OpenClaw config: $config_path"
+    log "would preserve other OpenClaw channels and only update channels.marmot"
+    log "would preserve existing channels.marmot.senderPolicy if present"
+    log "would not copy --allow-welcomer into senderPolicy; configure senderPolicy or MARMOT_ALLOWED_USERS before claiming chat readiness"
         return 0
     fi
 
@@ -808,8 +816,12 @@ OpenClaw:
 Restart your existing OpenClaw gateway when you are ready for it to load the Marmot plugin/config:
   openclaw gateway run
 
-Then add the agent identity above in White Noise, invite it from an authorized
-account, and send a test message.
+Then add the agent identity above in White Noise and invite it from an authorized
+welcomer. Chat is not ready until you also configure a separate inbound sender
+ACL in channels.marmot.senderPolicy (raw 64-character Marmot account hex, or
+allowAll: true) or export MARMOT_ALLOWED_USERS / MARMOT_ALLOW_ALL_USERS, then
+restart the gateway. Existing senderPolicy is preserved on reinstall; welcomer
+entries are not copied into it.
 
 Existing OpenClaw channels were not removed or disabled. The installer only installed the Marmot plugin and updated channels.marmot.
 

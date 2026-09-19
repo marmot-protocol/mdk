@@ -66,4 +66,9 @@ OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR=1 pnpm vitest run \
   test/channel.test.ts \
   test/bounded-keyed-async-queue.test.ts \
   test/outbound.test.ts \
-  test/plugin-sdk-surface.test.ts
+  test/plugin-sdk-surface.test.ts \
+  test/sender-policy.test.ts \
+  test/sender-policy-entrypoint.test.ts \
+  test/client.test.ts \
+  test/inbound.test.ts \
+  test/config.test.ts

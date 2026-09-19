@@ -42,10 +42,17 @@ import {
   markMarmotInboundSetupFailed,
   markMarmotInboundStarting,
   markMarmotInboundStopped,
+  markMarmotSenderPolicyResult,
   marmotInboundRuntimeSnapshot,
   type MarmotAllowlistSyncResult,
 } from "./runtime-state.js";
 import { syncAllowlist } from "./security.js";
+import {
+  authorizeInboundSender,
+  createSenderAuthorizer,
+  senderAuthorizationInputFromMessage,
+  type MarmotSenderAuthorizer,
+} from "./sender-policy.js";
 
 export type {
   MarmotAllowlistSyncFailureReason,
@@ -219,6 +226,12 @@ export interface StartMarmotInboundOptions {
    * fails before the subscription is active. Not invoked after a clean stop.
    */
   onSetupFailed?: () => void;
+  /**
+   * Account-bound sender ACL shared with the dispatcher. Standalone callers
+   * that omit it get an equivalent binding from the selected account config;
+   * there is no allow fallback.
+   */
+  authorizer?: MarmotSenderAuthorizer;
 }
 
 // OpenClaw owns one gateway task per configured channel account. Keep one
@@ -265,6 +278,7 @@ export function startMarmotInbound(
     return () => {};
   }
   const attemptId = inboundActiveAccounts.get(inboundAccountKey)!;
+  let authorizer: MarmotSenderAuthorizer | undefined = options.authorizer;
   const publishStatus = (): void => {
     options.statusSink?.(marmotInboundRuntimeSnapshot(statusAccountId));
   };
@@ -299,8 +313,10 @@ export function startMarmotInbound(
       return false;
     }
     if (mode === "setup-failed") {
+      authorizer?.setLifecycle("stopped");
       markMarmotInboundSetupFailed(statusAccountId);
     } else {
+      authorizer?.setLifecycle("stopped");
       markMarmotInboundStopped(statusAccountId);
     }
     publishStatus();
@@ -360,6 +376,19 @@ export function startMarmotInbound(
     if (stopping || !ownsReservation()) {
       return;
     }
+    if (!authorizer) {
+      authorizer = createSenderAuthorizer({ policy: resolved.senderPolicy });
+    }
+    if (!authorizer.bindReceivingAccount(accountIdHex)) {
+      api.logger.warn("marmot: inbound sender policy is not bound to a valid receiving account");
+      failSetup();
+      return;
+    }
+    if (authorizer.lifecycle() === "unbound" || authorizer.lifecycle() === "pending") {
+      authorizer.setLifecycle(resolved.senderPolicy.state === "invalid" ? "invalid" : "active");
+    }
+    markMarmotSenderPolicyResult(statusAccountId, authorizer.policy);
+    publishStatus();
     let readyLogged = false;
     const pendingAmbient = new Map<string, MarmotAmbientEvent[]>();
     const ambientKey = (account: string, group: string) => `${account}:${group}`;
@@ -416,6 +445,14 @@ export function startMarmotInbound(
     const handleInbound = async (
       message: MarmotInboundMessage,
     ): Promise<MarmotInboundCompletionOutcome> => {
+      const authorization = authorizeInboundSender(
+        authorizer,
+        senderAuthorizationInputFromMessage(message),
+      );
+      if (authorization.outcome === "deny") {
+        api.logger.info(`marmot: inbound sender denied (reason=${authorization.reason})`);
+        return "denied";
+      }
       if (onboardingStore) {
         const intercepted = await maybeHandleProfileOnboardingInbound({
           store: onboardingStore,
@@ -621,6 +658,10 @@ export function startMarmotInbound(
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
+      authorizer,
+      onDenied: (reason) => {
+        api.logger.info(`marmot: inbound sender denied (reason=${reason})`);
+      },
       reconnectDelayMs: options.reconnectDelayMs,
       maxReconnectDelayMs: options.maxReconnectDelayMs,
       onReady: () => {

@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- OpenClaw Marmot now enforces an account-global inbound sender ACL before
+  queueing, onboarding, or agent-turn admission. Configure
+  `channels.marmot.senderPolicy` or the Hermes-compatible
+  `MARMOT_ALLOWED_USERS` / `MARMOT_ALLOW_ALL_USERS` environment fallback.
+  `dm.allowFrom` remains welcomer/invite admission only. Missing or invalid
+  sender policy is fail-closed and is not reported as a healthy channel.
+
 ## [0.10.2] - 2026-09-19
 
 Update generated bindings, native libraries, and C headers together. Account storage advances through migration 86; back up before upgrade because downgrade is unsupported. See [0.10.2 release notes](../../docs/release/0.10.2.md).

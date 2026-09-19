@@ -36,6 +36,7 @@ import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
   marmotInboundRuntimeSnapshot,
 } from "./runtime-state.js";
+import { senderPolicyIsReady } from "./sender-policy.js";
 
 export const MARMOT_CHANNEL_ID = "marmot";
 
@@ -43,6 +44,8 @@ interface MarmotStatusProbe {
   ok: boolean;
   accounts: number;
   localSigningAccounts: number;
+  senderPolicyState?: string;
+  senderPolicyAllowedUserCount?: number;
 }
 
 interface MarmotChannelsConfig {
@@ -126,12 +129,15 @@ function accountSnapshot(
 }
 
 async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<MarmotStatusProbe> {
+  const senderReady = senderPolicyIsReady(account.senderPolicy.state);
   const response = await clientForAccount(account).accountList();
   const localSigningAccounts = response.accounts.filter((entry) => entry.local_signing).length;
   return {
-    ok: localSigningAccounts > 0,
+    ok: localSigningAccounts > 0 && senderReady,
     accounts: response.accounts.length,
     localSigningAccounts,
+    senderPolicyState: account.senderPolicy.state,
+    senderPolicyAllowedUserCount: account.senderPolicy.allowedUserCount,
   };
 }
 

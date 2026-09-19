@@ -10,9 +10,12 @@ import {
   markMarmotInboundStarting,
   markMarmotInboundStopped,
   markMarmotOutboundSent,
+  markMarmotSenderPolicyResult,
   marmotAllowlistPolicyState,
   marmotInboundRuntimeSnapshot,
+  marmotSenderPolicyState,
   MARMOT_ALLOWLIST_SYNC_FAILED,
+  MARMOT_SENDER_POLICY_MISSING,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
 
@@ -45,6 +48,7 @@ describe("per-account composed readiness", () => {
     markMarmotInboundStopped("work");
     beginMarmotAccountLifecycle("work");
     markMarmotAllowlistSyncResult("work", { state: "reconciled" });
+    markMarmotSenderPolicyResult("work", { state: "allowlist", allowedUserCount: 1 });
     expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
       connected: false,
       lastError: null,
@@ -70,6 +74,7 @@ describe("per-account composed readiness", () => {
     });
 
     markMarmotAllowlistSyncResult("work", { state: "reconciled" });
+    markMarmotSenderPolicyResult("work", { state: "allow_all", allowedUserCount: 0 });
     expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
       connected: false,
       lastError: "inbound subscription dropped",
@@ -107,6 +112,7 @@ describe("per-account composed readiness", () => {
 
     beginMarmotAccountLifecycle("beta");
     markMarmotAllowlistSyncResult("beta", { state: "reconciled" });
+    markMarmotSenderPolicyResult("beta", { state: "allowlist", allowedUserCount: 1 });
     markMarmotInboundStarting("beta");
     markMarmotInboundReady("beta");
     markMarmotInboundReceived("beta");
@@ -149,9 +155,30 @@ describe("per-account composed readiness", () => {
     });
   });
 
+  it("keeps missing or invalid sender policy disconnected after a welcomer-ready ack", () => {
+    beginMarmotAccountLifecycle("work");
+    markMarmotAllowlistSyncResult("work", { state: "reconciled" });
+    markMarmotSenderPolicyResult("work", { state: "missing", allowedUserCount: 0 });
+    markMarmotInboundStarting("work");
+    markMarmotInboundReady("work");
+    expect(marmotSenderPolicyState("work")).toBe("missing");
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      connected: false,
+      lastError: MARMOT_SENDER_POLICY_MISSING,
+    });
+
+    markMarmotSenderPolicyResult("work", { state: "invalid", allowedUserCount: 0 });
+    expect(marmotInboundRuntimeSnapshot("work")).toMatchObject({
+      connected: false,
+      lastError: "marmot_sender_policy_invalid",
+    });
+    expect(JSON.stringify(marmotInboundRuntimeSnapshot("work"))).not.toContain("aa".repeat(32));
+  });
+
   it("ignores a stale setup failure after the current generation is acknowledged", () => {
     beginMarmotAccountLifecycle("work");
     markMarmotAllowlistSyncResult("work", { state: "reconciled" });
+    markMarmotSenderPolicyResult("work", { state: "allowlist", allowedUserCount: 1 });
     markMarmotInboundStarting("work");
     markMarmotInboundReady("work");
     markMarmotInboundSetupFailed("work");

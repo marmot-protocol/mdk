@@ -125,6 +125,7 @@ function account(overrides: Partial<ResolvedMarmotAccount> = {}): ResolvedMarmot
     profileOnboardingStatePath: "/tmp/onboarding.json",
     debounceMs: 0,
     dmPolicy: "allowlist",
+    senderPolicy: { state: "allow_all", allowedUsers: [], allowedUserCount: 0 },
     ...overrides,
   };
 }

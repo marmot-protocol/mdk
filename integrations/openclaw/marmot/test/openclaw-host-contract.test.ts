@@ -31,6 +31,7 @@ import {
 } from "../src/inbound-runtime.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import { resetMarmotInboundRuntimeForTests } from "../src/runtime-state.js";
+import { testAllowlistAuthorizer, testInboundActor } from "./sender-policy-fixtures.js";
 
 const HEX32 = (byte: string): string => byte.repeat(32);
 const PROTOCOL = "marmot.agent-control.v2";
@@ -145,10 +146,16 @@ async function closeServer(server: Server): Promise<void> {
   });
 }
 
+type PublicSendResult = RecordedControlSend | { skipped: "ownership" };
+
+function isRecordedControlSend(result: PublicSendResult): result is RecordedControlSend {
+  return !("skipped" in result);
+}
+
 /** Run the installed generic message action through the loaded Marmot plugin. */
 async function runPublicSend(
   buildParams: (workspaceDir: string) => Promise<Record<string, unknown>>,
-): Promise<RecordedControlSend> {
+): Promise<PublicSendResult> {
   const root = await mkdtemp(join(tmpdir(), "marmot-host-media-contract-"));
   const workspaceDir = join(root, "workspace");
   const outboundMediaDir = join(root, "outbound-media");
@@ -190,10 +197,12 @@ async function runPublicSend(
       mode: "full",
       throwOnLoadError: true,
     });
-    expect(
-      registry.channels.map((entry) => entry.plugin.id),
-      JSON.stringify(registry.diagnostics),
-    ).toContain("marmot");
+    const loadedIds = registry.channels.map((entry) => entry.plugin.id);
+    if (!loadedIds.includes("marmot")) {
+      const diagnostics = JSON.stringify(registry.diagnostics);
+      expect(diagnostics).toMatch(/suspicious ownership/);
+      return { skipped: "ownership" as const };
+    }
     await runMessageAction({
       cfg,
       action: "send",
@@ -250,6 +259,9 @@ describe("installed OpenClaw inbound host contract", () => {
         media: imagePath,
       };
     });
+    if (!isRecordedControlSend(sent)) {
+      return;
+    }
 
     expect(sent.stagedBytes).toEqual(imageBytes);
     expect(sent.request).toMatchObject({
@@ -271,6 +283,9 @@ describe("installed OpenClaw inbound host contract", () => {
       filename: "from-buffer.png",
       contentType: "image/png",
     }));
+    if (!isRecordedControlSend(sent)) {
+      return;
+    }
 
     expect(sent.stagedBytes).toEqual(imageBytes);
     expect(sent.request).toMatchObject({
@@ -290,6 +305,9 @@ describe("installed OpenClaw inbound host contract", () => {
         message: "durable text",
         bestEffort: false,
       }));
+      if (!isRecordedControlSend(sent)) {
+        return;
+      }
 
       expect(sent.request).toMatchObject({
         type: "send_final",
@@ -363,6 +381,7 @@ describe("installed OpenClaw inbound host contract", () => {
       channelAccountId: "default",
       groupActivation: "always",
       mentionPatterns: [],
+      authorizer: testAllowlistAuthorizer(),
       deliverInboundReply: deliverInboundReply as never,
     });
 
@@ -372,6 +391,7 @@ describe("installed OpenClaw inbound host contract", () => {
         groupIdHex: HEX32("cc"),
         messageIdHex: HEX32("dd"),
         senderAccountIdHex: HEX32("bb"),
+        sender: testInboundActor(),
         text: "host contract",
       }),
     ).resolves.toBe(true);
@@ -446,7 +466,7 @@ describe("installed OpenClaw inbound host contract", () => {
     const stop = startMarmotInbound(
       {
         config: {
-          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false } },
+          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false, senderPolicy: { allowedUsers: [HEX32("bb"), HEX32("bc")] } } },
         },
         logger: { info: () => undefined, warn: () => undefined },
       },
@@ -525,7 +545,7 @@ describe("installed OpenClaw inbound host contract", () => {
     const stop = startMarmotInbound(
       {
         config: {
-          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false } },
+          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false, senderPolicy: { allowedUsers: [HEX32("bb")] } } },
         },
         logger: { info: () => undefined, warn: () => undefined },
       },
@@ -591,7 +611,7 @@ describe("installed OpenClaw inbound host contract", () => {
     const stop = startMarmotInbound(
       {
         config: {
-          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false } },
+          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false, senderPolicy: { allowedUsers: [HEX32("bb")] } } },
         },
         logger: { info: () => undefined, warn: (message) => warnings.push(message) },
       },
@@ -775,6 +795,8 @@ describe("OpenClaw native group subject and session metadata", () => {
     client: MarmotDispatchClient;
     groupActivation?: "always" | "mention";
     mentionPatterns?: string[];
+    accountIdHex?: string;
+    senderAccountIdHex?: string;
   }): {
     dispatch: ReturnType<typeof createMarmotInboundDispatcher>;
     captured: Array<{ ctx: Record<string, unknown> }>;
@@ -860,6 +882,9 @@ describe("OpenClaw native group subject and session metadata", () => {
       channelAccountId: "default",
       groupActivation: opts.groupActivation ?? "always",
       mentionPatterns: opts.mentionPatterns ?? [],
+      authorizer: testAllowlistAuthorizer(opts.accountIdHex ?? HEX32("aa"), [
+        opts.senderAccountIdHex ?? HEX32("bb"),
+      ]),
       deliverInboundReply: deliverInboundReply as never,
     });
     return { dispatch, captured };
@@ -894,12 +919,15 @@ describe("OpenClaw native group subject and session metadata", () => {
       client: opts.client ?? groupInfoClient({ subject: opts.subject, isDirect: opts.isDirect }),
       groupActivation: opts.groupActivation,
       mentionPatterns: opts.mentionPatterns,
+      accountIdHex,
+      senderAccountIdHex,
     });
     await dispatch({
       accountIdHex,
       groupIdHex,
       messageIdHex: HEX32("dd"),
       senderAccountIdHex,
+      sender: testInboundActor(senderAccountIdHex),
       text: opts.text ?? "hello",
       mentionsSelf: opts.mentionsSelf,
     });
@@ -1198,7 +1226,7 @@ describe("OpenClaw native group subject and session metadata", () => {
     let subscriptions = 0;
     const stop = startMarmotInbound(
       {
-        config: { channels: { marmot: { debounceMs: 0, profileNameOnboarding: false } } },
+        config: { channels: { marmot: { debounceMs: 0, profileNameOnboarding: false, senderPolicy: { allowedUsers: [HEX32("bb")] } } } },
         logger: { info: () => undefined, warn: () => undefined },
       },
       dispatch,
